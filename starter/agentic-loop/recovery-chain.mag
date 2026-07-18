@@ -1,0 +1,32 @@
+;; A downstream reviewer deliberately accepts the builder's whole result union,
+;; so a failed builder can preserve partial output and still continue the graph.
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+(type BuildReport {:summary String})
+(type ReviewReport {:assessment String})
+
+(let [builder
+      (nefor.actors.agent
+        (as nefor.actors.AgentConfig {:id "builder"
+         :model nil :profile nil :provider "mock-provider"
+         :system "Build the requested change." :tools (as (List String) [])
+         :da-policy nil :max-corrections 0})
+        (type-tag nefor.contracts.Task) "task" (type-tag BuildReport))
+      reviewer
+      (nefor.actors.agent
+        (as nefor.actors.AgentConfig {:id "reviewer"
+         :model nil :profile nil :provider "mock-provider"
+         :system "Review the builder result, including retained partial output."
+         :tools (as (List String) []) :da-policy nil :max-corrections 0})
+        (type-tag (| BuildReport nefor.contracts.AgentError))
+        "nefor.agent.Result"
+        (type-tag ReviewReport))
+      chain (nefor.graph.connect builder reviewer)
+      initial (nefor.graph.typed-message
+                (get chain "input")
+                (as nefor.contracts.Task {:prompt "Implement the change"}))]
+  (nefor.artifact.compile
+    (nefor.graph.finish chain [initial] (as (List nefor.graph.Rule) []))))

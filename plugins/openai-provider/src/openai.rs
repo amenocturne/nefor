@@ -187,6 +187,8 @@ pub struct ChatRequest<'a> {
     /// to v1 when no tool plugins are attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<&'a [serde_json::Value]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<&'a serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -452,6 +454,35 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chat_request_serializes_native_json_schema_response_format() {
+        let messages = vec![Message::user("answer")];
+        let response_format = json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "mag_output",
+                "strict": true,
+                "schema": {"type": "string"}
+            }
+        });
+        let request = ChatRequest {
+            model: "gpt-5",
+            messages: &messages,
+            stream: true,
+            reasoning_effort: None,
+            stream_options: None,
+            tools: None,
+            response_format: Some(&response_format),
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["response_format"]["type"], "json_schema");
+        assert_eq!(
+            value["response_format"]["json_schema"]["schema"]["type"],
+            "string"
+        );
+    }
 
     #[test]
     fn parse_sse_chunk_extracts_delta_content() {

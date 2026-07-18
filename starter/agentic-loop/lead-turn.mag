@@ -24,7 +24,8 @@
                  "write-review"
                  "mag"
                  "mag-eval"]
-         :da-policy nil})
+         :da-policy nil
+         :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))

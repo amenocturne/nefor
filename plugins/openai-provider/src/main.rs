@@ -59,7 +59,8 @@ use openai_provider::config::Config;
 use openai_provider::openai::{Message, ModelInfo, ToolCall};
 use openai_provider::state::{ChatId, ChatRestore, ChatStats, Chats, ChatsError, TurnToken};
 use openai_provider::stream::{
-    list_models, run_chat_stream_with_retry_progress, ReasoningEvent, RetryProgress, StreamError,
+    list_models, run_chat_stream_with_retry_progress_and_format, ReasoningEvent, RetryProgress,
+    StreamError,
 };
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -518,6 +519,16 @@ async fn dispatch_event(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let response_format = body.get("output_schema").map(|schema| {
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "mag_output",
+                        "strict": true,
+                        "schema": schema,
+                    }
+                })
+            });
             tracing::info!(
                 target: "openai_provider::chat",
                 chat_id = %chat_id,
@@ -535,6 +546,7 @@ async fn dispatch_event(
                 chat_id,
                 false,
                 extra_tools,
+                response_format,
             )
             .await?;
         }
@@ -641,6 +653,7 @@ async fn dispatch_event(
                 chat_id,
                 true,
                 Vec::new(),
+                None,
             )
             .await?;
         }
@@ -836,6 +849,7 @@ async fn start_completion_turn(
     chat_id: ChatId,
     legacy_default_chat: bool,
     extra_tools: Vec<Value>,
+    response_format: Option<Value>,
 ) -> Result<(), LlmError> {
     let history = match chats.request_history_snapshot(&chat_id).await {
         Ok(h) => h,
@@ -879,6 +893,7 @@ async fn start_completion_turn(
         cancel,
         legacy_default_chat,
         extra_tools,
+        response_format,
     );
     Ok(())
 }
@@ -896,6 +911,7 @@ fn spawn_turn(
     cancel: TurnToken,
     legacy_default_chat: bool,
     extra_tools: Vec<Value>,
+    response_format: Option<Value>,
 ) {
     tokio::spawn(async move {
         // The streaming/tool helpers only need the abort signal; the
@@ -1023,7 +1039,7 @@ fn spawn_turn(
             // firing in a tool loop gets its own timer (per-firing
             // reasoning, never accumulated across firings).
             let mut reasoning_started_at: Option<std::time::Instant> = None;
-            let result = run_chat_stream_with_retry_progress(
+            let result = run_chat_stream_with_retry_progress_and_format(
                 &client,
                 &endpoint,
                 token.as_deref(),
@@ -1032,8 +1048,12 @@ fn spawn_turn(
                 &history,
                 tools_slice,
                 reasoning_effort.as_deref(),
+                response_format.as_ref(),
                 cancel_token.clone(),
                 |delta| {
+                    if response_format.is_some() {
+                        return;
+                    }
                     let body = stream_delta_body(
                         &prefix_for_delta,
                         &id_for_delta,
@@ -1332,11 +1352,16 @@ fn spawn_turn(
             )
             .await;
 
+        let visible_final_text = if response_format.is_some() {
+            ""
+        } else {
+            &final_text
+        };
         let stream_end = stream_end_body(
             &config,
             &turn_id,
             &chat_id,
-            &final_text,
+            visible_final_text,
             &active_model,
             elapsed_ms,
             final_finish_reason.as_deref(),

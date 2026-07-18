@@ -3,7 +3,6 @@
 ;; and the runtime registry.
 
 (require "core.types")
-(require "core.validated")
 
 (type Task {:prompt String})
 (type ProviderInput {:content String})
@@ -20,12 +19,14 @@
                        :expected String
                        :actual String
                        :message String})
-(type OutputError {:kind String
-                   :message String
-                   :attempts Int
-                   :violations (List OutputViolation)})
+(type ProviderError {:message String
+                     :detail (core.types.Option String)})
+(type OutputValidationError {:violations (List OutputViolation)})
+(type AgentErrorReason (| ProviderError OutputValidationError))
+(type AgentError {:last_output Data
+                  :reason AgentErrorReason})
 
-(type AdapterParams {:seed String})
+(type AdapterParams {:seed String :schema Data})
 (type LlmParams {:model Data
                  :profile Data
                  :provider String
@@ -43,7 +44,9 @@
                               :provider String
                               :system String
                               :tools (List String)
-                              :schema Data})
+                              :schema Data
+                              :max_corrections Int})
+(type SelectAgentResultParams {})
 (type CollectorParams {:expected_senders (List String)})
 (type DynamicParams {})
 
@@ -60,7 +63,12 @@
 (foreign nefor.factory.structured-output [T]
   {:params StructuredOutputParams
    :input ProviderInput
-   :output (| ToolCalls (core.validated.Validated OutputError T))})
+   :output (| ToolCalls (| T AgentError))})
+
+(foreign nefor.factory.select-agent-result [T]
+  {:params SelectAgentResultParams
+   :input (| T AgentError)
+   :output (| T AgentError)})
 
 (foreign nefor.factory.run-tool
   {:params RunToolParams
@@ -96,7 +104,7 @@
   {:params DynamicParams :input T :output T})
 (foreign nefor.factory.collected-prompt [T]
   {:params DynamicParams :input (List T) :output ProviderInput})
-(foreign nefor.factory.outcome [T E]
+(foreign nefor.factory.outcome [T]
   {:params DynamicParams
-   :input (core.validated.Validated E T)
-   :output (core.validated.Validated E T)})
+   :input (| T AgentError)
+   :output (| T AgentError)})

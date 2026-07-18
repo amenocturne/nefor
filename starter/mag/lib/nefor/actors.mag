@@ -7,7 +7,8 @@
                    :provider String
                    :system String
                    :tools (List String)
-                   :da-policy Data})
+                   :da-policy Data
+                   :max-corrections Int})
 (type ApprovalConfig {:id String :prompt String})
 (type BranchFragment [I A B]
   {:actors (List nefor.graph.Actor)
@@ -16,11 +17,21 @@
    :first (nefor.graph.Port A)
    :second (nefor.graph.Port B)})
 
-;; Agent is an ordinary graph-fragment constructor. `output-type` is the
-;; semantic type exposed at the boundary; `FinalAnswer` remains the wire type
-;; emitted by the foreign LLM actor.
+(def branch-fragment-delta (fn [I A B]
+  [[fragment (BranchFragment I A B)]] -> nefor.graph.Delta
+  (as nefor.graph.Delta
+    {:actors (get fragment "actors")
+     :routes (get fragment "routes")
+     :messages []
+     :kills []})))
+
+;; Every agent has one public result port with semantic type `O | AgentError`.
+;; The stable result wire keeps whole-union chaining ordinary; `select-result`
+;; below introduces distinct runtime ports only when a lead wants to route the
+;; variants independently.
 (def agent (fn [I O] [[config AgentConfig] [input-type (TypeTag I)]
-                [input-wire String] [output-type (TypeTag O)]] -> (nefor.graph.Fragment I O)
+                [input-wire String] [output-type (TypeTag O)]]
+  -> (nefor.graph.Fragment I (| O nefor.contracts.AgentError))
   (let [id (get config "id")
         entry-id (str id ".entry")
         llm-id (str id ".llm")
@@ -37,9 +48,9 @@
         tool-calls (nefor.graph.port llm-id
                      (type-tag nefor.contracts.ToolCalls)
                      "generic-tool.ToolCalls")
-        final-answer (nefor.graph.port llm-id
-                       output-type
-                       "generic-provider.FinalAnswer")
+        result (nefor.graph.port llm-id
+                 (type-tag (| O nefor.contracts.AgentError))
+                 "nefor.agent.Result")
         run-in (nefor.graph.port run-tool-id
                  (type-tag nefor.contracts.ToolCalls)
                  "generic-tool.ToolCalls")
@@ -53,20 +64,23 @@
                      (type-tag nefor.contracts.ProviderInput)
                      "generic-provider.ProviderOut")]
 
-    (as (nefor.graph.Fragment I O) {:actors
-      [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [I])
-         (as nefor.contracts.AdapterParams {:seed "provider-in"})
+    (as (nefor.graph.Fragment I (| O nefor.contracts.AgentError)) {:actors
+       [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [I])
+         (as nefor.contracts.AdapterParams
+           {:seed "provider-in" :schema (type-schema input-type)})
          (nefor.graph.store-port entry-in)
          [(nefor.graph.store-port entry-out)])
-       (nefor.graph.actor llm-id nefor.factory.llm
-         (as nefor.contracts.LlmParams {:model (get config "model")
+       (nefor.graph.actor llm-id (specialize nefor.factory.structured-output [O])
+         (as nefor.contracts.StructuredOutputParams {:model (get config "model")
           :profile (get config "profile")
           :provider (get config "provider")
           :system (get config "system")
-          :tools (or (get config "tools") (as (List String) []))})
+          :tools (or (get config "tools") (as (List String) []))
+          :schema (type-schema output-type)
+          :max_corrections (get config "max-corrections")})
          (nefor.graph.store-port llm-in)
          [(nefor.graph.store-port tool-calls)
-          (nefor.graph.store-port final-answer)])
+          (nefor.graph.store-port result)])
        (nefor.graph.actor run-tool-id nefor.factory.run-tool
          (as nefor.contracts.RunToolParams
            {:tools (or (get config "tools") (as (List String) []))
@@ -81,7 +95,32 @@
               (nefor.graph.store-route (nefor.graph.route run-out result-in))
               (nefor.graph.store-route (nefor.graph.route result-out llm-in))]
      :input entry-in
-     :output final-answer}))))
+     :output result}))))
+
+(def select-result (fn [I O]
+  [[fragment (nefor.graph.Fragment I (| O nefor.contracts.AgentError))]
+   [id String]]
+  -> (BranchFragment I O nefor.contracts.AgentError)
+  (let [selector-id (str id ".select-result")
+        selector-in (nefor.graph.port selector-id
+                      (type-tag (| O nefor.contracts.AgentError))
+                      "nefor.agent.Result")
+        success (nefor.graph.port selector-id (type-tag O) "nefor.agent.Output")
+        failure (nefor.graph.port selector-id
+                  (type-tag nefor.contracts.AgentError) "nefor.agent.Error")]
+    (as (BranchFragment I O nefor.contracts.AgentError)
+      {:actors (concat (get fragment "actors")
+        [(nefor.graph.actor selector-id
+          (specialize nefor.factory.select-agent-result [O])
+          (as nefor.contracts.SelectAgentResultParams {})
+          (nefor.graph.store-port selector-in)
+          [(nefor.graph.store-port success) (nefor.graph.store-port failure)])])
+       :routes (concat (get fragment "routes")
+         [(nefor.graph.store-route
+           (nefor.graph.route (get fragment "output") selector-in))])
+       :input (get fragment "input")
+       :first success
+       :second failure}))))
 
 (def approval-gate (fn [[config ApprovalConfig]]
   -> (BranchFragment nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)

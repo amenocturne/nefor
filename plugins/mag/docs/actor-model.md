@@ -48,8 +48,8 @@ messages and emits messages, nothing else.
 
 Rule-capable outputs use the same ordinary output envelope as routing. Their
 declared wire is `kind`; `value` is the complete semantic value of the port.
-For example, structured output carries the complete `Validated<OutputError,T>`
-under `value`, not an unsound projection of only the successful `T`.
+For example, an agent result carries either the complete `T` or complete
+`AgentError` under `value`, with its runtime variant marker preserved.
 
 ## Factories
 
@@ -203,13 +203,13 @@ kernel killed the id — display semantics for consumers, not mechanics: kill
 handlers run, abort envelopes flush, and ordering is identical for every
 reason.
 
-| Reason         | Emitted when                                                                                  |
-| -------------- | --------------------------------------------------------------------------------------------- |
+| Reason         | Emitted when                                                                           |
+| -------------- | -------------------------------------------------------------------------------------- |
 | `modification` | a kill entry in an applied modification — the mid-run control-plane kill (the default) |
-| `run_complete` | run-context teardown after the selected structural result output was emitted                  |
-| `run_failed`   | run-context teardown after an unhandled actor failure ended the run                           |
-| `killed`       | run-context teardown for an outright kill (`mag.kill_run`)                                    |
-| `reaped`       | session-boundary sweep: a new session's `begin_run` reaped a stale context                    |
+| `run_complete` | run-context teardown after the selected structural result output was emitted           |
+| `run_failed`   | run-context teardown after an unhandled actor failure ended the run                    |
+| `killed`       | run-context teardown for an outright kill (`mag.kill_run`)                             |
+| `reaped`       | session-boundary sweep: a new session's `begin_run` reaped a stale context             |
 
 Consumers render `run_complete` teardown kills as completion — the node stays
 done, so a successful run never repaints as terminated — and every other
@@ -330,8 +330,9 @@ the kernel escalates the construct failure as a run failure.
 
 The direct `llm` factory schema is the table above: `provider`, `model`,
 `system`, `tools`, `profile`, `reasoning_effort`, and `history`. The MAG bridge
-forwards only `model`, `system`, `tools`, and `reasoning_effort` into the
-provider `chat.create` request; `provider` selects the provider actor at
+forwards `model`, `system`, `tools`, and `reasoning_effort` into the provider
+`chat.create` request. For typed agents it also places the converted
+`output_schema` on `chat.complete`; `provider` selects the provider actor at
 construction. Profile resolution is control-plane composition via
 `params_overlay` (for example, the lead-workflow spawner resolves profiles to
 provider/model/`reasoning_effort` before execute). Arbitrary provider-specific
@@ -341,21 +342,25 @@ of provider-specific reasoning knobs.
 
 ### Structured output boundary
 
-`structured-output` is separate from the prose-producing `llm` factory. Its
-params include a versioned MAG type descriptor produced by
-`(type-schema (type-tag T))`. It adds a JSON-only instruction to the first
-provider round and uses one Rust-owned parse-and-validate operation, so Lua
-never guesses whether a table represented a JSON array or object.
+Every public agent uses the `structured-output` provider boundary. Its params
+include a versioned MAG type descriptor produced by
+`(type-schema (type-tag T))` and `max_corrections`. The bridge converts the
+descriptor to provider-neutral JSON Schema; each provider chooses its own
+realization. The OpenAI-compatible provider uses `response_format`, while the
+ChatGPT provider uses the Responses API's `text.format`. MAG does not branch on
+that choice and still performs the authoritative Rust-owned validation.
 
 Tool calls take the ordinary `generic-tool.ToolCalls` path and consume no
-validation attempts. An invalid final answer becomes a diagnostic user turn.
-A valid answer emits `nefor.structured.Validated` tagged
-`core.validated.Valid`; three invalid final answers emit the same terminal wire
-tagged `core.validated.Invalid` with a structured `OutputError`. Provider
-failures remain suffered actor failures, not validation attempts.
+corrections. An invalid candidate becomes a diagnostic user turn while budget
+remains. A valid candidate emits `nefor.agent.Result` with variant `success`.
+Exhaustion emits the same wire with variant `error` and an
+`OutputValidationError`; a provider terminal failure emits a `ProviderError`.
+Both errors carry mandatory agent-owned `last_output`, retaining an earlier
+completed candidate when a later correction round fails.
 
-The MAG constructor is `nefor.structured.agent`. JSON and retry policy belong
-to this Nefor library/factory composition, never to the MAG compiler.
+The canonical MAG constructor is `nefor.actors.agent`. Its public type is
+`I -> (O | AgentError)`. `max_corrections = 0` means no correction,
+`1` means one correction, and so on.
 
 The descriptor is compiler-derived protected params data. `mag.execute`
 rejects any `params_overlay` that attempts to replace `schema`; accepting such
@@ -368,4 +373,4 @@ normalization, cancellation, draining, and error behavior. A logical turn
 starts at a non-continuation graph activation and spans any tool-result rounds
 and structured correction retries. If the same live actor receives another
 activation after a completed final output, that is a fresh logical turn:
-structured attempts reset and its schema instruction is appended again.
+correction count and `last_output` reset.

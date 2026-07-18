@@ -46,13 +46,15 @@
                   [(nefor.graph.store-port output)])]
        :routes [] :input input :output output}))))
 
-(def outcome (fn [T E] [[id String] [type (TypeTag T)] [error (TypeTag E)]]
-  -> (nefor.graph.Fragment (core.validated.Validated E T) (core.validated.Validated E T))
-  (let [port-type (type-tag (core.validated.Validated E T))
-        input (nefor.graph.port id port-type "nefor.structured.Validated")
+(def outcome (fn [T] [[id String] [type (TypeTag T)]]
+  -> (nefor.graph.Fragment (| T nefor.contracts.AgentError)
+       (| T nefor.contracts.AgentError))
+  (let [port-type (type-tag (| T nefor.contracts.AgentError))
+        input (nefor.graph.port id port-type "nefor.agent.Result")
         output (nefor.graph.port id port-type "nefor.outcome.Result")]
-    (as (nefor.graph.Fragment (core.validated.Validated E T) (core.validated.Validated E T))
-      {:actors [(nefor.graph.actor id (specialize nefor.factory.outcome [T E])
+    (as (nefor.graph.Fragment (| T nefor.contracts.AgentError)
+          (| T nefor.contracts.AgentError))
+      {:actors [(nefor.graph.actor id (specialize nefor.factory.outcome [T])
                   (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
                   [(nefor.graph.store-port output)])]
        :routes [] :input input :output output}))))

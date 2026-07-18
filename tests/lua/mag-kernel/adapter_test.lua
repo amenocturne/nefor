@@ -10,6 +10,9 @@
 
 local Registry = require("registry")
 local adapter  = require("factories.adapter")
+local schema = { version = 1, root = {
+  kind = "named", name = "Task", body = { kind = "string" }
+} }
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -74,7 +77,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = adapter.construct("docs-explorer.entry", { seed = "provider-in" }, emit)
+  local inst = adapter.construct("docs-explorer.entry", { seed = "provider-in", schema = schema }, emit)
   assert_true(inst ~= nil, "adapter constructs")
   local ready = find_kind(msgs, "mag.ready")
   assert_true(ready ~= nil, "adapter emits ready")
@@ -87,7 +90,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = adapter.construct("docs-explorer.entry", { seed = "provider-in" }, emit)
+  local inst = adapter.construct("docs-explorer.entry", { seed = "provider-in", schema = schema }, emit)
 
   local completion = inst.deliver(single("__initial",
     "task", { kind = "task", prompt = "explore the codebase" }))
@@ -98,8 +101,10 @@ do
   assert_eq(out.from, "docs-explorer.entry", "ProviderOut is id-signed")
   assert_eq(#out.messages, 1, "one turn message for the downstream provider")
   assert_eq(out.messages[1].role, "user", "the seed becomes a user-role turn")
-  assert_eq(out.messages[1].content, "explore the codebase",
-    "the task prompt is the turn content")
+  assert_eq(out.messages[1].content.mag_type.root.name, "Task",
+    "the declared semantic identity accompanies the turn")
+  assert_eq(out.messages[1].content.value.prompt, "explore the codebase",
+    "the complete typed task is the turn value")
 end
 
 -- ==================================================================
@@ -108,7 +113,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = adapter.construct("code-writer.entry", { seed = "provider-in" }, emit)
+  local inst = adapter.construct("code-writer.entry", { seed = "provider-in", schema = schema }, emit)
 
   -- final_answer preferred when present.
   inst.deliver(single("docs-explorer.llm", "generic-provider.FinalAnswer",
@@ -117,7 +122,7 @@ do
   assert_true(out ~= nil, "an upstream FinalAnswer lifts into a ProviderOut turn")
   assert_eq(out.from, "code-writer.entry", "ProviderOut is id-signed")
   assert_eq(out.messages[1].role, "user", "the hand-off becomes a user-role turn")
-  assert_eq(out.messages[1].content, "found the bug in foo.rs",
+  assert_eq(out.messages[1].content.value, "found the bug in foo.rs",
     "final_answer is preferred as the turn content")
 end
 
@@ -127,19 +132,19 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = adapter.construct("code-writer.entry", {}, emit)
+  local inst = adapter.construct("code-writer.entry", { schema = schema }, emit)
 
   -- text used when no final_answer.
   inst.deliver(single("up", "generic-provider.FinalAnswer",
     { kind = "generic-provider.FinalAnswer", text = "just the text" }))
   local out1 = msgs[#msgs]
-  assert_eq(out1.messages[1].content, "just the text", "text is used when final_answer is absent")
+  assert_eq(out1.messages[1].content.value, "just the text", "text is used when final_answer is absent")
 
   -- raw result passes through verbatim when neither final_answer nor text.
   inst.deliver(single("up", "generic-provider.FinalAnswer",
     { kind = "generic-provider.FinalAnswer", result = { nested = "structured" } }))
   local out2 = msgs[#msgs]
-  assert_eq(out2.messages[1].content.nested, "structured",
+  assert_eq(out2.messages[1].content.value.nested, "structured",
     "the raw result passes through verbatim for the provider layer to serialize")
 end
 

@@ -855,6 +855,25 @@ end
 -- concern, never part of the answer text.
 local function mag_result_text(result)
   if type(result) ~= "table" then return nil end
+  if result.variant == "success" then
+    if type(result.value) == "string" then return result.value end
+    if type(result.value) == "table" and type(result.value.content) == "string" then
+      return result.value.content
+    end
+  elseif result.variant == "error" and type(result.value) == "table" then
+    local last = result.value.last_output
+    if type(last) == "string" then return last end
+    if type(last) == "table" then
+      if type(last.text) == "string" and #last.text > 0 then return last.text end
+      if type(last.final_answer) == "string" and #last.final_answer > 0 then
+        return last.final_answer
+      end
+    end
+    local reason = result.value.reason
+    if type(reason) == "table" and type(reason.message) == "string" then
+      return reason.message
+    end
+  end
   if type(result.text) == "string" and #result.text > 0 then
     return result.text
   end

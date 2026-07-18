@@ -32,14 +32,15 @@ with `nefor.graph.finish`, and return a compiled artifact.
          :provider "chatgpt"
          :system "Answer the task."
          :tools ["read_file" "mag-eval"]
-         :da-policy nil})
+         :da-policy nil
+         :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))
       initial
-      (nefor.graph.message
-        "worker.entry"
-        (as Data {:kind "task" :prompt "Inspect the repository."}))
+      (nefor.graph.typed-message
+        (get worker "input")
+        (as nefor.contracts.Task {:prompt "Inspect the repository."}))
       program
       (nefor.graph.finish
         worker
@@ -52,6 +53,17 @@ Agent tools contain context I/O plus `mag-eval` for world work; add
 `edit_file` or `write_file` only to write-capable agents. `:model` and
 `:profile` may be `nil` when the runtime supplies them. The runtime inventory
 is the authority for available providers, profiles, tools, and foreign actors.
+
+Every agent has type `I -> (O | nefor.contracts.AgentError)`. The result
+boundary above deliberately accepts either variant. `String` is an ordinary
+choice for `I` or `O`, including the empty string; provider failure still keeps
+the `AgentError` variant. `:max-corrections 0` means initial attempt only, `1`
+allows one correction, and so on.
+
+Connect the whole union to an agent that accepts both variants, or call
+`(nefor.actors.select-result worker "worker-result")` to obtain typed `first`
+(`O`) and `second` (`AgentError`) ports. Every selected branch must be routed,
+handled by a resident rule, or carried to an explicit result boundary.
 
 ## One-off shell work
 

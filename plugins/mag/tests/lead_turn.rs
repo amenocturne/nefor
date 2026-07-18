@@ -289,7 +289,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
         .unwrap();
     let structured = actors
         .iter()
-        .find(|actor| actor.get("id").and_then(Value::as_str) == Some("typed-task.structured"))
+        .find(|actor| actor.get("id").and_then(Value::as_str) == Some("typed-task.llm"))
         .expect("structured actor lowered");
     assert_eq!(
         structured.get("foreign").and_then(Value::as_str),
@@ -301,7 +301,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     );
     assert_eq!(
         structured
-            .pointer("/routes/nefor.structured.Validated/0")
+            .pointer("/routes/nefor.agent.Result/0")
             .and_then(Value::as_str),
         None,
         "terminal validated output is not routed onward"
@@ -317,7 +317,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             "principal": "lead",
             "artifact": artifact.clone(),
             "params_overlay": {
-                "typed-task.structured": {
+                "typed-task.llm": {
                     "schema": {"version": 1, "root": {"kind": "data"}}
                 }
             }
@@ -345,7 +345,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             "principal": "lead",
             "artifact": artifact,
             "params_overlay": {
-                "typed-task.structured": { "provider": MOCK, "model": "mock-model" }
+                "typed-task.llm": { "provider": MOCK, "model": "mock-model" }
             }
         })),
     )
@@ -360,24 +360,17 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
         .and_then(Value::as_str)
         .unwrap()
         .to_owned();
-    let mut saw_schema_instruction = false;
-    loop {
+    let saw_provider_schema = loop {
         let event = next_event(&mut reader, "first typed provider round").await;
         match event.get("kind").and_then(Value::as_str) {
-            Some(kind)
-                if kind == append_kind
-                    && event
-                        .pointer_str("/message/content")
-                        .is_some_and(|text| text.contains("bare JSON")) =>
-            {
-                saw_schema_instruction = true;
+            Some(kind) if kind == complete_kind => {
+                break event.pointer_str("/output_schema/properties/task/type") == Some("string");
             }
-            Some(kind) if kind == complete_kind => break,
             Some("mag.error") => panic!("typed program failed: {event:?}"),
             _ => {}
         }
-    }
-    assert!(saw_schema_instruction);
+    };
+    assert!(saw_provider_schema);
     send_event(
         &mut stdin,
         obj(json!({
@@ -426,13 +419,95 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
         result.get("status").and_then(Value::as_str),
         Some("completed")
     );
-    assert_eq!(
-        result.pointer_str("/result/value/tag"),
-        Some("core.validated.Valid")
+    assert_eq!(result.pointer_str("/result/variant"), Some("success"));
+    assert_eq!(result.pointer_str("/result/value/task"), Some("build"));
+    shutdown(stdin, child).await;
+}
+
+#[tokio::test]
+async fn whole_agent_error_union_can_drive_a_recovery_agent() {
+    const MOCK: &str = "mock-provider";
+    let data_dir = std::env::temp_dir().join(format!("mag-recovery-chain-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    handshake(&mut reader, &mut stdin).await;
+
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": "mag.load",
+            "id": "recovery-chain-load",
+            "source_dir": starter_dir().to_string_lossy(),
+            "module_roots": [starter_dir().join("mag/lib").to_string_lossy()],
+            "entry": "agentic-loop/recovery-chain.mag",
+        })),
+    )
+    .await;
+    let loaded = next_event_of_kind(&mut reader, "mag.loaded").await;
+    let artifact = loaded.get("artifact").cloned().expect("recovery artifact");
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": "mag.execute",
+            "id": "recovery-chain-exec",
+            "run_id": "recovery-chain-run",
+            "session_id": SESSION_ID,
+            "principal": "lead",
+            "artifact": artifact,
+        })),
+    )
+    .await;
+
+    let builder_create = next_event_of_kind(&mut reader, &format!("{MOCK}.chat.create")).await;
+    let builder_id = builder_create["chat_id"].as_str().unwrap().to_owned();
+    next_event_of_kind(&mut reader, &format!("{MOCK}.chat.complete")).await;
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": format!("{MOCK}.chat.complete.result"),
+            "chat_id": builder_id,
+            "output": {"text": "partial builder notes"},
+        })),
+    )
+    .await;
+
+    let reviewer_create = next_event_of_kind(&mut reader, &format!("{MOCK}.chat.create")).await;
+    let reviewer_id = reviewer_create["chat_id"].as_str().unwrap().to_owned();
+    let mut retained_partial = false;
+    loop {
+        let event = next_event(&mut reader, "reviewer request").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some(kind) if kind == format!("{MOCK}.chat.append") => {
+                retained_partial |= event
+                    .pointer_str("/message/content/value/value/last_output/text")
+                    == Some("partial builder notes");
+            }
+            Some(kind) if kind == format!("{MOCK}.chat.complete") => break,
+            Some("mag.error") => panic!("recovery chain failed: {event:?}"),
+            _ => {}
+        }
+    }
+    assert!(
+        retained_partial,
+        "reviewer did not receive builder last_output"
     );
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": format!("{MOCK}.chat.complete.result"),
+            "chat_id": reviewer_id,
+            "output": {"text": "{\"assessment\":\"continue from partial work\"}"},
+        })),
+    )
+    .await;
+    let result = next_event_of_kind(&mut reader, "mag.run_result").await;
+    assert_eq!(result.pointer_str("/result/variant"), Some("success"));
     assert_eq!(
-        result.pointer_str("/result/value/value/task"),
-        Some("build")
+        result.pointer_str("/result/value/assessment"),
+        Some("continue from partial work")
     );
     shutdown(stdin, child).await;
 }
@@ -536,8 +611,8 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     next_event_of_kind(&mut reader, "mock-provider.chat.complete").await;
     let first_id = first["chat_id"].as_str().unwrap().to_owned();
     let second_id = second["chat_id"].as_str().unwrap().to_owned();
-    assert!(first_id.contains("expand.worker.1.structured"));
-    assert!(second_id.contains("expand.worker.0.structured"));
+    assert!(first_id.contains("expand.worker.1.llm"));
+    assert!(second_id.contains("expand.worker.0.llm"));
     // Planner order is one,two; completion order is two,one.
     send_event(
         &mut stdin,
@@ -574,8 +649,8 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         }
     }
     let ordered = ordered_input.expect("typed worker list reached summarizer");
-    assert_eq!(ordered[0]["value"]["task"], "a");
-    assert_eq!(ordered[1]["value"]["task"], "a.collect");
+    assert_eq!(ordered[0]["task"], "a");
+    assert_eq!(ordered[1]["task"], "a.collect");
     send_event(
         &mut stdin,
         obj(json!({"kind":"mock-provider.chat.complete.result",
@@ -584,7 +659,8 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
     assert_eq!(result["status"], "completed", "{result:?}");
-    assert_eq!(result["result"]["value"]["tag"], "core.validated.Valid");
+    assert_eq!(result["result"]["variant"], "success");
+    assert_eq!(result["result"]["value"]["content"], "done");
     shutdown(stdin, child).await;
 }
 
@@ -661,7 +737,8 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
             break event;
         }
     };
-    assert_eq!(result["result"]["value"]["tag"], "core.validated.Valid");
+    assert_eq!(result["result"]["variant"], "success");
+    assert_eq!(result["result"]["value"]["content"], "empty");
     shutdown(stdin, child).await;
 }
 
@@ -698,7 +775,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
     assert!(worker["chat_id"]
         .as_str()
         .unwrap()
-        .contains("expand.worker.0.structured"));
+        .contains("expand.worker.0.llm"));
     complete_chat(
         &mut reader,
         &mut stdin,
@@ -715,7 +792,8 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
-    assert_eq!(result["result"]["value"]["tag"], "core.validated.Valid");
+    assert_eq!(result["result"]["variant"], "success");
+    assert_eq!(result["result"]["value"]["content"], "one done");
     shutdown(stdin, child).await;
 }
 
@@ -763,8 +841,12 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
         }
     };
     assert_eq!(result["status"], "completed", "{result:?}");
-    assert_eq!(result["result"]["value"]["tag"], "core.validated.Invalid");
-    assert_eq!(result["result"]["value"]["errors"][0]["attempts"], 3);
+    assert_eq!(result["result"]["variant"], "error");
+    assert_eq!(result["result"]["value"]["last_output"]["text"], "not json");
+    assert!(result["result"]["value"]["reason"]["violations"].is_array());
+    assert!(result["result"]["value"]["reason"]
+        .get("attempts")
+        .is_none());
     shutdown(stdin, child).await;
 }
 
@@ -871,7 +953,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let append_kind = format!("{PROVIDER}.chat.append");
     let append = next_event_of_kind(&mut reader, &append_kind).await;
     assert_eq!(
-        append.pointer_str("/message/content"),
+        append.pointer_str("/message/content/value/prompt"),
         Some("what is in the repo?"),
     );
     let complete_kind = format!("{PROVIDER}.chat.complete");
@@ -978,7 +1060,10 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     );
     send_event(
         &mut stdin,
-        chat_result(&chat_id2, json!({ "text": "the repo holds nefor" })),
+        chat_result(
+            &chat_id2,
+            json!({ "text": "{\"content\":\"the repo holds nefor\"}" }),
+        ),
     )
     .await;
 
@@ -992,7 +1077,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         Some("exec-turn-1")
     );
     assert_eq!(
-        result.pointer_str("/result/text"),
+        result.pointer_str("/result/value/content"),
         Some("the repo holds nefor"),
         "the sink's final answer rides the terminal reply inline"
     );
@@ -1044,7 +1129,10 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     );
     let a3 = next_event_of_kind(&mut reader, &append_kind).await;
     assert_eq!(a3.pointer_str("/message/role"), Some("user"));
-    assert_eq!(a3.pointer_str("/message/content"), Some("and what else?"));
+    assert_eq!(
+        a3.pointer_str("/message/content/value/prompt"),
+        Some("and what else?")
+    );
 
     shutdown(stdin, child).await;
     std::fs::remove_dir_all(&data_dir).ok();
@@ -1292,7 +1380,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
         &mut stdin,
         chat_result(
             &chat_id2,
-            json!({ "text": "I stopped the read as you asked." }),
+            json!({ "text": "{\"content\":\"I stopped the read as you asked.\"}" }),
         ),
     )
     .await;
@@ -1308,7 +1396,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
         "the surviving run settles its original execute reply"
     );
     assert_eq!(
-        result.pointer_str("/result/text"),
+        result.pointer_str("/result/value/content"),
         Some("I stopped the read as you asked."),
         "the lead's post-interrupt final answer rides the terminal reply"
     );

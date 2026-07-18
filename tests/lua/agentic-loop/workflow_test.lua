@@ -619,6 +619,32 @@ do
   assert(exec2 ~= nil, "a failed turn releases the single-flight slot")
 end
 
+-- Typed agent results decode their semantic success value rather than exposing
+-- the runtime envelope. A routed AgentError prefers its retained provider
+-- output so partial work remains visible to the user and future turns.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("typed success", "r-typed-success")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
+    result = { variant = "success", value = { content = "clean answer" } },
+  })
+  assert(find_call(decode_calls(), "chat.message.append", "assistant", "clean answer") ~= nil,
+    "typed success renders the semantic FinalAnswer content")
+
+  fresh_loop()
+  exec = begin_bound_turn("typed failure", "r-typed-error")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
+    result = { variant = "error", value = {
+      last_output = { text = "partial builder report" },
+      reason = { message = "provider unavailable", detail = { tag = "core.types.None" } },
+    } },
+  })
+  assert(find_call(decode_calls(), "chat.message.append", "assistant", "partial builder report") ~= nil,
+    "typed AgentError preserves and renders the last completed provider output")
+end
+
 -- (interrupt preserves context) an interrupted lead turn settles failed with
 -- an "interrupted by user" error; it records the honest interrupt placeholder
 -- (not the raw error string) so the next turn sees the message was interrupted.

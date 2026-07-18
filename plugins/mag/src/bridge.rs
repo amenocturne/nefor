@@ -194,7 +194,7 @@ impl CapabilityBridge {
         for message in append_messages(&args) {
             out.push(append_envelope(&provider, &chat_id, message));
         }
-        out.push(complete_envelope(&provider, &chat_id));
+        out.push(complete_envelope(&provider, &chat_id, &args));
 
         self.pending.insert(
             chat_id,
@@ -392,13 +392,24 @@ fn append_envelope(provider: &str, chat_id: &str, message: Value) -> Map<String,
     m
 }
 
-fn complete_envelope(provider: &str, chat_id: &str) -> Map<String, Value> {
+fn complete_envelope(
+    provider: &str,
+    chat_id: &str,
+    args: &Map<String, Value>,
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
         Value::String(format!("{provider}.chat.complete")),
     );
     m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
+    if let Some(descriptor) = args.get("output_schema").filter(|value| !value.is_null()) {
+        if let Ok(descriptor) =
+            serde_json::from_value::<nefor_mag::schema::TypeSchema>(descriptor.clone())
+        {
+            m.insert("output_schema".into(), descriptor.to_json_schema());
+        }
+    }
     m
 }
 
@@ -460,6 +471,12 @@ mod tests {
                 "model": "opus",
                 "system": "be helpful",
                 "tools": ["fs/read"],
+                "output_schema": {
+                    "version": 1,
+                    "root": {"kind": "record", "fields": [
+                        {"name": "answer", "schema": {"kind": "string"}}
+                    ]}
+                },
                 "input": { "kind": "generic-provider.ProviderOut",
                            "messages": [ { "role": "user", "content": "hi" } ] }
             }
@@ -497,6 +514,10 @@ mod tests {
             .expect("message");
         assert_eq!(msg.get("role").and_then(Value::as_str), Some("user"));
         assert_eq!(msg.get("content").and_then(Value::as_str), Some("hi"));
+        assert_eq!(
+            out[2]["output_schema"]["properties"]["answer"]["type"],
+            "string"
+        );
 
         // A completion result correlates back to the minted correlation id.
         let result = obj(json!({

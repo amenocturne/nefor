@@ -1729,10 +1729,9 @@ mod tests {
             root.join("main.mag"),
             r#"
               (require "core.validated")
-              (require "nefor.contracts")
               (type Task {:task String})
               (def task-name (fn [[task Task]] -> String (get task "task")))
-              (def expand (fn [[checked (core.validated.Validated nefor.contracts.OutputError Task)]] -> Artifact
+              (def expand (fn [[checked (core.validated.Validated String Task)]] -> Artifact
                 (if (= (get checked "tag") "core.validated.Valid")
                   (artifact "nefor.graph-delta/v1"
                     {:actors []
@@ -1756,7 +1755,7 @@ mod tests {
                    :params {:greeting "expanded"} :routes {}}]
                  :messages [{:to "source" :content {:kind "stub.In"}}]
                  :kills []
-                 :rules [{:id "expand" :on {:actor "source" :type (type-evidence (type-tag (core.validated.Validated nefor.contracts.OutputError Task))) :wire "stub.Out"}
+                 :rules [{:id "expand" :on {:actor "source" :type (type-evidence (type-tag (core.validated.Validated String Task))) :wire "stub.Out"}
                           :fn "expand"}
                          {:id "finish" :on {:actor "middle" :type (type-evidence (type-tag Data)) :wire "stub.Out"}
                           :fn "finish"}]

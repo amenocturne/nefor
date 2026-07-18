@@ -39,10 +39,11 @@ A typed port records two identities:
   composition and lowered to a versioned structural descriptor;
 - `wire`: the runtime tag emitted or accepted by the foreign implementation.
 
-This lets an agent fragment expose a nominal result such as `CodeAudit` while
-its LLM actor still emits `generic-provider.FinalAnswer`. The distinction is
-declared by the library boundary with `(type-tag CodeAudit)`; an undeclared or
-misspelled semantic type fails compilation. The compiler neither knows what an
+This lets an agent fragment expose `(CodeAudit | AgentError)` on the stable
+`nefor.agent.Result` wire. The success type is declared with
+`(type-tag CodeAudit)`; an undeclared or misspelled semantic type fails
+compilation. `nefor.actors.select-result` introduces distinct success/error
+ports when the lead wants separate routes. The compiler neither knows what an
 LLM is nor invents a coercion.
 
 Foreign capabilities are typed values. `nefor.graph.actor` accepts a

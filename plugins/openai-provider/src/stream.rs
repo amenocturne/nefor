@@ -186,6 +186,45 @@ pub async fn run_chat_stream_with_retry_progress<F, R, P>(
     tools: Option<&[serde_json::Value]>,
     reasoning_effort: Option<&str>,
     cancel: CancellationToken,
+    on_delta: F,
+    on_reasoning: R,
+    on_retry_progress: P,
+) -> Result<StreamOutcome, StreamError>
+where
+    F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
+    P: FnMut(RetryProgress),
+{
+    run_chat_stream_with_retry_progress_and_format(
+        client,
+        endpoint,
+        api_key,
+        auth_header,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        None,
+        cancel,
+        on_delta,
+        on_reasoning,
+        on_retry_progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_chat_stream_with_retry_progress_and_format<F, R, P>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    auth_header: &str,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    reasoning_effort: Option<&str>,
+    response_format: Option<&serde_json::Value>,
+    cancel: CancellationToken,
     mut on_delta: F,
     mut on_reasoning: R,
     mut on_retry_progress: P,
@@ -204,6 +243,7 @@ where
             include_usage: true,
         }),
         tools,
+        response_format,
     };
 
     if tracing::enabled!(tracing::Level::INFO) {

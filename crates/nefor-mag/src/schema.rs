@@ -113,6 +113,69 @@ impl TypeSchema {
             violations,
         }
     }
+
+    /// Convert the compiler-owned MAG descriptor into provider-neutral JSON
+    /// Schema. Providers decide whether to use this as a native response
+    /// format, a terminal tool schema, constrained decoding, or a prompt aid.
+    pub fn to_json_schema(&self) -> Value {
+        schema_type_to_json_schema(&self.root)
+    }
+}
+
+fn schema_type_to_json_schema(schema: &SchemaType) -> Value {
+    match schema {
+        SchemaType::Data => serde_json::json!({}),
+        SchemaType::Unit => serde_json::json!({"type": "null"}),
+        SchemaType::Bool => serde_json::json!({"type": "boolean"}),
+        SchemaType::Int => serde_json::json!({"type": "integer"}),
+        SchemaType::Float => serde_json::json!({"type": "number"}),
+        SchemaType::String => serde_json::json!({"type": "string"}),
+        SchemaType::List { item } => serde_json::json!({
+            "type": "array",
+            "items": schema_type_to_json_schema(item),
+        }),
+        SchemaType::Map { value } => serde_json::json!({
+            "type": "object",
+            "additionalProperties": schema_type_to_json_schema(value),
+        }),
+        SchemaType::Record { fields } => {
+            let properties = fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        schema_type_to_json_schema(&field.schema),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let required = fields
+                .iter()
+                .map(|field| Value::String(field.name.clone()))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            })
+        }
+        SchemaType::Union { variants } => serde_json::json!({
+            "anyOf": variants.iter().map(schema_type_to_json_schema).collect::<Vec<_>>(),
+        }),
+        SchemaType::Product { components } => serde_json::json!({
+            "type": "array",
+            "prefixItems": components.iter().map(schema_type_to_json_schema).collect::<Vec<_>>(),
+            "minItems": components.len(),
+            "maxItems": components.len(),
+        }),
+        SchemaType::Named { name, body } => {
+            let mut value = schema_type_to_json_schema(body);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("title".into(), Value::String(name.clone()));
+            }
+            value
+        }
+    }
 }
 
 fn reify_type(
@@ -470,6 +533,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("unresolved type variable T"), "{error}");
+    }
+
+    #[test]
+    fn provider_json_schema_preserves_records_lists_and_nominal_identity() {
+        let schema = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Named {
+                name: "TaskPlan".into(),
+                body: Box::new(SchemaType::Record {
+                    fields: vec![SchemaField {
+                        name: "steps".into(),
+                        schema: SchemaType::List {
+                            item: Box::new(SchemaType::String),
+                        },
+                    }],
+                }),
+            },
+        };
+        let json = schema.to_json_schema();
+        assert_eq!(json["title"], "TaskPlan");
+        assert_eq!(json["properties"]["steps"]["type"], "array");
+        assert_eq!(json["properties"]["steps"]["items"]["type"], "string");
+        assert_eq!(json["required"], serde_json::json!(["steps"]));
+        assert_eq!(json["additionalProperties"], false);
     }
 
     #[test]

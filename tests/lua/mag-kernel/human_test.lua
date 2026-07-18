@@ -246,7 +246,7 @@ do
     if p.id == "rework" then lifted = p.output end
   end
   assert_true(lifted ~= nil, "the rework adapter emitted a routed provider turn")
-  assert_eq(lifted.messages[1].content, "tighten the wording",
+  assert_eq(lifted.messages[1].content.value, "tighten the wording",
     "the rejection reason is the next turn's content")
 
   -- The human approves: the gate exits human.Approved into the sink.

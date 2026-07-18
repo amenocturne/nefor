@@ -88,6 +88,11 @@ function M.construct(id, params, emit, options)
     turn_active = false
     awaiting_continuation = false
   end
+  function state:fail(detail)
+    self:emit({ kind = kinds.failed, failure = kinds.Failed, value = { error = detail } })
+    turn_active = false
+    awaiting_continuation = false
+  end
 
   local function extend_history(input)
     if type(input) == "string" then
@@ -110,6 +115,8 @@ function M.construct(id, params, emit, options)
       system = params.system,
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,
+      output_schema = params.schema,
+      max_corrections = params.max_corrections,
       input = { messages = messages },
     }
   end
@@ -136,8 +143,11 @@ function M.construct(id, params, emit, options)
   end
 
   local function emit_failure(detail)
-    state:emit({ kind = kinds.failed, failure = kinds.Failed, value = { error = detail } })
-    turn_active = false
+    if options.on_error then
+      options.on_error(state, detail)
+    else
+      state:fail(detail)
+    end
   end
 
   local function emit_tool_calls(result)
@@ -185,6 +195,7 @@ function M.construct(id, params, emit, options)
         return nil
       end
       if type(result) == "table" and type(result.tool_calls) == "table" and #result.tool_calls > 0 then
+        if options.on_tool_calls then options.on_tool_calls(state, result) end
         emit_tool_calls(result)
         return nil
       end

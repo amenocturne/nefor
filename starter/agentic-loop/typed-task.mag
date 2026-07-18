@@ -1,24 +1,24 @@
-;; Shipped structured-output example: the terminal value is either a checked
-;; TaskDescription or a typed OutputError after three invalid final answers.
+;; Shipped typed-agent example: the terminal value is either TaskDescription
+;; or AgentError after the configured correction budget is exhausted.
 (require "nefor.actors")
 (require "nefor.artifact")
 (require "nefor.contracts")
 (require "nefor.graph")
-(require "nefor.structured")
 
 (type TaskDescription {:task String
                        :description String
                        :dependent-tasks (List String)})
 
 (let [worker
-      (nefor.structured.agent
+      (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "typed-task"
          :model nil
          :profile nil
          :provider "mock-provider"
          :system "Describe the requested task."
          :tools (as (List String) [])
-         :da-policy nil})
+         :da-policy nil
+         :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag TaskDescription))

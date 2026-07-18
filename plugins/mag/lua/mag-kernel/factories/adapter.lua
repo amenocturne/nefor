@@ -64,6 +64,9 @@ local M = {}
 local FINAL_ANSWER = "generic-provider.FinalAnswer"
 local PROVIDER_OUT = "generic-provider.ProviderOut"
 local REJECTED = "human.Rejected"
+local AGENT_RESULT = "nefor.agent.Result"
+local AGENT_OUTPUT = "nefor.agent.Output"
+local AGENT_ERROR = "nefor.agent.Error"
 
 M.declaration = {
   name = "adapter",
@@ -76,6 +79,9 @@ M.declaration = {
       {wire=FINAL_ANSWER,type={kind="variable",name="T"}},
       {wire=REJECTED,type={kind="variable",name="T"}},
       {wire=PROVIDER_OUT,type={kind="variable",name="T"}},
+      {wire=AGENT_RESULT,type={kind="variable",name="T"}},
+      {wire=AGENT_OUTPUT,type={kind="variable",name="T"}},
+      {wire=AGENT_ERROR,type={kind="variable",name="T"}},
     },
     outputs = {{ wire = "generic-provider.ProviderOut", type = {
       kind="named", name="nefor.contracts.ProviderInput", arguments={}
@@ -84,13 +90,15 @@ M.declaration = {
 
   params = {
     seed = "string?", -- boundary-shape label (the loader authors "provider-in")
+    schema = "table",
   },
 
   -- Union input (shape.lua): the initial task seed, an upstream FinalAnswer,
   -- or a human gate's rejection re-entering the provider loop (the gate
   -- template's revise leg). Firing "on any".
   inputs = {
-    boundary = { "task", FINAL_ANSWER, REJECTED, PROVIDER_OUT },
+    boundary = { "task", FINAL_ANSWER, REJECTED, PROVIDER_OUT,
+      AGENT_RESULT, AGENT_OUTPUT, AGENT_ERROR },
   },
 
   outputs = {
@@ -104,7 +112,7 @@ M.declaration = {
 -- declared tag (a type fact), extract the turn content per input, wrap it as a
 -- single user-role message. Pure: strings pass through, structured values pass
 -- through verbatim for the provider layer to serialize.
-local function to_provider_out(tag, message)
+local function to_provider_out(tag, message, schema)
   message = message or {}
   local content
   if tag == FINAL_ANSWER then
@@ -115,14 +123,26 @@ local function to_provider_out(tag, message)
     content = message.reason
   elseif tag == PROVIDER_OUT then
     return message
+  elseif tag == AGENT_RESULT then
+    content = { variant = message.variant, value = message.value }
   else
-    -- the initial task seed ({ kind = "task", prompt = ... })
+    -- Canonical typed messages carry `value`; retain the historical task seed
+    -- shape only as an external-boundary fallback.
     local value = message.value
-    content = message.prompt or (type(value) == "table" and value.prompt) or value
+    if value ~= nil then
+      content = value
+    elseif message.prompt ~= nil then
+      content = { prompt = message.prompt }
+    else
+      content = message
+    end
   end
   return {
     kind = "generic-provider.ProviderOut",
-    messages = { { role = "user", content = content } },
+    messages = { { role = "user", content = {
+      mag_type = schema,
+      value = content,
+    } } },
   }
 end
 
@@ -144,7 +164,7 @@ function M.construct(id, params, emit, deps)
   function instance.deliver(activation)
     activation = activation or {}
     local one = (activation.messages or {})[1] or {}
-    emit(sign(to_provider_out(one.tag, one.message)))
+    emit(sign(to_provider_out(one.tag, one.message, params.schema)))
     return { status = "ok" }
   end
 

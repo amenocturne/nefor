@@ -3,8 +3,7 @@
 -- bounded correction policy.
 local boundary = require("factories.provider-boundary")
 local M = {}
-local MAX_ATTEMPTS = 3
-local VALIDATED = "nefor.structured.Validated"
+local RESULT = "nefor.agent.Result"
 
 M.declaration = {
   name = "structured-output",
@@ -13,27 +12,28 @@ M.declaration = {
     input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
     output={kind="union",items={
       {kind="named",name="nefor.contracts.ToolCalls",arguments={}},
-      {kind="named",name="core.validated.Validated",arguments={
-        {kind="named",name="nefor.contracts.OutputError",arguments={}},
+      {kind="union",items={
         {kind="variable",name="T"},
+        {kind="named",name="nefor.contracts.AgentError",arguments={}},
       }},
     }},
     inputs = {{ wire="generic-provider.ProviderOut", type={kind="named",
       name="nefor.contracts.ProviderInput",arguments={}} }},
     outputs = {
       {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}},
-      {wire=VALIDATED,type={kind="named",name="core.validated.Validated",arguments={
-        {kind="named",name="nefor.contracts.OutputError",arguments={}},
+      {wire=RESULT,type={kind="union",items={
         {kind="variable",name="T"},
+        {kind="named",name="nefor.contracts.AgentError",arguments={}},
       }}},
     },
   },
   params = {
     model = "table?", profile = "table?", provider = "string",
     system = "string?", tools = "table?", history = "table?", schema = "table",
+    max_corrections = "number",
   },
   inputs = { provider_out = "generic-provider.ProviderOut" },
-  outputs = { "generic-tool.ToolCalls", VALIDATED },
+  outputs = { "generic-tool.ToolCalls", RESULT },
   signals = { "kill", "drain" },
 }
 
@@ -53,20 +53,30 @@ local function correction(validation)
     .. "Return a corrected bare JSON value only. Diagnostics: " .. detail
 end
 
-local function output_error(validation, attempts, kind, message)
+local function output_violations(validation, message)
   local violations = validation.violations
   if type(violations) ~= "table" or next(violations) == nil then
     violations = {{ path = "$", code = "invalid_json", expected = "typed JSON",
       actual = "invalid", message = message or
         (type(validation.error) == "table" and validation.error.message) or "invalid JSON" }}
   end
-  return {
-    kind = kind or (type(validation.error) == "table" and validation.error.kind) or "schema_violation",
-    message = message or (type(validation.error) == "table" and validation.error.message)
-      or "JSON did not conform to the required MAG type",
-    attempts = attempts,
-    violations = violations,
-  }
+  return violations
+end
+
+local function option(value)
+  if type(value) == "string" then
+    return { tag = "core.types.Some", value = value }
+  end
+  return { tag = "core.types.None" }
+end
+
+local function provider_error(detail)
+  if type(detail) == "table" then
+    local message = detail.message
+    if type(message) ~= "string" or message == "" then message = tostring(detail) end
+    return { message = message, detail = option(detail.detail) }
+  end
+  return { message = tostring(detail), detail = option(nil) }
 end
 
 function M.construct(id, params, emit)
@@ -77,18 +87,31 @@ function M.construct(id, params, emit)
   if type(nefor.typed_json) ~= "table" or type(nefor.typed_json.validate) ~= "function" then
     return nil, "structured-output requires nefor.typed_json.validate"
   end
-  local attempts = 0
+  if type(params.max_corrections) ~= "number" or params.max_corrections < 0
+      or params.max_corrections % 1 ~= 0 then
+    return nil, string.format("structured-output '%s': params.max_corrections must be a non-negative integer", tostring(id))
+  end
+  local corrections = 0
+  local last_output = nefor.json.decode("null")
+  local function finish_result(state, variant, value)
+    local message = { kind=RESULT, variant=variant, value=value }
+    local delta = state:transcript_delta()
+    if #delta > 0 then message.transcript_delta = delta end
+    state:finish(message)
+  end
+  local function finish_error(state, reason)
+    finish_result(state, "error", {
+      last_output=last_output, reason=reason,
+    })
+  end
   return boundary.construct(id, params, emit, {
     name = "structured-output",
-    on_turn_start = function(state)
-      attempts = 0
-      state:append({
-        role = "user",
-        content = "Return exactly one bare JSON value and no markdown or commentary. "
-          .. "It must conform to this versioned MAG type descriptor: " .. json_encode(params.schema),
-      })
+    on_turn_start = function(_)
+      corrections = 0
+      last_output = nefor.json.decode("null")
     end,
     on_final = function(state, result)
+      last_output = result
       local text = boundary.answer_text(result)
       local validation
       if text == nil then
@@ -100,30 +123,26 @@ function M.construct(id, params, emit)
         state:append({ role = "assistant", content = text })
       end
       if validation.ok then
-        state:finish({
-          kind = VALIDATED,
-          value = { tag = "core.validated.Valid", value = validation.value },
-        })
-        return
-      end
-      attempts = attempts + 1
-      if attempts >= MAX_ATTEMPTS then
-        state:finish({ kind = VALIDATED, value = {
-          tag = "core.validated.Invalid",
-          errors = { output_error(validation, attempts) },
-        } })
+        finish_result(state, "success", validation.value)
         return
       end
       if state:is_draining() then
-        state:finish({ kind = VALIDATED, value = {
-          tag = "core.validated.Invalid",
-          errors = { output_error(validation, attempts, "drained",
-            "structured output was draining and could not start a correction round") },
-        } })
+        state:fail("structured output was draining and could not start a correction round")
         return
       end
+      if corrections >= params.max_corrections then
+        finish_error(state, { violations=output_violations(validation) })
+        return
+      end
+      corrections = corrections + 1
       state:append({ role = "user", content = correction(validation) })
       state:retry()
+    end,
+    on_tool_calls = function(_, result)
+      last_output = result
+    end,
+    on_error = function(state, detail)
+      finish_error(state, provider_error(detail))
     end,
   })
 end

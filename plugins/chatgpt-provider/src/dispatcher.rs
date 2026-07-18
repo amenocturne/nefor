@@ -30,7 +30,7 @@ use crate::catalog::ToolCatalog;
 use crate::config::ServeArgs;
 use crate::error::ChatgptError;
 use crate::responses::request::{
-    Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest,
+    Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest, TextControls,
 };
 use crate::responses::stream::ResponseEvent;
 use crate::responses::{CompactRequest, ModelEntry, ResponsesClient, UsageSnapshot};
@@ -1562,7 +1562,8 @@ async fn handle_chat_complete(
             return Ok(());
         }
     };
-    spawn_turn(ctx.clone(), chat_id, cancel);
+    let output_schema = body.get("output_schema").cloned();
+    spawn_turn(ctx.clone(), chat_id, cancel, output_schema);
     Ok(())
 }
 
@@ -2010,7 +2011,12 @@ fn should_retry_pre_output_stream_error(
         && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
 }
 
-fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
+fn spawn_turn(
+    ctx: DispatcherContext,
+    chat_id: ChatId,
+    cancel: TurnToken,
+    output_schema: Option<Value>,
+) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let started = std::time::Instant::now();
@@ -2139,6 +2145,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                 .await
                 .unwrap_or(true);
 
+            let text = structured_text_controls(output_schema.as_ref());
             let req = ResponsesApiRequest {
                 model: snapshot.model.clone(),
                 instructions: translated.instructions,
@@ -2152,7 +2159,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                 include,
                 service_tier: None,
                 prompt_cache_key: None,
-                text: None,
+                text,
             };
 
             // Snapshot auth before sending so we can fail fast on
@@ -2341,13 +2348,15 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                             Some(Ok(event)) => match event {
                                 ResponseEvent::OutputTextDelta { delta, .. } => {
                                     output_text.push_str(&delta);
-                                    let body = stream_delta_body(
-                                        &ctx.args.event_prefix(),
-                                        &turn_id,
-                                        &chat_id,
-                                        &delta,
-                                    );
-                                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                    if output_schema.is_none() {
+                                        let body = stream_delta_body(
+                                            &ctx.args.event_prefix(),
+                                            &turn_id,
+                                            &chat_id,
+                                            &delta,
+                                        );
+                                        let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                    }
                                 }
                                 ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
                                     if reasoning_started_at.is_none() {
@@ -2637,11 +2646,16 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
             )
             .await;
 
+        let visible_final_text = if output_schema.is_some() {
+            ""
+        } else {
+            &final_text
+        };
         let body = stream_end_body(
             &ctx.args,
             &turn_id,
             &chat_id,
-            &final_text,
+            visible_final_text,
             &active_model,
             elapsed_ms,
             final_finish_reason.as_deref(),
@@ -2680,6 +2694,18 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
     });
 }
 
+fn structured_text_controls(output_schema: Option<&Value>) -> Option<TextControls> {
+    output_schema.map(|schema| TextControls {
+        verbosity: None,
+        format: Some(serde_json::json!({
+            "type": "json_schema",
+            "name": "mag_output",
+            "strict": true,
+            "schema": schema,
+        })),
+    })
+}
+
 fn snippet(s: &str) -> String {
     if s.len() <= 200 {
         s.to_owned()
@@ -2708,6 +2734,18 @@ mod tests {
             provider_name: "chatgpt".into(),
             base_url: "https://example.invalid".into(),
         }
+    }
+
+    #[test]
+    fn mag_output_schema_uses_responses_native_text_format() {
+        let schema = serde_json::json!({"type": "object"});
+        let controls = structured_text_controls(Some(&schema)).unwrap();
+        let format = controls.format.unwrap();
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "mag_output");
+        assert_eq!(format["strict"], true);
+        assert_eq!(format["schema"]["type"], "object");
+        assert!(structured_text_controls(None).is_none());
     }
 
     #[test]

@@ -8,7 +8,8 @@
    :provider "mock-plugin"
    :system ""
    :tools []
-   :da-policy nil})
+   :da-policy nil
+   :max-corrections 0})
   (type-tag nefor.contracts.Task)
   "task"
   (type-tag MissingSemanticType))

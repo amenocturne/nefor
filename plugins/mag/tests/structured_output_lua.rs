@@ -19,6 +19,16 @@ fn harness() -> Lua {
         .unwrap(),
     )
     .unwrap();
+    json.set(
+        "decode",
+        lua.create_function(|lua, source: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&source).map_err(mlua::Error::external)?;
+            lua.to_value(&value)
+        })
+        .unwrap(),
+    )
+    .unwrap();
     nefor.set("json", json).unwrap();
 
     let typed = lua.create_table().unwrap();
@@ -68,7 +78,8 @@ fn structured_output_retries_and_preserves_tool_rounds() {
           }}
         }
         local actor, err = factory.construct("typed", {
-          provider = "mock-provider", schema = schema, tools = { "read_file" }
+          provider = "mock-provider", schema = schema, tools = { "read_file" },
+          max_corrections = 2
         }, emit)
         assert(actor, err)
 
@@ -77,7 +88,8 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }}}})
         assert(emitted[#emitted].kind == "capability.invoke")
         local first_request = emitted[#emitted].request
-        assert(first_request.input.messages[#first_request.input.messages].content:find("bare JSON"))
+        assert(first_request.output_schema.version == 1)
+        assert(first_request.max_corrections == 2)
 
         actor.deliver({ kind = "reply", result = { tool_calls = {{
           id = "call-1", name = "read_file", args = { path = "x" }
@@ -99,9 +111,9 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         assert(messages[#messages].content:find("%$%.task"))
 
         actor.deliver({ kind = "reply", result = { text = [[{"task":"build"}]] } })
-        assert(emitted[#emitted - 1].kind == "nefor.structured.Validated")
-        assert(emitted[#emitted - 1].value.tag == "core.validated.Valid")
-        assert(emitted[#emitted - 1].value.value.task == "build")
+        assert(emitted[#emitted - 1].kind == "nefor.agent.Result")
+        assert(emitted[#emitted - 1].variant == "success")
+        assert(emitted[#emitted - 1].value.task == "build")
       "#,
     )
     .exec()
@@ -109,7 +121,7 @@ fn structured_output_retries_and_preserves_tool_rounds() {
 }
 
 #[test]
-fn three_invalid_final_answers_emit_typed_terminal_error() {
+fn exhausted_corrections_emit_agent_error_without_attempt_count() {
     let lua = harness();
     lua.load(
         r#"
@@ -117,7 +129,8 @@ fn three_invalid_final_answers_emit_typed_terminal_error() {
         local emitted = {}
         local actor = assert(factory.construct("typed", {
           provider = "mock-provider",
-          schema = { version = 1, root = { kind = "string" } }
+          schema = { version = 1, root = { kind = "string" } },
+          max_corrections = 2
         }, function(message) emitted[#emitted + 1] = message end))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
@@ -126,10 +139,96 @@ fn three_invalid_final_answers_emit_typed_terminal_error() {
         actor.deliver({ kind = "reply", result = { text = "false" } })
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
-        assert(terminal.kind == "nefor.structured.Validated")
-        assert(terminal.value.tag == "core.validated.Invalid")
-        assert(terminal.value.errors[1].attempts == 3)
-        assert(terminal.value.errors[1].kind == "schema_violation")
+        assert(terminal.kind == "nefor.agent.Result")
+        assert(terminal.variant == "error")
+        assert(terminal.value.reason.violations[1].path == "$")
+        assert(terminal.value.reason.attempts == nil)
+        assert(terminal.value.last_output.text == "null")
+      "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn zero_corrections_rejects_the_initial_invalid_candidate() {
+    let lua = harness();
+    lua.load(
+        r#"
+        local factory = require("factories.structured-output")
+        local emitted = {}
+        local actor = assert(factory.construct("no-retry", {
+          provider = "mock-provider",
+          schema = { version = 1, root = { kind = "string" } },
+          max_corrections = 0
+        }, function(message) emitted[#emitted + 1] = message end))
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+          messages = {{ role = "user", content = "answer" }}
+        }}}})
+        actor.deliver({ kind = "reply", result = { text = "1", raw = "candidate" } })
+        local terminal = emitted[#emitted - 1]
+        assert(terminal.kind == "nefor.agent.Result")
+        assert(terminal.variant == "error")
+        assert(terminal.value.last_output.raw == "candidate")
+        assert(terminal.value.reason.violations[1].code == "wrong_type")
+        for _, message in ipairs(emitted) do
+          assert(not (message.kind == "capability.invoke" and message.ref == "no-retry@r2"))
+        end
+      "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn result_selector_preserves_values_and_rejects_unknown_variants() {
+    let lua = harness();
+    lua.load(
+        r#"
+        local factory = require("factories.select-agent-result")
+        local emitted = {}
+        local actor = assert(factory.construct("select", {},
+          function(message) emitted[#emitted + 1] = message end))
+        local success = actor.deliver({ messages = {{ message = {
+          variant = "success", value = { answer = 42 }
+        }}}})
+        assert(success.status == "ok")
+        assert(emitted[#emitted].kind == "nefor.agent.Output")
+        assert(emitted[#emitted].value.answer == 42)
+        local failure = actor.deliver({ messages = {{ message = {
+          variant = "error", value = { last_output = "draft" }
+        }}}})
+        assert(failure.status == "ok")
+        assert(emitted[#emitted].kind == "nefor.agent.Error")
+        assert(emitted[#emitted].value.last_output == "draft")
+        local malformed = actor.deliver({ messages = {{ message = { value = 1 } }}})
+        assert(malformed.status == "failed")
+      "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn ordinary_string_output_accepts_the_empty_string() {
+    let lua = harness();
+    lua.load(
+        r#"
+        local factory = require("factories.structured-output")
+        local emitted = {}
+        local actor = assert(factory.construct("empty-string", {
+          provider = "mock-provider",
+          schema = { version = 1, root = { kind = "string" } },
+          max_corrections = 0
+        }, function(message) emitted[#emitted + 1] = message end))
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+          messages = {{ role = "user", content = "answer" }}
+        }}}})
+        actor.deliver({ kind = "reply", result = { text = [[""]] } })
+        local terminal = emitted[#emitted - 1]
+        assert(terminal.kind == "nefor.agent.Result")
+        assert(terminal.variant == "success")
+        assert(terminal.value == "")
       "#,
     )
     .exec()
@@ -146,7 +245,8 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
           local emitted = {}
           local actor = assert(factory.construct(id, {
             provider = "mock-provider",
-            schema = { version = 1, root = { kind = "string" } }
+            schema = { version = 1, root = { kind = "string" } },
+            max_corrections = 1
           }, function(message) emitted[#emitted + 1] = message end))
           actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
             messages = {{ role = "user", content = "answer" }}
@@ -156,23 +256,35 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
 
         local correlation, correlation_out = new_actor("correlation")
         correlation.deliver({ kind = "reply", error = "provider unavailable" })
-        assert(correlation_out[#correlation_out].kind == "mag.failed")
-        assert(correlation_out[#correlation_out].value.error == "provider unavailable")
+        local correlation_error = correlation_out[#correlation_out - 1]
+        assert(correlation_error.kind == "nefor.agent.Result")
+        assert(correlation_error.variant == "error")
+        assert(correlation_error.value.reason.message == "provider unavailable")
+        assert(correlation_error.value.reason.detail.tag == "core.types.None")
+        assert(nefor.json.encode(correlation_error.value.last_output) == "null")
+
+        local detailed, detailed_out = new_actor("detailed")
+        detailed.deliver({ kind = "reply", error = {
+          message = "provider message", detail = "provider-owned detail"
+        }})
+        local detailed_error = detailed_out[#detailed_out - 1].value.reason
+        assert(detailed_error.message == "provider message")
+        assert(detailed_error.detail.tag == "core.types.Some")
+        assert(detailed_error.detail.value == "provider-owned detail")
 
         local in_band, in_band_out = new_actor("in-band")
         in_band.deliver({ kind = "reply", result = {
           finish_reason = "error", error = "upstream refused"
         }})
-        assert(in_band_out[#in_band_out].kind == "mag.failed")
-        assert(in_band_out[#in_band_out].value.error == "upstream refused")
+        assert(in_band_out[#in_band_out - 1].value.reason.message == "upstream refused")
 
         for _, bad_detail in ipairs({ "", false, { nested = "not a message" } }) do
           local malformed, malformed_out = new_actor("malformed-detail")
           malformed.deliver({ kind = "reply", result = {
             finish_reason = "error", error = bad_detail
           }})
-          assert(malformed_out[#malformed_out].kind == "mag.failed")
-          assert(malformed_out[#malformed_out].value.error
+          assert(malformed_out[#malformed_out - 1].kind == "nefor.agent.Result")
+          assert(malformed_out[#malformed_out - 1].value.reason.message
             == 'provider returned finish_reason "error" with no detail')
         end
 
@@ -182,15 +294,29 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         killed.handle_kill()
         assert(killed_out[#killed_out].kind == "mock-provider.chat.cancel")
 
+        local retained, retained_out = new_actor("retained")
+        retained.deliver({ kind = "reply", result = { text = "1", marker = "first" } })
+        retained.deliver({ kind = "reply", error = "correction transport failed" })
+        local retained_error = retained_out[#retained_out - 1]
+        assert(retained_error.value.reason.message == "correction transport failed")
+        assert(retained_error.value.last_output.marker == "first")
+
+        local after_tool, after_tool_out = new_actor("after-tool")
+        after_tool.deliver({ kind = "reply", result = { marker = "tool-round", tool_calls = {{
+          id = "call-1", name = "read_file", args = { path = "x" }
+        }} }})
+        after_tool.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+          messages = {{ role = "tool", content = "done", tool_call_id = "call-1" }}
+        }}}})
+        after_tool.deliver({ kind = "reply", error = "post-tool provider failure" })
+        local tool_error = after_tool_out[#after_tool_out - 1]
+        assert(tool_error.value.last_output.marker == "tool-round")
+
         local drained, drained_out = new_actor("drained")
         drained.deliver({ kind = "reply", result = { text = "1" } })
         drained.handle_drain()
         drained.deliver({ kind = "reply", result = { text = "false" } })
-        local terminal = drained_out[#drained_out - 1]
-        assert(terminal.kind == "nefor.structured.Validated")
-        assert(terminal.value.tag == "core.validated.Invalid")
-        assert(terminal.value.errors[1].kind == "drained")
-        assert(terminal.value.errors[1].attempts == 2)
+        assert(drained_out[#drained_out].kind == "mag.failed")
       "#,
     )
     .exec()
@@ -206,7 +332,8 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         local emitted = {}
         local actor = assert(factory.construct("repeat", {
           provider = "mock-provider",
-          schema = { version = 1, root = { kind = "string" } }
+          schema = { version = 1, root = { kind = "string" } },
+          max_corrections = 2
         }, function(message) emitted[#emitted + 1] = message end))
         local function activate(content)
           actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
@@ -216,7 +343,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
 
         activate("first")
         actor.deliver({ kind = "reply", result = { text = [["ok"]] } })
-        assert(emitted[#emitted - 1].value.tag == "core.validated.Valid")
+        assert(emitted[#emitted - 1].variant == "success")
 
         activate("second")
         actor.deliver({ kind = "reply", result = { text = "1" } })
@@ -227,8 +354,8 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         actor.deliver({ kind = "reply", result = { text = "false" } })
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
-        assert(terminal.value.tag == "core.validated.Invalid")
-        assert(terminal.value.errors[1].attempts == 3)
+        assert(terminal.variant == "error")
+        assert(terminal.value.reason.violations ~= nil)
       "#,
     )
     .exec()

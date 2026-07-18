@@ -2,13 +2,13 @@
 
 ## Planner → workers → collector → static result
 
-A resident rule can bind exactly to `Validated<OutputError,List<Task>>`.
-`Valid` uses `indexed-map` to pair the actual task list with deterministic
+A typed result selector exposes the planner's `List<Task>` and `AgentError`
+ports to separate resident rules. The success rule uses `indexed-map` to pair the actual task list with deterministic
 positions, maps those values into real structured-agent fragments, then
 returns one atomic delta containing those workers, typed task messages,
 worker-to-collector routes, and the collector route to a summarizer already in
-the initial graph. `Invalid` normalizes to the same typed outcome wire and
-spawns nothing. For `[]`, `nefor.dynamic.empty-to` targets the summarizer's
+the initial graph. The error rule routes the complete `AgentError` to the
+static outcome and spawns nothing. For `[]`, `nefor.dynamic.empty-to` targets the summarizer's
 typed `Port<List<T>>`; a zero-input collector would never fire. The shipped
 program is `starter/agentic-loop/dynamic-tasks.mag` and its real provider E2Es
 cover zero, invalid, and reverse worker completion.
@@ -55,7 +55,7 @@ Firing is the contract; the kernel assembles the activation.
 ## Cycle (the agentic loop)
 
 Cycles are legal as-is and unbounded. Every cycle exits through a typed
-variant — the llm's union output routes `FinalAnswer` out of the loop — so
+variant — the agent's result union routes `O | AgentError` out of the loop — so
 the typed exit is the terminator. There is no loop-budget mechanism: a run
 that never reaches its exit is stopped via the control plane's
 kill/interrupt. Never encode "give up after N tries" in a prompt.
