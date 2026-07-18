@@ -20,6 +20,7 @@ local Entry        = require("libs.chat.entry")
 local log          = require("libs.chat.log")
 local tool_display = require("libs.chat.tool_display")
 local height_cache = require("libs.chat.height_cache")
+local workflow_controls = require("libs.chat.workflow_controls")
 local mag_run_bindings = require("libs.mag-run-bindings")
 
 local shallow_merge = common.shallow_merge
@@ -28,8 +29,6 @@ local format_args   = common.format_args
 
 local M = {}
 local run_bindings = mag_run_bindings.new()
-
-local DOUBLE_ESC_MS = 600
 
 local function active_config()
   local ok, cfg = pcall(function() return require("config").active end)
@@ -574,6 +573,7 @@ local function handle_input_submit(msg, state)
     prompt_history = hist,
     history_cursor = NIL_SENTINEL,
     pending_user_echo = wire_text,
+    pending_user_echo_idx = #with_user.entries,
   })
   tui.scroll_into_view("transcript")
   return cleared, {
@@ -672,56 +672,52 @@ local function handle_help_key(_msg, state)
   return state, {}
 end
 
-local function join_with_space(left, right)
-  if type(left) ~= "string" or left == "" then return right or "" end
-  if type(right) ~= "string" or right == "" then return left end
-  return left .. " " .. right
-end
-
-local function restore_queued_to_prompt(state)
-  local idx = state.queued_entry_idx
-  if type(idx) ~= "number" then return state end
-  local queued = state.entries and state.entries[idx]
-  local text = queued and queued.text or ""
-  local entries = {}
-  for i, entry in ipairs(state.entries or {}) do
-    if i ~= idx then entries[#entries + 1] = entry end
+local function apply_control_decisions(state, decisions, metadata)
+  local effects = {}
+  if metadata and metadata.restored_queue then height_cache.invalidate_all() end
+  for _, decision in ipairs(decisions) do
+    if decision.kind == "schedule_escape_timeout" then
+      effects[#effects + 1] = {
+        kind = "dispatch_after", delay_ms = decision.delay_ms,
+        body = { kind = "chat.escape_timeout", token = decision.token },
+      }
+    elseif decision.kind == "steer_queued" then
+      effects[#effects + 1] = {
+        kind = "send_to", target = "engine", body = { kind = "chat.steer" },
+      }
+    elseif decision.kind == "hard_stop_lead" then
+      effects[#effects + 1] = {
+        kind = "send_to", target = "engine",
+        body = { kind = "chat.interrupt", drop_queued = true },
+      }
+    elseif decision.kind == "terminate_all_non_lead_workflows" then
+      effects[#effects + 1] = {
+        kind = "send_to", target = "engine",
+        body = { kind = "chat.workflows.terminate_requested", scope = "all" },
+      }
+      effects[#effects + 1] = {
+        kind = "send_to", target = "mag", body = { kind = "mag.kill_all_runs" },
+      }
+    elseif decision.kind == "terminate_workflow" then
+      effects[#effects + 1] = {
+        kind = "send_to", target = "engine",
+        body = {
+          kind = "chat.workflows.terminate_requested",
+          scope = "one",
+          run_id = decision.run_id,
+        },
+      }
+      effects[#effects + 1] = {
+        kind = "send_to", target = "mag",
+        body = { kind = "mag.kill_run", run_id = decision.run_id },
+      }
+    end
   end
-  local in_flight = state.in_flight
-  if type(in_flight) == "number" and in_flight > idx then in_flight = in_flight - 1 end
-  height_cache.invalidate_all()
-  return shallow_merge(state, {
-    entries = entries,
-    in_flight = in_flight,
-    queued_entry_idx = NIL_SENTINEL,
-    pending_user_echo = NIL_SENTINEL,
-    input_value = join_with_space(text, state.input_value),
-  })
-end
-
-local function hard_stop_lead(state)
-  state = restore_queued_to_prompt(state)
-  return shallow_merge(state, {
-    escape_token = NIL_SENTINEL,
-    last_esc_ms = NIL_SENTINEL,
-  }), {
-    { kind = "send_to", target = "engine",
-      body = { kind = "chat.interrupt", drop_queued = true } },
-  }
+  return state, effects
 end
 
 local function handle_escape_timeout(msg, state)
-  if msg.token ~= state.escape_token then return state, {} end
-  local cleared = shallow_merge(state, {
-    escape_token = NIL_SENTINEL,
-    last_esc_ms = NIL_SENTINEL,
-  })
-  if state.queued_entry_idx and (state.pending or state.in_flight ~= nil) then
-    return cleared, {
-      { kind = "send_to", target = "engine", body = { kind = "chat.steer" } },
-    }
-  end
-  return cleared, {}
+  return apply_control_decisions(workflow_controls.escape_timeout(state, msg.token))
 end
 
 local function handle_escape(_msg, state)
@@ -763,22 +759,8 @@ local function handle_escape(_msg, state)
       history_cursor = NIL_SENTINEL,
     }), {}
   end
-  -- 4) Resolve the gesture only after the double-Esc window. The first
-  -- press schedules a tokened local callback and performs no lead action.
-  local now = tui.now_ms()
-  if state.escape_token and state.last_esc_ms
-      and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
-    return hard_stop_lead(state)
-  end
-  local token = (state.escape_token_seq or 0) + 1
-  return shallow_merge(state, {
-    last_esc_ms = now,
-    escape_token = token,
-    escape_token_seq = token,
-  }), {
-    { kind = "dispatch_after", delay_ms = DOUBLE_ESC_MS,
-      body = { kind = "chat.escape_timeout", token = token } },
-  }
+  -- 4) The reusable control machine resolves the tokenized Esc gesture.
+  return apply_control_decisions(workflow_controls.escape(state, tui.now_ms()))
 end
 
 -- ── session lifecycle ─────────────────────────────────────────────────
@@ -880,22 +862,22 @@ local function handle_message_append(msg, state)
   -- actor's capture buffer. Sits before every transcript decision so
   -- the transcript's own routing stays byte-identical.
   state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
-  -- Round-trip echo dedup.
+  -- Round-trip echo ownership is indexed: unrelated graph output may append
+  -- after the optimistic user entry before its durable projection arrives.
   if role == "user"
      and state.pending_user_echo ~= nil
      and state.pending_user_echo == text then
     local entries = state.entries or {}
-    local tail = entries[#entries]
-    local local_push_landed = tail
-      and tail.role == "user"
-      and tail.text == text
-    if local_push_landed then
-      return shallow_merge(state, { pending_user_echo = NIL_SENTINEL }), {}
+    local idx = state.pending_user_echo_idx
+    local owned = type(idx) == "number" and entries[idx] or nil
+    local cleared = shallow_merge(state, {
+      pending_user_echo = NIL_SENTINEL,
+      pending_user_echo_idx = NIL_SENTINEL,
+    })
+    if owned and owned.role == "user" and owned.text == text then
+      return cleared, {}
     end
-    return transcript.push_entry(
-      shallow_merge(state, { pending_user_echo = NIL_SENTINEL }),
-      Entry.user(text)
-    ), {}
+    return transcript.push_entry(cleared, Entry.user(text)), {}
   end
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
@@ -988,13 +970,6 @@ local function handle_stream_end(msg, state)
   state = agent_streams.record(state, msg.chat_id, "stream_end", nil, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
-  if state.queued_entry_idx then
-    local qe = next_state.entries[state.queued_entry_idx]
-    next_state = shallow_merge(next_state, {
-      queued_entry_idx = NIL_SENTINEL,
-      pending_user_echo = qe and qe.text or NIL_SENTINEL,
-    })
-  end
   return next_state, {}
 end
 
@@ -1449,11 +1424,21 @@ local function handle_mag_run_started(msg, state)
 end
 
 local function handle_queue_steered(_msg, state)
-  if not state.queued_entry_idx then return state, {} end
-  local queued = (state.entries or {})[state.queued_entry_idx]
+  local idx = state.queued_entry_idx
+  if type(idx) ~= "number" then return state, {} end
+  local entries = {}
+  for i, entry in ipairs(state.entries or {}) do
+    if i ~= idx then entries[#entries + 1] = entry end
+  end
+  local in_flight = state.in_flight
+  if type(in_flight) == "number" and in_flight > idx then in_flight = in_flight - 1 end
+  height_cache.invalidate_all()
   return shallow_merge(state, {
+    entries = entries,
+    in_flight = in_flight,
     queued_entry_idx = NIL_SENTINEL,
-    pending_user_echo = queued and queued.text or NIL_SENTINEL,
+    pending_user_echo = NIL_SENTINEL,
+    pending_user_echo_idx = NIL_SENTINEL,
   }), {}
 end
 
@@ -1644,41 +1629,7 @@ local function route_keys_and_popups(msg, state)
     if kind == "key.enter" or kind == "key.y" or kind == "key.Y" then
       local p = state.popup
       local next_state = shallow_merge(state, { popup = NIL_SENTINEL })
-      local effects = {}
-      if p.scope == "all" then
-        local lead_active = state.pending == true or state.in_flight ~= nil
-        for _, run in pairs(state.runs or {}) do
-          if run.principal == "lead" and run.completed_at_ms == nil then
-            lead_active = true
-            break
-          end
-        end
-        if lead_active then
-          local stop_effects
-          next_state, stop_effects = hard_stop_lead(next_state)
-          for _, effect in ipairs(stop_effects) do effects[#effects + 1] = effect end
-        end
-        effects[#effects + 1] = {
-          kind = "send_to", target = "engine",
-          body = { kind = "chat.workflows.terminate_requested", scope = "all" },
-        }
-        effects[#effects + 1] = {
-          kind = "send_to", target = "mag", body = { kind = "mag.kill_all_runs" },
-        }
-        return next_state, effects
-      end
-      local run = (state.runs or {})[p.run_id]
-      if not run or run.completed_at_ms ~= nil then return next_state, {} end
-      if run.principal == "lead" then
-        return hard_stop_lead(next_state)
-      end
-      return next_state, {
-        { kind = "send_to", target = "engine",
-          body = { kind = "chat.workflows.terminate_requested",
-            scope = "one", run_id = p.run_id } },
-        { kind = "send_to", target = "mag",
-          body = { kind = "mag.kill_run", run_id = p.run_id } },
-      }
+      return apply_control_decisions(workflow_controls.confirm_termination(next_state, p))
     end
     return state, {}
   end

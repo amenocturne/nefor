@@ -98,6 +98,7 @@ local state = {
   current_turn   = nil,         ---@type table|nil
   deferred_queue       = {},    ---@type table  queued relay texts { text }
   pending_user_inputs  = {},    ---@type table  queued submits while busy
+  pending_inputs_projected = 0, ---@type integer cold-queue prefix already projected
   pending_steer        = nil,   ---@type table|nil queued inputs awaiting MAG steer ack
 
   -- Observer registries. Public on_* setters append; producers fire via
@@ -536,20 +537,25 @@ end
 flush_pending_user_inputs = function()
   if state.current_run_id ~= nil then return end
   if #state.pending_user_inputs == 0 then return end
-  local combined = table.concat(state.pending_user_inputs, "\n")
+  local inputs = state.pending_user_inputs
+  local combined = table.concat(inputs, "\n")
   nefor.log.info("agentic-loop: flushing queued user inputs", {
-    count = #state.pending_user_inputs,
+    count = #inputs,
     text_preview = string.sub(combined, 1, 80),
   })
+  local projected_count = state.pending_inputs_projected
   state.pending_user_inputs = {}
-  -- The optimistic TUI entry owns queued text until promotion. Persist its
-  -- canonical user projection only when the queue becomes model-visible.
+  state.pending_inputs_projected = 0
+  -- The first cold submit is projected immediately. Later cold submits are
+  -- optimistic queued text, so promotion replaces only that unprojected suffix.
   emit("nefor-tui", { kind = "chat.queue.steered" })
-  emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "user",
-    text = combined,
-  })
+  if projected_count < #inputs then
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "user",
+      text = table.concat(inputs, "\n", projected_count + 1),
+    })
+  end
   submit_orchestrator_run(combined)
 end
 
@@ -605,6 +611,7 @@ end
 local function cancel(drop_queued)
   if drop_queued then
     state.pending_user_inputs = {}
+    state.pending_inputs_projected = 0
     state.pending_steer = nil
   end
   kill_active_lead_run()
@@ -615,6 +622,7 @@ local function steer_pending_inputs()
   if #state.pending_user_inputs == 0 then return false end
   local texts = state.pending_user_inputs
   state.pending_user_inputs = {}
+  state.pending_inputs_projected = 0
   local text = table.concat(texts, "\n")
   local id = "lead-steer-" .. envelope.uuid_lite()
   state.pending_steer = {
@@ -665,6 +673,7 @@ local function cancel_all()
   local interrupted = interrupt_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
   state.pending_user_inputs = {}
+  state.pending_inputs_projected = 0
   state.pending_steer = nil
   if interrupted then
     emit("nefor-tui", {
@@ -693,6 +702,7 @@ local function new_chat()
   state.current_turn = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
+  state.pending_inputs_projected = 0
   state.pending_steer = nil
   state.history = {}
 end
@@ -751,6 +761,21 @@ local function handle_chat_input_submit(body)
 
   if state.current_run_id ~= nil then
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    return
+  end
+
+  if state.lead_program.artifact == nil then
+    local first_cold_input = #state.pending_user_inputs == 0
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    if first_cold_input then
+      state.pending_inputs_projected = 1
+      emit("nefor-tui", {
+        kind = "chat.message.append",
+        role = "user",
+        text = text,
+      })
+    end
+    ensure_lead_program_loaded()
     return
   end
 
@@ -1047,6 +1072,7 @@ local function teardown_for_session_end()
   state.current_turn   = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
+  state.pending_inputs_projected = 0
   state.pending_steer       = nil
   state.history            = {}
   emit_idle_state("session-ended")
@@ -1389,6 +1415,7 @@ M._internals  = {
     state.current_turn = nil
     state.deferred_queue = {}
     state.pending_user_inputs = {}
+    state.pending_inputs_projected = 0
     state.pending_steer = nil
     state.stream_observers = {}
     state.reasoning_observers = {}

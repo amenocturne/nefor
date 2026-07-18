@@ -296,16 +296,61 @@ local function begin_bound_turn(text, scope)
   return exec
 end
 
--- (echo) chat.input.submit emits chat.message.append role=user.
+-- (echo) once the turn program is warm, chat.input.submit emits the durable
+-- chat.message.append role=user immediately.
 do
   fresh_loop()
+  local warmup = begin_turn("warmup")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = warmup.body.run_id,
+    status = "completed", result = { text = "ready" },
+  })
+  _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first prompt" })
   local calls = decode_calls()
   local user_echo = find_call(calls, "chat.message.append", "user", "first prompt")
   assert(user_echo ~= nil,
-    "chat.input.submit must emit chat.message.append role=user")
+    "warm chat.input.submit must emit chat.message.append role=user")
   assert_eq(user_echo.target, "nefor-tui",
     "user echo must target nefor-tui specifically")
+end
+
+-- (cold load ownership) the initial ordinary submit is durable immediately;
+-- later cold submits stay optimistic until mag.loaded promotes their coalesced
+-- suffix. The model still receives the whole cold batch exactly once.
+do
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "cold one" })
+  local calls = decode_calls()
+  local load = find_kind(calls, "mag.load")
+  assert(load ~= nil, "cold submit loads the turn program")
+  assert(find_call(calls, "chat.message.append", "user", "cold one") ~= nil,
+    "initial cold submit emits its durable projection immediately")
+
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "cold two" })
+  calls = decode_calls()
+  assert_eq(find_kind(calls, "mag.load"), nil,
+    "additional cold submits coalesce behind the existing load")
+  assert_eq(find_call(calls, "chat.message.append", "user"), nil,
+    "additional cold submits remain owned by the optimistic queue")
+
+  _test.calls_clear()
+  send_to_loop("mag", {
+    kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:cold", artifact = lead_artifact(),
+  })
+  calls = decode_calls()
+  local exec = find_kind(calls, "mag.execute")
+  assert(exec ~= nil, "loaded program starts the queued turn")
+  assert_eq(exec.body.artifact.data.messages[1].content.prompt, "cold one\ncold two",
+    "cold submits coalesce into one model delivery")
+  assert(find_kind(calls, "chat.queue.steered") ~= nil,
+    "promotion reconciles the optimistic queue")
+  assert(find_call(calls, "chat.message.append", "user", "cold two") ~= nil,
+    "promotion durably projects only the unprojected cold suffix")
+  assert_eq(find_call(calls, "chat.message.append", "user", "cold one"), nil,
+    "promotion does not duplicate the initial cold projection")
 end
 
 -- (turn) a submit clones the program with the user text as the task,

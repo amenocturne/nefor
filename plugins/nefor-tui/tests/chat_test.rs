@@ -565,6 +565,113 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
 }
 
 #[test]
+fn accepted_steering_reconciles_indexed_entry_after_non_tail_interleaving() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "queued-owned");
+    let _ = engine.take_emit_queue();
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "system", "text": "interleaved-result" }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "queued-owned" }),
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("interleaved-result"),
+        "interleaved result missing: {out:?}"
+    );
+    assert_eq!(
+        out.matches("queued-owned").count(),
+        1,
+        "accepted steering must reconcile its indexed optimistic entry even when it is not tail: {out:?}"
+    );
+}
+
+#[test]
+fn accepted_steering_preserves_repeated_equal_user_text() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "same-text");
+    let _ = engine.take_emit_queue();
+
+    dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "same-text" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "same-text" }),
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert_eq!(
+        out.matches("same-text").count(),
+        2,
+        "accepted steering must not globally dedup repeated equal user text: {out:?}"
+    );
+}
+
+#[test]
+fn stream_end_then_double_escape_restores_and_drops_unaccepted_queue() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "queued-before-end");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    type_text(&mut engine, "draft");
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "text": "answer", "model": "test", "duration_ms": 1 }),
+    );
+    engine.handle_key(key("escape")).expect("first escape");
+    engine.handle_key(key("escape")).expect("second escape");
+
+    let emits = engine.take_emit_queue();
+    let interrupt = emits
+        .iter()
+        .find(|(_, body)| body.get("kind").and_then(|v| v.as_str()) == Some("chat.interrupt"))
+        .expect("hard stop interrupt");
+    assert_eq!(
+        interrupt.1.get("drop_queued").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("queued-before-end draft"),
+        "queue must return before draft: {out:?}"
+    );
+    assert_eq!(
+        out.matches("queued-before-end").count(),
+        1,
+        "unaccepted queue must leave no transcript copy after stream end + hard stop: {out:?}"
+    );
+}
+
+#[test]
 fn single_escape_without_queue_expires_as_noop() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
