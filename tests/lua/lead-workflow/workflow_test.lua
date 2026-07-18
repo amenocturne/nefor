@@ -1729,6 +1729,58 @@ do
     "session cleanup removes eval active ownership")
 end
 
+-- TUI-requested workflow termination settles and renders every run without
+-- turning the user's stop decision into replacement lead work.
+do
+  fresh()
+  local registry = lw._internals.run_registry
+  local run_ids = {}
+  for i = 1, 2 do
+    local run_id = registry:mint_run_id()
+    lw._internals.register_active_run(run_id,
+      { { id = "worker-" .. i, foreign = "llm" } }, "worker-" .. i,
+      "dispatch-" .. i, "terminated-" .. i, sessions.current_id())
+    invoke_tool("wait-terminated-" .. i, "await-run", { run_id = run_id })
+    run_ids[i] = run_id
+  end
+  _test.calls_clear()
+  feed("nefor-tui", { kind = "chat.workflows.terminate_requested", scope = "all" })
+  assert_eq(lw._internals.state.active_runs[run_ids[1]].terminate_reason,
+    "user-tui-termination", "TUI provenance classifies the first live run")
+  assert_eq(lw._internals.state.active_runs[run_ids[2]].terminate_reason,
+    "user-tui-termination", "TUI provenance classifies every live run")
+
+  for i, run_id in ipairs(run_ids) do
+    feed("mag", { kind = "mag.run_result", run_id = run_id,
+      status = "killed", error = "run killed" })
+    local calls = decode_calls()
+    assert_true(find_call(calls, function(c)
+      return c.body.kind == "chat.graph_result.append"
+        and c.body.run_id == run_id
+        and c.body.status == "failed"
+        and c.body.error == "run killed"
+    end) ~= nil, "user-terminated run " .. i .. " remains visibly failed")
+    assert_true(find_call(calls, function(c)
+      return c.body.kind == "tool.result"
+        and c.body.id == "wait-terminated-" .. i
+        and c.body.error_code == "await_run_killed"
+    end) ~= nil, "user-terminated run " .. i .. " still settles its waiter")
+  end
+  assert_eq(#agentic_loop._internals.state.deferred_queue, 0,
+    "user termination creates no deferred lead task")
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0,
+    "user termination creates no queued lead task")
+  assert_eq(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end), nil,
+    "multiple killed workflows create no replacement lead turn")
+
+  _test.calls_clear()
+  for _, run_id in ipairs(run_ids) do
+    feed("mag", { kind = "mag.run_result", run_id = run_id,
+      status = "killed", error = "duplicate" })
+  end
+  assert_eq(#decode_calls(), 0, "duplicate user-termination terminals remain idempotent")
+end
+
 -- Cancellation during pending load removes correlation, so a late compiler
 -- response cannot submit orphaned work.
 do

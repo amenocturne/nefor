@@ -512,10 +512,15 @@ fn double_escape_stops_lead_and_moves_queue_before_existing_prompt_text() {
         Some(true)
     );
 
-    let out = render_str(&mut engine);
+    let out = render_snapshot(&mut engine);
     assert!(
         out.contains("queued draft"),
         "double Esc should restore queued text before the existing draft with one space: {out:?}"
+    );
+    let queued_occurrences = out.matches("queued").count();
+    assert_eq!(
+        queued_occurrences, 1,
+        "restored text must exist only in the prompt, not the transcript: {out:?}"
     );
 }
 
@@ -527,6 +532,7 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
 
     submit_text(&mut engine, "first");
     let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
     submit_text(&mut engine, "queued");
     let _ = engine.take_emit_queue();
 
@@ -544,11 +550,17 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
         Some("chat.steer")
     );
 
+    let _ = render_str(&mut engine);
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "queued" }),
+    );
     let out = render_snapshot(&mut engine);
-    assert!(
-        out.contains("queued"),
-        "steered message remains in the transcript: {out:?}"
+    assert_eq!(
+        out.matches("queued").count(),
+        1,
+        "accepted steering keeps exactly one visible user occurrence: {out:?}"
     );
 }
 
@@ -2261,7 +2273,7 @@ fn double_escape_stops_only_the_lead() {
 }
 
 #[test]
-fn workflow_popup_escape_only_cancels_the_popup() {
+fn selected_workflow_termination_emits_classification_before_kill() {
     let mut engine = Engine::new(100, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -2275,11 +2287,29 @@ fn workflow_popup_escape_only_cancels_the_popup() {
     engine.handle_key(key("x")).expect("open terminate popup");
     assert!(render_snapshot(&mut engine).contains("Terminate one?"));
 
-    engine.handle_key(key("escape")).expect("cancel popup");
-    assert!(engine.take_emit_queue().is_empty());
-    assert!(
-        !engine.has_scheduled_dispatches(),
-        "popup Esc must not arm the lead escape gesture"
+    engine.handle_key(key("enter")).expect("confirm popup");
+    let emits = engine.take_emit_queue();
+    let kinds: Vec<_> = emits
+        .iter()
+        .filter_map(|(_, body)| body.get("kind").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["chat.workflows.terminate_requested", "mag.kill_run"]
+    );
+    assert_eq!(emits[0].0.as_deref(), Some("engine"));
+    assert_eq!(
+        emits[0].1.get("scope").and_then(|v| v.as_str()),
+        Some("one")
+    );
+    assert_eq!(
+        emits[0].1.get("run_id").and_then(|v| v.as_str()),
+        Some("run-one")
+    );
+    assert_eq!(emits[1].0.as_deref(), Some("mag"));
+    assert_eq!(
+        emits[1].1.get("run_id").and_then(|v| v.as_str()),
+        Some("run-one")
     );
 }
 
@@ -2341,7 +2371,19 @@ fn uppercase_x_terminates_all_runs_including_lead() {
         .iter()
         .filter_map(|(_, body)| body.get("kind").and_then(|v| v.as_str()))
         .collect();
-    assert_eq!(kinds, vec!["chat.interrupt", "mag.kill_all_runs"]);
+    assert_eq!(
+        kinds,
+        vec![
+            "chat.interrupt",
+            "chat.workflows.terminate_requested",
+            "mag.kill_all_runs"
+        ]
+    );
+    assert_eq!(emits[1].0.as_deref(), Some("engine"));
+    assert_eq!(
+        emits[1].1.get("scope").and_then(|v| v.as_str()),
+        Some("all")
+    );
 }
 
 #[test]

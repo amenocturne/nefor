@@ -542,6 +542,14 @@ flush_pending_user_inputs = function()
     text_preview = string.sub(combined, 1, 80),
   })
   state.pending_user_inputs = {}
+  -- The optimistic TUI entry owns queued text until promotion. Persist its
+  -- canonical user projection only when the queue becomes model-visible.
+  emit("nefor-tui", { kind = "chat.queue.steered" })
+  emit("nefor-tui", {
+    kind = "chat.message.append",
+    role = "user",
+    text = combined,
+  })
   submit_orchestrator_run(combined)
 end
 
@@ -629,7 +637,14 @@ local function handle_run_steered(body)
   if pending == nil or body.in_reply_to ~= pending.id then return end
   state.pending_steer = nil
   if body.accepted == true and body.run_id == pending.run_id then
+    -- Acceptance is the ownership boundary: the queued text is now part of
+    -- model-visible history, so emit its durable transcript projection once.
     emit("nefor-tui", { kind = "chat.queue.steered" })
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "user",
+      text = table.concat(pending.texts, "\n"),
+    })
     return
   end
   local restored = {}
@@ -736,11 +751,6 @@ local function handle_chat_input_submit(body)
 
   if state.current_run_id ~= nil then
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "user",
-      text = text,
-    })
     return
   end
 

@@ -1102,7 +1102,11 @@ local function handle_mag_run_result(body)
   if not run_registry:claim_delivery(run_id) then return end
   if failed then
     emit_mag_result_block(run, "failed", nil, err)
-    relay_kernel_completion(run_id, false, nil, err)
+    -- A TUI termination is already a user decision. Settlement and visibility
+    -- still happen, but feeding the kill back as a task would restart the lead.
+    if run.terminate_reason ~= "user-tui-termination" then
+      relay_kernel_completion(run_id, false, nil, err)
+    end
     return
   end
   emit_mag_result_block(run, "success", body.output_path, nil)
@@ -1746,6 +1750,20 @@ local function handle_tool_invoke(body)
   })
 end
 
+local function mark_user_terminated_runs(body)
+  if body.scope == "one" then
+    run_registry:mark_terminating(body.run_id, "user-tui-termination")
+    return
+  end
+  if body.scope ~= "all" then return end
+  local ids = {}
+  for run_id in pairs(state.active_runs) do ids[#ids + 1] = run_id end
+  table.sort(ids)
+  for _, run_id in ipairs(ids) do
+    run_registry:mark_terminating(run_id, "user-tui-termination")
+  end
+end
+
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
 
@@ -1760,6 +1778,12 @@ local function receive_msg(entry)
   if kind == "lead-workflow.tool.invoke" then
     if replay_window.active() then return end
     handle_tool_invoke(body)
+    return
+  end
+
+  if kind == "chat.workflows.terminate_requested" then
+    if replay_window.active() or decoded.from ~= "nefor-tui" then return end
+    mark_user_terminated_runs(body)
     return
   end
 

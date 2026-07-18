@@ -640,8 +640,8 @@ do
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "second" })
   local calls = decode_calls()
-  assert(find_call(calls, "chat.message.append", "user", "second") ~= nil,
-    "busy submit still echoes the user line")
+  assert_eq(find_call(calls, "chat.message.append", "user", "second"), nil,
+    "busy submit remains owned by the optimistic TUI queue until promotion")
   assert_eq(find_kind(calls, "mag.execute"), nil,
     "busy submit must not double-dispatch")
 
@@ -651,6 +651,9 @@ do
     status = "completed", result = { text = "first answer" },
   })
   calls = decode_calls()
+  local projected = find_call(calls, "chat.message.append", "user", "second")
+  assert(projected ~= nil,
+    "queued promotion emits its durable user projection exactly when it becomes model-visible")
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "queued input promotes into a fresh turn on close")
   assert_eq(exec2.body.artifact.data.messages[1].content.prompt, "second",
@@ -686,6 +689,9 @@ do
   calls = decode_calls()
   assert(find_kind(calls, "chat.queue.steered") ~= nil,
     "accepted steer tells the TUI its queued entry is now live transcript")
+  local projected = find_call(calls, "chat.message.append", "user", "queued")
+  assert(projected ~= nil,
+    "accepted steer emits the durable user projection exactly once")
   assert_eq(agentic_loop._internals.state.pending_steer, nil,
     "accepted steer clears the acknowledgement latch")
 end

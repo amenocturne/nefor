@@ -1450,7 +1450,11 @@ end
 
 local function handle_queue_steered(_msg, state)
   if not state.queued_entry_idx then return state, {} end
-  return shallow_merge(state, { queued_entry_idx = NIL_SENTINEL }), {}
+  local queued = (state.entries or {})[state.queued_entry_idx]
+  return shallow_merge(state, {
+    queued_entry_idx = NIL_SENTINEL,
+    pending_user_echo = queued and queued.text or NIL_SENTINEL,
+  }), {}
 end
 
 local function handle_mag_actor_spawned(msg, state)
@@ -1655,6 +1659,10 @@ local function route_keys_and_popups(msg, state)
           for _, effect in ipairs(stop_effects) do effects[#effects + 1] = effect end
         end
         effects[#effects + 1] = {
+          kind = "send_to", target = "engine",
+          body = { kind = "chat.workflows.terminate_requested", scope = "all" },
+        }
+        effects[#effects + 1] = {
           kind = "send_to", target = "mag", body = { kind = "mag.kill_all_runs" },
         }
         return next_state, effects
@@ -1665,6 +1673,9 @@ local function route_keys_and_popups(msg, state)
         return hard_stop_lead(next_state)
       end
       return next_state, {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.workflows.terminate_requested",
+            scope = "one", run_id = p.run_id } },
         { kind = "send_to", target = "mag",
           body = { kind = "mag.kill_run", run_id = p.run_id } },
       }
