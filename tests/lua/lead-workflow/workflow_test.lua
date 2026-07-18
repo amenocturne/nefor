@@ -642,7 +642,9 @@ local function lead_turn_modification()
         routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
-    messages = { { to = "lead.entry", content = { kind = "task", prompt = "<initial task text>" } } },
+    messages = { { to = "lead.entry", content = {
+      kind = "task", value = { prompt = "<initial task text>" },
+    } } },
     kills = {},
     rules = {},
   }
@@ -669,7 +671,7 @@ local function relayed_lead_prompt()
   if exec == nil then return nil end
   local msg = exec.body.artifact and exec.body.artifact.data
     and exec.body.artifact.data.messages and exec.body.artifact.data.messages[1]
-  return msg and msg.content and msg.content.prompt or nil
+  return msg and msg.content and msg.content.value and msg.content.value.prompt or nil
 end
 
 do

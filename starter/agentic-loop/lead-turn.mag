@@ -30,12 +30,12 @@
         "task"
         (type-tag nefor.contracts.FinalAnswer))
       initial
-      (nefor.graph.message
-        "lead.entry"
-        (as Data {:kind "task" :prompt "<initial task text>"}))
+      (nefor.graph.typed-message
+        (get lead "input")
+        (as nefor.contracts.Task {:prompt "<initial task text>"}))
       program
       (nefor.graph.finish
         lead
-        (as (List nefor.graph.Message) [initial])
+        [initial]
         (as (List nefor.graph.Rule) []))]
   (nefor.artifact.compile program))

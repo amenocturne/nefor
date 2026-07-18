@@ -207,7 +207,11 @@ fn turn_artifact(program: &Value, user_text: &str) -> Value {
         .expect("program has messages");
     for msg in messages {
         if let Some(content) = msg.get_mut("content") {
-            content["prompt"] = Value::String(user_text.to_owned());
+            let value = content
+                .get_mut("value")
+                .and_then(Value::as_object_mut)
+                .expect("initial task content carries a typed value");
+            value.insert("prompt".to_owned(), Value::String(user_text.to_owned()));
         }
     }
     m

@@ -349,6 +349,10 @@ local function derive_program_seams(modification)
   if type(entry_actor) ~= "string" then
     return nil, "turn-program has no initial message (no entry actor)"
   end
+  local content = msg.content
+  if type(content) ~= "table" or type(content.value) ~= "table" then
+    return nil, "turn-program initial message is not a typed value"
+  end
   local llm_actor
   for _, actor in ipairs(modification.actors or {}) do
     if actor.id == entry_actor then
@@ -446,8 +450,8 @@ local function submit_orchestrator_run(user_text)
   local artifact = deep_clone(p.artifact)
   local mod = artifact.data
   for _, msg in ipairs(mod.messages or {}) do
-    if msg.to == p.entry_actor and type(msg.content) == "table" then
-      msg.content.prompt = user_text
+    if msg.to == p.entry_actor then
+      msg.content.value.prompt = user_text
     end
   end
 

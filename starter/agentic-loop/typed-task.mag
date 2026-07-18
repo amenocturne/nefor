@@ -22,8 +22,8 @@
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag TaskDescription))
-      initial (nefor.graph.message
-                "typed-task.entry"
-                (as Data {:kind "task" :prompt "Describe the build task"}))]
+      initial (nefor.graph.typed-message
+                (get worker "input")
+                (as nefor.contracts.Task {:prompt "Describe the build task"}))]
   (nefor.artifact.compile
     (nefor.graph.finish worker [initial] (as (List nefor.graph.Rule) []))))

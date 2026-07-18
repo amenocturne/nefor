@@ -180,7 +180,9 @@ local function lead_artifact()
       },
     },
     messages = {
-      { to = "lead.entry", content = { kind = "task", prompt = "<initial task text>" } },
+      { to = "lead.entry", content = {
+        kind = "task", value = { prompt = "<initial task text>" },
+      } },
     },
     kills = {},
     rules = {},
@@ -343,7 +345,7 @@ do
   calls = decode_calls()
   local exec = find_kind(calls, "mag.execute")
   assert(exec ~= nil, "loaded program starts the queued turn")
-  assert_eq(exec.body.artifact.data.messages[1].content.prompt, "cold one\ncold two",
+  assert_eq(exec.body.artifact.data.messages[1].content.value.prompt, "cold one\ncold two",
     "cold submits coalesce into one model delivery")
   assert(find_kind(calls, "chat.queue.steered") ~= nil,
     "promotion reconciles the optimistic queue")
@@ -365,8 +367,10 @@ do
   local mod = exec.body.artifact and exec.body.artifact.data
   assert(type(mod) == "table", "the artifact rides inline on the execute")
   assert_eq(mod.messages[1].to, "lead.entry", "task targets the program's entry actor")
-  assert_eq(mod.messages[1].content.prompt, "hello lead",
-    "the initial mag.Task payload is the user message")
+  assert_eq(mod.messages[1].content.kind, "task",
+    "task injection preserves the typed input wire")
+  assert_eq(mod.messages[1].content.value.prompt, "hello lead",
+    "the literal first user message replaces the typed task template")
   local overlay = exec.body.params_overlay["lead.llm"]
   assert(type(overlay) == "table", "params overlay keys the derived llm actor")
   -- The base system prompt leads, with the ambient MAG-workspace block
@@ -479,7 +483,7 @@ do
     "the cached program is not re-loaded per turn")
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "second turn executes")
-  assert_eq(exec2.body.artifact.data.messages[1].content.prompt, "and more?")
+  assert_eq(exec2.body.artifact.data.messages[1].content.value.prompt, "and more?")
   local seeded = exec2.body.params_overlay["lead.llm"].history
   assert_eq(#seeded, 2, "second turn's llm seeds the prior turn's pair")
   assert_eq(seeded[1].content, "hello lead")
@@ -727,7 +731,7 @@ do
     "queued promotion emits its durable user projection exactly when it becomes model-visible")
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "queued input promotes into a fresh turn on close")
-  assert_eq(exec2.body.artifact.data.messages[1].content.prompt, "second",
+  assert_eq(exec2.body.artifact.data.messages[1].content.value.prompt, "second",
     "the promoted turn carries the queued text")
   local seeded = exec2.body.params_overlay["lead.llm"].history
   assert_eq(#seeded, 2, "the promoted turn seeds the finished turn's history")
@@ -869,7 +873,7 @@ do
   local calls = decode_calls()
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "an idle lead relays the completion immediately")
-  local prompt = exec2.body.artifact.data.messages[1].content.prompt
+  local prompt = exec2.body.artifact.data.messages[1].content.value.prompt
   assert(string.find(prompt, "mag-sub-1", 1, true) ~= nil,
     "the relay turn names the finished run")
   assert(string.find(prompt, "sub answer", 1, true) ~= nil,
@@ -905,7 +909,7 @@ do
   local calls = decode_calls()
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "an idle lead relays the interrupted failure immediately")
-  local prompt = exec2.body.artifact.data.messages[1].content.prompt
+  local prompt = exec2.body.artifact.data.messages[1].content.value.prompt
   assert(string.find(prompt, "FAILED", 1, true) ~= nil,
     "the relay turn marks the interrupted run as FAILED")
   assert(string.find(prompt, "interrupted by user", 1, true) ~= nil,
@@ -1026,7 +1030,7 @@ do
     if c.body.kind == "mag.execute" then execs[#execs + 1] = c end
   end
   assert_eq(#execs, 1, "both queued completions flush as one relay turn")
-  local prompt = execs[1].body.artifact.data.messages[1].content.prompt
+  local prompt = execs[1].body.artifact.data.messages[1].content.value.prompt
   assert(prompt:find("alpha output", 1, true) ~= nil,
     "the merged relay carries the first completion")
   assert(prompt:find("beta output", 1, true) ~= nil,

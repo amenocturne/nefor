@@ -95,9 +95,9 @@ There are no compiler forms named `agent`, `bash`, `graph`, `subgraph`, or
         "task"
         (type-tag nefor.contracts.FinalAnswer))
       initial
-      (nefor.graph.message
-        "worker.entry"
-        (as Data {:kind "task" :prompt "<initial task text>"}))
+      (nefor.graph.typed-message
+        (get worker "input")
+        (as nefor.contracts.Task {:prompt "<initial task text>"}))
       program
       (nefor.graph.finish
         worker [initial] (as (List nefor.graph.Rule) []))]
