@@ -1,4 +1,5 @@
 local M = {}
+local queued_input = require("libs.chat.queued_input")
 
 M.ESCAPE_DELAY_MS = 600
 
@@ -8,14 +9,6 @@ local function copy_table(source)
   return out
 end
 
-local function join_with_one_space(left, right)
-  left = type(left) == "string" and left or ""
-  right = type(right) == "string" and right or ""
-  if left == "" then return right end
-  if right == "" then return left end
-  return left .. " " .. right
-end
-
 local function clear_escape(state)
   local next_state = copy_table(state)
   next_state.last_esc_ms = nil
@@ -23,30 +16,8 @@ local function clear_escape(state)
   return next_state
 end
 
-local function restore_queued_input(state)
-  local idx = state.queued_entry_idx
-  if type(idx) ~= "number" then return copy_table(state), false end
-
-  local queued = state.entries and state.entries[idx]
-  local entries = {}
-  for i, entry in ipairs(state.entries or {}) do
-    if i ~= idx then entries[#entries + 1] = entry end
-  end
-
-  local next_state = copy_table(state)
-  next_state.entries = entries
-  next_state.queued_entry_idx = nil
-  next_state.pending_user_echo = nil
-  next_state.pending_user_echo_idx = nil
-  next_state.input_value = join_with_one_space(queued and queued.text, state.input_value)
-  if type(state.in_flight) == "number" and state.in_flight > idx then
-    next_state.in_flight = state.in_flight - 1
-  end
-  return next_state, true
-end
-
 function M.hard_stop_lead(state)
-  local next_state, restored_queue = restore_queued_input(state)
+  local next_state, restored_queue = queued_input.restore(state)
   next_state = clear_escape(next_state)
   return next_state, { { kind = "hard_stop_lead" } }, { restored_queue = restored_queue }
 end

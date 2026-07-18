@@ -21,6 +21,7 @@ local log          = require("libs.chat.log")
 local tool_display = require("libs.chat.tool_display")
 local height_cache = require("libs.chat.height_cache")
 local workflow_controls = require("libs.chat.workflow_controls")
+local queued_input = require("libs.chat.queued_input")
 local mag_run_bindings = require("libs.mag-run-bindings")
 
 local shallow_merge = common.shallow_merge
@@ -538,27 +539,10 @@ local function handle_input_submit(msg, state)
   -- When a turn is already in flight, coalesce into a single queued
   -- entry instead of pushing a new user bubble per message.
   if state.pending or state.in_flight ~= nil then
-    local next_state
-    if state.queued_entry_idx then
-      local old = state.entries[state.queued_entry_idx]
-      local combined = Entry.set_text(old, old.text .. "\n" .. wire_text)
-      local new_entries = {}
-      for ei = 1, #state.entries do
-        new_entries[ei] = (ei == state.queued_entry_idx) and combined or state.entries[ei]
-      end
-      next_state = shallow_merge(state, {
-        entries = new_entries,
-        input_value = "", completion = NIL_SENTINEL,
-        prompt_history = hist, history_cursor = NIL_SENTINEL,
-      })
-    else
-      local with_user = transcript.push_entry(state, Entry.user(wire_text))
-      next_state = shallow_merge(with_user, {
-        input_value = "", completion = NIL_SENTINEL,
-        prompt_history = hist, history_cursor = NIL_SENTINEL,
-        queued_entry_idx = #with_user.entries,
-      })
-    end
+    local next_state = shallow_merge(queued_input.submit(state, wire_text, true), {
+      input_value = "", completion = NIL_SENTINEL,
+      prompt_history = hist, history_cursor = NIL_SENTINEL,
+    })
     tui.scroll_into_view("transcript")
     return next_state, {
       { kind = "send_to", target = "engine",
@@ -566,14 +550,11 @@ local function handle_input_submit(msg, state)
     }
   end
 
-  local with_user = transcript.push_entry(state, Entry.user(wire_text))
-  local cleared = shallow_merge(with_user, {
+  local cleared = shallow_merge(queued_input.submit(state, wire_text, false), {
     input_value = "", pending = true,
     turn_started_at = tui.now_ms(), completion = NIL_SENTINEL,
     prompt_history = hist,
     history_cursor = NIL_SENTINEL,
-    pending_user_echo = wire_text,
-    pending_user_echo_idx = #with_user.entries,
   })
   tui.scroll_into_view("transcript")
   return cleared, {
@@ -864,20 +845,9 @@ local function handle_message_append(msg, state)
   state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
   -- Round-trip echo ownership is indexed: unrelated graph output may append
   -- after the optimistic user entry before its durable projection arrives.
-  if role == "user"
-     and state.pending_user_echo ~= nil
-     and state.pending_user_echo == text then
-    local entries = state.entries or {}
-    local idx = state.pending_user_echo_idx
-    local owned = type(idx) == "number" and entries[idx] or nil
-    local cleared = shallow_merge(state, {
-      pending_user_echo = NIL_SENTINEL,
-      pending_user_echo_idx = NIL_SENTINEL,
-    })
-    if owned and owned.role == "user" and owned.text == text then
-      return cleared, {}
-    end
-    return transcript.push_entry(cleared, Entry.user(text)), {}
+  if role == "user" then
+    local reconciled, matched = queued_input.reconcile_echo(state, text)
+    if matched then return reconciled, {} end
   end
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
@@ -1424,22 +1394,10 @@ local function handle_mag_run_started(msg, state)
 end
 
 local function handle_queue_steered(_msg, state)
-  local idx = state.queued_entry_idx
-  if type(idx) ~= "number" then return state, {} end
-  local entries = {}
-  for i, entry in ipairs(state.entries or {}) do
-    if i ~= idx then entries[#entries + 1] = entry end
-  end
-  local in_flight = state.in_flight
-  if type(in_flight) == "number" and in_flight > idx then in_flight = in_flight - 1 end
+  local next_state, changed = queued_input.accept_steered(state)
+  if not changed then return state, {} end
   height_cache.invalidate_all()
-  return shallow_merge(state, {
-    entries = entries,
-    in_flight = in_flight,
-    queued_entry_idx = NIL_SENTINEL,
-    pending_user_echo = NIL_SENTINEL,
-    pending_user_echo_idx = NIL_SENTINEL,
-  }), {}
+  return next_state, {}
 end
 
 local function handle_mag_actor_spawned(msg, state)
