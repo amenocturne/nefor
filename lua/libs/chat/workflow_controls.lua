@@ -13,7 +13,20 @@ local function clear_escape(state)
   local next_state = copy_table(state)
   next_state.last_esc_ms = nil
   next_state.escape_token = nil
+  next_state.escape_count = nil
   return next_state
+end
+
+local function arm_escape(state, now_ms, count)
+  local next_state = copy_table(state)
+  local token = (state.escape_token_seq or 0) + 1
+  next_state.last_esc_ms = now_ms
+  next_state.escape_token = token
+  next_state.escape_token_seq = token
+  next_state.escape_count = count
+  return next_state, {
+    { kind = "schedule_escape_timeout", token = token, delay_ms = M.ESCAPE_DELAY_MS },
+  }
 end
 
 function M.hard_stop_lead(state)
@@ -22,20 +35,29 @@ function M.hard_stop_lead(state)
   return next_state, { { kind = "hard_stop_lead" } }, { restored_queue = restored_queue }
 end
 
+function M.kill_all_workflows(state)
+  local next_state, restored_queue = queued_input.restore(state)
+  next_state = clear_escape(next_state)
+  return next_state, {
+    { kind = "hard_stop_lead" },
+    { kind = "terminate_all_workflows" },
+  }, { restored_queue = restored_queue }
+end
+
 function M.escape(state, now_ms)
   if state.escape_token ~= nil and state.last_esc_ms ~= nil
       and now_ms - state.last_esc_ms <= M.ESCAPE_DELAY_MS then
-    return M.hard_stop_lead(state)
+    if state.escape_count == 2 then return M.kill_all_workflows(state) end
+    if state.escape_count == 1 then
+      local next_state, decisions, metadata = M.hard_stop_lead(state)
+      local armed, timeout_decisions = arm_escape(next_state, now_ms, 2)
+      decisions[#decisions + 1] = timeout_decisions[1]
+      return armed, decisions, metadata
+    end
   end
 
-  local next_state = copy_table(state)
-  local token = (state.escape_token_seq or 0) + 1
-  next_state.last_esc_ms = now_ms
-  next_state.escape_token = token
-  next_state.escape_token_seq = token
-  return next_state, {
-    { kind = "schedule_escape_timeout", token = token, delay_ms = M.ESCAPE_DELAY_MS },
-  }, { restored_queue = false }
+  local next_state, decisions = arm_escape(state, now_ms, 1)
+  return next_state, decisions, { restored_queue = false }
 end
 
 function M.escape_timeout(state, token)
@@ -44,7 +66,7 @@ function M.escape_timeout(state, token)
   end
 
   local next_state = clear_escape(state)
-  if state.queued_entry_idx ~= nil then
+  if state.escape_count == 1 and state.queued_entry_idx ~= nil then
     return next_state, { { kind = "steer_queued" } }, { restored_queue = false }
   end
   return next_state, {}, { restored_queue = false }
@@ -90,7 +112,7 @@ function M.confirm_termination(state, request)
     end
   end
   if has_active_non_lead then
-    decisions[#decisions + 1] = { kind = "terminate_all_non_lead_workflows" }
+    decisions[#decisions + 1] = { kind = "terminate_all_workflows" }
   end
   return next_state, decisions, metadata
 end

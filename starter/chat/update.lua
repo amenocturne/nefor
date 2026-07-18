@@ -210,6 +210,7 @@ local function handle_input_submit(msg, state)
       last_turn_duration_ms = NIL_SENTINEL,
       last_esc_ms = NIL_SENTINEL,
       escape_token = NIL_SENTINEL,
+      escape_count = NIL_SENTINEL,
       history_cursor = NIL_SENTINEL,
       popup = NIL_SENTINEL,
       queued_entry_idx = NIL_SENTINEL,
@@ -405,6 +406,7 @@ local function handle_input_submit(msg, state)
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
         escape_token = NIL_SENTINEL,
+        escape_count = NIL_SENTINEL,
         history_cursor = NIL_SENTINEL,
         popup = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -671,7 +673,7 @@ local function apply_control_decisions(state, decisions, metadata)
         kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt", drop_queued = true },
       }
-    elseif decision.kind == "terminate_all_non_lead_workflows" then
+    elseif decision.kind == "terminate_all_workflows" then
       effects[#effects + 1] = {
         kind = "send_to", target = "engine",
         body = { kind = "chat.workflows.terminate_requested", scope = "all" },
@@ -758,6 +760,7 @@ local function handle_session_end(_msg, state)
     completion       = NIL_SENTINEL,
     last_esc_ms      = NIL_SENTINEL,
     escape_token     = NIL_SENTINEL,
+    escape_count     = NIL_SENTINEL,
     runs             = {},
     agent_streams    = {},
     scope_to_run     = {},

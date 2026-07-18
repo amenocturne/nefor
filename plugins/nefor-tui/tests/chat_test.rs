@@ -2380,6 +2380,46 @@ fn double_escape_stops_only_the_lead() {
 }
 
 #[test]
+fn triple_escape_immediately_kills_every_workflow_including_lead() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("escape")).expect("first esc");
+    assert!(engine.take_emit_queue().is_empty());
+
+    engine.handle_key(key("escape")).expect("second esc");
+    let second = engine.take_emit_queue();
+    assert_eq!(
+        second[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.interrupt"),
+        "second ESC still stops lead immediately"
+    );
+
+    engine.handle_key(key("escape")).expect("third esc");
+    let third = engine.take_emit_queue();
+    let kinds: Vec<_> = third
+        .iter()
+        .filter_map(|(_, body)| body.get("kind").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "chat.interrupt",
+            "chat.workflows.terminate_requested",
+            "mag.kill_all_runs"
+        ],
+        "third ESC must take the unconditional global kill path"
+    );
+    assert_eq!(third[1].0.as_deref(), Some("engine"));
+    assert_eq!(
+        third[1].1.get("scope").and_then(|v| v.as_str()),
+        Some("all")
+    );
+    assert_eq!(third[2].0.as_deref(), Some("mag"));
+}
+
+#[test]
 fn selected_workflow_termination_emits_classification_before_kill() {
     let mut engine = Engine::new(100, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

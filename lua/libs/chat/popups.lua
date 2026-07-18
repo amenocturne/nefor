@@ -23,6 +23,7 @@ local HELP_BODY = [[Keys:
   Shift+Enter  insert newline
   Esc          steer queued message after current LLM exchange
   Esc Esc      stop lead; restore queued text to prompt (within 600ms)
+  Esc Esc Esc  kill every workflow, including lead (within 600ms per press)
   Ctrl+B       toggle sidebar
   Tab          focus sidebar ↔ prompt
   (sidebar)    ↑/↓ move · Space view · Enter fold · x/X terminate one/all · Esc back

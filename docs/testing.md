@@ -167,8 +167,9 @@ Things to verify:
 - `/model <model-id>` switches model at runtime
 - `/safe`, `/auto`, and `/yolo` toggle policy; see `docs/approval-model.md`
 - `/new` clears transcript and starts a fresh chat
-- Single Esc cancels in-flight turn (chat unblocks for next submit)
-- Double Esc within 600ms → fan-cancel (lead run + queued inputs) → system message reports counts
+- Single Esc steers queued input after the current LLM exchange
+- Double Esc within 600ms stops lead and restores queued text to the prompt
+- Triple Esc within 600ms per press immediately kills every workflow, including lead
 - A dispatched kernel run (lead `mag` tool, action=execute) appears in the sidebar run panel; actor groups go running → done
 
 ## Verifying known concerns
