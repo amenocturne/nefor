@@ -2385,6 +2385,12 @@ fn triple_escape_immediately_kills_every_workflow_including_lead() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "queued");
+    let _ = engine.take_emit_queue();
+
     engine.handle_key(key("escape")).expect("first esc");
     assert!(engine.take_emit_queue().is_empty());
 
@@ -2395,6 +2401,7 @@ fn triple_escape_immediately_kills_every_workflow_including_lead() {
         Some("chat.interrupt"),
         "second ESC still stops lead immediately"
     );
+    let _ = render_str(&mut engine);
 
     engine.handle_key(key("escape")).expect("third esc");
     let third = engine.take_emit_queue();
@@ -2417,6 +2424,13 @@ fn triple_escape_immediately_kills_every_workflow_including_lead() {
         Some("all")
     );
     assert_eq!(third[2].0.as_deref(), Some("mag"));
+
+    type_text(&mut engine, "tail");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("queued tail"),
+        "triple ESC must retain double-ESC queue restoration with a trailing space: {out:?}"
+    );
 }
 
 #[test]

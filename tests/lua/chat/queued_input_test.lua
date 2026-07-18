@@ -47,4 +47,12 @@ eq(did_restore, true)
 eq(#restored.entries, 1)
 eq(restored.input_value, "queued draft")
 
+local restored_empty = queued_input.restore({
+  entries = { { role = "user", text = "lead" }, { role = "user", text = "queued" } },
+  queued_entry_idx = 2,
+  input_value = "",
+})
+eq(restored_empty.input_value, "queued ",
+  "restoring into an empty prompt leaves a space ready for continued typing")
+
 print("queued_input_test: all assertions passed")

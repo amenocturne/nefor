@@ -35,7 +35,7 @@ function M.hard_stop_lead(state)
   return next_state, { { kind = "hard_stop_lead" } }, { restored_queue = restored_queue }
 end
 
-function M.kill_all_workflows(state)
+function M.terminate_all(state)
   local next_state, restored_queue = queued_input.restore(state)
   next_state = clear_escape(next_state)
   return next_state, {
@@ -47,7 +47,7 @@ end
 function M.escape(state, now_ms)
   if state.escape_token ~= nil and state.last_esc_ms ~= nil
       and now_ms - state.last_esc_ms <= M.ESCAPE_DELAY_MS then
-    if state.escape_count == 2 then return M.kill_all_workflows(state) end
+    if state.escape_count == 2 then return M.terminate_all(state) end
     if state.escape_count == 1 then
       local next_state, decisions, metadata = M.hard_stop_lead(state)
       local armed, timeout_decisions = arm_escape(next_state, now_ms, 2)
@@ -76,14 +76,6 @@ local function active(run)
   return type(run) == "table" and run.completed_at_ms == nil
 end
 
-local function active_lead(state)
-  if state.pending == true or state.in_flight ~= nil then return true end
-  for _, run in pairs(state.runs or {}) do
-    if active(run) and run.principal == "lead" then return true end
-  end
-  return false
-end
-
 function M.confirm_termination(state, request)
   if type(request) ~= "table" then return copy_table(state), {}, { restored_queue = false } end
 
@@ -98,23 +90,7 @@ function M.confirm_termination(state, request)
 
   if request.scope ~= "all" then return copy_table(state), {}, { restored_queue = false } end
 
-  local next_state = copy_table(state)
-  local decisions = {}
-  local metadata = { restored_queue = false }
-  if active_lead(state) then
-    next_state, decisions, metadata = M.hard_stop_lead(next_state)
-  end
-  local has_active_non_lead = false
-  for _, run in pairs(state.runs or {}) do
-    if active(run) and run.principal ~= "lead" then
-      has_active_non_lead = true
-      break
-    end
-  end
-  if has_active_non_lead then
-    decisions[#decisions + 1] = { kind = "terminate_all_workflows" }
-  end
-  return next_state, decisions, metadata
+  return M.terminate_all(state)
 end
 
 return M

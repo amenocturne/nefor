@@ -21,7 +21,7 @@ local function join_with_one_space(left, right)
   left = type(left) == "string" and left or ""
   right = type(right) == "string" and right or ""
   if left == "" then return right end
-  if right == "" then return left end
+  if right == "" then return left .. " " end
   return left .. " " .. right
 end
 

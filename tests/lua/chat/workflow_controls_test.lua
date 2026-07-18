@@ -98,4 +98,10 @@ eq(seen["terminate_all_workflows:"], true, "all terminates active non-leads")
 eq(seen["terminate_workflow:lead"], nil, "lead is not killed through workflow adapter")
 eq(seen["terminate_workflow:done"], nil, "completed workflow remains untouched")
 
+local _, unconditional_all = controls.confirm_termination(state(), { scope = "all" })
+eq(unconditional_all[1].kind, "hard_stop_lead",
+  "terminate-all always takes the shared lead hard-stop path")
+eq(unconditional_all[2].kind, "terminate_all_workflows",
+  "terminate-all always emits the global MAG kill even without tracked runs")
+
 print("workflow_controls_test: all assertions passed")
