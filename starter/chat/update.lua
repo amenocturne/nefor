@@ -202,7 +202,8 @@ local function handle_input_submit(msg, state)
   if cmd == "new" or cmd == "clear" then
     reset_transcript_scroll()
     local cleared = shallow_merge(state, {
-      entries = {}, in_flight = NIL_SENTINEL, input_value = "",
+      entries = {}, in_flight = NIL_SENTINEL,
+      pending_assistant_projection = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
       runs = {}, sidebar_folds = {},
       agent_streams = {}, scope_to_run = {},
@@ -398,7 +399,8 @@ local function handle_input_submit(msg, state)
       }
       reset_transcript_scroll()
       local cleared = shallow_merge(state, {
-        entries = {}, in_flight = NIL_SENTINEL, input_value = "",
+        entries = {}, in_flight = NIL_SENTINEL,
+        pending_assistant_projection = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
         runs = {}, sidebar_folds = {},
         agent_streams = {}, scope_to_run = {},
@@ -488,6 +490,7 @@ local function handle_input_submit(msg, state)
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
+        pending_assistant_projection = NIL_SENTINEL,
         pending = false, runs = {}, sidebar_folds = {},
         agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
@@ -752,6 +755,7 @@ local function handle_session_end(_msg, state)
   run_bindings = mag_run_bindings.new()
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
+    pending_assistant_projection = NIL_SENTINEL,
     pending          = false,
     turn_started_at  = NIL_SENTINEL,
     last_turn_duration_ms = NIL_SENTINEL,
@@ -848,9 +852,16 @@ local function handle_message_append(msg, state)
   state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
   -- Round-trip echo ownership is indexed: unrelated graph output may append
   -- after the optimistic user entry before its durable projection arrives.
+  if role ~= "assistant" then
+    state = transcript.close_assistant_projection(state)
+  end
   if role == "user" then
     local reconciled, matched = queued_input.reconcile_echo(state, text)
     if matched then return reconciled, {} end
+  end
+  if role == "assistant" then
+    local projected, matched = transcript.project_assistant_message(state, text)
+    if matched then return projected, {} end
   end
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
@@ -1038,6 +1049,7 @@ local function handle_tool_start(msg, state)
   else input_str = "" end
   local raw_input = msg.input
   local contract = (state.tool_displays or {})[msg.name]
+  state = transcript.close_assistant_projection(state)
   return transcript.push_entry(state, Entry.tool_call(
     msg.id or "", msg.name or "?", input_str,
     type(msg.input) == "table" and msg.input or nil,
@@ -1713,6 +1725,7 @@ local function route_keys_and_popups(msg, state)
         return shallow_merge(state, {
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
+          pending_assistant_projection = NIL_SENTINEL,
           pending = false, runs = {}, sidebar_folds = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,

@@ -338,6 +338,113 @@ fn streaming_delta_appends_to_transcript() {
     );
 }
 
+#[test]
+fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
+    let mut engine = Engine::new(120, 40).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for (answer, duration_ms, output_tokens) in [
+        ("answer before status", 2_000, 40),
+        ("answer after status", 3_000, 60),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.reasoning.delta", "text": "provider reasoning" }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.reasoning.end", "duration_ms": 100 }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": duration_ms }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.session.stats",
+                "model": "gpt-test",
+                "last_turn_duration_ms": duration_ms,
+                "last_turn_output_tokens": output_tokens,
+            }),
+        );
+        if answer == "answer before status" {
+            dispatch_event(
+                &mut engine,
+                json!({
+                    "kind": "chat.graph_result.append",
+                    "run_id": "mag-run-1",
+                    "run_name": "eval-1",
+                    "status": "failed",
+                    "duration_ms": 500,
+                    "error": "killed",
+                }),
+            );
+        }
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "assistant", "text": answer }),
+        );
+    }
+
+    let out = render_str(&mut engine);
+    let before = out.find("answer before status").expect("first answer");
+    let status = out.find("mag workflow").expect("graph status");
+    let after = out.find("answer after status").expect("second answer");
+    assert!(
+        before < status && status < after,
+        "provider chronology changed:\n{out}"
+    );
+    assert_eq!(
+        out.matches("▣ gpt-test").count(),
+        2,
+        "each structured answer must keep its model footer:\n{out}"
+    );
+    assert_eq!(
+        out.matches("20 tok/s").count(),
+        2,
+        "each structured answer must keep its duration/token footer:\n{out}"
+    );
+    let tail = &out[after..];
+    assert!(
+        tail.contains("gpt-test") && tail.contains("3s") && tail.contains("20 tok/s"),
+        "the post-status answer must retain stats below its content:\n{out}"
+    );
+}
+
+#[test]
+fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 1 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "t1", "name": "mag-eval", "input": {} }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "final answer" }),
+    );
+
+    let out = render_str(&mut engine);
+    let tool = out.find("mag-eval").expect("tool entry");
+    let answer = out.find("final answer").expect("final answer");
+    assert!(
+        tool < answer,
+        "final answer attached to the tool-call round:\n{out}"
+    );
+}
+
 // Kernel-run actor chats (mag `<actor>@rN`) stream on the same bus as
 // the lead's chat — deliberately, so the session log and run-panel
 // consumers capture the deltas — but the transcript renders only the

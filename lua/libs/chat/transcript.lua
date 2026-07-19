@@ -45,6 +45,7 @@ function M.append_assistant_delta(state, delta)
   return shallow_merge(state, {
     entries   = new_entries,
     in_flight = #new_entries,
+    pending_assistant_projection = NIL_SENTINEL,
     pending   = false,
   })
 end
@@ -58,7 +59,9 @@ function M.append_reasoning_delta(state, delta)
     log.log("transcript", "reasoning_delta new_stream v=%d count=%d",
       new_entry.v, #new_entries)
     return shallow_merge(state, {
-      entries = new_entries, in_flight = #new_entries, pending = false,
+      entries = new_entries, in_flight = #new_entries,
+      pending_assistant_projection = NIL_SENTINEL,
+      pending = false,
     })
   end
   local e = state.entries[idx]
@@ -87,7 +90,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     or nil
 
   if state.in_flight == nil then
-    if final_text and #final_text > 0 then
+    if (final_text and #final_text > 0) or model ~= nil or duration_ms ~= nil then
       local new_entry = Entry.assistant_stream()
       new_entry = Entry.finalize(new_entry, {
         text = final_text, model = model, duration_ms = duration_ms,
@@ -100,12 +103,15 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
         pending              = false,
         turn_started_at      = NIL_SENTINEL,
         last_turn_duration_ms = turn_dur,
+        pending_assistant_projection = (new_entry.text or "") == ""
+          and #new_entries or NIL_SENTINEL,
       })
     end
     return shallow_merge(state, {
       pending              = false,
       turn_started_at      = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
+      pending_assistant_projection = NIL_SENTINEL,
     })
   end
 
@@ -123,6 +129,8 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
       pending              = false,
       turn_started_at      = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
+      pending_assistant_projection = (new_entry.text or "") == ""
+        and state.in_flight or NIL_SENTINEL,
     })
   end
 
@@ -131,7 +139,32 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     pending              = false,
     turn_started_at      = NIL_SENTINEL,
     last_turn_duration_ms = turn_dur,
+    pending_assistant_projection = NIL_SENTINEL,
   })
+end
+
+-- Structured-output providers finish the visible provider stream before the
+-- agentic loop projects the validated final answer as chat.message.append.
+-- Keep both halves in the provider entry so its reasoning, content, and stats
+-- retain one chronological position even when an asynchronous graph result
+-- lands between stream completion and durable projection.
+function M.project_assistant_message(state, text)
+  local idx = state.pending_assistant_projection
+  if idx == nil then return state, false end
+  local entry = idx and state.entries[idx] or nil
+  if entry == nil or entry.role ~= "assistant" or (entry.text or "") ~= "" then
+    return M.close_assistant_projection(state), false
+  end
+  local updated = Entry.set_text(entry, text)
+  return shallow_merge(state, {
+    entries = replace_entry(state.entries, idx, updated),
+    pending_assistant_projection = NIL_SENTINEL,
+  }), true
+end
+
+function M.close_assistant_projection(state)
+  if state.pending_assistant_projection == nil then return state end
+  return shallow_merge(state, { pending_assistant_projection = NIL_SENTINEL })
 end
 
 function M.attach_tool_end(state, id, output, error_flag)
