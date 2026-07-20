@@ -73,20 +73,22 @@ local CANNED_MAG_PROGRAM = table.concat({
   '(let [sx (nefor.actors.agent',
   '           (as nefor.actors.AgentConfig',
   '             {:id "sx" :model nil :profile "standard" :provider "mock-plugin"',
-  '              :system "Summarise octopuses in one sentence." :tools [] :da-policy nil})',
+  '              :system "Summarise octopuses in one sentence." :tools [] :da-policy nil',
+  '              :max-corrections 2})',
   '           (type-tag nefor.contracts.Task) "task" (type-tag OctopusSummary))',
   '      sy (nefor.actors.agent',
   '           (as nefor.actors.AgentConfig',
   '             {:id "sy" :model nil :profile "standard" :provider "mock-plugin"',
-  '              :system "Summarise lighthouses in one sentence." :tools [] :da-policy nil})',
-  '           (type-tag OctopusSummary) "generic-provider.FinalAnswer"',
+  '              :system "Summarise lighthouses in one sentence." :tools [] :da-policy nil',
+  '              :max-corrections 2})',
+  '           (type-tag (| OctopusSummary nefor.contracts.AgentError)) "nefor.agent.Result"',
   '           (type-tag LighthouseSummary))',
   '      combine (nefor.actors.agent',
   '                (as nefor.actors.AgentConfig',
   '                  {:id "combine" :model nil :profile "standard" :provider "mock-plugin"',
   '                   :system "Combine the two summaries above into one paragraph."',
-  '                   :tools [] :da-policy nil})',
-  '                (type-tag LighthouseSummary) "generic-provider.FinalAnswer"',
+  '                   :tools [] :da-policy nil :max-corrections 2})',
+  '                (type-tag (| LighthouseSummary nefor.contracts.AgentError)) "nefor.agent.Result"',
   '                (type-tag nefor.contracts.FinalAnswer))',
   '      chain (nefor.graph.connect (nefor.graph.connect sx sy) combine)',
   '      initial (nefor.graph.typed-message (get chain "input")',
@@ -257,6 +259,9 @@ end
 local function flatten_content(content)
   if type(content) ~= "table" then return content end
   if type(content.message) == "string" then return content.message end
+  if type(content.value) == "table" and type(content.value.prompt) == "string" then
+    return content.value.prompt
+  end
   local keys = {}
   for k in pairs(content) do keys[#keys + 1] = tostring(k) end
   table.sort(keys)
@@ -652,7 +657,12 @@ local function pick_response_for(chat_id)
   --    deterministic "I don't know what you mean, here's what I do
   --    know" answer.
   -- ----------------------------------------------------------------
-  return { text = HELP_TEXT, finish_reason = "stop" }
+  return {
+    text = MOCK_PROVIDER_BANNER
+        .. "\n\n[mock unmatched input: " .. tostring(last_user) .. "]\n"
+        .. HELP_BODY,
+    finish_reason = "stop",
+  }
 end
 
 -- Canned reasoning chunks emitted ahead of content for the orchestrator's
@@ -836,6 +846,16 @@ nefor.on(NAME .. ".chat.complete", function(body)
   interrupted[chat_id] = nil
 
   local resp = pick_response_for(chat_id)
+  -- The starter's agent boundary is typed: successful terminal text must be
+  -- a bare JSON FinalAnswer value. Tool-call and error turns use their own
+  -- wire shapes and deliberately bypass this encoding. Keep `resp.text`
+  -- human-readable for stream events; only the terminal provider result and
+  -- provider-side history carry the typed JSON wire value.
+  local result_text = resp.text
+  if not (type(resp.tool_calls) == "table" and #resp.tool_calls > 0)
+      and type(resp.text) == "string" and resp.finish_reason ~= "error" then
+    result_text = nefor.json.encode({ content = resp.text })
+  end
   nefor.log(string.format(
     "chat.complete chat_id=%s finish=%s text_len=%d tool_calls=%s",
     chat_id,
@@ -922,7 +942,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
 
   -- chat.complete.result with ProviderOut shape.
   local output = {
-    text          = resp.text or "",
+    text          = result_text or "",
     finish_reason = resp.finish_reason,
     usage         = {
       prompt_tokens     = 0,
@@ -951,7 +971,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
   if not chats[chat_id] then chats[chat_id] = {} end
   table.insert(chats[chat_id], {
     role       = "assistant",
-    content    = resp.text or "",
+    content    = result_text or "",
     tool_calls = resp.tool_calls,
   })
 end)

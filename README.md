@@ -120,6 +120,8 @@ composition belongs in Lua.
 ## Development
 
 All commands live in the [`justfile`](justfile). Run `just` to see the full list.
+Use `just test` for the fast default checks and `just test-integration` for the
+release-bundle and deterministic TUI daily-path suites.
 
 ## Docs
 

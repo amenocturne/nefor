@@ -50,6 +50,29 @@ cargo test -- --ignored
 
 Conventional pre-commit checks: `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings`. Both expected to pass on main.
 
+## Daily-path integration suites
+
+The process-level checks are intentionally separate from `just test`, so an
+ordinary unit-test run never depends on a PTY tool or terminal timing:
+
+```bash
+just test-release-bundle  # built artifacts match the runtime-plugin manifest
+just test-tui-scenarios   # real engine + starter + mock provider in a PTY
+just test-integration     # both suites
+```
+
+`test-tui-scenarios` uses the environment-managed `tui-driver`; it never clones
+or installs a test tool. The scenario pack covers first-turn completion,
+multi-turn readiness, permission/workflow mode switching, and triple-Escape
+interruption followed by a successful recovery turn. Every scenario receives
+its own `NEFOR_DATA_DIR`, disables live providers, and writes forensic bundles
+under `tmp/tui-driver-artifacts/`.
+
+Release bundles and source installs derive plugin names from Cargo packages
+under `plugins/`. The Cargo target name is authoritative, so the MAG runtime is
+shipped as `mag-plugin`; the separate `mag` compiler CLI is not mistaken for a
+runtime plugin. `share/nefor/plugins.manifest` records the exact expected set.
+
 ## Manual verification — agentic-cli surface
 
 The CLI is a pure-Lua plugin declared in `cli-config/init.lua`. Run via `nefor plugin agentic-cli ...`. Use the mock provider for deterministic testing without needing a live LLM.
@@ -275,7 +298,7 @@ The multi-agent kernel flow uses a separate pair — `CANNED_MAG_FILE` and `CANN
 - **Mock e2e suite**: 6 scenarios, all green, ~2.5s wall
 - **Clippy**: clean across `cargo clippy --workspace --all-targets -- -D warnings`
 - **Fmt**: clean
-- **TUI smoke**: renders, streams, slash commands, double-Esc fan-cancel all work against a real provider
+- **TUI scenarios**: first turn, multi-turn readiness, mode changes, and triple-Esc recovery pass against the deterministic mock
 - **CLI smoke**: single-shot canonical prompt produces canonical answer; REPL EOFs cleanly; all three formats work
 
 If those are all true, you have a healthy nefor.

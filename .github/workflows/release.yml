@@ -96,19 +96,7 @@ jobs:
           DIST=nefor-${{ matrix.target }}
           TARGET_BIN=target/${{ matrix.target }}/release
 
-          mkdir -p "$DIST/bin" "$DIST/share/nefor/plugins" "$DIST/share/nefor/starter"
-
-          cp "$TARGET_BIN/nefor" "$DIST/bin/nefor"
-
-          for p in plugins/*/; do
-            name=$(basename "$p")
-            bin="$TARGET_BIN/$name"
-            [ -f "$bin" ] && cp "$bin" "$DIST/share/nefor/plugins/$name"
-          done
-
-          cp -R starter/* "$DIST/share/nefor/starter/"
-          cp LICENSE README.md "$DIST/share/nefor/"
-          [ -f CHANGELOG.md ] && cp CHANGELOG.md "$DIST/share/nefor/" || true
+          tools/bundle-release.sh "$TARGET_BIN" "$DIST"
 
           tar -czf "$DIST.tar.gz" "$DIST"
           SHA256=$(shasum -a 256 "$DIST.tar.gz" | awk '{print $1}')

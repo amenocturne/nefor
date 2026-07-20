@@ -54,39 +54,48 @@ test-provider:
 test-tui:
     cargo test -p nefor-tui --lib
 
-# Drive the real starter with the same pinned tui-driver locally and in CI.
-test-tui-smoke:
+# Drive the real starter through the environment-managed tui-driver.
+test-tui-scenarios:
     #!/usr/bin/env bash
     set -euo pipefail
-    readonly tui_driver_rev="0919a8efb130f5e5784dab227a84550284e08ad4"
-    tui_driver_dir="${TUI_DRIVER_DIR:-{{ justfile_directory() }}/tmp/tui-driver}"
-    if [ ! -d "$tui_driver_dir/.git" ]; then
-      git clone --no-checkout https://github.com/amenocturne/tui-driver.git "$tui_driver_dir"
+    if ! command -v tui-driver >/dev/null 2>&1; then
+      echo "tui-driver is not installed; use this environment's managed installation" >&2
+      exit 127
     fi
-    if ! git -C "$tui_driver_dir" cat-file -e "$tui_driver_rev^{commit}" 2>/dev/null; then
-      git -C "$tui_driver_dir" fetch --depth 1 origin "$tui_driver_rev"
-    fi
-    git -C "$tui_driver_dir" checkout --detach "$tui_driver_rev"
-    test "$(git -C "$tui_driver_dir" rev-parse HEAD)" = "$tui_driver_rev"
     mkdir -p "{{ justfile_directory() }}/tmp"
-    data_dir="$(mktemp -d "{{ justfile_directory() }}/tmp/tui-driver-data.XXXXXX")"
-    trap 'rm -rf "$data_dir"' EXIT
+    suite_dir="$(mktemp -d "{{ justfile_directory() }}/tmp/tui-driver-suite.XXXXXX")"
+    trap 'rm -rf "$suite_dir"' EXIT
     rm -rf "{{ justfile_directory() }}/tmp/tui-driver-artifacts"
     cargo build --workspace --locked
-    cargo run --quiet --locked --manifest-path "$tui_driver_dir/Cargo.toml" -- \
-      run-script tests/tui/starter-mock-smoke.json \
-      --repo-root "{{ justfile_directory() }}" \
-      --artifacts-dir "{{ justfile_directory() }}/tmp/tui-driver-artifacts" \
-      --env "NEFOR_DATA_DIR=$data_dir" \
-      --env NEFOR_DEFAULT_PROVIDER=mock-plugin \
-      --env NEFOR_DEFAULT_MODEL=mock-model \
-      --env NEFOR_ENABLE_CHATGPT=0 \
-      --env NEFOR_ENABLE_OLLAMA=0 \
-      --env NEFOR_USE_REPO_PLUGIN_BINS=0 \
-      --env NEFOR_TEST_FAST_MOCK=1
+    scenarios=(
+      tests/tui/starter-mock-smoke.json
+      tests/tui/starter-mock-multi-turn.json
+      tests/tui/starter-mode-commands.json
+      tests/tui/starter-interrupt-recovery.json
+    )
+    for scenario in "${scenarios[@]}"; do
+      scenario_name="$(basename "$scenario" .json)"
+      data_dir="$suite_dir/$scenario_name"
+      mkdir -p "$data_dir"
+      fast_mock=1
+      if [ "$scenario_name" = "starter-interrupt-recovery" ]; then fast_mock=0; fi
+      tui-driver run-script "$scenario" \
+        --repo-root "{{ justfile_directory() }}" \
+        --artifacts-dir "{{ justfile_directory() }}/tmp/tui-driver-artifacts" \
+        --env "NEFOR_DATA_DIR=$data_dir" \
+        --env NEFOR_DEFAULT_PROVIDER=mock-plugin \
+        --env NEFOR_DEFAULT_MODEL=mock-model \
+        --env NEFOR_ENABLE_CHATGPT=0 \
+        --env NEFOR_ENABLE_OLLAMA=0 \
+        --env NEFOR_USE_REPO_PLUGIN_BINS=0 \
+        --env "NEFOR_TEST_FAST_MOCK=$fast_mock"
+    done
 
-# All local TUI confidence: renderer/unit coverage plus the real starter smoke.
-test-tui-all: test-tui test-tui-smoke
+# Backwards-compatible name for the full deterministic TUI scenario pack.
+test-tui-smoke: test-tui-scenarios
+
+# All local TUI confidence: renderer/unit coverage plus the real starter scenarios.
+test-tui-all: test-tui test-tui-scenarios
 
 # TUI chat workflow, replay, autocomplete, and input integration tests.
 test-tui-chat:
@@ -97,6 +106,14 @@ test-all:
     cargo test --workspace --exclude nefor-tui
     cargo test -p nefor-tui --lib
     cargo test -p nefor-tui --test chat_test -- --test-threads=1
+
+# Validate that a built workspace becomes a complete installable distribution.
+test-release-bundle:
+    cargo build --workspace --locked
+    tools/test-release-bundle.sh "{{ justfile_directory() }}/target/debug"
+
+# Deterministic process-level checks kept separate from the fast default suite.
+test-integration: test-release-bundle test-tui-scenarios
 
 # Clippy across the workspace with warnings promoted to errors — matches CI.
 lint:
@@ -205,13 +222,10 @@ install-nefor channel="source":
         cd "{{justfile_directory()}}"
         install -m 0755 "target/release/nefor" "$PREFIX/bin/nefor"
         echo "  $PREFIX/bin/nefor"
-        # Every workspace [[bin]] except the CLI entry and dev-only tools is
-        # a plugin. cargo metadata keeps bins whose name differs from their
-        # crate directory (mag-plugin) covered, and a missing build artifact
-        # fails the install instead of being silently skipped.
-        plugins=$(cargo metadata --no-deps --format-version 1 \
-          | jq -r '.packages[].targets[] | select(.kind[]=="bin") | .name' \
-          | grep -vx -e nefor -e fake-engine)
+        # Derive runtime plugins from packages physically under plugins/.
+        # Target names, not crate directories, are authoritative: the MAG
+        # runtime directory is `mag`, while its binary is `mag-plugin`.
+        plugins=$(tools/plugin-binaries.sh)
         for name in $plugins; do
           install -m 0755 "target/release/$name" "$LIBEXEC_BIN/$name"
           echo "  $LIBEXEC_BIN/$name"

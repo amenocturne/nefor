@@ -17,6 +17,7 @@
 //! - `nefor.sleep(ms)` — async sleep. Must be called from inside an async
 //!   handler context (mlua's async coroutine).
 //! - `nefor.log(msg)` — write to stderr via `tracing::info!`.
+//! - `nefor.json.{encode,decode}` — JSON conversion for scripted wire payloads.
 //!
 //! ## Synchronisation
 //!
@@ -188,8 +189,32 @@ impl LuaHost {
         self.install_emit(&nefor)?;
         self.install_emit_raw(&nefor)?;
         self.install_sleep(&nefor)?;
+        self.install_json(&nefor)?;
 
         lua.globals().set("nefor", nefor)?;
+        Ok(())
+    }
+
+    fn install_json(&self, nefor: &Table) -> Result<(), MockError> {
+        let lua = &self.inner.lua;
+        let json = lua.create_table()?;
+        json.set(
+            "encode",
+            lua.create_function(|_, value: Value| {
+                let value = lua_value_to_json(value)?;
+                serde_json::to_string(&value)
+                    .map_err(|error| mlua::Error::runtime(format!("nefor.json.encode: {error}")))
+            })?,
+        )?;
+        json.set(
+            "decode",
+            lua.create_function(|lua, source: String| {
+                let value: JsonValue = serde_json::from_str(&source)
+                    .map_err(|error| mlua::Error::runtime(format!("nefor.json.decode: {error}")))?;
+                json_value_to_lua(lua, &value)
+            })?,
+        )?;
+        nefor.set("json", json)?;
         Ok(())
     }
 
@@ -787,6 +812,28 @@ mod tests {
         host.exec_script("t", r#"nefor.log("hello from lua")"#)
             .await
             .expect("log call");
+    }
+
+    #[tokio::test]
+    async fn nefor_json_round_trips_script_values() {
+        let (tx, _rx) = mpsc::channel(4);
+        let host = LuaHost::new("mock-plugin", tx).expect("new");
+        let (encoded, decoded): (String, String) = host
+            .lua()
+            .load(
+                r#"
+                local encoded = nefor.json.encode({ content = "line 1\nline 2" })
+                return encoded, nefor.json.decode(encoded).content
+                "#,
+            )
+            .eval_async()
+            .await
+            .expect("json round trip");
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&encoded).expect("valid json"),
+            json!({ "content": "line 1\nline 2" })
+        );
+        assert_eq!(decoded, "line 1\nline 2");
     }
 
     #[tokio::test]

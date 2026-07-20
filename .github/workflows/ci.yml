@@ -25,6 +25,9 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --locked
 
+      - name: release bundle completeness
+        run: tools/test-release-bundle.sh "$PWD/target/debug"
+
       - name: cargo test
         run: |
           cargo test --workspace --exclude nefor-tui --locked
@@ -47,13 +50,16 @@ jobs:
 
       - uses: taiki-e/install-action@just
 
-      - name: Run TUI smoke scenario
-        run: just test-tui-smoke
+      - name: Install managed tui-driver
+        run: cargo install --git https://github.com/amenocturne/tui-driver.git --rev 0919a8efb130f5e5784dab227a84550284e08ad4 --locked tui-driver
+
+      - name: Run TUI daily-path scenarios
+        run: just test-tui-scenarios
 
       - name: Upload TUI smoke artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: tui-smoke-artifacts
+          name: tui-scenario-artifacts
           path: tmp/tui-driver-artifacts/
           if-no-files-found: ignore

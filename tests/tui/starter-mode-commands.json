@@ -1,0 +1,35 @@
+{
+  "name": "starter-permission-and-workflow-modes-remain-usable",
+  "command": {
+    "argv": ["bash", "tests/tui/run-nefor-under-test.sh"],
+    "cwd": ".",
+    "cols": 120,
+    "rows": 36
+  },
+  "steps": [
+    {"kind": "wait_text", "text": "mock-model", "timeout_ms": 30000},
+    {"kind": "type", "text": "/auto"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_text", "text": "AUTO", "timeout_ms": 10000},
+    {"kind": "type", "text": "/yolo"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_text", "text": "YOLO", "timeout_ms": 10000},
+    {"kind": "type", "text": "/safe"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_text", "text": "SAFE", "timeout_ms": 10000},
+    {"kind": "type", "text": "the secret key is mode-before"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_text", "text": "secret key is now", "timeout_ms": 30000},
+    {"kind": "wait_not_text", "text": "[thinking", "timeout_ms": 10000},
+    {"kind": "type", "text": "/mode default"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_not_text", "text": "mode-before", "timeout_ms": 10000},
+    {"kind": "type", "text": "the secret key is mode-ok"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_text", "text": "secret key is now", "timeout_ms": 30000},
+    {"kind": "wait_not_text", "text": "[thinking", "timeout_ms": 10000},
+    {"kind": "key", "key": "CtrlC"},
+    {"kind": "wait_text", "text": "NEFOR_EXIT_CODE=0", "timeout_ms": 10000},
+    {"kind": "wait_exit", "timeout_ms": 10000}
+  ]
+}
