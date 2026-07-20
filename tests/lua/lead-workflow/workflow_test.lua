@@ -326,6 +326,7 @@ do
   _test.calls_clear()
   execute_mag("system-overlay-execute", "system-overlay.mag")
   local modification = read_only_modification()
+  modification.actors[2].foreign = "nefor.factory.structured-output"
   modification.actors[2].params.profile = nil
   feed_loaded(modification)
   local exec = find_call(decode_calls(), function(c)
@@ -334,7 +335,8 @@ do
   assert_true(exec ~= nil, "configured universal system permits execution")
   local patch = exec.body.params_overlay["worker.llm"]
   assert_eq(patch.provider, "chatgpt", "ready agent receives default provider")
-  assert_eq(patch.model, "general-model", "ready agent receives default model")
+  assert_eq(patch.model, "general-model",
+    "structured-output ready agent receives default model")
   assert_eq(patch.reasoning_effort, "medium", "ready agent receives default effort")
   assert_eq(patch.system,
     "universal composed prompt\n\n---\n\nAnswer the task.",

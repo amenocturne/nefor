@@ -335,6 +335,11 @@ local function compose_agent_system(base, positional_overlay)
   return base
 end
 
+local function is_llm_actor(actor)
+  return actor.foreign == "nefor.factory.llm"
+      or actor.foreign == "nefor.factory.structured-output"
+end
+
 -- Resolve runtime-owned LLM parameters over an artifact's actors. A raw actor
 -- may select an explicit profile or reasoning effort; composition-provided
 -- ready agents omit both and receive the configured defaults. The runtime
@@ -372,7 +377,7 @@ local function resolve_agent_params(actors)
         model = resolved.model,
         reasoning_effort = resolved.reasoning_effort,
       }
-    elseif actor.foreign == "nefor.factory.llm" and not has_raw_effort then
+    elseif is_llm_actor(actor) and not has_raw_effort then
       if agent_defaults == nil then
         return nil, "llm actor '" .. tostring(actor.id) ..
           "' is missing required :profile. " ..
@@ -384,7 +389,7 @@ local function resolve_agent_params(actors)
         reasoning_effort = agent_defaults.reasoning_effort,
       }
     end
-    if actor.foreign == "nefor.factory.llm"
+    if is_llm_actor(actor)
         and agent_defaults ~= nil then
       overlay[actor.id] = overlay[actor.id] or {}
       overlay[actor.id].system = compose_agent_system(agent_defaults.system, params.system)
