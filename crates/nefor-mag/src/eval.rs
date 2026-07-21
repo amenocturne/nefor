@@ -55,6 +55,11 @@ pub mod fuel {
         })
     }
 
+    #[cfg(test)]
+    pub fn remaining() -> Option<u64> {
+        REMAINING.with(Cell::get)
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             if self.active {
@@ -120,11 +125,11 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, MagError> {
         Expr::Nil => Ok(Value::Unit),
         Expr::Keyword(v) => Ok(Value::Keyword(v.clone())),
         Expr::Symbol(v) => env.lookup(v).cloned(),
-        Expr::Vector(xs) => Ok(Value::Vector(
+        Expr::Vector(xs) => Ok(Value::Vector(std::sync::Arc::new(
             xs.iter()
                 .map(|x| eval_expr(env, x))
                 .collect::<Result<_, _>>()?,
-        )),
+        ))),
         Expr::Map(xs) => eval_map(env, xs),
         Expr::List(xs) => eval_list(env, xs),
     }
@@ -139,7 +144,7 @@ fn eval_map(env: &mut Env, pairs: &[(Expr, Expr)]) -> Result<Value, MagError> {
         };
         map.insert(key, eval_expr(env, v)?);
     }
-    Ok(Value::Map(map))
+    Ok(Value::Map(std::sync::Arc::new(map)))
 }
 
 fn eval_list(env: &mut Env, items: &[Expr]) -> Result<Value, MagError> {
@@ -278,7 +283,7 @@ fn eval_as(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     let ty = parse_type(env, &args[0], &HashSet::new())?;
     let value = eval_expr(env, &args[1])?;
     validate_value(env, &value, &ty)?;
-    Ok(Value::Typed(Box::new(raw(&value).clone()), ty))
+    Ok(Value::Typed(std::sync::Arc::new(raw(&value).clone()), ty))
 }
 
 fn eval_type_tag(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
@@ -707,6 +712,9 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
                     got: args.len(),
                 });
             }
+            if let Some(result) = caller.memoized_call(fun, args) {
+                return Ok(result);
+            }
             let (expected_return, type_bindings) = crate::checker::check_call(caller, fun, args)
                 .map_err(|error| match &fun.name {
                     Some(name) => MagError::Type(format!("calling {name}: {error}")),
@@ -718,6 +726,9 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
             }
             for (k, v) in &fun.closure {
                 env.define(k, v.clone());
+            }
+            if let Some(name) = &fun.name {
+                env.define(name, Value::Fn(fun.clone()));
             }
             env.push_scope();
             for (p, v) in fun.params.iter().zip(args) {
@@ -731,7 +742,9 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
                 out = eval_expr(&mut env, expr)?;
             }
             validate_value(caller, &out, &expected_return)?;
-            Ok(Value::Typed(Box::new(out), expected_return))
+            let result = Value::Typed(std::sync::Arc::new(out), expected_return);
+            caller.memoize_call(fun, args, &result);
+            Ok(result)
         }
         Value::BuiltinFn(name) => builtin(caller, name, args),
         _ => Err(MagError::Eval(format!("cannot call {}", f.type_name()))),
@@ -795,7 +808,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         "remove-at" => {
             arity(args, 2)?;
             let mut values = match raw(&args[0]) {
-                Value::List(values) | Value::Vector(values) => values.clone(),
+                Value::List(values) | Value::Vector(values) => values.as_ref().clone(),
                 _ => return Err(MagError::Eval("remove-at expects List".into())),
             };
             let index = match raw(&args[1]) {
@@ -813,7 +826,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 )));
             }
             values.remove(index);
-            Ok(Value::Vector(values))
+            Ok(Value::Vector(std::sync::Arc::new(values)))
         }
         "get" => {
             arity(args, 2)?;
@@ -829,19 +842,21 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         "assoc" => {
             arity(args, 3)?;
             let mut m = match raw(&args[0]) {
-                Value::Map(m) => m.clone(),
+                Value::Map(m) => m.as_ref().clone(),
                 _ => return Err(MagError::Eval("assoc expects a map".into())),
             };
             m.insert(
                 value_string(&args[1]).trim_start_matches(':').into(),
                 args[2].clone(),
             );
-            Ok(Value::Map(m))
+            Ok(Value::Map(std::sync::Arc::new(m)))
         }
         "keys" => {
             arity(args, 1)?;
             match raw(&args[0]) {
-                Value::Map(m) => Ok(Value::Vector(m.keys().cloned().map(Value::Str).collect())),
+                Value::Map(m) => Ok(Value::Vector(std::sync::Arc::new(
+                    m.keys().cloned().map(Value::Str).collect(),
+                ))),
                 _ => Err(MagError::Eval("keys expects a map".into())),
             }
         }
@@ -859,12 +874,12 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             arity(args, 2)?;
             match (raw(&args[0]), raw(&args[1])) {
                 (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{a}{b}"))),
-                (Value::Vector(a), Value::Vector(b)) => {
-                    Ok(Value::Vector(a.iter().chain(b).cloned().collect()))
-                }
-                (Value::List(a), Value::List(b)) => {
-                    Ok(Value::List(a.iter().chain(b).cloned().collect()))
-                }
+                (Value::Vector(a), Value::Vector(b)) => Ok(Value::Vector(std::sync::Arc::new(
+                    a.iter().chain(b.iter()).cloned().collect(),
+                ))),
+                (Value::List(a), Value::List(b)) => Ok(Value::List(std::sync::Arc::new(
+                    a.iter().chain(b.iter()).cloned().collect(),
+                ))),
                 _ => Err(MagError::Eval(
                     "concat expects matching strings or collections".into(),
                 )),
@@ -957,7 +972,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             let full = resolve_workspace_path(env.source_dir(), path)?;
             let mut s = env.read_file(&full, path)?;
             if let Some(Value::Map(m)) = args.get(1) {
-                for (k, v) in m {
+                for (k, v) in m.iter() {
                     s = s.replace(&format!("{{{{{k}}}}}"), &value_string(v));
                 }
             }
@@ -992,45 +1007,46 @@ fn collection_builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, Ma
     match name {
         "map" => {
             arity(args, 2)?;
-            Ok(Value::Vector(
+            Ok(Value::Vector(std::sync::Arc::new(
                 seq(&args[1])?
                     .iter()
                     .map(|v| apply(env, &args[0], std::slice::from_ref(v)))
                     .collect::<Result<_, _>>()?,
-            ))
+            )))
         }
         "indexed-map" => {
             arity(args, 2)?;
-            Ok(Value::Vector(
+            Ok(Value::Vector(std::sync::Arc::new(
                 seq(&args[1])?
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .enumerate()
                     .map(|(index, value)| apply(env, &args[0], &[Value::Int(index as i64), value]))
                     .collect::<Result<_, _>>()?,
-            ))
+            )))
         }
         "filter" => {
             arity(args, 2)?;
             let mut out = vec![];
-            for v in seq(&args[1])? {
+            for v in seq(&args[1])?.iter().cloned() {
                 if truthy(&apply(env, &args[0], std::slice::from_ref(&v))?) {
                     out.push(v)
                 }
             }
-            Ok(Value::Vector(out))
+            Ok(Value::Vector(std::sync::Arc::new(out)))
         }
         "flat-map" => {
             arity(args, 2)?;
             let mut out = vec![];
-            for v in seq(&args[1])? {
-                out.extend(seq(&apply(env, &args[0], &[v])?)?)
+            for v in seq(&args[1])?.iter().cloned() {
+                out.extend(seq(&apply(env, &args[0], &[v])?)?.iter().cloned())
             }
-            Ok(Value::Vector(out))
+            Ok(Value::Vector(std::sync::Arc::new(out)))
         }
         "fold" => {
             arity(args, 3)?;
             let mut acc = args[1].clone();
-            for v in seq(&args[2])? {
+            for v in seq(&args[2])?.iter().cloned() {
                 acc = apply(env, &args[0], &[acc, v])?;
             }
             Ok(acc)
@@ -1038,7 +1054,8 @@ fn collection_builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, Ma
         "sort-by" => {
             arity(args, 2)?;
             let mut keyed = seq(&args[1])?
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|value| {
                     let key = apply(env, &args[0], std::slice::from_ref(&value))?;
                     let key = key
@@ -1051,9 +1068,9 @@ fn collection_builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, Ma
                 })
                 .collect::<Result<Vec<_>, MagError>>()?;
             keyed.sort_by(|left, right| left.0.cmp(&right.0));
-            Ok(Value::Vector(
+            Ok(Value::Vector(std::sync::Arc::new(
                 keyed.into_iter().map(|(_, value)| value).collect(),
-            ))
+            )))
         }
         _ => unreachable!(),
     }
@@ -1097,7 +1114,10 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Value::Keyword(a), Value::Keyword(b)) => a == b,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::List(a), Value::List(b)) | (Value::Vector(a), Value::Vector(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(left, right)| equal(left, right))
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(left, right)| equal(left, right))
         }
         (Value::Map(a), Value::Map(b)) => {
             a.len() == b.len()
@@ -1135,7 +1155,7 @@ fn module_path(name: &str) -> Result<String, MagError> {
 fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
     if let Some(defs) = env.module_cached(name) {
         env.install_module(name, defs.clone());
-        return Ok(Value::Map(defs));
+        return Ok(Value::Map(std::sync::Arc::new(defs)));
     }
     env.begin_module(name)?;
     let relative = module_path(name)?;
@@ -1179,7 +1199,7 @@ fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
             for (module_name, module_defs) in env.loaded_modules() {
                 env.install_module(&module_name, module_defs);
             }
-            Ok(Value::Map(defs))
+            Ok(Value::Map(std::sync::Arc::new(defs)))
         }
         Err(e) => Err(e),
     }
@@ -1221,5 +1241,37 @@ fn maybe_require(env: &mut Env, items: &[Expr]) -> Option<Result<Value, MagError
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_call_reuses_the_cached_shared_result_without_spending_fuel() {
+        let source = r#"
+            (def values [1 2 3])
+            (def copy (fn [[items (List Int)]] -> (List Int)
+              (map (fn [[item Int]] -> Int item) items)))
+            (artifact "test.memo/v1" {})
+        "#;
+        let expressions = crate::parser::parse(&crate::lexer::tokenize(source).unwrap()).unwrap();
+        let mut env = Env::new();
+        let _fuel = fuel::install(1_000);
+        eval_program(&mut env, &expressions).unwrap();
+        let argument = env.lookup("values").unwrap().clone();
+
+        let first = apply_named(&env, "copy", argument.clone()).unwrap();
+        let after_first = fuel::remaining().unwrap();
+        let second = apply_named(&env, "copy", argument).unwrap();
+
+        assert_eq!(fuel::remaining(), Some(after_first));
+        match (first, second) {
+            (Value::Typed(left, _), Value::Typed(right, _)) => {
+                assert!(std::sync::Arc::ptr_eq(&left, &right));
+            }
+            values => panic!("expected typed results, got {values:?}"),
+        }
     }
 }

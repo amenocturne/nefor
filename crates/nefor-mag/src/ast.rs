@@ -59,14 +59,14 @@ pub struct FnValue {
     pub closure: Vec<(String, Value)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypeDecl {
     pub name: String,
     pub params: Vec<String>,
     pub body: MagType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForeignDecl {
     pub name: String,
     pub type_params: Vec<String>,
@@ -76,7 +76,7 @@ pub struct ForeignDecl {
     pub output: MagType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForeignEvidence {
     pub identity: String,
     pub arguments: Vec<MagType>,
@@ -99,9 +99,9 @@ pub enum Value {
     Bool(bool),
     Keyword(String),
     Symbol(String),
-    List(Vec<Value>),
-    Vector(Vec<Value>),
-    Map(BTreeMap<String, Value>),
+    List(Arc<Vec<Value>>),
+    Vector(Arc<Vec<Value>>),
+    Map(Arc<BTreeMap<String, Value>>),
     Fn(Arc<FnValue>),
     BuiltinFn(String),
     Type(MagType),
@@ -110,7 +110,7 @@ pub enum Value {
     Foreign(ForeignDecl),
     ForeignEvidence(ForeignEvidence),
     Artifact(Artifact),
-    Typed(Box<Value>, MagType),
+    Typed(Arc<Value>, MagType),
 }
 
 impl Value {

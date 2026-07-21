@@ -24,9 +24,26 @@ file reached through `(read path)` are immutable within one loaded program.
 The first read snapshots the file's raw contents; later reads of the same
 resolved path, including reads from resident functions, reuse that value. A
 file edit becomes visible only after a new load and compilation. This keeps
-evaluation referentially transparent within the compilation environment and
-permits structural sharing and function-result memoization without exposing
-runtime references in the language.
+evaluation referentially transparent within the compilation environment.
+
+The evaluator uses that invariant directly. Compound values have shared
+immutable storage, so ordinary binding and argument passing retain references
+to one allocation rather than recursively copying data. Completed pure calls
+are memoized by function identity and the identities of their immutable
+arguments. The cache is bounded and may evict entries; eviction affects only
+work performed, never the artifact. Neither storage identity nor memoization is
+observable or expressible in MAG.
+
+The evaluator still enforces expression-depth, call-depth, and total-step
+limits. They bound genuinely new or diverging work. Reusing a completed call
+returns its shared result without charging its body to the step budget again.
+
+In particular, graph nodes are ordinary immutable values. Constructing a node
+once and using its binding at several edge boundaries shares the original node
+and its stored projection internally. The graph remains only an edge set, and
+its complete node set is still derived from edge endpoints. No node list,
+reference value, registry, or add-node language surface follows from the
+implementation.
 
 ## Modules
 

@@ -183,12 +183,14 @@ pub fn json_to_value(value: &serde_json::Value) -> Value {
             .or_else(|| v.as_f64().map(Value::Float))
             .unwrap_or_else(|| Value::Str(v.to_string())),
         serde_json::Value::String(v) => Value::Str(v.clone()),
-        serde_json::Value::Array(v) => Value::Vector(v.iter().map(json_to_value).collect()),
-        serde_json::Value::Object(v) => Value::Map(
+        serde_json::Value::Array(v) => {
+            Value::Vector(std::sync::Arc::new(v.iter().map(json_to_value).collect()))
+        }
+        serde_json::Value::Object(v) => Value::Map(std::sync::Arc::new(
             v.iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
                 .collect(),
-        ),
+        )),
     }
 }
 
@@ -210,31 +212,31 @@ pub fn json_to_typed_value(
                 .collect();
             let body = substitute(&decl.body, &substitutions);
             Value::Typed(
-                Box::new(json_to_typed_value(env, value, &body)?),
+                std::sync::Arc::new(json_to_typed_value(env, value, &body)?),
                 ty.clone(),
             )
         }
-        MagType::List(item) => Value::Vector(
+        MagType::List(item) => Value::Vector(std::sync::Arc::new(
             value
                 .as_array()
                 .ok_or_else(|| MagError::Type(format!("expected {ty}")))?
                 .iter()
                 .map(|entry| json_to_typed_value(env, entry, item))
                 .collect::<Result<_, _>>()?,
-        ),
-        MagType::Map(_, item) => Value::Map(
+        )),
+        MagType::Map(_, item) => Value::Map(std::sync::Arc::new(
             value
                 .as_object()
                 .ok_or_else(|| MagError::Type(format!("expected {ty}")))?
                 .iter()
                 .map(|(key, entry)| Ok((key.clone(), json_to_typed_value(env, entry, item)?)))
                 .collect::<Result<BTreeMap<_, _>, MagError>>()?,
-        ),
+        )),
         MagType::Record(fields) => {
             let object = value
                 .as_object()
                 .ok_or_else(|| MagError::Type(format!("expected {ty}")))?;
-            Value::Map(
+            Value::Map(std::sync::Arc::new(
                 fields
                     .iter()
                     .map(|(key, field_type)| {
@@ -244,7 +246,7 @@ pub fn json_to_typed_value(
                         Ok((key.clone(), json_to_typed_value(env, field, field_type)?))
                     })
                     .collect::<Result<BTreeMap<_, _>, MagError>>()?,
-            )
+            ))
         }
         MagType::Union(variants) => {
             let selected = variants
@@ -257,11 +259,11 @@ pub fn json_to_typed_value(
                 })
                 .ok_or_else(|| MagError::Type(format!("value does not conform to {ty}")))?;
             Value::Typed(
-                Box::new(json_to_typed_value(env, value, selected)?),
+                std::sync::Arc::new(json_to_typed_value(env, value, selected)?),
                 ty.clone(),
             )
         }
-        MagType::Product(_) => Value::Typed(Box::new(json_to_value(value)), ty.clone()),
+        MagType::Product(_) => Value::Typed(std::sync::Arc::new(json_to_value(value)), ty.clone()),
         MagType::Data => json_to_value(value),
         MagType::Unit | MagType::Bool | MagType::Int | MagType::Float | MagType::String => {
             json_to_value(value)

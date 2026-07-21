@@ -1,9 +1,107 @@
-use crate::ast::TypeDecl;
-use crate::ast::Value;
+use crate::ast::{FnValue, TypeDecl, Value};
 use crate::error::MagError;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+const MEMOIZED_CALL_LIMIT: usize = 16_384;
+
+// Compound MAG values are immutable shared allocations. Holding the Value in
+// the key both keeps its allocation alive and lets repeated uses compare by
+// identity without walking large graphs. Scalars compare by value because
+// their identity is their value. Cache eviction changes cost, never semantics.
+#[derive(Debug, Clone)]
+struct MemoArg(Value);
+
+impl MemoArg {
+    fn new(value: &Value) -> Option<Self> {
+        if matches!(value, Value::Artifact(_)) {
+            None
+        } else {
+            Some(Self(value.clone()))
+        }
+    }
+}
+
+impl PartialEq for MemoArg {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Value::Unit, Value::Unit) => true,
+            (Value::Str(left), Value::Str(right))
+            | (Value::Keyword(left), Value::Keyword(right))
+            | (Value::Symbol(left), Value::Symbol(right))
+            | (Value::BuiltinFn(left), Value::BuiltinFn(right)) => left == right,
+            (Value::Int(left), Value::Int(right)) => left == right,
+            (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::List(left), Value::List(right)) => Arc::ptr_eq(left, right),
+            (Value::Vector(left), Value::Vector(right)) => Arc::ptr_eq(left, right),
+            (Value::Map(left), Value::Map(right)) => Arc::ptr_eq(left, right),
+            (Value::Fn(left), Value::Fn(right)) => Arc::ptr_eq(left, right),
+            (Value::Type(left), Value::Type(right))
+            | (Value::TypeTag(left), Value::TypeTag(right)) => left == right,
+            (Value::TypeDecl(left), Value::TypeDecl(right)) => left == right,
+            (Value::Foreign(left), Value::Foreign(right)) => left == right,
+            (Value::ForeignEvidence(left), Value::ForeignEvidence(right)) => left == right,
+            (Value::Typed(left, left_type), Value::Typed(right, right_type)) => {
+                left_type == right_type && Arc::ptr_eq(left, right)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MemoArg {}
+
+impl Hash for MemoArg {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.0).hash(state);
+        match &self.0 {
+            Value::Unit => {}
+            Value::Str(value)
+            | Value::Keyword(value)
+            | Value::Symbol(value)
+            | Value::BuiltinFn(value) => value.hash(state),
+            Value::Int(value) => value.hash(state),
+            Value::Float(value) => value.to_bits().hash(state),
+            Value::Bool(value) => value.hash(state),
+            Value::List(value) | Value::Vector(value) => Arc::as_ptr(value).hash(state),
+            Value::Map(value) => Arc::as_ptr(value).hash(state),
+            Value::Fn(value) => Arc::as_ptr(value).hash(state),
+            Value::Type(value) | Value::TypeTag(value) => value.hash(state),
+            Value::TypeDecl(value) => value.hash(state),
+            Value::Foreign(value) => value.hash(state),
+            Value::ForeignEvidence(value) => value.hash(state),
+            Value::Typed(value, ty) => {
+                Arc::as_ptr(value).hash(state);
+                ty.hash(state);
+            }
+            Value::Artifact(_) => unreachable!("artifacts are not memoized arguments"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemoCall {
+    function: Arc<FnValue>,
+    args: Vec<MemoArg>,
+}
+
+impl PartialEq for MemoCall {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.function, &other.function) && self.args == other.args
+    }
+}
+
+impl Eq for MemoCall {}
+
+impl Hash for MemoCall {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.function).hash(state);
+        self.args.hash(state);
+    }
+}
 
 #[derive(Debug, Default)]
 struct CompilationState {
@@ -11,6 +109,7 @@ struct CompilationState {
     loading: Vec<String>,
     foreign_identities: HashSet<String>,
     file_reads: HashMap<PathBuf, Result<String, String>>,
+    memoized_calls: HashMap<MemoCall, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,5 +366,37 @@ impl Env {
                 .map_err(|error| format!("cannot read {requested}: {error}"))
         });
         result.clone().map_err(MagError::Eval)
+    }
+
+    pub fn memoized_call(&self, function: &Arc<FnValue>, args: &[Value]) -> Option<Value> {
+        let args = args.iter().map(MemoArg::new).collect::<Option<Vec<_>>>()?;
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .memoized_calls
+            .get(&MemoCall {
+                function: function.clone(),
+                args,
+            })
+            .cloned()
+    }
+
+    pub fn memoize_call(&self, function: &Arc<FnValue>, args: &[Value], result: &Value) {
+        let Some(args) = args.iter().map(MemoArg::new).collect::<Option<Vec<_>>>() else {
+            return;
+        };
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Keep resident programs bounded even when rule functions see a long
+        // stream of distinct inputs. Clearing only forfeits prior work.
+        if state.memoized_calls.len() >= MEMOIZED_CALL_LIMIT {
+            state.memoized_calls.clear();
+        }
+        state.memoized_calls.insert(
+            MemoCall {
+                function: function.clone(),
+                args,
+            },
+            result.clone(),
+        );
     }
 }

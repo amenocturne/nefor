@@ -62,6 +62,21 @@ that snapshot, including resident function evaluation. To observe an edited
 file, load and compile the program again. Interpolation remains per call and is
 applied after retrieving the cached raw contents.
 
+Compound values are also structurally shared inside the evaluator. Binding,
+passing, and storing the same immutable list, map, or typed value keeps a small
+reference to its original allocation instead of copying the complete value.
+Completed pure function calls on the same function and shared argument values
+reuse their result within the loaded program. The memoization cache is bounded;
+eviction may cause recomputation but cannot change a MAG result. These are
+implementation properties, not reference or cache operations in the language.
+The expression-step limit remains a guard against genuinely new or diverging
+evaluation; a memoized call does not spend that budget on its body again.
+
+For graph libraries this means a node bound once can be used at any number of
+edge boundaries without duplicating its stored definition or reevaluating pure
+node projections. Graph membership remains wholly determined by those edge
+boundaries; there is still no separate node registry or add-node operation.
+
 ## Structural type descriptors
 
 `(type-schema (type-tag T))` reifies a JSON-representable MAG data type into a

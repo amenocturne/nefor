@@ -133,7 +133,7 @@ pub fn eval_fn(
         )));
     }
     let argument = Value::Typed(
-        Box::new(json::json_to_typed_value(
+        std::sync::Arc::new(json::json_to_typed_value(
             &program.env,
             &input,
             &input_type,
@@ -191,7 +191,9 @@ pub fn validate_rule_fn_input(
 fn extract_artifact(value: Value, source: &str) -> Result<Artifact, MagError> {
     match value {
         Value::Artifact(artifact) => Ok(artifact),
-        Value::Typed(inner, types::MagType::Artifact) => extract_artifact(*inner, source),
+        Value::Typed(inner, types::MagType::Artifact) => {
+            extract_artifact(inner.as_ref().clone(), source)
+        }
         other => Err(MagError::Eval(format!(
             "{source} must return Artifact, got {}",
             other.type_name()

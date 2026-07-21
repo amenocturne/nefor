@@ -404,6 +404,42 @@ fn recursive_evaluation_is_bounded() {
 }
 
 #[test]
+fn repeated_pure_calls_fit_the_budget_by_reusing_results() {
+    let root = workspace("memoized-budget");
+    let calls = std::iter::repeat_n("(identity value)", 28_000)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source = format!(
+        "(def value 7)\n(def identity (fn [[item Int]] -> Int item))\n(artifact \"test.memoized-budget/v1\" [{calls}])"
+    );
+
+    let artifact = compile(&source, &root).unwrap();
+    assert_eq!(artifact.data.as_array().unwrap().len(), 28_000);
+}
+
+#[test]
+fn named_functions_keep_their_lexical_recursive_binding() {
+    let root = workspace("lexical-recursion");
+    let artifact = compile(
+        r#"
+          (def walk (fn [[items (List Int)]] -> Int
+            (if (= (count items) 0)
+              0
+              (walk (remove-at items 0)))))
+          (def saved walk)
+          (def before (saved [1 2 3]))
+          (def walk (fn [[items (List Int)]] -> Int 99))
+          (artifact "test.lexical-recursion/v1"
+            {:before before :after (saved [1 2 3])})
+        "#,
+        &root,
+    )
+    .unwrap();
+
+    assert_eq!(artifact.data, json!({"before": 0, "after": 0}));
+}
+
+#[test]
 fn deeply_nested_non_function_expressions_are_bounded() {
     let root = workspace("expression-depth");
     let mut expression = String::from("\"value\"");

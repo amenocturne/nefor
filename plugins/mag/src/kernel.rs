@@ -707,6 +707,63 @@ mod tests {
         compile_mag_source(host, name, &source)
     }
 
+    #[test]
+    fn compile_reuses_shared_nodes_across_a_multi_agent_graph() {
+        let host = shipped_host();
+        let source = r#"
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+(def make-agent (fn [I O] [[id String] [input-type (TypeTag I)]
+                            [input-wire String] [output-type (TypeTag O)]]
+  -> (nefor.graph.Node I (| O nefor.contracts.AgentError))
+  (nefor.actors.agent
+    (as nefor.actors.AgentConfig
+      {:id id :model nil :profile nil :provider "test-provider"
+       :system "" :tools [] :da-policy nil :max-corrections 2})
+    input-type input-wire output-type)))
+
+(let [left-task (nefor.graph.source "left-task" (type-tag nefor.contracts.Task)
+                   (as nefor.contracts.Task {:prompt "left"}))
+      middle-task (nefor.graph.source "middle-task" (type-tag nefor.contracts.Task)
+                     (as nefor.contracts.Task {:prompt "middle"}))
+      right-task (nefor.graph.source "right-task" (type-tag nefor.contracts.Task)
+                    (as nefor.contracts.Task {:prompt "right"}))
+      left (make-agent "left" (type-tag nefor.contracts.Task) "task"
+             (type-tag nefor.contracts.FinalAnswer))
+      middle (make-agent "middle" (type-tag nefor.contracts.Task) "task"
+               (type-tag nefor.contracts.FinalAnswer))
+      right (make-agent "right" (type-tag nefor.contracts.Task) "task"
+              (type-tag nefor.contracts.FinalAnswer))
+      synthesis (make-agent "synthesis"
+                  (type-tag (+ (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)
+                               (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)
+                               (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+                  "nefor.agent.Result" (type-tag nefor.contracts.FinalAnswer))
+      result (nefor.graph.output "result"
+               (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+      topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+                 (nefor.graph.add-edges graph
+                   [(nefor.graph.edge left-task left)
+                    (nefor.graph.edge middle-task middle)
+                    (nefor.graph.edge right-task right)
+                    (nefor.graph.edge left synthesis)
+                    (nefor.graph.edge middle synthesis)
+                    (nefor.graph.edge right synthesis)
+                    (nefor.graph.edge synthesis result)]))]
+  (nefor.artifact.compile topology))
+"#;
+
+        let modification = compile_mag_source(&host, "shared-multi-agent", source);
+        assert_eq!(
+            modification["actors"].as_array().map(Vec::len),
+            Some(20),
+            "each node is lowered once even when it appears at multiple edge boundaries"
+        );
+    }
+
     fn documented_shell_expression(needle: &str) -> String {
         let patterns = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib/patterns.md"),
