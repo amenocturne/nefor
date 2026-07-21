@@ -19,6 +19,15 @@ host-recognized output wrapper. Its format is a qualified string identity and
 its data is an ordinary MAG value. Validation abstractions such as `Validated`
 are library-defined.
 
+Compilation is a snapshot boundary. Source modules, host inputs, and every
+file reached through `(read path)` are immutable within one loaded program.
+The first read snapshots the file's raw contents; later reads of the same
+resolved path, including reads from resident functions, reuse that value. A
+file edit becomes visible only after a new load and compilation. This keeps
+evaluation referentially transparent within the compilation environment and
+permits structural sharing and function-result memoization without exposing
+runtime references in the language.
+
 ## Modules
 
 - `core/types.mag` has module identity `core.types` and is imported with

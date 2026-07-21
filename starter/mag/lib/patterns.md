@@ -4,6 +4,8 @@ MAG programs load namespaced libraries with `(require "library.name")` and
 compose immutable values. Vectors are list literals; collection functions use
 prefix form: `(map function values)` and `(concat left right)`.
 Never write `(import ...)`; MAG modules use literal `(require "...")` forms.
+Each file used by `(read ...)` is snapshotted on first access for the loaded
+program. After editing that file, compile or reload the program to observe it.
 
 ## Graph model
 

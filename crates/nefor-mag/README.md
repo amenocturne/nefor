@@ -53,6 +53,15 @@ Libraries stop artifact construction with `(fail diagnostic-data)`. Immutable
 host data is available through the `inputs` map, for example
 `(get inputs :foreign_contracts)`.
 
+## Compilation snapshot
+
+A loaded MAG program observes immutable compilation inputs. Modules evaluate
+once, and the first `(read path)` snapshots that file's raw contents for the
+life of the loaded program; every later read of the same resolved path reuses
+that snapshot, including resident function evaluation. To observe an edited
+file, load and compile the program again. Interpolation remains per call and is
+applied after retrieving the cached raw contents.
+
 ## Structural type descriptors
 
 `(type-schema (type-tag T))` reifies a JSON-representable MAG data type into a

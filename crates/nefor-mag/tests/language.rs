@@ -158,6 +158,32 @@ fn immutable_inputs_are_visible_to_programs() {
 }
 
 #[test]
+fn file_reads_are_immutable_for_the_loaded_program() {
+    let root = workspace("file-read-snapshot");
+    fs::write(root.join("value.txt"), "first").unwrap();
+    fs::write(
+        root.join("main.mag"),
+        r#"
+          (def initial (read "value.txt"))
+          (def reread (fn [[ignored Unit]] -> Artifact
+            (artifact "test.file-read/v1" (read "value.txt"))))
+          (artifact "test.file-read/v1" initial)
+        "#,
+    )
+    .unwrap();
+
+    let loaded = load_with_inputs(&root, "main.mag", json!({})).unwrap();
+    assert_eq!(loaded.artifact.data, json!("first"));
+
+    fs::write(root.join("value.txt"), "second").unwrap();
+    let reread = eval_fn(&loaded, "reread", serde_json::Value::Null).unwrap();
+    assert_eq!(reread.data, json!("first"));
+
+    let reloaded = load_with_inputs(&root, "main.mag", json!({})).unwrap();
+    assert_eq!(reloaded.artifact.data, json!("second"));
+}
+
+#[test]
 fn fail_preserves_library_diagnostics() {
     let root = workspace("failure");
     let error = compile("(fail {:kind \"Invalid\" :errors [\"bad route\"]})", &root)

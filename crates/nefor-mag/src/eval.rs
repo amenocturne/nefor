@@ -955,8 +955,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 .as_str()
                 .ok_or_else(|| MagError::Eval("read path must be a string".into()))?;
             let full = resolve_workspace_path(env.source_dir(), path)?;
-            let mut s = std::fs::read_to_string(full)
-                .map_err(|e| MagError::Eval(format!("cannot read {path}: {e}")))?;
+            let mut s = env.read_file(&full, path)?;
             if let Some(Value::Map(m)) = args.get(1) {
                 for (k, v) in m {
                     s = s.replace(&format!("{{{{{k}}}}}"), &value_string(v));

@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
-struct Modules {
+struct CompilationState {
     loaded: HashMap<String, BTreeMap<String, Value>>,
     loading: Vec<String>,
     foreign_identities: HashSet<String>,
+    file_reads: HashMap<PathBuf, Result<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,7 +19,7 @@ pub struct Env {
     source_dir: PathBuf,
     module_roots: Vec<PathBuf>,
     module: String,
-    modules: Arc<Mutex<Modules>>,
+    state: Arc<Mutex<CompilationState>>,
     imports: HashSet<String>,
 }
 
@@ -34,21 +35,21 @@ impl Env {
             Path::new("."),
             vec![PathBuf::from(".")],
             "main",
-            Arc::new(Mutex::new(Modules::default())),
+            Arc::new(Mutex::new(CompilationState::default())),
         )
     }
     fn new_in(
         source_dir: &Path,
         module_roots: Vec<PathBuf>,
         module: &str,
-        modules: Arc<Mutex<Modules>>,
+        state: Arc<Mutex<CompilationState>>,
     ) -> Self {
         let mut env = Self {
             scopes: vec![HashMap::new()],
             source_dir: source_dir.into(),
             module_roots,
             module: module.into(),
-            modules,
+            state,
             imports: HashSet::new(),
         };
         for name in [
@@ -110,7 +111,7 @@ impl Env {
             path,
             module_roots,
             "main",
-            Arc::new(Mutex::new(Modules::default())),
+            Arc::new(Mutex::new(CompilationState::default())),
         )
     }
     pub fn source_dir(&self) -> &Path {
@@ -172,7 +173,7 @@ impl Env {
             source_dir: self.source_dir.clone(),
             module_roots: self.module_roots.clone(),
             module: self.module.clone(),
-            modules: self.modules.clone(),
+            state: self.state.clone(),
             imports: self.imports.clone(),
         }
     }
@@ -189,7 +190,7 @@ impl Env {
             .collect()
     }
     pub fn module_cached(&self, name: &str) -> Option<BTreeMap<String, Value>> {
-        self.modules
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .loaded
@@ -197,7 +198,7 @@ impl Env {
             .cloned()
     }
     pub fn loaded_modules(&self) -> Vec<(String, BTreeMap<String, Value>)> {
-        self.modules
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .loaded
@@ -206,7 +207,7 @@ impl Env {
             .collect()
     }
     pub fn begin_module(&self, name: &str) -> Result<(), MagError> {
-        let mut m = self.modules.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(at) = m.loading.iter().position(|x| x == name) {
             let mut cycle = m.loading[at..].to_vec();
             cycle.push(name.into());
@@ -219,8 +220,8 @@ impl Env {
         Ok(())
     }
     pub fn register_foreign(&self, identity: &str) -> Result<(), MagError> {
-        let mut modules = self.modules.lock().unwrap_or_else(|e| e.into_inner());
-        if !modules.foreign_identities.insert(identity.to_string()) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.foreign_identities.insert(identity.to_string()) {
             return Err(MagError::Type(format!(
                 "duplicate foreign declaration for {identity}"
             )));
@@ -228,7 +229,7 @@ impl Env {
         Ok(())
     }
     pub fn finish_module(&mut self, name: &str, defs: BTreeMap<String, Value>) {
-        let mut m = self.modules.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
         m.loading.pop();
         m.loaded.insert(name.into(), defs.clone());
         drop(m);
@@ -250,11 +251,21 @@ impl Env {
             &self.source_dir,
             self.module_roots.clone(),
             name,
-            self.modules.clone(),
+            self.state.clone(),
         );
         if let Ok(inputs) = self.lookup("inputs") {
             env.define("inputs", inputs.clone());
         }
         env
+    }
+
+    pub fn read_file(&self, path: &Path, requested: &str) -> Result<String, MagError> {
+        let key = path.to_path_buf();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let result = state.file_reads.entry(key.clone()).or_insert_with(|| {
+            std::fs::read_to_string(&key)
+                .map_err(|error| format!("cannot read {requested}: {error}"))
+        });
+        result.clone().map_err(MagError::Eval)
     }
 }
