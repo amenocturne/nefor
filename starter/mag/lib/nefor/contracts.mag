@@ -39,6 +39,8 @@
                   :timeout_ms Data})
 (type HumanParams {:prompt String})
 (type SinkParams {})
+(type SourceParams [T] {:value T})
+(type OutputParams {})
 (type StructuredOutputParams {:model Data
                               :profile Data
                               :provider String
@@ -94,6 +96,16 @@
   {:params SinkParams
    :input T
    :output Unit})
+
+(foreign nefor.factory.source [T]
+  {:params (SourceParams T)
+   :input Unit
+   :output T})
+
+(foreign nefor.factory.output [T]
+  {:params OutputParams
+   :input T
+   :output T})
 
 (foreign nefor.factory.collector [T]
   {:params CollectorParams

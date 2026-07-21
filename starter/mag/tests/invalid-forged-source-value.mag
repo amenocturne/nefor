@@ -1,0 +1,22 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+
+;; Reusing valid source evidence cannot authorize a captured value of another
+;; type. The pure boundary validator checks the value against that evidence.
+(let [legitimate (nefor.graph.source "start" (type-tag String) "valid")
+      original (first (get legitimate "actors"))
+      forged-actor (as nefor.graph.Actor
+        {:id (get original "id")
+         :foreign (get original "foreign")
+         :evidence (get original "evidence")
+         :params {:value 42}
+         :input (get original "input")
+         :outputs (get original "outputs")})
+      forged (nefor.graph.node "start" "source" [forged-actor]
+               (as (List nefor.graph.StoredRoute) [])
+               (get legitimate "messages")
+               (get legitimate "input") (get legitimate "output"))
+      result (nefor.graph.output "result" (type-tag String))]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base [(nefor.graph.edge forged result)]))))

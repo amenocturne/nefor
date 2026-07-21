@@ -116,7 +116,9 @@ local function format_routes(routes)
     local dests = routes[ty]
     local names = {}
     if type(dests) == "table" then
-      for _, d in ipairs(dests) do names[#names + 1] = tostring(d) end
+      for _, destination in ipairs(dests) do
+        names[#names + 1] = tostring(destination.actor) .. "/" .. tostring(destination.wire)
+      end
     end
     parts[#parts + 1] = ty .. " -> " .. table.concat(names, ", ")
   end

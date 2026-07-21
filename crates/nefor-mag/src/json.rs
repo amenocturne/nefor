@@ -92,6 +92,87 @@ pub(crate) fn type_evidence_to_json(ty: &MagType) -> Result<serde_json::Value, M
     })
 }
 
+pub(crate) fn type_evidence_from_json(value: &serde_json::Value) -> Result<MagType, MagError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| MagError::Type("type evidence must be an object".into()))?;
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| MagError::Type("type evidence needs a string kind".into()))?;
+    let string = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| MagError::Type(format!("type evidence needs string field {name}")))
+    };
+    let nested = |name: &str| {
+        object
+            .get(name)
+            .ok_or_else(|| MagError::Type(format!("type evidence needs field {name}")))
+            .and_then(type_evidence_from_json)
+    };
+    let items = |name: &str| -> Result<Vec<MagType>, MagError> {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| MagError::Type(format!("type evidence needs list field {name}")))?
+            .iter()
+            .map(type_evidence_from_json)
+            .collect()
+    };
+    Ok(match kind {
+        "primitive" => match string("name")?.as_str() {
+            "Data" => MagType::Data,
+            "Unit" => MagType::Unit,
+            "Bool" => MagType::Bool,
+            "Int" => MagType::Int,
+            "Float" => MagType::Float,
+            "String" => MagType::String,
+            name => {
+                return Err(MagError::Type(format!(
+                    "unknown primitive type evidence {name}"
+                )))
+            }
+        },
+        "named" => MagType::Named(string("name")?, items("arguments")?),
+        "list" => MagType::List(Box::new(nested("item")?)),
+        "map" => MagType::Map(Box::new(nested("key")?), Box::new(nested("value")?)),
+        "record" => {
+            let fields = object
+                .get("fields")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| MagError::Type("record type evidence needs fields".into()))?
+                .iter()
+                .map(|field| {
+                    let field = field.as_object().ok_or_else(|| {
+                        MagError::Type("record type evidence field must be an object".into())
+                    })?;
+                    let name = field
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            MagError::Type("record type evidence field needs a name".into())
+                        })?;
+                    let ty = field.get("type").ok_or_else(|| {
+                        MagError::Type("record type evidence field needs a type".into())
+                    })?;
+                    Ok((name.to_owned(), type_evidence_from_json(ty)?))
+                })
+                .collect::<Result<_, MagError>>()?;
+            MagType::Record(fields)
+        }
+        "union" => MagType::Union(items("items")?),
+        "product" => MagType::Product(items("items")?),
+        unknown => {
+            return Err(MagError::Type(format!(
+                "unknown type evidence kind {unknown}"
+            )))
+        }
+    })
+}
+
 pub fn json_to_value(value: &serde_json::Value) -> Value {
     match value {
         serde_json::Value::Null => Value::Unit,

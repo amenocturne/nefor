@@ -1,0 +1,13 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+
+;; The pass-through output is a single, unambiguous result boundary. Multiple
+;; incoming edges require an explicit combining node before it.
+(let [left (nefor.graph.source "left" (type-tag Unit) nil)
+      right (nefor.graph.source "right" (type-tag Unit) nil)
+      result (nefor.graph.output "result" (type-tag Unit))]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge left result)
+         (nefor.graph.edge right result)]))))

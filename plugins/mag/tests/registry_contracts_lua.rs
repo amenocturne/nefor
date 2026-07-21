@@ -140,13 +140,61 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
       local mismatched=reg:validate_modification({actors={
         {id="source",factory="producer",evidence={version=2,identity="nefor.factory.producer",
           arguments={p("String")},input=p("Unit"),output=p("String")},input={type=p("Unit"),wire="Start"},
-          outputs={{type=p("String"),wire="Same"}},routes={["Same"]={"dest"}}},
+          outputs={{type=p("String"),wire="Same"}},routes={["Same"]={{actor="dest",wire="Same"}}}},
         {id="dest",factory="consumer",evidence={version=2,identity="nefor.factory.consumer",
           arguments={p("Int")},input=p("Int"),output=p("Unit")},input={type=p("Int"),wire="Same"},
           outputs={{type=p("Unit"),wire="Done"}},routes={}}
       }})
       assert(not mismatched.ok)
       assert(table.concat(mismatched.errors,"; "):find("semantic endpoint types differ"))
+
+      assert(reg:register({declaration={name="product-consumer",type_variables={"T"},
+        semantic={input={kind="product",items={v("T"),v("T")}},output=p("Unit"),
+          inputs={{wire="Pair",type={kind="product",items={v("T"),v("T")}}}},
+          outputs={{wire="Done",type=p("Unit")}}},params={},inputs={value={"Pair","Pair"}},outputs={"Done"}},
+        construct=function() return {} end}))
+      local repeated_product_actors={
+        {id="left",factory="producer",evidence={version=2,identity="nefor.factory.producer",
+          arguments={p("String")},input=p("Unit"),output=p("String")},input={type=p("Unit"),wire="Start"},
+          outputs={{type=p("String"),wire="Same"}},routes={Same={{actor="pair",wire="Pair"}}}},
+        {id="right",factory="producer",evidence={version=2,identity="nefor.factory.producer",
+          arguments={p("String")},input=p("Unit"),output=p("String")},input={type=p("Unit"),wire="Start"},
+          outputs={{type=p("String"),wire="Same"}},routes={Same={{actor="pair",wire="Pair"}}}},
+        {id="pair",factory="product-consumer",evidence={version=2,identity="nefor.factory.product-consumer",
+          arguments={p("String")},input={kind="product",items={p("String"),p("String")}},output=p("Unit")},
+          input={type={kind="product",items={p("String"),p("String")}},wire="Pair"},
+          outputs={{type=p("Unit"),wire="Done"}},routes={}}
+      }
+      local repeated_product=reg:validate_modification({actors=repeated_product_actors})
+      assert(repeated_product.ok,table.concat(repeated_product.errors or {},"; "))
+      local killed_source=reg:validate_modification({kills={"right"}},nil,repeated_product_actors)
+      assert(not killed_source.ok)
+      assert(table.concat(killed_source.errors,"; "):find("component multiset"))
+      local killed_target=reg:validate_modification({kills={"pair"}},nil,repeated_product_actors)
+      assert(killed_target.ok,table.concat(killed_target.errors or {},"; "))
+      local tombstoned_right=repeated_product_actors[2]
+      local dead_respawn=reg:validate_modification(
+        {actors={tombstoned_right}},
+        function(id)
+          if id=="right" then return "nefor.factory.producer","dead",tombstoned_right end
+          if id=="left" then return "nefor.factory.producer","alive",repeated_product_actors[1] end
+          if id=="pair" then return "nefor.factory.product-consumer","alive",repeated_product_actors[3] end
+          return nil
+        end,
+        {repeated_product_actors[1],repeated_product_actors[3]})
+      assert(not dead_respawn.ok)
+      assert(table.concat(dead_respawn.errors,"; "):find("component multiset"))
+      local underfilled=reg:validate_modification({actors={
+        repeated_product_actors[1],repeated_product_actors[3]}})
+      assert(not underfilled.ok)
+      assert(table.concat(underfilled.errors,"; "):find("component multiset"))
+      local third={id="third",factory="producer",evidence={version=2,identity="nefor.factory.producer",
+        arguments={p("String")},input=p("Unit"),output=p("String")},input={type=p("Unit"),wire="Start"},
+        outputs={{type=p("String"),wire="Same"}},routes={Same={{actor="pair",wire="Pair"}}}}
+      local overfilled=reg:validate_modification({actors={
+        repeated_product_actors[1],repeated_product_actors[2],third,repeated_product_actors[3]}})
+      assert(not overfilled.ok)
+      assert(table.concat(overfilled.errors,"; "):find("component multiset"))
 
       assert(reg:register({declaration={name="choice",type_variables={"A","B"},
         semantic={input=p("Unit"),output={kind="union",items={v("A"),v("B")}},inputs={{wire="Start",type=p("Unit")}},outputs={{wire="Left",type=v("A")},{wire="Right",type=v("B")}}},params={},inputs={start="Start"},outputs={"Left","Right"}},

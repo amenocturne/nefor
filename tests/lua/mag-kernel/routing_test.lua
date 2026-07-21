@@ -136,7 +136,7 @@ do
     got[#got + 1] = activation.messages[1]
     return "ok"
   end)
-  local a = spawn_actor(h, "a", "producer", { ["hop.Ping"] = { "b" } }, function(self, activation)
+  local a = spawn_actor(h, "a", "producer", { ["hop.Ping"] = { { actor = "b", wire = "hop.Ping" } } }, function(self, activation)
     -- On its own activation, emit an id-signed output that routes to b.
     self.emit({ kind = "hop.Ping", from = self.id, payload = "hello-from-a" })
     return "ok"
@@ -210,7 +210,7 @@ do
   })
 
   spawn_actor(h, "b", "consumer", {}, function() return "ok" end)
-  local a = spawn_actor(h, "a", "producer", { ["hop.Ping"] = { "b" } }, function(self)
+  local a = spawn_actor(h, "a", "producer", { ["hop.Ping"] = { { actor = "b", wire = "hop.Ping" } } }, function(self)
     self.emit({ kind = "hop.Ping", from = self.id, payload = "x" })
     return "ok"
   end)
@@ -243,7 +243,7 @@ do
     return "ok"
   end)
 
-  local w = spawn_actor(h, "w", "worker", { ["job.Done"] = { "out" } }, function(self, activation)
+  local w = spawn_actor(h, "w", "worker", { ["job.Done"] = { { actor = "out", wire = "job.Done" } } }, function(self, activation)
     if activation.kind == "reply" then
       -- Capability answered: emit the final output, then complete.
       self.emit({ kind = "job.Done", from = self.id, answer = activation.result.value })
@@ -297,8 +297,8 @@ do
     return "ok"
   end)
   -- Two distinct upstreams, each routing mag.Unit into the same product input.
-  local u1 = spawn_actor(h, "u1", "upstream", { ["mag.Unit"] = { "j" } }, function() return "ok" end)
-  local u2 = spawn_actor(h, "u2", "upstream", { ["mag.Unit"] = { "j" } }, function() return "ok" end)
+  local u1 = spawn_actor(h, "u1", "upstream", { ["mag.Unit"] = { { actor = "j", wire = "mag.Unit" } } }, function() return "ok" end)
+  local u2 = spawn_actor(h, "u2", "upstream", { ["mag.Unit"] = { { actor = "j", wire = "mag.Unit" } } }, function() return "ok" end)
   h.router:on_ready("j")
   u1.emit({ kind = "mag.ready", from = "u1" })
   u2.emit({ kind = "mag.ready", from = "u2" })
@@ -337,7 +337,7 @@ do
   end)
   -- The dependency edge is a mag.Unit route on the upstream — a route key that
   -- is NOT a declared factory output; the kernel emits it on completion.
-  local t = spawn_actor(h, "t", "task", { ["mag.Unit"] = { "d" } }, function(self)
+  local t = spawn_actor(h, "t", "task", { ["mag.Unit"] = { { actor = "d", wire = "mag.Unit" } } }, function(self)
     -- The factory does its work and returns a normal completion. It never
     -- emits mag.Unit and does not know a dependency edge exists.
     return "ok"
@@ -497,7 +497,7 @@ do
     return "ok"
   end)
   ready(h, c)
-  local w2 = spawn_actor(h, "w2", "worker", { ["mag.Failed"] = { "c" } }, function()
+  local w2 = spawn_actor(h, "w2", "worker", { ["mag.Failed"] = { { actor = "c", wire = "mag.Failed" } } }, function()
     return { status = "failed", failure = "mag.Failed", value = { error = "handled" } }
   end)
   ready(h, w2)

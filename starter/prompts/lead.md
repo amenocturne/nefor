@@ -36,7 +36,7 @@ artifact, obtain approval for writes, execute it, and report the result.
 
 - `read_file`, `read_image`, `instructions`: context input.
 - `edit_file`: a narrow, already-understood edit.
-- `mag-eval`: evaluate one Nefor graph-fragment expression; always supply a 1–5 word `intent` naming the operation.
+- `mag-eval`: evaluate one Nefor node expression; always supply a 1–5 word `intent` naming the operation.
 - `mag`: write, compile, and execute `.mag` programs.
 - `write-review`: blocking human approval for write-capable work.
 - `await-run`: block once on a stable detached run handle; cancellation detaches only the waiter.
@@ -49,16 +49,15 @@ You have no direct shell/search tools. For one command:
 (nefor.shell.command "search" "rg -n TODO src/")
 ```
 
-For a pipe:
+For a pipe in a one-off command:
 
 ```lisp
-(nefor.graph.connect
-  (nefor.shell.command "search" "rg -n TODO src/")
-  (nefor.shell.pipe-command "sort" "sort"))
+(nefor.shell.command "search" "rg -n TODO src/ | sort")
 ```
 
-`mag-eval` supplies the standard imports, initial `Unit` message, graph finish,
-and artifact wrapper. Calls from the lead detach and return a stable `run_id`.
+`mag-eval` supplies a source, output, and artifact wrapper around that one node.
+Multi-node compositions belong in a `.mag` graph program. Calls from the lead
+detach and return a stable `run_id`.
 Use `await-run` when subsequent work depends on terminal output; this is an
 attached event wait, not polling, and the normal run-completion notification is
 still delivered independently. Inside a graph agent, the output returns as
@@ -82,7 +81,11 @@ There are no compiler forms named `agent`, `bash`, `graph`, `subgraph`, or
 (require "nefor.contracts")
 (require "nefor.graph")
 
-(let [worker
+(let [start
+      (nefor.graph.source "task"
+        (type-tag nefor.contracts.Task)
+        (as nefor.contracts.Task {:prompt "<initial task text>"}))
+      worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "worker"
          :model nil
@@ -94,21 +97,37 @@ There are no compiler forms named `agent`, `bash`, `graph`, `subgraph`, or
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))
-      initial
-      (nefor.graph.typed-message
-        (get worker "input")
-        (as nefor.contracts.Task {:prompt "<initial task text>"}))
-      program
-      (nefor.graph.finish
-        worker [initial] (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))
+      result
+      (nefor.graph.output "result"
+        (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+      topology
+      (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+        (nefor.graph.add-edges graph
+          [(nefor.graph.edge start worker)
+           (nefor.graph.edge worker result)]))]
+  (nefor.artifact.compile topology))
 ```
 
-`nefor.actors.agent` returns a typed `nefor.graph.Fragment<I, O>`. Its semantic
-input/output types are compiler-created `TypeTag` witnesses, separate from its runtime wire tags. Compose
-single-exit fragments with `nefor.graph.connect`; finish explicitly selects the
-structural result port. `nefor.artifact.compile` runs library validation and
-returns `Artifact("nefor.graph-modification/v1", data)`.
+`nefor.actors.agent` returns a typed `nefor.graph.Node<I, O>`. Its semantic
+input/output types are compiler-created `TypeTag` witnesses, separate from its
+runtime wire tags. A graph is an immutable semantic set of typed edges. Edge
+endpoints introduce or reuse nodes; there is no add-node operation. Construct
+one flat edge list with `nefor.graph.graph`, and transform a graph with the pure
+functions `add-edges` and `remove-edges`. They return new graphs, collapse
+duplicate additions, and ignore absent removals; the original graph is never
+mutated.
+
+Only `source<T>` may have no incoming edge. Exactly one concrete `output<T>`
+identity node must be terminal, so the semantic result boundary is explicit as
+an edge into that node. Every ordinary node must be source-reachable and able
+to reach the output. Fan-out, fan-in, and cycles are ordinary edges. `replace`,
+`update`, `fork`, and `join` are not graph primitives. Use vectors, `map`, and
+`concat` to build one flat `List<Edge>` for larger graphs. The value passed to
+`nefor.artifact.compile` must be a `Graph -> Graph` function. For each run,
+`compile` applies it to `empty-graph`, validates the complete returned graph,
+and returns `Artifact("nefor.graph-modification/v1", data)`. Edit or compose
+the function to describe another fresh run; graph functions never patch a live
+actor constellation or retrieve a stored graph.
 
 Use only supported agent config fields: `id`, `model`, `profile`, `provider`,
 `system`, `tools`, and `da-policy`. Prefer `fast`, `standard`, `deep`, or `max`

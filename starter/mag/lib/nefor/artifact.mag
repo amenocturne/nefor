@@ -4,11 +4,13 @@
 (def format "nefor.graph-modification/v1")
 (def delta-format "nefor.graph-delta/v1")
 
-;; Validation and lowering are explicit library calls. The host recognizes
-;; only the final Artifact wrapper.
-(def compile (fn [[graph nefor.graph.Graph]]
+;; Authored programs are pure Graph -> Graph transformations. Compilation
+;; applies one to empty-graph; the host recognizes only the final Artifact
+;; wrapper and executes it as a fresh run.
+(def compile (fn [[transform (Fn nefor.graph.Graph nefor.graph.Graph)]]
                  -> Artifact
-  (let [checked (nefor.graph.validate
+  (let [graph (transform nefor.graph.empty-graph)
+        checked (nefor.graph.validate
                   graph
                   (map nefor.graph.foreign-contract
                        (as (List Data)
@@ -20,6 +22,26 @@
         (nefor.graph.lower
           (get (as (core.validated.Valid nefor.graph.Graph) checked)
                "value")))
+      (let [ignored (fail checked)]
+        (artifact format {}))))))
+
+(def compile-program (fn [[transform (Fn nefor.graph.Graph nefor.graph.Graph)]
+                          [rules (List nefor.graph.Rule)]]
+                         -> Artifact
+  (let [graph (transform nefor.graph.empty-graph)
+        checked (nefor.graph.validate
+                  graph
+                  (map nefor.graph.foreign-contract
+                       (as (List Data)
+                           (get (as (Map String Data) inputs)
+                                "foreign_contracts"))))
+        checked-tag (get checked "tag")]
+    (if (= checked-tag "core.validated.Valid")
+      (artifact format
+        (nefor.graph.lower-program
+          (as nefor.graph.Program
+            {:graph (get (as (core.validated.Valid nefor.graph.Graph) checked) "value")
+             :rules rules})))
       (let [ignored (fail checked)]
         (artifact format {}))))))
 

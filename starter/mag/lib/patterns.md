@@ -1,22 +1,35 @@
-# MAG patterns — canonical authoring contract
+# MAG graph cookbook
 
-MAG programs load namespaced libraries with the literal string form
-`(require "library.name")`. A module such as `nefor.actors` then exposes
-qualified symbols such as `nefor.actors.agent` and
-`nefor.actors.AgentConfig`.
+MAG programs load namespaced libraries with `(require "library.name")` and
+compose immutable values. Vectors are list literals; collection functions use
+prefix form: `(map function values)` and `(concat left right)`.
+Never write `(import ...)`; MAG modules use literal `(require "...")` forms.
 
-Never write `(import ...)`: MAG has no `import` form. Never use the removed
-bare helpers `agent`, `node`, or `graph`. Do not copy syntax from historical
-session files under the session data directory; those files may have been
-written for an older dialect. This document and successful compilation by the
-current MAG compiler are the syntax authority.
+## Graph model
 
-## Complete minimal agent program
+A graph is a semantic set of typed edges. Its deterministic list backing is an
+implementation detail. Edge endpoints carry their node definitions, so an edge
+introduces both missing nodes and reuses equal definitions with the same id.
+There is no add-node operation.
 
-This is the complete current shape. Keep the `require` forms, construct the
-configuration as `nefor.actors.AgentConfig`, pass semantic type witnesses and
-runtime wire names separately, provide the initial message, select the result
-with `nefor.graph.finish`, and return a compiled artifact.
+```text
+(nefor.graph.graph edges)
+(nefor.graph.add-edges topology added)
+(nefor.graph.remove-edges topology removed)
+```
+
+All three are total pure functions. Adding an existing edge and removing an
+absent edge return the same graph. Duplicate edges collapse. `replace`,
+`update`, `fork`, and `join` are not graph primitives.
+
+Graph functions construct definitions; they do not mutate a running actor
+constellation. An authored program is a `Graph -> Graph` function.
+`nefor.artifact.compile` applies it to `empty-graph`, validates the complete
+result, and produces the artifact for a fresh run from that result. Edit or
+compose the function to describe a different future run; there is no stored
+graph retrieval or hot graph mutation in this API.
+
+## Complete agent graph
 
 ```lisp
 (require "nefor.actors")
@@ -24,67 +37,87 @@ with `nefor.graph.finish`, and return a compiled artifact.
 (require "nefor.contracts")
 (require "nefor.graph")
 
-(let [worker
+(let [start
+      (nefor.graph.source "task"
+        (type-tag nefor.contracts.Task)
+        (as nefor.contracts.Task {:prompt "Inspect the repository."}))
+      worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "worker"
-         :model nil
-         :profile "standard"
-         :provider "chatgpt"
-         :system "Answer the task."
-         :tools ["read_file" "mag-eval"]
-         :da-policy nil
-         :max-corrections 2})
+         :model nil :profile "standard" :provider "chatgpt"
+         :system "Answer the task." :tools ["read_file" "mag-eval"]
+         :da-policy nil :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))
-      initial
-      (nefor.graph.typed-message
-        (get worker "input")
-        (as nefor.contracts.Task {:prompt "Inspect the repository."}))
-      program
-      (nefor.graph.finish
-        worker
-        (as (List nefor.graph.Message) [initial])
-        (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))
+      result
+      (nefor.graph.output "result"
+        (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+      topology
+      (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+        (nefor.graph.add-edges graph
+          [(nefor.graph.edge start worker)
+           (nefor.graph.edge worker result)]))]
+  (nefor.artifact.compile topology))
 ```
 
-Agent tools contain context I/O plus `mag-eval` for world work; add
-`edit_file` or `write_file` only to write-capable agents. `:model` and
-`:profile` may be `nil` when the runtime supplies them. The runtime inventory
-is the authority for available providers, profiles, tools, and foreign actors.
+`source<T>` is the only node kind allowed to have no incoming edge. It captures
+an initial value validated against its specialized `T`, then emits `T`.
+`output<T>` is a real `T -> T` identity node;
+exactly one must exist and it must be terminal. Every ordinary node must be
+reachable from a source and able to reach the output.
 
-Every agent has type `I -> (O | nefor.contracts.AgentError)`. The result
-boundary above deliberately accepts either variant. `String` is an ordinary
-choice for `I` or `O`, including the empty string; provider failure still keeps
-the `AgentError` variant. `:max-corrections 0` means initial attempt only, `1`
-allows one correction, and so on.
+Every agent has type `I -> (O | nefor.contracts.AgentError)`. Connect that whole
+union to a compatible node, or use `nefor.actors.select-result` in a resident
+program that handles both variant ports. `:max-corrections 0` means the initial
+attempt only.
 
-Connect the whole union to an agent that accepts both variants, or call
-`(nefor.actors.select-result worker "worker-result")` to obtain typed `first`
-(`O`) and `second` (`AgentError`) ports. Every selected branch must be routed,
-handled by a resident rule, or carried to an explicit result boundary.
+## Composing edge families
 
-## One-off shell work
-
-`mag-eval` requires a 1–5 word `intent` plus a graph-fragment expression and supplies the required
-libraries, initial `Unit` message, graph finish, validation, and artifact
-wrapper:
+`graph` accepts one flat `List<Edge>`. Use ordinary list composition rather
+than implicit flattening:
 
 ```lisp
-(nefor.shell.command "list" "ls src")
+(nefor.graph.graph
+  (concat
+    [(nefor.graph.edge octopus-task octopus)
+     (nefor.graph.edge lighthouse-task lighthouse)]
+    (concat
+      (map (fn [[worker WorkerNode]] -> nefor.graph.Edge
+             (nefor.graph.edge worker summarizer))
+           workers)
+      [(nefor.graph.edge summarizer result)])))
 ```
 
-Pipe stdout into another command by composing fragments:
+The concrete element type in real programs is the relevant nominal node type;
+the example names it `WorkerNode` only to show the required function signature.
+
+## Shell work
+
+A one-off `mag-eval` expression returns one node and carries a required 1–5-word
+`intent` describing the operation:
 
 ```lisp
-(nefor.graph.connect
-  (nefor.shell.command "search" "rg -n TODO src/")
-  (nefor.shell.pipe-command "sort" "sort"))
+(nefor.shell.command "search" "rg -n TODO src/")
 ```
 
-`nefor.shell.command` is unbounded and runs until the process exits. Opt into a
-wall-clock bound with the nominal `as` refinement and exact `timeout_ms` field:
+For a pipeline, write a graph program with source, command nodes, and output:
+
+```lisp
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      search (nefor.shell.command "search" "rg -n TODO src/")
+      sort (nefor.shell.pipe-command "sort" "sort")
+      result (nefor.graph.output-for "result" sort)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start search)
+         (nefor.graph.edge search sort)
+         (nefor.graph.edge sort result)]))))
+```
+
+Shell commands are unbounded unless `nefor.shell.command-with-options` receives
+`(as nefor.shell.BashOptions {:timeout_ms 30000})`.
 
 ```lisp
 (nefor.shell.command-with-options
@@ -93,27 +126,28 @@ wall-clock bound with the nominal `as` refinement and exact `timeout_ms` field:
   (as nefor.shell.BashOptions {:timeout_ms 30000}))
 ```
 
-Shell commands still pass through the capability gate.
+## Products, unions, fan-out, and cycles
 
-## Result boundary
+- `A + B` is an all-of product. Before application, incoming edge types must
+  exactly cover its component multiset. Slots bind to sender edges, including
+  repeated component types from different nodes.
+- `A | B` is a one-of union. Either arriving variant can fire the consumer.
+- Fan-out is multiple edges with one producer; fan-in is multiple edges with
+  one consumer. Neither needs a special node.
+- Cycles are ordinary edges and remain legal when every participating node is
+  source-reachable and can reach the output.
+- Ordering without data uses a `Unit` edge.
+- Absence is represented positively through timeout/failure output, never a
+  negative graph predicate.
 
-`nefor.graph.finish` selects the fragment output structurally. There is no sink
-node and no implicit terminal. Every useful output must either route onward or
-be the selected result port; library validation rejects uncovered outputs.
+## Validation boundary
 
-## Products, unions, and cycles
+MAG parsing and type checking establish that graph transformations are valid
+code. For each run, the transformation is applied to `empty-graph`, then the
+concrete returned graph is validated before application: node identity
+consistency, foreign contracts, edge types, source/output structure, and
+reachability. A rejected transformation starts no run.
 
-- `A + B` is an all-of product. Runtime slots bind to sender edges, so equal
-  component types from different actors do not conflate.
-- `A | B` is a one-of union. Either arriving variant can satisfy the input.
-- Cycles are ordinary routes. A typed output leaving the cycle is its exit;
-  runaway work is stopped through the control plane.
-- Completion ordering uses explicit `Unit` messages/routes. Absence is modeled
-  positively through a timeout or failure output, never a negative predicate.
-
-## Semantic distinctions
-
-Routing uses runtime wire tags, while library composition checks semantic MAG
-types. When equal payload shapes carry different meanings, declare distinct
-nominal types and expose them at fragment boundaries. Do not encode routing
-meaning only in prompts or parse error text from success-shaped values.
+Resident rule subscriptions are program metadata, not edges. Their operational
+delta artifact remains a separate kernel facility and does not grant actors
+authority to mutate graph definitions.

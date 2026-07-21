@@ -9,7 +9,10 @@
                        :description String
                        :dependent-tasks (List String)})
 
-(let [worker
+(let [start (nefor.graph.source "typed-task-input"
+              (type-tag nefor.contracts.Task)
+              (as nefor.contracts.Task {:prompt "Describe the build task"}))
+      worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "typed-task"
          :model nil
@@ -22,8 +25,10 @@
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag TaskDescription))
-      initial (nefor.graph.typed-message
-                (get worker "input")
-                (as nefor.contracts.Task {:prompt "Describe the build task"}))]
+      result (nefor.graph.output "typed-task-output"
+               (type-tag (| TaskDescription nefor.contracts.AgentError)))]
   (nefor.artifact.compile
-    (nefor.graph.finish worker [initial] (as (List nefor.graph.Rule) []))))
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start worker)
+         (nefor.graph.edge worker result)]))))

@@ -375,13 +375,14 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         r#"(require "nefor.artifact")
 (require "nefor.graph")
 (require "nefor.shell")
-(let [fragment (nefor.shell.command "x" "true")
-      initial (nefor.shell.start-message fragment)
-      program (nefor.graph.finish
-                fragment
-                (as (List nefor.graph.Message) [initial])
-                (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))"#,
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation (nefor.shell.command "x" "true")
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))"#,
     )
     .expect("write shell subset regression");
     let subset = load(
@@ -399,22 +400,135 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         "a shell fragment exposing the mag.Text subset must compile: {subset:#?}"
     );
 
+    let graph_laws = [
+        (
+            "direct",
+            "(nefor.graph.add-edges base [first second])",
+        ),
+        (
+            "permutation",
+            "(nefor.graph.add-edges base [second first])",
+        ),
+        (
+            "associative",
+            "(nefor.graph.add-edges (nefor.graph.add-edges base [first]) [second])",
+        ),
+        (
+            "idempotent",
+            "(nefor.graph.add-edges (nefor.graph.add-edges base [first second]) [second first first])",
+        ),
+        (
+            "absent-removal",
+            "(nefor.graph.remove-edges (nefor.graph.add-edges base [first second]) [absent absent])",
+        ),
+        (
+            "remove-add-roundtrip",
+            "(nefor.graph.add-edges (nefor.graph.remove-edges (nefor.graph.add-edges base [first second]) [first]) [first])",
+        ),
+    ];
+    let mut algebra_results = Vec::new();
+    for (name, expression) in graph_laws {
+        let file_name = format!("graph-edge-algebra-{name}.mag");
+        let source = format!(
+            r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation (nefor.shell.command "operation" "true")
+      unused (nefor.shell.command "unused" "false")
+      result (nefor.graph.output-for "result" operation)
+      first (nefor.graph.edge start operation)
+      second (nefor.graph.edge operation result)
+      absent (nefor.graph.edge start unused)
+      expected (nefor.graph.graph [first second])
+      laws [(= expected (nefor.graph.graph [second first]))
+            (= expected (nefor.graph.add-edges
+                          (nefor.graph.add-edges nefor.graph.empty-graph [first])
+                          [second]))
+            (= expected (nefor.graph.add-edges expected [first second first]))
+            (= expected (nefor.graph.remove-edges expected [absent absent]))]
+      laws-hold (= (count (filter (fn [[holds Bool]] -> Bool holds) laws))
+                   (count laws))]
+  (if laws-hold
+    (nefor.artifact.compile
+      (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+        {expression}))
+    (fail {{:kind "GraphSetLawFailure"}})))"#
+        );
+        fs::write(temp_root.join(&file_name), source).expect("write graph edge algebra regression");
+        let result = load(
+            &mut reader,
+            &mut stdin,
+            &format!("graph-edge-algebra-{name}"),
+            &temp_root,
+            Path::new(&file_name),
+            std::slice::from_ref(&lib_root),
+        )
+        .await;
+        assert_eq!(
+            result.get("kind").and_then(Value::as_str),
+            Some("mag.loaded"),
+            "pure graph set law {name} must compile: {result:#?}"
+        );
+        algebra_results.push((name, result));
+    }
+    let (_, algebra) = &algebra_results[0];
+    let expected_artifact = algebra.get("artifact").expect("direct graph artifact");
+    let expected_hash = algebra.get("hash").expect("direct graph artifact hash");
+    for (name, result) in &algebra_results[1..] {
+        assert_eq!(
+            result.get("artifact"),
+            Some(expected_artifact),
+            "graph set law {name} changed canonical lowering"
+        );
+        assert_eq!(
+            result.get("hash"),
+            Some(expected_hash),
+            "graph set law {name} changed the canonical artifact hash"
+        );
+    }
+    let algebra_actors = algebra
+        .get("artifact")
+        .and_then(|artifact| artifact.pointer("/data/actors"))
+        .and_then(Value::as_array)
+        .expect("graph algebra artifact actors");
+    assert_eq!(
+        algebra_actors.len(),
+        3,
+        "duplicate additions collapse and absent removals introduce no nodes"
+    );
+    assert!(
+        algebra_actors
+            .iter()
+            .all(|actor| actor.get("id").and_then(Value::as_str) != Some("unused")),
+        "removing an absent edge must leave the graph unchanged"
+    );
+    let route_count = algebra_actors
+        .iter()
+        .filter_map(|actor| actor.get("routes").and_then(Value::as_object))
+        .flat_map(|routes| routes.values())
+        .filter_map(Value::as_array)
+        .map(Vec::len)
+        .sum::<usize>();
+    assert_eq!(route_count, 2, "duplicate edges must not lower twice");
+
     fs::write(
         temp_root.join("worktree-create.mag"),
         r#"(require "nefor.artifact")
 (require "nefor.graph")
 (require "nefor.worktree")
-(let [fragment (nefor.worktree.create
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation (nefor.worktree.create
                  "workspace"
                  (as nefor.worktree.CreateSpec
                    {:repository "/repo" :path "/worktrees/topic"
                     :branch "topic" :base "main"}))
-      initial (nefor.worktree.start-message fragment)
-      program (nefor.graph.finish
-                fragment
-                (as (List nefor.graph.Message) [initial])
-                (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))"#,
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))"#,
     )
     .expect("write worktree create regression");
     let worktree = load(
@@ -468,17 +582,18 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         r#"(require "nefor.artifact")
 (require "nefor.graph")
 (require "nefor.worktree")
-(let [fragment (nefor.worktree.open
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation (nefor.worktree.open
                  "workspace"
                  (as nefor.worktree.OpenSpec
                    {:repository "/repo" :path "/worktrees/topic"
                     :branch "topic"}))
-      initial (nefor.worktree.start-message fragment)
-      program (nefor.graph.finish
-                fragment
-                (as (List nefor.graph.Message) [initial])
-                (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))"#,
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))"#,
     )
     .expect("write worktree open regression");
     let open_worktree = load(
@@ -497,7 +612,13 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
     );
     let open_actor = open_worktree
         .get("artifact")
-        .and_then(|artifact| artifact.pointer("/data/actors/0"))
+        .and_then(|artifact| artifact.pointer("/data/actors"))
+        .and_then(Value::as_array)
+        .and_then(|actors| {
+            actors
+                .iter()
+                .find(|actor| actor.get("id").and_then(Value::as_str) == Some("workspace"))
+        })
         .expect("worktree open actor");
     assert_eq!(
         open_actor.get("foreign").and_then(Value::as_str),
@@ -518,17 +639,20 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
               (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
               (nefor.graph.store-port input)
               (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
-      fragment (as (nefor.graph.Fragment Unit nefor.contracts.Text)
-                 {:actors (as (List nefor.graph.Actor) [actor])
+      operation (as (nefor.graph.Node Unit nefor.contracts.Text)
+                 {:id "x" :role "ordinary"
+                  :actors (as (List nefor.graph.Actor) [actor])
                   :routes (as (List nefor.graph.StoredRoute) [])
+                  :messages (as (List nefor.graph.Message) [])
                   :input input
                   :output output})
-      program (nefor.graph.finish
-                fragment
-                (as (List nefor.graph.Message)
-                    [(nefor.graph.message "x" (as Data {:kind "mag.Unit"}))])
-                (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))"#,
+      start (nefor.graph.source "start" (type-tag Unit) nil)
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))"#,
     )
     .expect("write unknown shell output regression");
     let unknown = load(

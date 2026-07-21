@@ -111,9 +111,12 @@ local function validate_actor_shape(actor, idx)
       if not is_array(dests) then
         return string.format("actor '%s' route '%s' must be an array of ids", actor.id, typ)
       end
-      for _, d in ipairs(dests) do
-        if type(d) ~= "string" then
-          return string.format("actor '%s' route '%s' has a non-string destination", actor.id, typ)
+      for _, destination in ipairs(dests) do
+        if type(destination) ~= "table"
+            or type(destination.actor) ~= "string" or destination.actor == ""
+            or type(destination.wire) ~= "string" or destination.wire == "" then
+          return string.format(
+            "actor '%s' route '%s' needs { actor, wire } destinations", actor.id, typ)
         end
       end
     end
@@ -130,13 +133,17 @@ local function validate_routes(self, mod)
   if not self.registry then
     return nil
   end
+  local existing_specs = {}
+  for _, entry in self.pairs() do
+    if entry.state == ALIVE then existing_specs[#existing_specs + 1] = entry end
+  end
   local result = self.registry:validate_modification(mod, function(dest_id)
     local entry = self.actors[dest_id]
     if not entry then
       return nil
     end
     return entry.factory, entry.state, entry
-  end)
+  end, existing_specs)
   if result.ok then
     return nil
   end

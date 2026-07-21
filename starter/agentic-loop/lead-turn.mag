@@ -7,7 +7,10 @@
 (require "nefor.contracts")
 (require "nefor.graph")
 
-(let [lead
+(let [start (nefor.graph.source "lead-task"
+              (type-tag nefor.contracts.Task)
+              (as nefor.contracts.Task {:prompt "<initial task text>"}))
+      lead
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "lead"
          :model nil
@@ -29,13 +32,10 @@
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))
-      initial
-      (nefor.graph.typed-message
-        (get lead "input")
-        (as nefor.contracts.Task {:prompt "<initial task text>"}))
-      program
-      (nefor.graph.finish
-        lead
-        [initial]
-        (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))
+      result (nefor.graph.output "lead-output"
+               (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+      topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+                 (nefor.graph.add-edges graph
+                   [(nefor.graph.edge start lead)
+                    (nefor.graph.edge lead result)]))]
+  (nefor.artifact.compile topology))

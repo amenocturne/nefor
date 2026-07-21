@@ -8,7 +8,10 @@
 (type BuildReport {:summary String})
 (type ReviewReport {:assessment String})
 
-(let [builder
+(let [start (nefor.graph.source "recovery-input"
+              (type-tag nefor.contracts.Task)
+              (as nefor.contracts.Task {:prompt "Implement the change"}))
+      builder
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "builder"
          :model nil :profile nil :provider "mock-provider"
@@ -24,9 +27,11 @@
         (type-tag (| BuildReport nefor.contracts.AgentError))
         "nefor.agent.Result"
         (type-tag ReviewReport))
-      chain (nefor.graph.connect builder reviewer)
-      initial (nefor.graph.typed-message
-                (get chain "input")
-                (as nefor.contracts.Task {:prompt "Implement the change"}))]
+      result (nefor.graph.output "recovery-output"
+               (type-tag (| ReviewReport nefor.contracts.AgentError)))]
   (nefor.artifact.compile
-    (nefor.graph.finish chain [initial] (as (List nefor.graph.Rule) []))))
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start builder)
+         (nefor.graph.edge builder reviewer)
+         (nefor.graph.edge reviewer result)]))))

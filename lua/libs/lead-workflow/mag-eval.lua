@@ -107,9 +107,9 @@ M.schema = {
   name        = "mag-eval",
   display = { label = "mag-eval", primary = { arg = "intent" }, result = { kind = "content" } },
   description =
-    "Evaluate one MAG graph-fragment expression on the actor kernel. " ..
+    "Evaluate one MAG node expression on the actor kernel. " ..
     "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
-    "pipe fragments with (nefor.graph.connect left right). Commands run " ..
+    "compose multi-node work in a .mag graph. Commands run " ..
     "until they exit — long-running " ..
     "work (servers, review UIs, watch loops) needs no backgrounding, no " ..
     "`&`, no polling; run it in the foreground. " ..
@@ -230,12 +230,14 @@ function M.handle(firing_id, args, metadata)
     '(require "nefor.artifact")\n',
     '(require "nefor.graph")\n',
     '(require "nefor.shell")\n',
-    '(let [fragment ', expr, '\n',
-    '      initial (nefor.shell.start-message fragment)\n',
-    '      program (nefor.graph.finish fragment ',
-    '                (as (List nefor.graph.Message) [initial]) ',
-    '                (as (List nefor.graph.Rule) []))]\n',
-    '  (nefor.artifact.compile program))\n',
+    '(let [start (nefor.graph.source "eval-input" (type-tag Unit) nil)\n',
+    '      operation ', expr, '\n',
+    '      result (nefor.graph.output-for "eval-output" operation)\n',
+    '      topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph\n',
+    '                 (nefor.graph.add-edges graph ',
+    '                   [(nefor.graph.edge start operation) ',
+    '                    (nefor.graph.edge operation result)]))]\n',
+    '  (nefor.artifact.compile topology))\n',
   })
   fh:write(source)
   fh:close()

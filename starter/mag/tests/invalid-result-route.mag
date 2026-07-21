@@ -1,25 +1,16 @@
+(require "nefor.artifact")
 (require "nefor.graph")
 (require "nefor.shell")
 
-;; Regression: a declared result port is terminal and cannot simultaneously
-;; feed another actor.
-(let [first (nefor.shell.command "first" "printf first")
-      second (nefor.shell.pipe-command "second" "cat")
-      program
-      (nefor.graph.graph
-        (concat (get first "actors") (get second "actors"))
-        [(nefor.graph.store-route
-           (nefor.graph.route (get first "output") (get second "input")))
-         (nefor.graph.store-route
-           (nefor.graph.route (get second "output") (get second "input")))]
-        [(nefor.shell.start-message first)]
-        (as (List nefor.graph.Rule) [])
-        (get first "output"))
-      bash-contract
-      (nefor.graph.foreign-contract
-        (as Data
-          {:identity "nefor.factory.bash"
-           :type_scheme
-           {:input_tags ["mag.Unit" "mag.Text"]
-            :outputs ["mag.Text"]}}))]
-  (fail (nefor.graph.validate program [bash-contract])))
+;; Regression: the concrete output node is terminal and cannot source an edge.
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      first (nefor.shell.command "first" "printf first")
+      result (nefor.graph.output-for "result" first)
+      second (nefor.shell.pipe-command "second" "cat")]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start first)
+         (nefor.graph.edge first result)
+         (nefor.graph.edge result second)
+         (nefor.graph.edge second result)]))))

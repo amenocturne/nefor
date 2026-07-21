@@ -269,8 +269,11 @@ compiler special case.
   `mag.CommandFailed`), and every destination — spawned in the same
   modification or already live in the inventory (the post-apply actor set) —
   must declare an input port accepting the routed tag. A route no port accepts
-  REJECTS the modification with the precise wiring error; it can never reach
-  delivery and starve an actor. A rejected initial `mag.execute` modification
+  REJECTS the modification with the precise wiring error. Product inputs are
+  checked over the complete post-apply incoming route multiset: every
+  component needs exactly one compatible sender-bound edge, including repeated
+  types, so underfill and overfill reject before registration rather than
+  parking an actor forever. A rejected initial `mag.execute` modification
   fails the run; a rejected mid-run `mag.apply` modification is an error
   routed to the control plane and normally leaves the run live. Race artifacts
   are never rejections: spawning an id that is already alive is the logged no-op

@@ -144,7 +144,7 @@ do
   local h = harness()
   local result = h.obs:apply({
     actors = {
-      { id = "s", factory = "src", params = {}, routes = { ["t.Alt"] = { "d" } } },
+      { id = "s", factory = "src", params = {}, routes = { ["t.Alt"] = { { actor = "d", wire = "t.Alt" } } } },
       { id = "d", factory = "dst", params = {}, routes = {} },
     },
   })
@@ -169,7 +169,7 @@ do
   local h = harness()
   local result = h.obs:apply({
     actors = {
-      { id = "s", factory = "src", params = {}, routes = { ["t.Nope"] = { "d" } } },
+      { id = "s", factory = "src", params = {}, routes = { ["t.Nope"] = { { actor = "d", wire = "t.Nope" } } } },
       { id = "d", factory = "dst", params = {}, routes = {} },
     },
   })
@@ -190,9 +190,9 @@ do
       {
         id = "s", factory = "src", params = {},
         routes = {
-          ["t.Out"] = { "d", "f" }, -- fanout: single port + union port
-          ["t.Alt"] = { "f" }, -- second union variant
-          ["mag.Unit"] = { "u" }, -- dependency edge: reserved key, undeclared
+          ["t.Out"] = { { actor = "d", wire = "t.Out" }, { actor = "f", wire = "t.Out" } }, -- fanout: single port + union port
+          ["t.Alt"] = { { actor = "f", wire = "t.Alt" } }, -- second union variant
+          ["mag.Unit"] = { { actor = "u", wire = "mag.Unit" } }, -- dependency edge: reserved key, undeclared
         },
       },
       { id = "d", factory = "dst", params = {}, routes = {} },
@@ -214,7 +214,7 @@ do
   local h = harness()
   local result = h.obs:apply({
     actors = {
-      { id = "s", factory = "src", params = {}, routes = { ["mag.Unit"] = { "d" } } },
+      { id = "s", factory = "src", params = {}, routes = { ["mag.Unit"] = { { actor = "d", wire = "mag.Unit" } } } },
       { id = "d", factory = "dst", params = {}, routes = {} },
     },
   })
@@ -238,14 +238,14 @@ do
 
   -- A later spawn routing an unaccepted tag AT THE LIVE d rejects.
   local bad = h.obs:apply({
-    actors = { { id = "s", factory = "src", params = {}, routes = { ["t.Alt"] = { "d" } } } },
+    actors = { { id = "s", factory = "src", params = {}, routes = { ["t.Alt"] = { { actor = "d", wire = "t.Alt" } } } } },
   })
   assert_eq(bad.ok, false, "wiring into a live destination is validated")
   assert_contains(bad.error, 'wiring "s" -t.Alt-> "d"', "the live-destination error is precise")
 
   -- A route at a never-existed id rejects (a typo, not a race).
   local ghost = h.obs:apply({
-    actors = { { id = "s2", factory = "src", params = {}, routes = { ["t.Out"] = { "ghost" } } } },
+    actors = { { id = "s2", factory = "src", params = {}, routes = { ["t.Out"] = { { actor = "ghost", wire = "t.Out" } } } } },
   })
   assert_eq(ghost.ok, false, "a never-existed route destination rejects")
   assert_contains(ghost.error, '"ghost" does not exist', "the error names the missing destination")
@@ -254,7 +254,7 @@ do
   -- (delivery drops those sends as logged no-ops).
   assert_eq(h.obs:apply({ kills = { "d" } }).ok, true, "the kill applies")
   local dead = h.obs:apply({
-    actors = { { id = "s3", factory = "src", params = {}, routes = { ["t.Out"] = { "d" } } } },
+    actors = { { id = "s3", factory = "src", params = {}, routes = { ["t.Out"] = { { actor = "d", wire = "t.Out" } } } } },
   })
   assert_eq(dead.ok, true, "a route at a dead destination passes (settled race semantics): "
     .. tostring(dead.error))

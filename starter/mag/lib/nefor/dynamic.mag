@@ -7,17 +7,18 @@
 (def collector (fn [T] [[id String]
                          [expected-senders (List String)]
                          [item-type (TypeTag T)]]
-  -> (nefor.graph.Fragment T (List T))
+  -> (nefor.graph.Node T (List T))
   (let [input (nefor.graph.port id item-type "nefor.dynamic.Item")
         output (nefor.graph.port id (type-tag (List T)) "nefor.dynamic.Collected")]
-    (as (nefor.graph.Fragment T (List T))
-      {:actors [(nefor.graph.actor id
+    (as (nefor.graph.Node T (List T))
+      {:id id :role "ordinary" :actors [(nefor.graph.actor id
                   (specialize nefor.factory.collector [T])
                   (as nefor.contracts.CollectorParams
                     {:expected_senders expected-senders})
                   (nefor.graph.store-port input)
                   [(nefor.graph.store-port output)])]
        :routes (as (List nefor.graph.StoredRoute) [])
+       :messages []
        :input input
        :output output}))))
 
@@ -27,34 +28,34 @@
   (nefor.graph.typed-message target (as (List T) []))))
 
 (def collect-item (fn [T] [[id String] [type (TypeTag T)] [input-wire String]]
-  -> (nefor.graph.Fragment T T)
+  -> (nefor.graph.Node T T)
   (let [input (nefor.graph.port id type input-wire)
         output (nefor.graph.port id type "nefor.dynamic.Item")]
-    (as (nefor.graph.Fragment T T)
-      {:actors [(nefor.graph.actor id (specialize nefor.factory.collect-item [T])
+    (as (nefor.graph.Node T T)
+      {:id id :role "ordinary" :actors [(nefor.graph.actor id (specialize nefor.factory.collect-item [T])
                   (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
                   [(nefor.graph.store-port output)])]
-       :routes [] :input input :output output}))))
+       :routes [] :messages [] :input input :output output}))))
 
 (def collected-prompt (fn [T] [[id String] [type (TypeTag T)]]
-  -> (nefor.graph.Fragment (List T) nefor.contracts.ProviderInput)
+  -> (nefor.graph.Node (List T) nefor.contracts.ProviderInput)
   (let [input (nefor.graph.port id (type-tag (List T)) "nefor.dynamic.Collected")
         output (nefor.graph.port id (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderOut")]
-    (as (nefor.graph.Fragment (List T) nefor.contracts.ProviderInput)
-      {:actors [(nefor.graph.actor id (specialize nefor.factory.collected-prompt [T])
+    (as (nefor.graph.Node (List T) nefor.contracts.ProviderInput)
+      {:id id :role "ordinary" :actors [(nefor.graph.actor id (specialize nefor.factory.collected-prompt [T])
                   (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
                   [(nefor.graph.store-port output)])]
-       :routes [] :input input :output output}))))
+       :routes [] :messages [] :input input :output output}))))
 
 (def outcome (fn [T] [[id String] [type (TypeTag T)]]
-  -> (nefor.graph.Fragment (| T nefor.contracts.AgentError)
+  -> (nefor.graph.Node (| T nefor.contracts.AgentError)
        (| T nefor.contracts.AgentError))
   (let [port-type (type-tag (| T nefor.contracts.AgentError))
         input (nefor.graph.port id port-type "nefor.agent.Result")
         output (nefor.graph.port id port-type "nefor.outcome.Result")]
-    (as (nefor.graph.Fragment (| T nefor.contracts.AgentError)
+    (as (nefor.graph.Node (| T nefor.contracts.AgentError)
           (| T nefor.contracts.AgentError))
-      {:actors [(nefor.graph.actor id (specialize nefor.factory.outcome [T])
+      {:id id :role "ordinary" :actors [(nefor.graph.actor id (specialize nefor.factory.outcome [T])
                   (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
                   [(nefor.graph.store-port output)])]
-       :routes [] :input input :output output}))))
+       :routes [] :messages [] :input input :output output}))))

@@ -338,34 +338,47 @@ local function deep_clone(value)
 end
 
 -- Derive the turn-program's seams from its compiled modification:
---   * entry actor — the initial task message's target;
+--   * source actor — the initial Unit message's target and task-value owner;
+--   * entry actor — the source value's destination;
 --   * lead llm — the llm-factory actor the entry adapter routes
 --     `generic-provider.ProviderOut` into (the overlay + binding target).
 -- Derivation over hardcoding keeps the program hackable: rename the agent
 -- in lead-turn.mag and the spawner follows.
 local function derive_program_seams(modification)
   local msg = (modification.messages or {})[1]
-  local entry_actor = type(msg) == "table" and msg.to or nil
-  if type(entry_actor) ~= "string" then
-    return nil, "turn-program has no initial message (no entry actor)"
+  local source_actor = type(msg) == "table" and msg.to or nil
+  if type(source_actor) ~= "string" then
+    return nil, "turn-program has no initial message (no source actor)"
   end
-  local content = msg.content
-  if type(content) ~= "table" or type(content.value) ~= "table" then
-    return nil, "turn-program initial message is not a typed value"
-  end
+  local entry_actor
   local llm_actor
+  for _, actor in ipairs(modification.actors or {}) do
+    if actor.id == source_actor then
+      local destinations = type(actor.routes) == "table"
+        and actor.routes["nefor.graph.Value"] or nil
+      local destination = type(destinations) == "table" and destinations[1] or nil
+      entry_actor = type(destination) == "table" and destination.actor or nil
+      if type(actor.params) ~= "table" or type(actor.params.value) ~= "table" then
+        return nil, "turn-program source actor has no typed task value"
+      end
+    end
+  end
+  if type(entry_actor) ~= "string" then
+    return nil, "turn-program source routes no task value (no entry actor)"
+  end
   for _, actor in ipairs(modification.actors or {}) do
     if actor.id == entry_actor then
       local dests = type(actor.routes) == "table"
         and actor.routes["generic-provider.ProviderOut"] or nil
-      llm_actor = type(dests) == "table" and dests[1] or nil
+      local destination = type(dests) == "table" and dests[1] or nil
+      llm_actor = type(destination) == "table" and destination.actor or nil
     end
   end
   if type(llm_actor) ~= "string" then
     return nil, "turn-program entry actor '" .. tostring(entry_actor)
       .. "' routes no ProviderOut (no lead llm actor)"
   end
-  return { entry_actor = entry_actor, llm_actor = llm_actor }, nil
+  return { source_actor = source_actor, entry_actor = entry_actor, llm_actor = llm_actor }, nil
 end
 
 -- Kick the turn-program load handshake (idempotent while in flight). The
@@ -413,6 +426,7 @@ local function handle_lead_program_loaded(body)
   end
   p.artifact = artifact
   p.hash = body.hash
+  p.source_actor = seams.source_actor
   p.entry_actor = seams.entry_actor
   p.llm_actor = seams.llm_actor
   nefor.log.info("agentic-loop: lead turn-program cached", {
@@ -449,9 +463,9 @@ local function submit_orchestrator_run(user_text)
 
   local artifact = deep_clone(p.artifact)
   local mod = artifact.data
-  for _, msg in ipairs(mod.messages or {}) do
-    if msg.to == p.entry_actor then
-      msg.content.value.prompt = user_text
+  for _, actor in ipairs(mod.actors or {}) do
+    if actor.id == p.source_actor then
+      actor.params.value.prompt = user_text
     end
   end
 
@@ -1429,6 +1443,7 @@ M._internals  = {
       module_roots = nil,
       artifact = nil,
       hash = nil,
+      source_actor = nil,
       entry_actor = nil,
       llm_actor = nil,
       load_id = nil,

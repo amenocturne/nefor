@@ -155,7 +155,10 @@ fn two_agent_modification() -> Value {
                 "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"generic-provider.FinalAnswer","type":final_answer}],
                 "params": { "model": "opus", "provider": PROVIDER, "system": "work" },
                 "routes": {
-                    "generic-tool.ToolCalls": [format!("{prefix}.run-tool")],
+                    "generic-tool.ToolCalls": [{
+                        "actor": format!("{prefix}.run-tool"),
+                        "wire": "generic-tool.ToolCalls"
+                    }],
                     "generic-provider.FinalAnswer": []
                 }
             }),
@@ -166,7 +169,10 @@ fn two_agent_modification() -> Value {
                 "input":{"wire":"generic-tool.ToolCalls","type":tool_calls},
                 "outputs":[{"wire":"generic-tool.ToolHandle","type":tool_handle.clone()}],
                 "params": {},
-                "routes": { "generic-tool.ToolHandle": [format!("{prefix}.tool-result")] }
+                "routes": { "generic-tool.ToolHandle": [{
+                    "actor": format!("{prefix}.tool-result"),
+                    "wire": "generic-tool.ToolHandle"
+                }] }
             }),
             json!({
                 "id": format!("{prefix}.tool-result"),
@@ -175,7 +181,10 @@ fn two_agent_modification() -> Value {
                 "input":{"wire":"generic-tool.ToolHandle","type":tool_handle},
                 "outputs":[{"wire":"generic-provider.ProviderOut","type":provider_input}],
                 "params": {},
-                "routes": { "generic-provider.ProviderOut": [format!("{prefix}.llm")] }
+                "routes": { "generic-provider.ProviderOut": [{
+                    "actor": format!("{prefix}.llm"),
+                    "wire": "generic-provider.ProviderOut"
+                }] }
             }),
         ]
     }
@@ -632,9 +641,14 @@ fn worktree_program(operation: &str, repository: &str, path: &str, branch: &str)
         r#"(require "nefor.artifact")
 (require "nefor.graph")
 (require "nefor.worktree")
-(let [workspace {constructor}
-      program (nefor.graph.finish workspace [(nefor.worktree.start-message workspace)] [])]
-  (nefor.artifact.compile program))"#
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      workspace {constructor}
+      result (nefor.graph.output-for "result" workspace)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start workspace)
+         (nefor.graph.edge workspace result)]))))"#
     )
 }
 

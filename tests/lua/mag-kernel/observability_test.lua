@@ -76,14 +76,14 @@ do
   -- A scripted run mixing all three outcomes.
   local r1 = obs:apply({
     actors = {
-      actor_spec("A", "worker", {}, { ["stub.Out"] = { "B" } }),
+      actor_spec("A", "worker", {}, { ["stub.Out"] = { { actor = "B", wire = "stub.Out" } } }),
       actor_spec("B", "worker", {}, {}),
     },
     messages = { { to = "A", content = { kind = "seed" } } },
   })
   assert_true(r1.ok, "spawn A+B applies")
 
-  local r2 = obs:apply({ actors = { actor_spec("A", "worker", {}, { ["stub.Out"] = { "B" } }) } })
+  local r2 = obs:apply({ actors = { actor_spec("A", "worker", {}, { ["stub.Out"] = { { actor = "B", wire = "stub.Out" } } }) } })
   assert_true(r2.ok, "duplicate spawn A is a no-op, not a rejection")
 
   local r3 = obs:apply({ kills = { "B" } })
@@ -174,7 +174,7 @@ do
   obs:run_started({ run_id = "run-1", run_name = "demo" })
   obs:apply({
     actors = {
-      actor_spec("A", "worker", {}, { ["stub.Out"] = { "B" } }),
+      actor_spec("A", "worker", {}, { ["stub.Out"] = { { actor = "B", wire = "stub.Out" } } }),
       actor_spec("B", "worker", {}, {}),
     },
   })

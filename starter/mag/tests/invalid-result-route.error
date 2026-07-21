@@ -1,1 +1,1 @@
-result boundary output must not also source a route
+only source nodes may have zero incoming edges, and output nodes are terminal

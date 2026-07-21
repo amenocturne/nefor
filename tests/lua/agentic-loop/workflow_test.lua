@@ -161,28 +161,33 @@ end
 -- ------------------------------------------------------------------
 
 -- The compiled lead-turn.mag shape the mag plugin's `mag.loaded` reply
--- carries (entry adapter → lead llm → sink; the spawner derives its
--- seams — entry actor, llm actor — from this, never hardcodes them).
+-- carries (source → entry adapter → lead llm → output; the spawner derives
+-- its source, entry, and llm seams from this, never hardcodes them).
 local function lead_artifact()
   return { format = "nefor.graph-modification/v1", data = {
     actors = {
       {
+        id = "lead.source", foreign = "nefor.factory.source",
+        params = { value = { prompt = "<initial task text>" } },
+        routes = { ["nefor.graph.Value"] = {
+          { actor = "lead.entry", wire = "task" },
+        } },
+      },
+      {
         id = "lead.entry", foreign = "nefor.factory.adapter",
         params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderOut"] = { "lead.llm" } },
+        routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } },
       },
       {
         id = "lead.llm", foreign = "nefor.factory.llm",
         params = { tools = { "read_file", "mag" } },
         routes = {
-          ["generic-tool.ToolCalls"] = { "lead.run-tool" },
+          ["generic-tool.ToolCalls"] = { { actor = "lead.run-tool", wire = "generic-tool.ToolCalls" } },
         },
       },
     },
     messages = {
-      { to = "lead.entry", content = {
-        kind = "task", value = { prompt = "<initial task text>" },
-      } },
+      { to = "lead.source", content = { kind = "mag.Unit" } },
     },
     kills = {},
     rules = {},
@@ -192,6 +197,13 @@ local function lead_artifact()
       wire = "generic-provider.FinalAnswer",
     } },
   } }
+end
+
+local function task_prompt(modification)
+  for _, actor in ipairs(modification.actors or {}) do
+    if actor.id == "lead.source" then return actor.params.value.prompt end
+  end
+  return nil
 end
 
 local function fresh_loop()
@@ -345,7 +357,7 @@ do
   calls = decode_calls()
   local exec = find_kind(calls, "mag.execute")
   assert(exec ~= nil, "loaded program starts the queued turn")
-  assert_eq(exec.body.artifact.data.messages[1].content.value.prompt, "cold one\ncold two",
+  assert_eq(task_prompt(exec.body.artifact.data), "cold one\ncold two",
     "cold submits coalesce into one model delivery")
   assert(find_kind(calls, "chat.queue.steered") ~= nil,
     "promotion reconciles the optimistic queue")
@@ -366,11 +378,11 @@ do
   assert_eq(exec.body.principal, "lead", "lead turn execute declares the lead domain principal")
   local mod = exec.body.artifact and exec.body.artifact.data
   assert(type(mod) == "table", "the artifact rides inline on the execute")
-  assert_eq(mod.messages[1].to, "lead.entry", "task targets the program's entry actor")
-  assert_eq(mod.messages[1].content.kind, "task",
-    "task injection preserves the typed input wire")
-  assert_eq(mod.messages[1].content.value.prompt, "hello lead",
-    "the literal first user message replaces the typed task template")
+  assert_eq(mod.messages[1].to, "lead.source", "Unit activation targets the source actor")
+  assert_eq(mod.messages[1].content.kind, "mag.Unit",
+    "the source activation remains a Unit message")
+  assert_eq(task_prompt(mod), "hello lead",
+    "the literal first user message replaces the source's typed task value")
   local overlay = exec.body.params_overlay["lead.llm"]
   assert(type(overlay) == "table", "params overlay keys the derived llm actor")
   -- The base system prompt leads, with the ambient MAG-workspace block
@@ -384,7 +396,7 @@ do
     "the block names the session workspace dir")
   assert(string.find(overlay.system, "wf-mag-session", 1, true) ~= nil,
     "the workspace dir is anchored to the active session")
-  assert(string.find(overlay.system, "MAG patterns", 1, true) ~= nil,
+  assert(string.find(overlay.system, "MAG graph cookbook", 1, true) ~= nil,
     "patterns.md is inlined into the block")
   assert(string.find(overlay.system, "(require", 1, true) ~= nil,
     "the inlined contract carries current literal require syntax")
@@ -483,7 +495,7 @@ do
     "the cached program is not re-loaded per turn")
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "second turn executes")
-  assert_eq(exec2.body.artifact.data.messages[1].content.value.prompt, "and more?")
+  assert_eq(task_prompt(exec2.body.artifact.data), "and more?")
   local seeded = exec2.body.params_overlay["lead.llm"].history
   assert_eq(#seeded, 2, "second turn's llm seeds the prior turn's pair")
   assert_eq(seeded[1].content, "hello lead")
@@ -731,7 +743,7 @@ do
     "queued promotion emits its durable user projection exactly when it becomes model-visible")
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "queued input promotes into a fresh turn on close")
-  assert_eq(exec2.body.artifact.data.messages[1].content.value.prompt, "second",
+  assert_eq(task_prompt(exec2.body.artifact.data), "second",
     "the promoted turn carries the queued text")
   local seeded = exec2.body.params_overlay["lead.llm"].history
   assert_eq(#seeded, 2, "the promoted turn seeds the finished turn's history")
@@ -873,7 +885,7 @@ do
   local calls = decode_calls()
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "an idle lead relays the completion immediately")
-  local prompt = exec2.body.artifact.data.messages[1].content.value.prompt
+  local prompt = task_prompt(exec2.body.artifact.data)
   assert(string.find(prompt, "mag-sub-1", 1, true) ~= nil,
     "the relay turn names the finished run")
   assert(string.find(prompt, "sub answer", 1, true) ~= nil,
@@ -909,7 +921,7 @@ do
   local calls = decode_calls()
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "an idle lead relays the interrupted failure immediately")
-  local prompt = exec2.body.artifact.data.messages[1].content.value.prompt
+  local prompt = task_prompt(exec2.body.artifact.data)
   assert(string.find(prompt, "FAILED", 1, true) ~= nil,
     "the relay turn marks the interrupted run as FAILED")
   assert(string.find(prompt, "interrupted by user", 1, true) ~= nil,
@@ -1030,7 +1042,7 @@ do
     if c.body.kind == "mag.execute" then execs[#execs + 1] = c end
   end
   assert_eq(#execs, 1, "both queued completions flush as one relay turn")
-  local prompt = execs[1].body.artifact.data.messages[1].content.value.prompt
+  local prompt = task_prompt(execs[1].body.artifact.data)
   assert(prompt:find("alpha output", 1, true) ~= nil,
     "the merged relay carries the first completion")
   assert(prompt:find("beta output", 1, true) ~= nil,

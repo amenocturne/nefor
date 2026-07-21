@@ -283,8 +283,11 @@ function M:route_output(sender_id, tag, message)
   if not dests then
     return
   end
-  for _, dest_id in ipairs(dests) do
-    self:deliver(dest_id, sender_id, tag, message)
+  for _, destination in ipairs(dests) do
+    local delivered = {}
+    for key, value in pairs(message) do delivered[key] = value end
+    delivered.kind = destination.wire
+    self:deliver(destination.actor, sender_id, destination.wire, delivered)
   end
 end
 
@@ -393,8 +396,10 @@ end
 
 -- Derive a product input's slots from the routes topology. Slot identity is
 -- the incoming edge (sender, type), not the bare component type: scan every
--- actor's routes for entries that (a) target this actor and (b) carry a tag
--- that is a component of the product. Each such (sender, tag) is one slot.
+-- actor's routes for entries that (a) target this actor and (b) deliver on a
+-- wire that is a component of the product. Each such (sender, destination
+-- wire) is one slot. Source and destination wires may differ because routing
+-- performs the typed retag at the edge boundary.
 -- This is what makes `(Unit + Unit)` from two upstreams unambiguous — two
 -- edges, two sender-bound slots — where keying by the bare type could not tell
 -- them apart (docs/ir.md, Firing). Because ids are signed and routes are
@@ -406,24 +411,20 @@ function M:derive_slots(dest_id, product_shape)
   end
   local edges = {}
   for sender_id, actor in self.inventory.pairs() do
-    for tag, dests in pairs(actor.routes or {}) do
-      if components[tag] then
-        for _, d in ipairs(dests) do
-          if d == dest_id then
-            edges[#edges + 1] = { sender = sender_id, type = tag }
-          end
+    for _, dests in pairs(actor.routes or {}) do
+      for _, destination in ipairs(dests) do
+        if destination.actor == dest_id and components[destination.wire] then
+          edges[#edges + 1] = { sender = sender_id, type = destination.wire }
         end
       end
     end
   end
-  -- Arity check: a well-lowered product has exactly one sender-bound slot per
-  -- component (docs/ir.md, Firing: slot identity is the incoming edge). A
-  -- mismatch means the routes topology under-/over-fills the product — a
-  -- lowering bug that would otherwise leave the actor silently unable to fire
-  -- (too few edges) or assembling ill-defined sets (too many). Surface it.
+  -- Application validation guarantees exact product coverage before the
+  -- inventory changes. Reaching this backstop means an internal topology
+  -- invariant was broken; fail loudly rather than parking a partial product.
   local component_count = #shape.tags(product_shape)
   if #edges ~= component_count then
-    self.log.warn(string.format(
+    error(string.format(
       "actor '%s': product input derives %d sender-bound slot(s) but the shape has %d component(s)",
       tostring(dest_id), #edges, component_count))
   end

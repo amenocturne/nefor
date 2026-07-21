@@ -144,7 +144,7 @@ do
 
   local bad = reg:validate_modification({
     actors = {
-      { id = "a", factory = "stub", params = {}, routes = { ["stub.Nope"] = { "b" } } },
+      { id = "a", factory = "stub", params = {}, routes = { ["stub.Nope"] = { { actor = "b", wire = "stub.Nope" } } } },
     },
   })
   assert_eq(bad.ok, false, "route key not in declared outputs is rejected")
@@ -155,7 +155,7 @@ do
     actors = {
       -- routes to an id not present in this modification: destination compat
       -- is the fold's concern, so key-in-outputs alone must pass.
-      { id = "a", factory = "stub", params = {}, routes = { ["stub.Out"] = { "downstream" } } },
+      { id = "a", factory = "stub", params = {}, routes = { ["stub.Out"] = { { actor = "downstream", wire = "stub.Out" } } } },
     },
   })
   assert_eq(good.ok, true, "declared output tag as a route key is accepted")
@@ -242,7 +242,7 @@ do
   local compatible = reg:validate_modification({
     actors = {
       { id = "p", factory = "producer", params = {},
-        routes = { ["src.Out"] = { "c-single", "c-union", "c-product" } } },
+        routes = { ["src.Out"] = { { actor = "c-single", wire = "src.Out" }, { actor = "c-union", wire = "src.Out" }, { actor = "c-product", wire = "src.Out" } } } },
       { id = "c-single",  factory = "single-consumer",  params = {}, routes = {} },
       { id = "c-union",   factory = "union-consumer",   params = {}, routes = {} },
       { id = "c-product", factory = "product-consumer", params = {}, routes = {} },
@@ -254,7 +254,7 @@ do
   local incompatible = reg:validate_modification({
     actors = {
       { id = "p", factory = "producer", params = {},
-        routes = { ["src.Out"] = { "c-wrong" } } },
+        routes = { ["src.Out"] = { { actor = "c-wrong", wire = "src.Out" } } } },
       { id = "c-wrong", factory = "wrong-consumer", params = {}, routes = {} },
     },
   })

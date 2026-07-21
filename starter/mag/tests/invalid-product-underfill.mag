@@ -1,0 +1,25 @@
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+(foreign test.product [T]
+  {:params Unit :input (+ T T) :output T})
+
+(let [left (nefor.graph.source "left" (type-tag nefor.contracts.Text)
+             (as nefor.contracts.Text {:content "left"}))
+      input (nefor.graph.port "join"
+              (type-tag (+ nefor.contracts.Text nefor.contracts.Text))
+              "test.Value")
+      output (nefor.graph.port "join" (type-tag nefor.contracts.Text) "test.Value")
+      worker (nefor.graph.actor "join"
+               (specialize test.product [nefor.contracts.Text]) nil
+               (nefor.graph.store-port input) [(nefor.graph.store-port output)])
+      join (nefor.graph.node "join" "ordinary" [worker]
+             (as (List nefor.graph.StoredRoute) [])
+             (as (List nefor.graph.Message) []) input output)
+      result (nefor.graph.output "result" (type-tag nefor.contracts.Text))]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge left join)
+         (nefor.graph.edge join result)]))))

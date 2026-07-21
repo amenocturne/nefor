@@ -76,7 +76,7 @@ pub struct ForeignDecl {
     pub output: MagType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignEvidence {
     pub identity: String,
     pub arguments: Vec<MagType>,

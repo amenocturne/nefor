@@ -1,0 +1,20 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+
+;; A terminal ordinary actor is not the concrete output boundary merely
+;; because its author writes the output role string.
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      ordinary (nefor.shell.command "fake-output" "printf fake")
+      fake-output (nefor.graph.node
+                    (get ordinary "id")
+                    "output"
+                    (get ordinary "actors")
+                    (get ordinary "routes")
+                    (get ordinary "messages")
+                    (get ordinary "input")
+                    (get ordinary "output"))]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge start fake-output)]))))

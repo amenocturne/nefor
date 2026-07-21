@@ -137,8 +137,8 @@ do
 
   local res = h.obs:apply({
     actors = {
-      { id = "u1", factory = "upstream", params = {}, routes = { ["l.Out"] = { "j" } } },
-      { id = "u2", factory = "upstream", params = {}, routes = { ["r.Out"] = { "j" } } },
+      { id = "u1", factory = "upstream", params = {}, routes = { ["l.Out"] = { { actor = "j", wire = "l.Out" } } } },
+      { id = "u2", factory = "upstream", params = {}, routes = { ["r.Out"] = { { actor = "j", wire = "r.Out" } } } },
       { id = "j", factory = "joiner", params = {}, routes = {} },
     },
   })
@@ -319,7 +319,7 @@ do
 
   local res = h.obs:apply({
     actors = {
-      { id = "entry", factory = "entry", params = {}, routes = { ["hop.Ping"] = { "sink" }, ["alt.Out"] = { "exhaust" } } },
+      { id = "entry", factory = "entry", params = {}, routes = { ["hop.Ping"] = { { actor = "sink", wire = "hop.Ping" } }, ["alt.Out"] = { { actor = "exhaust", wire = "alt.Out" } } } },
       { id = "sink", factory = "terminal", params = {}, routes = {} },
       { id = "exhaust", factory = "summarizer", params = {}, routes = {} },
     },

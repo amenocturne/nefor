@@ -442,6 +442,19 @@ fn infer_builtin(
             }
         }
         "str" => Ok(MagType::String),
+        "canonical" => {
+            exact(1)?;
+            let _ = infer(env, locals, &args[0])?;
+            Ok(MagType::String)
+        }
+        "conforms?" => {
+            exact(2)?;
+            let _ = infer(env, locals, &args[0])?;
+            let evidence = infer(env, locals, &args[1])?;
+            compatible(env, &evidence, &MagType::Data, &mut HashMap::new())
+                .map_err(MagError::Type)?;
+            Ok(MagType::Bool)
+        }
         "fail" => {
             exact(1)?;
             let _ = infer(env, locals, &args[0])?;
@@ -477,6 +490,18 @@ fn infer_builtin(
             compatible(env, &a, &b, &mut HashMap::new()).map_err(MagError::Type)?;
             Ok(a)
         }
+        "remove-at" => {
+            exact(2)?;
+            let collection = infer(env, locals, &args[0])?;
+            let index = infer(env, locals, &args[1])?;
+            compatible(env, &index, &MagType::Int, &mut HashMap::new()).map_err(MagError::Type)?;
+            match collection {
+                MagType::List(_) => Ok(collection),
+                actual => Err(MagError::Type(format!(
+                    "remove-at expects List, got {actual}"
+                ))),
+            }
+        }
         "keys" => {
             exact(1)?;
             match infer(env, locals, &args[0])? {
@@ -486,7 +511,14 @@ fn infer_builtin(
                 actual => Err(MagError::Type(format!("keys expects a map, got {actual}"))),
             }
         }
-        "map" | "filter" | "flat-map" => {
+        "first" => {
+            exact(1)?;
+            match infer(env, locals, &args[0])? {
+                MagType::List(item) => Ok(*item),
+                actual => Err(MagError::Type(format!("first expects List, got {actual}"))),
+            }
+        }
+        "map" | "filter" | "flat-map" | "sort-by" => {
             exact(2)?;
             let fun = infer(env, locals, &args[0])?;
             let collection = infer(env, locals, &args[1])?;
@@ -506,6 +538,10 @@ fn infer_builtin(
             compatible(env, &item, &params[0], &mut HashMap::new()).map_err(MagError::Type)?;
             if name == "filter" {
                 compatible(env, &result, &MagType::Bool, &mut HashMap::new())
+                    .map_err(MagError::Type)?;
+                Ok(MagType::List(Box::new(item)))
+            } else if name == "sort-by" {
+                compatible(env, &result, &MagType::String, &mut HashMap::new())
                     .map_err(MagError::Type)?;
                 Ok(MagType::List(Box::new(item)))
             } else if name == "flat-map" {

@@ -410,6 +410,142 @@ fn builtin_type_rules_are_total_and_assoc_checks_values() {
 }
 
 #[test]
+fn canonical_and_sort_by_are_typed_deterministic_builtins() {
+    let root = workspace("canonical-sort-by");
+    let artifact = compile(
+        r#"
+          (type Item {:id String :rank Int})
+          (def items (as (List Item)
+            [(as Item {:id "third" :rank 30})
+             (as Item {:id "first" :rank 10})
+             (as Item {:id "second" :rank 20})]))
+          (def ordered
+            (sort-by
+              (fn [[item Item]] -> String (get item "id"))
+              items))
+          (artifact "test.canonical/v1"
+            {:canonical (canonical {:nodes ["a" "b"]
+                                    :meta {:z 2 :a 1}
+                                    :kind "edge"})
+             :removed (remove-at ["a" "b" "c"] 1)
+             :string-ok (conforms? "value" (type-evidence (type-tag String)))
+             :string-bad (conforms? 42 (type-evidence (type-tag String)))
+             :item-ok (conforms? {:id "item" :rank 1}
+                        (type-evidence (type-tag Item)))
+             :ids (map (fn [[item Item]] -> String (get item "id")) ordered)})
+        "#,
+        &root,
+    )
+    .unwrap();
+    assert_eq!(
+        artifact.data,
+        json!({
+            "canonical": "{\"kind\":\"edge\",\"meta\":{\"a\":1,\"z\":2},\"nodes\":[\"a\",\"b\"]}",
+            "removed": ["a", "c"],
+            "string-ok": true,
+            "string-bad": false,
+            "item-ok": true,
+            "ids": ["first", "second", "third"]
+        })
+    );
+
+    let bad_key = compile(
+        "(artifact \"test.sort/v1\" (sort-by (fn [[value Int]] -> Int value) [2 1]))",
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        bad_key.contains("sort-by callback must return String"),
+        "{bad_key}"
+    );
+
+    let bad_arity = compile("(artifact \"test.canonical/v1\" (canonical 1 2))", &root)
+        .unwrap_err()
+        .to_string();
+    assert!(bad_arity.contains("expected 1, got 2"), "{bad_arity}");
+}
+
+#[test]
+fn graph_product_input_accepts_repeated_typed_fan_in() {
+    let root = workspace("product-fan-in");
+    let mag_lib =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib");
+    fs::write(
+        root.join("main.mag"),
+        r#"
+          (require "nefor.graph")
+          (foreign test.product [T]
+            {:params Unit :input (+ T T) :output T})
+          (let [left (nefor.graph.source
+                       "left" (type-tag nefor.contracts.Text)
+                       (as nefor.contracts.Text {:content "left"}))
+                right (nefor.graph.source
+                        "right" (type-tag nefor.contracts.Text)
+                        (as nefor.contracts.Text {:content "right"}))
+                join-input (nefor.graph.port
+                             "join"
+                             (type-tag (+ nefor.contracts.Text nefor.contracts.Text))
+                             "test.Value")
+                join-output (nefor.graph.port
+                              "join" (type-tag nefor.contracts.Text) "test.Value")
+                join-actor (nefor.graph.actor
+                             "join" (specialize test.product [nefor.contracts.Text]) nil
+                             (nefor.graph.store-port join-input)
+                             [(nefor.graph.store-port join-output)])
+                join (nefor.graph.node
+                       "join" "ordinary" [join-actor]
+                       (as (List nefor.graph.StoredRoute) [])
+                       (as (List nefor.graph.Message) [])
+                       join-input join-output)
+                result (nefor.graph.output
+                         "result" (type-tag nefor.contracts.Text))
+                topology (nefor.graph.graph
+                           [(nefor.graph.edge left join)
+                            (nefor.graph.edge right join)
+                            (nefor.graph.edge join result)])
+                contracts (map nefor.graph.foreign-contract
+                                (as (List Data)
+                                  (get (as (Map String Data) inputs)
+                                       "foreign_contracts")))
+                checked (nefor.graph.validate topology contracts)]
+            (artifact "test.product-fan-in/v1" {:tag (get checked "tag")}))
+        "#,
+    )
+    .unwrap();
+    let inputs = json!({
+        "foreign_contracts": [
+            {
+                "identity": "nefor.factory.source",
+                "type_scheme": {
+                    "input_tags": ["mag.Unit"],
+                    "outputs": ["nefor.graph.Value"]
+                }
+            },
+            {
+                "identity": "nefor.factory.output",
+                "type_scheme": {
+                    "input_tags": ["nefor.graph.Value"],
+                    "outputs": ["nefor.graph.Value"]
+                }
+            },
+            {
+                "identity": "test.product",
+                "type_scheme": {
+                    "input_tags": ["test.Value"],
+                    "outputs": ["test.Value"]
+                }
+            }
+        ]
+    });
+    let artifact =
+        load_with_inputs_and_module_roots(&root, "main.mag", inputs, &[root.clone(), mag_lib])
+            .unwrap()
+            .artifact;
+    assert_eq!(artifact.data["tag"], "core.validated.Valid");
+}
+
+#[test]
 fn union_unification_commits_substitutions_and_rejects_ambiguity() {
     let root = workspace("union-substitution");
     let artifact = compile(

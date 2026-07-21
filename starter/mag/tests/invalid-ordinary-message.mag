@@ -1,0 +1,22 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+
+;; Initial messages are boundary authority, not a capability ordinary nodes
+;; may obtain by placing a message in their record.
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation (nefor.shell.command "operation" "true")
+      injected (nefor.graph.node
+                 (get operation "id")
+                 "ordinary"
+                 (get operation "actors")
+                 (get operation "routes")
+                 [(nefor.graph.message "operation" {:kind "mag.Unit"})]
+                 (get operation "input")
+                 (get operation "output"))
+      result (nefor.graph.output-for "result" injected)]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge start injected)
+         (nefor.graph.edge injected result)]))))

@@ -1426,14 +1426,16 @@ local function lead_workflow_tool_schemas()
         "modification. Use action='execute' to compile, validate, and run. " ..
         "Graph and agent semantics live in namespaced MAG libraries. " ..
         "A program requires nefor.actors, nefor.graph, nefor.contracts, and " ..
-        "nefor.artifact; construct an agent fragment, add an explicit initial " ..
-        "message with nefor.graph.finish, then return " ..
-        "(nefor.artifact.compile program). Use the agent constructor shown " ..
+        "nefor.artifact; construct source, agent, and output nodes, connect " ..
+        "them through one flat edge list in a Graph -> Graph function, then " ..
+        "pass that function to nefor.artifact.compile. Compile applies it to " ..
+        "empty-graph for a fresh run. Use the agent constructor shown " ..
         "by the injected canonical contract. " ..
         "Pass compiler-checked semantic type witnesses separately from runtime " ..
         "wire tags; use (type-tag nefor.contracts.Task), wire \"task\", and " ..
-        "an output such as (type-tag nefor.contracts.FinalAnswer). The result boundary is " ..
-        "structural metadata, not a sink actor. Agent loops are unbounded; " ..
+        "an output such as (type-tag nefor.contracts.FinalAnswer). Exactly one " ..
+        "concrete output<T> identity node marks the result boundary. Graph " ..
+        "operations are pure, retrieve no stored graph, and never mutate a live run. Agent loops are unbounded; " ..
         "stop early via interrupt/kill. The injected lib/patterns.md is the " ..
         "canonical complete example: use literal (require \"...\") forms and " ..
         "never copy historical session files or use removed import/bare-helper syntax. " ..

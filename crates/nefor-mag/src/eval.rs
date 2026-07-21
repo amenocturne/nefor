@@ -761,6 +761,27 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         "str" => Ok(Value::Str(
             args.iter().map(value_string).collect::<Vec<_>>().join(""),
         )),
+        "canonical" => {
+            arity(args, 1)?;
+            let json = canonical_json(crate::json::value_to_json(&args[0])?);
+            serde_json::to_string(&json)
+                .map(Value::Str)
+                .map_err(|error| MagError::Eval(format!("canonical serialization failed: {error}")))
+        }
+        "conforms?" => {
+            arity(args, 2)?;
+            let evidence = crate::json::value_to_json(&args[1])?;
+            let Ok(ty) = crate::json::type_evidence_from_json(&evidence) else {
+                return Ok(Value::Bool(false));
+            };
+            let Ok(schema) = crate::schema::TypeSchema::reify(env, &ty) else {
+                return Ok(Value::Bool(false));
+            };
+            let value = crate::json::value_to_json(&args[0])?;
+            let encoded = serde_json::to_string(&value)
+                .map_err(|error| MagError::Eval(format!("serialize conformance value: {error}")))?;
+            Ok(Value::Bool(schema.validate_json(&encoded).ok))
+        }
         "count" => {
             arity(args, 1)?;
             let n = match raw(&args[0]) {
@@ -770,6 +791,29 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 _ => return Err(MagError::Eval("count expects a collection".into())),
             };
             Ok(Value::Int(n as i64))
+        }
+        "remove-at" => {
+            arity(args, 2)?;
+            let mut values = match raw(&args[0]) {
+                Value::List(values) | Value::Vector(values) => values.clone(),
+                _ => return Err(MagError::Eval("remove-at expects List".into())),
+            };
+            let index = match raw(&args[1]) {
+                Value::Int(index) if *index >= 0 => *index as usize,
+                _ => {
+                    return Err(MagError::Eval(
+                        "remove-at index must be non-negative Int".into(),
+                    ))
+                }
+            };
+            if index >= values.len() {
+                return Err(MagError::Eval(format!(
+                    "remove-at index {index} is out of bounds for {} values",
+                    values.len()
+                )));
+            }
+            values.remove(index);
+            Ok(Value::Vector(values))
         }
         "get" => {
             arity(args, 2)?;
@@ -799,6 +843,16 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             match raw(&args[0]) {
                 Value::Map(m) => Ok(Value::Vector(m.keys().cloned().map(Value::Str).collect())),
                 _ => Err(MagError::Eval("keys expects a map".into())),
+            }
+        }
+        "first" => {
+            arity(args, 1)?;
+            match raw(&args[0]) {
+                Value::List(values) | Value::Vector(values) => values
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| MagError::Eval("first expects a non-empty List".into())),
+                _ => Err(MagError::Eval("first expects a List".into())),
             }
         }
         "concat" => {
@@ -888,7 +942,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 args[1].clone()
             })
         }
-        "map" | "indexed-map" | "filter" | "flat-map" | "fold" => {
+        "map" | "indexed-map" | "filter" | "flat-map" | "fold" | "sort-by" => {
             collection_builtin(env, name, args)
         }
         "read" => {
@@ -912,6 +966,22 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         }
         "require" => Err(MagError::Eval("require is a special form".into())),
         _ => Err(MagError::Eval(format!("unknown builtin {name}"))),
+    }
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(fields) => {
+            let sorted = fields
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        scalar => scalar,
     }
 }
 
@@ -966,6 +1036,26 @@ fn collection_builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, Ma
             }
             Ok(acc)
         }
+        "sort-by" => {
+            arity(args, 2)?;
+            let mut keyed = seq(&args[1])?
+                .into_iter()
+                .map(|value| {
+                    let key = apply(env, &args[0], std::slice::from_ref(&value))?;
+                    let key = key
+                        .as_str()
+                        .ok_or_else(|| {
+                            MagError::Eval("sort-by callback must return String".into())
+                        })?
+                        .to_owned();
+                    Ok((key, value))
+                })
+                .collect::<Result<Vec<_>, MagError>>()?;
+            keyed.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(Value::Vector(
+                keyed.into_iter().map(|(_, value)| value).collect(),
+            ))
+        }
         _ => unreachable!(),
     }
 }
@@ -1015,6 +1105,11 @@ fn equal(a: &Value, b: &Value) -> bool {
                 && a.iter()
                     .all(|(key, value)| b.get(key).is_some_and(|other| equal(value, other)))
         }
+        (Value::Type(a), Value::Type(b)) | (Value::TypeTag(a), Value::TypeTag(b)) => a == b,
+        (Value::TypeDecl(a), Value::TypeDecl(b)) => a == b,
+        (Value::Foreign(a), Value::Foreign(b)) => a == b,
+        (Value::ForeignEvidence(a), Value::ForeignEvidence(b)) => a == b,
+        (Value::Artifact(a), Value::Artifact(b)) => a == b,
         _ => false,
     }
 }

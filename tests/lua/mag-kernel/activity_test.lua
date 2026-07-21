@@ -138,7 +138,7 @@ do
 
   local res = h.obs:apply({
     actors = {
-      { id = "w", factory = "worker", params = {}, routes = { ["mag.Unit"] = { "f" } } },
+      { id = "w", factory = "worker", params = {}, routes = { ["mag.Unit"] = { { actor = "f", wire = "mag.Unit" } } } },
       { id = "f", factory = "follower", params = {}, routes = {} },
     },
     messages = { { to = "w", content = { kind = "seed.In" } } },
@@ -273,7 +273,7 @@ do
   -- Routed failure: flaky.Err reaches the catcher, and flaky still idles.
   h.obs:apply({
     actors = {
-      { id = "flaky", factory = "flaky", params = {}, routes = { ["flaky.Err"] = { "catch" } } },
+      { id = "flaky", factory = "flaky", params = {}, routes = { ["flaky.Err"] = { { actor = "catch", wire = "flaky.Err" } } } },
       { id = "catch", factory = "catcher", params = {}, routes = {} },
     },
     messages = { { to = "flaky", content = { kind = "seed.In" } } },

@@ -39,6 +39,59 @@ local function compatible_output_type(expected, actual)
   return expected.kind == "named" and actual.kind == "named"
 end
 
+-- A route delivers one producer value into a consumer activation. Exact
+-- semantic identity is the ordinary case; union and product activations also
+-- accept compatible component values. Product multiplicity is checked from
+-- the sender-bound route slots after the whole modification is validated.
+local function accepts_semantic(target, source)
+  if type_node.equal(target, source) then return true end
+  if target.kind == "union" then
+    if source.kind == "union" then
+      for _, source_item in ipairs(source.items or {}) do
+        if not accepts_semantic(target, source_item) then return false end
+      end
+      return true
+    end
+    for _, target_item in ipairs(target.items or {}) do
+      if accepts_semantic(target_item, source) then return true end
+    end
+    return false
+  end
+  if target.kind == "product" then
+    for _, target_item in ipairs(target.items or {}) do
+      if accepts_semantic(target_item, source) then return true end
+    end
+  end
+  return false
+end
+
+local function without_index(values, removed)
+  local out = {}
+  for index, value in ipairs(values) do
+    if index ~= removed then out[#out + 1] = value end
+  end
+  return out
+end
+
+local function product_components_cover(components, sources)
+  if #components ~= #sources then return false end
+  if #sources == 0 then return true end
+  local source = sources[1]
+  local remaining_sources = without_index(sources, 1)
+  for index, component in ipairs(components) do
+    if accepts_semantic(component, source) and
+        product_components_cover(without_index(components, index), remaining_sources) then
+      return true
+    end
+  end
+  return false
+end
+
+local function product_input_covered(target, sources)
+  return (#sources == 1 and type_node.equal(target, sources[1])) or
+      product_components_cover(target.items or {}, sources)
+end
+
 -- Kernel-synthesized status types (docs/ir.md, Firing: "Reserved status types
 -- are kernel-emitted"). Lowering encodes ordering/failure edges as route keys
 -- carrying these tags, yet a factory never declares them as outputs — the
@@ -341,7 +394,7 @@ end
 -- modification are skipped, as before.
 --
 -- Returns { ok = true } or { ok = false, errors = { <msg>, ... } }.
-function registry:validate_modification(modification, resolve)
+function registry:validate_modification(modification, resolve, existing_specs)
   local errors = {}
   local actors = (modification and modification.actors) or {}
 
@@ -467,7 +520,9 @@ function registry:validate_modification(modification, resolve)
             "actor %q: route key %q is not a declared output of factory %q",
             tostring(spec.id), tostring(tag), spec.factory))
         else
-          for _, dest_id in ipairs(dests) do
+          for _, destination in ipairs(dests) do
+            local dest_id = destination.actor
+            local dest_wire = destination.wire
             local dest_factory,dest_spec = dest_factory_of(spec, tag, dest_id)
             if dest_factory then
               local dest_decl = self:declaration(dest_factory)
@@ -478,15 +533,15 @@ function registry:validate_modification(modification, resolve)
               else
                 local accepted = false
                 for _, in_shape in pairs(dest_decl.inputs) do
-                  if shape.accepts(in_shape, tag) then
+                  if shape.accepts(in_shape, dest_wire) then
                     accepted = true
                     break
                   end
                 end
                 if not accepted then
                   table.insert(errors, string.format(
-                    "wiring %q -%s-> %q: no input of factory %q accepts that tag",
-                    tostring(spec.id), tag, tostring(dest_id), dest_factory))
+                    "wiring %q -%s-> %q/%s: no input of factory %q accepts the destination wire",
+                    tostring(spec.id), tag, tostring(dest_id), tostring(dest_wire), dest_factory))
                 elseif dest_spec and (spec.evidence or dest_spec.evidence) then
                   local source_semantic=nil
                   for _,output in ipairs(spec.outputs or {}) do
@@ -495,7 +550,8 @@ function registry:validate_modification(modification, resolve)
                     end
                   end
                   local dest_semantic=type(dest_spec.input)=="table" and dest_spec.input.type or nil
-                  if not source_semantic or not dest_semantic or not type_node.equal(source_semantic,dest_semantic) then
+                  if not source_semantic or not dest_semantic or
+                      not accepts_semantic(dest_semantic, source_semantic) then
                     table.insert(errors,string.format(
                       "wiring %q -%s-> %q: semantic endpoint types differ",
                       tostring(spec.id),tag,tostring(dest_id)))
@@ -506,6 +562,53 @@ function registry:validate_modification(modification, resolve)
           end
         end
       end
+    end
+  end
+
+  -- Product firing is an all-of contract over the complete post-apply route
+  -- topology. Per-edge compatibility is insufficient: repeated components
+  -- need repeated sender-bound edges, and both underfill and overfill must be
+  -- rejected before actors are registered.
+  local post_specs = {}
+  for _, spec in ipairs(existing_specs or {}) do post_specs[spec.id] = spec end
+  for _, spec in ipairs(actors) do
+    local _, prior_state = nil, nil
+    if resolve then _, prior_state = resolve(spec.id) end
+    -- Inventory lifecycles are monotone: a spawn at a tombstoned id is a
+    -- no-op, so its proposed routes cannot participate in post-apply product
+    -- coverage. A live id is already represented by existing_specs and also
+    -- wins over a duplicate spawn.
+    if prior_state ~= "dead" and not post_specs[spec.id] then
+      post_specs[spec.id] = spec
+    end
+  end
+  for _, id in ipairs((modification and modification.kills) or {}) do
+    post_specs[id] = nil
+  end
+  local incoming = {}
+  for _, source in pairs(post_specs) do
+    for wire, destinations in pairs(source.routes or {}) do
+      local source_type = nil
+      for _, output in ipairs(source.outputs or {}) do
+        if output.wire == wire then
+          if source_type then source_type = false else source_type = output.type end
+        end
+      end
+      for _, destination in ipairs(destinations) do
+        if source_type then
+          incoming[destination.actor] = incoming[destination.actor] or {}
+          table.insert(incoming[destination.actor], source_type)
+        end
+      end
+    end
+  end
+  for id, target in pairs(post_specs) do
+    local input_type = type(target.input) == "table" and target.input.type or nil
+    if type(input_type) == "table" and input_type.kind == "product" and
+        not product_input_covered(input_type, incoming[id] or {}) then
+      table.insert(errors, string.format(
+        "actor %q: product input incoming route types must exactly cover its component multiset",
+        tostring(id)))
     end
   end
 

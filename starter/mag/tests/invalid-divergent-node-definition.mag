@@ -1,0 +1,16 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+
+;; Edge identity is logical endpoints plus route, but duplicate identities must
+;; not erase evidence that one node id denotes divergent immutable definitions.
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation-a (nefor.shell.command "operation" "printf a")
+      operation-b (nefor.shell.command "operation" "printf b")
+      result (nefor.graph.output-for "result" operation-a)]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge start operation-a)
+         (nefor.graph.edge start operation-b)
+         (nefor.graph.edge operation-a result)]))))

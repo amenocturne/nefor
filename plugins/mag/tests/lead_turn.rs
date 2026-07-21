@@ -200,17 +200,18 @@ async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
 /// message.
 fn turn_artifact(program: &Value, user_text: &str) -> Value {
     let mut m = program.clone();
-    let messages = m
+    let actors = m
         .get_mut("data")
-        .and_then(|data| data.get_mut("messages"))
+        .and_then(|data| data.get_mut("actors"))
         .and_then(Value::as_array_mut)
-        .expect("program has messages");
-    for msg in messages {
-        if let Some(content) = msg.get_mut("content") {
-            let value = content
-                .get_mut("value")
+        .expect("program has actors");
+    for actor in actors {
+        if actor.get("foreign").and_then(Value::as_str) == Some("nefor.factory.source") {
+            let value = actor
+                .get_mut("params")
+                .and_then(|params| params.get_mut("value"))
                 .and_then(Value::as_object_mut)
-                .expect("initial task content carries a typed value");
+                .expect("source actor carries the typed task value");
             value.insert("prompt".to_owned(), Value::String(user_text.to_owned()));
         }
     }

@@ -29,7 +29,7 @@ namespaced modules
 ## Authoring layer
 
 `nefor.graph` defines graph data and composition functions. `nefor.actors` and
-`nefor.shell` are ordinary libraries that return `nefor.graph.Fragment` values;
+`nefor.shell` are ordinary libraries that return `nefor.graph.Node` values;
 there are no compiler builtins named `agent`, `bash`, `graph`, `subgraph`, or
 `sink`.
 
@@ -39,7 +39,7 @@ A typed port records two identities:
   composition and lowered to a versioned structural descriptor;
 - `wire`: the runtime tag emitted or accepted by the foreign implementation.
 
-This lets an agent fragment expose `(CodeAudit | AgentError)` on the stable
+This lets an agent node expose `(CodeAudit | AgentError)` on the stable
 `nefor.agent.Result` wire. The success type is declared with
 `(type-tag CodeAudit)`; an undeclared or misspelled semantic type fails
 compilation. `nefor.actors.select-result` introduces distinct success/error
@@ -55,8 +55,9 @@ inputs and are checked again by `nefor.graph.validate` before lowering.
 
 `nefor.graph.lower` produces only the graph-modification data consumed by the
 kernel: actors, typed routes, initial messages, kills, rules, and structural
-result metadata. Initial activation is explicit library data. The result is
-selected by `{from: Port}`; no terminal actor or sink route is synthesized.
+result metadata. A `source<T>` node owns initial activation. A concrete
+`output<T>` identity actor is the unique terminal, and the structural result
+metadata selects that actor's output port.
 
 The runtime binds each qualified foreign identity to an implementation and
 revalidates its concrete input/output contract as exact semantic-type/runtime-
@@ -79,24 +80,25 @@ live-plus-new inventory before applying anything.
 
 ## One-off command expressions
 
-`mag-eval` wraps a fragment expression with the standard artifact pipeline, so
+`mag-eval` wraps one node expression with a source, output, and the standard
+artifact pipeline, so
 the expression itself is concise:
 
 ```lisp
 (nefor.shell.command "search" "rg -n TODO src/")
 ```
 
-Pipelines use the graph library explicitly:
+For a one-off pipeline, keep it inside the command node:
 
 ```lisp
-(nefor.graph.connect
-  (nefor.shell.command "search" "rg -n TODO src/")
-  (nefor.shell.pipe-command "sort" "sort"))
+(nefor.shell.command "search" "rg -n TODO src/ | sort")
 ```
 
-The wrapper imports `nefor.artifact`, `nefor.graph`, and `nefor.shell`, creates
-the initial `Unit` message with `nefor.shell.start-message`, calls
-`nefor.graph.finish`, and then `nefor.artifact.compile`.
+Multi-node pipelines are full `.mag` programs: construct `source`, command,
+pipe-command, and `output` nodes, place their edges in one flat list, then pass
+a `Graph -> Graph` function to `nefor.artifact.compile`. Each compilation
+applies that function to `empty-graph` and validates the result for a fresh
+run; it does not retrieve or mutate a stored graph.
 
 ## Module resolution
 

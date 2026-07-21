@@ -1,0 +1,20 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+
+;; A role string cannot turn an ordinary actor into the concrete source
+;; boundary. Source authority comes from its factory and exact node shape.
+(let [ordinary (nefor.shell.command "fake-source" "printf fake")
+      fake-source (nefor.graph.node
+                    (get ordinary "id")
+                    "source"
+                    (get ordinary "actors")
+                    (get ordinary "routes")
+                    (get ordinary "messages")
+                    (get ordinary "input")
+                    (get ordinary "output"))
+      result (nefor.graph.output-for "result" fake-source)]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge fake-source result)]))))

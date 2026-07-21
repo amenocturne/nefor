@@ -201,7 +201,11 @@ fn read_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<Strin
                 Some('t') => s.push('\t'),
                 Some('\\') => s.push('\\'),
                 Some('"') => s.push('"'),
-                Some(c) => s.push(c),
+                Some(c) => {
+                    return Err(MagError::Lex(format!(
+                        "unknown string escape \\{c}; use \\\\ for a literal backslash"
+                    )))
+                }
                 None => return Err(MagError::Lex("unterminated escape in string".into())),
             },
             Some(c) => s.push(c),
@@ -246,6 +250,15 @@ mod tests {
     fn string_with_escapes() {
         let tokens = tokenize(r#""line\none\ttwo\\end\"""#).unwrap();
         assert_eq!(tokens, vec![Token::Str("line\none\ttwo\\end\"".into())]);
+    }
+
+    #[test]
+    fn unknown_string_escape_is_rejected_without_dropping_the_backslash() {
+        let error = tokenize(r#""find -exec echo {} \;""#).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "lexer: unknown string escape \\;; use \\\\ for a literal backslash"
+        );
     }
 
     #[test]

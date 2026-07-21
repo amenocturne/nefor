@@ -5,37 +5,33 @@
 
 ;; Shell execution is a foreign capability wrapped by ordinary library code.
 (def bash (fn [I] [[id String] [command String] [options BashOptions]
-               [input-type (TypeTag I)] [input-wire String]] -> (nefor.graph.Fragment I nefor.contracts.Text)
+               [input-type (TypeTag I)] [input-wire String]] -> (nefor.graph.Node I nefor.contracts.Text)
   (let [input (nefor.graph.port id
                 input-type
                 input-wire)
         output (nefor.graph.port id
                  (type-tag nefor.contracts.Text)
                  "mag.Text")]
-    (as (nefor.graph.Fragment I nefor.contracts.Text)
-     {:actors [(nefor.graph.actor id nefor.factory.bash
+    (as (nefor.graph.Node I nefor.contracts.Text)
+     {:id id :role "ordinary" :actors [(nefor.graph.actor id nefor.factory.bash
                 (as nefor.contracts.BashParams
                   {:command command
                    :timeout_ms (get options "timeout_ms")})
                 (nefor.graph.store-port input)
                 [(nefor.graph.store-port output)])]
      :routes (as (List nefor.graph.StoredRoute) [])
+     :messages []
      :input input
      :output output}))))
 
-(def command (fn [[id String] [text String]] -> (nefor.graph.Fragment Unit nefor.contracts.Text)
+(def command (fn [[id String] [text String]] -> (nefor.graph.Node Unit nefor.contracts.Text)
   (bash id text (as BashOptions {:timeout_ms nil}) (type-tag Unit) "mag.Unit")))
 
 (def command-with-options
-  (fn [[id String] [text String] [options BashOptions]] -> (nefor.graph.Fragment Unit nefor.contracts.Text)
+  (fn [[id String] [text String] [options BashOptions]] -> (nefor.graph.Node Unit nefor.contracts.Text)
     (bash id text options (type-tag Unit) "mag.Unit")))
 
-(def pipe-command (fn [[id String] [text String]] -> (nefor.graph.Fragment nefor.contracts.Text nefor.contracts.Text)
+(def pipe-command (fn [[id String] [text String]] -> (nefor.graph.Node nefor.contracts.Text nefor.contracts.Text)
   (bash id text (as BashOptions {:timeout_ms nil})
         (type-tag nefor.contracts.Text)
         "mag.Text")))
-
-(def start-message (fn [O] [[fragment (nefor.graph.Fragment Unit O)]] -> nefor.graph.Message
-  (nefor.graph.message
-    (get (get fragment "input") "actor")
-    (as (Map String Data) {:kind "mag.Unit"}))))

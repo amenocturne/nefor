@@ -10,19 +10,21 @@
                    :da-policy Data
                    :max-corrections Int})
 (type ApprovalConfig {:id String :prompt String})
-(type BranchFragment [I A B]
-  {:actors (List nefor.graph.Actor)
+(type BranchNode [I A B]
+  {:id String
+   :actors (List nefor.graph.Actor)
    :routes (List nefor.graph.StoredRoute)
+   :messages (List nefor.graph.Message)
    :input (nefor.graph.Port I)
    :first (nefor.graph.Port A)
    :second (nefor.graph.Port B)})
 
-(def branch-fragment-delta (fn [I A B]
-  [[fragment (BranchFragment I A B)]] -> nefor.graph.Delta
+(def branch-node-delta (fn [I A B]
+  [[fragment (BranchNode I A B)]] -> nefor.graph.Delta
   (as nefor.graph.Delta
     {:actors (get fragment "actors")
      :routes (get fragment "routes")
-     :messages []
+     :messages (get fragment "messages")
      :kills []})))
 
 ;; Every agent has one public result port with semantic type `O | AgentError`.
@@ -31,7 +33,7 @@
 ;; variants independently.
 (def agent (fn [I O] [[config AgentConfig] [input-type (TypeTag I)]
                 [input-wire String] [output-type (TypeTag O)]]
-  -> (nefor.graph.Fragment I (| O nefor.contracts.AgentError))
+  -> (nefor.graph.Node I (| O nefor.contracts.AgentError))
   (let [id (get config "id")
         entry-id (str id ".entry")
         llm-id (str id ".llm")
@@ -64,7 +66,7 @@
                      (type-tag nefor.contracts.ProviderInput)
                      "generic-provider.ProviderOut")]
 
-    (as (nefor.graph.Fragment I (| O nefor.contracts.AgentError)) {:actors
+    (as (nefor.graph.Node I (| O nefor.contracts.AgentError)) {:id id :role "ordinary" :actors
        [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [I])
          (as nefor.contracts.AdapterParams
            {:seed "provider-in" :schema (type-schema input-type)})
@@ -90,17 +92,18 @@
          (as nefor.contracts.ToolResultParams {})
          (nefor.graph.store-port result-in)
          [(nefor.graph.store-port result-out)])]
-     :routes [(nefor.graph.store-route (nefor.graph.route entry-out llm-in))
-              (nefor.graph.store-route (nefor.graph.route tool-calls run-in))
-              (nefor.graph.store-route (nefor.graph.route run-out result-in))
-              (nefor.graph.store-route (nefor.graph.route result-out llm-in))]
+     :routes [(nefor.graph.stored-route entry-out llm-in)
+              (nefor.graph.stored-route tool-calls run-in)
+              (nefor.graph.stored-route run-out result-in)
+              (nefor.graph.stored-route result-out llm-in)]
+     :messages []
      :input entry-in
      :output result}))))
 
 (def select-result (fn [I O]
-  [[fragment (nefor.graph.Fragment I (| O nefor.contracts.AgentError))]
+  [[fragment (nefor.graph.Node I (| O nefor.contracts.AgentError))]
    [id String]]
-  -> (BranchFragment I O nefor.contracts.AgentError)
+  -> (BranchNode I O nefor.contracts.AgentError)
   (let [selector-id (str id ".select-result")
         selector-in (nefor.graph.port selector-id
                       (type-tag (| O nefor.contracts.AgentError))
@@ -108,22 +111,22 @@
         success (nefor.graph.port selector-id (type-tag O) "nefor.agent.Output")
         failure (nefor.graph.port selector-id
                   (type-tag nefor.contracts.AgentError) "nefor.agent.Error")]
-    (as (BranchFragment I O nefor.contracts.AgentError)
-      {:actors (concat (get fragment "actors")
+    (as (BranchNode I O nefor.contracts.AgentError)
+      {:id id :actors (concat (get fragment "actors")
         [(nefor.graph.actor selector-id
           (specialize nefor.factory.select-agent-result [O])
           (as nefor.contracts.SelectAgentResultParams {})
           (nefor.graph.store-port selector-in)
           [(nefor.graph.store-port success) (nefor.graph.store-port failure)])])
        :routes (concat (get fragment "routes")
-         [(nefor.graph.store-route
-           (nefor.graph.route (get fragment "output") selector-in))])
+         [(nefor.graph.stored-route (get fragment "output") selector-in)])
+       :messages (get fragment "messages")
        :input (get fragment "input")
        :first success
        :second failure}))))
 
 (def approval-gate (fn [[config ApprovalConfig]]
-  -> (BranchFragment nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)
+  -> (BranchNode nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)
   (let [id (get config "id")
         actor-id (str id ".human")
         input (nefor.graph.port actor-id
@@ -135,13 +138,14 @@
         rejected (nefor.graph.port actor-id
                    (type-tag nefor.contracts.Rejected)
                    "human.Rejected")]
-    (as (BranchFragment nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)
-     {:actors [(nefor.graph.actor actor-id nefor.factory.human
+    (as (BranchNode nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)
+     {:id id :actors [(nefor.graph.actor actor-id nefor.factory.human
                 (as nefor.contracts.HumanParams {:prompt (get config "prompt")})
                 (nefor.graph.store-port input)
                 [(nefor.graph.store-port approved)
                  (nefor.graph.store-port rejected)])]
      :routes (as (List nefor.graph.StoredRoute) [])
+     :messages []
      :input input
      :first approved
      :second rejected}))))

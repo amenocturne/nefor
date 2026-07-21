@@ -169,7 +169,8 @@ local function artifact_from_modification(modification)
       for wire, destinations in pairs(actor.routes or {}) do
         local kept = {}
         for _, destination in ipairs(destinations) do
-          if not sink_ids[destination] and destination ~= "sink" then
+          local destination_id = destination.actor
+          if not sink_ids[destination_id] and destination_id ~= "sink" then
             kept[#kept + 1] = destination
           end
         end
@@ -188,7 +189,8 @@ local function artifact_from_modification(modification)
     if actor.factory ~= "sink" then
       for wire, destinations in pairs(actor.routes or {}) do
         for _, destination in ipairs(destinations) do
-          if destination == "sink" or sink_ids[destination] then
+          local destination_id = destination.actor
+          if destination_id == "sink" or sink_ids[destination_id] then
             result = { from = { actor = actor.id, type = wire, wire = wire } }
           end
         end
@@ -212,11 +214,11 @@ local function read_only_modification()
     actors = {
       { id = "worker.entry", factory = "adapter",
         params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderOut"] = { "worker.llm" } } },
+        routes = { ["generic-provider.ProviderOut"] = { { actor = "worker.llm", wire = "generic-provider.ProviderOut" } } } },
       { id = "worker.llm", factory = "llm",
         params = { system = "Answer the task.", provider = "chatgpt",
                    profile = "standard", tools = { "read_file" } },
-        routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
+        routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
     messages = { { to = "worker.entry", content = { kind = "task", prompt = "<initial task text>" } } },
@@ -231,7 +233,7 @@ local function writer_modification()
       { id = "build.llm", factory = "llm",
         params = { system = "Implement feature X.", provider = "chatgpt",
                    profile = "fast", tools = { "read_file", "write_file" } },
-        routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
+        routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
     messages = { { to = "build.llm", content = { kind = "task", prompt = "<initial task text>" } } },
@@ -638,15 +640,18 @@ end
 local function lead_turn_modification()
   return {
     actors = {
+      { id = "lead.source", factory = "source",
+        params = { value = { prompt = "<initial task text>" } },
+        routes = { ["nefor.graph.Value"] = {
+          { actor = "lead.entry", wire = "task" },
+        } } },
       { id = "lead.entry", factory = "adapter", params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderOut"] = { "lead.llm" } } },
+        routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } } },
       { id = "lead.llm", factory = "llm", params = {},
-        routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
+        routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
-    messages = { { to = "lead.entry", content = {
-      kind = "task", value = { prompt = "<initial task text>" },
-    } } },
+    messages = { { to = "lead.source", content = { kind = "mag.Unit" } } },
     kills = {},
     rules = {},
   }
@@ -671,9 +676,11 @@ local function relayed_lead_prompt()
        and c.body.run_name == "lead"
   end)
   if exec == nil then return nil end
-  local msg = exec.body.artifact and exec.body.artifact.data
-    and exec.body.artifact.data.messages and exec.body.artifact.data.messages[1]
-  return msg and msg.content and msg.content.value and msg.content.value.prompt or nil
+  local modification = exec.body.artifact and exec.body.artifact.data
+  for _, actor in ipairs(modification and modification.actors or {}) do
+    if actor.id == "lead.source" then return actor.params.value.prompt end
+  end
+  return nil
 end
 
 do

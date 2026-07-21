@@ -667,24 +667,12 @@ mod tests {
         .expect("load shipped kernel")
     }
 
-    fn compile_mag_eval_expression(host: &LuaHost, name: &str, expression: &str) -> JsonValue {
+    fn compile_mag_source(host: &LuaHost, name: &str, source: &str) -> JsonValue {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let source_dir =
             std::env::temp_dir().join(format!("mag-kernel-shell-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&source_dir);
         std::fs::create_dir_all(&source_dir).expect("create shell test workspace");
-        let source = format!(
-            r#"(require "nefor.artifact")
-(require "nefor.graph")
-(require "nefor.shell")
-(let [fragment {expression}
-      initial (nefor.shell.start-message fragment)
-      program (nefor.graph.finish fragment
-                (as (List nefor.graph.Message) [initial])
-                (as (List nefor.graph.Rule) []))]
-  (nefor.artifact.compile program))
-"#
-        );
         std::fs::write(source_dir.join("main.mag"), source).expect("write shell test program");
         let contracts = host.registry_contracts().expect("runtime contracts");
         let loaded = nefor_mag::load_with_inputs_and_module_roots(
@@ -693,12 +681,30 @@ mod tests {
             serde_json::json!({"foreign_contracts": contracts}),
             &[manifest.join("../../starter/mag/lib")],
         )
-        .expect("compile mag-eval-style shell expression");
+        .expect("compile MAG test program");
         let artifact = serde_json::to_value(loaded.artifact).expect("serialize shell artifact");
         let modification =
             crate::artifact_modification(&artifact).expect("normalize shell artifact");
         let _ = std::fs::remove_dir_all(source_dir);
         modification
+    }
+
+    fn compile_mag_eval_expression(host: &LuaHost, name: &str, expression: &str) -> JsonValue {
+        let source = format!(
+            r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      operation {expression}
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))
+"#
+        );
+        compile_mag_source(host, name, &source)
     }
 
     fn documented_shell_expression(needle: &str) -> String {
@@ -885,13 +891,31 @@ mod tests {
             .expect("command run failure")
             .is_none());
 
-        let pipe_emits = start_shell_expression(
-            &host,
-            "shell-pipe-null",
-            r#"(nefor.graph.connect
-  (nefor.shell.command "source" "printf source")
-  (nefor.shell.pipe-command "pipe" "cat"))"#,
+        let pipe_program = r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+(let [start (nefor.graph.source "start" (type-tag Unit) nil)
+      source (nefor.shell.command "source" "printf source")
+      pipe (nefor.shell.pipe-command "pipe" "cat")
+      result (nefor.graph.output-for "result" pipe)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start source)
+         (nefor.graph.edge source pipe)
+         (nefor.graph.edge pipe result)]))))"#;
+        let pipe_modification = compile_mag_source(&host, "shell-pipe-null", pipe_program);
+        let begun = host
+            .begin_run("shell-pipe-null", "shell-pipe-null", None)
+            .expect("begin pipe");
+        assert!(begun.ok);
+        host.drain_emits().expect("drain pipe begin");
+        assert!(
+            host.start("shell-pipe-null", &pipe_modification)
+                .expect("start pipe")
+                .ok
         );
+        let pipe_emits = host.drain_emits().expect("drain source invocation");
         let source = tool_invoke(&pipe_emits, "printf source");
         let source_id = source["id"].as_str().expect("source correlation id");
         assert!(source["args"]["args"]
@@ -1171,7 +1195,7 @@ mod tests {
         let stopped_route = serde_json::json!({
             "actors": [
                 {"id":"source", "factory":"nefor.factory.stub", "params":{},
-                 "routes":{"stub.Out":["consumer"]}},
+                 "routes":{"stub.Out":[{"actor":"consumer","wire":"stub.Out"}]}},
                 {"id":"consumer", "factory":"nefor.factory.stub", "params":{}, "routes":{}}
             ],
             "messages":[{"to":"source", "content":{"kind":"stub.In"}}],

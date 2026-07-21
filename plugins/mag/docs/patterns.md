@@ -4,7 +4,7 @@
 
 A typed result selector exposes the planner's `List<Task>` and `AgentError`
 ports to separate resident rules. The success rule uses `indexed-map` to pair the actual task list with deterministic
-positions, maps those values into real structured-agent fragments, then
+positions, maps those values into real structured-agent nodes, then
 returns one atomic delta containing those workers, typed task messages,
 worker-to-collector routes, and the collector route to a summarizer already in
 the initial graph. The error rule routes the complete `AgentError` to the
