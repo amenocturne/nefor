@@ -934,6 +934,7 @@ fn spawn_turn(
         let started = std::time::Instant::now();
         let mut total_prompt_tokens: u64 = 0;
         let mut total_completion_tokens: u64 = 0;
+        let mut observed_usage = false;
         let mut iterations: u32 = 0;
 
         // Final outcome of the *last* HTTP call — what we emit
@@ -1116,6 +1117,7 @@ fn spawn_turn(
             match result {
                 Ok(outcome) => {
                     if let Some(u) = outcome.usage {
+                        observed_usage = true;
                         total_prompt_tokens = total_prompt_tokens.saturating_add(u.prompt_tokens);
                         total_completion_tokens =
                             total_completion_tokens.saturating_add(u.completion_tokens);
@@ -1346,8 +1348,11 @@ fn spawn_turn(
             .record_turn(
                 &chat_id,
                 Some(&active_model),
-                total_prompt_tokens,
-                total_completion_tokens,
+                if interrupted && !observed_usage {
+                    None
+                } else {
+                    Some((total_prompt_tokens, total_completion_tokens))
+                },
                 elapsed_ms,
             )
             .await;
@@ -3687,6 +3692,10 @@ mod tests {
         )
         .await
         .expect("create");
+        chats
+            .record_turn(&chat_id, Some("test-model"), Some((17, 9)), 123)
+            .await
+            .expect("seed stats");
 
         // 2. chat.append { role=user }.
         let append_body = make_event_body(
@@ -3829,6 +3838,14 @@ mod tests {
             "stored partial and wire-observed partial must share a prefix; \
              stored={assistant_content:?} wire={wire_partial:?}",
         );
+        let stats = chats.stats_snapshot(&chat_id).await.expect("stats");
+        assert_eq!(stats.turns_completed, 2);
+        assert_eq!(stats.cumulative_input_tokens, 17);
+        assert_eq!(stats.cumulative_output_tokens, 9);
+        assert_eq!(stats.last_turn_input_tokens, 17);
+        assert_eq!(stats.last_turn_output_tokens, 9);
+        assert_eq!(stats.last_turn_context_tokens, 17);
+        assert!(stats.last_turn_duration_ms.is_some());
     }
 
     /// Fix #1 regression: when `<prefix>.chat.complete` carries an

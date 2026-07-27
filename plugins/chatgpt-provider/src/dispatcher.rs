@@ -1997,6 +1997,22 @@ impl ReasoningSummaryFormatter {
     }
 }
 
+fn parsed_token_usage(response: &Value) -> Option<(u64, u64)> {
+    let usage = response.get("usage")?;
+    Some((
+        usage.get("input_tokens")?.as_u64()?,
+        usage.get("output_tokens")?.as_u64()?,
+    ))
+}
+
+fn usage_to_record(interrupted: bool, total_usage: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    if interrupted {
+        total_usage
+    } else {
+        Some(total_usage.unwrap_or((0, 0)))
+    }
+}
+
 fn should_retry_pre_output_stream_error(
     err: &ChatgptError,
     output_text: &str,
@@ -2034,8 +2050,7 @@ fn spawn_turn(
         let mut final_tool_calls: Vec<ToolCall> = Vec::new();
         let mut interrupted = false;
         let mut errored = false;
-        let mut total_input_tokens: u64 = 0;
-        let mut total_output_tokens: u64 = 0;
+        let mut total_usage: Option<(u64, u64)> = None;
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
         let mut auth_401_recovery_stage: u8 = 0;
@@ -2465,13 +2480,10 @@ fn spawn_turn(
                                 ResponseEvent::Completed { response } => {
                                     iter_finish_reason =
                                         response.get("finish_reason").and_then(|v| v.as_str()).map(str::to_owned);
-                                    if let Some(usage) = response.get("usage") {
-                                        if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                                            iter_input_tokens = input;
-                                        }
-                                        if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                                            iter_output_tokens = output;
-                                        }
+                                    if let Some((input, output)) = parsed_token_usage(&response) {
+                                        iter_input_tokens = input;
+                                        iter_output_tokens = output;
+                                        total_usage.get_or_insert((0, 0));
                                     }
                                     break;
                                 }
@@ -2554,8 +2566,10 @@ fn spawn_turn(
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
-            total_input_tokens = total_input_tokens.saturating_add(iter_input_tokens);
-            total_output_tokens = total_output_tokens.saturating_add(iter_output_tokens);
+            if let Some((total_input_tokens, total_output_tokens)) = total_usage.as_mut() {
+                *total_input_tokens = total_input_tokens.saturating_add(iter_input_tokens);
+                *total_output_tokens = total_output_tokens.saturating_add(iter_output_tokens);
+            }
 
             if let Some(err_msg) = iter_errored {
                 if iter_retryable_before_output {
@@ -2640,8 +2654,7 @@ fn spawn_turn(
             .record_turn(
                 &chat_id,
                 Some(&active_model),
-                total_input_tokens,
-                total_output_tokens,
+                usage_to_record(interrupted, total_usage),
                 elapsed_ms,
             )
             .await;
@@ -3161,6 +3174,57 @@ mod tests {
             "1. Done\n   body"
         );
         assert_eq!(f.finish().concat(), "\n2. Partial\n");
+    }
+
+    #[tokio::test]
+    async fn graceful_interrupt_with_unmeasured_usage_preserves_prior_token_stats() {
+        for response in [
+            serde_json::json!({"usage": null}),
+            serde_json::json!({"usage": {"input_tokens": "unknown", "output_tokens": []}}),
+        ] {
+            let chats = Chats::with_default_model(Some("fallback".into()));
+            let chat_id = ChatId::new("interrupted");
+            chats
+                .create(chat_id.clone(), None, None, None, None, None)
+                .await
+                .expect("create");
+            chats
+                .record_turn(&chat_id, Some("gpt-5"), Some((17, 9)), 123)
+                .await
+                .expect("seed stats");
+
+            let measured_usage = parsed_token_usage(&response);
+            chats
+                .record_turn(
+                    &chat_id,
+                    Some("gpt-5"),
+                    usage_to_record(true, measured_usage),
+                    456,
+                )
+                .await
+                .expect("record interrupted turn");
+
+            let stats = chats.stats_snapshot(&chat_id).await.expect("stats");
+            assert_eq!(stats.turns_completed, 2);
+            assert_eq!(stats.cumulative_input_tokens, 17);
+            assert_eq!(stats.cumulative_output_tokens, 9);
+            assert_eq!(stats.last_turn_input_tokens, 17);
+            assert_eq!(stats.last_turn_output_tokens, 9);
+            assert_eq!(stats.last_turn_duration_ms, Some(456));
+            assert_eq!(stats.model.as_deref(), Some("gpt-5"));
+        }
+    }
+
+    #[test]
+    fn parsed_token_usage_keeps_legitimate_numeric_zero_measured() {
+        let response = serde_json::json!({
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        });
+        assert_eq!(parsed_token_usage(&response), Some((0, 0)));
+        assert_eq!(
+            usage_to_record(true, parsed_token_usage(&response)),
+            Some((0, 0))
+        );
     }
 
     #[test]

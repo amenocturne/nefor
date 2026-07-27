@@ -783,8 +783,7 @@ impl Chats {
         &self,
         id: &ChatId,
         model: Option<&str>,
-        prompt_tokens: u64,
-        completion_tokens: u64,
+        usage: Option<(u64, u64)>,
         duration_ms: u64,
     ) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
@@ -795,16 +794,18 @@ impl Chats {
             chat.stats.model = Some(m.to_owned());
         }
         chat.stats.turns_completed = chat.stats.turns_completed.saturating_add(1);
-        chat.stats.cumulative_input_tokens = chat
-            .stats
-            .cumulative_input_tokens
-            .saturating_add(prompt_tokens);
-        chat.stats.cumulative_output_tokens = chat
-            .stats
-            .cumulative_output_tokens
-            .saturating_add(completion_tokens);
-        chat.stats.last_turn_input_tokens = prompt_tokens;
-        chat.stats.last_turn_output_tokens = completion_tokens;
+        if let Some((prompt_tokens, completion_tokens)) = usage {
+            chat.stats.cumulative_input_tokens = chat
+                .stats
+                .cumulative_input_tokens
+                .saturating_add(prompt_tokens);
+            chat.stats.cumulative_output_tokens = chat
+                .stats
+                .cumulative_output_tokens
+                .saturating_add(completion_tokens);
+            chat.stats.last_turn_input_tokens = prompt_tokens;
+            chat.stats.last_turn_output_tokens = completion_tokens;
+        }
         chat.stats.last_turn_duration_ms = Some(duration_ms);
         Ok(())
     }
@@ -1082,10 +1083,10 @@ mod tests {
         c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
-        c.record_turn(&id, Some("gpt-5"), 100, 50, 1234)
+        c.record_turn(&id, Some("gpt-5"), Some((100, 50)), 1234)
             .await
             .expect("first");
-        c.record_turn(&id, Some("gpt-5"), 120, 60, 2222)
+        c.record_turn(&id, Some("gpt-5"), Some((120, 60)), 2222)
             .await
             .expect("second");
         let snap = c.stats_snapshot(&id).await.expect("snap");
@@ -1093,6 +1094,52 @@ mod tests {
         assert_eq!(snap.cumulative_input_tokens, 220);
         assert_eq!(snap.cumulative_output_tokens, 110);
         assert_eq!(snap.last_turn_duration_ms, Some(2222));
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_without_usage_preserves_last_measured_tokens() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        c.record_turn(&id, Some("gpt-5"), Some((120, 60)), 2222)
+            .await
+            .expect("seed");
+
+        c.record_turn(&id, Some("gpt-5"), None, 3333)
+            .await
+            .expect("interrupted turn");
+
+        let snap = c.stats_snapshot(&id).await.expect("snap");
+        assert_eq!(snap.turns_completed, 2);
+        assert_eq!(snap.cumulative_input_tokens, 120);
+        assert_eq!(snap.cumulative_output_tokens, 60);
+        assert_eq!(snap.last_turn_input_tokens, 120);
+        assert_eq!(snap.last_turn_output_tokens, 60);
+        assert_eq!(snap.last_turn_duration_ms, Some(3333));
+    }
+
+    #[tokio::test]
+    async fn measured_zero_usage_replaces_last_turn_tokens() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        c.record_turn(&id, Some("gpt-5"), Some((120, 60)), 2222)
+            .await
+            .expect("seed");
+
+        c.record_turn(&id, Some("gpt-5"), Some((0, 0)), 3333)
+            .await
+            .expect("zero-usage turn");
+
+        let snap = c.stats_snapshot(&id).await.expect("snap");
+        assert_eq!(snap.turns_completed, 2);
+        assert_eq!(snap.last_turn_input_tokens, 0);
+        assert_eq!(snap.last_turn_output_tokens, 0);
+        assert_eq!(snap.last_turn_duration_ms, Some(3333));
     }
 
     #[tokio::test]
