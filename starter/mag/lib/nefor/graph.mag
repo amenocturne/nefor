@@ -375,13 +375,40 @@
 (def actor-output-wires (fn [[value Actor]] -> (List String)
   (map (fn [[output StoredPort]] -> String (get output "wire"))
        (get value "outputs"))))
-(def actor-contract-valid? (fn [[contracts (List ForeignContract)] [value Actor]] -> Bool
-  (= (count (filter (fn [[contract ForeignContract]] -> Bool
-    (if (= (get contract "identity") (get value "foreign"))
-      (let [scheme (get contract "type_scheme")]
-        (if (contains-string? (get scheme "input_tags") (get (get value "input") "wire"))
-          (all-strings-in? (actor-output-wires value) (get scheme "outputs")) false))
-      false)) contracts)) 1)))
+(def actor-contract-errors (fn [[contracts (List ForeignContract)] [value Actor]]
+  -> (List String)
+  (let [identity (get value "foreign")
+        matching (filter (fn [[contract ForeignContract]] -> Bool
+                           (= (get contract "identity") identity))
+                         contracts)]
+    (if (= (count matching) 0)
+      [(str (str (str "actor " (canonical (get value "id")))
+                 ": foreign identity ")
+            (str (canonical identity) " is not present in the runtime inventory"))]
+      (let [scheme (get (first matching) "type_scheme")
+            input-wire (get (get value "input") "wire")
+            accepted-inputs (get scheme "input_tags")
+            output-wires (actor-output-wires value)
+            accepted-outputs (get scheme "outputs")
+            input-errors
+              (if (contains-string? accepted-inputs input-wire)
+                (as (List String) [])
+                [(str
+                   (str (str (str (str "actor " (canonical (get value "id")))
+                                      ": foreign ")
+                                 (canonical identity))
+                            (str " rejects input wire " (canonical input-wire)))
+                   (str "; accepted input wires: " (canonical accepted-inputs)))])
+            output-errors
+              (if (all-strings-in? output-wires accepted-outputs)
+                (as (List String) [])
+                [(str
+                   (str (str (str (str "actor " (canonical (get value "id")))
+                                      ": foreign ")
+                                 (canonical identity))
+                            (str " exposes output wires " (canonical output-wires)))
+                   (str "; accepted output wires: " (canonical accepted-outputs)))])]
+        (concat input-errors output-errors))))))
 
 (def actor-id-count (fn [[actors (List Actor)] [id String]] -> Int
   (count (filter (fn [[candidate Actor]] -> Bool (= (get candidate "id") id)) actors))))
@@ -472,8 +499,10 @@
                  (filter (fn [[candidate StoredNode]] -> Bool
                            (not (reaches-output? value candidate))) nodes)
                  nodes)
-          bad-contracts (filter (fn [[candidate Actor]] -> Bool
-                           (not (actor-contract-valid? contracts candidate))) actors)
+          contract-errors (flat-map
+                            (fn [[candidate Actor]] -> (List String)
+                              (actor-contract-errors contracts candidate))
+                            actors)
           bad-boundaries (filter (fn [[candidate StoredNode]] -> Bool
                             (not (boundary-valid? candidate))) nodes)
           bad-product-inputs (filter (fn [[candidate StoredNode]] -> Bool
@@ -493,11 +522,11 @@
                   (if (= (count bad-product-inputs) 0)
                     (if (= (count unreachable) 0)
                       (if (= (count dead) 0)
-                        (if (= (count bad-contracts) 0)
+                        (if (= (count contract-errors) 0)
                           (if (= (count bad-routes) 0)
                             (core.validated.valid value)
                             (core.validated.invalid ["graph contains an unknown or incompatible edge"]))
-                          (core.validated.invalid ["node foreign identity or wire contract does not match the runtime inventory"]))
+                          (core.validated.invalid contract-errors))
                         (core.validated.invalid ["every node must have a path to the output node"]))
                       (core.validated.invalid ["every node must be reachable from a source node"]))
                     (core.validated.invalid ["product input incoming edge types must exactly cover its component multiset"]))

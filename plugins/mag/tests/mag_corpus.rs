@@ -673,8 +673,128 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         unknown
             .get("message")
             .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("wire contract does not match")),
-        "unknown output failure should identify the inventory contract: {unknown:#?}"
+            .is_some_and(|message| {
+                message.contains("actor \\\"x\\\"")
+                    && message.contains("foreign \\\"nefor.factory.bash\\\"")
+                    && message.contains("exposes output wires [\\\"mag.Unknown\\\"]")
+                    && message.contains("accepted output wires:")
+            }),
+        "unknown output failure should identify the actor and accepted inventory outputs: {unknown:#?}"
+    );
+
+    fs::write(
+        temp_root.join("shell-input-unknown.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(let [input (nefor.graph.port "x" (type-tag Unit) "mag.Unknown")
+      output (nefor.graph.port "x" (type-tag nefor.contracts.Text) "mag.Text")
+      actor (nefor.graph.actor
+              "x"
+              nefor.factory.bash
+              (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
+              (nefor.graph.store-port input)
+              (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
+      operation (as (nefor.graph.Node Unit nefor.contracts.Text)
+                 {:id "x" :role "ordinary"
+                  :actors (as (List nefor.graph.Actor) [actor])
+                  :routes (as (List nefor.graph.StoredRoute) [])
+                  :messages (as (List nefor.graph.Message) [])
+                  :input input
+                  :output output})
+      start (nefor.graph.source "start" (type-tag Unit) nil)
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))"#,
+    )
+    .expect("write unknown shell input regression");
+    let unknown_input = load(
+        &mut reader,
+        &mut stdin,
+        "shell-input-unknown",
+        &temp_root,
+        Path::new("shell-input-unknown.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        unknown_input.get("kind").and_then(Value::as_str),
+        Some("mag.error"),
+        "an authored input absent from the runtime scheme must fail: {unknown_input:#?}"
+    );
+    assert!(
+        unknown_input
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.contains("actor \\\"x\\\"")
+                    && message.contains("foreign \\\"nefor.factory.bash\\\"")
+                    && message.contains("rejects input wire \\\"mag.Unknown\\\"")
+                    && message.contains("accepted input wires:")
+            }),
+        "unknown input failure should identify the actor and accepted inventory inputs: {unknown_input:#?}"
+    );
+
+    fs::write(
+        temp_root.join("foreign-identity-unknown.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(foreign missing.factory
+  {:params nefor.contracts.BashParams
+   :input Unit
+   :output nefor.contracts.Text})
+(let [input (nefor.graph.port "x" (type-tag Unit) "mag.Unit")
+      output (nefor.graph.port "x" (type-tag nefor.contracts.Text) "mag.Text")
+      actor (nefor.graph.actor
+              "x"
+              missing.factory
+              (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
+              (nefor.graph.store-port input)
+              (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
+      operation (as (nefor.graph.Node Unit nefor.contracts.Text)
+                 {:id "x" :role "ordinary"
+                  :actors (as (List nefor.graph.Actor) [actor])
+                  :routes (as (List nefor.graph.StoredRoute) [])
+                  :messages (as (List nefor.graph.Message) [])
+                  :input input
+                  :output output})
+      start (nefor.graph.source "start" (type-tag Unit) nil)
+      result (nefor.graph.output-for "result" operation)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start operation)
+         (nefor.graph.edge operation result)]))))"#,
+    )
+    .expect("write unknown foreign identity regression");
+    let unknown_identity = load(
+        &mut reader,
+        &mut stdin,
+        "foreign-identity-unknown",
+        &temp_root,
+        Path::new("foreign-identity-unknown.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        unknown_identity.get("kind").and_then(Value::as_str),
+        Some("mag.error"),
+        "an authored foreign absent from the runtime inventory must fail: {unknown_identity:#?}"
+    );
+    assert!(
+        unknown_identity
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.contains("actor \\\"x\\\"")
+                    && message.contains("foreign identity \\\"missing.factory\\\"")
+                    && message.contains("is not present in the runtime inventory")
+            }),
+        "unknown identity failure should distinguish missing inventory entries: {unknown_identity:#?}"
     );
 
     for (index, path) in entrypoints.iter().enumerate() {
