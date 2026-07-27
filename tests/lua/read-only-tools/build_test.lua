@@ -20,16 +20,23 @@ nefor.engine = {
   end,
 }
 
+NEFOR_CONFIG_DIR = "/custom/runtime-config"
+NEFOR_DATA_DIR = "/custom/runtime-data"
+
 local rot = require("libs.read-only-tools")
 
--- Build a spec, drive a tool-gate.hello, return the advertised names as a set.
-local function advertised_names(opts)
+local function advertised_tools(opts)
   captured = nil
   local spec = rot.build(opts)
   local hello = nefor.json.encode({ body = { kind = "tool-gate.hello" } })
   spec.receive_msg({ origin = "plugin", payload = hello })
+  return captured or {}
+end
+
+-- Build a spec, drive a tool-gate.hello, return the advertised names as a set.
+local function advertised_names(opts)
   local names = {}
-  for _, t in ipairs(captured or {}) do names[t.name] = true end
+  for _, t in ipairs(advertised_tools(opts)) do names[t.name] = true end
   return names
 end
 
@@ -42,6 +49,24 @@ do
   assert_true(not n["python-read"], "python-read NOT advertised when omitted")
   assert_true(not n.instructions, "instructions NOT advertised when omitted")
   assert_true(not n.discover_instruction_files, "discover NOT advertised when omitted")
+end
+
+-- skill description exposes the effective config-root convention.
+do
+  local skill
+  for _, tool in ipairs(advertised_tools { include = { "skill" } }) do
+    if tool.name == "skill" then skill = tool end
+  end
+  assert_true(skill ~= nil, "skill schema advertised")
+  assert_true(
+    skill.description:find("/custom/runtime-config/skills/<name>/skill.md", 1, true),
+    "skill description contains resolved config-root path convention")
+  assert_true(
+    not skill.description:find("/custom/runtime-data", 1, true),
+    "skill description does not use data root")
+  assert_true(
+    not skill.description:find("<config>", 1, true),
+    "skill description does not leave config root ambiguous")
 end
 
 -- omitted include => no base tools (pure opt-in default; no contamination).

@@ -459,7 +459,7 @@ local function base_schemas()
       display = { label = "Load skill", primary = { arg = "name" }, result = { kind = "receipt", text = "skill loaded" } },
       description =
         "Load a workflow skill by name from the config's skills directory " ..
-        "(<config>/skills/<name>/skill.md). Read the skill BEFORE acting on a " ..
+        "(" .. SKILLS_DIR .. "/<name>/skill.md). Read the skill BEFORE acting on a " ..
         "task that matches its description — it carries the workflow, CLI " ..
         "usage, and conventions. Pass an array to load several at once.",
       parameters = {
