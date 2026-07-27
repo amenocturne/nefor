@@ -473,7 +473,11 @@ fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.message.append", "role": "system", "text": "[interrupted]" }),
+        json!({
+            "kind": "chat.message.append",
+            "role": "system",
+            "text": "[interrupted by user — cancelling in-flight work]",
+        }),
     );
     dispatch_event(
         &mut engine,
@@ -482,7 +486,9 @@ fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
 
     let out = render_str(&mut engine);
     let answer = out.find("structured answer").expect("structured answer");
-    let notice = out.find("[interrupted]").expect("interrupt notice");
+    let notice = out
+        .find("[interrupted by user — cancelling in-flight work]")
+        .expect("interrupt notice");
     assert!(
         answer < notice,
         "the answer must retain its provider-round position before the notice:\n{out}"
@@ -490,6 +496,59 @@ fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
     assert!(
         out[answer..notice].contains("▣ gpt-test · 2s · 20 tok/s"),
         "the projected answer must retain its provider footer:\n{out}"
+    );
+}
+
+#[test]
+fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats",
+            "last_turn_duration_ms": 2_000,
+            "last_turn_output_tokens": 40,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.message.append",
+            "role": "system",
+            "text": "[lead turn failed] terminal MAG failure",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "next turn" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "later answer" }),
+    );
+
+    let out = render_str(&mut engine);
+    let failure = out.find("[lead turn failed]").expect("lead failure notice");
+    let user = out.find("next turn").expect("next user message");
+    let answer = out.find("later answer").expect("later assistant message");
+    assert!(
+        failure < user && user < answer,
+        "failed-turn chronology changed:\n{out}"
+    );
+    assert!(
+        out[..failure].contains("▣ gpt-test · 2s · 20 tok/s"),
+        "failed provider round must retain its own footer before the notice:\n{out}"
+    );
+    assert!(
+        !out[answer..].contains("gpt-test") && !out[answer..].contains("tok/s"),
+        "later assistant inherited stale failed-turn metadata:\n{out}"
     );
 }
 

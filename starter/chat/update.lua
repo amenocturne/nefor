@@ -853,8 +853,9 @@ local function handle_message_append(msg, state)
   state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
   -- The pending structured answer owns the provider round's chronological
   -- position. Same-turn transcript appends can arrive before its durable
-  -- assistant projection; only an explicit failed turn closes that ownership.
-  if role == "system" and text:match("^Error:") then
+  -- assistant projection; only an explicit terminal failure closes that ownership.
+  if role == "system" and (text:match("^Error:")
+      or text:match("^%[lead turn failed%]")) then
     state = transcript.close_assistant_projection(state)
   end
   if role == "user" then
