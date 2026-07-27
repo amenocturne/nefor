@@ -672,6 +672,7 @@ local function apply_control_decisions(state, decisions, metadata)
         kind = "send_to", target = "engine", body = { kind = "chat.steer" },
       }
     elseif decision.kind == "hard_stop_lead" then
+      state = transcript.close_assistant_projection(state)
       effects[#effects + 1] = {
         kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt", drop_queued = true },
@@ -795,7 +796,7 @@ local function handle_replay_end(_msg, state)
 end
 
 local function handle_chat_reset(_msg, state)
-  return state, {}
+  return transcript.close_assistant_projection(state), {}
 end
 
 -- ── inbound chat-contract events ──────────────────────────────────────
@@ -850,9 +851,10 @@ local function handle_message_append(msg, state)
   -- actor's capture buffer. Sits before every transcript decision so
   -- the transcript's own routing stays byte-identical.
   state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
-  -- Round-trip echo ownership is indexed: unrelated graph output may append
-  -- after the optimistic user entry before its durable projection arrives.
-  if role ~= "assistant" then
+  -- The pending structured answer owns the provider round's chronological
+  -- position. Same-turn transcript appends can arrive before its durable
+  -- assistant projection; only an explicit failed turn closes that ownership.
+  if role == "system" and text:match("^Error:") then
     state = transcript.close_assistant_projection(state)
   end
   if role == "user" then

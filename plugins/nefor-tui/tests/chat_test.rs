@@ -414,6 +414,86 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
 }
 
 #[test]
+fn structured_answer_keeps_footer_across_interleaved_steered_user_append() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats",
+            "last_turn_duration_ms": 2_000,
+            "last_turn_output_tokens": 40,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "steered follow-up" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "structured answer" }),
+    );
+
+    let out = render_str(&mut engine);
+    let answer = out.find("structured answer").expect("structured answer");
+    let steering = out.find("steered follow-up").expect("steered user append");
+    assert!(
+        answer < steering,
+        "the answer must retain its provider-round position before steering:\n{out}"
+    );
+    assert!(
+        out[answer..steering].contains("▣ gpt-test · 2s · 20 tok/s"),
+        "the projected answer must retain its provider footer:\n{out}"
+    );
+}
+
+#[test]
+fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats",
+            "last_turn_duration_ms": 2_000,
+            "last_turn_output_tokens": 40,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "system", "text": "[interrupted]" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "structured answer" }),
+    );
+
+    let out = render_str(&mut engine);
+    let answer = out.find("structured answer").expect("structured answer");
+    let notice = out.find("[interrupted]").expect("interrupt notice");
+    assert!(
+        answer < notice,
+        "the answer must retain its provider-round position before the notice:\n{out}"
+    );
+    assert!(
+        out[answer..notice].contains("▣ gpt-test · 2s · 20 tok/s"),
+        "the projected answer must retain its provider footer:\n{out}"
+    );
+}
+
+#[test]
 fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
