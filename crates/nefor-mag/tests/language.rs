@@ -29,7 +29,8 @@ fn artifact_is_the_only_top_level_output() {
 fn typed_library_functions_return_artifacts() {
     let root = workspace("typed-artifact");
     let source = r#"
-      (def emit (fn [[data Data]] -> Artifact (artifact "test.typed-artifact/v1" data)))
+      (def emit (fn [T] [[value T]] -> Artifact
+        (artifact "test.typed-artifact/v1" value)))
       (emit {:answer 42})
     "#;
     let artifact = compile(source, &root).unwrap();
@@ -191,13 +192,13 @@ fn product_type_evidence_preserves_order_and_grouping() {
 }
 
 #[test]
-fn nominal_types_and_generic_foreigns_are_declared_data() {
+fn nominal_types_and_generic_foreigns_are_precisely_declared() {
     let root = workspace("types");
     let source = r#"
       (type Payload {:text String})
       (type Outcome [T] (| T Unit))
       (foreign nefor.factory.worker [T]
-        {:params (Map String Data) :input T :output (Outcome T)})
+        {:params (Map String String) :input T :output (Outcome T)})
       (artifact "test.types/v1" {:payload (str Payload) :foreign (str nefor.factory.worker)})
     "#;
     let artifact = compile(source, &root).unwrap();
@@ -206,11 +207,11 @@ fn nominal_types_and_generic_foreigns_are_declared_data() {
 }
 
 #[test]
-fn immutable_inputs_are_visible_to_programs() {
+fn immutable_host_inputs_expose_only_typed_projections() {
     let root = workspace("inputs");
     fs::write(
         root.join("core/input.mag"),
-        "(def contracts (get inputs :foreign_contracts))",
+        "(def contracts (foreign-contracts))",
     )
     .unwrap();
     fs::write(
@@ -221,10 +222,26 @@ fn immutable_inputs_are_visible_to_programs() {
     let loaded = load_with_inputs(
         &root,
         "main.mag",
-        json!({"foreign_contracts":[{"name":"x"}]}),
+        json!({"foreign_contracts":[{
+            "identity":"x",
+            "implementation":"private",
+            "params":{"heterogeneous": true},
+            "type_scheme":{
+                "variables":[],
+                "inputs":{"wire":{"kind":"private"}},
+                "input_tags":["in"],
+                "outputs":["out"]
+            }
+        }]}),
     )
     .unwrap();
-    assert_eq!(loaded.artifact.data, json!([{"name":"x"}]));
+    assert_eq!(
+        loaded.artifact.data,
+        json!([{
+            "identity":"x",
+            "type_scheme":{"input_tags":["in"],"outputs":["out"]}
+        }])
+    );
 }
 
 #[test]
@@ -295,20 +312,21 @@ fn checker_rejects_bad_returns_and_calls() {
 }
 
 #[test]
-fn as_is_an_explicit_checked_external_data_boundary() {
-    let root = workspace("as-boundary");
-    fs::write(root.join("main.mag"), "(type Contract {:identity String})\n(artifact \"test.as/v1\" (as (List Contract) (get inputs :contracts)))").unwrap();
-    let good = load_with_inputs(
+fn host_inputs_are_opaque_outside_typed_projections() {
+    let root = workspace("opaque-inputs");
+    fs::write(
+        root.join("main.mag"),
+        "(artifact \"test.inputs/v1\" (get inputs :contracts))",
+    )
+    .unwrap();
+    let error = load_with_inputs(
         &root,
         "main.mag",
         json!({"contracts":[{"identity":"worker"}]}),
     )
-    .unwrap();
-    assert_eq!(good.artifact.data, json!([{"identity":"worker"}]));
-    let bad = load_with_inputs(&root, "main.mag", json!({"contracts":[{"missing":true}]}))
-        .unwrap_err()
-        .to_string();
-    assert!(bad.contains("does not conform"), "{bad}");
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("get expects a map"), "{error}");
 }
 
 #[test]
@@ -380,12 +398,13 @@ fn empty_lists_retain_expected_element_types_at_runtime() {
 }
 
 #[test]
-fn record_literals_satisfy_homogeneous_string_maps() {
+fn record_literals_satisfy_precise_homogeneous_string_maps() {
     let root = workspace("record-map");
     let source = r#"
-      (def accept-data-map (fn [[value (Map String Data)]] -> Int (count value)))
+      (def accept-string-map (fn [[value (Map String String)]] -> Int (count value)))
       (artifact "test.record-map/v1"
-        {:count (accept-data-map (as (Map String Data) {:kind "task" :prompt "Audit"}))})
+        {:count (accept-string-map
+          (as (Map String String) {:kind "task" :prompt "Audit"}))})
     "#;
     let artifact = compile(source, &root).unwrap();
     assert_eq!(artifact.data["count"], 2);
@@ -613,7 +632,7 @@ fn product_positions_preserve_selected_constructor_evidence() {
 fn explicit_record_refinement_reports_missing_and_unexpected_fields() {
     let root = workspace("exact-refinement");
     let error = compile(
-        "(type BashOptions {:timeout_ms Data})\n(artifact \"test.exact/v1\" (as BashOptions {:timeout-ms 30000}))",
+        "(type BashOptions {:timeout_ms Int})\n(artifact \"test.exact/v1\" (as BashOptions {:timeout-ms 30000}))",
         &root,
     )
     .unwrap_err()
@@ -812,9 +831,7 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
                             (nefor.graph.edge right join)
                             (nefor.graph.edge join result)])
                 contracts (map nefor.graph.foreign-contract
-                                (as (List Data)
-                                  (get (as (Map String Data) inputs)
-                                       "foreign_contracts")))
+                                (foreign-contracts))
                 checked (nefor.graph.validate topology contracts)]
             (artifact "test.product-fan-in/v1" {:tag (get checked "tag")}))
         "#,
@@ -850,6 +867,26 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
             .unwrap()
             .artifact;
     assert_eq!(artifact.data["tag"], "core.validated.Valid");
+}
+
+#[test]
+fn data_is_not_a_source_type_or_cast_target() {
+    let root = workspace("removed-data");
+    let declaration = compile(
+        "(type Payload {:value Data})\n(artifact \"test.removed/v1\" {})",
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        declaration.contains("unresolved symbol: Data"),
+        "{declaration}"
+    );
+
+    let cast = compile("(artifact \"test.removed/v1\" (as Data {:value 1}))", &root)
+        .unwrap_err()
+        .to_string();
+    assert!(cast.contains("unresolved symbol: Data"), "{cast}");
 }
 
 #[test]

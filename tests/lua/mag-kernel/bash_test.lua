@@ -32,6 +32,13 @@ local function capture()
   return out, function(message) out[#out + 1] = message end
 end
 
+local function bash_params(command)
+  return {
+    command = command,
+    timeout_ms = { present = false, milliseconds = 0 },
+  }
+end
+
 local function find_kind(msgs, kind)
   for _, m in ipairs(msgs) do
     if m.kind == kind then return m end
@@ -109,21 +116,27 @@ do
   assert_true(err:find("command", 1, true) ~= nil, "the failure names the missing param")
 
   local msgs, emit2 = capture()
-  local ok_inst = bash.construct("bash-1", { command = "ls" }, emit2)
+  local ok_inst = bash.construct("bash-1", {
+    command = "ls", timeout_ms = { present = false, milliseconds = 0 },
+  }, emit2)
   assert_true(ok_inst ~= nil, "bash constructs with a command")
   local ready = find_kind(msgs, "mag.ready")
   assert_true(ready ~= nil, "bash emits ready at construct")
   assert_eq(ready.from, "bash-1", "ready is id-signed")
 
-  -- timeout_ms is optional but validated: an ill-typed bound fails
+  -- timeout_ms is a precise record: an ill-typed bound fails
   -- construction; a valid one rides the capability args.
-  local _, bad_err = bash.construct("bash-2", { command = "ls", timeout_ms = "soon" }, emit2)
+  local _, bad_err = bash.construct("bash-2", {
+    command = "ls", timeout_ms = { present = true, milliseconds = "soon" },
+  }, emit2)
   assert_true(bad_err ~= nil and bad_err:find("timeout_ms", 1, true) ~= nil,
     "an ill-typed timeout_ms fails construction with the detail")
 
   local m3, emit3 = capture()
-  local bounded = bash.construct("bash-3", { command = "sleep 90", timeout_ms = 120000 }, emit3)
-  assert_true(bounded ~= nil, "bash constructs with a numeric timeout_ms")
+  local bounded = bash.construct("bash-3", {
+    command = "sleep 90", timeout_ms = { present = true, milliseconds = 120000 },
+  }, emit3)
+  assert_true(bounded ~= nil, "bash constructs with a bounded Timeout")
   bounded.deliver(single("mag.control", "mag.Unit", { kind = "mag.Unit" }))
   local inv = find_kind(m3, "capability.invoke")
   assert_eq(inv.request.args.timeout_ms, 120000, "the authored timeout rides the args")
@@ -135,7 +148,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = bash.construct("bash-1", { command = "printf 'b\\na\\n'" }, emit)
+  local inst = bash.construct("bash-1", bash_params("printf 'b\\na\\n'"), emit)
 
   local pending = inst.deliver(single("mag.control", "mag.Unit", { kind = "mag.Unit" }))
   assert_eq(pending.status, "pending", "the command defers until the capability answers")
@@ -164,7 +177,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = bash.construct("bash-2", { command = "sort" }, emit)
+  local inst = bash.construct("bash-2", bash_params("sort"), emit)
 
   inst.deliver(single("bash-1", "mag.Text", { kind = "mag.Text", text = "b\na\n" }))
   local inv = find_kind(msgs, "capability.invoke")
@@ -183,7 +196,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = bash.construct("bash-1", { command = "false" }, emit)
+  local inst = bash.construct("bash-1", bash_params("false"), emit)
   inst.deliver(single("mag.control", "mag.Unit", { kind = "mag.Unit" }))
   local inv = find_kind(msgs, "capability.invoke")
 
@@ -203,7 +216,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = bash.construct("bash-1", { command = "ls" }, emit)
+  local inst = bash.construct("bash-1", bash_params("ls"), emit)
   inst.deliver(single("mag.control", "mag.Unit", { kind = "mag.Unit" }))
   local inv = find_kind(msgs, "capability.invoke")
 
@@ -219,7 +232,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = bash.construct("bash-1", { command = "rg foo" }, emit)
+  local inst = bash.construct("bash-1", bash_params("rg foo"), emit)
   inst.deliver(single("mag.control", "mag.Unit", { kind = "mag.Unit" }))
   local inv = find_kind(msgs, "capability.invoke")
 
@@ -235,7 +248,7 @@ end
 
 do
   local msgs, emit = capture()
-  local inst = bash.construct("bash-1", { command = "sleep 5" }, emit)
+  local inst = bash.construct("bash-1", bash_params("sleep 5"), emit)
   inst.deliver(single("mag.control", "mag.Unit", { kind = "mag.Unit" }))
   local inv = find_kind(msgs, "capability.invoke")
 

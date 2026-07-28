@@ -17,11 +17,12 @@ libraries, compose ordinary typed values, and return one host-recognized value:
 available under that namespace, including through transitive imports. Modules
 are evaluated once per compilation, and circular imports are rejected.
 
-Core types are `Artifact`, `Data`, `Unit`, `Bool`, `Int`, `Float`, `String`, `List`, and
-`Map`. `Data` is the closed recursive JSON algebra (scalars, lists, and string-keyed
-maps), not a top type. Named declarations are nominal, generic parameters are explicit, `|` is
-a one-of sum, and `+` is an all-of product. Runtime concepts are introduced by
-libraries and qualified `foreign` declarations rather than compiler builtins.
+Authoring types are `Unit`, `Bool`, `Int`, `Float`, `String`, `List`, `Map`,
+records, named types, sums, and products. `JsonValue` is available only when
+heterogeneous JSON is itself the declared domain; maps cannot be cast into it.
+Named declarations are nominal, generic parameters are explicit, `|` is a
+one-of sum, and `+` is an all-of product. Runtime concepts are introduced by
+libraries and qualified `foreign` declarations rather than untyped values.
 
 Functions have explicit signatures. The first form is monomorphic; the second
 binds generic types explicitly:
@@ -31,9 +32,9 @@ binds generic types explicitly:
 (fn [T E] [[value T] [convert (Fn T E)]] -> E (convert value))
 ```
 
-Use `(as Target value)` to validate and refine untrusted `Data`, such as host
-inputs, into a declared nominal or collection type. There are no implicit
-coercions from `Data`.
+Use `(as Target value)` to validate and refine a structurally typed value into
+a declared nominal or collection type. Host inputs are inferred as concrete
+records and collections; there is no universal type or cast escape hatch.
 
 Foreign capabilities are first-class. A generic declaration is specialized
 with types before use, and its qualified runtime identity can be projected as
@@ -49,9 +50,9 @@ The specialized value has type `(Foreign WorkerParams Task Result)`, so generic
 library constructors can validate parameters and boundaries without knowing
 what the capability implements.
 
-Libraries stop artifact construction with `(fail diagnostic-data)`. Immutable
-host data is available through the `inputs` map, for example
-`(get inputs :foreign_contracts)`.
+Libraries stop artifact construction with `(fail diagnostic-data)`. Raw host
+inputs remain compiler-private; libraries consume typed projections such as
+`(foreign-contracts)`.
 
 ## Compilation snapshot
 
@@ -79,17 +80,19 @@ boundaries; there is still no separate node registry or add-node operation.
 
 ## Structural type descriptors
 
-`(type-schema (type-tag T))` reifies a JSON-representable MAG data type into a
-versioned `Data` descriptor. Named types remain named for diagnostics while
+`(type-schema (type-tag T))` reifies a JSON-representable MAG type into an
+opaque compiler-owned `TypeSchema`. Named types remain named for diagnostics while
 their substituted bodies describe the runtime structure. Records are strict:
 all fields are required and additional fields are rejected. The supported
-shapes are `Data`, `Unit`, `Bool`, `Int`, `Float`, `String`, lists,
+shapes are `JsonValue`, `Unit`, `Bool`, `Int`, `Float`, `String`, lists,
 string-keyed maps, records, unions, and products. Functions, foreign
 capabilities, artifacts, type tags, unresolved variables, and maps with
 non-string keys fail while loading the MAG program.
 
-The descriptor is transport-neutral. Nefor's structured-agent library chooses
-JSON as one external encoding; the MAG compiler itself has no provider, LLM,
+The schema and `(type-evidence ...)` descriptors are transport-neutral opaque
+values. They serialize only when the compiler constructs an artifact; maps
+cannot forge them. Nefor's structured-agent library chooses JSON as one
+external encoding, while the MAG compiler itself has no provider, LLM,
 prompting, or retry behavior.
 
 Semantic type identities use compiler-created witnesses rather than strings:

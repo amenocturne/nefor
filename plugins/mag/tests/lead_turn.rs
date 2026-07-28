@@ -108,8 +108,11 @@ async fn next_event_of_kind<R: AsyncBufReadExt + Unpin>(
         if body.get("kind").and_then(Value::as_str) == Some(kind) {
             return body;
         }
-        if body.get("kind").and_then(Value::as_str) == Some("mag.error") {
-            panic!("mag.error while expecting {kind}: {body:?}");
+        if matches!(
+            body.get("kind").and_then(Value::as_str),
+            Some("mag.error" | "mag.run_failed")
+        ) {
+            panic!("MAG failure while expecting {kind}: {body:?}");
         }
     }
 }
@@ -848,8 +851,11 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
     assert_eq!(result["status"], "completed", "{result:?}");
     assert_eq!(result["result"]["variant"], "error");
     assert_eq!(result["result"]["value"]["last_output"]["text"], "not json");
-    assert!(result["result"]["value"]["reason"]["violations"].is_array());
-    assert!(result["result"]["value"]["reason"]
+    assert!(result["result"]["value"]["reason"]["type"]
+        .as_str()
+        .is_some_and(|tag| tag.starts_with("sha256:")));
+    assert!(result["result"]["value"]["reason"]["value"]["violations"].is_array());
+    assert!(result["result"]["value"]["reason"]["value"]
         .get("attempts")
         .is_none());
     shutdown(stdin, child).await;

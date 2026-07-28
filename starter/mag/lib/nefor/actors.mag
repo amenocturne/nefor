@@ -2,12 +2,12 @@
 (require "nefor.contracts")
 
 (type AgentConfig {:id String
-                   :model Data
-                   :profile Data
+                   :model nefor.contracts.OptionalIdentifier
+                   :profile nefor.contracts.OptionalIdentifier
                    :provider String
                    :system String
                    :tools (List String)
-                   :da-policy Data
+                   :da-policy nefor.contracts.DaPolicy
                    :max-corrections Int})
 (type ApprovalConfig {:id String :prompt String})
 (type BranchNode [I A B]
@@ -79,6 +79,11 @@
           :system (get config "system")
           :tools (or (get config "tools") (as (List String) []))
           :schema (type-schema output-type)
+          :provider_error_type
+            (type-id (type-evidence (type-tag nefor.contracts.ProviderError)))
+          :validation_error_type
+            (type-id
+              (type-evidence (type-tag nefor.contracts.OutputValidationError)))
           :max_corrections (get config "max-corrections")})
          (nefor.graph.store-port llm-in)
          [(nefor.graph.store-port tool-calls)

@@ -710,17 +710,14 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
     let original = value;
     let value = raw(value);
     let valid = match ty {
-        MagType::Data => match value {
-            Value::Unit | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
-            Value::List(items) | Value::Vector(items) => items
-                .iter()
-                .all(|item| validate_value(env, item, &MagType::Data).is_ok()),
-            Value::Map(map) => map
-                .values()
-                .all(|item| validate_value(env, item, &MagType::Data).is_ok()),
-            _ => false,
-        },
         MagType::Artifact => matches!(value, Value::Artifact(_)),
+        MagType::JsonValue => matches!(value, Value::JsonValue(_)),
+        MagType::TypeDescriptor => matches!(value, Value::TypeDescriptor(_)),
+        MagType::TypeSchema => matches!(value, Value::TypeSchema(_)),
+        MagType::SemanticTypeId => matches!(value, Value::SemanticTypeId(_)),
+        MagType::PackedValue => matches!(value, Value::PackedValue(_)),
+        MagType::HostInputs => matches!(value, Value::HostInputs(_)),
+        MagType::Never => false,
         MagType::Unit => matches!(value, Value::Unit),
         MagType::Bool => matches!(value, Value::Bool(_)),
         MagType::Int => matches!(value, Value::Int(_)),
@@ -873,9 +870,9 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         }
         "conforms?" => {
             arity(args, 2)?;
-            let evidence = crate::json::value_to_json(env, &args[1])?;
-            let Ok(ty) = crate::json::type_evidence_from_json(&evidence) else {
-                return Ok(Value::Bool(false));
+            let ty = match raw(&args[1]) {
+                Value::TypeDescriptor(ty) => ty.to_mag_type(),
+                _ => return Err(MagError::Type("conforms? expects a TypeDescriptor".into())),
             };
             let Ok(schema) = crate::schema::TypeSchema::reify(env, &ty) else {
                 return Ok(Value::Bool(false));
@@ -1014,9 +1011,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         "type-evidence" => {
             arity(args, 1)?;
             match raw(&args[0]) {
-                Value::TypeTag(ty) => Ok(crate::json::json_to_value(
-                    &crate::json::concrete_type_to_json(ty)?,
-                )),
+                Value::TypeTag(ty) => Ok(Value::TypeDescriptor(ty.clone())),
                 other => Err(MagError::Type(format!(
                     "type-evidence expects TypeTag, got {}",
                     other.type_name()
@@ -1035,9 +1030,200 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 }
             };
             let schema = crate::schema::TypeSchema::reify(env, &ty.to_mag_type())?;
-            let json = serde_json::to_value(schema)
-                .map_err(|error| MagError::Eval(format!("serialize type schema: {error}")))?;
-            Ok(crate::json::json_to_value(&json))
+            Ok(Value::TypeSchema(schema))
+        }
+        "type-id" => {
+            arity(args, 1)?;
+            let Value::TypeDescriptor(ty) = raw(&args[0]) else {
+                return Err(MagError::Type("type-id expects a TypeDescriptor".into()));
+            };
+            Ok(Value::SemanticTypeId(ty.stable_id()))
+        }
+        "pack" => {
+            arity(args, 1)?;
+            Ok(Value::PackedValue(std::sync::Arc::new(args[0].clone())))
+        }
+        "packed-empty-record?" => {
+            arity(args, 1)?;
+            let Value::PackedValue(value) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "packed-empty-record? expects PackedValue".into(),
+                ));
+            };
+            Ok(Value::Bool(
+                matches!(raw(value), Value::Map(fields) if fields.is_empty()),
+            ))
+        }
+        "packed-record-has-only-key?" => {
+            arity(args, 2)?;
+            let Value::PackedValue(value) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "packed-record-has-only-key? expects PackedValue".into(),
+                ));
+            };
+            let key = args[1]
+                .as_str()
+                .ok_or_else(|| MagError::Type("packed record key must be String".into()))?;
+            Ok(Value::Bool(matches!(
+                raw(value),
+                Value::Map(fields) if fields.len() == 1 && fields.contains_key(key)
+            )))
+        }
+        "packed-field-conforms?" => {
+            arity(args, 3)?;
+            let Value::PackedValue(value) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "packed-field-conforms? expects PackedValue".into(),
+                ));
+            };
+            let key = args[1]
+                .as_str()
+                .ok_or_else(|| MagError::Type("packed record key must be String".into()))?;
+            let Value::TypeDescriptor(ty) = raw(&args[2]) else {
+                return Err(MagError::Type(
+                    "packed-field-conforms? expects TypeDescriptor".into(),
+                ));
+            };
+            let valid = match raw(value) {
+                Value::Map(fields) => fields
+                    .get(key)
+                    .is_some_and(|field| validate_value(env, field, &ty.to_mag_type()).is_ok()),
+                _ => false,
+            };
+            Ok(Value::Bool(valid))
+        }
+        "descriptor-kind" => {
+            arity(args, 1)?;
+            let Value::TypeDescriptor(ty) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "descriptor-kind expects TypeDescriptor".into(),
+                ));
+            };
+            let kind = match ty {
+                crate::types::ConcreteType::Sum { .. } => "union",
+                crate::types::ConcreteType::Product { .. } => "product",
+                crate::types::ConcreteType::Named { .. } => "named",
+                crate::types::ConcreteType::List { .. } => "list",
+                crate::types::ConcreteType::Map { .. } => "map",
+                crate::types::ConcreteType::Record { .. } => "record",
+                _ => "primitive",
+            };
+            Ok(Value::Str(kind.into()))
+        }
+        "descriptor-items" => {
+            arity(args, 1)?;
+            let Value::TypeDescriptor(ty) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "descriptor-items expects TypeDescriptor".into(),
+                ));
+            };
+            let items = match ty {
+                crate::types::ConcreteType::Sum { arms } => arms,
+                crate::types::ConcreteType::Product { items } => items,
+                _ => {
+                    return Err(MagError::Type(
+                        "descriptor-items expects a sum or product descriptor".into(),
+                    ))
+                }
+            };
+            Ok(Value::Vector(std::sync::Arc::new(
+                items.iter().cloned().map(Value::TypeDescriptor).collect(),
+            )))
+        }
+        "foreign-contracts" => {
+            arity(args, 0)?;
+            let Value::HostInputs(inputs) = raw(env.lookup("inputs")?) else {
+                return Err(MagError::Type(
+                    "foreign-contracts requires compiler host inputs".into(),
+                ));
+            };
+            let contracts = inputs
+                .get("foreign_contracts")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    MagError::Type("host inputs need a foreign_contracts list".into())
+                })?;
+            let projected = contracts
+                .iter()
+                .map(|contract| {
+                    let identity = contract
+                        .get("identity")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            MagError::Type("foreign contract needs string identity".into())
+                        })?;
+                    let scheme = contract.get("type_scheme").ok_or_else(|| {
+                        MagError::Type("foreign contract needs type_scheme".into())
+                    })?;
+                    let input_tags = scheme
+                        .get("input_tags")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            MagError::Type(
+                                "foreign contract type_scheme needs input_tags".into(),
+                            )
+                        })?;
+                    let outputs = scheme
+                        .get("outputs")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            MagError::Type("foreign contract type_scheme needs outputs".into())
+                        })?;
+                    Ok(Value::Map(std::sync::Arc::new(
+                        [
+                            ("identity".into(), Value::Str(identity.into())),
+                            (
+                                "type_scheme".into(),
+                                Value::Map(std::sync::Arc::new(
+                                    [
+                                        (
+                                            "input_tags".into(),
+                                            Value::Vector(std::sync::Arc::new(
+                                                input_tags
+                                                    .iter()
+                                                    .map(|tag| {
+                                                        tag.as_str()
+                                                            .map(|tag| Value::Str(tag.into()))
+                                                            .ok_or_else(|| {
+                                                                MagError::Type(
+                                                                    "foreign input tag must be String"
+                                                                        .into(),
+                                                                )
+                                                            })
+                                                    })
+                                                    .collect::<Result<_, _>>()?,
+                                            )),
+                                        ),
+                                        (
+                                            "outputs".into(),
+                                            Value::Vector(std::sync::Arc::new(
+                                                outputs
+                                                    .iter()
+                                                    .map(|tag| {
+                                                        tag.as_str()
+                                                            .map(|tag| Value::Str(tag.into()))
+                                                            .ok_or_else(|| {
+                                                                MagError::Type(
+                                                                    "foreign output tag must be String"
+                                                                        .into(),
+                                                                )
+                                                            })
+                                                    })
+                                                    .collect::<Result<_, _>>()?,
+                                            )),
+                                        ),
+                                    ]
+                                    .into_iter()
+                                    .collect(),
+                                )),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )))
+                })
+                .collect::<Result<Vec<_>, MagError>>()?;
+            Ok(Value::Vector(std::sync::Arc::new(projected)))
         }
         "not" => {
             arity(args, 1)?;
@@ -1225,6 +1411,12 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Value::TypeDecl(a), Value::TypeDecl(b)) => a == b,
         (Value::Foreign(a), Value::Foreign(b)) => a == b,
         (Value::ForeignEvidence(a), Value::ForeignEvidence(b)) => a == b,
+        (Value::TypeDescriptor(a), Value::TypeDescriptor(b)) => a == b,
+        (Value::TypeSchema(a), Value::TypeSchema(b)) => a == b,
+        (Value::SemanticTypeId(a), Value::SemanticTypeId(b)) => a == b,
+        (Value::PackedValue(a), Value::PackedValue(b)) => equal(a, b),
+        (Value::JsonValue(a), Value::JsonValue(b)) => a == b,
+        (Value::HostInputs(a), Value::HostInputs(b)) => a == b,
         (Value::Artifact(a), Value::Artifact(b)) => a == b,
         _ => false,
     }

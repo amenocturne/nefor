@@ -7,8 +7,14 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MagType {
-    Data,
     Artifact,
+    JsonValue,
+    TypeDescriptor,
+    TypeSchema,
+    SemanticTypeId,
+    PackedValue,
+    HostInputs,
+    Never,
     Unit,
     Bool,
     Int,
@@ -33,7 +39,7 @@ pub enum MagType {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConcreteType {
-    Data,
+    JsonValue,
     Unit,
     Bool,
     Int,
@@ -84,7 +90,7 @@ impl ConcreteType {
 
     pub fn to_mag_type(&self) -> MagType {
         match self {
-            Self::Data => MagType::Data,
+            Self::JsonValue => MagType::JsonValue,
             Self::Unit => MagType::Unit,
             Self::Bool => MagType::Bool,
             Self::Int => MagType::Int,
@@ -123,9 +129,6 @@ impl ConcreteType {
 
     pub fn accepts(&self, actual: &Self) -> bool {
         if self == actual {
-            return true;
-        }
-        if matches!(self, Self::Data) && actual.is_data() {
             return true;
         }
         if let Self::Sum { arms } = actual {
@@ -173,23 +176,6 @@ impl ConcreteType {
             _ => false,
         }
     }
-
-    fn is_data(&self) -> bool {
-        match self {
-            Self::Data
-            | Self::Unit
-            | Self::Bool
-            | Self::Int
-            | Self::Float
-            | Self::String
-            | Self::Named { .. } => true,
-            Self::List { item } => item.is_data(),
-            Self::Map { key, value } => key.as_ref() == &Self::String && value.is_data(),
-            Self::Record { fields } => fields.values().all(Self::is_data),
-            Self::Sum { arms } => arms.iter().all(Self::is_data),
-            Self::Product { items } => items.iter().all(Self::is_data),
-        }
-    }
 }
 
 fn resolve(
@@ -198,7 +184,7 @@ fn resolve(
     resolving: &mut HashSet<String>,
 ) -> Result<ConcreteType, MagError> {
     Ok(match ty {
-        MagType::Data => ConcreteType::Data,
+        MagType::JsonValue => ConcreteType::JsonValue,
         MagType::Unit => ConcreteType::Unit,
         MagType::Bool => ConcreteType::Bool,
         MagType::Int => ConcreteType::Int,
@@ -297,6 +283,12 @@ fn resolve(
             ))
         }
         MagType::Artifact => return unsupported("Artifact"),
+        MagType::TypeDescriptor => return unsupported("TypeDescriptor"),
+        MagType::TypeSchema => return unsupported("TypeSchema"),
+        MagType::SemanticTypeId => return unsupported("SemanticTypeId"),
+        MagType::PackedValue => return unsupported("PackedValue"),
+        MagType::HostInputs => return unsupported("HostInputs"),
+        MagType::Never => return unsupported("Never"),
         MagType::TypeTag(_) => return unsupported("TypeTag"),
         MagType::ForeignEvidence => return unsupported("ForeignEvidence"),
         MagType::Function(_, _) => return unsupported("Fn"),
@@ -313,8 +305,14 @@ fn unsupported<T>(name: &str) -> Result<T, MagError> {
 impl fmt::Display for MagType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Data => write!(f, "Data"),
             Self::Artifact => write!(f, "Artifact"),
+            Self::JsonValue => write!(f, "JsonValue"),
+            Self::TypeDescriptor => write!(f, "TypeDescriptor"),
+            Self::TypeSchema => write!(f, "TypeSchema"),
+            Self::SemanticTypeId => write!(f, "SemanticTypeId"),
+            Self::PackedValue => write!(f, "PackedValue"),
+            Self::HostInputs => write!(f, "HostInputs"),
+            Self::Never => write!(f, "Never"),
             Self::Unit => write!(f, "Unit"),
             Self::Bool => write!(f, "Bool"),
             Self::Int => write!(f, "Int"),

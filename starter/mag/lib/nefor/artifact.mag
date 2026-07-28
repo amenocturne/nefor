@@ -12,10 +12,7 @@
   (let [graph (transform nefor.graph.empty-graph)
         checked (nefor.graph.validate
                   graph
-                  (map nefor.graph.foreign-contract
-                       (as (List Data)
-                           (get (as (Map String Data) inputs)
-                                "foreign_contracts"))))
+                  (map nefor.graph.foreign-contract (foreign-contracts)))
         checked-tag (get checked "tag")]
     (if (= checked-tag "core.validated.Valid")
       (artifact format
@@ -31,10 +28,7 @@
   (let [graph (transform nefor.graph.empty-graph)
         checked (nefor.graph.validate
                   graph
-                  (map nefor.graph.foreign-contract
-                       (as (List Data)
-                           (get (as (Map String Data) inputs)
-                                "foreign_contracts"))))
+                  (map nefor.graph.foreign-contract (foreign-contracts)))
         checked-tag (get checked "tag")]
     (if (= checked-tag "core.validated.Valid")
       (artifact format

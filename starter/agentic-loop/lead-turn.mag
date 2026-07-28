@@ -13,8 +13,8 @@
       lead
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "lead"
-         :model nil
-         :profile nil
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.no-identifier)
          :provider "chatgpt"
          :system ""
          :tools ["read_file"
@@ -27,7 +27,7 @@
                  "write-review"
                  "mag"
                  "mag-eval"]
-         :da-policy nil
+         :da-policy (nefor.contracts.no-da-policy)
          :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"

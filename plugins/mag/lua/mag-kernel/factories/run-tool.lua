@@ -104,6 +104,9 @@ function M.construct(id, params, emit, deps)
   if da_policy == nil then
     da_policy = params.da_policy
   end
+  if type(da_policy) == "table" and type(da_policy.rules) == "table" then
+    da_policy = da_policy.rules
+  end
   local allowlist = params.allowlist
   if allowlist == nil then
     allowlist = params.tools

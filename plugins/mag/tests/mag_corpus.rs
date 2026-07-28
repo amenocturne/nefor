@@ -636,7 +636,8 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
       actor (nefor.graph.actor
               "x"
               nefor.factory.bash
-              (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
+              (as nefor.contracts.BashParams
+                {:command "true" :timeout_ms (nefor.contracts.no-timeout)})
               (nefor.graph.store-port input)
               (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
       operation (as (nefor.graph.Node Unit nefor.contracts.Text)
@@ -692,7 +693,8 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
       actor (nefor.graph.actor
               "x"
               nefor.factory.bash
-              (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
+              (as nefor.contracts.BashParams
+                {:command "true" :timeout_ms (nefor.contracts.no-timeout)})
               (nefor.graph.store-port input)
               (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
       operation (as (nefor.graph.Node Unit nefor.contracts.Text)
@@ -752,7 +754,8 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
       actor (nefor.graph.actor
               "x"
               missing.factory
-              (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
+              (as nefor.contracts.BashParams
+                {:command "true" :timeout_ms (nefor.contracts.no-timeout)})
               (nefor.graph.store-port input)
               (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
       operation (as (nefor.graph.Node Unit nefor.contracts.Text)

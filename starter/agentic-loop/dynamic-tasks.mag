@@ -17,9 +17,11 @@
   (let [task (get entry "value") id (worker-id entry)
         agent (nefor.actors.agent
                 (as nefor.actors.AgentConfig
-                  {:id id :model {} :profile {} :provider "mock-provider"
+                  {:id id :model (nefor.contracts.no-identifier)
+                   :profile (nefor.contracts.no-identifier) :provider "mock-provider"
                    :system (str "Complete this task: " (get task "description"))
-                   :tools [] :da-policy {} :max-corrections 2})
+                   :tools [] :da-policy (nefor.contracts.no-da-policy)
+                   :max-corrections 2})
                 (type-tag Task) "task" (type-tag WorkerResult))]
     agent)))
 
@@ -32,14 +34,20 @@
 
 
 (def planner-agent (nefor.actors.agent
-  (as nefor.actors.AgentConfig {:id "planner" :model {} :profile {} :provider "mock-provider"
-    :system "Return the task plan." :tools [] :da-policy {} :max-corrections 2})
+  (as nefor.actors.AgentConfig {:id "planner"
+    :model (nefor.contracts.no-identifier)
+    :profile (nefor.contracts.no-identifier) :provider "mock-provider"
+    :system "Return the task plan." :tools []
+    :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
   (type-tag nefor.contracts.Task) "task" (type-tag (List Task))))
 (def planner (nefor.actors.select-result planner-agent "planner-result"))
 (def prompt (nefor.dynamic.collected-prompt "summary-input" (type-tag (| WorkerResult nefor.contracts.AgentError))))
 (def summarizer (nefor.actors.agent
-  (as nefor.actors.AgentConfig {:id "summarizer" :model {} :profile {} :provider "mock-provider"
-    :system "Summarize the ordered worker results." :tools [] :da-policy {} :max-corrections 2})
+  (as nefor.actors.AgentConfig {:id "summarizer"
+    :model (nefor.contracts.no-identifier)
+    :profile (nefor.contracts.no-identifier) :provider "mock-provider"
+    :system "Summarize the ordered worker results." :tools []
+    :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
   (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderOut" (type-tag Summary)))
 (def outcome (nefor.dynamic.outcome "outcome" (type-tag Summary)))
 (def result (nefor.graph.output "result"

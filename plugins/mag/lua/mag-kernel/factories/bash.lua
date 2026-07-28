@@ -62,7 +62,7 @@ M.declaration = {
     },
     outputs={
       {wire="mag.Text",type={kind="named",name="nefor.contracts.Text",arguments={}}},
-      {wire=COMMAND_FAILED,type={kind="primitive",name="Data"}},
+      {wire=COMMAND_FAILED,type={kind="named",name="nefor.contracts.CommandFailure",arguments={}}},
     },
   },
 
@@ -118,12 +118,12 @@ function M.construct(id, params, emit, deps)
   if type(command) ~= "string" or command == "" then
     return nil, "bash actor requires a non-empty string params.command"
   end
-  local timeout_ms = params.timeout_ms
-  if type(nefor) == "table" and type(nefor.json) == "table"
-      and type(nefor.json.is_null) == "function"
-      and nefor.json.is_null(timeout_ms) then
-    timeout_ms = nil
+  local timeout = params.timeout_ms
+  if type(timeout) ~= "table" or type(timeout.present) ~= "boolean"
+      or type(timeout.milliseconds) ~= "number" then
+    return nil, "bash actor params.timeout_ms must be a Timeout record"
   end
+  local timeout_ms = timeout.present and timeout.milliseconds or nil
   if timeout_ms ~= nil and (type(timeout_ms) ~= "number" or timeout_ms < 1) then
     return nil, "bash actor params.timeout_ms must be a positive number of milliseconds"
   end

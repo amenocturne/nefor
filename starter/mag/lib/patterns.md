@@ -46,9 +46,10 @@ graph retrieval or hot graph mutation in this API.
       worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "worker"
-         :model nil :profile "standard" :provider "chatgpt"
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.identifier "standard") :provider "chatgpt"
          :system "Answer the task." :tools ["read_file" "mag-eval"]
-         :da-policy nil :max-corrections 2})
+         :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))
@@ -119,13 +120,15 @@ For a pipeline, write a graph program with source, command nodes, and output:
 ```
 
 Shell commands are unbounded unless `nefor.shell.command-with-options` receives
-`(as nefor.shell.BashOptions {:timeout_ms 30000})`.
+`(as nefor.shell.BashOptions
+  {:timeout_ms (nefor.contracts.timeout-ms 30000)})`.
 
 ```lisp
 (nefor.shell.command-with-options
   "bounded-search"
   "rg -n TODO src/"
-  (as nefor.shell.BashOptions {:timeout_ms 30000}))
+  (as nefor.shell.BashOptions
+    {:timeout_ms (nefor.contracts.timeout-ms 30000)}))
 ```
 
 ## Products, unions, fan-out, and cycles

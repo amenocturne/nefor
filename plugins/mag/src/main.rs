@@ -905,13 +905,20 @@ fn apply_params_overlay(
             Some(p) => p,
             None => continue,
         };
-        let protected_schema = matches!(
-            obj.get("factory").and_then(Value::as_str),
-            Some("structured-output" | "nefor.factory.structured-output")
-        );
-        if protected_schema && patch.contains_key("schema") {
+        let factory = obj.get("factory").and_then(Value::as_str);
+        let protected_params: &[&str] = match factory {
+            Some("structured-output" | "nefor.factory.structured-output") => {
+                &["schema", "provider_error_type", "validation_error_type"]
+            }
+            Some("outcome" | "nefor.factory.outcome") => &["error_type"],
+            _ => &[],
+        };
+        if let Some(param) = protected_params
+            .iter()
+            .find(|param| patch.contains_key(**param))
+        {
             return Err(format!(
-                "params_overlay for structured-output actor {id:?} cannot replace protected compiler-derived param \"schema\""
+                "params_overlay for actor {id:?} cannot replace protected compiler-derived param {param:?}"
             ));
         }
         let params = obj
@@ -1728,18 +1735,16 @@ mod tests {
         fs::write(
             root.join("main.mag"),
             r#"
-              (require "core.validated")
               (type Task {:task String})
+              (type ExpandedResult {:greeting String})
               (def task-name (fn [[task Task]] -> String (get task "task")))
-              (def expand (fn [[checked (core.validated.Validated String Task)]] -> Artifact
-                (if (= (get checked "tag") "core.validated.Valid")
-                  (artifact "nefor.graph-delta/v1"
-                    {:actors []
-                     :messages [{:to "middle" :content {:kind "stub.In" :task (task-name (get checked "value"))}}]
-                     :kills []
-                     :rules []})
-                  (artifact "nefor.graph-delta/v1" {:actors [] :messages [] :kills [] :rules []}))))
-              (def finish (fn [[task Data]] -> Artifact
+              (def expand (fn [[task Task]] -> Artifact
+                (artifact "nefor.graph-delta/v1"
+                  {:actors []
+                   :messages [{:to "middle" :content {:kind "stub.In" :task (task-name task)}}]
+                   :kills []
+                   :rules []})))
+              (def finish (fn [[task Task]] -> Artifact
                 (artifact "nefor.graph-delta/v1"
                   {:actors []
                    :messages [{:to "result" :content {:kind "stub.In" :task task}}]
@@ -1748,18 +1753,18 @@ mod tests {
               (artifact "nefor.graph-modification/v1"
                 {:actors [
                   {:id "source" :foreign "nefor.factory.stub"
-                   :params {:value {:tag "core.validated.Valid" :value {:task "one"}}} :routes {}}
+                   :params {:value {:task "one"}} :routes {}}
                   {:id "middle" :foreign "nefor.factory.stub"
                    :params {:value {:task "nested"}} :routes {}}
                   {:id "result" :foreign "nefor.factory.stub"
                    :params {:greeting "expanded"} :routes {}}]
                  :messages [{:to "source" :content {:kind "stub.In"}}]
                  :kills []
-                 :rules [{:id "expand" :on {:actor "source" :type (type-evidence (type-tag (core.validated.Validated String Task))) :wire "stub.Out"}
+                 :rules [{:id "expand" :on {:actor "source" :type (type-evidence (type-tag Task)) :wire "stub.Out"}
                           :fn "expand"}
-                         {:id "finish" :on {:actor "middle" :type (type-evidence (type-tag Data)) :wire "stub.Out"}
+                         {:id "finish" :on {:actor "middle" :type (type-evidence (type-tag Task)) :wire "stub.Out"}
                           :fn "finish"}]
-                 :result {:from {:actor "result" :type (type-evidence (type-tag Data)) :wire "stub.Out"}}})
+                 :result {:from {:actor "result" :type (type-evidence (type-tag ExpandedResult)) :wire "stub.Out"}}})
             "#,
         )
         .expect("program");
@@ -1797,7 +1802,10 @@ mod tests {
         let completion = host
             .take_run_complete("rule-e2e")
             .expect("completion")
-            .expect("delta fired static result actor");
+            .unwrap_or_else(|| {
+                let failure = host.take_run_failed("rule-e2e").expect("rule run failure");
+                panic!("delta did not fire static result actor: {failure:?}")
+            });
         assert_eq!(
             completion
                 .result
@@ -1852,22 +1860,59 @@ mod tests {
     }
 
     #[test]
-    fn params_overlay_cannot_replace_compiler_derived_structured_schema() {
+    fn params_overlay_cannot_replace_compiler_derived_params() {
         let original = serde_json::json!({"version": 1, "root": {"kind": "string"}});
         let mut modification = serde_json::json!({
-            "actors": [{
-                "id": "typed",
-                "factory": "nefor.factory.structured-output",
-                "params": {"schema": original, "provider": "mock-provider"}
-            }]
+            "actors": [
+                {
+                    "id": "typed",
+                    "factory": "nefor.factory.structured-output",
+                    "params": {
+                        "schema": original,
+                        "provider": "mock-provider",
+                        "provider_error_type": "provider-id",
+                        "validation_error_type": "validation-id"
+                    }
+                },
+                {
+                    "id": "result",
+                    "factory": "outcome",
+                    "params": {"error_type": "agent-error-id"}
+                }
+            ]
         });
-        let overlay = serde_json::json!({
-            "typed": {"schema": {"version": 1, "root": {"kind": "data"}}}
-        });
-        let error =
-            apply_params_overlay(&mut modification, overlay.as_object().unwrap()).unwrap_err();
-        assert!(error.contains("protected compiler-derived param \"schema\""));
+        for (actor, param, value) in [
+            (
+                "typed",
+                "schema",
+                serde_json::json!({"version": 1, "root": {"kind": "string"}}),
+            ),
+            ("typed", "provider_error_type", serde_json::json!("forged")),
+            (
+                "typed",
+                "validation_error_type",
+                serde_json::json!("forged"),
+            ),
+            ("result", "error_type", serde_json::json!("forged")),
+        ] {
+            let overlay = serde_json::json!({(actor): {(param): value}});
+            let error =
+                apply_params_overlay(&mut modification, overlay.as_object().unwrap()).unwrap_err();
+            assert!(error.contains(&format!("protected compiler-derived param {param:?}")));
+        }
         assert_eq!(modification["actors"][0]["params"]["schema"], original);
+        assert_eq!(
+            modification["actors"][0]["params"]["provider_error_type"],
+            "provider-id"
+        );
+        assert_eq!(
+            modification["actors"][0]["params"]["validation_error_type"],
+            "validation-id"
+        );
+        assert_eq!(
+            modification["actors"][1]["params"]["error_type"],
+            "agent-error-id"
+        );
     }
 
     #[test]

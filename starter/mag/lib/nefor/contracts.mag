@@ -19,38 +19,59 @@
                        :expected String
                        :actual String
                        :message String})
+(type OptionalIdentifier {:present Bool :value String})
 (type ProviderError {:message String
-                     :detail (core.types.Option String)})
+                     :detail OptionalIdentifier})
 (type OutputValidationError {:violations (List OutputViolation)})
 (type AgentErrorReason (| ProviderError OutputValidationError))
-(type AgentError {:last_output Data
+(type AgentError {:last_output JsonValue
                   :reason AgentErrorReason})
 
-(type AdapterParams {:seed String :schema Data})
-(type LlmParams {:model Data
-                 :profile Data
+(type DaPolicy {:rules (Map String String)})
+(type Timeout {:present Bool :milliseconds Int})
+(type CommandFailure {:error String :command String})
+
+(def no-identifier (fn [] -> OptionalIdentifier
+  (as OptionalIdentifier {:present false :value ""})))
+(def identifier (fn [[value String]] -> OptionalIdentifier
+  (as OptionalIdentifier {:present true :value value})))
+(def no-da-policy (fn [] -> DaPolicy
+  (as DaPolicy {:rules (as (Map String String) {})})))
+(def da-policy (fn [[rules (Map String String)]] -> DaPolicy
+  (as DaPolicy {:rules rules})))
+(def no-timeout (fn [] -> Timeout
+  (as Timeout {:present false :milliseconds 0})))
+(def timeout-ms (fn [[milliseconds Int]] -> Timeout
+  (as Timeout {:present true :milliseconds milliseconds})))
+
+(type AdapterParams {:seed String :schema TypeSchema})
+(type LlmParams {:model OptionalIdentifier
+                 :profile OptionalIdentifier
                  :provider String
                  :system String
                  :tools (List String)})
 (type RunToolParams {:tools (List String)
-                     :da-policy Data})
+                     :da-policy DaPolicy})
 (type ToolResultParams {})
 (type BashParams {:command String
-                  :timeout_ms Data})
+                  :timeout_ms Timeout})
 (type HumanParams {:prompt String})
 (type SinkParams {})
 (type SourceParams [T] {:value T})
 (type OutputParams {})
-(type StructuredOutputParams {:model Data
-                              :profile Data
+(type StructuredOutputParams {:model OptionalIdentifier
+                              :profile OptionalIdentifier
                               :provider String
                               :system String
                               :tools (List String)
-                              :schema Data
+                              :schema TypeSchema
+                              :provider_error_type SemanticTypeId
+                              :validation_error_type SemanticTypeId
                               :max_corrections Int})
 (type SelectAgentResultParams {})
 (type CollectorParams {:expected_senders (List String)})
 (type DynamicParams {})
+(type OutcomeParams {:error_type SemanticTypeId})
 
 (foreign nefor.factory.adapter [T]
   {:params AdapterParams
@@ -117,6 +138,6 @@
 (foreign nefor.factory.collected-prompt [T]
   {:params DynamicParams :input (List T) :output ProviderInput})
 (foreign nefor.factory.outcome [T]
-  {:params DynamicParams
+  {:params OutcomeParams
    :input (| T AgentError)
    :output (| T AgentError)})

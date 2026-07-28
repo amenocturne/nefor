@@ -16,7 +16,16 @@ struct MemoArg(Value);
 
 impl MemoArg {
     fn new(value: &Value) -> Option<Self> {
-        if matches!(value, Value::Artifact(_)) {
+        if matches!(
+            value,
+            Value::Artifact(_)
+                | Value::TypeDescriptor(_)
+                | Value::TypeSchema(_)
+                | Value::SemanticTypeId(_)
+                | Value::PackedValue(_)
+                | Value::JsonValue(_)
+                | Value::HostInputs(_)
+        ) {
             None
         } else {
             Some(Self(value.clone()))
@@ -81,7 +90,13 @@ impl Hash for MemoArg {
                 Arc::as_ptr(value).hash(state);
                 ty.hash(state);
             }
-            Value::Artifact(_) => unreachable!("artifacts are not memoized arguments"),
+            Value::Artifact(_)
+            | Value::TypeDescriptor(_)
+            | Value::TypeSchema(_)
+            | Value::SemanticTypeId(_)
+            | Value::PackedValue(_)
+            | Value::JsonValue(_)
+            | Value::HostInputs(_) => unreachable!("opaque values are not memoized arguments"),
         }
     }
 }
@@ -183,13 +198,25 @@ impl Env {
             "require",
             "artifact",
             "type-schema",
+            "type-id",
+            "pack",
+            "packed-empty-record?",
+            "packed-record-has-only-key?",
+            "packed-field-conforms?",
+            "descriptor-kind",
+            "descriptor-items",
+            "foreign-contracts",
         ] {
             env.define(name, Value::BuiltinFn(name.into()));
         }
         for (name, ty) in [
-            ("Data", crate::types::MagType::Data),
             ("ForeignEvidence", crate::types::MagType::ForeignEvidence),
             ("Artifact", crate::types::MagType::Artifact),
+            ("JsonValue", crate::types::MagType::JsonValue),
+            ("TypeDescriptor", crate::types::MagType::TypeDescriptor),
+            ("TypeSchema", crate::types::MagType::TypeSchema),
+            ("SemanticTypeId", crate::types::MagType::SemanticTypeId),
+            ("PackedValue", crate::types::MagType::PackedValue),
             ("Unit", crate::types::MagType::Unit),
             ("Bool", crate::types::MagType::Bool),
             ("Int", crate::types::MagType::Int),

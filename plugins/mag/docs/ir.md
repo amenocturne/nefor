@@ -4,7 +4,7 @@
 
 Lowered actors retain an opaque `ForeignEvidence` value produced by
 `specialize`: version, foreign identity, concrete arguments, and instantiated
-semantic input/output. Ordinary MAG data and `as Data` cannot construct this
+semantic input/output. Ordinary MAG maps cannot construct this
 value. At the artifact boundary it becomes a versioned descriptor; the runtime
 checks identity, arity, registry scheme instantiation, semantic endpoints, and
 fixed wire tags before spawning anything. Non-generic actors remain unchanged.
@@ -190,7 +190,7 @@ types decide when the actor runs.
 | union `(A \| B)`  | on any — whichever arrives first activates alone                                 |
 | product `(A + B)` | on all — the kernel accumulates components and delivers one assembled activation |
 
-Data flow subsumes dependency: if `A -> B` carries data, B structurally cannot
+Dataflow subsumes dependency: if `A -> B` carries data, B structurally cannot
 fire before A's output arrives. There is no separate dependency graph in the
 IR — the authoring layer may present dataflow and firing constraints as two
 views, but both lower to routes plus input contracts. Ordering without data

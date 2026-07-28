@@ -82,7 +82,7 @@ fn outcome_emits_once_and_drain_settles_an_empty_boundary() {
             r#"
             local factory = require("factories.outcome")
             local emitted = {}
-            local actor = assert(factory.construct("result", {},
+            local actor = assert(factory.construct("result", { error_type = "error-tag" },
               function(message) emitted[#emitted + 1] = message end))
             local value = { tag = "core.validated.Valid", value = "done" }
             assert(actor.deliver({ messages = {{ message = { value = value } }} }).status == "ok")
@@ -94,7 +94,7 @@ fn outcome_emits_once_and_drain_settles_an_empty_boundary() {
             assert(#emitted == 2)
 
             local drained = {}
-            local waiting = assert(factory.construct("waiting", {},
+            local waiting = assert(factory.construct("waiting", { error_type = "error-tag" },
               function(message) drained[#drained + 1] = message end))
             waiting.handle_drain()
             assert(drained[2].kind == "mag.failed")

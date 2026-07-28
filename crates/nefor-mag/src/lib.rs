@@ -42,7 +42,7 @@ pub fn compile_with_inputs_and_module_roots(
     let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
     let mut env =
         Env::new_with_stdlib_source_dir_and_module_roots(source_dir, module_roots.to_vec());
-    env.define("inputs", json::json_to_value(&inputs));
+    env.define("inputs", Value::HostInputs(inputs));
     let exprs = parser::parse(&lexer::tokenize(source)?)?;
     extract_artifact(eval::eval_program(&mut env, &exprs)?, "top-level program")
 }
@@ -82,7 +82,7 @@ pub fn load_with_inputs_and_module_roots(
         .map_err(|e| MagError::Eval(format!("cannot read program {}: {e}", path.display())))?;
     let mut env =
         Env::new_with_stdlib_source_dir_and_module_roots(source_dir, module_roots.to_vec());
-    env.define("inputs", json::json_to_value(&inputs));
+    env.define("inputs", Value::HostInputs(inputs));
     let exprs = parser::parse(&lexer::tokenize(&source)?)?;
     let artifact = extract_artifact(eval::eval_program(&mut env, &exprs)?, "top-level program")?;
     let encoded = serde_json::to_vec(&artifact)
@@ -179,7 +179,10 @@ pub fn validate_rule_fn_input(
     let ast::Value::Fn(function) = program.env.lookup(name)? else {
         unreachable!("validate_rule_fn accepted a non-function")
     };
-    let actual = json::type_evidence_to_json(&function.param_types[0])?;
+    let actual = json::concrete_type_to_json(&types::ConcreteType::resolve(
+        &program.env,
+        &function.param_types[0],
+    )?)?;
     if actual != *expected_input {
         return Err(MagError::Type(format!(
             "rule function '{name}' input does not match its structural source type"

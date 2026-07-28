@@ -1,8 +1,8 @@
 (require "nefor.artifact")
 (require "nefor.graph")
 
-;; Reusing valid source evidence cannot authorize a captured value of another
-;; type. The pure boundary validator checks the value against that evidence.
+;; Actor parameter storage is compiler-packed. A map cannot forge the private
+;; existential package even when every other actor field is copied.
 (let [legitimate (nefor.graph.source "start" (type-tag String) "valid")
       original (first (get legitimate "actors"))
       forged-actor (as nefor.graph.Actor

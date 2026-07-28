@@ -362,10 +362,13 @@ The canonical MAG constructor is `nefor.actors.agent`. Its public type is
 `I -> (O | AgentError)`. `max_corrections = 0` means no correction,
 `1` means one correction, and so on.
 
-The descriptor is compiler-derived protected params data. `mag.execute`
-rejects any `params_overlay` that attempts to replace `schema`; accepting such
-an overlay would let runtime data weaken the type promised by the fragment.
-Provider/model/history overlays remain ordinary runtime configuration.
+The descriptor and semantic error type identities are compiler-derived
+protected params data. `mag.execute` rejects any `params_overlay` that attempts
+to replace `schema`, `provider_error_type`, or `validation_error_type`;
+accepting such an overlay would let runtime data weaken or counterfeit the type
+promised by the fragment. Provider/model/history overlays remain ordinary
+runtime configuration. The outcome boundary likewise protects its
+compiler-derived `error_type`.
 
 Both provider-boundary factories use `factories/provider-boundary.lua` for
 history validation and seeding, provider correlation, tool-call transcript

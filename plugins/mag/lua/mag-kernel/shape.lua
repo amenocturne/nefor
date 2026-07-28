@@ -12,7 +12,7 @@
 --   union   `(A | B)`    fires on any        — whichever arrives activates
 --   product `(A + B)`    fires on all        — kernel assembles one activation
 --
--- Data representation (plain, readable data — no metatables, no behavior):
+-- Plain representation (readable tables — no metatables, no behavior):
 --   single  -> a string tag                       "generic-provider.ProviderOut"
 --   union   -> a list of tags                      { "A", "B" }
 --   product -> a struct keyed by `product`         { product = { "A", "B" } }

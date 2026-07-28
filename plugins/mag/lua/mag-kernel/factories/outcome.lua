@@ -12,6 +12,9 @@ function M.construct(id,params,emit)
     if done then return {status="failed",failure=kinds.Failed,value={kind="duplicate_outcome"}} end
     local message=a.messages[1].message or {}; local value=message.value
     local variant=message.variant
+    if variant==nil and type(value)=="table" and value.type==params.error_type then
+      variant="error"; value=value.value
+    end
     if variant==nil then variant=type(value)=="table" and value.reason~=nil and "error" or "success" end
     done=true; emit({kind="nefor.outcome.Result",from=id,variant=variant,value=value}); return {status="ok"}
   end

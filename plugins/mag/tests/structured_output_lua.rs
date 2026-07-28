@@ -79,7 +79,9 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }
         local actor, err = factory.construct("typed", {
           provider = "mock-provider", schema = schema, tools = { "read_file" },
-          max_corrections = 2
+          max_corrections = 2,
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
         }, emit)
         assert(actor, err)
 
@@ -130,7 +132,9 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
         local actor = assert(factory.construct("typed", {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
-          max_corrections = 2
+          max_corrections = 2,
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
@@ -141,8 +145,9 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.agent.Result")
         assert(terminal.variant == "error")
-        assert(terminal.value.reason.violations[1].path == "$")
-        assert(terminal.value.reason.attempts == nil)
+        assert(terminal.value.reason.type == "validation-error-tag")
+        assert(terminal.value.reason.value.violations[1].path == "$")
+        assert(terminal.value.reason.value.attempts == nil)
         assert(terminal.value.last_output.text == "null")
       "#,
     )
@@ -160,7 +165,9 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
         local actor = assert(factory.construct("no-retry", {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
-          max_corrections = 0
+          max_corrections = 0,
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
@@ -170,7 +177,7 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
         assert(terminal.kind == "nefor.agent.Result")
         assert(terminal.variant == "error")
         assert(terminal.value.last_output.raw == "candidate")
-        assert(terminal.value.reason.violations[1].code == "wrong_type")
+        assert(terminal.value.reason.value.violations[1].code == "wrong_type")
         for _, message in ipairs(emitted) do
           assert(not (message.kind == "capability.invoke" and message.ref == "no-retry@r2"))
         end
@@ -219,7 +226,9 @@ fn ordinary_string_output_accepts_the_empty_string() {
         local actor = assert(factory.construct("empty-string", {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
-          max_corrections = 0
+          max_corrections = 0,
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
@@ -246,7 +255,9 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
           local actor = assert(factory.construct(id, {
             provider = "mock-provider",
             schema = { version = 1, root = { kind = "string" } },
-            max_corrections = 1
+            max_corrections = 1,
+            provider_error_type = "provider-error-tag",
+            validation_error_type = "validation-error-tag"
           }, function(message) emitted[#emitted + 1] = message end))
           actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
             messages = {{ role = "user", content = "answer" }}
@@ -259,24 +270,25 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         local correlation_error = correlation_out[#correlation_out - 1]
         assert(correlation_error.kind == "nefor.agent.Result")
         assert(correlation_error.variant == "error")
-        assert(correlation_error.value.reason.message == "provider unavailable")
-        assert(correlation_error.value.reason.detail.tag == "core.types.None")
+        assert(correlation_error.value.reason.type == "provider-error-tag")
+        assert(correlation_error.value.reason.value.message == "provider unavailable")
+        assert(correlation_error.value.reason.value.detail.present == false)
         assert(nefor.json.encode(correlation_error.value.last_output) == "null")
 
         local detailed, detailed_out = new_actor("detailed")
         detailed.deliver({ kind = "reply", error = {
           message = "provider message", detail = "provider-owned detail"
         }})
-        local detailed_error = detailed_out[#detailed_out - 1].value.reason
+        local detailed_error = detailed_out[#detailed_out - 1].value.reason.value
         assert(detailed_error.message == "provider message")
-        assert(detailed_error.detail.tag == "core.types.Some")
+        assert(detailed_error.detail.present == true)
         assert(detailed_error.detail.value == "provider-owned detail")
 
         local in_band, in_band_out = new_actor("in-band")
         in_band.deliver({ kind = "reply", result = {
           finish_reason = "error", error = "upstream refused"
         }})
-        assert(in_band_out[#in_band_out - 1].value.reason.message == "upstream refused")
+        assert(in_band_out[#in_band_out - 1].value.reason.value.message == "upstream refused")
 
         for _, bad_detail in ipairs({ "", false, { nested = "not a message" } }) do
           local malformed, malformed_out = new_actor("malformed-detail")
@@ -284,7 +296,7 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
             finish_reason = "error", error = bad_detail
           }})
           assert(malformed_out[#malformed_out - 1].kind == "nefor.agent.Result")
-          assert(malformed_out[#malformed_out - 1].value.reason.message
+          assert(malformed_out[#malformed_out - 1].value.reason.value.message
             == 'provider returned finish_reason "error" with no detail')
         end
 
@@ -298,7 +310,7 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         retained.deliver({ kind = "reply", result = { text = "1", marker = "first" } })
         retained.deliver({ kind = "reply", error = "correction transport failed" })
         local retained_error = retained_out[#retained_out - 1]
-        assert(retained_error.value.reason.message == "correction transport failed")
+        assert(retained_error.value.reason.value.message == "correction transport failed")
         assert(retained_error.value.last_output.marker == "first")
 
         local after_tool, after_tool_out = new_actor("after-tool")
@@ -333,7 +345,9 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         local actor = assert(factory.construct("repeat", {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
-          max_corrections = 2
+          max_corrections = 2,
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
         local function activate(content)
           actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
@@ -355,7 +369,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.variant == "error")
-        assert(terminal.value.reason.violations ~= nil)
+        assert(terminal.value.reason.value.violations ~= nil)
       "#,
     )
     .exec()

@@ -4,15 +4,15 @@
 ;; A graph is an immutable edge set. The list is a deterministic storage
 ;; detail: graph/add-edges/remove-edges normalize it to set semantics.
 (type Port [T] {:actor String :type (TypeTag T) :wire String})
-(type StoredPort {:actor String :type Data :wire String})
+(type StoredPort {:actor String :type TypeDescriptor :wire String})
 (type Actor {:id String
              :foreign String
              :evidence ForeignEvidence
-             :params Data
+             :params PackedValue
              :input StoredPort
              :outputs (List StoredPort)})
 (type StoredRoute {:from StoredPort :to StoredPort})
-(type Message {:to String :content Data})
+(type Message {:to String :content PackedValue})
 (type Rule {:id String :on StoredPort :fn String})
 (type StoredNode {:id String
                   :role String
@@ -45,9 +45,9 @@
                   :evidence ForeignEvidence
                   :input StoredPort
                   :outputs (List StoredPort)
-                  :params Data
+                  :params PackedValue
                   :routes (Map String (List LowerDestination))})
-(type LowerMessage {:to String :content Data})
+(type LowerMessage {:to String :content PackedValue})
 (type LowerRule {:id String :on StoredPort :fn String})
 (type ResultBoundary {:from StoredPort})
 (type Modification {:actors (List LowerActor)
@@ -81,7 +81,7 @@
                 [input StoredPort] [outputs (List StoredPort)]] -> Actor
   (as Actor {:id id :foreign (foreign-id capability)
              :evidence (foreign-evidence capability)
-             :params (as Data params) :input input :outputs outputs})))
+             :params (pack params) :input input :outputs outputs})))
 
 (def node (fn [I O] [[id String] [role String] [actors (List Actor)]
                      [routes (List StoredRoute)] [messages (List Message)]
@@ -103,11 +103,11 @@
   (as Edge {:from (store-node from) :to (store-node to)
             :route (stored-route (get from "output") (get to "input"))})))
 
-(def message (fn [[to String] [content Data]] -> Message
-  (as Message {:to to :content content})))
+(def message (fn [T] [[to String] [content T]] -> Message
+  (as Message {:to to :content (pack content)})))
 (def typed-message (fn [T] [[to (Port T)] [value T]] -> Message
   (as Message {:to (get to "actor")
-               :content (as Data {:kind (get to "wire") :value value})})))
+               :content (pack {:kind (get to "wire") :value value})})))
 (def rule (fn [T] [[id String] [on (Port T)] [fn-name String]] -> Rule
   (as Rule {:id id :on (store-port on) :fn fn-name})))
 
@@ -118,7 +118,7 @@
                        (as (nefor.contracts.SourceParams T) {:value value})
                        (store-port input) [(store-port output)])]
     (node id "source" [source-actor] (as (List StoredRoute) [])
-      [(message id (as Data {:kind "mag.Unit"}))] input output))))
+      [(message id {:kind "mag.Unit"})] input output))))
 
 (def output (fn [T] [[id String] [type (TypeTag T)]] -> (Node T T)
   (let [input (port id type "nefor.graph.Value")
@@ -266,12 +266,16 @@
     (path-to? value (get candidate "id") (get result "id")
               (as (List String) [])))))
 
-(def foreign-contract (fn [[entry Data]] -> ForeignContract
-  (as ForeignContract {:identity (as String (get entry "identity"))
-   :type_scheme {:input_tags (as (List String)
-                                  (get (get entry "type_scheme") "input_tags"))
-                 :outputs (as (List String)
-                              (get (get entry "type_scheme") "outputs"))}})))
+(def foreign-contract
+  (fn [[entry {:identity String
+               :type_scheme {:input_tags (List String)
+                             :outputs (List String)}}]]
+      -> ForeignContract
+    (as ForeignContract
+      {:identity (get entry "identity")
+       :type_scheme (as ForeignTypeScheme
+                      {:input_tags (get (get entry "type_scheme") "input_tags")
+                       :outputs (get (get entry "type_scheme") "outputs")})})))
 
 (def contains-string? (fn [[values (List String)] [value String]] -> Bool
   (not (= (count (filter (fn [[candidate String]] -> Bool (= candidate value)) values)) 0))))
@@ -280,13 +284,13 @@
                       (not (contains-string? right value))) left)) 0)))
 (def one-port? (fn [[ports (List StoredPort)] [expected StoredPort]] -> Bool
   (= ports [expected])))
-(def empty-data-map? (fn [[value Data]] -> Bool
-  (= (count (keys (as (Map String Data) value))) 0)))
-(def source-params-valid? (fn [[value Data]] -> Bool
-  (= (keys (as (Map String Data) value)) ["value"])))
+(def empty-packed-map? (fn [[value PackedValue]] -> Bool
+  (packed-empty-record? value)))
+(def source-params-valid? (fn [[value PackedValue]] -> Bool
+  (packed-record-has-only-key? value "value")))
 (def source-value-valid? (fn [[value Actor] [output StoredPort]] -> Bool
-  (conforms? (get (as (Map String Data) (get value "params")) "value")
-             (get output "type"))))
+  (packed-field-conforms? (get value "params") "value"
+                          (get output "type"))))
 (def source-evidence-valid? (fn [[value Actor] [output StoredPort]] -> Bool
   (let [output-type (get output "type")]
     (= (canonical (get value "evidence"))
@@ -320,7 +324,7 @@
                       (if (one-port? (get boundary "outputs") output)
                         (if (= (count (get candidate "routes")) 0)
                           (if (= (get candidate "messages")
-                                 [(message id (as Data {:kind "mag.Unit"}))])
+                                 [(message id {:kind "mag.Unit"})])
                             (if (source-params-valid? (get boundary "params"))
                               (source-value-valid? boundary output) false)
                             false)
@@ -349,7 +353,7 @@
                       (if (= (get boundary "input") input)
                         (if (output-evidence-valid? boundary input)
                           (if (one-port? (get boundary "outputs") output)
-                            (if (empty-data-map? (get boundary "params"))
+                            (if (empty-packed-map? (get boundary "params"))
                               (if (= (count (get candidate "routes")) 0)
                                 (= (count (get candidate "messages")) 0) false)
                               false)
@@ -427,34 +431,35 @@
   (= (count (filter (fn [[candidate Actor]] -> Bool
     (if (= (get candidate "id") (get value "actor"))
       (= (get candidate "input") value) false)) actors)) 1)))
-(def type-kind (fn [[value Data]] -> String
-  (as String (get value "kind"))))
-(def type-items (fn [[value Data]] -> (List Data)
-  (as (List Data) (get value "items"))))
-(def type-accepts? (fn [[target Data] [source Data]] -> Bool
+(def type-kind (fn [[value TypeDescriptor]] -> String
+  (descriptor-kind value)))
+(def type-items (fn [[value TypeDescriptor]] -> (List TypeDescriptor)
+  (descriptor-items value)))
+(def type-accepts? (fn [[target TypeDescriptor] [source TypeDescriptor]] -> Bool
   (if (= target source)
     true
     (if (= (type-kind target) "union")
       (if (= (type-kind source) "union")
-        (= (count (filter (fn [[source-item Data]] -> Bool
+        (= (count (filter (fn [[source-item TypeDescriptor]] -> Bool
                             (not (type-accepts? target source-item)))
                           (type-items source))) 0)
-        (not (= (count (filter (fn [[target-item Data]] -> Bool
+        (not (= (count (filter (fn [[target-item TypeDescriptor]] -> Bool
                                  (type-accepts? target-item source))
                                (type-items target))) 0)))
       (if (= (type-kind target) "product")
-        (not (= (count (filter (fn [[target-item Data]] -> Bool
+        (not (= (count (filter (fn [[target-item TypeDescriptor]] -> Bool
                                  (type-accepts? target-item source))
                                (type-items target))) 0))
         false)))))
-(def product-types-cover? (fn [[sources (List Data)] [components (List Data)]] -> Bool
+(def product-types-cover? (fn [[sources (List TypeDescriptor)]
+                               [components (List TypeDescriptor)]] -> Bool
   (if (= (count sources) (count components))
     (if (= (count sources) 0)
       true
       (let [source (first sources)
             remaining-sources (remove-at sources 0)
             candidates (indexed-map
-              (fn [[index Int] [component Data]] -> Bool
+              (fn [[index Int] [component TypeDescriptor]] -> Bool
                 (if (type-accepts? component source)
                   (product-types-cover? remaining-sources
                     (remove-at components index))
@@ -463,8 +468,8 @@
         (not (= (count (filter (fn [[matched Bool]] -> Bool matched)
                                candidates)) 0))))
     false)))
-(def incoming-types (fn [[value Graph] [id String]] -> (List Data)
-  (map (fn [[candidate Edge]] -> Data
+(def incoming-types (fn [[value Graph] [id String]] -> (List TypeDescriptor)
+  (map (fn [[candidate Edge]] -> TypeDescriptor
          (get (get (get candidate "route") "from") "type"))
        (filter (fn [[candidate Edge]] -> Bool
                  (= (get (get candidate "to") "id") id))

@@ -109,9 +109,13 @@ function M.construct(id, params, emit, options)
   local function build_request()
     local messages = {}
     for i, message in ipairs(history) do messages[i] = message end
+    local model = params.model
+    if type(model) == "table" then
+      model = model.present and model.value or nil
+    end
     return {
       chat_id = pending.chat_id,
-      model = params.model,
+      model = model,
       system = params.system,
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,

@@ -19,7 +19,7 @@ pub struct TypeSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SchemaType {
-    Data,
+    JsonValue,
     Unit,
     Bool,
     Int,
@@ -128,7 +128,7 @@ impl TypeSchema {
 
 fn schema_type_to_json_schema(schema: &SchemaType) -> Value {
     match schema {
-        SchemaType::Data => serde_json::json!({}),
+        SchemaType::JsonValue => serde_json::json!({}),
         SchemaType::Unit => serde_json::json!({"type": "null"}),
         SchemaType::Bool => serde_json::json!({"type": "boolean"}),
         SchemaType::Int => serde_json::json!({"type": "integer"}),
@@ -193,7 +193,7 @@ fn schema_type_to_json_schema(schema: &SchemaType) -> Value {
 fn reify_concrete(ty: &crate::types::ConcreteType) -> Result<SchemaType, MagError> {
     use crate::types::ConcreteType;
     Ok(match ty {
-        ConcreteType::Data => SchemaType::Data,
+        ConcreteType::JsonValue => SchemaType::JsonValue,
         ConcreteType::Unit => SchemaType::Unit,
         ConcreteType::Bool => SchemaType::Bool,
         ConcreteType::Int => SchemaType::Int,
@@ -266,7 +266,7 @@ fn validate_at(schema: &SchemaType, value: &Value, path: &str, out: &mut Vec<Vio
                 }
             }
         }
-        SchemaType::Data => {}
+        SchemaType::JsonValue => {}
         SchemaType::Unit => expect(value.is_null(), path, "Unit", value, out),
         SchemaType::Bool => expect(value.is_boolean(), path, "Bool", value, out),
         SchemaType::Int => expect(value.as_i64().is_some(), path, "Int", value, out),
@@ -430,7 +430,7 @@ fn expect(valid: bool, path: &str, expected: &str, value: &Value, out: &mut Vec<
 
 fn describe(schema: &SchemaType) -> String {
     match schema {
-        SchemaType::Data => "Data".into(),
+        SchemaType::JsonValue => "JsonValue".into(),
         SchemaType::Unit => "Unit".into(),
         SchemaType::Bool => "Bool".into(),
         SchemaType::Int => "Int".into(),

@@ -88,12 +88,12 @@ There are no compiler forms named `agent`, `bash`, `graph`, `subgraph`, or
       worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "worker"
-         :model nil
-         :profile "standard"
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.identifier "standard")
          :provider "chatgpt"
          :system "Answer the task."
          :tools ["read_file" "mag-eval"]
-         :da-policy nil})
+         :da-policy (nefor.contracts.no-da-policy)})
         (type-tag nefor.contracts.Task)
         "task"
         (type-tag nefor.contracts.FinalAnswer))

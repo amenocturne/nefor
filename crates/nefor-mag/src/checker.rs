@@ -105,7 +105,7 @@ fn infer_list(
     xs: &[Expr],
 ) -> Result<MagType, MagError> {
     if xs.is_empty() {
-        return Ok(MagType::List(Box::new(MagType::Data)));
+        return Ok(MagType::EmptyList);
     }
     let first = infer(env, locals, &xs[0])?;
     for item in &xs[1..] {
@@ -416,7 +416,7 @@ fn infer_builtin(
         "type-evidence" => {
             exact(1)?;
             match infer(env, locals, &args[0])? {
-                MagType::TypeTag(_) => Ok(MagType::Data),
+                MagType::TypeTag(_) => Ok(MagType::TypeDescriptor),
                 actual => Err(MagError::Type(format!(
                     "type-evidence expects TypeTag, got {actual}"
                 ))),
@@ -425,11 +425,23 @@ fn infer_builtin(
         "type-schema" => {
             exact(1)?;
             match infer(env, locals, &args[0])? {
-                MagType::TypeTag(_) => Ok(MagType::Data),
+                MagType::TypeTag(_) => Ok(MagType::TypeSchema),
                 actual => Err(MagError::Type(format!(
                     "type-schema expects TypeTag, got {actual}"
                 ))),
             }
+        }
+        "type-id" => {
+            exact(1)?;
+            let descriptor = infer(env, locals, &args[0])?;
+            compatible(
+                env,
+                &descriptor,
+                &MagType::TypeDescriptor,
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
+            Ok(MagType::SemanticTypeId)
         }
         "or" => {
             exact(2)?;
@@ -451,14 +463,102 @@ fn infer_builtin(
             exact(2)?;
             let _ = infer(env, locals, &args[0])?;
             let evidence = infer(env, locals, &args[1])?;
-            compatible(env, &evidence, &MagType::Data, &mut HashMap::new())
-                .map_err(MagError::Type)?;
+            compatible(
+                env,
+                &evidence,
+                &MagType::TypeDescriptor,
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
             Ok(MagType::Bool)
         }
         "fail" => {
             exact(1)?;
             let _ = infer(env, locals, &args[0])?;
-            Ok(MagType::Data)
+            Ok(MagType::Never)
+        }
+        "pack" => {
+            exact(1)?;
+            let _ = infer(env, locals, &args[0])?;
+            Ok(MagType::PackedValue)
+        }
+        "packed-empty-record?" => {
+            exact(1)?;
+            let value = infer(env, locals, &args[0])?;
+            compatible(env, &value, &MagType::PackedValue, &mut HashMap::new())
+                .map_err(MagError::Type)?;
+            Ok(MagType::Bool)
+        }
+        "packed-record-has-only-key?" | "packed-field-conforms?" => {
+            exact(if name == "packed-record-has-only-key?" {
+                2
+            } else {
+                3
+            })?;
+            let value = infer(env, locals, &args[0])?;
+            compatible(env, &value, &MagType::PackedValue, &mut HashMap::new())
+                .map_err(MagError::Type)?;
+            let key = infer(env, locals, &args[1])?;
+            compatible(env, &key, &MagType::String, &mut HashMap::new()).map_err(MagError::Type)?;
+            if name == "packed-field-conforms?" {
+                let descriptor = infer(env, locals, &args[2])?;
+                compatible(
+                    env,
+                    &descriptor,
+                    &MagType::TypeDescriptor,
+                    &mut HashMap::new(),
+                )
+                .map_err(MagError::Type)?;
+            }
+            Ok(MagType::Bool)
+        }
+        "descriptor-kind" => {
+            exact(1)?;
+            let descriptor = infer(env, locals, &args[0])?;
+            compatible(
+                env,
+                &descriptor,
+                &MagType::TypeDescriptor,
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
+            Ok(MagType::String)
+        }
+        "descriptor-items" => {
+            exact(1)?;
+            let descriptor = infer(env, locals, &args[0])?;
+            compatible(
+                env,
+                &descriptor,
+                &MagType::TypeDescriptor,
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
+            Ok(MagType::List(Box::new(MagType::TypeDescriptor)))
+        }
+        "foreign-contracts" => {
+            exact(0)?;
+            Ok(MagType::List(Box::new(MagType::Record(
+                [
+                    ("identity".into(), MagType::String),
+                    (
+                        "type_scheme".into(),
+                        MagType::Record(
+                            [
+                                (
+                                    "input_tags".into(),
+                                    MagType::List(Box::new(MagType::String)),
+                                ),
+                                ("outputs".into(), MagType::List(Box::new(MagType::String))),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ))))
         }
         "read" => {
             if !(1..=2).contains(&args.len()) {
@@ -610,9 +710,9 @@ fn value_type(value: &Value) -> Option<MagType> {
         Value::Float(_) => Some(MagType::Float),
         Value::Str(_) | Value::Keyword(_) | Value::Symbol(_) => Some(MagType::String),
         Value::List(v) | Value::Vector(v) if v.is_empty() => Some(MagType::EmptyList),
-        Value::List(v) | Value::Vector(v) => Some(MagType::List(Box::new(
-            v.first().and_then(value_type).unwrap_or(MagType::Data),
-        ))),
+        Value::List(v) | Value::Vector(v) => {
+            Some(MagType::List(Box::new(v.first().and_then(value_type)?)))
+        }
         Value::Product(v) => Some(MagType::Product(
             v.iter().map(value_type).collect::<Option<Vec<_>>>()?,
         )),
@@ -634,6 +734,12 @@ fn value_type(value: &Value) -> Option<MagType> {
             Box::new(decl.output.clone()),
         )),
         Value::ForeignEvidence(_) => Some(MagType::ForeignEvidence),
+        Value::TypeDescriptor(_) => Some(MagType::TypeDescriptor),
+        Value::TypeSchema(_) => Some(MagType::TypeSchema),
+        Value::SemanticTypeId(_) => Some(MagType::SemanticTypeId),
+        Value::PackedValue(_) => Some(MagType::PackedValue),
+        Value::JsonValue(_) => Some(MagType::JsonValue),
+        Value::HostInputs(_) => Some(MagType::HostInputs),
         Value::Artifact(_) => Some(MagType::Artifact),
         Value::Typed(_, ty) => Some(ty.clone()),
         Value::BuiltinFn(_) => None,
@@ -642,7 +748,6 @@ fn value_type(value: &Value) -> Option<MagType> {
 
 fn field_type(env: &Env, ty: &MagType, key: Option<&str>) -> Option<MagType> {
     match ty {
-        MagType::Data => Some(MagType::Data),
         MagType::Map(_, v) => Some((**v).clone()),
         MagType::Record(fields) => key.and_then(|k| fields.get(k).cloned()),
         MagType::Named(name, args) => env.type_decl(name).and_then(|decl| {
@@ -688,6 +793,9 @@ fn compatible(
     if actual == expected {
         return Ok(());
     }
+    if matches!(actual, MagType::Never) {
+        return Ok(());
+    }
     if matches!(actual, MagType::EmptyList) && matches!(expected, MagType::List(_)) {
         return Ok(());
     }
@@ -714,7 +822,6 @@ fn compatible(
         return Ok(());
     }
     match expected {
-        MagType::Data if is_data(actual) => Ok(()),
         MagType::Union(options) => {
             let mut matches = options.iter().filter_map(|option| {
                 let mut candidate = subst.clone();
@@ -801,24 +908,6 @@ fn compatible(
             _ => Err(format!("expected {expected}, got {actual}")),
         },
         _ => Err(format!("expected {expected}, got {actual}")),
-    }
-}
-fn is_data(t: &MagType) -> bool {
-    match t {
-        MagType::Unit
-        | MagType::Bool
-        | MagType::Int
-        | MagType::Float
-        | MagType::String
-        | MagType::Var(_)
-        | MagType::Named(_, _)
-        | MagType::Data => true,
-        MagType::List(v) => is_data(v),
-        MagType::EmptyList => true,
-        MagType::Map(k, v) => matches!(**k, MagType::String) && is_data(v),
-        MagType::Record(v) => v.values().all(is_data),
-        MagType::Union(v) | MagType::Product(v) => v.iter().all(is_data),
-        _ => false,
     }
 }
 pub(crate) fn substitute(ty: &MagType, subst: &HashMap<String, MagType>) -> MagType {

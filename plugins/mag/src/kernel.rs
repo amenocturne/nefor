@@ -721,8 +721,10 @@ mod tests {
   -> (nefor.graph.Node I (| O nefor.contracts.AgentError))
   (nefor.actors.agent
     (as nefor.actors.AgentConfig
-      {:id id :model nil :profile nil :provider "test-provider"
-       :system "" :tools [] :da-policy nil :max-corrections 2})
+      {:id id :model (nefor.contracts.no-identifier)
+       :profile (nefor.contracts.no-identifier) :provider "test-provider"
+       :system "" :tools [] :da-policy (nefor.contracts.no-da-policy)
+       :max-corrections 2})
     input-type input-wire output-type)))
 
 (let [left-task (nefor.graph.source "left-task" (type-tag nefor.contracts.Task)
@@ -1013,7 +1015,7 @@ mod tests {
 
         for (run_id, bound) in [("shell-zero", "0"), ("shell-negative", "-1")] {
             let expression = format!(
-                "(nefor.shell.command-with-options \"invalid\" \"true\" (as nefor.shell.BashOptions {{:timeout_ms {bound}}}))"
+                "(nefor.shell.command-with-options \"invalid\" \"true\" (as nefor.shell.BashOptions {{:timeout_ms (nefor.contracts.timeout-ms {bound})}}))"
             );
             let emits = start_shell_expression(&host, run_id, &expression);
             assert!(emits
@@ -1042,7 +1044,7 @@ mod tests {
 (require "nefor.graph")
 
 (foreign nefor.factory.stub
-  {:params (Map String Data)
+  {:params (Map String String)
    :input nefor.contracts.Text
    :output nefor.contracts.Text})
 (let [start (nefor.graph.source "start" (type-tag nefor.contracts.Text)
@@ -1050,7 +1052,7 @@ mod tests {
       input (nefor.graph.port "echo" (type-tag nefor.contracts.Text) "stub.In")
       output (nefor.graph.port "echo" (type-tag nefor.contracts.Text) "stub.Out")
       actor (nefor.graph.actor "echo"
-              nefor.factory.stub (as (Map String Data) {})
+              nefor.factory.stub (as (Map String String) {})
               (nefor.graph.store-port input) [(nefor.graph.store-port output)])
       echo (nefor.graph.node "echo" "ordinary" [actor]
              (as (List nefor.graph.StoredRoute) [])
@@ -1099,7 +1101,8 @@ mod tests {
             run_id,
             r#"(nefor.shell.command-with-options
                  "broken" "true"
-                 (as nefor.shell.BashOptions {:timeout_ms 0}))"#,
+                 (as nefor.shell.BashOptions
+                   {:timeout_ms (nefor.contracts.timeout-ms 0)}))"#,
         );
 
         assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);

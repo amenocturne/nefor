@@ -30,6 +30,7 @@ M.declaration = {
   params = {
     model = "table?", profile = "table?", provider = "string",
     system = "string?", tools = "table?", history = "table?", schema = "table",
+    provider_error_type = "string", validation_error_type = "string",
     max_corrections = "number",
   },
   inputs = { provider_out = "generic-provider.ProviderOut" },
@@ -65,9 +66,9 @@ end
 
 local function option(value)
   if type(value) == "string" then
-    return { tag = "core.types.Some", value = value }
+    return { present = true, value = value }
   end
-  return { tag = "core.types.None" }
+  return { present = false, value = "" }
 end
 
 local function provider_error(detail)
@@ -91,6 +92,12 @@ function M.construct(id, params, emit)
       or params.max_corrections % 1 ~= 0 then
     return nil, string.format("structured-output '%s': params.max_corrections must be a non-negative integer", tostring(id))
   end
+  if type(params.provider_error_type) ~= "string"
+      or type(params.validation_error_type) ~= "string" then
+    return nil, string.format(
+      "structured-output '%s': compiler error constructor ids are required",
+      tostring(id))
+  end
   local corrections = 0
   local last_output = nefor.json.decode("null")
   local function finish_result(state, variant, value)
@@ -99,9 +106,9 @@ function M.construct(id, params, emit)
     if #delta > 0 then message.transcript_delta = delta end
     state:finish(message)
   end
-  local function finish_error(state, reason)
+  local function finish_error(state, reason_type, reason)
     finish_result(state, "error", {
-      last_output=last_output, reason=reason,
+      last_output=last_output, reason={type=reason_type,value=reason},
     })
   end
   return boundary.construct(id, params, emit, {
@@ -131,7 +138,8 @@ function M.construct(id, params, emit)
         return
       end
       if corrections >= params.max_corrections then
-        finish_error(state, { violations=output_violations(validation) })
+        finish_error(state, params.validation_error_type,
+          { violations=output_violations(validation) })
         return
       end
       corrections = corrections + 1
@@ -142,7 +150,7 @@ function M.construct(id, params, emit)
       last_output = result
     end,
     on_error = function(state, detail)
-      finish_error(state, provider_error(detail))
+      finish_error(state, params.provider_error_type, provider_error(detail))
     end,
   })
 end

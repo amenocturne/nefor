@@ -14,16 +14,19 @@
       builder
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "builder"
-         :model nil :profile nil :provider "mock-provider"
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.no-identifier) :provider "mock-provider"
          :system "Build the requested change." :tools (as (List String) [])
-         :da-policy nil :max-corrections 0})
+         :da-policy (nefor.contracts.no-da-policy) :max-corrections 0})
         (type-tag nefor.contracts.Task) "task" (type-tag BuildReport))
       reviewer
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "reviewer"
-         :model nil :profile nil :provider "mock-provider"
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.no-identifier) :provider "mock-provider"
          :system "Review the builder result, including retained partial output."
-         :tools (as (List String) []) :da-policy nil :max-corrections 0})
+         :tools (as (List String) [])
+         :da-policy (nefor.contracts.no-da-policy) :max-corrections 0})
         (type-tag (| BuildReport nefor.contracts.AgentError))
         "nefor.agent.Result"
         (type-tag ReviewReport))
