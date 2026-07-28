@@ -66,6 +66,7 @@ local shape = require("shape")
 local firing = require("firing")
 local correlation = require("correlation")
 local kinds = require("kinds")
+local typed_value = require("typed-value")
 
 local M = {}
 M.__index = M
@@ -163,7 +164,8 @@ function M.new(opts)
     ready = {}, -- id -> true once the factory confirmed ready
     busy = {}, -- id -> busy-since stamp while an activation window is open
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
-    result_boundary = nil, -- { actor, wire }; structural, never a factory
+    result_boundary = nil, -- compiled StoredPort; structural, never a factory
+    arrival_seq = 0,
   }, M)
   return self
 end
@@ -244,19 +246,118 @@ function M:on_emit(id, message)
     -- plane reads outputs by path) before routing it downstream. Kernel-
     -- synthesized status types (mag.Unit / failures) go out via apply_completion,
     -- not here, so only real actor outputs are persisted.
-    self.persist_output(id, message)
-    if self.observe_output(id, kind, message) == false then return end
+    local arrival, arrival_error = self:factory_arrival(id, kind, message)
+    if not arrival then
+      self.log.error(arrival_error)
+      self.events({
+        kind = EVT_RUN_FAILED,
+        from = id,
+        failure = "typed-output",
+        error = arrival_error,
+      })
+      return
+    end
+    local observed = {}
+    for key, value in pairs(message) do observed[key] = value end
+    observed.semantic_type_id = arrival.type_id
+    observed.constructor_id = arrival.constructor_id
+    observed.arrival_id = arrival.arrival_id
+    self.persist_output(id, observed)
+    if self.observe_output(id, kind, observed) == false then return end
     local boundary = self.result_boundary
     if boundary and boundary.actor == id and boundary.wire == kind then
+      local host = nefor and nefor.semantic_type
+      if type(boundary.type) == "table" and
+          (type(host) ~= "table" or type(host.accepts) ~= "function"
+            or not host.accepts(boundary.type, arrival.type)) then
+        self.events({
+          kind = EVT_RUN_FAILED,
+          from = id,
+          failure = "typed-result",
+          error = string.format(
+            "result boundary '%s.%s' does not accept emitted semantic type '%s'",
+            tostring(id), tostring(kind), tostring(arrival.type_id)),
+        })
+        return
+      end
       self.events({
         kind = EVT_RUN_COMPLETE,
         from = id,
-        result = message,
+        result = observed,
         persisted = true,
       })
     end
-    self:route_output(id, kind, message)
+    self:route_output(id, kind, observed, arrival)
   end
+end
+
+function M:next_arrival_id()
+  self.arrival_seq = self.arrival_seq + 1
+  return "arrival:" .. tostring(self.arrival_seq)
+end
+
+function M:factory_arrival(id, wire, payload)
+  local actor = self.inventory.get(id)
+  local endpoint = nil
+  for _, output in ipairs((actor and actor.outputs) or {}) do
+    if output.wire == wire then
+      if endpoint then
+        return nil, string.format(
+          "actor '%s' emitted ambiguous output wire '%s'", tostring(id), tostring(wire))
+      end
+      endpoint = output
+    end
+  end
+  if not endpoint and actor and #(actor.outputs or {}) == 0 then
+    endpoint = {
+      type_id = tostring(wire),
+      type = { kind = "named", name = "legacy." .. tostring(wire), arguments = {} },
+    }
+  end
+  if endpoint and (type(endpoint.type_id) ~= "string" or type(endpoint.type) ~= "table") then
+    endpoint = {
+      type_id = tostring(wire),
+      type = { kind = "named", name = "legacy." .. tostring(wire), arguments = {} },
+    }
+  end
+  if not endpoint or type(endpoint.type_id) ~= "string" or type(endpoint.type) ~= "table" then
+    return nil, string.format(
+      "actor '%s' emitted undeclared typed output wire '%s'", tostring(id), tostring(wire))
+  end
+  local actual_type = endpoint.type
+  local actual_type_id = endpoint.type_id
+  local constructor_id = endpoint.type_id
+  if endpoint.type.kind == "union" then
+    local selected = payload.semantic_type_id or
+      (type(payload.value) == "table" and payload.value.type or nil)
+    local host = nefor and nefor.semantic_type
+    if type(selected) ~= "string" or type(host) ~= "table" or type(host.id) ~= "function" then
+      return nil, string.format(
+        "actor '%s' emitted a sum without a trusted constructor identity", tostring(id))
+    end
+    actual_type = nil
+    for _, arm in ipairs(endpoint.type.items or {}) do
+      if host.id(arm) == selected then actual_type = arm break end
+    end
+    if not actual_type then
+      return nil, string.format(
+        "actor '%s' emitted constructor '%s' outside its declared sum",
+        tostring(id), tostring(selected))
+    end
+    actual_type_id = selected
+    constructor_id = selected
+  end
+  return typed_value.factory({
+    arrival_id = self:next_arrival_id(),
+    from = id,
+    edge_id = "factory:" .. tostring(id) .. ":" .. tostring(wire),
+    type_id = actual_type_id,
+    type = actual_type,
+    constructor_id = constructor_id,
+    protocol_wire = wire,
+    product_position = -1,
+    payload = payload,
+  })
 end
 
 -- The sink's terminal completion signal (factories/sink.lua). It carries the
@@ -274,7 +375,7 @@ end
 
 -- Route one id-signed output along the sender's routes[tag]. A tag with no
 -- route entry simply goes nowhere; fanout (many dests) needs no special case.
-function M:route_output(sender_id, tag, message)
+function M:route_output(sender_id, tag, message, source_arrival)
   local sender = self.inventory.get(sender_id)
   if not sender then
     return
@@ -284,11 +385,54 @@ function M:route_output(sender_id, tag, message)
     return
   end
   for _, destination in ipairs(dests) do
-    local delivered = {}
-    for key, value in pairs(message) do delivered[key] = value end
-    delivered.kind = destination.wire
-    self:deliver(destination.actor, sender_id, destination.wire, delivered)
+    local source = source_arrival
+    if not source then
+      local source_type_id = destination.source_type_id or tostring(tag)
+      local source_type
+      if destination.source_type_id then
+        source_type = self:descriptor_for_id(sender_id, source_type_id)
+      else
+        source_type = {
+          kind = "named",
+          name = "legacy." .. tostring(tag),
+          arguments = {},
+        }
+      end
+      source = typed_value.factory({
+        arrival_id = self:next_arrival_id(),
+        from = sender_id,
+        edge_id = "kernel:" .. tostring(sender_id) .. ":" .. tostring(tag),
+        type_id = source_type_id,
+        type = source_type,
+        constructor_id = source_type_id,
+        protocol_wire = tag,
+        product_position = -1,
+        payload = message,
+      })
+    end
+    local dest = self.inventory.get(destination.actor)
+    local input = dest and dest.input
+    local accepts = true
+    local host = nefor and nefor.semantic_type
+    if input and type(input.type) == "table" and
+        type(host) == "table" and type(host.accepts) == "function" then
+      accepts = host.accepts(input.type, source.type)
+    end
+    if accepts then
+      self:deliver(destination.actor, typed_value.routed(source, destination))
+    end
   end
+end
+
+function M:descriptor_for_id(actor_id, type_id)
+  local actor = self.inventory.get(actor_id)
+  for _, endpoint in ipairs((actor and actor.outputs) or {}) do
+    if endpoint.type_id == type_id then return endpoint.type end
+  end
+  local input = actor and actor.input
+  if input and input.type_id == type_id then return input.type end
+  error(string.format("actor '%s' has no descriptor for semantic id '%s'",
+    tostring(actor_id), tostring(type_id)))
 end
 
 -- Deliver one typed message to a destination id. Dead target → dropped as a
@@ -296,13 +440,58 @@ end
 -- lived). Live target → fed to the firing machine, constructed or not: the
 -- machine buffers partial product inputs, and an assembled activation
 -- constructs the instance on demand (activate).
-function M:deliver(dest_id, from, tag, message)
+function M:deliver(dest_id, arrival, legacy_tag, legacy_message)
+  if not typed_value.is_trusted(arrival) then
+    local from = arrival
+    local dest = self.inventory.get(dest_id)
+    local input = dest and dest.input
+    arrival = typed_value.initial({
+      arrival_id = self:next_arrival_id(),
+      from = from,
+      type_id = (input and input.type_id) or tostring(legacy_tag),
+      type = (input and input.type) or
+        { kind = "named", name = "legacy." .. tostring(legacy_tag), arguments = {} },
+      constructor_id = (input and input.type_id) or tostring(legacy_tag),
+      protocol_wire = legacy_tag,
+      product_position = -1,
+      payload = legacy_message,
+    })
+  end
   local dest = self.inventory.get(dest_id)
   if not dest or dest.state == "dead" then
     self.log.info(string.format("send dropped: target '%s' is dead", tostring(dest_id)))
     return
   end
-  self:fire(dest_id, from, tag, message)
+  self:fire(dest_id, arrival)
+end
+
+function M:deliver_initial(dest_id, from, message)
+  local dest = self.inventory.get(dest_id)
+  if not dest or type(dest.input) ~= "table" then
+    local content = message.content or {}
+    return self:deliver(dest_id, from, content.kind, content)
+  end
+  local type_id = message.semantic_type_id or dest.input.type_id or
+    ((message.content or {}).kind)
+  local descriptor = message.semantic_type or dest.input.type or
+    { kind = "named", name = "legacy." .. tostring(type_id), arguments = {} }
+  if dest.input.type_id and type_id ~= dest.input.type_id then
+    local detail = string.format(
+      "initial message for '%s' has semantic type id '%s', expected '%s'",
+      tostring(dest_id), tostring(type_id), tostring(dest.input.type_id))
+    self.events({ kind = EVT_RUN_FAILED, from = dest_id, failure = "typed-input", error = detail })
+    return
+  end
+  self:deliver(dest_id, typed_value.initial({
+    arrival_id = self:next_arrival_id(),
+    from = from,
+    type_id = type_id,
+    type = descriptor,
+    constructor_id = type_id,
+    protocol_wire = (message.content and message.content.kind) or dest.input.wire,
+    product_position = -1,
+    payload = message.content,
+  }))
 end
 
 -- Tags delivered by tag, past the declared ports (actor-model.md, The
@@ -332,34 +521,57 @@ local PORT_BYPASS_TAGS = {
 -- escalates to the control plane as mag.run_failed and the host fails the
 -- run. Sends to DEAD targets stay drop-and-log (deliver above — settled race
 -- semantics, untouched).
-function M:fire(dest_id, from, tag, message)
+function M:fire(dest_id, arrival, legacy_tag, legacy_message)
+  if not typed_value.is_trusted(arrival) then
+    local from = arrival
+    local dest = self.inventory.get(dest_id)
+    local input = dest and dest.input
+    arrival = typed_value.initial({
+      arrival_id = self:next_arrival_id(),
+      from = from,
+      type_id = (input and input.type_id) or tostring(legacy_tag),
+      type = (input and input.type) or
+        { kind = "named", name = "legacy." .. tostring(legacy_tag), arguments = {} },
+      constructor_id = (input and input.type_id) or tostring(legacy_tag),
+      protocol_wire = legacy_tag,
+      product_position = -1,
+      payload = legacy_message,
+    })
+  end
   local ports = self:machines_for(dest_id)
   for _, machine in pairs(ports) do
-    if machine:accepts(tag) then
-      for _, activation in ipairs(machine:offer(from, tag, message)) do
+    if machine:accepts(arrival.protocol_wire) then
+      local offered = machine.semantic and arrival or arrival.payload
+      for _, activation in ipairs(machine:offer(
+        arrival.from, arrival.protocol_wire, offered)) do
         self:activate(dest_id, activation)
       end
       return
     end
   end
-  if PORT_BYPASS_TAGS[tag] then
+  if PORT_BYPASS_TAGS[arrival.protocol_wire] then
     local instance = self.instances[dest_id]
     if instance and type(instance.deliver) == "function" then
       local completion = instance.deliver({
         shape = "single",
-        messages = { { from = from, tag = tag, message = message } },
+        messages = { {
+          from = arrival.from,
+          tag = arrival.protocol_wire,
+          message = arrival.payload,
+          arrival = arrival,
+        } },
       })
       self:apply_completion(dest_id, completion)
     else
       self.log.warn(string.format(
         "'%s' dropped: actor '%s' is not constructed (nothing awaits a reply)",
-        tostring(tag), tostring(dest_id)))
+        tostring(arrival.protocol_wire), tostring(dest_id)))
     end
     return
   end
   local detail = string.format(
     "actor '%s' has no input port accepting tag '%s' (sent from '%s'); failing the run",
-    tostring(dest_id), tostring(tag), tostring(from))
+    tostring(dest_id), tostring(arrival.protocol_wire), tostring(arrival.from))
   self.log.error(detail)
   self.events({
     kind = EVT_RUN_FAILED,
@@ -384,14 +596,34 @@ function M:machines_for(id)
   if decl and type(decl.inputs) == "table" then
     for port, in_shape in pairs(decl.inputs) do
       local slots = nil
-      if shape.classify(in_shape) == "product" then
-        slots = self:derive_slots(id, in_shape)
+      local semantic = actor.input and actor.input.type_id and
+        { input_type_id = actor.input.type_id } or nil
+      if semantic and actor.input.type and actor.input.type.kind == "product" then
+        slots = self:derive_slots(id)
+      elseif shape.classify(in_shape) == "product" then
+        slots = self:derive_legacy_slots(id, in_shape)
       end
-      ports[port] = firing.build(in_shape, slots)
+      ports[port] = firing.build(in_shape, slots, semantic)
     end
   end
   self.machines[id] = ports
   return ports
+end
+
+function M:derive_legacy_slots(dest_id, product_shape)
+  local components = {}
+  for _, tag in ipairs(shape.tags(product_shape)) do components[tag] = true end
+  local edges = {}
+  for sender_id, actor in self.inventory.pairs() do
+    for _, destinations in pairs(actor.routes or {}) do
+      for _, destination in ipairs(destinations) do
+        if destination.actor == dest_id and components[destination.wire] then
+          edges[#edges + 1] = { sender = sender_id, type = destination.wire }
+        end
+      end
+    end
+  end
+  return edges
 end
 
 -- Derive a product input's slots from the routes topology. Slot identity is
@@ -404,17 +636,28 @@ end
 -- edges, two sender-bound slots — where keying by the bare type could not tell
 -- them apart (docs/ir.md, Firing). Because ids are signed and routes are
 -- directional, the binding is a static fact of the topology.
-function M:derive_slots(dest_id, product_shape)
-  local components = {}
-  for _, t in ipairs(shape.tags(product_shape)) do
-    components[t] = true
-  end
+function M:derive_slots(dest_id)
   local edges = {}
+  local whole_edges = 0
+  local destination_actor = self.inventory.get(dest_id)
+  local input_type_id = destination_actor and destination_actor.input
+    and destination_actor.input.type_id
   for sender_id, actor in self.inventory.pairs() do
     for _, dests in pairs(actor.routes or {}) do
       for _, destination in ipairs(dests) do
-        if destination.actor == dest_id and components[destination.wire] then
-          edges[#edges + 1] = { sender = sender_id, type = destination.wire }
+        if destination.actor == dest_id then
+          if type(destination.product_position) == "number" and
+              destination.product_position >= 0 then
+            edges[#edges + 1] = {
+              sender = sender_id,
+              type = destination.wire,
+              edge_id = destination.edge_id,
+              product_position = destination.product_position,
+            }
+          elseif destination.product_position == -1 and
+              destination.destination_type_id == input_type_id then
+            whole_edges = whole_edges + 1
+          end
         end
       end
     end
@@ -422,11 +665,13 @@ function M:derive_slots(dest_id, product_shape)
   -- Application validation guarantees exact product coverage before the
   -- inventory changes. Reaching this backstop means an internal topology
   -- invariant was broken; fail loudly rather than parking a partial product.
-  local component_count = #shape.tags(product_shape)
-  if #edges ~= component_count then
+  local component_count = destination_actor and destination_actor.input and
+    destination_actor.input.type and #(destination_actor.input.type.items or {}) or 0
+  if (#edges == 0 and whole_edges == 0) or
+      (#edges > 0 and #edges ~= component_count) then
     error(string.format(
-      "actor '%s': product input derives %d sender-bound slot(s) but the shape has %d component(s)",
-      tostring(dest_id), #edges, component_count))
+      "actor '%s': product input derives %d component slot(s) and %d whole edge(s), but the shape has %d component(s)",
+      tostring(dest_id), #edges, whole_edges, component_count))
   end
   return edges
 end

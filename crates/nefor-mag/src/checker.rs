@@ -443,6 +443,17 @@ fn infer_builtin(
             .map_err(MagError::Type)?;
             Ok(MagType::SemanticTypeId)
         }
+        "value-type-id" => {
+            exact(2)?;
+            let actual = infer(env, locals, &args[0])?;
+            let MagType::TypeTag(expected) = infer(env, locals, &args[1])? else {
+                return Err(MagError::Type(
+                    "value-type-id expects a TypeTag as its second argument".into(),
+                ));
+            };
+            compatible(env, &expected, &actual, &mut HashMap::new()).map_err(MagError::Type)?;
+            Ok(MagType::SemanticTypeId)
+        }
         "or" => {
             exact(2)?;
             let a = infer(env, locals, &args[0])?;
@@ -489,17 +500,24 @@ fn infer_builtin(
                 .map_err(MagError::Type)?;
             Ok(MagType::Bool)
         }
-        "packed-record-has-only-key?" | "packed-field-conforms?" => {
-            exact(if name == "packed-record-has-only-key?" {
-                2
-            } else {
+        "packed-record-has-only-key?"
+        | "packed-record-has-only-keys?"
+        | "packed-field-conforms?" => {
+            exact(if name == "packed-field-conforms?" {
                 3
+            } else {
+                2
             })?;
             let value = infer(env, locals, &args[0])?;
             compatible(env, &value, &MagType::PackedValue, &mut HashMap::new())
                 .map_err(MagError::Type)?;
             let key = infer(env, locals, &args[1])?;
-            compatible(env, &key, &MagType::String, &mut HashMap::new()).map_err(MagError::Type)?;
+            let expected_key = if name == "packed-record-has-only-keys?" {
+                MagType::List(Box::new(MagType::String))
+            } else {
+                MagType::String
+            };
+            compatible(env, &key, &expected_key, &mut HashMap::new()).map_err(MagError::Type)?;
             if name == "packed-field-conforms?" {
                 let descriptor = infer(env, locals, &args[2])?;
                 compatible(

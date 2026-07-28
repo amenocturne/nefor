@@ -1157,6 +1157,128 @@ mod tests {
     }
 
     #[test]
+    fn whole_product_reaches_output_through_ordinary_firing() {
+        let host = shipped_host();
+        let modification = compile_mag_source(
+            &host,
+            "whole-product-output",
+            r#"
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+(let [pair-type (type-tag (+ nefor.contracts.Text nefor.contracts.Text))
+      start (nefor.graph.source "start" pair-type
+              (as (+ nefor.contracts.Text nefor.contracts.Text)
+                [(as nefor.contracts.Text {:content "left"})
+                 (as nefor.contracts.Text {:content "right"})]))
+      result (nefor.graph.output "result" pair-type)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph [(nefor.graph.edge start result)]))))
+            "#,
+        );
+
+        let begun = host
+            .begin_run("whole-product-output", "whole-product-output", None)
+            .expect("begin product run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host
+            .start("whole-product-output", &modification)
+            .expect("start product run");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let completion = host
+            .take_run_complete("whole-product-output")
+            .expect("read completion")
+            .expect("whole product graph completes");
+        let result = completion.result.expect("typed product result");
+        assert_eq!(result["kind"], "nefor.graph.Value");
+        assert_eq!(result["value"][0]["content"], "left");
+        assert_eq!(result["value"][1]["content"], "right");
+        assert_eq!(result["semantic_type_id"], result["constructor_id"]);
+    }
+
+    #[test]
+    fn sum_arrival_routes_only_to_compatible_branches_and_keeps_constructor_id() {
+        let host = shipped_host();
+        let modification = compile_mag_source(
+            &host,
+            "direct-sum-routing",
+            r#"
+(require "nefor.artifact")
+(require "nefor.graph")
+
+(type Left {:value String})
+(type Right {:value Int})
+(type Choice (| Left Right))
+
+(foreign nefor.factory.stub
+  {:params (Map String String) :input Choice :output Choice})
+
+(def branch (fn [T] [[id String] [type (TypeTag T)]] -> (nefor.graph.Node T T)
+  (let [input (nefor.graph.port id type "stub.In")
+        output (nefor.graph.port id type "stub.Out")
+        actor (nefor.graph.actor id
+                nefor.factory.stub
+                (as (Map String String) {})
+                (nefor.graph.store-port input)
+                [(nefor.graph.store-port output)])]
+    (nefor.graph.node id "ordinary" [actor]
+      (as (List nefor.graph.StoredRoute) [])
+      (as (List nefor.graph.Message) []) input output))))
+
+(let [start (nefor.graph.source "start" (type-tag Choice)
+              (as Choice (as Left {:value "chosen"})))
+      left (branch "left" (type-tag Left))
+      right (branch "right" (type-tag Right))
+      result (nefor.graph.output "result" (type-tag Choice))]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start left)
+         (nefor.graph.edge start right)
+         (nefor.graph.edge left result)
+         (nefor.graph.edge right result)]))))
+            "#,
+        );
+        let begun = host
+            .begin_run("direct-sum-routing", "direct-sum-routing", None)
+            .expect("begin direct sum run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host
+            .start("direct-sum-routing", &modification)
+            .expect("start direct sum run");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let emits = host.drain_emits().expect("drain direct sum events");
+        assert!(
+            emits.iter().any(|event| {
+                event.get("kind").and_then(JsonValue::as_str) == Some("mag.actor_ready")
+                    && event.get("id").and_then(JsonValue::as_str) == Some("left")
+            }),
+            "{emits:?}"
+        );
+        assert!(!emits.iter().any(|event| {
+            event.get("kind").and_then(JsonValue::as_str) == Some("mag.actor_ready")
+                && event.get("id").and_then(JsonValue::as_str) == Some("right")
+        }));
+        let completion = host
+            .take_run_complete("direct-sum-routing")
+            .expect("read completion");
+        assert!(
+            completion.is_some(),
+            "sum graph did not complete: {emits:?}"
+        );
+        let completion = completion.expect("checked above");
+        let result = completion.result.expect("typed sum result");
+        assert_eq!(result["semantic_type_id"], result["constructor_id"]);
+        assert!(result["semantic_type_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("sha256:")));
+    }
+
+    #[test]
     fn factory_construction_failure_is_an_out_of_band_run_failure() {
         let host = shipped_host();
         let run_id = "factory-construction-failure";

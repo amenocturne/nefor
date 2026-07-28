@@ -24,9 +24,16 @@ function M.construct(id, _, emit)
 
   function instance.deliver(activation)
     local message = ((activation or {}).messages or {})[1]
+    local arrival = message and message.arrival
     local forwarded = {}
     for key, value in pairs((message and message.message) or {}) do
       forwarded[key] = value
+    end
+    if arrival then
+      forwarded.semantic_type_id = arrival.constructor_id or arrival.type_id
+      forwarded.semantic_type = arrival.type
+      forwarded.constructor_id = arrival.constructor_id
+      forwarded.arrival_id = arrival.arrival_id
     end
     forwarded.kind = VALUE
     forwarded.from = id

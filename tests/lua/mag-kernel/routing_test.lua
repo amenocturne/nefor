@@ -14,6 +14,8 @@
 local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
+local firing = require("firing")
+local typed_value = require("typed-value")
 
 -- ------------------------------------------------------------------
 -- assert helpers
@@ -96,8 +98,6 @@ local function count(t) local n = 0; for _ in pairs(t) do n = n + 1 end; return 
 -- ==================================================================
 
 do
-  local firing = require("firing")
-
   local single = firing.build("A.T")
   assert_eq(#single:offer("s", "A.T", { n = 1 }), 1, "single fires per matching message")
   assert_eq(#single:offer("s", "A.T", { n = 2 }), 1, "single fires again on the next message")
@@ -119,6 +119,63 @@ do
   assert_eq(fired[1].shape, "product", "assembled activation is a product")
   -- one u1 message remains queued; a second u2 completes the leftover set
   assert_eq(#prod:offer("u2", "mag.Unit", {}), 1, "leftover u1 + a second u2 assembles a second set")
+end
+
+-- ==================================================================
+-- compiled ordered product positions + whole-value isolation
+-- ==================================================================
+
+do
+  local descriptor = { kind = "product", items = {
+    { kind = "named", name = "test.A", arguments = {} },
+    { kind = "named", name = "test.B", arguments = {} },
+  } }
+  local machine = firing.build({ product = { "in.Pair", "in.Pair" } }, {
+    { edge_id = "edge-a", product_position = 0 },
+    { edge_id = "edge-b", product_position = 1 },
+  }, { input_type_id = "pair-id" })
+
+  local function arrival(id, edge, type_id, position, value)
+    local source = typed_value.factory({
+      arrival_id = id,
+      from = "producer",
+      edge_id = "factory",
+      type_id = type_id,
+      type = descriptor,
+      constructor_id = type_id,
+      protocol_wire = "out.Value",
+      product_position = -1,
+      payload = { value = value },
+    })
+    return typed_value.routed(source, {
+      actor = "pair",
+      wire = "in.Pair",
+      edge_id = edge,
+      product_position = position,
+    })
+  end
+
+  assert_eq(#machine:offer("producer", "in.Pair",
+    arrival("a1", "edge-a", "a-id", 0, "A1")), 0,
+    "first component queues")
+  local whole = machine:offer("producer", "in.Pair",
+    arrival("whole", "whole-edge", "pair-id", -1, "whole"))
+  assert_eq(#whole, 1, "whole product fires immediately")
+  assert_true(whole[1].whole, "whole activation is identified")
+  local assembled = machine:offer("producer", "in.Pair",
+    arrival("b3", "edge-b", "b-id", 1, "B3"))
+  assert_eq(#assembled, 1, "queued components assemble independently of whole arrivals")
+  assert_eq(assembled[1].messages[1].message.value, "A1", "position zero is stable")
+  assert_eq(assembled[1].messages[2].message.value, "B3", "position one is stable")
+
+  local first = arrival("equal-1", "edge-a", "a-id", 0, "same")
+  local second = arrival("equal-2", "edge-a", "a-id", 0, "same")
+  assert_true(first.arrival_id ~= second.arrival_id,
+    "equal payloads on one edge remain distinct arrivals")
+  assert_eq(#machine:offer("producer", "in.Pair", first), 0,
+    "one edge cannot fill another product position")
+  assert_eq(#machine:offer("producer", "in.Pair", second), 0,
+    "a second emission on the same edge queues in the same occurrence")
 end
 
 -- ==================================================================

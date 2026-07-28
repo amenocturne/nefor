@@ -13,7 +13,7 @@ M.declaration = {
     inputs = { { wire = kinds.Unit, type = { kind = "primitive", name = "Unit" } } },
     outputs = { { wire = VALUE, type = variable } },
   },
-  params = { value = "data" },
+  params = { value = "data", value_type = "semantic-type-id" },
   inputs = { start = kinds.Unit },
   outputs = { VALUE },
   signals = {},
@@ -23,7 +23,12 @@ function M.construct(id, params, emit)
   local instance = { id = id }
 
   function instance.deliver()
-    emit({ kind = VALUE, from = id, value = params.value })
+    emit({
+      kind = VALUE,
+      from = id,
+      value = params.value,
+      semantic_type_id = params.value_type,
+    })
     return { status = "ok" }
   end
 

@@ -2,7 +2,7 @@ use crate::ast::{Artifact, Expr, FnValue, ForeignDecl, TypeDecl, Value};
 use crate::env::Env;
 use crate::error::MagError;
 use crate::types::{ConcreteType, MagType};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 pub mod fuel {
@@ -1039,6 +1039,22 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             };
             Ok(Value::SemanticTypeId(ty.stable_id()))
         }
+        "value-type-id" => {
+            arity(args, 2)?;
+            let Value::TypeTag(declared) = raw(&args[1]) else {
+                return Err(MagError::Type(
+                    "value-type-id expects a TypeTag as its second argument".into(),
+                ));
+            };
+            let selected = if matches!(declared, ConcreteType::Sum { .. }) {
+                explicit_constructor(env, &args[0])?.ok_or_else(|| {
+                    MagError::Type("sum value lacks selected constructor evidence".into())
+                })?
+            } else {
+                declared.clone()
+            };
+            Ok(Value::SemanticTypeId(selected.stable_id()))
+        }
         "pack" => {
             arity(args, 1)?;
             Ok(Value::PackedValue(std::sync::Arc::new(args[0].clone())))
@@ -1067,6 +1083,36 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             Ok(Value::Bool(matches!(
                 raw(value),
                 Value::Map(fields) if fields.len() == 1 && fields.contains_key(key)
+            )))
+        }
+        "packed-record-has-only-keys?" => {
+            arity(args, 2)?;
+            let Value::PackedValue(value) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "packed-record-has-only-keys? expects PackedValue".into(),
+                ));
+            };
+            let values = match raw(&args[1]) {
+                Value::List(values) | Value::Vector(values) => values,
+                _ => {
+                    return Err(MagError::Type(
+                        "packed-record-has-only-keys? expects a String list".into(),
+                    ))
+                }
+            };
+            let keys = values
+                .iter()
+                .map(|value| {
+                    value.as_str().ok_or_else(|| {
+                        MagError::Type("packed-record-has-only-keys? expects a String list".into())
+                    })
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            Ok(Value::Bool(matches!(
+                raw(value),
+                Value::Map(fields)
+                    if fields.len() == keys.len()
+                        && fields.keys().all(|key| keys.contains(key.as_str()))
             )))
         }
         "packed-field-conforms?" => {

@@ -364,9 +364,9 @@ local function new_run_context(meta)
     }
     return registry:construct(record.factory, record.id, record.params, emit, deps)
   end)
-  inv.set_deliver(function(to, from, content)
-    content = content or {}
-    router:deliver(to, from, content.kind, content)
+  inv.set_deliver(function(to, from, content, message)
+    message = message or { content = content }
+    router:deliver_initial(to, from, message)
   end)
 
   -- Observability: the observer wraps apply, deriving lifecycle events and one
@@ -492,6 +492,12 @@ return {
         or type(boundary.wire) ~= "string" then
       return { ok = false, error = "initial artifact needs result.from { actor, wire }" }
     end
+    local typed_artifact = type(mod.types) == "table"
+    if typed_artifact and (type(boundary.type_id) ~= "string"
+        or type(boundary.type) ~= "table") then
+      return { ok = false, error =
+        "typed initial artifact needs result.from { actor, wire, type_id, type }" }
+    end
     local source
     for _, spec in ipairs(mod.actors or {}) do
       if spec.id == boundary.actor then
@@ -503,18 +509,30 @@ return {
       return { ok = false, error = string.format(
         "result boundary source actor %q does not exist", boundary.actor) }
     end
-    local declaration = registry:declaration(source.factory)
     local declared = false
-    for _, output in ipairs((declaration and declaration.outputs) or {}) do
-      if output == boundary.wire then
-        declared = true
-        break
+    if typed_artifact then
+      for _, output in ipairs(source.outputs or {}) do
+        if output.wire == boundary.wire and output.type_id == boundary.type_id then
+          local host = nefor and nefor.semantic_type
+          declared = type(host) == "table" and type(host.id) == "function"
+            and host.id(boundary.type) == boundary.type_id
+            and host.id(output.type) == output.type_id
+          if declared then break end
+        end
+      end
+    else
+      local declaration = registry:declaration(source.factory)
+      for _, output in ipairs((declaration and declaration.outputs) or {}) do
+        if output == boundary.wire then
+          declared = true
+          break
+        end
       end
     end
     if not declared then
       return { ok = false, error = string.format(
-        "result boundary wire %q is not a declared output of actor %q",
-        boundary.wire, boundary.actor) }
+        "result boundary %q with semantic type %q is not a declared output of actor %q",
+        boundary.wire, tostring(boundary.type_id), boundary.actor) }
     end
     local seen_rules = {}
     for index, rule in ipairs(mod.rules or {}) do
@@ -556,7 +574,7 @@ return {
     end
     ctx.rules = mod.rules or {}
     ctx.rule_ids = seen_rules
-    ctx.router:set_result_boundary({ actor = boundary.actor, wire = boundary.wire })
+    ctx.router:set_result_boundary(boundary)
     local modification = {}
     for key, value in pairs(mod) do
       if key ~= "result" and key ~= "rules" then

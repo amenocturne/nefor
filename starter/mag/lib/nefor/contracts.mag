@@ -57,7 +57,7 @@
                   :timeout_ms Timeout})
 (type HumanParams {:prompt String})
 (type SinkParams {})
-(type SourceParams [T] {:value T})
+(type SourceParams [T] {:value T :value_type SemanticTypeId})
 (type OutputParams {})
 (type StructuredOutputParams {:model OptionalIdentifier
                               :profile OptionalIdentifier

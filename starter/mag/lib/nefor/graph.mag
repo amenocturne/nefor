@@ -137,7 +137,8 @@
   (let [input (port id (type-tag Unit) "mag.Unit")
         output (port id type "nefor.graph.Value")
         source-actor (actor id (specialize nefor.factory.source [T])
-                       (as (nefor.contracts.SourceParams T) {:value value})
+                       (as (nefor.contracts.SourceParams T)
+                         {:value value :value_type (value-type-id value type)})
                        (store-port input) [(store-port output)])]
     (node id "source" [source-actor] (as (List StoredRoute) [])
       [(message input {:kind "mag.Unit"})] input output))))
@@ -309,7 +310,7 @@
 (def empty-packed-map? (fn [[value PackedValue]] -> Bool
   (packed-empty-record? value)))
 (def source-params-valid? (fn [[value PackedValue]] -> Bool
-  (packed-record-has-only-key? value "value")))
+  (packed-record-has-only-keys? value ["value" "value_type"])))
 (def source-value-valid? (fn [[value Actor] [output StoredPort]] -> Bool
   (packed-field-conforms? (get value "params") "value"
                           (get output "type"))))

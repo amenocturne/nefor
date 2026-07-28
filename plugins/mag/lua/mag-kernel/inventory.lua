@@ -329,7 +329,7 @@ local function do_send(self, msg)
   -- race artifact of first-applied-wins.
   if entry and entry.state == ALIVE then
     if self.deliver then
-      self.deliver(msg.to, "mag.control", msg.content)
+      self.deliver(msg.to, "mag.control", msg.content, msg)
     else
       entry.mailbox[#entry.mailbox + 1] = msg.content
     end

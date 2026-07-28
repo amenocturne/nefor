@@ -18,6 +18,7 @@
 -- masquerading as a complete set.
 
 local shape = require("shape")
+local typed_value = require("typed-value")
 
 local M = {}
 M.__index = M
@@ -28,14 +29,32 @@ M.__index = M
 --                 incoming edges, one per slot, derived from routes topology
 --                 by the caller (see routing.lua, derive_slots). Ignored for
 --                 single/union, which carry no per-slot accumulation.
-function M.build(input_shape, slot_edges)
+function M.build(input_shape, slot_edges, semantic)
   local kind = assert(shape.classify(input_shape))
-  local self = setmetatable({ kind = kind, tags = {} }, M)
+  local self = setmetatable({
+    kind = kind,
+    tags = {},
+    semantic = semantic,
+  }, M)
   for _, t in ipairs(shape.tags(input_shape)) do
     self.tags[t] = true
   end
 
   if kind == "product" then
+    if semantic then
+      self.slots = {}
+      self.queues = {}
+      self.edge_positions = {}
+      for _, edge in ipairs(slot_edges or {}) do
+        local position = edge.product_position
+        if type(position) == "number" and position >= 0 then
+          self.slots[position + 1] = position
+          self.queues[position] = self.queues[position] or {}
+          self.edge_positions[edge.edge_id] = position
+        end
+      end
+      return self
+    end
     -- Ordered slot keys + per-slot FIFO queues. The key is the edge
     -- (sender + type), never the bare type, so two edges carrying the same
     -- type stay distinct slots.
@@ -68,6 +87,9 @@ end
 -- yields one activation per complete set now assembleable (usually zero or
 -- one, but a backlog can release several).
 function M:offer(from, tag, message)
+  if self.semantic and typed_value.is_trusted(message) then
+    return self:offer_typed(message)
+  end
   if not self.tags[tag] then
     return {}
   end
@@ -93,6 +115,60 @@ function M:offer(from, tag, message)
       msgs[i] = table.remove(self.queues[k], 1)
     end
     activations[#activations + 1] = { shape = "product", messages = msgs }
+  end
+  return activations
+end
+
+function M:offer_typed(arrival)
+  if self.kind ~= "product" then
+    return { {
+      shape = self.kind,
+      messages = { {
+        from = arrival.from,
+        tag = arrival.protocol_wire,
+        message = arrival.payload,
+        arrival = arrival,
+      } },
+    } }
+  end
+
+  if arrival.product_position == -1 and arrival.type_id == self.semantic.input_type_id then
+    return { {
+      shape = "product",
+      whole = true,
+      typed_value = arrival,
+      messages = { {
+        from = arrival.from,
+        tag = arrival.protocol_wire,
+        message = arrival.payload,
+        arrival = arrival,
+      } },
+    } }
+  end
+
+  local position = self.edge_positions[arrival.edge_id]
+  if position == nil or position ~= arrival.product_position then
+    return {}
+  end
+  local queue = self.queues[position]
+  queue[#queue + 1] = {
+    from = arrival.from,
+    tag = arrival.protocol_wire,
+    message = arrival.payload,
+    arrival = arrival,
+  }
+
+  local activations = {}
+  while self:_complete() do
+    local messages = {}
+    for index = 1, #self.slots do
+      local slot = self.slots[index]
+      messages[index] = table.remove(self.queues[slot], 1)
+    end
+    activations[#activations + 1] = {
+      shape = "product",
+      messages = messages,
+    }
   end
   return activations
 end
