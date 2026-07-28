@@ -167,6 +167,34 @@ function M.close_assistant_projection(state)
   return shallow_merge(state, { pending_assistant_projection = NIL_SENTINEL })
 end
 
+-- Canonical entry-state transition for assistant events shared by every chat
+-- composition. Config reducers retain routing, capture, and aggregate-status
+-- policy; this reducer alone decides whether a durable assistant append fills
+-- a provider-owned empty entry or creates a new transcript entry.
+function M.reduce_assistant_event(state, msg)
+  if msg.kind == "chat.stream.end" then
+    return M.finalize_assistant(state, msg.text, msg.model, msg.duration_ms), true
+  end
+
+  if msg.kind == "chat.session.stats" then
+    local output_tokens = msg.last_turn_output_tokens or msg.completion_tokens
+    local duration_ms = msg.last_turn_duration_ms or msg.duration_ms
+    if output_tokens == nil and duration_ms == nil then return state, true end
+    return M.attach_latest_assistant_stats(state, output_tokens, duration_ms), true
+  end
+
+  if msg.kind ~= "chat.message.append" or msg.role ~= "assistant" then
+    return state, false
+  end
+  local text = msg.text or ""
+  if text == "" then return state, true end
+  local projected, matched = M.project_assistant_message(state, text)
+  if matched then return projected, true end
+  return M.push_entry(projected, {
+    role = "assistant", text = text, kind = "text",
+  }), true
+end
+
 function M.attach_tool_end(state, id, output, error_flag)
   for i = #state.entries, 1, -1 do
     local e = state.entries[i]

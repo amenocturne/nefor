@@ -37,6 +37,30 @@ fn workflow_controls_transition_laws() {
 }
 
 #[test]
+fn assistant_transcript_transition_laws() {
+    let lua = Lua::new();
+    let root = repo_root();
+    let lua_root = root.join("lua").display().to_string();
+    lua.load(format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
+          package.path,
+        }}, ";")"#,
+    ))
+    .exec()
+    .expect("set package.path");
+
+    let test_path = root.join("tests/lua/chat/transcript_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", test_path.display()));
+    lua.load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+        .unwrap_or_else(|error| panic!("transcript_test.lua failed:\n{error}"));
+}
+
+#[test]
 fn queued_input_ownership_laws() {
     let lua = Lua::new();
     let root = repo_root();

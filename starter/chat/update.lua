@@ -863,8 +863,8 @@ local function handle_message_append(msg, state)
     if matched then return reconciled, {} end
   end
   if role == "assistant" then
-    local projected, matched = transcript.project_assistant_message(state, text)
-    if matched then return projected, {} end
+    local next_state, handled = transcript.reduce_assistant_event(state, msg)
+    if handled then return next_state, {} end
   end
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
@@ -956,7 +956,7 @@ end
 local function handle_stream_end(msg, state)
   state = agent_streams.record(state, msg.chat_id, "stream_end", nil, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
-  local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
+  local next_state = transcript.reduce_assistant_event(state, msg)
   return next_state, {}
 end
 
@@ -977,13 +977,7 @@ end
 
 local function handle_session_stats(msg, state)
   if is_foreign_chat(msg, state) then return state, {} end
-  local next_state = state
-  local output_tokens = msg.last_turn_output_tokens or msg.completion_tokens
-  local duration_ms = msg.last_turn_duration_ms or msg.duration_ms
-  if output_tokens ~= nil or duration_ms ~= nil then
-    next_state = transcript.attach_latest_assistant_stats(
-      next_state, output_tokens, duration_ms)
-  end
+  local next_state = transcript.reduce_assistant_event(state, msg)
   local stats = shallow_merge(next_state.stats or {}, {})
   for k, v in pairs(msg) do
     if k ~= "kind" then stats[k] = v end
