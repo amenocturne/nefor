@@ -205,6 +205,8 @@ impl Env {
             "packed-field-conforms?",
             "descriptor-accepts?",
             "descriptor-input-covered-by?",
+            "descriptor-input-assignments",
+            "descriptor-output-covered-by?",
             "foreign-contracts",
         ] {
             env.define(name, Value::BuiltinFn(name.into()));

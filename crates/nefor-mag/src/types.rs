@@ -2,7 +2,7 @@ use crate::env::Env;
 use crate::error::MagError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +70,28 @@ pub enum ConcreteType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SemanticTypeId(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAssignmentError {
+    IncompleteCoverage,
+    AmbiguousCoverage,
+}
+
+impl fmt::Display for InputAssignmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteCoverage => {
+                write!(f, "incoming edge types do not completely cover the input")
+            }
+            Self::AmbiguousCoverage => {
+                write!(
+                    f,
+                    "incoming edge types ambiguously cover distinct input positions"
+                )
+            }
+        }
+    }
+}
 
 impl SemanticTypeId {
     pub fn as_str(&self) -> &str {
@@ -179,8 +201,13 @@ impl ConcreteType {
 
     /// Compatibility for one graph edge. A product consumer may receive the
     /// complete tuple or one source statically assigned to a component
-    /// occurrence; aggregate coverage is checked separately.
+    /// occurrence. A sum source may route the alternatives accepted by this
+    /// destination; exhaustive handling of every source arm is checked across
+    /// all outgoing edges separately.
     pub fn accepts_edge_source(&self, actual: &Self) -> bool {
+        if let Self::Sum { arms } = actual {
+            return arms.iter().any(|arm| self.accepts_edge_source(arm));
+        }
         self.accepts(actual)
             || matches!(self, Self::Product { items } if items.iter().any(|item| item.accepts(actual)))
     }
@@ -192,35 +219,126 @@ impl ConcreteType {
     /// Retaining the successful occurrence assignment is a lowering concern;
     /// this predicate owns only the compatibility-backed coverage decision.
     pub fn input_is_covered_by(&self, sources: &[Self]) -> bool {
+        self.assign_input_sources(sources).is_ok()
+    }
+
+    /// Assign every component edge to one ordered product occurrence. `None`
+    /// identifies a whole-value edge; `Some(position)` identifies a component
+    /// queue. Equal repeated components are assigned by source order, while
+    /// more than one assignment across distinct component descriptors is an
+    /// ambiguity.
+    pub fn assign_input_sources(
+        &self,
+        sources: &[Self],
+    ) -> Result<Vec<Option<usize>>, InputAssignmentError> {
         let Self::Product { items } = self else {
-            return true;
+            return (!sources.is_empty()
+                && sources
+                    .iter()
+                    .all(|source| self.accepts_edge_source(source)))
+            .then(|| vec![None; sources.len()])
+            .ok_or(InputAssignmentError::IncompleteCoverage);
         };
-        if sources.len() == 1 && sources[0] == *self {
-            return true;
+
+        let mut result = vec![None; sources.len()];
+        let component_sources = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| !self.accepts(source))
+            .collect::<Vec<_>>();
+        if component_sources.is_empty() {
+            return sources
+                .iter()
+                .all(|source| self.accepts(source))
+                .then_some(result)
+                .ok_or(InputAssignmentError::IncompleteCoverage);
         }
-        product_components_cover(items, sources)
+        if component_sources.len() != items.len() {
+            return Err(InputAssignmentError::IncompleteCoverage);
+        }
+
+        let mut capacities = BTreeMap::<ConcreteType, usize>::new();
+        for item in items {
+            *capacities.entry(item.clone()).or_default() += 1;
+        }
+        let mut semantic_assignments = BTreeSet::new();
+        collect_component_assignments(
+            &component_sources,
+            0,
+            &mut capacities,
+            &mut Vec::new(),
+            &mut semantic_assignments,
+        );
+        let mut assignments = semantic_assignments.into_iter();
+        let assignment = assignments
+            .next()
+            .ok_or(InputAssignmentError::IncompleteCoverage)?;
+        if assignments.next().is_some() {
+            return Err(InputAssignmentError::AmbiguousCoverage);
+        }
+
+        let mut positions = BTreeMap::<ConcreteType, VecDeque<usize>>::new();
+        for (position, item) in items.iter().enumerate() {
+            positions
+                .entry(item.clone())
+                .or_default()
+                .push_back(position);
+        }
+        for ((source_index, _), component) in component_sources.into_iter().zip(assignment) {
+            result[source_index] = positions
+                .get_mut(&component)
+                .and_then(VecDeque::pop_front)
+                .map(Some)
+                .ok_or(InputAssignmentError::IncompleteCoverage)?;
+        }
+        Ok(result)
+    }
+
+    pub fn output_is_covered_by(&self, handlers: &[Self]) -> bool {
+        match self {
+            Self::Sum { arms } => arms.iter().all(|arm| {
+                handlers
+                    .iter()
+                    .any(|handler| handler.accepts_edge_source(arm))
+            }),
+            output => handlers
+                .iter()
+                .any(|handler| handler.accepts_edge_source(output)),
+        }
     }
 }
 
-fn product_components_cover(components: &[ConcreteType], sources: &[ConcreteType]) -> bool {
-    if components.len() != sources.len() {
-        return false;
+fn collect_component_assignments(
+    sources: &[(usize, &ConcreteType)],
+    source_index: usize,
+    capacities: &mut BTreeMap<ConcreteType, usize>,
+    current: &mut Vec<ConcreteType>,
+    assignments: &mut BTreeSet<Vec<ConcreteType>>,
+) {
+    if assignments.len() > 1 {
+        return;
     }
-    let Some((source, remaining_sources)) = sources.split_first() else {
-        return true;
+    let Some((_, source)) = sources.get(source_index) else {
+        assignments.insert(current.clone());
+        return;
     };
-    components.iter().enumerate().any(|(index, component)| {
-        component.accepts(source)
-            && product_components_cover(
-                &components
-                    .iter()
-                    .enumerate()
-                    .filter(|(candidate, _)| *candidate != index)
-                    .map(|(_, component)| component.clone())
-                    .collect::<Vec<_>>(),
-                remaining_sources,
-            )
-    })
+    let candidates = capacities
+        .iter()
+        .filter(|(component, remaining)| **remaining > 0 && component.accepts(source))
+        .map(|(component, _)| component.clone())
+        .collect::<Vec<_>>();
+    for component in candidates {
+        let Some(remaining) = capacities.get_mut(&component) else {
+            continue;
+        };
+        *remaining -= 1;
+        current.push(component.clone());
+        collect_component_assignments(sources, source_index + 1, capacities, current, assignments);
+        current.pop();
+        if let Some(remaining) = capacities.get_mut(&component) {
+            *remaining += 1;
+        }
+    }
 }
 
 fn resolve(
@@ -549,6 +667,54 @@ mod tests {
         assert!(pair.input_is_covered_by(&[text.clone(), text.clone()]));
         assert!(!pair.input_is_covered_by(std::slice::from_ref(&text)));
         assert!(!pair.input_is_covered_by(&[text, int]));
+    }
+
+    #[test]
+    fn product_assignments_preserve_wholes_and_order_equal_occurrences() {
+        let text =
+            ConcreteType::resolve(&env_with_types(), &MagType::Named("main.Z".into(), vec![]))
+                .unwrap();
+        let pair = ConcreteType::Product {
+            items: vec![text.clone(), text.clone()],
+        };
+        assert_eq!(
+            pair.assign_input_sources(&[text.clone(), pair.clone(), text])
+                .unwrap(),
+            vec![Some(0), None, Some(1)]
+        );
+    }
+
+    #[test]
+    fn product_assignments_reject_distinct_position_ambiguity() {
+        let env = env_with_types();
+        let x = ConcreteType::resolve(&env, &MagType::Named("main.X".into(), vec![])).unwrap();
+        let y = ConcreteType::resolve(&env, &MagType::Named("main.Y".into(), vec![])).unwrap();
+        let either = ConcreteType::Sum {
+            arms: vec![x.clone(), y.clone()],
+        };
+        let product = ConcreteType::Product {
+            items: vec![either.clone(), x.clone()],
+        };
+        assert_eq!(
+            product.assign_input_sources(&[x.clone(), x]),
+            Err(InputAssignmentError::AmbiguousCoverage)
+        );
+    }
+
+    #[test]
+    fn output_coverage_is_exhaustive_per_sum_arm() {
+        let env = env_with_types();
+        let x = ConcreteType::resolve(&env, &MagType::Named("main.X".into(), vec![])).unwrap();
+        let y = ConcreteType::resolve(&env, &MagType::Named("main.Y".into(), vec![])).unwrap();
+        let output = ConcreteType::Sum {
+            arms: vec![x.clone(), y.clone()],
+        };
+        assert!(!x.accepts(&output));
+        assert!(x.accepts_edge_source(&output));
+        assert!(output.output_is_covered_by(&[x.clone(), y]));
+        assert!(output.output_is_covered_by(std::slice::from_ref(&output)));
+        assert!(!output.output_is_covered_by(&[x]));
+        assert!(!output.output_is_covered_by(&[]));
     }
 
     #[test]

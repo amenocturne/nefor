@@ -11,7 +11,7 @@
              :params PackedValue
              :input StoredPort
              :outputs (List StoredPort)})
-(type StoredRoute {:from StoredPort :to StoredPort})
+(type StoredRoute {:id String :from StoredPort :to StoredPort})
 (type Message {:to StoredPort :content PackedValue})
 (type Rule {:id String :on StoredPort :fn String})
 (type StoredNode {:id String
@@ -39,7 +39,11 @@
                          :outputs (List String)})
 (type ForeignContract {:identity String
                        :type_scheme ForeignTypeScheme})
-(type LowerDestination {:actor String :wire String})
+(type LowerDestination {:actor String
+                        :wire String
+                        :edge_id String
+                        :product_position Int})
+(type AssignedRoute {:route StoredRoute :product_position Int})
 (type LowerActor {:id String
                   :foreign String
                   :evidence ForeignEvidence
@@ -99,7 +103,11 @@
                   :output (store-port (get value "output"))})))
 
 (def stored-route (fn [A B] [[from (Port A)] [to (Port B)]] -> StoredRoute
-  (as StoredRoute {:from (store-port from) :to (store-port to)})))
+  (let [stored-from (store-port from) stored-to (store-port to)]
+    (as StoredRoute
+      {:id (canonical {:from stored-from :to stored-to})
+       :from stored-from
+       :to stored-to}))))
 
 (def edge (fn [I T U O] [[from (Node I T)] [to (Node U O)]] -> Edge
   (as Edge {:from (store-node from) :to (store-node to)
@@ -239,7 +247,7 @@
     (not (role? candidate "source")))))
 (def output-shape-valid? (fn [[value Graph] [candidate StoredNode]] -> Bool
   (if (role? candidate "output")
-    (if (= (incoming-count value (get candidate "id")) 1)
+    (if (not (= (incoming-count value (get candidate "id")) 0))
       (= (outgoing-count value (get candidate "id")) 0)
       false)
     true)))
@@ -435,16 +443,67 @@
   (= (count (filter (fn [[candidate Actor]] -> Bool
     (if (= (get candidate "id") (get value "actor"))
       (= (get candidate "input") value) false)) actors)) 1)))
-(def incoming-types (fn [[value Graph] [id String]] -> (List TypeDescriptor)
-  (map (fn [[candidate Edge]] -> TypeDescriptor
-         (get (get (get candidate "route") "from") "type"))
-       (filter (fn [[candidate Edge]] -> Bool
-                 (= (get (get candidate "to") "id") id))
-               (get value "edges")))))
-(def product-input-coverage-valid? (fn [[value Graph] [candidate StoredNode]] -> Bool
+(def route-id (fn [[value StoredRoute]] -> String (get value "id")))
+(def incoming-routes-to (fn [[routes (List StoredRoute)] [input StoredPort]]
+  -> (List StoredRoute)
+  (sort-by route-id
+    (filter (fn [[candidate StoredRoute]] -> Bool
+              (= (get candidate "to") input))
+            routes))))
+(def messages-to (fn [[messages (List Message)] [input StoredPort]] -> (List Message)
+  (filter (fn [[candidate Message]] -> Bool
+            (= (get candidate "to") input))
+          messages)))
+(def actor-input-source-types (fn [[value Graph] [candidate Actor]]
+  -> (List TypeDescriptor)
+  (let [input (get candidate "input")]
+    (concat
+      (map (fn [[route StoredRoute]] -> TypeDescriptor
+             (get (get route "from") "type"))
+           (incoming-routes-to (graph-routes value) input))
+      (map (fn [[message Message]] -> TypeDescriptor
+             (get (get message "to") "type"))
+           (messages-to (graph-messages value) input))))))
+(def actor-input-coverage-valid? (fn [[value Graph] [candidate Actor]] -> Bool
   (descriptor-input-covered-by?
     (get (get candidate "input") "type")
-    (incoming-types value (get candidate "id")))))
+    (actor-input-source-types value candidate))))
+(def route-handler-types (fn [[routes (List StoredRoute)] [output StoredPort]]
+  -> (List TypeDescriptor)
+  (map (fn [[route StoredRoute]] -> TypeDescriptor
+         (get (get route "to") "type"))
+       (filter (fn [[candidate StoredRoute]] -> Bool
+                 (= (get candidate "from") output))
+               routes))))
+(def rule-handler-types (fn [[rules (List Rule)] [output StoredPort]]
+  -> (List TypeDescriptor)
+  (map (fn [[candidate Rule]] -> TypeDescriptor
+         (get (get candidate "on") "type"))
+       (filter (fn [[candidate Rule]] -> Bool
+                 (= (get candidate "on") output))
+               rules))))
+(def terminal-output? (fn [[value Graph] [output StoredPort]] -> Bool
+  (not (= (count
+    (filter (fn [[candidate StoredNode]] -> Bool
+              (if (= (get candidate "role") "output")
+                (= (get candidate "output") output)
+                false))
+            (graph-nodes value))) 0))))
+(def actor-output-coverage-valid? (fn [[value Graph] [rules (List Rule)]
+                                         [output StoredPort]] -> Bool
+  (if (terminal-output? value output)
+    true
+    (descriptor-output-covered-by?
+      (get output "type")
+      (concat (route-handler-types (graph-routes value) output)
+              (rule-handler-types rules output))))))
+(def actor-outputs-coverage-valid? (fn [[value Graph] [rules (List Rule)]
+                                          [candidate Actor]] -> Bool
+  (= (count
+       (filter (fn [[output StoredPort]] -> Bool
+                 (not (actor-output-coverage-valid? value rules output)))
+               (get candidate "outputs")))
+     0)))
 (def route-valid? (fn [[actors (List Actor)] [value StoredRoute]] -> Bool
   (if (port-is-output? actors (get value "from"))
     (if (port-is-input? actors (get value "to"))
@@ -453,7 +512,8 @@
       false)
     false)))
 
-(def validate (fn [[value Graph] [contracts (List ForeignContract)]]
+(def validate-with-rules (fn [[value Graph] [rules (List Rule)]
+                              [contracts (List ForeignContract)]]
   -> (core.validated.Validated String Graph)
   (as (core.validated.Validated String Graph)
     (let [nodes (graph-nodes value)
@@ -473,8 +533,10 @@
                             actors)
           bad-boundaries (filter (fn [[candidate StoredNode]] -> Bool
                             (not (boundary-valid? candidate))) nodes)
-          bad-product-inputs (filter (fn [[candidate StoredNode]] -> Bool
-                                (not (product-input-coverage-valid? value candidate))) nodes)
+          bad-input-coverage (filter (fn [[candidate Actor]] -> Bool
+                                (not (actor-input-coverage-valid? value candidate))) actors)
+          bad-output-coverage (filter (fn [[candidate Actor]] -> Bool
+                                 (not (actor-outputs-coverage-valid? value rules candidate))) actors)
           bad-routes (filter (fn [[candidate StoredRoute]] -> Bool
                         (not (route-valid? actors candidate))) (graph-routes value))]
       (if (= (count (get value "edges")) 0)
@@ -487,36 +549,70 @@
               (core.validated.invalid ["graph needs exactly one concrete output node"])
               (if (= (count bad-shapes) 0)
                 (if (= (count bad-boundaries) 0)
-                  (if (= (count bad-product-inputs) 0)
-                    (if (= (count unreachable) 0)
-                      (if (= (count dead) 0)
-                        (if (= (count contract-errors) 0)
-                          (if (= (count bad-routes) 0)
-                            (core.validated.valid value)
-                            (core.validated.invalid ["graph contains an unknown or incompatible edge"]))
-                          (core.validated.invalid contract-errors))
-                        (core.validated.invalid ["every node must have a path to the output node"]))
-                      (core.validated.invalid ["every node must be reachable from a source node"]))
-                    (core.validated.invalid ["product input incoming edge types must exactly cover its component multiset"]))
+                  (if (= (count bad-input-coverage) 0)
+                    (if (= (count bad-output-coverage) 0)
+                      (if (= (count unreachable) 0)
+                        (if (= (count dead) 0)
+                          (if (= (count contract-errors) 0)
+                            (if (= (count bad-routes) 0)
+                              (core.validated.valid value)
+                              (core.validated.invalid ["graph contains an unknown or incompatible edge"]))
+                            (core.validated.invalid contract-errors))
+                          (core.validated.invalid ["every node must have a path to the output node"]))
+                        (core.validated.invalid ["every node must be reachable from a source node"]))
+                      (core.validated.invalid ["every actor output alternative must have an ordinary route, resident subscription, or terminal output path"]))
+                    (core.validated.invalid ["actor input incoming types must be compatible and exactly cover every product occurrence"]))
                   (core.validated.invalid ["boundary node roles require their concrete source/output factory shape, and ordinary nodes cannot contain initial messages"]))
                 (core.validated.invalid ["only source nodes may have zero incoming edges, and output nodes are terminal"]))))))))))
 
-(def routes-from (fn [[routes (List StoredRoute)] [actor-id String]] -> (List StoredRoute)
-  (filter (fn [[candidate StoredRoute]] -> Bool
-            (= (get (get candidate "from") "actor") actor-id)) routes)))
-(def actor-routes (fn [[routes (List StoredRoute)] [value Actor]]
+(def validate (fn [[value Graph] [contracts (List ForeignContract)]]
+  -> (core.validated.Validated String Graph)
+  (validate-with-rules value (as (List Rule) []) contracts)))
+
+(def zip-route-assignments (fn [[routes (List StoredRoute)] [positions (List Int)]]
+  -> (List AssignedRoute)
+  (if (= (count routes) 0)
+    (as (List AssignedRoute) [])
+    (concat
+      [(as AssignedRoute {:route (first routes)
+                          :product_position (first positions)})]
+      (zip-route-assignments (remove-at routes 0) (remove-at positions 0))))))
+(def assigned-routes-to (fn [[routes (List StoredRoute)] [input StoredPort]]
+  -> (List AssignedRoute)
+  (let [incoming (incoming-routes-to routes input)
+        sources (map (fn [[candidate StoredRoute]] -> TypeDescriptor
+                       (get (get candidate "from") "type"))
+                     incoming)]
+    (if (= (count incoming) 0)
+      (as (List AssignedRoute) [])
+      (let [positions (descriptor-input-assignments (get input "type") sources)]
+        (zip-route-assignments incoming positions))))))
+(def assigned-routes (fn [[routes (List StoredRoute)] [actors (List Actor)]]
+  -> (List AssignedRoute)
+  (flat-map (fn [[candidate Actor]] -> (List AssignedRoute)
+              (assigned-routes-to routes (get candidate "input")))
+            actors)))
+(def assigned-routes-from (fn [[routes (List AssignedRoute)] [actor-id String]]
+  -> (List AssignedRoute)
+  (filter (fn [[candidate AssignedRoute]] -> Bool
+            (= (get (get (get candidate "route") "from") "actor") actor-id))
+          routes)))
+(def actor-routes (fn [[routes (List AssignedRoute)] [value Actor]]
   -> (Map String (List LowerDestination))
-  (fold (fn [[out (Map String (List LowerDestination))] [candidate StoredRoute]]
+  (fold (fn [[out (Map String (List LowerDestination))] [assigned AssignedRoute]]
     -> (Map String (List LowerDestination))
-    (let [from (get candidate "from") to (get candidate "to")
+    (let [candidate (get assigned "route")
+          from (get candidate "from") to (get candidate "to")
           wire (get from "wire")
           old (or (get out wire) (as (List LowerDestination) []))
           destination (as LowerDestination {:actor (get to "actor")
-                                             :wire (get to "wire")})]
+                                             :wire (get to "wire")
+                                             :edge_id (get candidate "id")
+                                             :product_position (get assigned "product_position")})]
       (assoc out wire (concat old [destination]))))
     (as (Map String (List LowerDestination)) {})
-    (routes-from routes (get value "id")))))
-(def lower-actor-with-routes (fn [[routes (List StoredRoute)] [value Actor]] -> LowerActor
+    (assigned-routes-from routes (get value "id")))))
+(def lower-actor-with-routes (fn [[routes (List AssignedRoute)] [value Actor]] -> LowerActor
   (as LowerActor {:id (get value "id") :foreign (get value "foreign")
                   :evidence (get value "evidence") :input (get value "input")
                   :outputs (get value "outputs") :params (get value "params")
@@ -531,11 +627,13 @@
 (def result-boundary (fn [[value Graph]] -> ResultBoundary
   (as ResultBoundary {:from (get (first (outputs value)) "output")})))
 (def lower-program (fn [[value Program]] -> Modification
-  (let [topology (get value "graph") routes (graph-routes topology)]
+  (let [topology (get value "graph")
+        actors (graph-actors topology)
+        routes (assigned-routes (graph-routes topology) actors)]
     (as Modification
       {:actors (map (fn [[candidate Actor]] -> LowerActor
                       (lower-actor-with-routes routes candidate))
-                    (graph-actors topology))
+                    actors)
        :messages (map lower-message (graph-messages topology))
        :kills (as (List String) [])
        :rules (map lower-rule (get value "rules"))
@@ -573,12 +671,14 @@
              :messages (concat [(typed-message to value)] (get change "messages"))
              :kills (get change "kills")})))
 (def lower-delta (fn [[value Delta]] -> LowerDelta
-  (as LowerDelta
+  (let [actors (get value "actors")
+        routes (assigned-routes (get value "routes") actors)]
+    (as LowerDelta
     {:actors (map (fn [[candidate Actor]] -> LowerActor
-                    (lower-actor-with-routes (get value "routes") candidate))
-                  (get value "actors"))
+                    (lower-actor-with-routes routes candidate))
+                  actors)
      :messages (map lower-message (get value "messages"))
-     :kills (get value "kills") :rules (as (List LowerRule) [])})))
+     :kills (get value "kills") :rules (as (List LowerRule) [])}))))
 
 ;; A resident program may begin with rule-observed exits that only become
 ;; connected after a rule returns its operational delta. Its explicit boundary

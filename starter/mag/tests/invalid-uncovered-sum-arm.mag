@@ -1,0 +1,27 @@
+(require "nefor.artifact")
+(require "nefor.graph")
+
+(type Left {:value Int})
+(type Right {:value String})
+(type Choice (| Left Right))
+
+(foreign test.left
+  {:params Unit :input Left :output Left})
+
+(let [start (nefor.graph.source "start" (type-tag Choice)
+              (as Choice (as Left {:value 1})))
+      input (nefor.graph.port "left" (type-tag Left) "test.Value")
+      output (nefor.graph.port "left" (type-tag Left) "test.Value")
+      worker (nefor.graph.actor "left" test.left nil
+               (nefor.graph.store-port input)
+               [(nefor.graph.store-port output)])
+      left (nefor.graph.node "left" "ordinary" [worker]
+             (as (List nefor.graph.StoredRoute) [])
+             (as (List nefor.graph.Message) [])
+             input output)
+      result (nefor.graph.output "result" (type-tag Left))]
+  (nefor.artifact.compile
+    (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges base
+        [(nefor.graph.edge start left)
+         (nefor.graph.edge left result)]))))

@@ -26,8 +26,9 @@
                           [rules (List nefor.graph.Rule)]]
                          -> Artifact
   (let [graph (transform nefor.graph.empty-graph)
-        checked (nefor.graph.validate
+        checked (nefor.graph.validate-with-rules
                   graph
+                  rules
                   (map nefor.graph.foreign-contract (foreign-contracts)))
         checked-tag (get checked "tag")]
     (if (= checked-tag "core.validated.Valid")

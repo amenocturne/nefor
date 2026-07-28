@@ -813,6 +813,9 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
         root.join("main.mag"),
         r#"
           (require "nefor.graph")
+          (type CoveredLeft {:value Int})
+          (type CoveredRight {:value String})
+          (type CoveredChoice (| CoveredLeft CoveredRight))
           (foreign test.product [T]
             {:params Unit :input (+ T T) :output T})
           (let [left (nefor.graph.source
@@ -842,10 +845,71 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
                            [(nefor.graph.edge left join)
                             (nefor.graph.edge right join)
                             (nefor.graph.edge join result)])
+                product-result (nefor.graph.output
+                                 "product-result"
+                                 (type-tag
+                                   (+ nefor.contracts.Text
+                                      nefor.contracts.Text)))
+                output-topology (nefor.graph.graph
+                                  [(nefor.graph.edge left product-result)
+                                   (nefor.graph.edge right product-result)])
+                reversed-output-topology (nefor.graph.graph
+                                           [(nefor.graph.edge right product-result)
+                                            (nefor.graph.edge left product-result)])
+                choice-start
+                  (nefor.graph.source
+                    "choice-start"
+                    (type-tag CoveredChoice)
+                    (as CoveredChoice (as CoveredLeft {:value 1})))
+                choice-result
+                  (nefor.graph.output "choice-result" (type-tag CoveredLeft))
+                choice-topology
+                  (nefor.graph.graph
+                    [(nefor.graph.edge choice-start choice-result)])
+                choice-rule
+                  (nefor.graph.rule
+                    "observe-choice" (get choice-start "output") "observe-choice")
                 contracts (map nefor.graph.foreign-contract
                                 (foreign-contracts))
-                checked (nefor.graph.validate topology contracts)]
-            (artifact "test.product-fan-in/v1" {:tag (get checked "tag")}))
+                checked (nefor.graph.validate topology contracts)
+                output-checked
+                  (nefor.graph.validate output-topology contracts)
+                choice-without-rule
+                  (nefor.graph.validate choice-topology contracts)
+                choice-with-rule
+                  (nefor.graph.validate-with-rules
+                    choice-topology [choice-rule] contracts)
+                lowered (nefor.graph.lower topology)
+                lowered-left
+                  (first (filter
+                    (fn [[candidate nefor.graph.LowerActor]] -> Bool
+                      (= (get candidate "id") "left"))
+                    (get lowered "actors")))
+                lowered-right
+                  (first (filter
+                    (fn [[candidate nefor.graph.LowerActor]] -> Bool
+                      (= (get candidate "id") "right"))
+                    (get lowered "actors")))
+                destinations
+                  (concat
+                    (get (get lowered-left "routes") "nefor.graph.Value")
+                    (get (get lowered-right "routes") "nefor.graph.Value"))]
+            (artifact "test.product-fan-in/v1"
+              {:tag (get checked "tag")
+               :output-tag (get output-checked "tag")
+               :choice-without-rule (get choice-without-rule "tag")
+               :choice-with-rule (get choice-with-rule "tag")
+               :permutation-stable
+                 (= (canonical (nefor.graph.lower output-topology))
+                    (canonical (nefor.graph.lower reversed-output-topology)))
+               :positions
+                 (map (fn [[destination nefor.graph.LowerDestination]] -> Int
+                        (get destination "product_position"))
+                      destinations)
+               :edge-ids
+                 (map (fn [[destination nefor.graph.LowerDestination]] -> String
+                        (get destination "edge_id"))
+                      destinations)}))
         "#,
     )
     .unwrap();
@@ -883,6 +947,17 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
         "{:?}",
         artifact.data
     );
+    assert_eq!(artifact.data["output-tag"], "core.validated.Valid");
+    assert_eq!(
+        artifact.data["choice-without-rule"],
+        "core.validated.Invalid"
+    );
+    assert_eq!(artifact.data["choice-with-rule"], "core.validated.Valid");
+    assert_eq!(artifact.data["permutation-stable"], true);
+    assert_eq!(artifact.data["positions"], json!([0, 1]));
+    let edge_ids = artifact.data["edge-ids"].as_array().unwrap();
+    assert_eq!(edge_ids.len(), 2);
+    assert_ne!(edge_ids[0], edge_ids[1]);
 }
 
 #[test]
@@ -903,14 +978,33 @@ fn graph_descriptor_operations_are_compiler_owned() {
              :product (descriptor-input-covered-by?
                         (type-evidence (type-tag (+ Left Left)))
                         [(type-evidence (type-tag Left))
-                         (type-evidence (type-tag Left))])})
+                         (type-evidence (type-tag Left))])
+             :assignments (descriptor-input-assignments
+                            (type-evidence (type-tag (+ Left Left)))
+                            [(type-evidence (type-tag Left))
+                             (type-evidence (type-tag (+ Left Left)))
+                             (type-evidence (type-tag Left))])
+             :covered-output (descriptor-output-covered-by?
+                               (type-evidence (type-tag Choice))
+                               [(type-evidence (type-tag Left))
+                                (type-evidence (type-tag Right))])
+             :uncovered-output (descriptor-output-covered-by?
+                                 (type-evidence (type-tag Choice))
+                                 [(type-evidence (type-tag Left))])})
         "#,
         &root,
     )
     .unwrap();
     assert_eq!(
         artifact.data,
-        json!({"arm":true,"wrong-arm":false,"product":true})
+        json!({
+            "arm": true,
+            "wrong-arm": false,
+            "product": true,
+            "assignments": [0, -1, 1],
+            "covered-output": true,
+            "uncovered-output": false
+        })
     );
 
     let forged = compile(

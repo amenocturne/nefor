@@ -1,1 +1,1 @@
-product input incoming edge types must exactly cover its component multiset
+actor input incoming types must be compatible and exactly cover every product occurrence

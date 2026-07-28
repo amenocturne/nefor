@@ -1,7 +1,7 @@
 use crate::ast::{Artifact, Expr, FnValue, ForeignDecl, TypeDecl, Value};
 use crate::env::Env;
 use crate::error::MagError;
-use crate::types::MagType;
+use crate::types::{ConcreteType, MagType};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -1132,6 +1132,44 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Bool(target.input_is_covered_by(&sources)))
         }
+        "descriptor-input-assignments" => {
+            arity(args, 2)?;
+            let Value::TypeDescriptor(target) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "descriptor-input-assignments expects a TypeDescriptor target".into(),
+                ));
+            };
+            let sources = descriptor_list(
+                &args[1],
+                "descriptor-input-assignments expects a descriptor list",
+            )?;
+            target
+                .assign_input_sources(&sources)
+                .map(|assignments| {
+                    Value::List(std::sync::Arc::new(
+                        assignments
+                            .into_iter()
+                            .map(|position| {
+                                Value::Int(position.map_or(-1, |position| position as i64))
+                            })
+                            .collect(),
+                    ))
+                })
+                .map_err(|error| MagError::Type(error.to_string()))
+        }
+        "descriptor-output-covered-by?" => {
+            arity(args, 2)?;
+            let Value::TypeDescriptor(target) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "descriptor-output-covered-by? expects a TypeDescriptor target".into(),
+                ));
+            };
+            let handlers = descriptor_list(
+                &args[1],
+                "descriptor-output-covered-by? expects a descriptor list",
+            )?;
+            Ok(Value::Bool(target.output_is_covered_by(&handlers)))
+        }
         "foreign-contracts" => {
             arity(args, 0)?;
             let Value::HostInputs(inputs) = raw(env.lookup("inputs")?) else {
@@ -1356,6 +1394,20 @@ fn collection_builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, Ma
         }
         _ => unreachable!(),
     }
+}
+
+fn descriptor_list(value: &Value, error: &str) -> Result<Vec<ConcreteType>, MagError> {
+    let values = match raw(value) {
+        Value::List(values) | Value::Vector(values) => values,
+        _ => return Err(MagError::Type(error.into())),
+    };
+    values
+        .iter()
+        .map(|value| match raw(value) {
+            Value::TypeDescriptor(descriptor) => Ok(descriptor.clone()),
+            _ => Err(MagError::Type(error.into())),
+        })
+        .collect()
 }
 
 fn arity<T>(args: &[T], expected: usize) -> Result<(), MagError> {

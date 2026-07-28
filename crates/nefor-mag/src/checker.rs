@@ -512,7 +512,10 @@ fn infer_builtin(
             }
             Ok(MagType::Bool)
         }
-        "descriptor-accepts?" | "descriptor-input-covered-by?" => {
+        "descriptor-accepts?"
+        | "descriptor-input-covered-by?"
+        | "descriptor-input-assignments"
+        | "descriptor-output-covered-by?" => {
             exact(2)?;
             let descriptor = infer(env, locals, &args[0])?;
             compatible(
@@ -529,7 +532,11 @@ fn infer_builtin(
             };
             let value = infer(env, locals, &args[1])?;
             compatible(env, &value, &expected, &mut HashMap::new()).map_err(MagError::Type)?;
-            Ok(MagType::Bool)
+            if name == "descriptor-input-assignments" {
+                Ok(MagType::List(Box::new(MagType::Int)))
+            } else {
+                Ok(MagType::Bool)
+            }
         }
         "foreign-contracts" => {
             exact(0)?;
