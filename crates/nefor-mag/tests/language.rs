@@ -360,10 +360,10 @@ fn specialized_foreign_evidence_round_trips_exactly() {
             "arguments": [
                 named("main.Params"),
                 {"kind":"list","item":named("main.Input")},
-                {"kind":"union","items":[named("main.Output"), named("main.Error")]}
+                {"kind":"union","items":[named("main.Error"), named("main.Output")]}
             ],
             "input": {"kind":"list","item":named("main.Input")},
-            "output": {"kind":"union","items":[named("main.Output"), named("main.Error")]}
+            "output": {"kind":"union","items":[named("main.Error"), named("main.Output")]}
         })
     );
 }
@@ -818,9 +818,18 @@ fn type_schema_preserves_qualified_nominals_and_substitutes_generics() {
 fn type_schema_rejects_non_data_and_non_string_map_keys() {
     let root = workspace("type-schema-errors");
     for (ty, expected) in [
-        ("(Fn String String)", "Fn is not representable"),
-        ("Artifact", "Artifact is not representable"),
-        ("(TypeTag String)", "TypeTag is not representable"),
+        (
+            "(Fn String String)",
+            "Fn cannot enter a concrete semantic descriptor",
+        ),
+        (
+            "Artifact",
+            "Artifact cannot enter a concrete semantic descriptor",
+        ),
+        (
+            "(TypeTag String)",
+            "TypeTag cannot enter a concrete semantic descriptor",
+        ),
         ("(Map Int String)", "JSON object keys must be String"),
     ] {
         let source = format!("(artifact \"test.schema/v1\" (type-schema (type-tag {ty})))");

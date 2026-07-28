@@ -15,13 +15,13 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
         Value::Bool(v) => Ok((*v).into()),
         Value::Keyword(v) => Ok(format!(":{v}").into()),
         Value::Symbol(v) => Ok(v.clone().into()),
-        Value::TypeTag(ty) => type_evidence_to_json(ty),
+        Value::TypeTag(ty) => concrete_type_to_json(ty),
         Value::ForeignEvidence(evidence) => Ok(serde_json::json!({
             "version": 2,
             "identity": evidence.identity,
-            "arguments": evidence.arguments.iter().map(type_evidence_to_json).collect::<Result<Vec<_>, _>>()?,
-            "input": type_evidence_to_json(&evidence.input)?,
-            "output": type_evidence_to_json(&evidence.output)?,
+            "arguments": evidence.arguments.iter().map(concrete_type_to_json).collect::<Result<Vec<_>, _>>()?,
+            "input": concrete_type_to_json(&evidence.input)?,
+            "output": concrete_type_to_json(&evidence.output)?,
         })),
         Value::List(v) | Value::Vector(v) => Ok(serde_json::Value::Array(
             v.iter().map(value_to_json).collect::<Result<_, _>>()?,
@@ -40,6 +40,50 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
             other.type_name()
         ))),
     }
+}
+
+pub(crate) fn concrete_type_to_json(
+    ty: &crate::types::ConcreteType,
+) -> Result<serde_json::Value, MagError> {
+    use crate::types::ConcreteType;
+    let primitive = |name: &str| serde_json::json!({ "kind": "primitive", "name": name });
+    Ok(match ty {
+        ConcreteType::Data => primitive("Data"),
+        ConcreteType::Unit => primitive("Unit"),
+        ConcreteType::Bool => primitive("Bool"),
+        ConcreteType::Int => primitive("Int"),
+        ConcreteType::Float => primitive("Float"),
+        ConcreteType::String => primitive("String"),
+        ConcreteType::Named {
+            name, arguments, ..
+        } => serde_json::json!({
+            "kind": "named",
+            "name": name,
+            "arguments": arguments.iter().map(concrete_type_to_json).collect::<Result<Vec<_>, _>>()?,
+        }),
+        ConcreteType::List { item } => serde_json::json!({
+            "kind": "list", "item": concrete_type_to_json(item)?
+        }),
+        ConcreteType::Map { key, value } => serde_json::json!({
+            "kind": "map",
+            "key": concrete_type_to_json(key)?,
+            "value": concrete_type_to_json(value)?,
+        }),
+        ConcreteType::Record { fields } => serde_json::json!({
+            "kind": "record",
+            "fields": fields.iter().map(|(name, ty)| Ok(serde_json::json!({
+                "name": name, "type": concrete_type_to_json(ty)?
+            }))).collect::<Result<Vec<_>, MagError>>()?,
+        }),
+        ConcreteType::Sum { arms } => serde_json::json!({
+            "kind": "union",
+            "items": arms.iter().map(concrete_type_to_json).collect::<Result<Vec<_>, _>>()?,
+        }),
+        ConcreteType::Product { items } => serde_json::json!({
+            "kind": "product",
+            "items": items.iter().map(concrete_type_to_json).collect::<Result<Vec<_>, _>>()?,
+        }),
+    })
 }
 
 pub(crate) fn type_evidence_to_json(ty: &MagType) -> Result<serde_json::Value, MagError> {

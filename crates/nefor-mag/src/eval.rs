@@ -288,7 +288,10 @@ fn eval_as(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
 
 fn eval_type_tag(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     arity(args, 1)?;
-    Ok(Value::TypeTag(parse_type(env, &args[0], &HashSet::new())?))
+    let ty = parse_type(env, &args[0], &HashSet::new())?;
+    Ok(Value::TypeTag(crate::types::ConcreteType::resolve(
+        env, &ty,
+    )?))
 }
 
 fn eval_specialize(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
@@ -321,6 +324,9 @@ fn eval_specialize(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         .iter()
         .map(|expr| parse_type(env, expr, &HashSet::new()))
         .collect::<Result<Vec<_>, _>>()?;
+    for ty in &types {
+        crate::types::ConcreteType::resolve(env, ty)?;
+    }
     let subst = decl
         .type_params
         .iter()
@@ -681,9 +687,12 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
             let body = crate::checker::substitute(&decl.body, &substitutions);
             validate_value(env, value, &body).is_ok()
         }),
-        MagType::TypeTag(expected) => {
-            matches!(value, Value::TypeTag(actual) if actual == expected.as_ref())
-        }
+        MagType::TypeTag(expected) => matches!(
+            value,
+            Value::TypeTag(actual)
+                if crate::types::ConcreteType::resolve(env, expected)
+                    .is_ok_and(|expected| actual == &expected)
+        ),
         MagType::ForeignEvidence => matches!(value, Value::ForeignEvidence(_)),
         MagType::Union(types) => types.iter().any(|t| validate_value(env, value, t).is_ok()),
         MagType::Product(types) => types.iter().all(|t| validate_value(env, value, t).is_ok()),
@@ -908,9 +917,13 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             match raw(&args[0]) {
                 Value::Foreign(decl) => Ok(Value::ForeignEvidence(crate::ast::ForeignEvidence {
                     identity: decl.name.clone(),
-                    arguments: decl.specialization.clone(),
-                    input: decl.input.clone(),
-                    output: decl.output.clone(),
+                    arguments: decl
+                        .specialization
+                        .iter()
+                        .map(|ty| crate::types::ConcreteType::resolve(env, ty))
+                        .collect::<Result<_, _>>()?,
+                    input: crate::types::ConcreteType::resolve(env, &decl.input)?,
+                    output: crate::types::ConcreteType::resolve(env, &decl.output)?,
                 })),
                 _ => Err(MagError::Type(
                     "foreign-evidence expects a Foreign capability".into(),
@@ -921,7 +934,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             arity(args, 1)?;
             match raw(&args[0]) {
                 Value::TypeTag(ty) => Ok(crate::json::json_to_value(
-                    &crate::json::type_evidence_to_json(ty)?,
+                    &crate::json::concrete_type_to_json(ty)?,
                 )),
                 other => Err(MagError::Type(format!(
                     "type-evidence expects TypeTag, got {}",
@@ -940,7 +953,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                     )))
                 }
             };
-            let schema = crate::schema::TypeSchema::reify(env, ty)?;
+            let schema = crate::schema::TypeSchema::reify(env, &ty.to_mag_type())?;
             let json = serde_json::to_value(schema)
                 .map_err(|error| MagError::Eval(format!("serialize type schema: {error}")))?;
             Ok(crate::json::json_to_value(&json))
@@ -1099,7 +1112,7 @@ fn value_string(v: &Value) -> String {
         Value::Bool(n) => n.to_string(),
         Value::Type(t) => t.to_string(),
         Value::TypeDecl(d) => d.name.clone(),
-        Value::TypeTag(t) => t.to_string(),
+        Value::TypeTag(t) => t.to_mag_type().to_string(),
         Value::Foreign(d) => d.name.clone(),
         _ => format!("<{:?}>", v.type_name()),
     }
@@ -1124,7 +1137,8 @@ fn equal(a: &Value, b: &Value) -> bool {
                 && a.iter()
                     .all(|(key, value)| b.get(key).is_some_and(|other| equal(value, other)))
         }
-        (Value::Type(a), Value::Type(b)) | (Value::TypeTag(a), Value::TypeTag(b)) => a == b,
+        (Value::Type(a), Value::Type(b)) => a == b,
+        (Value::TypeTag(a), Value::TypeTag(b)) => a == b,
         (Value::TypeDecl(a), Value::TypeDecl(b)) => a == b,
         (Value::Foreign(a), Value::Foreign(b)) => a == b,
         (Value::ForeignEvidence(a), Value::ForeignEvidence(b)) => a == b,

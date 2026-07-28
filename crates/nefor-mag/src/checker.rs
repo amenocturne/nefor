@@ -624,7 +624,7 @@ fn value_type(value: &Value) -> Option<MagType> {
         )),
         Value::Type(t) => Some(t.clone()),
         Value::TypeDecl(d) => Some(MagType::Named(d.name.clone(), vec![])),
-        Value::TypeTag(ty) => Some(MagType::TypeTag(Box::new(ty.clone()))),
+        Value::TypeTag(ty) => Some(MagType::TypeTag(Box::new(ty.to_mag_type()))),
         Value::Foreign(decl) => Some(MagType::Foreign(
             Box::new(decl.params.clone()),
             Box::new(decl.input.clone()),
@@ -668,7 +668,7 @@ fn field_type(env: &Env, ty: &MagType, key: Option<&str>) -> Option<MagType> {
 }
 
 fn compatible(
-    _env: &Env,
+    env: &Env,
     actual: &MagType,
     expected: &MagType,
     subst: &mut HashMap<String, MagType>,
@@ -676,7 +676,7 @@ fn compatible(
     if let MagType::Var(name) = expected {
         if let Some(bound) = subst.get(name) {
             let bound = bound.clone();
-            return compatible(_env, actual, &bound, subst)
+            return compatible(env, actual, &bound, subst)
                 .map_err(|_| format!("{name} was {bound}, got {actual}"));
         }
         subst.insert(name.clone(), actual.clone());
@@ -688,9 +688,25 @@ fn compatible(
     if matches!(actual, MagType::EmptyList) && matches!(expected, MagType::List(_)) {
         return Ok(());
     }
+    // Once inference has removed open variables, compatibility is owned by
+    // the same normalized descriptor relation emitted to the runtime.
+    if let (Ok(actual), Ok(expected)) = (
+        crate::types::ConcreteType::resolve(env, actual),
+        crate::types::ConcreteType::resolve(env, expected),
+    ) {
+        return expected.accepts(&actual).then_some(()).ok_or_else(|| {
+            if matches!(expected, crate::types::ConcreteType::Named { .. }) {
+                format!(
+                    "expected nominal {expected:?}, got {actual:?}; use as for explicit refinement"
+                )
+            } else {
+                format!("expected {expected:?}, got {actual:?}")
+            }
+        });
+    }
     if let MagType::Union(variants) = actual {
         for variant in variants {
-            compatible(_env, variant, expected, subst)?;
+            compatible(env, variant, expected, subst)?;
         }
         return Ok(());
     }
@@ -699,7 +715,7 @@ fn compatible(
         MagType::Union(options) => {
             let mut matches = options.iter().filter_map(|option| {
                 let mut candidate = subst.clone();
-                compatible(_env, actual, option, &mut candidate)
+                compatible(env, actual, option, &mut candidate)
                     .ok()
                     .map(|_| candidate)
             });
@@ -721,7 +737,7 @@ fn compatible(
                 if actual_name == expected_name && actual_args.len() == expected_args.len() =>
             {
                 for (actual_arg, expected_arg) in actual_args.iter().zip(expected_args) {
-                    compatible(_env, actual_arg, expected_arg, subst)?;
+                    compatible(env, actual_arg, expected_arg, subst)?;
                 }
                 Ok(())
             }
@@ -730,21 +746,21 @@ fn compatible(
             )),
         },
         MagType::TypeTag(expected_type) => match actual {
-            MagType::TypeTag(actual_type) => compatible(_env, actual_type, expected_type, subst),
+            MagType::TypeTag(actual_type) => compatible(env, actual_type, expected_type, subst),
             _ => Err(format!("expected {expected}, got {actual}")),
         },
         MagType::List(e) => match actual {
-            MagType::List(a) => compatible(_env, a, e, subst),
+            MagType::List(a) => compatible(env, a, e, subst),
             _ => Err(format!("expected {expected}, got {actual}")),
         },
         MagType::Map(ek, ev) => match actual {
             MagType::Map(ak, av) => {
-                compatible(_env, ak, ek, subst)?;
-                compatible(_env, av, ev, subst)
+                compatible(env, ak, ek, subst)?;
+                compatible(env, av, ev, subst)
             }
             MagType::Record(fields) if matches!(ek.as_ref(), MagType::String) => {
                 for value in fields.values() {
-                    compatible(_env, value, ev, subst)?;
+                    compatible(env, value, ev, subst)?;
                 }
                 Ok(())
             }
@@ -754,7 +770,7 @@ fn compatible(
             MagType::Record(af) if ef.len() == af.len() => {
                 for (k, e) in ef {
                     compatible(
-                        _env,
+                        env,
                         af.get(k).ok_or_else(|| format!("missing field {k}"))?,
                         e,
                         subst,
@@ -767,17 +783,17 @@ fn compatible(
         MagType::Function(ep, er) => match actual {
             MagType::Function(ap, ar) if ap.len() == ep.len() => {
                 for (a, e) in ap.iter().zip(ep) {
-                    compatible(_env, a, e, subst)?;
+                    compatible(env, a, e, subst)?;
                 }
-                compatible(_env, ar, er, subst)
+                compatible(env, ar, er, subst)
             }
             _ => Err(format!("expected {expected}, got {actual}")),
         },
         MagType::Foreign(ep, ei, eo) => match actual {
             MagType::Foreign(ap, ai, ao) => {
-                compatible(_env, ap, ep, subst)?;
-                compatible(_env, ai, ei, subst)?;
-                compatible(_env, ao, eo, subst)
+                compatible(env, ap, ep, subst)?;
+                compatible(env, ai, ei, subst)?;
+                compatible(env, ao, eo, subst)
             }
             _ => Err(format!("expected {expected}, got {actual}")),
         },

@@ -1,10 +1,9 @@
-use crate::checker::substitute;
 use crate::env::Env;
 use crate::error::MagError;
 use crate::types::MagType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -68,10 +67,9 @@ pub struct JsonValidationError {
 
 impl TypeSchema {
     pub fn reify(env: &Env, ty: &MagType) -> Result<Self, MagError> {
-        let mut resolving = HashSet::new();
         Ok(Self {
             version: SCHEMA_VERSION,
-            root: reify_type(env, ty, &mut resolving)?,
+            root: reify_concrete(&crate::types::ConcreteType::resolve(env, ty)?)?,
         })
     }
 
@@ -178,104 +176,50 @@ fn schema_type_to_json_schema(schema: &SchemaType) -> Value {
     }
 }
 
-fn reify_type(
-    env: &Env,
-    ty: &MagType,
-    resolving: &mut HashSet<String>,
-) -> Result<SchemaType, MagError> {
+fn reify_concrete(ty: &crate::types::ConcreteType) -> Result<SchemaType, MagError> {
+    use crate::types::ConcreteType;
     Ok(match ty {
-        MagType::Data => SchemaType::Data,
-        MagType::Unit => SchemaType::Unit,
-        MagType::Bool => SchemaType::Bool,
-        MagType::Int => SchemaType::Int,
-        MagType::Float => SchemaType::Float,
-        MagType::String => SchemaType::String,
-        MagType::List(item) => SchemaType::List {
-            item: Box::new(reify_type(env, item, resolving)?),
+        ConcreteType::Data => SchemaType::Data,
+        ConcreteType::Unit => SchemaType::Unit,
+        ConcreteType::Bool => SchemaType::Bool,
+        ConcreteType::Int => SchemaType::Int,
+        ConcreteType::Float => SchemaType::Float,
+        ConcreteType::String => SchemaType::String,
+        ConcreteType::List { item } => SchemaType::List {
+            item: Box::new(reify_concrete(item)?),
         },
-        MagType::Map(key, value) if key.as_ref() == &MagType::String => SchemaType::Map {
-            value: Box::new(reify_type(env, value, resolving)?),
-        },
-        MagType::Map(key, _) => {
+        ConcreteType::Map { key, value } if key.as_ref() == &ConcreteType::String => {
+            SchemaType::Map {
+                value: Box::new(reify_concrete(value)?),
+            }
+        }
+        ConcreteType::Map { key, .. } => {
             return Err(MagError::Type(format!(
-                "cannot reify (Map {key} _): JSON object keys must be String"
+                "cannot reify Map<{key:?}, _>: JSON object keys must be String"
             )))
         }
-        MagType::Record(fields) => SchemaType::Record {
+        ConcreteType::Record { fields } => SchemaType::Record {
             fields: fields
                 .iter()
                 .map(|(name, ty)| {
                     Ok(SchemaField {
                         name: name.clone(),
-                        schema: reify_type(env, ty, resolving)?,
+                        schema: reify_concrete(ty)?,
                     })
                 })
                 .collect::<Result<_, MagError>>()?,
         },
-        MagType::Union(variants) => SchemaType::Union {
-            variants: variants
-                .iter()
-                .map(|ty| reify_type(env, ty, resolving))
-                .collect::<Result<_, _>>()?,
+        ConcreteType::Sum { arms } => SchemaType::Union {
+            variants: arms.iter().map(reify_concrete).collect::<Result<_, _>>()?,
         },
-        MagType::Product(components) => SchemaType::Product {
-            components: components
-                .iter()
-                .map(|ty| reify_type(env, ty, resolving))
-                .collect::<Result<_, _>>()?,
+        ConcreteType::Product { items } => SchemaType::Product {
+            components: items.iter().map(reify_concrete).collect::<Result<_, _>>()?,
         },
-        MagType::Named(name, args) => {
-            let decl = env.type_decl(name).ok_or_else(|| {
-                MagError::Type(format!("cannot reify unknown nominal type {name}"))
-            })?;
-            if decl.params.len() != args.len() {
-                return Err(MagError::Type(format!(
-                    "cannot reify {name}: expected {} type arguments, got {}",
-                    decl.params.len(),
-                    args.len()
-                )));
-            }
-            let key = format!("{name}<{args:?}>");
-            if !resolving.insert(key.clone()) {
-                return Err(MagError::Type(format!(
-                    "cannot reify recursive type {name}"
-                )));
-            }
-            let substitutions: HashMap<_, _> = decl
-                .params
-                .iter()
-                .cloned()
-                .zip(args.iter().cloned())
-                .collect();
-            let body = reify_type(env, &substitute(&decl.body, &substitutions), resolving)?;
-            resolving.remove(&key);
-            SchemaType::Named {
-                name: name.clone(),
-                body: Box::new(body),
-            }
-        }
-        MagType::EmptyList => {
-            return Err(MagError::Type(
-                "cannot reify an untyped empty-list placeholder".into(),
-            ))
-        }
-        MagType::Artifact => return unsupported("Artifact"),
-        MagType::TypeTag(_) => return unsupported("TypeTag"),
-        MagType::ForeignEvidence => return unsupported("ForeignEvidence"),
-        MagType::Function(_, _) => return unsupported("Fn"),
-        MagType::Foreign(_, _, _) => return unsupported("Foreign"),
-        MagType::Var(name) => {
-            return Err(MagError::Type(format!(
-                "cannot reify unresolved type variable {name}"
-            )))
-        }
+        ConcreteType::Named { name, body, .. } => SchemaType::Named {
+            name: name.clone(),
+            body: Box::new(reify_concrete(body)?),
+        },
     })
-}
-
-fn unsupported<T>(name: &str) -> Result<T, MagError> {
-    Err(MagError::Type(format!(
-        "{name} is not representable as structural JSON data"
-    )))
 }
 
 fn validate_at(schema: &SchemaType, value: &Value, path: &str, out: &mut Vec<Violation>) {

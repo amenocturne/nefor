@@ -79,9 +79,9 @@ pub struct ForeignDecl {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForeignEvidence {
     pub identity: String,
-    pub arguments: Vec<MagType>,
-    pub input: MagType,
-    pub output: MagType,
+    pub arguments: Vec<crate::types::ConcreteType>,
+    pub input: crate::types::ConcreteType,
+    pub output: crate::types::ConcreteType,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ pub enum Value {
     BuiltinFn(String),
     Type(MagType),
     TypeDecl(TypeDecl),
-    TypeTag(MagType),
+    TypeTag(crate::types::ConcreteType),
     Foreign(ForeignDecl),
     ForeignEvidence(ForeignEvidence),
     Artifact(Artifact),
