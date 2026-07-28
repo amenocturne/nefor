@@ -369,19 +369,31 @@ fn specialized_foreign_evidence_round_trips_exactly() {
     )
     .unwrap();
 
-    let named = |name: &str| json!({"kind":"named","name":name,"arguments":[]});
+    let primitive = |name: &str| json!({"kind":"primitive","name":name});
+    let named = |name: &str, field: &str, ty: serde_json::Value| {
+        json!({
+            "kind":"named",
+            "name":name,
+            "arguments":[],
+            "body":{"kind":"record","fields":[{"name":field,"type":ty}]}
+        })
+    };
+    let params = named("main.Params", "seed", primitive("String"));
+    let input = named("main.Input", "prompt", primitive("String"));
+    let error = named("main.Error", "message", primitive("String"));
+    let output = named("main.Output", "answer", primitive("String"));
     assert_eq!(
         artifact.data,
         json!({
             "version": 2,
             "identity": "runtime.worker",
             "arguments": [
-                named("main.Params"),
-                {"kind":"list","item":named("main.Input")},
-                {"kind":"union","items":[named("main.Error"), named("main.Output")]}
+                params,
+                {"kind":"list","item":input},
+                {"kind":"union","items":[error, output]}
             ],
-            "input": {"kind":"list","item":named("main.Input")},
-            "output": {"kind":"union","items":[named("main.Error"), named("main.Output")]}
+            "input": {"kind":"list","item":input},
+            "output": {"kind":"union","items":[error, output]}
         })
     );
 }
@@ -866,7 +878,49 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
         load_with_inputs_and_module_roots(&root, "main.mag", inputs, &[root.clone(), mag_lib])
             .unwrap()
             .artifact;
-    assert_eq!(artifact.data["tag"], "core.validated.Valid");
+    assert_eq!(
+        artifact.data["tag"], "core.validated.Valid",
+        "{:?}",
+        artifact.data
+    );
+}
+
+#[test]
+fn graph_descriptor_operations_are_compiler_owned() {
+    let root = workspace("graph-descriptors");
+    let artifact = compile(
+        r#"
+          (type Left {:value Int})
+          (type Right {:value String})
+          (type Choice (| Left Right))
+          (artifact "test.graph-descriptors/v1"
+            {:arm (descriptor-accepts?
+                    (type-evidence (type-tag Choice))
+                    (type-evidence (type-tag Left)))
+             :wrong-arm (descriptor-accepts?
+                          (type-evidence (type-tag Left))
+                          (type-evidence (type-tag Right)))
+             :product (descriptor-input-covered-by?
+                        (type-evidence (type-tag (+ Left Left)))
+                        [(type-evidence (type-tag Left))
+                         (type-evidence (type-tag Left))])})
+        "#,
+        &root,
+    )
+    .unwrap();
+    assert_eq!(
+        artifact.data,
+        json!({"arm":true,"wrong-arm":false,"product":true})
+    );
+
+    let forged = compile(
+        r#"(artifact "test.graph-descriptors/v1"
+             (as TypeDescriptor {:kind "primitive" :name "String"}))"#,
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(forged.contains("does not conform"), "{forged}");
 }
 
 #[test]
@@ -918,7 +972,18 @@ fn type_tags_are_typed_canonical_witnesses() {
     .unwrap();
     assert_eq!(
         artifact.data,
-        json!({"kind":"named","name":"main.Payload","arguments":[]})
+        json!({
+            "kind":"named",
+            "name":"main.Payload",
+            "arguments":[],
+            "body":{
+                "kind":"record",
+                "fields":[{
+                    "name":"value",
+                    "type":{"kind":"primitive","name":"Int"}
+                }]
+            }
+        })
     );
 
     let unknown = compile("(artifact \"test.tag/v1\" (type-tag Missing))", &root)

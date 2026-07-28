@@ -203,8 +203,8 @@ impl Env {
             "packed-empty-record?",
             "packed-record-has-only-key?",
             "packed-field-conforms?",
-            "descriptor-kind",
-            "descriptor-items",
+            "descriptor-accepts?",
+            "descriptor-input-covered-by?",
             "foreign-contracts",
         ] {
             env.define(name, Value::BuiltinFn(name.into()));

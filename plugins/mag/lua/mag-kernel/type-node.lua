@@ -3,7 +3,7 @@ local M = {}
 local PRIMITIVES = { JsonValue=true, Unit=true, Bool=true, Int=true, Float=true, String=true }
 local KEYS = {
   primitive={kind=true,name=true}, variable={kind=true,name=true},
-  named={kind=true,name=true,arguments=true}, list={kind=true,item=true},
+  named={kind=true,name=true,arguments=true,body=true}, list={kind=true,item=true},
   map={kind=true,key=true,value=true}, record={kind=true,fields=true},
   union={kind=true,items=true}, product={kind=true,items=true},
 }
@@ -18,9 +18,11 @@ local function dense_array(value)
   return count==#value
 end
 
-local function exact_keys(node, allowed)
+local function exact_keys(node, allowed, optional)
   for key in pairs(node) do if not allowed[key] then return false end end
-  for key in pairs(allowed) do if node[key]==nil then return false end end
+  for key in pairs(allowed) do
+    if node[key]==nil and (not optional or not optional[key]) then return false end
+  end
   return true
 end
 
@@ -29,7 +31,8 @@ local function validate(node, variables, path)
   if type(node)~="table" or type(node.kind)~="string" or not KEYS[node.kind] then
     return nil,path.." has an illegal or missing kind"
   end
-  if not exact_keys(node,KEYS[node.kind]) then return nil,path.." has missing or unknown fields" end
+  local optional=node.kind=="named" and {body=true} or nil
+  if not exact_keys(node,KEYS[node.kind],optional) then return nil,path.." has missing or unknown fields" end
   if node.kind=="primitive" then
     if not PRIMITIVES[node.name] then return nil,path.." has an illegal primitive" end
   elseif node.kind=="variable" then
@@ -43,6 +46,9 @@ local function validate(node, variables, path)
     if not dense_array(node.arguments) then return nil,path..".arguments must be a dense list" end
     for index,argument in ipairs(node.arguments) do
       local ok,err=validate(argument,variables,path..".arguments["..index.."]"); if not ok then return nil,err end
+    end
+    if node.body~=nil then
+      local ok,err=validate(node.body,variables,path..".body"); if not ok then return nil,err end
     end
   elseif node.kind=="list" then
     local ok,err=validate(node.item,variables,path..".item"); if not ok then return nil,err end
@@ -78,6 +84,12 @@ end
 function M.equal(left,right)
   if type(left)~=type(right) then return false end
   if type(left)~="table" then return left==right end
+  if left.kind=="named" and right.kind=="named" then
+    -- Runtime declarations name nominal constructors without embedding their
+    -- MAG bodies. Compiler evidence carries the body so Rust can verify the
+    -- complete descriptor; declaration conformance remains nominal here.
+    return left.name==right.name and M.equal(left.arguments,right.arguments)
+  end
   if left.kind=="union" or right.kind=="union" then
     if left.kind~="union" or right.kind~="union" then return false end
     local function flatten(node,out)

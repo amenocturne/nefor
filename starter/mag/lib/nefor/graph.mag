@@ -12,7 +12,7 @@
              :input StoredPort
              :outputs (List StoredPort)})
 (type StoredRoute {:from StoredPort :to StoredPort})
-(type Message {:to String :content PackedValue})
+(type Message {:to StoredPort :content PackedValue})
 (type Rule {:id String :on StoredPort :fn String})
 (type StoredNode {:id String
                   :role String
@@ -47,7 +47,9 @@
                   :outputs (List StoredPort)
                   :params PackedValue
                   :routes (Map String (List LowerDestination))})
-(type LowerMessage {:to String :content PackedValue})
+(type LowerMessage {:to String
+                    :semantic_type TypeDescriptor
+                    :content PackedValue})
 (type LowerRule {:id String :on StoredPort :fn String})
 (type ResultBoundary {:from StoredPort})
 (type Modification {:actors (List LowerActor)
@@ -103,10 +105,12 @@
   (as Edge {:from (store-node from) :to (store-node to)
             :route (stored-route (get from "output") (get to "input"))})))
 
-(def message (fn [T] [[to String] [content T]] -> Message
+(def stored-message (fn [P] [[to StoredPort] [content P]] -> Message
   (as Message {:to to :content (pack content)})))
+(def message (fn [T P] [[to (Port T)] [content P]] -> Message
+  (stored-message (store-port to) content)))
 (def typed-message (fn [T] [[to (Port T)] [value T]] -> Message
-  (as Message {:to (get to "actor")
+  (as Message {:to (store-port to)
                :content (pack {:kind (get to "wire") :value value})})))
 (def rule (fn [T] [[id String] [on (Port T)] [fn-name String]] -> Rule
   (as Rule {:id id :on (store-port on) :fn fn-name})))
@@ -118,7 +122,7 @@
                        (as (nefor.contracts.SourceParams T) {:value value})
                        (store-port input) [(store-port output)])]
     (node id "source" [source-actor] (as (List StoredRoute) [])
-      [(message id {:kind "mag.Unit"})] input output))))
+      [(message input {:kind "mag.Unit"})] input output))))
 
 (def output (fn [T] [[id String] [type (TypeTag T)]] -> (Node T T)
   (let [input (port id type "nefor.graph.Value")
@@ -324,7 +328,7 @@
                       (if (one-port? (get boundary "outputs") output)
                         (if (= (count (get candidate "routes")) 0)
                           (if (= (get candidate "messages")
-                                 [(message id {:kind "mag.Unit"})])
+                                 [(stored-message input {:kind "mag.Unit"})])
                             (if (source-params-valid? (get boundary "params"))
                               (source-value-valid? boundary output) false)
                             false)
@@ -431,43 +435,6 @@
   (= (count (filter (fn [[candidate Actor]] -> Bool
     (if (= (get candidate "id") (get value "actor"))
       (= (get candidate "input") value) false)) actors)) 1)))
-(def type-kind (fn [[value TypeDescriptor]] -> String
-  (descriptor-kind value)))
-(def type-items (fn [[value TypeDescriptor]] -> (List TypeDescriptor)
-  (descriptor-items value)))
-(def type-accepts? (fn [[target TypeDescriptor] [source TypeDescriptor]] -> Bool
-  (if (= target source)
-    true
-    (if (= (type-kind target) "union")
-      (if (= (type-kind source) "union")
-        (= (count (filter (fn [[source-item TypeDescriptor]] -> Bool
-                            (not (type-accepts? target source-item)))
-                          (type-items source))) 0)
-        (not (= (count (filter (fn [[target-item TypeDescriptor]] -> Bool
-                                 (type-accepts? target-item source))
-                               (type-items target))) 0)))
-      (if (= (type-kind target) "product")
-        (not (= (count (filter (fn [[target-item TypeDescriptor]] -> Bool
-                                 (type-accepts? target-item source))
-                               (type-items target))) 0))
-        false)))))
-(def product-types-cover? (fn [[sources (List TypeDescriptor)]
-                               [components (List TypeDescriptor)]] -> Bool
-  (if (= (count sources) (count components))
-    (if (= (count sources) 0)
-      true
-      (let [source (first sources)
-            remaining-sources (remove-at sources 0)
-            candidates (indexed-map
-              (fn [[index Int] [component TypeDescriptor]] -> Bool
-                (if (type-accepts? component source)
-                  (product-types-cover? remaining-sources
-                    (remove-at components index))
-                  false))
-              components)]
-        (not (= (count (filter (fn [[matched Bool]] -> Bool matched)
-                               candidates)) 0))))
-    false)))
 (def incoming-types (fn [[value Graph] [id String]] -> (List TypeDescriptor)
   (map (fn [[candidate Edge]] -> TypeDescriptor
          (get (get (get candidate "route") "from") "type"))
@@ -475,18 +442,14 @@
                  (= (get (get candidate "to") "id") id))
                (get value "edges")))))
 (def product-input-coverage-valid? (fn [[value Graph] [candidate StoredNode]] -> Bool
-  (let [target (get (get candidate "input") "type")]
-    (if (= (type-kind target) "product")
-      (let [sources (incoming-types value (get candidate "id"))]
-        (if (= sources [target])
-          true
-          (product-types-cover? sources (type-items target))))
-      true))))
+  (descriptor-input-covered-by?
+    (get (get candidate "input") "type")
+    (incoming-types value (get candidate "id")))))
 (def route-valid? (fn [[actors (List Actor)] [value StoredRoute]] -> Bool
   (if (port-is-output? actors (get value "from"))
     (if (port-is-input? actors (get value "to"))
-      (type-accepts? (get (get value "to") "type")
-                     (get (get value "from") "type"))
+      (descriptor-accepts? (get (get value "to") "type")
+                           (get (get value "from") "type"))
       false)
     false)))
 
@@ -559,7 +522,10 @@
                   :outputs (get value "outputs") :params (get value "params")
                   :routes (actor-routes routes value)})))
 (def lower-message (fn [[value Message]] -> LowerMessage
-  (as LowerMessage {:to (get value "to") :content (get value "content")})))
+  (let [to (get value "to")]
+    (as LowerMessage {:to (get to "actor")
+                      :semantic_type (get to "type")
+                      :content (get value "content")}))))
 (def lower-rule (fn [[value Rule]] -> LowerRule
   (as LowerRule {:id (get value "id") :on (get value "on") :fn (get value "fn")})))
 (def result-boundary (fn [[value Graph]] -> ResultBoundary

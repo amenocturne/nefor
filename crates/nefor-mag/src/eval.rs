@@ -1092,43 +1092,45 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             };
             Ok(Value::Bool(valid))
         }
-        "descriptor-kind" => {
-            arity(args, 1)?;
-            let Value::TypeDescriptor(ty) = raw(&args[0]) else {
+        "descriptor-accepts?" => {
+            arity(args, 2)?;
+            let Value::TypeDescriptor(target) = raw(&args[0]) else {
                 return Err(MagError::Type(
-                    "descriptor-kind expects TypeDescriptor".into(),
+                    "descriptor-accepts? expects TypeDescriptor arguments".into(),
                 ));
             };
-            let kind = match ty {
-                crate::types::ConcreteType::Sum { .. } => "union",
-                crate::types::ConcreteType::Product { .. } => "product",
-                crate::types::ConcreteType::Named { .. } => "named",
-                crate::types::ConcreteType::List { .. } => "list",
-                crate::types::ConcreteType::Map { .. } => "map",
-                crate::types::ConcreteType::Record { .. } => "record",
-                _ => "primitive",
+            let Value::TypeDescriptor(source) = raw(&args[1]) else {
+                return Err(MagError::Type(
+                    "descriptor-accepts? expects TypeDescriptor arguments".into(),
+                ));
             };
-            Ok(Value::Str(kind.into()))
+            Ok(Value::Bool(target.accepts_edge_source(source)))
         }
-        "descriptor-items" => {
-            arity(args, 1)?;
-            let Value::TypeDescriptor(ty) = raw(&args[0]) else {
+        "descriptor-input-covered-by?" => {
+            arity(args, 2)?;
+            let Value::TypeDescriptor(target) = raw(&args[0]) else {
                 return Err(MagError::Type(
-                    "descriptor-items expects TypeDescriptor".into(),
+                    "descriptor-input-covered-by? expects a TypeDescriptor target".into(),
                 ));
             };
-            let items = match ty {
-                crate::types::ConcreteType::Sum { arms } => arms,
-                crate::types::ConcreteType::Product { items } => items,
+            let sources = match raw(&args[1]) {
+                Value::List(sources) | Value::Vector(sources) => sources,
                 _ => {
                     return Err(MagError::Type(
-                        "descriptor-items expects a sum or product descriptor".into(),
+                        "descriptor-input-covered-by? expects a descriptor list".into(),
                     ))
                 }
             };
-            Ok(Value::Vector(std::sync::Arc::new(
-                items.iter().cloned().map(Value::TypeDescriptor).collect(),
-            )))
+            let sources = sources
+                .iter()
+                .map(|source| match raw(source) {
+                    Value::TypeDescriptor(source) => Ok(source.clone()),
+                    _ => Err(MagError::Type(
+                        "descriptor-input-covered-by? expects a descriptor list".into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Bool(target.input_is_covered_by(&sources)))
         }
         "foreign-contracts" => {
             arity(args, 0)?;

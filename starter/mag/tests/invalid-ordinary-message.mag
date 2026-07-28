@@ -11,7 +11,8 @@
                  "ordinary"
                  (get operation "actors")
                  (get operation "routes")
-                 [(nefor.graph.message "operation" {:kind "mag.Unit"})]
+                 [(nefor.graph.message (get operation "input")
+                                       {:kind "mag.Unit"})]
                  (get operation "input")
                  (get operation "output"))
       result (nefor.graph.output-for "result" injected)]

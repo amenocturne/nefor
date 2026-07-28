@@ -515,6 +515,7 @@ fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
 
     install_json(lua, &nefor)?;
     install_typed_json(lua, &nefor)?;
+    install_semantic_type(lua, &nefor)?;
     install_fs(lua, &nefor, data_root)?;
 
     let now_ms = lua.create_function(|_, _: ()| {
@@ -539,6 +540,42 @@ fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
     nefor.set("emit", emit)?;
 
     lua.globals().set("nefor", nefor)?;
+    Ok(())
+}
+
+/// Compiler-owned semantic descriptor operations used by runtime defensive
+/// checks. Lua may inspect declaration syntax, but graph compatibility and
+/// product coverage have exactly one implementation: `ConcreteType`.
+fn install_semantic_type(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
+    let semantic_type = lua.create_table()?;
+    let accepts = lua.create_function(|lua, (target, source): (Value, Value)| {
+        let target: JsonValue = lua.from_value(target)?;
+        let source: JsonValue = lua.from_value(source)?;
+        let target = nefor_mag::json::concrete_type_from_json(&target)
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        let source = nefor_mag::json::concrete_type_from_json(&source)
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        Ok(target.accepts_edge_source(&source))
+    })?;
+    semantic_type.set("accepts", accepts)?;
+
+    let input_covered_by = lua.create_function(|lua, (target, sources): (Value, Value)| {
+        let target: JsonValue = lua.from_value(target)?;
+        let sources: JsonValue = lua.from_value(sources)?;
+        let target = nefor_mag::json::concrete_type_from_json(&target)
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        let sources = sources
+            .as_array()
+            .ok_or_else(|| mlua::Error::runtime("semantic product sources must be a list"))?;
+        let sources = sources
+            .iter()
+            .map(nefor_mag::json::concrete_type_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        Ok(target.input_is_covered_by(&sources))
+    })?;
+    semantic_type.set("input_covered_by", input_covered_by)?;
+    nefor_tbl.set("semantic_type", semantic_type)?;
     Ok(())
 }
 

@@ -7,8 +7,10 @@ protocol; the compiler proves which `T` instantiated the foreign contract.
 
 MAG has no graph syntax or graph-specific lowering pass. It evaluates pure,
 typed library code. The shipped Nefor libraries represent actors, ports,
-routes, messages, rules, and result selection as ordinary nominal data, validate
-that data, and return the one host-recognized wrapper:
+routes, messages, rules, and result selection as nominal data whose semantic
+fields contain opaque compiler descriptors. Graph validation delegates
+compatibility and product coverage to the compiler rather than interpreting
+descriptor maps in MAG, then returns the one host-recognized wrapper:
 
 ```lisp
 (artifact "nefor.graph-modification/v1" modification-data)
@@ -36,7 +38,7 @@ there are no compiler builtins named `agent`, `bash`, `graph`, `subgraph`, or
 A typed port records two identities:
 
 - `type`: a compiler-created `TypeTag<T>` witness, used by generic library
-  composition and lowered to a versioned structural descriptor;
+  composition and lowered to a complete canonical structural descriptor;
 - `wire`: the runtime tag emitted or accepted by the foreign implementation.
 
 This lets an agent node expose `(CodeAudit | AgentError)` on the stable
@@ -54,14 +56,20 @@ inputs and are checked again by `nefor.graph.validate` before lowering.
 ## Runtime artifact
 
 `nefor.graph.lower` produces only the graph-modification data consumed by the
-kernel: actors, typed routes, initial messages, kills, rules, and structural
-result metadata. A `source<T>` node owns initial activation. A concrete
+kernel: actors, typed routes, typed initial messages, kills, rules, and
+structural result metadata. Each authored initial message retains its
+destination descriptor as `semantic_type` even though the current factory
+protocol still consumes `content.kind`. A `source<T>` node owns initial
+activation. A concrete
 `output<T>` identity actor is the unique terminal, and the structural result
 metadata selects that actor's output port.
 
 The runtime binds each qualified foreign identity to an implementation and
 revalidates its concrete input/output contract as exact semantic-type/runtime-
-wire pairs. It remains authoritative for
+wire pairs. Rust's `ConcreteType` relation is the single owner of semantic
+edge compatibility and product coverage; Lua validates protocol wiring and
+delegates non-trivial semantic checks to that host relation. The runtime
+remains authoritative for
 typed firing, sender-bound product slots, routing, lifecycle, failure handling,
 and result completion.
 

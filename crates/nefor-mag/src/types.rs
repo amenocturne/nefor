@@ -176,6 +176,51 @@ impl ConcreteType {
             _ => false,
         }
     }
+
+    /// Compatibility for one graph edge. A product consumer may receive the
+    /// complete tuple or one source statically assigned to a component
+    /// occurrence; aggregate coverage is checked separately.
+    pub fn accepts_edge_source(&self, actual: &Self) -> bool {
+        self.accepts(actual)
+            || matches!(self, Self::Product { items } if items.iter().any(|item| item.accepts(actual)))
+    }
+
+    /// Whether incoming edge types completely supply this input. Ordinary
+    /// inputs need no aggregate coverage check. Product inputs accept either
+    /// one whole-product edge or one compatible edge per ordered occurrence.
+    ///
+    /// Retaining the successful occurrence assignment is a lowering concern;
+    /// this predicate owns only the compatibility-backed coverage decision.
+    pub fn input_is_covered_by(&self, sources: &[Self]) -> bool {
+        let Self::Product { items } = self else {
+            return true;
+        };
+        if sources.len() == 1 && sources[0] == *self {
+            return true;
+        }
+        product_components_cover(items, sources)
+    }
+}
+
+fn product_components_cover(components: &[ConcreteType], sources: &[ConcreteType]) -> bool {
+    if components.len() != sources.len() {
+        return false;
+    }
+    let Some((source, remaining_sources)) = sources.split_first() else {
+        return true;
+    };
+    components.iter().enumerate().any(|(index, component)| {
+        component.accepts(source)
+            && product_components_cover(
+                &components
+                    .iter()
+                    .enumerate()
+                    .filter(|(candidate, _)| *candidate != index)
+                    .map(|(_, component)| component.clone())
+                    .collect::<Vec<_>>(),
+                remaining_sources,
+            )
+    })
 }
 
 fn resolve(
@@ -485,6 +530,25 @@ mod tests {
         };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0], items[1]);
+    }
+
+    #[test]
+    fn graph_edges_use_central_compatibility_and_products_require_occurrences() {
+        let text =
+            ConcreteType::resolve(&env_with_types(), &MagType::Named("main.Z".into(), vec![]))
+                .unwrap();
+        let int =
+            ConcreteType::resolve(&env_with_types(), &MagType::Named("main.X".into(), vec![]))
+                .unwrap();
+        let pair = ConcreteType::Product {
+            items: vec![text.clone(), text.clone()],
+        };
+        assert!(pair.accepts_edge_source(&text));
+        assert!(!pair.accepts_edge_source(&int));
+        assert!(pair.input_is_covered_by(std::slice::from_ref(&pair)));
+        assert!(pair.input_is_covered_by(&[text.clone(), text.clone()]));
+        assert!(!pair.input_is_covered_by(std::slice::from_ref(&text)));
+        assert!(!pair.input_is_covered_by(&[text, int]));
     }
 
     #[test]

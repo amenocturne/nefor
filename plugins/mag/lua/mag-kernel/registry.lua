@@ -39,57 +39,22 @@ local function compatible_output_type(expected, actual)
   return expected.kind == "named" and actual.kind == "named"
 end
 
--- A route delivers one producer value into a consumer activation. Exact
--- semantic identity is the ordinary case; union and product activations also
--- accept compatible component values. Product multiplicity is checked from
--- the sender-bound route slots after the whole modification is validated.
 local function accepts_semantic(target, source)
   if type_node.equal(target, source) then return true end
-  if target.kind == "union" then
-    if source.kind == "union" then
-      for _, source_item in ipairs(source.items or {}) do
-        if not accepts_semantic(target, source_item) then return false end
-      end
-      return true
-    end
-    for _, target_item in ipairs(target.items or {}) do
-      if accepts_semantic(target_item, source) then return true end
-    end
-    return false
+  local host = nefor and nefor.semantic_type
+  if type(host) ~= "table" or type(host.accepts) ~= "function" then
+    error("registry requires compiler semantic_type.accepts")
   end
-  if target.kind == "product" then
-    for _, target_item in ipairs(target.items or {}) do
-      if accepts_semantic(target_item, source) then return true end
-    end
-  end
-  return false
-end
-
-local function without_index(values, removed)
-  local out = {}
-  for index, value in ipairs(values) do
-    if index ~= removed then out[#out + 1] = value end
-  end
-  return out
-end
-
-local function product_components_cover(components, sources)
-  if #components ~= #sources then return false end
-  if #sources == 0 then return true end
-  local source = sources[1]
-  local remaining_sources = without_index(sources, 1)
-  for index, component in ipairs(components) do
-    if accepts_semantic(component, source) and
-        product_components_cover(without_index(components, index), remaining_sources) then
-      return true
-    end
-  end
-  return false
+  return host.accepts(target, source)
 end
 
 local function product_input_covered(target, sources)
-  return (#sources == 1 and type_node.equal(target, sources[1])) or
-      product_components_cover(target.items or {}, sources)
+  if #sources == 1 and type_node.equal(target, sources[1]) then return true end
+  local host = nefor and nefor.semantic_type
+  if type(host) ~= "table" or type(host.input_covered_by) ~= "function" then
+    error("registry requires compiler semantic_type.input_covered_by")
+  end
+  return host.input_covered_by(target, sources)
 end
 
 -- Kernel-synthesized status types (docs/ir.md, Firing: "Reserved status types

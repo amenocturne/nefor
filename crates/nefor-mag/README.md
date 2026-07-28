@@ -90,10 +90,12 @@ capabilities, artifacts, type tags, unresolved variables, and maps with
 non-string keys fail while loading the MAG program.
 
 The schema and `(type-evidence ...)` descriptors are transport-neutral opaque
-values. They serialize only when the compiler constructs an artifact; maps
-cannot forge them. Nefor's structured-agent library chooses JSON as one
-external encoding, while the MAG compiler itself has no provider, LLM,
-prompting, or retry behavior.
+values. They serialize only when the compiler constructs an artifact; named
+descriptors include their concrete substituted bodies, and maps cannot forge
+them. Descriptor compatibility and graph product coverage are compiler
+operations rather than library-side inspection of `kind`/`items`. Nefor's
+structured-agent library chooses JSON as one external encoding, while the MAG
+compiler itself has no provider, LLM, prompting, or retry behavior.
 
 Semantic type identities use compiler-created witnesses rather than strings:
 

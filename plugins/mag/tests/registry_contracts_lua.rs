@@ -1,6 +1,48 @@
 use std::path::PathBuf;
 
-use mlua::{Function, Lua};
+use mlua::{Function, Lua, LuaSerdeExt, Value};
+
+fn install_semantic_type(lua: &Lua) {
+    let nefor = lua.create_table().unwrap();
+    let semantic_type = lua.create_table().unwrap();
+    semantic_type
+        .set(
+            "accepts",
+            lua.create_function(|lua, (target, source): (Value, Value)| {
+                let target: serde_json::Value = lua.from_value(target)?;
+                let source: serde_json::Value = lua.from_value(source)?;
+                let target = nefor_mag::json::concrete_type_from_json(&target)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                let source = nefor_mag::json::concrete_type_from_json(&source)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                Ok(target.accepts_edge_source(&source))
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    semantic_type
+        .set(
+            "input_covered_by",
+            lua.create_function(|lua, (target, sources): (Value, Value)| {
+                let target: serde_json::Value = lua.from_value(target)?;
+                let sources: serde_json::Value = lua.from_value(sources)?;
+                let target = nefor_mag::json::concrete_type_from_json(&target)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                let sources = sources
+                    .as_array()
+                    .ok_or_else(|| mlua::Error::runtime("sources must be a list"))?
+                    .iter()
+                    .map(nefor_mag::json::concrete_type_from_json)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                Ok(target.input_is_covered_by(&sources))
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    nefor.set("semantic_type", semantic_type).unwrap();
+    lua.globals().set("nefor", nefor).unwrap();
+}
 
 fn kernel_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel")
@@ -59,6 +101,7 @@ fn registry_exposes_qualified_serializable_contracts() {
 #[test]
 fn registry_requires_compiler_specialization_for_generic_factories() {
     let lua = Lua::new();
+    install_semantic_type(&lua);
     let package: mlua::Table = lua.globals().get("package").unwrap();
     let current: String = package.get("path").unwrap();
     let root = kernel_dir();

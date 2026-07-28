@@ -12,7 +12,8 @@ Dynamic routes to static actors are validated against the live inventory
 atomically with new actors.
 
 The artifact carries version-2 structural type nodes directly: primitives,
-qualified nominal applications, lists, maps, records, unions, and products.
+qualified nominal applications with their concrete substituted bodies, lists,
+maps, records, unions, and products.
 Registry schemes use the same representation plus explicit variables. The
 runtime validates every node recursively, substitutes concrete arguments, and
 compares the result structurally; it never reparses a display string. Functions,
@@ -23,7 +24,9 @@ Registry semantic endpoints are declared as `{wire, type}` pairs. Validation
 checks each instantiated pair, so matching the set of wires and the set of
 union arms independently is insufficient: swapping two union types between
 their wires rejects before any actor is spawned. Dynamic routes additionally
-require the source and destination structural types to be equal.
+require compatibility according to the same Rust `ConcreteType` relation used
+while compiling the graph. Lua does not maintain a second union/product
+compatibility algorithm.
 Registration first requires the semantic input/output wire sets to exactly
 match the factory's runtime shapes. Every factory carrying such a semantic
 contract requires compiler evidence, including non-generic factories; only
@@ -80,7 +83,7 @@ logic primitives — logic lives in MAG, reached through the evaluator.
 ```json
 {
   "actors": [{ "id": "...", "factory": "...", "params": {}, "routes": {} }],
-  "messages": [{ "to": "...", "content": {} }],
+  "messages": [{ "to": "...", "semantic_type": {}, "content": {} }],
   "kills": ["..."],
   "rules": [{ "id": "expand", "on": { "actor": "planner", "wire": "tasks.Valid" }, "fn": "expand" }]
 }
@@ -98,8 +101,9 @@ logic primitives — logic lives in MAG, reached through the evaluator.
   array of destination ids; the authoring graph's edges dissolve here. A
   union exit becomes multiple keys; one type to many targets is fanout with
   no special casing. See lowering.md for the authoring-to-artifact mapping.
-- `messages` — sends: initial activation for new actors, inputs for
-  existing ones.
+- `messages` — sends: initial activation for new actors, inputs for existing
+  ones. Compiler-authored messages retain the concrete destination descriptor;
+  the current runtime still delivers the private protocol `content`.
 - `kills` — ids to remove. Kill removes actors and voids late outputs; it is
   not currently a general routeable failure output.
 - `rules` — immutable initial subscriptions. Each names a concrete source

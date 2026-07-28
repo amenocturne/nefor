@@ -72,7 +72,7 @@ fn selected_sum_payload(value: &Value) -> Option<(&MagType, &Value)> {
     }
 }
 
-pub(crate) fn concrete_type_to_json(
+pub fn concrete_type_to_json(
     ty: &crate::types::ConcreteType,
 ) -> Result<serde_json::Value, MagError> {
     use crate::types::ConcreteType;
@@ -85,11 +85,14 @@ pub(crate) fn concrete_type_to_json(
         ConcreteType::Float => primitive("Float"),
         ConcreteType::String => primitive("String"),
         ConcreteType::Named {
-            name, arguments, ..
+            name,
+            arguments,
+            body,
         } => serde_json::json!({
             "kind": "named",
             "name": name,
             "arguments": arguments.iter().map(concrete_type_to_json).collect::<Result<Vec<_>, _>>()?,
+            "body": concrete_type_to_json(body)?,
         }),
         ConcreteType::List { item } => serde_json::json!({
             "kind": "list", "item": concrete_type_to_json(item)?
@@ -114,6 +117,171 @@ pub(crate) fn concrete_type_to_json(
             "items": items.iter().map(concrete_type_to_json).collect::<Result<Vec<_>, _>>()?,
         }),
     })
+}
+
+/// Decode the canonical descriptor representation emitted into MAG artifacts.
+/// Runtime callers use this before applying the compiler's compatibility
+/// relation, so arbitrary Lua tables never become semantic authority.
+pub fn concrete_type_from_json(
+    value: &serde_json::Value,
+) -> Result<crate::types::ConcreteType, MagError> {
+    use crate::types::ConcreteType;
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| MagError::Type("semantic descriptor must be an object".into()))?;
+    let kind = string_field(object, "kind")?;
+    let descriptor = match kind {
+        "primitive" => match string_field(object, "name")? {
+            "JsonValue" => ConcreteType::JsonValue,
+            "Unit" => ConcreteType::Unit,
+            "Bool" => ConcreteType::Bool,
+            "Int" => ConcreteType::Int,
+            "Float" => ConcreteType::Float,
+            "String" => ConcreteType::String,
+            name => {
+                return Err(MagError::Type(format!(
+                    "unknown semantic primitive {name:?}"
+                )))
+            }
+        },
+        "named" => ConcreteType::Named {
+            name: string_field(object, "name")?.to_owned(),
+            arguments: descriptor_list(object, "arguments")?,
+            // Compiler artifacts include the body. Separately-owned Lua
+            // declarations and direct kernel fixtures name nominal
+            // constructors without embedding MAG definitions; those nodes
+            // are usable for nominal compatibility but not stable identity.
+            body: Box::new(match object.get("body") {
+                Some(body) => concrete_type_from_json(body)?,
+                None => ConcreteType::Unit,
+            }),
+        },
+        "list" => ConcreteType::List {
+            item: Box::new(concrete_type_from_json(object.get("item").ok_or_else(
+                || MagError::Type("list semantic descriptor needs item".into()),
+            )?)?),
+        },
+        "map" => ConcreteType::Map {
+            key: Box::new(concrete_type_from_json(object.get("key").ok_or_else(
+                || MagError::Type("map semantic descriptor needs key".into()),
+            )?)?),
+            value: Box::new(concrete_type_from_json(object.get("value").ok_or_else(
+                || MagError::Type("map semantic descriptor needs value".into()),
+            )?)?),
+        },
+        "record" => {
+            let fields = object
+                .get("fields")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| MagError::Type("record semantic descriptor needs fields".into()))?;
+            let mut decoded = BTreeMap::new();
+            let mut previous: Option<&str> = None;
+            for field in fields {
+                let field = field.as_object().ok_or_else(|| {
+                    MagError::Type("record descriptor field must be an object".into())
+                })?;
+                let name = string_field(field, "name")?;
+                if previous.is_some_and(|previous| previous >= name) {
+                    return Err(MagError::Type(
+                        "record descriptor fields must be uniquely sorted".into(),
+                    ));
+                }
+                previous = Some(name);
+                let ty =
+                    concrete_type_from_json(field.get("type").ok_or_else(|| {
+                        MagError::Type("record descriptor field needs type".into())
+                    })?)?;
+                decoded.insert(name.to_owned(), ty);
+            }
+            ConcreteType::Record { fields: decoded }
+        }
+        "union" => {
+            let arms = descriptor_list(object, "items")?;
+            if arms.len() < 2
+                || arms
+                    != arms
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+            {
+                return Err(MagError::Type(
+                    "sum descriptor arms must be canonical, unique, and sorted".into(),
+                ));
+            }
+            ConcreteType::Sum { arms }
+        }
+        "product" => {
+            let items = descriptor_list(object, "items")?;
+            if items.len() < 2 {
+                return Err(MagError::Type(
+                    "product semantic descriptor needs at least two items".into(),
+                ));
+            }
+            ConcreteType::Product { items }
+        }
+        other => {
+            return Err(MagError::Type(format!(
+                "unknown semantic descriptor kind {other:?}"
+            )))
+        }
+    };
+    let canonical = concrete_type_to_json(&descriptor)?;
+    if canonical != fill_missing_named_bodies(value) {
+        return Err(MagError::Type(
+            "semantic descriptor is not in canonical compiler form".into(),
+        ));
+    }
+    Ok(descriptor)
+}
+
+fn fill_missing_named_bodies(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(fill_missing_named_bodies).collect())
+        }
+        serde_json::Value::Object(object) => {
+            let mut object = object
+                .iter()
+                .map(|(key, value)| (key.clone(), fill_missing_named_bodies(value)))
+                .collect::<serde_json::Map<_, _>>();
+            if object.get("kind").and_then(serde_json::Value::as_str) == Some("named")
+                && !object.contains_key("body")
+            {
+                object.insert(
+                    "body".into(),
+                    serde_json::json!({"kind":"primitive","name":"Unit"}),
+                );
+            }
+            serde_json::Value::Object(object)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, MagError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| MagError::Type(format!("semantic descriptor needs string {field}")))
+}
+
+fn descriptor_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<crate::types::ConcreteType>, MagError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| MagError::Type(format!("semantic descriptor needs list {field}")))?
+        .iter()
+        .map(concrete_type_from_json)
+        .collect()
 }
 
 pub fn json_to_value(value: &serde_json::Value) -> Value {
@@ -254,4 +422,30 @@ pub fn json_to_typed_value(
             )))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ConcreteType;
+
+    #[test]
+    fn canonical_semantic_descriptors_round_trip_and_reject_forged_shape() {
+        let descriptor = ConcreteType::Named {
+            name: "main.Payload".into(),
+            arguments: vec![],
+            body: Box::new(ConcreteType::Record {
+                fields: BTreeMap::from([("value".into(), ConcreteType::Int)]),
+            }),
+        };
+        let encoded = concrete_type_to_json(&descriptor).unwrap();
+        assert_eq!(concrete_type_from_json(&encoded).unwrap(), descriptor);
+
+        let mut forged = encoded;
+        forged
+            .as_object_mut()
+            .unwrap()
+            .insert("wire".into(), serde_json::json!("not-semantic"));
+        assert!(concrete_type_from_json(&forged).is_err());
+    }
 }
