@@ -471,6 +471,75 @@ fn nominal_values_require_explicit_refinement() {
 }
 
 #[test]
+fn sum_refinement_preserves_explicit_leaf_constructor_evidence() {
+    let root = workspace("sum-constructor-evidence");
+    let artifact = compile(
+        r#"
+          (type X {:value Int})
+          (type Y {:value Int})
+          (type XY (| X Y))
+          (type Nested (| XY X))
+          (def generic (fn [T] [[value T]] -> T value))
+          (def x (as X {:value 1}))
+          (def selected (as Nested (generic (as XY x))))
+          (artifact "test.sum-evidence/v1" (as X selected))
+        "#,
+        &root,
+    )
+    .unwrap();
+
+    assert_eq!(artifact.data, json!({"value": 1}));
+}
+
+#[test]
+fn sum_refinement_rejects_lookalikes_without_matching_constructor_evidence() {
+    let root = workspace("sum-constructor-rejection");
+    let untagged = compile(
+        r#"
+          (type X {:value Int})
+          (type Y {:value Int})
+          (artifact "test.sum-evidence/v1" (as (| X Y) {:value 1}))
+        "#,
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        untagged.contains("no explicit constructor evidence"),
+        "{untagged}"
+    );
+
+    let lookalike = compile(
+        r#"
+          (type X {:value Int})
+          (type Y {:value Int})
+          (def selected (as (| X Y) (as X {:value 1})))
+          (artifact "test.sum-evidence/v1" (as Y selected))
+        "#,
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        lookalike.contains("cannot replace constructor evidence"),
+        "{lookalike}"
+    );
+
+    let invalid = compile(
+        r#"
+          (type X {:value Int})
+          (type Y {:value Int})
+          (type Z {:value Int})
+          (artifact "test.sum-evidence/v1" (as (| X Y) (as Z {:value 1})))
+        "#,
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(invalid.contains("not accepted"), "{invalid}");
+}
+
+#[test]
 fn explicit_record_refinement_reports_missing_and_unexpected_fields() {
     let root = workspace("exact-refinement");
     let error = compile(

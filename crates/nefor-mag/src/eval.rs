@@ -282,8 +282,7 @@ fn eval_as(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     arity(args, 2)?;
     let ty = parse_type(env, &args[0], &HashSet::new())?;
     let value = eval_expr(env, &args[1])?;
-    validate_value(env, &value, &ty)?;
-    Ok(Value::Typed(std::sync::Arc::new(raw(&value).clone()), ty))
+    checked_typed_value(env, value, ty)
 }
 
 fn eval_type_tag(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
@@ -634,6 +633,54 @@ fn record_field_diff(env: &Env, value: &Value, ty: &MagType) -> Option<String> {
     Some(details.join("; "))
 }
 
+fn checked_typed_value(env: &Env, value: Value, ty: MagType) -> Result<Value, MagError> {
+    validate_value(env, &value, &ty)?;
+    let Ok(accepted) = crate::types::ConcreteType::resolve(env, &ty) else {
+        return Ok(Value::Typed(std::sync::Arc::new(value), ty));
+    };
+    let selected = explicit_constructor(env, &value)?;
+    match (&accepted, selected) {
+        (crate::types::ConcreteType::Sum { .. }, Some(constructor))
+            if accepted.accepts(&constructor) => {}
+        (crate::types::ConcreteType::Sum { .. }, Some(constructor)) => {
+            return Err(MagError::Type(format!(
+                "constructor {constructor:?} is not accepted by {accepted:?}"
+            )));
+        }
+        (crate::types::ConcreteType::Sum { .. }, None) => {
+            return Err(MagError::Type(format!(
+                "value has no explicit constructor evidence accepted by {accepted:?}"
+            )));
+        }
+        (crate::types::ConcreteType::Named { .. }, Some(constructor))
+            if constructor != accepted =>
+        {
+            return Err(MagError::Type(format!(
+                "cannot replace constructor evidence {constructor:?} with {accepted:?}"
+            )));
+        }
+        _ => {}
+    }
+    Ok(Value::Typed(std::sync::Arc::new(value), ty))
+}
+
+fn explicit_constructor(
+    env: &Env,
+    value: &Value,
+) -> Result<Option<crate::types::ConcreteType>, MagError> {
+    let mut current = value;
+    while let Value::Typed(inner, evidence) = current {
+        match crate::types::ConcreteType::resolve(env, evidence)? {
+            constructor @ crate::types::ConcreteType::Named { .. } => {
+                return Ok(Some(constructor));
+            }
+            crate::types::ConcreteType::Sum { .. } => current = inner,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError> {
     let original = value;
     let value = raw(value);
@@ -751,7 +798,7 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
                 out = eval_expr(&mut env, expr)?;
             }
             validate_value(caller, &out, &expected_return)?;
-            let result = Value::Typed(std::sync::Arc::new(out), expected_return);
+            let result = checked_typed_value(caller, out, expected_return)?;
             caller.memoize_call(fun, args, &result);
             Ok(result)
         }
