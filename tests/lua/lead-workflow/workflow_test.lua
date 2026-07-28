@@ -991,6 +991,30 @@ do
     .. json.encode(_test.calls()))
 end
 
+-- Structured-output actors carry the compiler-checked OptionalIdentifier
+-- record rather than the plain string used by the untyped llm factory.
+do
+  fresh()
+  write_mag_file("firing-typed-profile-write", "typed-profile.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-typed-profile", "typed-profile.mag")
+  local m = read_only_modification()
+  m.actors[2].foreign = "nefor.factory.structured-output"
+  m.actors[2].params.profile = { present = true, value = "standard" }
+  feed_loaded(m)
+  local exec = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+  end)
+  assert_true(exec ~= nil, "a typed OptionalIdentifier profile executes")
+  local patch = exec.body.params_overlay["worker.llm"]
+  assert_eq(patch.provider, starter_profiles.standard.provider,
+    "typed profile resolves provider")
+  assert_eq(patch.model, starter_profiles.standard.model,
+    "typed profile resolves model")
+  assert_eq(patch.reasoning_effort, starter_profiles.standard.reasoning_effort,
+    "typed profile resolves effort")
+end
+
 do
   with_profiles({ zeta = starter_profiles.standard, alpha = starter_profiles.fast }, function()
     fresh()

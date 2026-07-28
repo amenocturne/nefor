@@ -328,12 +328,18 @@ local function lead_program_module_roots(source_dir)
   return roots
 end
 
--- Deep-copy plain data (the cached modification / history are cloned per
--- turn so per-turn mutation never leaks into the cache).
+-- Deep-copy JSON-shaped data (the cached modification / history are cloned
+-- per turn so per-turn mutation never leaks into the cache). Decoded JSON
+-- arrays carry a private mlua metatable, which is the only distinction
+-- between an empty `[]` and `{}`; semantic type descriptors rely on it.
 local function deep_clone(value)
   if type(value) ~= "table" then return value end
   local out = {}
   for k, v in pairs(value) do out[k] = deep_clone(v) end
+  if type(nefor.json.is_array) == "function" and nefor.json.is_array(value)
+      and type(nefor.json.mark_array) == "function" then
+    nefor.json.mark_array(out)
+  end
   return out
 end
 

@@ -165,6 +165,13 @@ end
 -- its source, entry, and llm seams from this, never hardcodes them).
 local function lead_artifact()
   return { format = "nefor.graph-modification/v1", data = {
+    types = {
+      task = {
+        kind = "named",
+        name = "nefor.contracts.Task",
+        arguments = json.decode("[]"),
+      },
+    },
     actors = {
       {
         id = "lead.source", foreign = "nefor.factory.source",
@@ -383,6 +390,8 @@ do
     "the source activation remains a Unit message")
   assert_eq(task_prompt(mod), "hello lead",
     "the literal first user message replaces the source's typed task value")
+  assert(json.is_array(mod.types.task.arguments),
+    "cloning the compiled artifact preserves empty descriptor arrays")
   local overlay = exec.body.params_overlay["lead.llm"]
   assert(type(overlay) == "table", "params overlay keys the derived llm actor")
   -- The base system prompt leads, with the ambient MAG-workspace block

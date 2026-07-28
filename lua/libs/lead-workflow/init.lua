@@ -340,6 +340,14 @@ local function is_llm_actor(actor)
       or actor.foreign == "nefor.factory.structured-output"
 end
 
+local function selected_profile(value)
+  if type(value) == "string" then return value end
+  if type(value) == "table" and value.present == true then
+    return value.value
+  end
+  return nil
+end
+
 -- Resolve runtime-owned LLM parameters over an artifact's actors. A raw actor
 -- may select an explicit profile or reasoning effort; composition-provided
 -- ready agents omit both and receive the configured defaults. The runtime
@@ -350,7 +358,7 @@ local function resolve_agent_params(actors)
   local profiles_err
   for _, actor in ipairs(actors or {}) do
     local params = type(actor.params) == "table" and actor.params or {}
-    local profile_name = params.profile
+    local profile_name = selected_profile(params.profile)
     local has_raw_effort = params.reasoning_effort ~= nil
     if profile_name ~= nil and has_raw_effort then
       return nil, "actor '" .. tostring(actor.id) ..
