@@ -28,9 +28,9 @@
      :kills []})))
 
 ;; Every agent has one public result port with semantic type `O | AgentError`.
-;; The stable result wire keeps whole-union chaining ordinary; `select-result`
-;; below introduces distinct runtime ports only when a lead wants to route the
-;; variants independently.
+;; The stable result wire carries the selected constructor identity. Ordinary
+;; edges route compatible arms directly; `result-arm` creates a typed resident
+;; subscription on that same actor/wire without inserting a selector actor.
 (def agent (fn [I O] [[config AgentConfig] [input-type (TypeTag I)]
                 [input-wire String] [output-type (TypeTag O)]]
   -> (nefor.graph.Node I (| O nefor.contracts.AgentError))
@@ -79,6 +79,9 @@
           :system (get config "system")
           :tools (or (get config "tools") (as (List String) []))
           :schema (type-schema output-type)
+          :output_type (type-id (type-evidence output-type))
+          :error_type
+            (type-id (type-evidence (type-tag nefor.contracts.AgentError)))
           :provider_error_type
             (type-id (type-evidence (type-tag nefor.contracts.ProviderError)))
           :validation_error_type
@@ -105,30 +108,11 @@
      :input entry-in
      :output result}))))
 
-(def select-result (fn [I O]
+(def result-arm (fn [I O T]
   [[fragment (nefor.graph.Node I (| O nefor.contracts.AgentError))]
-   [id String]]
-  -> (BranchNode I O nefor.contracts.AgentError)
-  (let [selector-id (str id ".select-result")
-        selector-in (nefor.graph.port selector-id
-                      (type-tag (| O nefor.contracts.AgentError))
-                      "nefor.agent.Result")
-        success (nefor.graph.port selector-id (type-tag O) "nefor.agent.Output")
-        failure (nefor.graph.port selector-id
-                  (type-tag nefor.contracts.AgentError) "nefor.agent.Error")]
-    (as (BranchNode I O nefor.contracts.AgentError)
-      {:id id :actors (concat (get fragment "actors")
-        [(nefor.graph.actor selector-id
-          (specialize nefor.factory.select-agent-result [O])
-          (as nefor.contracts.SelectAgentResultParams {})
-          (nefor.graph.store-port selector-in)
-          [(nefor.graph.store-port success) (nefor.graph.store-port failure)])])
-       :routes (concat (get fragment "routes")
-         [(nefor.graph.stored-route (get fragment "output") selector-in)])
-       :messages (get fragment "messages")
-       :input (get fragment "input")
-       :first success
-       :second failure}))))
+   [type (TypeTag T)]] -> (nefor.graph.Port T)
+  (let [result (get fragment "output")]
+    (nefor.graph.port (get result "actor") type (get result "wire")))))
 
 (def approval-gate (fn [[config ApprovalConfig]]
   -> (BranchNode nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)

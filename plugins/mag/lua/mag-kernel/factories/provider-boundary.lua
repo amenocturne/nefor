@@ -175,7 +175,12 @@ function M.construct(id, params, emit, options)
       content = type(result.text) == "string" and result.text or "",
       tool_calls = wire_calls,
     })
-    state:emit({ kind = "generic-tool.ToolCalls", calls = calls })
+    local semantic_calls = {}
+    for i, call in ipairs(calls) do
+      semantic_calls[i] = { name = call.name, arguments = call.args }
+    end
+    state:emit({ kind = "generic-tool.ToolCalls",
+      value = { calls = semantic_calls }, calls = calls })
     state:emit({ kind = kinds.complete })
     awaiting_continuation = true
   end

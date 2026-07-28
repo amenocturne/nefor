@@ -106,7 +106,8 @@ function M.construct(id, params, emit, deps)
     for i, r in ipairs(results) do
       messages[i] = to_message(r)
     end
-    emit(sign({ kind = "generic-provider.ProviderOut", messages = messages }))
+    emit(sign({ kind = "generic-provider.ProviderOut",
+      value = { content = messages }, messages = messages }))
     return { status = "ok" }
   end
 

@@ -15,7 +15,10 @@
              :input StoredPort
              :outputs (List StoredPort)})
 (type StoredRoute {:id String :from StoredPort :to StoredPort})
-(type Message {:to StoredPort :content PackedValue})
+(type Message {:to StoredPort
+               :semantic_type TypeDescriptor
+               :semantic_type_id SemanticTypeId
+               :content PackedValue})
 (type Rule {:id String :on StoredPort :fn String})
 (type StoredNode {:id String
                   :role String
@@ -124,12 +127,19 @@
             :route (stored-route (get from "output") (get to "input"))})))
 
 (def stored-message (fn [P] [[to StoredPort] [content P]] -> Message
-  (as Message {:to to :content (pack content)})))
+  (as Message {:to to
+               :semantic_type (get to "type")
+               :semantic_type_id (get to "type_id")
+               :content (pack content)})))
 (def message (fn [T P] [[to (Port T)] [content P]] -> Message
   (stored-message (store-port to) content)))
 (def typed-message (fn [T] [[to (Port T)] [value T]] -> Message
-  (as Message {:to (store-port to)
-               :content (pack {:kind (get to "wire") :value value})})))
+  (let [stored (store-port to)
+        selected (value-type-evidence value (get stored "type"))]
+    (as Message {:to stored
+                 :semantic_type selected
+                 :semantic_type_id (type-id selected)
+                 :content (pack {:kind (get to "wire") :value value})}))))
 (def rule (fn [T] [[id String] [on (Port T)] [fn-name String]] -> Rule
   (as Rule {:id id :on (store-port on) :fn fn-name})))
 
@@ -493,7 +503,10 @@
   (map (fn [[candidate Rule]] -> TypeDescriptor
          (get (get candidate "on") "type"))
        (filter (fn [[candidate Rule]] -> Bool
-                 (= (get candidate "on") output))
+                 (let [handler (get candidate "on")]
+                   (if (= (get handler "actor") (get output "actor"))
+                     (= (get handler "wire") (get output "wire"))
+                     false)))
                rules))))
 (def terminal-output? (fn [[value Graph] [output StoredPort]] -> Bool
   (not (= (count
@@ -641,8 +654,8 @@
 (def lower-message (fn [[value Message]] -> LowerMessage
   (let [to (get value "to")]
     (as LowerMessage {:to (get to "actor")
-                      :semantic_type (get to "type")
-                      :semantic_type_id (get to "type_id")
+                      :semantic_type (get value "semantic_type")
+                      :semantic_type_id (get value "semantic_type_id")
                       :content (get value "content")}))))
 (def lower-rule (fn [[value Rule]] -> LowerRule
   (as LowerRule {:id (get value "id") :on (get value "on") :fn (get value "fn")})))
@@ -662,7 +675,7 @@
             routes)))
 (def message-descriptors (fn [[messages (List Message)]] -> (List TypeDescriptor)
   (map (fn [[candidate Message]] -> TypeDescriptor
-         (get (get candidate "to") "type"))
+         (get candidate "semantic_type"))
        messages)))
 (def rule-descriptors (fn [[rules (List Rule)]] -> (List TypeDescriptor)
   (map (fn [[candidate Rule]] -> TypeDescriptor

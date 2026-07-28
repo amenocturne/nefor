@@ -30,7 +30,7 @@ M.__index = M
 --                 by the caller (see routing.lua, derive_slots). Ignored for
 --                 single/union, which carry no per-slot accumulation.
 function M.build(input_shape, slot_edges, semantic)
-  local kind = assert(shape.classify(input_shape))
+  local kind = semantic and semantic.kind or assert(shape.classify(input_shape))
   local self = setmetatable({
     kind = kind,
     tags = {},

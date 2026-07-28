@@ -135,7 +135,8 @@ function M.construct(id, params, emit, deps)
     for i = 1, batch.expected do
       results[i] = batch.results[i]
     end
-    emit(sign({ kind = "generic-tool.ToolHandle", results = results }))
+    emit(sign({ kind = "generic-tool.ToolHandle",
+      value = { results = results }, results = results }))
     -- Deferred completion resolves: async success so the kernel emits mag.Unit
     -- along dependency edges. The reply delivery returns nil.
     emit(sign({ kind = kinds.complete }))
@@ -172,7 +173,8 @@ function M.construct(id, params, emit, deps)
     -- complete synchronously rather than deferring on zero outstanding calls
     -- (which would never resolve). (Flagged.)
     if #calls == 0 then
-      emit(sign({ kind = "generic-tool.ToolHandle", results = {} }))
+      emit(sign({ kind = "generic-tool.ToolHandle",
+        value = { results = {} }, results = {} }))
       return { status = "ok" }
     end
 

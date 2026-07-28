@@ -45,7 +45,6 @@ M.declaration = {
       {wire="generic-provider.FinalAnswer",type={kind="variable",name="T"}},
       {wire="mag.Text",type={kind="variable",name="T"}},
       {wire="human.Approved",type={kind="variable",name="T"}},
-      {wire="nefor.outcome.Result",type={kind="variable",name="T"}},
     },
     outputs={{wire=kinds.Unit,type={kind="primitive",name="Unit"}}},
   },
@@ -60,7 +59,7 @@ M.declaration = {
     -- (mag.Text — the bash capability node, factories/bash.lua); a gate
     -- program terminates in the human's approval (human.Approved —
     -- factories/human.lua, the gate template's exit).
-    final = { "generic-provider.FinalAnswer", "mag.Text", "human.Approved", "nefor.outcome.Result" },
+    final = { "generic-provider.FinalAnswer", "mag.Text", "human.Approved" },
   },
 
   -- Completion is kernel-synthesized; the sink itself emits no data output.

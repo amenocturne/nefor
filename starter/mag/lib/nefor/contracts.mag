@@ -5,11 +5,11 @@
 (require "core.types")
 
 (type Task {:prompt String})
-(type ProviderInput {:content String})
+(type ProviderInput {:content JsonValue})
 (type FinalAnswer {:content String})
-(type ToolCall {:name String :arguments (Map String String)})
+(type ToolCall {:name String :arguments JsonValue})
 (type ToolCalls {:calls (List ToolCall)})
-(type ToolHandle {:call ToolCall})
+(type ToolHandle {:results JsonValue})
 (type ToolResult {:content String})
 (type Approved {:content String})
 (type Rejected {:reason String})
@@ -65,13 +65,13 @@
                               :system String
                               :tools (List String)
                               :schema TypeSchema
+                              :output_type SemanticTypeId
+                              :error_type SemanticTypeId
                               :provider_error_type SemanticTypeId
                               :validation_error_type SemanticTypeId
                               :max_corrections Int})
-(type SelectAgentResultParams {})
 (type CollectorParams {:expected_senders (List String)})
 (type DynamicParams {})
-(type OutcomeParams {:error_type SemanticTypeId})
 
 (foreign nefor.factory.adapter [T]
   {:params AdapterParams
@@ -87,11 +87,6 @@
   {:params StructuredOutputParams
    :input ProviderInput
    :output (| ToolCalls (| T AgentError))})
-
-(foreign nefor.factory.select-agent-result [T]
-  {:params SelectAgentResultParams
-   :input (| T AgentError)
-   :output (| T AgentError)})
 
 (foreign nefor.factory.run-tool
   {:params RunToolParams
@@ -137,7 +132,3 @@
   {:params DynamicParams :input T :output T})
 (foreign nefor.factory.collected-prompt [T]
   {:params DynamicParams :input (List T) :output ProviderInput})
-(foreign nefor.factory.outcome [T]
-  {:params OutcomeParams
-   :input (| T AgentError)
-   :output (| T AgentError)})

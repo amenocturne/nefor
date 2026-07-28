@@ -30,6 +30,7 @@ M.declaration = {
   params = {
     model = "table?", profile = "table?", provider = "string",
     system = "string?", tools = "table?", history = "table?", schema = "table",
+    output_type = "string", error_type = "string",
     provider_error_type = "string", validation_error_type = "string",
     max_corrections = "number",
   },
@@ -92,22 +93,23 @@ function M.construct(id, params, emit)
       or params.max_corrections % 1 ~= 0 then
     return nil, string.format("structured-output '%s': params.max_corrections must be a non-negative integer", tostring(id))
   end
-  if type(params.provider_error_type) ~= "string"
+  if type(params.output_type) ~= "string" or type(params.error_type) ~= "string"
+      or type(params.provider_error_type) ~= "string"
       or type(params.validation_error_type) ~= "string" then
     return nil, string.format(
-      "structured-output '%s': compiler error constructor ids are required",
+      "structured-output '%s': compiler result constructor ids are required",
       tostring(id))
   end
   local corrections = 0
   local last_output = nefor.json.decode("null")
-  local function finish_result(state, variant, value)
-    local message = { kind=RESULT, variant=variant, value=value }
+  local function finish_result(state, type_id, value)
+    local message = { kind=RESULT, semantic_type_id=type_id, value=value }
     local delta = state:transcript_delta()
     if #delta > 0 then message.transcript_delta = delta end
     state:finish(message)
   end
   local function finish_error(state, reason_type, reason)
-    finish_result(state, "error", {
+    finish_result(state, params.error_type, {
       last_output=last_output, reason={type=reason_type,value=reason},
     })
   end
@@ -130,7 +132,13 @@ function M.construct(id, params, emit)
         state:append({ role = "assistant", content = text })
       end
       if validation.ok then
-        finish_result(state, "success", validation.value)
+        local value = validation.value
+        local selected = params.output_type
+        if type(params.schema.root) == "table" and params.schema.root.kind == "union" then
+          selected = value.type
+          value = value.value
+        end
+        finish_result(state, selected, value)
         return
       end
       if state:is_draining() then

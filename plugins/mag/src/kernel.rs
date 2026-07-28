@@ -586,6 +586,17 @@ fn install_semantic_type(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
     })?;
     semantic_type.set("accepts", accepts)?;
 
+    let validate_value = lua.create_function(|lua, (descriptor, value): (Value, Value)| {
+        let descriptor: JsonValue = lua.from_value(descriptor)?;
+        let descriptor = nefor_mag::json::concrete_type_from_json(&descriptor)
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        let schema = nefor_mag::schema::TypeSchema::from_concrete(&descriptor)
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        let value: JsonValue = lua.from_value(value)?;
+        lua.to_value(&schema.validate_value(value))
+    })?;
+    semantic_type.set("validate_value", validate_value)?;
+
     let input_covered_by = lua.create_function(|lua, (target, sources): (Value, Value)| {
         let target: JsonValue = lua.from_value(target)?;
         let sources: JsonValue = lua.from_value(sources)?;
@@ -1157,6 +1168,59 @@ mod tests {
     }
 
     #[test]
+    fn factory_output_with_correct_type_id_but_malformed_value_fails_the_run() {
+        let host = shipped_host();
+        let modification = compile_mag_source(
+            &host,
+            "malformed-typed-output",
+            r#"
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+(foreign nefor.factory.stub
+  {:params (Map String String)
+   :input nefor.contracts.Text
+   :output nefor.contracts.Text})
+(let [start (nefor.graph.source "start" (type-tag nefor.contracts.Text)
+              (as nefor.contracts.Text {:content "valid"}))
+      input (nefor.graph.port "broken" (type-tag nefor.contracts.Text) "stub.In")
+      output (nefor.graph.port "broken" (type-tag nefor.contracts.Text) "stub.Out")
+      actor (nefor.graph.actor "broken" nefor.factory.stub
+              (as (Map String String) {:value "not-a-Text-record"})
+              (nefor.graph.store-port input) [(nefor.graph.store-port output)])
+      broken (nefor.graph.node "broken" "ordinary" [actor]
+               (as (List nefor.graph.StoredRoute) [])
+               (as (List nefor.graph.Message) []) input output)
+      result (nefor.graph.output-for "result" broken)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start broken)
+         (nefor.graph.edge broken result)]))))
+            "#,
+        );
+        let run_id = "malformed-typed-output";
+        assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host.start(run_id, &modification).expect("start");
+        assert!(outcome.ok, "modification remains structurally valid");
+        let failure = host
+            .take_run_failed(run_id)
+            .expect("read failure")
+            .expect("malformed factory value fails");
+        assert!(failure.contains("malformed semantic value"), "{failure}");
+        assert!(
+            failure.contains("expected nefor.contracts.Text"),
+            "{failure}"
+        );
+        assert!(host
+            .take_run_complete(run_id)
+            .expect("read completion")
+            .is_none());
+    }
+
+    #[test]
     fn whole_product_reaches_output_through_ordinary_firing() {
         let host = shipped_host();
         let modification = compile_mag_source(
@@ -1196,6 +1260,49 @@ mod tests {
         assert_eq!(result["kind"], "nefor.graph.Value");
         assert_eq!(result["value"][0]["content"], "left");
         assert_eq!(result["value"][1]["content"], "right");
+        assert_eq!(result["semantic_type_id"], result["constructor_id"]);
+    }
+
+    #[test]
+    fn component_edges_assemble_an_ordered_product_at_the_output() {
+        let host = shipped_host();
+        let modification = compile_mag_source(
+            &host,
+            "component-product-output",
+            r#"
+(require "nefor.artifact")
+(require "nefor.graph")
+
+(type Left {:content String})
+(type Right {:count Int})
+
+(let [left (nefor.graph.source "left" (type-tag Left)
+              (as Left {:content "first"}))
+      right (nefor.graph.source "right" (type-tag Right)
+               (as Right {:count 2}))
+      result (nefor.graph.output "result" (type-tag (+ Left Right)))]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge left result)
+         (nefor.graph.edge right result)]))))
+            "#,
+        );
+        let run_id = "component-product-output";
+        assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host.start(run_id, &modification).expect("start");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let emits = host.drain_emits().expect("drain product events");
+        let completion = host.take_run_complete(run_id).expect("read completion");
+        assert!(
+            completion.is_some(),
+            "component product graph did not complete: {emits:?}"
+        );
+        let completion = completion.expect("checked above");
+        let result = completion.result.expect("typed product result");
+        assert_eq!(result["value"][0]["content"], "first");
+        assert_eq!(result["value"][1]["count"], 2);
         assert_eq!(result["semantic_type_id"], result["constructor_id"]);
     }
 

@@ -8,7 +8,9 @@ M.declaration = { name="collected-prompt", type_variables={"T"},
 function M.construct(id, params, emit)
   local instance={id=id}
   function instance.deliver(a)
-    emit({kind="generic-provider.ProviderOut",from=id,messages={{role="user",content=a.messages[1].message.value}}})
+    local content=a.messages[1].message.value
+    emit({kind="generic-provider.ProviderOut",from=id,value={content=content},
+      messages={{role="user",content=content}}})
     return {status="ok"}
   end
   emit({kind="mag.ready",from=id}); return instance

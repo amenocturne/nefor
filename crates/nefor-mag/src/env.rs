@@ -200,6 +200,7 @@ impl Env {
             "type-schema",
             "type-id",
             "value-type-id",
+            "value-type-evidence",
             "pack",
             "packed-empty-record?",
             "packed-record-has-only-key?",

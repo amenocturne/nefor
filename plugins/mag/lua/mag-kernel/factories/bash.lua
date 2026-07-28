@@ -169,7 +169,7 @@ function M.construct(id, params, emit, deps)
 
     local stdout, stderr, exit = parse_output(activation.result)
     if exit == "0" then
-      emit(sign({ kind = "mag.Text", text = stdout }))
+      emit(sign({ kind = "mag.Text", value = { content = stdout }, text = stdout }))
       return { status = "ok" }
     end
     local detail = stderr

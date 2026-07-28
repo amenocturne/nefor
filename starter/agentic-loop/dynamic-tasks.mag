@@ -40,7 +40,11 @@
     :system "Return the task plan." :tools []
     :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
   (type-tag nefor.contracts.Task) "task" (type-tag (List Task))))
-(def planner (nefor.actors.select-result planner-agent "planner-result"))
+(def planner-success
+  (nefor.actors.result-arm planner-agent (type-tag (List Task))))
+(def planner-error-port
+  (nefor.actors.result-arm planner-agent
+    (type-tag nefor.contracts.AgentError)))
 (def prompt (nefor.dynamic.collected-prompt "summary-input" (type-tag (| WorkerResult nefor.contracts.AgentError))))
 (def summarizer (nefor.actors.agent
   (as nefor.actors.AgentConfig {:id "summarizer"
@@ -49,11 +53,9 @@
     :system "Summarize the ordered worker results." :tools []
     :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
   (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderOut" (type-tag Summary)))
-(def outcome (nefor.dynamic.outcome "outcome" (type-tag Summary)))
 (def result (nefor.graph.output "result"
   (type-tag (| Summary nefor.contracts.AgentError))))
 (def summary-input (get prompt "input"))
-(def outcome-input (get outcome "input"))
 (def expand (fn [[tasks (List Task)]] -> Artifact
   (if (= (count tasks) 0)
         (nefor.artifact.delta
@@ -70,29 +72,27 @@
           (nefor.artifact.delta routed)))))
 
 (def planner-error (fn [[error nefor.contracts.AgentError]] -> Artifact
-  (nefor.artifact.delta
-    (nefor.graph.delta-message (nefor.graph.delta
+    (nefor.artifact.delta
+      (nefor.graph.delta-message (nefor.graph.delta
       (as (List nefor.graph.Actor) []) (as (List nefor.graph.StoredRoute) [])
-      (as (List nefor.graph.Message) []) (as (List String) [])) outcome-input
+      (as (List nefor.graph.Message) []) (as (List String) []))
+      (get result "input")
       (as (| Summary nefor.contracts.AgentError) error)))))
 
 (def initial
   (nefor.graph.delta-route
     (nefor.graph.delta-route
-      (nefor.graph.delta-route
-        (nefor.graph.merge-delta (nefor.actors.branch-node-delta planner)
-          (nefor.graph.merge-delta (nefor.graph.node-delta prompt)
-            (nefor.graph.merge-delta (nefor.graph.node-delta summarizer)
-              (nefor.graph.merge-delta (nefor.graph.node-delta outcome)
-                (nefor.graph.node-delta result)))))
-        (get outcome "output") (get result "input"))
-      (get prompt "output") (get summarizer "input"))
-    (get summarizer "output") (get outcome "input")))
+      (nefor.graph.merge-delta (nefor.graph.node-delta planner-agent)
+        (nefor.graph.merge-delta (nefor.graph.node-delta prompt)
+          (nefor.graph.merge-delta (nefor.graph.node-delta summarizer)
+            (nefor.graph.node-delta result))))
+      (get summarizer "output") (get result "input"))
+    (get prompt "output") (get summarizer "input")))
 
 (artifact "nefor.graph-modification/v1"
   (nefor.graph.lower-resident
-    (nefor.graph.delta-message initial (get planner "input")
+    (nefor.graph.delta-message initial (get planner-agent "input")
       (as nefor.contracts.Task {:prompt "Plan this request"}))
-    [(nefor.graph.rule "expand" (get planner "first") "expand")
-     (nefor.graph.rule "planner-error" (get planner "second") "planner-error")]
+    [(nefor.graph.rule "expand" planner-success "expand")
+     (nefor.graph.rule "planner-error" planner-error-port "planner-error")]
     (get result "output")))

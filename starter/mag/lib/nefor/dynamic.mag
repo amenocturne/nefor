@@ -46,21 +46,3 @@
                   (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
                   [(nefor.graph.store-port output)])]
        :routes [] :messages [] :input input :output output}))))
-
-(def outcome (fn [T] [[id String] [type (TypeTag T)]]
-  -> (nefor.graph.Node (| T nefor.contracts.AgentError)
-       (| T nefor.contracts.AgentError))
-  (let [port-type (type-tag (| T nefor.contracts.AgentError))
-        input (nefor.graph.port id port-type "nefor.agent.Result")
-        output (nefor.graph.port id port-type "nefor.outcome.Result")]
-    (as (nefor.graph.Node (| T nefor.contracts.AgentError)
-          (| T nefor.contracts.AgentError))
-      {:id id :role "ordinary" :actors [(nefor.graph.actor id (specialize nefor.factory.outcome [T])
-                  (as nefor.contracts.OutcomeParams
-                    {:error_type
-                      (type-id
-                        (type-evidence
-                          (type-tag nefor.contracts.AgentError)))})
-                  (nefor.graph.store-port input)
-                  [(nefor.graph.store-port output)])]
-       :routes [] :messages [] :input input :output output}))))

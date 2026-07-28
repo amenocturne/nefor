@@ -49,7 +49,8 @@ messages and emits messages, nothing else.
 Rule-capable outputs use the same ordinary output envelope as routing. Their
 declared wire is `kind`; `value` is the complete semantic value of the port.
 For example, an agent result carries either the complete `T` or complete
-`AgentError` under `value`, with its runtime variant marker preserved.
+`AgentError` under `value`, with its compiler-issued constructor identity in
+`semantic_type_id`.
 
 ## Factories
 
@@ -352,11 +353,11 @@ that choice and still performs the authoritative Rust-owned validation.
 
 Tool calls take the ordinary `generic-tool.ToolCalls` path and consume no
 corrections. An invalid candidate becomes a diagnostic user turn while budget
-remains. A valid candidate emits `nefor.agent.Result` with variant `success`.
-Exhaustion emits the same wire with variant `error` and an
-`OutputValidationError`; a provider terminal failure emits a `ProviderError`.
-Both errors carry mandatory agent-owned `last_output`, retaining an earlier
-completed candidate when a later correction round fails.
+remains. A valid candidate emits `nefor.agent.Result` with the selected output
+constructor identity. Exhaustion emits the same wire with the `AgentError`
+constructor and an `OutputValidationError`; a provider terminal failure carries
+a `ProviderError`. Both errors carry mandatory agent-owned `last_output`,
+retaining an earlier completed candidate when a later correction round fails.
 
 The canonical MAG constructor is `nefor.actors.agent`. Its public type is
 `I -> (O | AgentError)`. `max_corrections = 0` means no correction,
@@ -367,8 +368,8 @@ protected params data. `mag.execute` rejects any `params_overlay` that attempts
 to replace `schema`, `provider_error_type`, or `validation_error_type`;
 accepting such an overlay would let runtime data weaken or counterfeit the type
 promised by the fragment. Provider/model/history overlays remain ordinary
-runtime configuration. The outcome boundary likewise protects its
-compiler-derived `error_type`.
+runtime configuration. The structured-output boundary likewise protects its
+compiler-derived `output_type` and `error_type`.
 
 Both provider-boundary factories use `factories/provider-boundary.lua` for
 history validation and seeding, provider correlation, tool-call transcript

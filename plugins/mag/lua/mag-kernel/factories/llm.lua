@@ -38,7 +38,9 @@ function M.construct(id, params, emit)
       end
     end,
     on_final = function(state, result)
-      local final = { kind = "generic-provider.FinalAnswer", result = result }
+      local content = boundary.answer_text(result) or ""
+      local final = { kind = "generic-provider.FinalAnswer",
+        value = { content = content }, result = result }
       if type(result) == "table" then
         final.text = result.text
         final.final_answer = result.final_answer

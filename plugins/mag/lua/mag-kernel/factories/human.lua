@@ -118,12 +118,14 @@ function M.construct(id, params, emit, deps)
       if message.approved then
         emit(sign({
           kind = "human.Approved",
+          value = { content = message.content or "" },
           subject = subject,
           content = message.content,
         }))
       else
         emit(sign({
           kind = "human.Rejected",
+          value = { reason = message.reason or "" },
           subject = subject,
           reason = message.reason,
         }))

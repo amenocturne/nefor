@@ -643,7 +643,11 @@ do
   local exec = begin_bound_turn("typed success", "r-typed-success")
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
-    result = { variant = "success", value = { content = "clean answer" } },
+    result = {
+      semantic_type_id = "sha256:final-answer",
+      semantic_type = { kind = "named", name = "nefor.contracts.FinalAnswer" },
+      value = { content = "clean answer" },
+    },
   })
   assert(find_call(decode_calls(), "chat.message.append", "assistant", "clean answer") ~= nil,
     "typed success renders the semantic FinalAnswer content")
@@ -652,10 +656,14 @@ do
   exec = begin_bound_turn("typed failure", "r-typed-error")
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
-    result = { variant = "error", value = {
-      last_output = { text = "partial builder report" },
-      reason = { message = "provider unavailable", detail = { tag = "core.types.None" } },
-    } },
+    result = {
+      semantic_type_id = "sha256:agent-error",
+      semantic_type = { kind = "named", name = "nefor.contracts.AgentError" },
+      value = {
+        last_output = { text = "partial builder report" },
+        reason = { message = "provider unavailable", detail = { tag = "core.types.None" } },
+      },
+    },
   })
   assert(find_call(decode_calls(), "chat.message.append", "assistant", "partial builder report") ~= nil,
     "typed AgentError preserves and renders the last completed provider output")

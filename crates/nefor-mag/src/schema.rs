@@ -73,9 +73,13 @@ pub struct JsonValidationError {
 
 impl TypeSchema {
     pub fn reify(env: &Env, ty: &MagType) -> Result<Self, MagError> {
+        Self::from_concrete(&crate::types::ConcreteType::resolve(env, ty)?)
+    }
+
+    pub fn from_concrete(ty: &crate::types::ConcreteType) -> Result<Self, MagError> {
         Ok(Self {
             version: SCHEMA_VERSION,
-            root: reify_concrete(&crate::types::ConcreteType::resolve(env, ty)?)?,
+            root: reify_concrete(ty)?,
         })
     }
 
@@ -108,6 +112,24 @@ impl TypeSchema {
                 };
             }
         };
+        self.validate_value(value)
+    }
+
+    pub fn validate_value(&self, value: Value) -> JsonValidation {
+        if self.version != SCHEMA_VERSION {
+            return JsonValidation {
+                ok: false,
+                value: None,
+                error: Some(JsonValidationError {
+                    kind: "unsupported_schema_version".into(),
+                    message: format!(
+                        "schema version {} is unsupported; expected {}",
+                        self.version, SCHEMA_VERSION
+                    ),
+                }),
+                violations: vec![],
+            };
+        }
         let mut violations = vec![];
         validate_at(&self.root, &value, "$", &mut violations);
         JsonValidation {

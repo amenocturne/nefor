@@ -308,6 +308,7 @@ local function do_spawn(self, actor)
     evidence = actor.evidence,
     input = actor.input,
     outputs = actor.outputs,
+    semantic_strict = actor.semantic_strict == true,
     routes = actor.routes or {},
     spec = spec_of(actor),
     state = ALIVE,

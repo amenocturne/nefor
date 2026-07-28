@@ -29,11 +29,9 @@ local output = require("factories.output")
 local human = require("factories.human")
 local llm = require("factories.llm")
 local structured_output = require("factories.structured-output")
-local select_agent_result = require("factories.select-agent-result")
 local collector = require("factories.collector")
 local collect_item = require("factories.collect-item")
 local collected_prompt = require("factories.collected-prompt")
-local outcome = require("factories.outcome")
 
 -- Shared per-node output persistence (lua/libs/output-persistence). The mag
 -- plugin host currently exposes only nefor.log (plugins/mag/src/kernel.rs,
@@ -84,11 +82,9 @@ local function build_registry()
   seed(human)
   seed(llm)
   seed(structured_output)
-  seed(select_agent_result)
   seed(collector)
   seed(collect_item)
   seed(collected_prompt)
-  seed(outcome)
   seed(run_tool)
   seed(tool_result)
   seed(adapter)
@@ -293,7 +289,12 @@ local function new_run_context(meta)
       if ctx.rule_failed then return false end
       ctx.emission_seq = ctx.emission_seq + 1
       for _, rule in ipairs(ctx.rules) do
-        if rule.on.actor == actor and rule.on.wire == wire then
+        local host = nefor and nefor.semantic_type
+        local semantic_match = not ctx.semantic_strict or type(rule.on.type) ~= "table"
+          or (type(output.semantic_type) == "table"
+            and type(host) == "table" and type(host.accepts) == "function"
+            and host.accepts(rule.on.type, output.semantic_type))
+        if rule.on.actor == actor and rule.on.wire == wire and semantic_match then
           if type(output) ~= "table" or output.value == nil then
             ctx.rule_error = string.format(
               "rule %q source %s/%s emitted no canonical value",
@@ -493,6 +494,7 @@ return {
       return { ok = false, error = "initial artifact needs result.from { actor, wire }" }
     end
     local typed_artifact = type(mod.types) == "table"
+    ctx.semantic_strict = typed_artifact
     if typed_artifact and (type(boundary.type_id) ~= "string"
         or type(boundary.type) ~= "table") then
       return { ok = false, error =
@@ -561,14 +563,26 @@ return {
         return { ok = false, error = string.format(
           "rule %q source actor %q does not exist", rule.id, rule.on.actor) }
       end
-      local rule_decl = registry:declaration(source_rule_actor.factory)
       local wire_declared = false
-      for _, output in ipairs((rule_decl and rule_decl.outputs) or {}) do
-        if output == rule.on.wire then wire_declared = true break end
+      if typed_artifact then
+        local host = nefor and nefor.semantic_type
+        for _, output in ipairs(source_rule_actor.outputs or {}) do
+          if output.wire == rule.on.wire and
+              type(host) == "table" and type(host.accepts) == "function"
+              and host.accepts(output.type, rule.on.type) then
+            wire_declared = true
+            break
+          end
+        end
+      else
+        local rule_decl = registry:declaration(source_rule_actor.factory)
+        for _, output in ipairs((rule_decl and rule_decl.outputs) or {}) do
+          if output == rule.on.wire then wire_declared = true break end
+        end
       end
       if not wire_declared then
         return { ok = false, error = string.format(
-          "rule %q wire %q is not an output of actor %q",
+          "rule %q semantic subscription on wire %q is not an output of actor %q",
           rule.id, rule.on.wire, rule.on.actor) }
       end
     end
@@ -579,6 +593,11 @@ return {
     for key, value in pairs(mod) do
       if key ~= "result" and key ~= "rules" then
         modification[key] = value
+      end
+    end
+    if typed_artifact then
+      for _, spec in ipairs(modification.actors or {}) do
+        spec.semantic_strict = true
       end
     end
     return ctx.observer:apply(modification)
@@ -596,6 +615,11 @@ return {
     end
     if type(mod) == "table" and mod.result ~= nil then
       return { ok = false, error = "a delta cannot define or replace the result boundary" }
+    end
+    if type(mod) == "table" and type(mod.types) == "table" then
+      for _, spec in ipairs(mod.actors or {}) do
+        spec.semantic_strict = true
+      end
     end
     return ctx.observer:apply(mod)
   end,

@@ -44,9 +44,10 @@ A typed port records two identities:
 This lets an agent node expose `(CodeAudit | AgentError)` on the stable
 `nefor.agent.Result` wire. The success type is declared with
 `(type-tag CodeAudit)`; an undeclared or misspelled semantic type fails
-compilation. `nefor.actors.select-result` introduces distinct success/error
-ports when the lead wants separate routes. The compiler neither knows what an
-LLM is nor invents a coercion.
+compilation. Compatible edges route each selected constructor directly.
+Resident rules use `nefor.actors.result-arm` to subscribe to one constructor
+on the same actor and wire. The compiler neither knows what an LLM is nor
+invents a coercion.
 
 Foreign capabilities are typed values. `nefor.graph.actor` accepts a
 `Foreign<P, I, O>`, validates the parameter type, and stores its qualified

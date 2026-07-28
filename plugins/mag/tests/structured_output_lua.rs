@@ -80,6 +80,8 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         local actor, err = factory.construct("typed", {
           provider = "mock-provider", schema = schema, tools = { "read_file" },
           max_corrections = 2,
+          output_type = "output-type-tag",
+          error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, emit)
@@ -114,7 +116,7 @@ fn structured_output_retries_and_preserves_tool_rounds() {
 
         actor.deliver({ kind = "reply", result = { text = [[{"task":"build"}]] } })
         assert(emitted[#emitted - 1].kind == "nefor.agent.Result")
-        assert(emitted[#emitted - 1].variant == "success")
+        assert(emitted[#emitted - 1].semantic_type_id == "output-type-tag")
         assert(emitted[#emitted - 1].value.task == "build")
       "#,
     )
@@ -133,6 +135,8 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
           max_corrections = 2,
+          output_type = "output-type-tag",
+          error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
@@ -144,7 +148,7 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.agent.Result")
-        assert(terminal.variant == "error")
+        assert(terminal.semantic_type_id == "agent-error-tag")
         assert(terminal.value.reason.type == "validation-error-tag")
         assert(terminal.value.reason.value.violations[1].path == "$")
         assert(terminal.value.reason.value.attempts == nil)
@@ -166,6 +170,8 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
           max_corrections = 0,
+          output_type = "output-type-tag",
+          error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
@@ -175,7 +181,7 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
         actor.deliver({ kind = "reply", result = { text = "1", raw = "candidate" } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.agent.Result")
-        assert(terminal.variant == "error")
+        assert(terminal.semantic_type_id == "agent-error-tag")
         assert(terminal.value.last_output.raw == "candidate")
         assert(terminal.value.reason.value.violations[1].code == "wrong_type")
         for _, message in ipairs(emitted) do
@@ -188,28 +194,39 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
 }
 
 #[test]
-fn result_selector_preserves_values_and_rejects_unknown_variants() {
+fn tagged_result_preserves_the_selected_constructor_without_a_selector() {
     let lua = harness();
     lua.load(
         r#"
-        local factory = require("factories.select-agent-result")
+        local factory = require("factories.structured-output")
         local emitted = {}
-        local actor = assert(factory.construct("select", {},
-          function(message) emitted[#emitted + 1] = message end))
-        local success = actor.deliver({ messages = {{ message = {
-          variant = "success", value = { answer = 42 }
-        }}}})
-        assert(success.status == "ok")
-        assert(emitted[#emitted].kind == "nefor.agent.Output")
-        assert(emitted[#emitted].value.answer == 42)
-        local failure = actor.deliver({ messages = {{ message = {
-          variant = "error", value = { last_output = "draft" }
-        }}}})
-        assert(failure.status == "ok")
-        assert(emitted[#emitted].kind == "nefor.agent.Error")
-        assert(emitted[#emitted].value.last_output == "draft")
-        local malformed = actor.deliver({ messages = {{ message = { value = 1 } }}})
-        assert(malformed.status == "failed")
+        local actor = assert(factory.construct("tagged", {
+          provider = "mock-provider",
+          schema = { version = 1, root = { kind = "union", variants = {
+            { tag = "left-tag", schema = { kind = "named", name = "Left",
+              body = { kind = "record", fields = {
+                { name = "answer", schema = { kind = "int" } }
+              }}}
+            },
+            { tag = "right-tag", schema = { kind = "named", name = "Right",
+              body = { kind = "string" }}
+            }
+          }}},
+          max_corrections = 0,
+          output_type = "declared-union-tag",
+          error_type = "agent-error-tag",
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
+        }, function(message) emitted[#emitted + 1] = message end))
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut",
+          message = { messages = {{ role = "user", content = "answer" }} } }}})
+        actor.deliver({ kind = "reply",
+          result = { text = [[{"type":"left-tag","value":{"answer":42}}]] } })
+        local terminal = emitted[#emitted - 1]
+        assert(terminal.kind == "nefor.agent.Result")
+        assert(terminal.semantic_type_id == "left-tag")
+        assert(terminal.value.answer == 42)
+        assert(terminal.variant == nil)
       "#,
     )
     .exec()
@@ -227,6 +244,8 @@ fn ordinary_string_output_accepts_the_empty_string() {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
           max_corrections = 0,
+          output_type = "output-type-tag",
+          error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
@@ -236,7 +255,7 @@ fn ordinary_string_output_accepts_the_empty_string() {
         actor.deliver({ kind = "reply", result = { text = [[""]] } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.agent.Result")
-        assert(terminal.variant == "success")
+        assert(terminal.semantic_type_id == "output-type-tag")
         assert(terminal.value == "")
       "#,
     )
@@ -256,6 +275,8 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
             provider = "mock-provider",
             schema = { version = 1, root = { kind = "string" } },
             max_corrections = 1,
+            output_type = "output-type-tag",
+            error_type = "agent-error-tag",
             provider_error_type = "provider-error-tag",
             validation_error_type = "validation-error-tag"
           }, function(message) emitted[#emitted + 1] = message end))
@@ -269,7 +290,7 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         correlation.deliver({ kind = "reply", error = "provider unavailable" })
         local correlation_error = correlation_out[#correlation_out - 1]
         assert(correlation_error.kind == "nefor.agent.Result")
-        assert(correlation_error.variant == "error")
+        assert(correlation_error.semantic_type_id == "agent-error-tag")
         assert(correlation_error.value.reason.type == "provider-error-tag")
         assert(correlation_error.value.reason.value.message == "provider unavailable")
         assert(correlation_error.value.reason.value.detail.present == false)
@@ -346,6 +367,8 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
           max_corrections = 2,
+          output_type = "output-type-tag",
+          error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
@@ -357,7 +380,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
 
         activate("first")
         actor.deliver({ kind = "reply", result = { text = [["ok"]] } })
-        assert(emitted[#emitted - 1].variant == "success")
+        assert(emitted[#emitted - 1].semantic_type_id == "output-type-tag")
 
         activate("second")
         actor.deliver({ kind = "reply", result = { text = "1" } })
@@ -368,7 +391,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         actor.deliver({ kind = "reply", result = { text = "false" } })
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
-        assert(terminal.variant == "error")
+        assert(terminal.semantic_type_id == "agent-error-tag")
         assert(terminal.value.reason.value.violations ~= nil)
       "#,
     )

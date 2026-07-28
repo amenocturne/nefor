@@ -65,8 +65,6 @@ local FINAL_ANSWER = "generic-provider.FinalAnswer"
 local PROVIDER_OUT = "generic-provider.ProviderOut"
 local REJECTED = "human.Rejected"
 local AGENT_RESULT = "nefor.agent.Result"
-local AGENT_OUTPUT = "nefor.agent.Output"
-local AGENT_ERROR = "nefor.agent.Error"
 
 M.declaration = {
   name = "adapter",
@@ -80,8 +78,6 @@ M.declaration = {
       {wire=REJECTED,type={kind="variable",name="T"}},
       {wire=PROVIDER_OUT,type={kind="variable",name="T"}},
       {wire=AGENT_RESULT,type={kind="variable",name="T"}},
-      {wire=AGENT_OUTPUT,type={kind="variable",name="T"}},
-      {wire=AGENT_ERROR,type={kind="variable",name="T"}},
     },
     outputs = {{ wire = "generic-provider.ProviderOut", type = {
       kind="named", name="nefor.contracts.ProviderInput", arguments={}
@@ -97,8 +93,7 @@ M.declaration = {
   -- or a human gate's rejection re-entering the provider loop (the gate
   -- template's revise leg). Firing "on any".
   inputs = {
-    boundary = { "task", FINAL_ANSWER, REJECTED, PROVIDER_OUT,
-      AGENT_RESULT, AGENT_OUTPUT, AGENT_ERROR },
+    boundary = { "task", FINAL_ANSWER, REJECTED, PROVIDER_OUT, AGENT_RESULT },
   },
 
   outputs = {
@@ -112,7 +107,7 @@ M.declaration = {
 -- declared tag (a type fact), extract the turn content per input, wrap it as a
 -- single user-role message. Pure: strings pass through, structured values pass
 -- through verbatim for the provider layer to serialize.
-local function to_provider_out(tag, message, schema)
+local function to_provider_out(tag, message, schema, arrival)
   message = message or {}
   local content
   if tag == FINAL_ANSWER then
@@ -123,8 +118,6 @@ local function to_provider_out(tag, message, schema)
     content = message.reason
   elseif tag == PROVIDER_OUT then
     return message
-  elseif tag == AGENT_RESULT then
-    content = { variant = message.variant, value = message.value }
   else
     -- Canonical typed messages carry `value`; retain the historical task seed
     -- shape only as an external-boundary fallback.
@@ -137,8 +130,14 @@ local function to_provider_out(tag, message, schema)
       content = message
     end
   end
+  if type(schema) == "table" and type(schema.root) == "table"
+      and schema.root.kind == "union" and type(arrival) == "table"
+      and type(arrival.constructor_id) == "string" then
+    content = { type = arrival.constructor_id, value = content }
+  end
   return {
     kind = "generic-provider.ProviderOut",
+    value = { content = content },
     messages = { { role = "user", content = {
       mag_type = schema,
       value = content,
@@ -164,7 +163,7 @@ function M.construct(id, params, emit, deps)
   function instance.deliver(activation)
     activation = activation or {}
     local one = (activation.messages or {})[1] or {}
-    emit(sign(to_provider_out(one.tag, one.message, params.schema)))
+    emit(sign(to_provider_out(one.tag, one.message, params.schema, one.arrival)))
     return { status = "ok" }
   end
 

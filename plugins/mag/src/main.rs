@@ -907,10 +907,13 @@ fn apply_params_overlay(
         };
         let factory = obj.get("factory").and_then(Value::as_str);
         let protected_params: &[&str] = match factory {
-            Some("structured-output" | "nefor.factory.structured-output") => {
-                &["schema", "provider_error_type", "validation_error_type"]
-            }
-            Some("outcome" | "nefor.factory.outcome") => &["error_type"],
+            Some("structured-output" | "nefor.factory.structured-output") => &[
+                "schema",
+                "output_type",
+                "error_type",
+                "provider_error_type",
+                "validation_error_type",
+            ],
             _ => &[],
         };
         if let Some(param) = protected_params
@@ -1870,14 +1873,11 @@ mod tests {
                     "params": {
                         "schema": original,
                         "provider": "mock-provider",
+                        "output_type": "output-id",
+                        "error_type": "agent-error-id",
                         "provider_error_type": "provider-id",
                         "validation_error_type": "validation-id"
                     }
-                },
-                {
-                    "id": "result",
-                    "factory": "outcome",
-                    "params": {"error_type": "agent-error-id"}
                 }
             ]
         });
@@ -1887,13 +1887,14 @@ mod tests {
                 "schema",
                 serde_json::json!({"version": 1, "root": {"kind": "string"}}),
             ),
+            ("typed", "output_type", serde_json::json!("forged")),
+            ("typed", "error_type", serde_json::json!("forged")),
             ("typed", "provider_error_type", serde_json::json!("forged")),
             (
                 "typed",
                 "validation_error_type",
                 serde_json::json!("forged"),
             ),
-            ("result", "error_type", serde_json::json!("forged")),
         ] {
             let overlay = serde_json::json!({(actor): {(param): value}});
             let error =
@@ -1910,7 +1911,11 @@ mod tests {
             "validation-id"
         );
         assert_eq!(
-            modification["actors"][1]["params"]["error_type"],
+            modification["actors"][0]["params"]["output_type"],
+            "output-id"
+        );
+        assert_eq!(
+            modification["actors"][0]["params"]["error_type"],
             "agent-error-id"
         );
     }

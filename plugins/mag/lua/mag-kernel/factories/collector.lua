@@ -37,12 +37,13 @@ function M.construct(id, params, emit)
     positions[sender] = index
   end
 
-  local values, received, finished = {}, 0, false
+  local values, semantic_values, received, finished = {}, {}, 0, false
   local instance = { id = id }
 
   local function failure(code, sender)
     finished = true
     values = {}
+    semantic_values = {}
     return {
       status = "failed",
       failure = kinds.Failed,
@@ -61,13 +62,28 @@ function M.construct(id, params, emit)
     -- The route wrapper is transport-only. Its `value` is the semantic T.
     values[index] = type(one.message) == "table" and one.message.value or nil
     if values[index] == nil then return failure("collector_missing_value", sender) end
+    semantic_values[index] = values[index]
+    local arrival = one.arrival
+    if type(arrival) == "table" and type(arrival.declared_type) == "table"
+        and arrival.declared_type.kind == "union" then
+      semantic_values[index] = {
+        type = arrival.constructor_id,
+        value = values[index],
+      }
+    end
     received = received + 1
     if received == #expected then
       finished = true
       local ordered = {}
-      for i = 1, #expected do ordered[i] = values[i] end
+      local semantic_ordered = {}
+      for i = 1, #expected do
+        ordered[i] = values[i]
+        semantic_ordered[i] = semantic_values[i]
+      end
       values = {}
-      emit({ kind = COLLECTED, from = id, value = ordered })
+      semantic_values = {}
+      emit({ kind = COLLECTED, from = id,
+        value = ordered, semantic_value = semantic_ordered })
     end
     return { status = "ok" }
   end
@@ -75,6 +91,7 @@ function M.construct(id, params, emit)
   function instance.handle_kill()
     finished = true
     values = {}
+    semantic_values = {}
   end
 
   function instance.handle_drain()
@@ -84,6 +101,7 @@ function M.construct(id, params, emit)
     end
     finished = true
     values = {}
+    semantic_values = {}
   end
 
   emit({ kind = kinds.ready, from = id })

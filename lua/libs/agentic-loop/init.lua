@@ -873,12 +873,16 @@ end
 -- concern, never part of the answer text.
 local function mag_result_text(result)
   if type(result) ~= "table" then return nil end
-  if result.variant == "success" then
+  local semantic_name = type(result.semantic_type) == "table"
+    and result.semantic_type.name or nil
+  local typed = type(result.semantic_type_id) == "string"
+  if typed and semantic_name ~= "nefor.contracts.AgentError" then
     if type(result.value) == "string" then return result.value end
     if type(result.value) == "table" and type(result.value.content) == "string" then
       return result.value.content
     end
-  elseif result.variant == "error" and type(result.value) == "table" then
+  elseif typed and semantic_name == "nefor.contracts.AgentError"
+      and type(result.value) == "table" then
     local last = result.value.last_output
     if type(last) == "string" then return last end
     if type(last) == "table" then

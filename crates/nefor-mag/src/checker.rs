@@ -446,13 +446,32 @@ fn infer_builtin(
         "value-type-id" => {
             exact(2)?;
             let actual = infer(env, locals, &args[0])?;
-            let MagType::TypeTag(expected) = infer(env, locals, &args[1])? else {
-                return Err(MagError::Type(
-                    "value-type-id expects a TypeTag as its second argument".into(),
-                ));
-            };
-            compatible(env, &expected, &actual, &mut HashMap::new()).map_err(MagError::Type)?;
+            match infer(env, locals, &args[1])? {
+                MagType::TypeTag(expected) => {
+                    compatible(env, &expected, &actual, &mut HashMap::new())
+                        .map_err(MagError::Type)?;
+                }
+                MagType::TypeDescriptor => {}
+                _ => {
+                    return Err(MagError::Type(
+                        "value-type-id expects TypeTag or TypeDescriptor evidence".into(),
+                    ))
+                }
+            }
             Ok(MagType::SemanticTypeId)
+        }
+        "value-type-evidence" => {
+            exact(2)?;
+            let _ = infer(env, locals, &args[0])?;
+            let evidence = infer(env, locals, &args[1])?;
+            compatible(
+                env,
+                &evidence,
+                &MagType::TypeDescriptor,
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
+            Ok(MagType::TypeDescriptor)
         }
         "or" => {
             exact(2)?;

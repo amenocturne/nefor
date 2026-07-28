@@ -12,6 +12,8 @@ local function build(fields)
     edge_id = fields.edge_id,
     type_id = assert(fields.type_id, "typed arrival needs type_id"),
     type = assert(fields.type, "typed arrival needs descriptor"),
+    declared_type_id = fields.declared_type_id or fields.type_id,
+    declared_type = fields.declared_type or fields.type,
     constructor_id = fields.constructor_id,
     protocol_wire = assert(fields.protocol_wire, "typed arrival needs protocol_wire"),
     product_position = fields.product_position or -1,
@@ -30,7 +32,7 @@ function M.factory(fields)
   return build(fields)
 end
 
-function M.routed(source, destination)
+function M.routed(source, destination, declared_type)
   assert(trusted[source], "routed arrival must come from a trusted boundary")
   return build({
     arrival_id = source.arrival_id,
@@ -39,6 +41,8 @@ function M.routed(source, destination)
       ("legacy:" .. tostring(source.from) .. ":" .. tostring(destination.actor)),
     type_id = source.type_id,
     type = source.type,
+    declared_type_id = destination.destination_type_id,
+    declared_type = declared_type,
     constructor_id = source.constructor_id,
     protocol_wire = assert(destination.wire, "compiled route needs destination wire"),
     product_position = destination.product_position,

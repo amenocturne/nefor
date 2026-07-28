@@ -71,9 +71,10 @@ exactly one must exist and it must be terminal. Every ordinary node must be
 reachable from a source and able to reach the output.
 
 Every agent has type `I -> (O | nefor.contracts.AgentError)`. Connect that whole
-union to a compatible node, or use `nefor.actors.select-result` in a resident
-program that handles both variant ports. `:max-corrections 0` means the initial
-attempt only.
+union to a compatible node. Direct edges dispatch selected constructors to
+compatible inputs; resident programs use `nefor.actors.result-arm` for typed
+rule subscriptions on the stable result wire. `:max-corrections 0` means the
+initial attempt only.
 
 ## Composing edge families
 

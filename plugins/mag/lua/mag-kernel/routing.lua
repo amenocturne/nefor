@@ -259,6 +259,7 @@ function M:on_emit(id, message)
     end
     local observed = {}
     for key, value in pairs(message) do observed[key] = value end
+    observed.semantic_type = arrival.type
     observed.semantic_type_id = arrival.type_id
     observed.constructor_id = arrival.constructor_id
     observed.arrival_id = arrival.arrival_id
@@ -267,7 +268,7 @@ function M:on_emit(id, message)
     local boundary = self.result_boundary
     if boundary and boundary.actor == id and boundary.wire == kind then
       local host = nefor and nefor.semantic_type
-      if type(boundary.type) == "table" and
+      if type(boundary.type_id) == "string" and type(boundary.type) == "table" and
           (type(host) ~= "table" or type(host.accepts) ~= "function"
             or not host.accepts(boundary.type, arrival.type)) then
         self.events({
@@ -347,12 +348,35 @@ function M:factory_arrival(id, wire, payload)
     actual_type_id = selected
     constructor_id = selected
   end
+  if actor.semantic_strict then
+    local host = nefor and nefor.semantic_type
+    if payload.value == nil or type(host) ~= "table"
+        or type(host.validate_value) ~= "function" then
+      return nil, string.format(
+        "actor '%s' emitted no canonical semantic value on '%s'",
+        tostring(id), tostring(wire))
+    end
+    local semantic_value = payload.semantic_value
+    if semantic_value == nil then semantic_value = payload.value end
+    local validation = host.validate_value(actual_type, semantic_value)
+    if not validation.ok then
+      local violation = (validation.violations or {})[1]
+      local detail = violation and
+        (tostring(violation.path) .. ": " .. tostring(violation.message))
+        or ((validation.error or {}).message or "semantic value does not conform")
+      return nil, string.format(
+        "actor '%s' emitted malformed semantic value on '%s': %s",
+        tostring(id), tostring(wire), tostring(detail))
+    end
+  end
   return typed_value.factory({
     arrival_id = self:next_arrival_id(),
     from = id,
     edge_id = "factory:" .. tostring(id) .. ":" .. tostring(wire),
     type_id = actual_type_id,
     type = actual_type,
+    declared_type_id = endpoint.type_id,
+    declared_type = endpoint.type,
     constructor_id = constructor_id,
     protocol_wire = wire,
     product_position = -1,
@@ -414,12 +438,13 @@ function M:route_output(sender_id, tag, message, source_arrival)
     local input = dest and dest.input
     local accepts = true
     local host = nefor and nefor.semantic_type
-    if input and type(input.type) == "table" and
+    if dest and dest.semantic_strict and input and type(input.type) == "table" and
         type(host) == "table" and type(host.accepts) == "function" then
       accepts = host.accepts(input.type, source.type)
     end
     if accepts then
-      self:deliver(destination.actor, typed_value.routed(source, destination))
+      self:deliver(destination.actor,
+        typed_value.routed(source, destination, input and input.type or source.type))
     end
   end
 end
@@ -475,22 +500,36 @@ function M:deliver_initial(dest_id, from, message)
     ((message.content or {}).kind)
   local descriptor = message.semantic_type or dest.input.type or
     { kind = "named", name = "legacy." .. tostring(type_id), arguments = {} }
-  if dest.input.type_id and type_id ~= dest.input.type_id then
+  local host = nefor and nefor.semantic_type
+  if dest.input.type_id and (type(host) ~= "table"
+      or type(host.accepts) ~= "function"
+      or not host.accepts(dest.input.type, descriptor)) then
     local detail = string.format(
-      "initial message for '%s' has semantic type id '%s', expected '%s'",
+      "initial message for '%s' has incompatible semantic type id '%s', expected '%s'",
       tostring(dest_id), tostring(type_id), tostring(dest.input.type_id))
     self.events({ kind = EVT_RUN_FAILED, from = dest_id, failure = "typed-input", error = detail })
     return
+  end
+  local content = message.content
+  if type(dest.input.type) == "table" and dest.input.type.kind == "union"
+      and type(content) == "table" and type(content.value) == "table"
+      and content.value.type == type_id and content.value.value ~= nil then
+    local normalized = {}
+    for key, value in pairs(content) do normalized[key] = value end
+    normalized.value = content.value.value
+    content = normalized
   end
   self:deliver(dest_id, typed_value.initial({
     arrival_id = self:next_arrival_id(),
     from = from,
     type_id = type_id,
     type = descriptor,
+    declared_type_id = dest.input.type_id,
+    declared_type = dest.input.type,
     constructor_id = type_id,
-    protocol_wire = (message.content and message.content.kind) or dest.input.wire,
+    protocol_wire = (content and content.kind) or dest.input.wire,
     product_position = -1,
-    payload = message.content,
+    payload = content,
   }))
 end
 
@@ -597,7 +636,11 @@ function M:machines_for(id)
     for port, in_shape in pairs(decl.inputs) do
       local slots = nil
       local semantic = actor.input and actor.input.type_id and
-        { input_type_id = actor.input.type_id } or nil
+        {
+          input_type_id = actor.input.type_id,
+          kind = actor.input.type and actor.input.type.kind == "product" and "product"
+            or (actor.input.type and actor.input.type.kind == "union" and "union" or "single"),
+        } or nil
       if semantic and actor.input.type and actor.input.type.kind == "product" then
         slots = self:derive_slots(id)
       elseif shape.classify(in_shape) == "product" then

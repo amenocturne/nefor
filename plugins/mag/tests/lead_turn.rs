@@ -58,6 +58,25 @@ fn kernel_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
 }
 
+fn assert_typed_result(result: &Map<String, Value>) {
+    let semantic = result
+        .pointer_str("/result/semantic_type_id")
+        .expect("terminal result carries semantic type identity");
+    assert!(semantic.starts_with("sha256:"), "{result:?}");
+    assert_eq!(
+        result.pointer_str("/result/constructor_id"),
+        Some(semantic),
+        "{result:?}"
+    );
+    assert!(
+        result
+            .get("result")
+            .and_then(|value| value.get("variant"))
+            .is_none(),
+        "{result:?}"
+    );
+}
+
 async fn spawn_mag(data_dir: &std::path::Path) -> Child {
     let mut cmd = tokio::process::Command::new(binary_path());
     cmd.arg("--kernel")
@@ -427,7 +446,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
         result.get("status").and_then(Value::as_str),
         Some("completed")
     );
-    assert_eq!(result.pointer_str("/result/variant"), Some("success"));
+    assert_typed_result(&result);
     assert_eq!(result.pointer_str("/result/value/task"), Some("build"));
     shutdown(stdin, child).await;
 }
@@ -512,7 +531,7 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
-    assert_eq!(result.pointer_str("/result/variant"), Some("success"));
+    assert_typed_result(&result);
     assert_eq!(
         result.pointer_str("/result/value/assessment"),
         Some("continue from partial work")
@@ -667,7 +686,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
     assert_eq!(result["status"], "completed", "{result:?}");
-    assert_eq!(result["result"]["variant"], "success");
+    assert_typed_result(&result);
     assert_eq!(result["result"]["value"]["content"], "done");
     shutdown(stdin, child).await;
 }
@@ -745,7 +764,7 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
             break event;
         }
     };
-    assert_eq!(result["result"]["variant"], "success");
+    assert_typed_result(&result);
     assert_eq!(result["result"]["value"]["content"], "empty");
     shutdown(stdin, child).await;
 }
@@ -800,7 +819,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
-    assert_eq!(result["result"]["variant"], "success");
+    assert_typed_result(&result);
     assert_eq!(result["result"]["value"]["content"], "one done");
     shutdown(stdin, child).await;
 }
@@ -849,8 +868,11 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
         }
     };
     assert_eq!(result["status"], "completed", "{result:?}");
-    assert_eq!(result["result"]["variant"], "error");
-    assert_eq!(result["result"]["value"]["last_output"]["text"], "not json");
+    assert_typed_result(&result);
+    assert_eq!(
+        result["result"]["value"]["last_output"]["text"], "not json",
+        "{result:?}"
+    );
     assert!(result["result"]["value"]["reason"]["type"]
         .as_str()
         .is_some_and(|tag| tag.starts_with("sha256:")));

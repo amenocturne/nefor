@@ -72,6 +72,7 @@ function M.construct(id, params, emit, deps)
     local one = (activation.messages or {})[1] or {}
     local value = params.value
     if params.canonical_from_message then value = one.message.value end
+    if value == nil and type(one.message) == "table" then value = one.message.value end
     emit(sign({
       kind = "stub.Out",
       greeting = params.greeting,

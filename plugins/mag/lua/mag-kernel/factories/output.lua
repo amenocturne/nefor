@@ -23,6 +23,32 @@ function M.construct(id, _, emit)
   local instance = { id = id }
 
   function instance.deliver(activation)
+    if activation and activation.shape == "product" and not activation.whole then
+      local values, semantic_values = {}, {}
+      for index, position in ipairs(activation.messages or {}) do
+        local message = position.message or {}
+        local value = message.value
+        if value == nil then value = message end
+        values[index] = value
+        semantic_values[index] = value
+        local arrival = position.arrival
+        local component = arrival and arrival.declared_type
+          and (arrival.declared_type.items or {})[index]
+        if type(component) == "table" and component.kind == "union" then
+          semantic_values[index] = {
+            type = arrival.constructor_id,
+            value = value,
+          }
+        end
+      end
+      emit({
+        kind = VALUE,
+        from = id,
+        value = values,
+        semantic_value = semantic_values,
+      })
+      return { status = "ok" }
+    end
     local message = ((activation or {}).messages or {})[1]
     local arrival = message and message.arrival
     local forwarded = {}

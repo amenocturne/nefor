@@ -1041,19 +1041,20 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         }
         "value-type-id" => {
             arity(args, 2)?;
-            let Value::TypeTag(declared) = raw(&args[1]) else {
+            let declared = declared_value_type(&args[1])?;
+            let selected = selected_value_type(env, &args[0], declared)?;
+            Ok(Value::SemanticTypeId(selected.stable_id()))
+        }
+        "value-type-evidence" => {
+            arity(args, 2)?;
+            let Value::TypeDescriptor(declared) = raw(&args[1]) else {
                 return Err(MagError::Type(
-                    "value-type-id expects a TypeTag as its second argument".into(),
+                    "value-type-evidence expects a TypeDescriptor".into(),
                 ));
             };
-            let selected = if matches!(declared, ConcreteType::Sum { .. }) {
-                explicit_constructor(env, &args[0])?.ok_or_else(|| {
-                    MagError::Type("sum value lacks selected constructor evidence".into())
-                })?
-            } else {
-                declared.clone()
-            };
-            Ok(Value::SemanticTypeId(selected.stable_id()))
+            Ok(Value::TypeDescriptor(selected_value_type(
+                env, &args[0], declared,
+            )?))
         }
         "pack" => {
             arity(args, 1)?;
@@ -1549,6 +1550,28 @@ fn raw(value: &Value) -> &Value {
     match value {
         Value::Typed(inner, _) => raw(inner),
         other => other,
+    }
+}
+
+fn declared_value_type(value: &Value) -> Result<&ConcreteType, MagError> {
+    match raw(value) {
+        Value::TypeTag(declared) | Value::TypeDescriptor(declared) => Ok(declared),
+        _ => Err(MagError::Type(
+            "value type evidence must be TypeTag or TypeDescriptor".into(),
+        )),
+    }
+}
+
+fn selected_value_type(
+    env: &Env,
+    value: &Value,
+    declared: &ConcreteType,
+) -> Result<ConcreteType, MagError> {
+    if matches!(declared, ConcreteType::Sum { .. }) {
+        explicit_constructor(env, value)?
+            .ok_or_else(|| MagError::Type("sum value lacks selected constructor evidence".into()))
+    } else {
+        Ok(declared.clone())
     }
 }
 
