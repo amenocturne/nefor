@@ -613,6 +613,9 @@ fn value_type(value: &Value) -> Option<MagType> {
         Value::List(v) | Value::Vector(v) => Some(MagType::List(Box::new(
             v.first().and_then(value_type).unwrap_or(MagType::Data),
         ))),
+        Value::Product(v) => Some(MagType::Product(
+            v.iter().map(value_type).collect::<Option<Vec<_>>>()?,
+        )),
         Value::Map(m) => Some(MagType::Record(
             m.iter()
                 .filter_map(|(k, v)| Some((k.clone(), value_type(v)?)))

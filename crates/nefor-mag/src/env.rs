@@ -36,7 +36,8 @@ impl PartialEq for MemoArg {
             (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
             (Value::Bool(left), Value::Bool(right)) => left == right,
             (Value::List(left), Value::List(right)) => Arc::ptr_eq(left, right),
-            (Value::Vector(left), Value::Vector(right)) => Arc::ptr_eq(left, right),
+            (Value::Vector(left), Value::Vector(right))
+            | (Value::Product(left), Value::Product(right)) => Arc::ptr_eq(left, right),
             (Value::Map(left), Value::Map(right)) => Arc::ptr_eq(left, right),
             (Value::Fn(left), Value::Fn(right)) => Arc::ptr_eq(left, right),
             (Value::Type(left), Value::Type(right)) => left == right,
@@ -66,7 +67,9 @@ impl Hash for MemoArg {
             Value::Int(value) => value.hash(state),
             Value::Float(value) => value.to_bits().hash(state),
             Value::Bool(value) => value.hash(state),
-            Value::List(value) | Value::Vector(value) => Arc::as_ptr(value).hash(state),
+            Value::List(value) | Value::Vector(value) | Value::Product(value) => {
+                Arc::as_ptr(value).hash(state)
+            }
             Value::Map(value) => Arc::as_ptr(value).hash(state),
             Value::Fn(value) => Arc::as_ptr(value).hash(state),
             Value::Type(value) => value.hash(state),

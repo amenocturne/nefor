@@ -101,6 +101,9 @@ pub enum Value {
     Symbol(String),
     List(Arc<Vec<Value>>),
     Vector(Arc<Vec<Value>>),
+    /// A checked ordered product. Unlike a Vector, every position retains its
+    /// own trusted type and constructor evidence.
+    Product(Arc<Vec<Value>>),
     Map(Arc<BTreeMap<String, Value>>),
     Fn(Arc<FnValue>),
     BuiltinFn(String),
@@ -132,6 +135,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
             Self::Vector(_) => "vector",
+            Self::Product(_) => "product",
             Self::Map(_) => "map",
             Self::Fn(_) => "fn",
             Self::BuiltinFn(_) => "builtin-fn",

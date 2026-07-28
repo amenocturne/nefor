@@ -634,6 +634,31 @@ fn record_field_diff(env: &Env, value: &Value, ty: &MagType) -> Option<String> {
 }
 
 fn checked_typed_value(env: &Env, value: Value, ty: MagType) -> Result<Value, MagError> {
+    if let MagType::Product(components) = &ty {
+        let values = match raw(&value) {
+            Value::List(values) | Value::Vector(values) | Value::Product(values) => values,
+            _ => {
+                return Err(MagError::Type(format!(
+                    "value does not conform to {ty}: expected an ordered tuple"
+                )))
+            }
+        };
+        if values.len() != components.len() {
+            return Err(MagError::Type(format!(
+                "value does not conform to {ty}: expected {} tuple positions, got {}",
+                components.len(),
+                values.len()
+            )));
+        }
+        let positions = values
+            .iter()
+            .cloned()
+            .zip(components)
+            .map(|(position, component)| checked_typed_value(env, position, component.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Value::Product(std::sync::Arc::new(positions)));
+    }
+
     validate_value(env, &value, &ty)?;
     let Ok(accepted) = crate::types::ConcreteType::resolve(env, &ty) else {
         return Ok(Value::Typed(std::sync::Arc::new(value), ty));
@@ -742,7 +767,16 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
         ),
         MagType::ForeignEvidence => matches!(value, Value::ForeignEvidence(_)),
         MagType::Union(types) => types.iter().any(|t| validate_value(env, value, t).is_ok()),
-        MagType::Product(types) => types.iter().all(|t| validate_value(env, value, t).is_ok()),
+        MagType::Product(types) => match value {
+            Value::List(values) | Value::Vector(values) | Value::Product(values) => {
+                values.len() == types.len()
+                    && values
+                        .iter()
+                        .zip(types)
+                        .all(|(position, ty)| validate_value(env, position, ty).is_ok())
+            }
+            _ => false,
+        },
         MagType::Function(_, _) => matches!(value, Value::Fn(_)),
         MagType::Foreign(_, _, _) => matches!(value, Value::Foreign(_)),
         MagType::Var(_) => true,
@@ -1173,7 +1207,9 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Keyword(a), Value::Keyword(b)) => a == b,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
-        (Value::List(a), Value::List(b)) | (Value::Vector(a), Value::Vector(b)) => {
+        (Value::List(a), Value::List(b))
+        | (Value::Vector(a), Value::Vector(b))
+        | (Value::Product(a), Value::Product(b)) => {
             a.len() == b.len()
                 && a.iter()
                     .zip(b.iter())

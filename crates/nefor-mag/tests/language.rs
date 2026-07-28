@@ -540,6 +540,72 @@ fn sum_refinement_rejects_lookalikes_without_matching_constructor_evidence() {
 }
 
 #[test]
+fn product_values_are_exact_ordered_tuples_with_authored_grouping() {
+    let root = workspace("product-values");
+    let artifact = compile(
+        r#"
+          (artifact "test.product-values/v1"
+            {:flat (as (+ Int String Int) [1 "middle" 2])
+             :left (as (+ (+ Int String) Bool)
+                       [(as (+ Int String) [3 "left"]) true])
+             :right (as (+ Int (+ String Bool))
+                        [4 (as (+ String Bool) ["right" false])])})
+        "#,
+        &root,
+    )
+    .unwrap();
+    assert_eq!(
+        artifact.data,
+        json!({
+            "flat": [1, "middle", 2],
+            "left": [[3, "left"], true],
+            "right": [4, ["right", false]],
+        })
+    );
+
+    for (name, source) in [
+        (
+            "short",
+            r#"(artifact "test.product/v1" (as (+ Int String) [1]))"#,
+        ),
+        (
+            "long",
+            r#"(artifact "test.product/v1" (as (+ Int String) [1 "x" 2]))"#,
+        ),
+        (
+            "positional",
+            r#"(artifact "test.product/v1" (as (+ Int String) ["x" 1]))"#,
+        ),
+        (
+            "old-intersection",
+            r#"(artifact "test.product/v1" (as (+ Int Int) 1))"#,
+        ),
+    ] {
+        let error = compile(source, &workspace(name)).unwrap_err().to_string();
+        assert!(error.contains("does not conform"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn product_positions_preserve_selected_constructor_evidence() {
+    let root = workspace("product-constructor-evidence");
+    let artifact = compile(
+        r#"
+          (type X {:value Int})
+          (type Y {:value Int})
+          (def tuple
+            (as (+ (| X Y) String)
+                [(as (| X Y) (as X {:value 1})) "kept"]))
+          (def accept (fn [[value (+ (| X Y) String)]] -> (+ (| X Y) String) value))
+          (artifact "test.product-evidence/v1" (accept tuple))
+        "#,
+        &root,
+    )
+    .unwrap();
+    assert_eq!(artifact.data, json!([{"value": 1}, "kept"]));
+}
+
+#[test]
 fn explicit_record_refinement_reports_missing_and_unexpected_fields() {
     let root = workspace("exact-refinement");
     let error = compile(

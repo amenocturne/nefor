@@ -321,11 +321,27 @@ fn validate_at(schema: &SchemaType, value: &Value, path: &str, out: &mut Vec<Vio
                 out.extend(best);
             }
         }
-        SchemaType::Product { components } => {
-            for component in components {
-                validate_at(component, value, path, out);
+        SchemaType::Product { components } => match value {
+            Value::Array(values) => {
+                if values.len() != components.len() {
+                    out.push(Violation {
+                        path: path.into(),
+                        code: "wrong_arity".into(),
+                        expected: format!("{} tuple positions", components.len()),
+                        actual: format!("{} tuple positions", values.len()),
+                        message: format!(
+                            "expected {} tuple positions, got {}",
+                            components.len(),
+                            values.len()
+                        ),
+                    });
+                }
+                for (index, (component, position)) in components.iter().zip(values).enumerate() {
+                    validate_at(component, position, &format!("{path}[{index}]"), out);
+                }
             }
-        }
+            _ => expect(false, path, "array", value, out),
+        },
     }
 }
 
@@ -358,11 +374,14 @@ fn describe(schema: &SchemaType) -> String {
             .map(describe)
             .collect::<Vec<_>>()
             .join(" | "),
-        SchemaType::Product { components } => components
-            .iter()
-            .map(describe)
-            .collect::<Vec<_>>()
-            .join(" & "),
+        SchemaType::Product { components } => format!(
+            "({})",
+            components
+                .iter()
+                .map(describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         SchemaType::Named { name, .. } => name.clone(),
     }
 }
@@ -536,30 +555,27 @@ mod tests {
     }
 
     #[test]
-    fn products_require_every_component() {
+    fn products_are_exact_positional_tuples() {
         let schema = TypeSchema {
             version: SCHEMA_VERSION,
             root: SchemaType::Product {
-                components: vec![
-                    SchemaType::Record {
-                        fields: vec![SchemaField {
-                            name: "name".into(),
-                            schema: SchemaType::String,
-                        }],
-                    },
-                    SchemaType::Record {
-                        fields: vec![SchemaField {
-                            name: "count".into(),
-                            schema: SchemaType::Int,
-                        }],
-                    },
-                ],
+                components: vec![SchemaType::String, SchemaType::Int, SchemaType::String],
             },
         };
-        // Products are intersections; strict records make two disjoint record
-        // components unsatisfiable, which is the existing MAG product meaning.
-        let invalid = schema.validate_json(r#"{"name":"x","count":1}"#);
-        assert!(!invalid.ok);
-        assert!(invalid.violations.iter().any(|v| v.code == "extra_field"));
+        assert!(schema.validate_json(r#"["left",1,"right"]"#).ok);
+
+        let short = schema.validate_json(r#"["left",1]"#);
+        assert!(short.violations.iter().any(|v| v.code == "wrong_arity"));
+
+        let swapped = schema.validate_json(r#"[1,"left","right"]"#);
+        assert!(swapped.violations.iter().any(|v| v.path == "$[0]"));
+        assert!(swapped.violations.iter().any(|v| v.path == "$[1]"));
+
+        let old_intersection = schema.validate_json(r#"{"name":"x","count":1}"#);
+        assert!(!old_intersection.ok);
+        assert!(old_intersection
+            .violations
+            .iter()
+            .any(|v| v.code == "wrong_type"));
     }
 }

@@ -23,7 +23,7 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
             "input": concrete_type_to_json(&evidence.input)?,
             "output": concrete_type_to_json(&evidence.output)?,
         })),
-        Value::List(v) | Value::Vector(v) => Ok(serde_json::Value::Array(
+        Value::List(v) | Value::Vector(v) | Value::Product(v) => Ok(serde_json::Value::Array(
             v.iter().map(value_to_json).collect::<Result<_, _>>()?,
         )),
         Value::Map(v) => Ok(serde_json::Value::Object(
@@ -307,7 +307,25 @@ pub fn json_to_typed_value(
                 ty.clone(),
             )
         }
-        MagType::Product(_) => Value::Typed(std::sync::Arc::new(json_to_value(value)), ty.clone()),
+        MagType::Product(components) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| MagError::Type(format!("expected ordered tuple {ty}")))?;
+            if values.len() != components.len() {
+                return Err(MagError::Type(format!(
+                    "expected {} tuple positions for {ty}, got {}",
+                    components.len(),
+                    values.len()
+                )));
+            }
+            Value::Product(std::sync::Arc::new(
+                values
+                    .iter()
+                    .zip(components)
+                    .map(|(position, component)| json_to_typed_value(env, position, component))
+                    .collect::<Result<_, _>>()?,
+            ))
+        }
         MagType::Data => json_to_value(value),
         MagType::Unit | MagType::Bool | MagType::Int | MagType::Float | MagType::String => {
             json_to_value(value)
