@@ -7,6 +7,38 @@ fn install_semantic_type(lua: &Lua) {
     let semantic_type = lua.create_table().unwrap();
     semantic_type
         .set(
+            "id",
+            lua.create_function(|lua, descriptor: Value| {
+                let descriptor: serde_json::Value = lua.from_value(descriptor)?;
+                let descriptor = nefor_mag::json::concrete_type_from_json(&descriptor)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                Ok(descriptor.stable_id().to_string())
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    semantic_type
+        .set(
+            "validate_declarations",
+            lua.create_function(|lua, declarations: Value| {
+                let declarations: serde_json::Value = lua.from_value(declarations)?;
+                let declarations = declarations
+                    .as_object()
+                    .ok_or_else(|| mlua::Error::runtime("declarations must be an object"))?;
+                for (id, descriptor) in declarations {
+                    let descriptor = nefor_mag::json::concrete_type_from_json(descriptor)
+                        .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                    if descriptor.stable_id().as_str() != id {
+                        return Err(mlua::Error::runtime("descriptor identity mismatch"));
+                    }
+                }
+                Ok(true)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    semantic_type
+        .set(
             "accepts",
             lua.create_function(|lua, (target, source): (Value, Value)| {
                 let target: serde_json::Value = lua.from_value(target)?;
@@ -73,6 +105,12 @@ fn registry_exposes_qualified_serializable_contracts() {
                   params = { count = "int" },
                   inputs = { value = "core.String" },
                   outputs = { "core.String" },
+                  semantic = {
+                    input = {kind="primitive",name="String"},
+                    output = {kind="primitive",name="String"},
+                    inputs = {{wire="core.String",type={kind="primitive",name="String"}}},
+                    outputs = {{wire="core.String",type={kind="primitive",name="String"}}},
+                  },
                   signals = {},
                 },
                 construct = function() return {} end,
@@ -87,6 +125,8 @@ fn registry_exposes_qualified_serializable_contracts() {
               assert(contracts[1].type_scheme.inputs.value == "core.String")
               assert(contracts[1].type_scheme.input_tags[1] == "core.String")
               assert(contracts[1].type_scheme.outputs[1] == "core.String")
+              assert(contracts[1].type_scheme.semantic.input.name == "String")
+              assert(contracts[1].type_scheme.semantic.inputs[1].wire == "core.String")
             end
             "#,
         )
@@ -157,6 +197,28 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
         version=2,identity="nefor.factory.fixed",arguments={},input=p("String"),output=p("Int")},
         input={wire="FixedIn",type=p("String")},outputs={{wire="FixedOut",type=p("Int")}},routes={}}}})
       assert(fixed_good.ok,table.concat(fixed_good.errors or {},"; "))
+      local string_id=nefor.semantic_type.id(p("String"))
+      local int_id=nefor.semantic_type.id(p("Int"))
+      local typed_fixed=reg:validate_modification({
+        types={[string_id]=p("String"),[int_id]=p("Int")},
+        actors={{id="fixed",factory="fixed",evidence={
+          version=2,identity="nefor.factory.fixed",arguments={},input=p("String"),output=p("Int")},
+          input={wire="FixedIn",type=p("String"),type_id=string_id},
+          outputs={{wire="FixedOut",type=p("Int"),type_id=int_id}},routes={}}}})
+      assert(typed_fixed.ok,table.concat(typed_fixed.errors or {},"; "))
+      local forged_key=reg:validate_modification({
+        types={["sha256:forged"]=p("String")},
+        actors={}})
+      assert(not forged_key.ok)
+      assert(table.concat(forged_key.errors,"; "):find("declarations are invalid"))
+      local mismatched_ref=reg:validate_modification({
+        types={[string_id]=p("String"),[int_id]=p("Int")},
+        actors={{id="fixed",factory="fixed",evidence={
+          version=2,identity="nefor.factory.fixed",arguments={},input=p("String"),output=p("Int")},
+          input={wire="FixedIn",type=p("String"),type_id=int_id},
+          outputs={{wire="FixedOut",type=p("Int"),type_id=int_id}},routes={}}}})
+      assert(not mismatched_ref.ok)
+      assert(table.concat(mismatched_ref.errors,"; "):find("absent or mismatched"))
       local fixed_tamper=reg:validate_modification({actors={{id="fixed",factory="fixed",evidence={
         version=2,identity="nefor.factory.fixed",arguments={},input=p("String"),output=p("Int")},
         input={wire="FixedIn",type=p("Int")},outputs={{wire="FixedOut",type=p("String")}},routes={}}}})

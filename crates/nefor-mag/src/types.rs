@@ -68,7 +68,7 @@ pub enum ConcreteType {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SemanticTypeId(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +147,60 @@ impl ConcreteType {
         let bytes = serde_json::to_vec(self)
             .unwrap_or_else(|_| unreachable!("ConcreteType serialization is infallible"));
         SemanticTypeId(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
+    pub fn declarations(&self) -> Result<BTreeMap<String, ConcreteType>, MagError> {
+        let mut declarations = BTreeMap::new();
+        self.collect_declarations(&mut declarations)?;
+        Ok(declarations)
+    }
+
+    fn collect_declarations(
+        &self,
+        declarations: &mut BTreeMap<String, ConcreteType>,
+    ) -> Result<(), MagError> {
+        let id = self.stable_id().to_string();
+        if let Some(existing) = declarations.get(&id) {
+            if existing != self {
+                return Err(MagError::Type(format!(
+                    "semantic type identity collision at {id}"
+                )));
+            }
+            return Ok(());
+        }
+        declarations.insert(id, self.clone());
+        match self {
+            Self::Named {
+                arguments, body, ..
+            } => {
+                for argument in arguments {
+                    argument.collect_declarations(declarations)?;
+                }
+                body.collect_declarations(declarations)?;
+            }
+            Self::List { item } => item.collect_declarations(declarations)?,
+            Self::Map { key, value } => {
+                key.collect_declarations(declarations)?;
+                value.collect_declarations(declarations)?;
+            }
+            Self::Record { fields } => {
+                for field in fields.values() {
+                    field.collect_declarations(declarations)?;
+                }
+            }
+            Self::Sum { arms } => {
+                for arm in arms {
+                    arm.collect_declarations(declarations)?;
+                }
+            }
+            Self::Product { items } => {
+                for item in items {
+                    item.collect_declarations(declarations)?;
+                }
+            }
+            Self::JsonValue | Self::Unit | Self::Bool | Self::Int | Self::Float | Self::String => {}
+        }
+        Ok(())
     }
 
     pub fn accepts(&self, actual: &Self) -> bool {
@@ -727,6 +781,24 @@ mod tests {
                 .unwrap();
         assert_eq!(first.stable_id(), second.stable_id());
         assert!(first.stable_id().as_str().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn descriptor_tables_include_stable_sum_constructor_declarations() {
+        let descriptor =
+            ConcreteType::resolve(&env_with_types(), &MagType::Named("main.B".into(), vec![]))
+                .unwrap();
+        let ConcreteType::Sum { arms } = &descriptor else {
+            panic!("B must unfold to a sum")
+        };
+        let declarations = descriptor.declarations().unwrap();
+        assert_eq!(
+            declarations.get(descriptor.stable_id().as_str()),
+            Some(&descriptor)
+        );
+        for arm in arms {
+            assert_eq!(declarations.get(arm.stable_id().as_str()), Some(arm));
+        }
     }
 
     #[test]

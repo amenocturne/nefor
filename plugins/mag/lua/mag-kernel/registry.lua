@@ -297,6 +297,7 @@ function registry:contracts(array_mt)
         inputs = decl.inputs,
         input_tags = input_tags,
         outputs = array_copy(decl.outputs),
+        semantic = decl.semantic,
       },
       signals = array_copy(decl.signals),
     }
@@ -362,6 +363,51 @@ end
 function registry:validate_modification(modification, resolve, existing_specs)
   local errors = {}
   local actors = (modification and modification.actors) or {}
+  local declarations = modification and modification.types or nil
+  local semantic_host = nefor and nefor.semantic_type
+
+  local function validate_type_reference(reference, label)
+    if type(reference) ~= "table" or type(reference.type) ~= "table" or
+        type(reference.type_id) ~= "string" then
+      table.insert(errors, label .. ": missing semantic descriptor identity")
+      return
+    end
+    local declared = declarations and declarations[reference.type_id] or nil
+    if not declared or not type_node.equal(declared, reference.type) then
+      table.insert(errors, label .. ": semantic descriptor identity is absent or mismatched")
+    end
+  end
+
+  if declarations ~= nil then
+    if type(declarations) ~= "table" or type(semantic_host) ~= "table" or
+        type(semantic_host.validate_declarations) ~= "function" then
+      table.insert(errors, "modification semantic declarations cannot be verified")
+    else
+      local ok, valid_or_error = pcall(semantic_host.validate_declarations, declarations)
+      if not ok or valid_or_error ~= true then
+        table.insert(errors, "modification semantic declarations are invalid: " ..
+          tostring(valid_or_error))
+      end
+      for _, spec in ipairs(actors) do
+        validate_type_reference(spec.input, string.format("actor %q input", tostring(spec.id)))
+        for index, output in ipairs(spec.outputs or {}) do
+          validate_type_reference(output, string.format(
+            "actor %q output %d", tostring(spec.id), index))
+        end
+      end
+      for index, message in ipairs(modification.messages or {}) do
+        validate_type_reference(
+          { type = message.semantic_type, type_id = message.semantic_type_id },
+          string.format("message %d", index))
+      end
+      for index, rule in ipairs(modification.rules or {}) do
+        validate_type_reference(rule.on, string.format("rule %d", index))
+      end
+      if modification.result ~= nil then
+        validate_type_reference(modification.result.from, "result boundary")
+      end
+    end
+  end
 
   -- id -> factory name, for destination wiring checks.
   local factory_of = {}
@@ -485,6 +531,12 @@ function registry:validate_modification(modification, resolve, existing_specs)
             "actor %q: route key %q is not a declared output of factory %q",
             tostring(spec.id), tostring(tag), spec.factory))
         else
+          local source_endpoint = nil
+          for _, output in ipairs(spec.outputs or {}) do
+            if output.wire == tag then
+              if source_endpoint then source_endpoint = false else source_endpoint = output end
+            end
+          end
           for _, destination in ipairs(dests) do
             local dest_id = destination.actor
             local dest_wire = destination.wire
@@ -520,6 +572,16 @@ function registry:validate_modification(modification, resolve, existing_specs)
                     table.insert(errors,string.format(
                       "wiring %q -%s-> %q: semantic endpoint types differ",
                       tostring(spec.id),tag,tostring(dest_id)))
+                  end
+                end
+                if declarations ~= nil then
+                  if not source_endpoint or
+                      destination.source_type_id ~= source_endpoint.type_id or
+                      type(dest_spec.input) ~= "table" or
+                      destination.destination_type_id ~= dest_spec.input.type_id then
+                    table.insert(errors, string.format(
+                      "wiring %q -%s-> %q: route semantic identities differ from endpoints",
+                      tostring(spec.id), tag, tostring(dest_id)))
                   end
                 end
               end

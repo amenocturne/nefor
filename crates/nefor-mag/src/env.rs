@@ -207,6 +207,7 @@ impl Env {
             "descriptor-input-covered-by?",
             "descriptor-input-assignments",
             "descriptor-output-covered-by?",
+            "descriptor-table",
             "foreign-contracts",
         ] {
             env.define(name, Value::BuiltinFn(name.into()));

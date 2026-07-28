@@ -1170,6 +1170,29 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             )?;
             Ok(Value::Bool(target.output_is_covered_by(&handlers)))
         }
+        "descriptor-table" => {
+            arity(args, 1)?;
+            let descriptors =
+                descriptor_list(&args[0], "descriptor-table expects a descriptor list")?;
+            let mut declarations = BTreeMap::new();
+            for descriptor in descriptors {
+                for (id, declaration) in descriptor.declarations()? {
+                    if let Some(existing) = declarations.insert(id.clone(), declaration.clone()) {
+                        if existing != declaration {
+                            return Err(MagError::Type(format!(
+                                "semantic type identity collision at {id}"
+                            )));
+                        }
+                    }
+                }
+            }
+            Ok(Value::Map(std::sync::Arc::new(
+                declarations
+                    .into_iter()
+                    .map(|(id, descriptor)| (id, Value::TypeDescriptor(descriptor)))
+                    .collect(),
+            )))
+        }
         "foreign-contracts" => {
             arity(args, 0)?;
             let Value::HostInputs(inputs) = raw(env.lookup("inputs")?) else {

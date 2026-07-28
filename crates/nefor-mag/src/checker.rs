@@ -538,6 +538,21 @@ fn infer_builtin(
                 Ok(MagType::Bool)
             }
         }
+        "descriptor-table" => {
+            exact(1)?;
+            let descriptors = infer(env, locals, &args[0])?;
+            compatible(
+                env,
+                &descriptors,
+                &MagType::List(Box::new(MagType::TypeDescriptor)),
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
+            Ok(MagType::Map(
+                Box::new(MagType::String),
+                Box::new(MagType::TypeDescriptor),
+            ))
+        }
         "foreign-contracts" => {
             exact(0)?;
             Ok(MagType::List(Box::new(MagType::Record(

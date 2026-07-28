@@ -890,6 +890,11 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
                     (fn [[candidate nefor.graph.LowerActor]] -> Bool
                       (= (get candidate "id") "right"))
                     (get lowered "actors")))
+                lowered-join
+                  (first (filter
+                    (fn [[candidate nefor.graph.LowerActor]] -> Bool
+                      (= (get candidate "id") "join"))
+                    (get lowered "actors")))
                 destinations
                   (concat
                     (get (get lowered-left "routes") "nefor.graph.Value")
@@ -899,6 +904,16 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
                :output-tag (get output-checked "tag")
                :choice-without-rule (get choice-without-rule "tag")
                :choice-with-rule (get choice-with-rule "tag")
+               :type-count (count (get lowered "types"))
+               :left-output-id
+                 (get (first (get lowered-left "outputs")) "type_id")
+               :join-output-id
+                 (get (first (get lowered-join "outputs")) "type_id")
+               :join-input-id (get (get lowered-join "input") "type_id")
+               :left-route-source-id
+                 (get (first destinations) "source_type_id")
+               :left-route-destination-id
+                 (get (first destinations) "destination_type_id")
                :permutation-stable
                  (= (canonical (nefor.graph.lower output-topology))
                     (canonical (nefor.graph.lower reversed-output-topology)))
@@ -953,6 +968,19 @@ fn graph_product_input_accepts_repeated_typed_fan_in() {
         "core.validated.Invalid"
     );
     assert_eq!(artifact.data["choice-with-rule"], "core.validated.Valid");
+    assert!(artifact.data["type-count"].as_u64().unwrap() >= 4);
+    assert_eq!(
+        artifact.data["left-output-id"],
+        artifact.data["left-route-source-id"]
+    );
+    assert_eq!(
+        artifact.data["left-output-id"], artifact.data["join-output-id"],
+        "wire names must not participate in semantic type identity"
+    );
+    assert_eq!(
+        artifact.data["join-input-id"],
+        artifact.data["left-route-destination-id"]
+    );
     assert_eq!(artifact.data["permutation-stable"], true);
     assert_eq!(artifact.data["positions"], json!([0, 1]));
     let edge_ids = artifact.data["edge-ids"].as_array().unwrap();

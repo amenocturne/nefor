@@ -4,7 +4,10 @@
 ;; A graph is an immutable edge set. The list is a deterministic storage
 ;; detail: graph/add-edges/remove-edges normalize it to set semantics.
 (type Port [T] {:actor String :type (TypeTag T) :wire String})
-(type StoredPort {:actor String :type TypeDescriptor :wire String})
+(type StoredPort {:actor String
+                  :type TypeDescriptor
+                  :type_id SemanticTypeId
+                  :wire String})
 (type Actor {:id String
              :foreign String
              :evidence ForeignEvidence
@@ -42,6 +45,8 @@
 (type LowerDestination {:actor String
                         :wire String
                         :edge_id String
+                        :source_type_id SemanticTypeId
+                        :destination_type_id SemanticTypeId
                         :product_position Int})
 (type AssignedRoute {:route StoredRoute :product_position Int})
 (type LowerActor {:id String
@@ -53,6 +58,7 @@
                   :routes (Map String (List LowerDestination))})
 (type LowerMessage {:to String
                     :semantic_type TypeDescriptor
+                    :semantic_type_id SemanticTypeId
                     :content PackedValue})
 (type LowerRule {:id String :on StoredPort :fn String})
 (type ResultBoundary {:from StoredPort})
@@ -60,6 +66,7 @@
                     :messages (List LowerMessage)
                     :kills (List String)
                     :rules (List LowerRule)
+                    :types (Map String TypeDescriptor)
                     :result ResultBoundary})
 
 ;; Dynamic rule artifacts remain an operation format over the running actor
@@ -73,15 +80,18 @@
 (type LowerDelta {:actors (List LowerActor)
                   :messages (List LowerMessage)
                   :kills (List String)
-                  :rules (List LowerRule)})
+                  :rules (List LowerRule)
+                  :types (Map String TypeDescriptor)})
 
 (def port (fn [T] [[actor String] [semantic-type (TypeTag T)] [wire-type String]] -> (Port T)
   (as (Port T) {:actor actor :type semantic-type :wire wire-type})))
 
 (def store-port (fn [T] [[value (Port T)]] -> StoredPort
-  (as StoredPort {:actor (get value "actor")
-                  :type (type-evidence (get value "type"))
-                  :wire (get value "wire")})))
+  (let [descriptor (type-evidence (get value "type"))]
+    (as StoredPort {:actor (get value "actor")
+                    :type descriptor
+                    :type_id (type-id descriptor)
+                    :wire (get value "wire")}))))
 
 (def actor (fn [P I O] [[id String] [capability (Foreign P I O)] [params P]
                 [input StoredPort] [outputs (List StoredPort)]] -> Actor
@@ -327,7 +337,9 @@
         (if (= (get boundary "id") id)
           (if (= (get boundary "foreign") "nefor.factory.source")
             (if (= input (as StoredPort
-                    {:actor id :type (type-evidence (type-tag Unit))
+                    {:actor id
+                     :type (type-evidence (type-tag Unit))
+                     :type_id (type-id (type-evidence (type-tag Unit)))
                      :wire "mag.Unit"}))
               (if (= (get output "actor") id)
                 (if (= (get output "wire") "nefor.graph.Value")
@@ -587,11 +599,17 @@
       (as (List AssignedRoute) [])
       (let [positions (descriptor-input-assignments (get input "type") sources)]
         (zip-route-assignments incoming positions))))))
-(def assigned-routes (fn [[routes (List StoredRoute)] [actors (List Actor)]]
+(def assigned-route (fn [[routes (List StoredRoute)] [candidate StoredRoute]]
+  -> AssignedRoute
+  (first
+    (filter (fn [[assigned AssignedRoute]] -> Bool
+              (= (get (get assigned "route") "id") (get candidate "id")))
+            (assigned-routes-to routes (get candidate "to"))))))
+(def assigned-routes (fn [[routes (List StoredRoute)]]
   -> (List AssignedRoute)
-  (flat-map (fn [[candidate Actor]] -> (List AssignedRoute)
-              (assigned-routes-to routes (get candidate "input")))
-            actors)))
+  (map (fn [[candidate StoredRoute]] -> AssignedRoute
+         (assigned-route routes candidate))
+       routes)))
 (def assigned-routes-from (fn [[routes (List AssignedRoute)] [actor-id String]]
   -> (List AssignedRoute)
   (filter (fn [[candidate AssignedRoute]] -> Bool
@@ -608,6 +626,8 @@
           destination (as LowerDestination {:actor (get to "actor")
                                              :wire (get to "wire")
                                              :edge_id (get candidate "id")
+                                             :source_type_id (get from "type_id")
+                                             :destination_type_id (get to "type_id")
                                              :product_position (get assigned "product_position")})]
       (assoc out wire (concat old [destination]))))
     (as (Map String (List LowerDestination)) {})
@@ -621,15 +641,53 @@
   (let [to (get value "to")]
     (as LowerMessage {:to (get to "actor")
                       :semantic_type (get to "type")
+                      :semantic_type_id (get to "type_id")
                       :content (get value "content")}))))
 (def lower-rule (fn [[value Rule]] -> LowerRule
   (as LowerRule {:id (get value "id") :on (get value "on") :fn (get value "fn")})))
 (def result-boundary (fn [[value Graph]] -> ResultBoundary
   (as ResultBoundary {:from (get (first (outputs value)) "output")})))
+(def actor-descriptors (fn [[actors (List Actor)]] -> (List TypeDescriptor)
+  (flat-map (fn [[candidate Actor]] -> (List TypeDescriptor)
+              (concat [(get (get candidate "input") "type")]
+                      (map (fn [[output StoredPort]] -> TypeDescriptor
+                             (get output "type"))
+                           (get candidate "outputs"))))
+            actors)))
+(def route-descriptors (fn [[routes (List StoredRoute)]] -> (List TypeDescriptor)
+  (flat-map (fn [[candidate StoredRoute]] -> (List TypeDescriptor)
+              [(get (get candidate "from") "type")
+               (get (get candidate "to") "type")])
+            routes)))
+(def message-descriptors (fn [[messages (List Message)]] -> (List TypeDescriptor)
+  (map (fn [[candidate Message]] -> TypeDescriptor
+         (get (get candidate "to") "type"))
+       messages)))
+(def rule-descriptors (fn [[rules (List Rule)]] -> (List TypeDescriptor)
+  (map (fn [[candidate Rule]] -> TypeDescriptor
+         (get (get candidate "on") "type"))
+       rules)))
+(def program-descriptors (fn [[topology Graph] [rules (List Rule)]]
+  -> (List TypeDescriptor)
+  (concat
+    (concat
+      (concat
+        (actor-descriptors (graph-actors topology))
+        (route-descriptors (graph-routes topology)))
+      (concat
+        (message-descriptors (graph-messages topology))
+        (rule-descriptors rules)))
+    [(get (get (first (outputs topology)) "output") "type")])))
+(def delta-descriptors (fn [[value Delta]] -> (List TypeDescriptor)
+  (concat
+    (concat
+      (actor-descriptors (get value "actors"))
+      (route-descriptors (get value "routes")))
+    (message-descriptors (get value "messages")))))
 (def lower-program (fn [[value Program]] -> Modification
   (let [topology (get value "graph")
         actors (graph-actors topology)
-        routes (assigned-routes (graph-routes topology) actors)]
+        routes (assigned-routes (graph-routes topology))]
     (as Modification
       {:actors (map (fn [[candidate Actor]] -> LowerActor
                       (lower-actor-with-routes routes candidate))
@@ -637,6 +695,7 @@
        :messages (map lower-message (graph-messages topology))
        :kills (as (List String) [])
        :rules (map lower-rule (get value "rules"))
+       :types (descriptor-table (program-descriptors topology (get value "rules")))
        :result (result-boundary topology)}))))
 (def lower (fn [[value Graph]] -> Modification
   (lower-program (program value (as (List Rule) [])))))
@@ -672,13 +731,15 @@
              :kills (get change "kills")})))
 (def lower-delta (fn [[value Delta]] -> LowerDelta
   (let [actors (get value "actors")
-        routes (assigned-routes (get value "routes") actors)]
+        routes (assigned-routes (get value "routes"))]
     (as LowerDelta
     {:actors (map (fn [[candidate Actor]] -> LowerActor
                     (lower-actor-with-routes routes candidate))
                   actors)
      :messages (map lower-message (get value "messages"))
-     :kills (get value "kills") :rules (as (List LowerRule) [])}))))
+     :kills (get value "kills")
+     :rules (as (List LowerRule) [])
+     :types (descriptor-table (delta-descriptors value))}))))
 
 ;; A resident program may begin with rule-observed exits that only become
 ;; connected after a rule returns its operational delta. Its explicit boundary
@@ -689,4 +750,7 @@
                       :messages (get lowered "messages")
                       :kills (get lowered "kills")
                       :rules (map lower-rule rules)
+                      :types (descriptor-table
+                               (concat (delta-descriptors change)
+                                       [(get (store-port result) "type")]))
                       :result (as ResultBoundary {:from (store-port result)})}))))
