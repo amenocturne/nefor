@@ -121,6 +121,76 @@ fn namespaced_transitive_and_diamond_imports_are_stable() {
 }
 
 #[test]
+fn qualified_nominal_constructors_do_not_duck_type() {
+    let root = workspace("qualified-nominals");
+    fs::create_dir_all(root.join("left")).unwrap();
+    fs::create_dir_all(root.join("right")).unwrap();
+    fs::write(root.join("left/types.mag"), "(type Payload {:value Int})").unwrap();
+    fs::write(root.join("right/types.mag"), "(type Payload {:value Int})").unwrap();
+    fs::write(
+        root.join("main.mag"),
+        r#"
+          (require "left.types")
+          (require "right.types")
+          (def accept-left
+            (fn [[value left.types.Payload]] -> left.types.Payload value))
+          (artifact "test.nominal-identity/v1"
+            (accept-left (as right.types.Payload {:value 1})))
+        "#,
+    )
+    .unwrap();
+
+    let error = load_with_inputs(&root, "main.mag", json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("left.types.Payload") && error.contains("right.types.Payload"),
+        "same-shaped constructors from different modules must remain distinct: {error}"
+    );
+}
+
+#[test]
+fn product_type_evidence_preserves_order_and_grouping() {
+    let root = workspace("product-grouping");
+    let artifact = compile(
+        r#"
+          (artifact "test.product-grouping/v1"
+            {:left (type-evidence (type-tag (+ (+ Int String) Bool)))
+             :right (type-evidence (type-tag (+ Int (+ String Bool))))
+             :flat (type-evidence (type-tag (+ Int String Bool)))})
+        "#,
+        &root,
+    )
+    .unwrap();
+
+    let left = json!({"kind":"product","items":[
+        {"kind":"product","items":[
+            {"kind":"primitive","name":"Int"},
+            {"kind":"primitive","name":"String"}
+        ]},
+        {"kind":"primitive","name":"Bool"}
+    ]});
+    let right = json!({"kind":"product","items":[
+        {"kind":"primitive","name":"Int"},
+        {"kind":"product","items":[
+            {"kind":"primitive","name":"String"},
+            {"kind":"primitive","name":"Bool"}
+        ]}
+    ]});
+    let flat = json!({"kind":"product","items":[
+        {"kind":"primitive","name":"Int"},
+        {"kind":"primitive","name":"String"},
+        {"kind":"primitive","name":"Bool"}
+    ]});
+    assert_eq!(artifact.data["left"], left);
+    assert_eq!(artifact.data["right"], right);
+    assert_eq!(artifact.data["flat"], flat);
+    assert_ne!(artifact.data["left"], artifact.data["right"]);
+    assert_ne!(artifact.data["left"], artifact.data["flat"]);
+    assert_ne!(artifact.data["right"], artifact.data["flat"]);
+}
+
+#[test]
 fn nominal_types_and_generic_foreigns_are_declared_data() {
     let root = workspace("types");
     let source = r#"
@@ -260,6 +330,42 @@ fn foreign_capabilities_are_first_class_and_specialized() {
 
     let bad = source.replace("{:seed \"x\"}", "{:wrong \"x\"}");
     assert!(compile(&bad, &root).is_err());
+}
+
+#[test]
+fn specialized_foreign_evidence_round_trips_exactly() {
+    let root = workspace("foreign-evidence-roundtrip");
+    let artifact = compile(
+        r#"
+          (type Params {:seed String})
+          (type Input {:prompt String})
+          (type Error {:message String})
+          (type Output {:answer String})
+          (foreign runtime.worker [P I O] {:params P :input I :output O})
+          (artifact "test.foreign-evidence/v1"
+            (foreign-evidence
+              (specialize runtime.worker
+                [Params (List Input) (| Output Error)])))
+        "#,
+        &root,
+    )
+    .unwrap();
+
+    let named = |name: &str| json!({"kind":"named","name":name,"arguments":[]});
+    assert_eq!(
+        artifact.data,
+        json!({
+            "version": 2,
+            "identity": "runtime.worker",
+            "arguments": [
+                named("main.Params"),
+                {"kind":"list","item":named("main.Input")},
+                {"kind":"union","items":[named("main.Output"), named("main.Error")]}
+            ],
+            "input": {"kind":"list","item":named("main.Input")},
+            "output": {"kind":"union","items":[named("main.Output"), named("main.Error")]}
+        })
+    );
 }
 
 #[test]

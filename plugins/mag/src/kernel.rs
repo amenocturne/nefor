@@ -1031,6 +1031,104 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_source_node_output_graph_executes_to_its_typed_result() {
+        let host = shipped_host();
+        let modification = compile_mag_source(
+            &host,
+            "ordinary-source-node-output",
+            r#"
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+(foreign nefor.factory.stub
+  {:params (Map String Data)
+   :input nefor.contracts.Text
+   :output nefor.contracts.Text})
+(let [start (nefor.graph.source "start" (type-tag nefor.contracts.Text)
+              (as nefor.contracts.Text {:content "ordinary"}))
+      input (nefor.graph.port "echo" (type-tag nefor.contracts.Text) "stub.In")
+      output (nefor.graph.port "echo" (type-tag nefor.contracts.Text) "stub.Out")
+      actor (nefor.graph.actor "echo"
+              nefor.factory.stub (as (Map String Data) {})
+              (nefor.graph.store-port input) [(nefor.graph.store-port output)])
+      echo (nefor.graph.node "echo" "ordinary" [actor]
+             (as (List nefor.graph.StoredRoute) [])
+             (as (List nefor.graph.Message) []) input output)
+      result (nefor.graph.output-for "result" echo)]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start echo)
+         (nefor.graph.edge echo result)]))))
+            "#,
+        );
+
+        let begun = host
+            .begin_run(
+                "ordinary-source-node-output",
+                "ordinary-source-node-output",
+                None,
+            )
+            .expect("begin ordinary run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host
+            .start("ordinary-source-node-output", &modification)
+            .expect("start ordinary run");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let completion = host
+            .take_run_complete("ordinary-source-node-output")
+            .expect("read completion")
+            .expect("ordinary graph completes");
+        let result = completion.result.expect("typed output result");
+        assert_eq!(result["kind"], "nefor.graph.Value");
+        assert_eq!(result["payload"]["value"]["content"], "ordinary");
+        assert!(host
+            .take_run_failed("ordinary-source-node-output")
+            .expect("read failure")
+            .is_none());
+    }
+
+    #[test]
+    fn factory_construction_failure_is_an_out_of_band_run_failure() {
+        let host = shipped_host();
+        let run_id = "factory-construction-failure";
+        let modification = compile_mag_eval_expression(
+            &host,
+            run_id,
+            r#"(nefor.shell.command-with-options
+                 "broken" "true"
+                 (as nefor.shell.BashOptions {:timeout_ms 0}))"#,
+        );
+
+        assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host.start(run_id, &modification).expect("start");
+        assert!(
+            outcome.ok,
+            "the modification itself remains valid: {:?}",
+            outcome.error
+        );
+        let failure = host
+            .take_run_failed(run_id)
+            .expect("read run failure")
+            .expect("construction failure is surfaced out of band");
+        assert!(
+            failure.contains("construct failed for 'broken'"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("positive number of milliseconds"),
+            "{failure}"
+        );
+        assert!(host
+            .take_run_complete(run_id)
+            .expect("read completion")
+            .is_none());
+    }
+
+    #[test]
     fn structural_result_boundary_accepts_arbitrary_declared_wire() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let path = manifest.join("lua/mag-kernel/init.lua");
@@ -1073,6 +1171,53 @@ mod tests {
                 .and_then(|v| v["greeting"].as_str()),
             Some("done")
         );
+    }
+
+    #[test]
+    fn rejected_modifications_leave_no_partial_inventory_changes() {
+        let host = shipped_host();
+        let run_id = "atomic-rejection";
+        assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
+        host.drain_emits().expect("drain begin event");
+
+        let rejected = host
+            .apply(
+                run_id,
+                &serde_json::json!({
+                    "actors": [{
+                        "id": "tentative",
+                        "factory": "nefor.factory.stub",
+                        "params": {},
+                        "routes": {}
+                    }],
+                    "messages": [{"to": "missing", "content": {"kind": "stub.In"}}],
+                    "kills": [],
+                    "rules": []
+                }),
+            )
+            .expect("apply rejected modification");
+        assert!(!rejected.ok);
+        assert!(rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown message target 'missing'")));
+
+        let probe = host
+            .apply(
+                run_id,
+                &serde_json::json!({
+                    "actors": [],
+                    "messages": [{"to": "tentative", "content": {"kind": "stub.In"}}],
+                    "kills": [],
+                    "rules": []
+                }),
+            )
+            .expect("probe inventory after rejection");
+        assert!(!probe.ok);
+        assert!(probe
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("unknown message target 'tentative'") }));
     }
 
     #[test]
