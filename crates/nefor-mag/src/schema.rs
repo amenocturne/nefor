@@ -28,7 +28,7 @@ pub enum SchemaType {
     List { item: Box<SchemaType> },
     Map { value: Box<SchemaType> },
     Record { fields: Vec<SchemaField> },
-    Union { variants: Vec<SchemaType> },
+    Union { variants: Vec<SchemaVariant> },
     Product { components: Vec<SchemaType> },
     Named { name: String, body: Box<SchemaType> },
 }
@@ -36,6 +36,12 @@ pub enum SchemaType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaField {
     pub name: String,
+    pub schema: SchemaType,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaVariant {
+    pub tag: String,
     pub schema: SchemaType,
 }
 
@@ -158,7 +164,15 @@ fn schema_type_to_json_schema(schema: &SchemaType) -> Value {
             })
         }
         SchemaType::Union { variants } => serde_json::json!({
-            "anyOf": variants.iter().map(schema_type_to_json_schema).collect::<Vec<_>>(),
+            "oneOf": variants.iter().map(|variant| serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "type": { "const": variant.tag },
+                    "value": schema_type_to_json_schema(&variant.schema),
+                },
+                "required": ["type", "value"],
+                "additionalProperties": false,
+            })).collect::<Vec<_>>(),
         }),
         SchemaType::Product { components } => serde_json::json!({
             "type": "array",
@@ -210,7 +224,16 @@ fn reify_concrete(ty: &crate::types::ConcreteType) -> Result<SchemaType, MagErro
                 .collect::<Result<_, MagError>>()?,
         },
         ConcreteType::Sum { arms } => SchemaType::Union {
-            variants: arms.iter().map(reify_concrete).collect::<Result<_, _>>()?,
+            variants: arms
+                .iter()
+                .map(|arm| {
+                    ensure_nominal_constructor(arm)?;
+                    Ok(SchemaVariant {
+                        tag: arm.stable_id().to_string(),
+                        schema: reify_concrete(arm)?,
+                    })
+                })
+                .collect::<Result<_, MagError>>()?,
         },
         ConcreteType::Product { items } => SchemaType::Product {
             components: items.iter().map(reify_concrete).collect::<Result<_, _>>()?,
@@ -220,6 +243,15 @@ fn reify_concrete(ty: &crate::types::ConcreteType) -> Result<SchemaType, MagErro
             body: Box::new(reify_concrete(body)?),
         },
     })
+}
+
+fn ensure_nominal_constructor(ty: &crate::types::ConcreteType) -> Result<(), MagError> {
+    match ty {
+        crate::types::ConcreteType::Named { .. } => Ok(()),
+        other => Err(MagError::Type(format!(
+            "sum arm {other:?} has no stable nominal constructor identity"
+        ))),
+    }
 }
 
 fn validate_at(schema: &SchemaType, value: &Value, path: &str, out: &mut Vec<Violation>) {
@@ -297,30 +329,68 @@ fn validate_at(schema: &SchemaType, value: &Value, path: &str, out: &mut Vec<Vio
             }
             _ => expect(false, path, "record", value, out),
         },
-        SchemaType::Union { variants } => {
-            let mut candidates = variants
-                .iter()
-                .map(|variant| {
-                    let mut violations = vec![];
-                    validate_at(variant, value, path, &mut violations);
-                    violations
-                })
-                .collect::<Vec<_>>();
-            if candidates.iter().any(Vec::is_empty) {
-                return;
+        SchemaType::Union { variants } => match value {
+            Value::Object(entries) => {
+                for (key, extra) in entries {
+                    if key != "type" && key != "value" {
+                        out.push(Violation {
+                            path: field_path(path, key),
+                            code: "extra_field".into(),
+                            expected: "no additional field".into(),
+                            actual: json_kind(extra).into(),
+                            message: format!("field '{key}' is not declared"),
+                        });
+                    }
+                }
+                let Some(tag) = entries.get("type") else {
+                    out.push(Violation {
+                        path: field_path(path, "type"),
+                        code: "missing_field".into(),
+                        expected: "constructor tag".into(),
+                        actual: "missing".into(),
+                        message: "required field 'type' is missing".into(),
+                    });
+                    return;
+                };
+                let Some(tag) = tag.as_str() else {
+                    expect(
+                        false,
+                        &field_path(path, "type"),
+                        "constructor tag",
+                        tag,
+                        out,
+                    );
+                    return;
+                };
+                let Some(variant) = variants.iter().find(|variant| variant.tag == tag) else {
+                    out.push(Violation {
+                        path: field_path(path, "type"),
+                        code: "unknown_union_tag".into(),
+                        expected: variants
+                            .iter()
+                            .map(|variant| variant.tag.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        actual: tag.into(),
+                        message: format!("constructor '{tag}' is not a member of this sum"),
+                    });
+                    return;
+                };
+                match entries.get("value") {
+                    Some(payload) => {
+                        validate_at(&variant.schema, payload, &field_path(path, "value"), out)
+                    }
+                    None => out.push(Violation {
+                        path: field_path(path, "value"),
+                        code: "missing_field".into(),
+                        expected: describe(&variant.schema),
+                        actual: "missing".into(),
+                        message: "required field 'value' is missing".into(),
+                    }),
+                }
             }
-            candidates.sort_by_key(Vec::len);
-            out.push(Violation {
-                path: path.into(),
-                code: "no_union_variant".into(),
-                expected: describe(schema),
-                actual: json_kind(value).into(),
-                message: "value does not conform to any union variant".into(),
-            });
-            if let Some(best) = candidates.into_iter().next() {
-                out.extend(best);
-            }
-        }
+            _ => expect(false, path, "tagged sum envelope", value, out),
+        },
         SchemaType::Product { components } => match value {
             Value::Array(values) => {
                 if values.len() != components.len() {
@@ -371,7 +441,7 @@ fn describe(schema: &SchemaType) -> String {
         SchemaType::Record { .. } => "record".into(),
         SchemaType::Union { variants } => variants
             .iter()
-            .map(describe)
+            .map(|variant| variant.tag.clone())
             .collect::<Vec<_>>()
             .join(" | "),
         SchemaType::Product { components } => format!(
@@ -471,7 +541,16 @@ mod tests {
                     SchemaField {
                         name: "choice".into(),
                         schema: SchemaType::Union {
-                            variants: vec![SchemaType::String, SchemaType::Bool],
+                            variants: vec![
+                                SchemaVariant {
+                                    tag: "sha256:text".into(),
+                                    schema: SchemaType::String,
+                                },
+                                SchemaVariant {
+                                    tag: "sha256:flag".into(),
+                                    schema: SchemaType::Bool,
+                                },
+                            ],
                         },
                     },
                 ],
@@ -479,7 +558,7 @@ mod tests {
         };
         assert!(
             schema
-                .validate_json(r#"{"labels":{"a":1},"choice":true}"#)
+                .validate_json(r#"{"labels":{"a":1},"choice":{"type":"sha256:flag","value":true}}"#)
                 .ok
         );
         let invalid = schema.validate_json(r#"{"labels":{"a":"one"}}"#);
@@ -552,6 +631,56 @@ mod tests {
         };
         assert!(float.validate_json("1.5").ok);
         assert!(!float.validate_json("1").ok);
+    }
+
+    #[test]
+    fn tagged_sums_require_exact_envelopes_and_selected_payloads() {
+        let schema = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Union {
+                variants: vec![
+                    SchemaVariant {
+                        tag: "sha256:x".into(),
+                        schema: SchemaType::Record {
+                            fields: vec![SchemaField {
+                                name: "value".into(),
+                                schema: SchemaType::Int,
+                            }],
+                        },
+                    },
+                    SchemaVariant {
+                        tag: "sha256:y".into(),
+                        schema: SchemaType::Record {
+                            fields: vec![SchemaField {
+                                name: "value".into(),
+                                schema: SchemaType::Int,
+                            }],
+                        },
+                    },
+                ],
+            },
+        };
+        assert!(
+            schema
+                .validate_json(r#"{"type":"sha256:y","value":{"value":1}}"#)
+                .ok
+        );
+        for invalid in [
+            r#"{"value":{"value":1}}"#,
+            r#"{"type":"sha256:y"}"#,
+            r#"{"type":"sha256:y","value":{"value":1},"extra":true}"#,
+            r#"{"type":"sha256:forged","value":{"value":1}}"#,
+            r#"{"type":"sha256:y","value":{"value":"wrong"}}"#,
+            r#"{"value":1}"#,
+        ] {
+            assert!(!schema.validate_json(invalid).ok, "{invalid}");
+        }
+        let provider = schema.to_json_schema();
+        assert_eq!(
+            provider["oneOf"][1]["properties"]["type"]["const"],
+            "sha256:y"
+        );
+        assert_eq!(provider["oneOf"][1]["additionalProperties"], false);
     }
 
     #[test]

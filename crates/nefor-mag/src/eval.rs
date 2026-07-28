@@ -858,7 +858,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             }
             Ok(Value::Artifact(Artifact {
                 format: format.into(),
-                data: crate::json::value_to_json(&args[1])?,
+                data: crate::json::value_to_json(env, &args[1])?,
             }))
         }
         "str" => Ok(Value::Str(
@@ -866,21 +866,21 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         )),
         "canonical" => {
             arity(args, 1)?;
-            let json = canonical_json(crate::json::value_to_json(&args[0])?);
+            let json = canonical_json(crate::json::value_to_json(env, &args[0])?);
             serde_json::to_string(&json)
                 .map(Value::Str)
                 .map_err(|error| MagError::Eval(format!("canonical serialization failed: {error}")))
         }
         "conforms?" => {
             arity(args, 2)?;
-            let evidence = crate::json::value_to_json(&args[1])?;
+            let evidence = crate::json::value_to_json(env, &args[1])?;
             let Ok(ty) = crate::json::type_evidence_from_json(&evidence) else {
                 return Ok(Value::Bool(false));
             };
             let Ok(schema) = crate::schema::TypeSchema::reify(env, &ty) else {
                 return Ok(Value::Bool(false));
             };
-            let value = crate::json::value_to_json(&args[0])?;
+            let value = crate::json::value_to_json(env, &args[0])?;
             let encoded = serde_json::to_string(&value)
                 .map_err(|error| MagError::Eval(format!("serialize conformance value: {error}")))?;
             Ok(Value::Bool(schema.validate_json(&encoded).ok))
@@ -981,7 +981,7 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
         }
         "fail" => {
             arity(args, 1)?;
-            let diagnostic = crate::json::value_to_json(&args[0])?;
+            let diagnostic = crate::json::value_to_json(env, &args[0])?;
             Err(MagError::Eval(format!("validation failed: {diagnostic}")))
         }
         "foreign-id" => {

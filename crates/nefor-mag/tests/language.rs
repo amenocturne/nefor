@@ -602,7 +602,11 @@ fn product_positions_preserve_selected_constructor_evidence() {
         &root,
     )
     .unwrap();
-    assert_eq!(artifact.data, json!([{"value": 1}, "kept"]));
+    let envelope = artifact.data[0].as_object().unwrap();
+    assert_eq!(envelope.len(), 2);
+    assert!(envelope["type"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(envelope["value"], json!({"value": 1}));
+    assert_eq!(artifact.data[1], "kept");
 }
 
 #[test]
@@ -947,6 +951,51 @@ fn type_schema_preserves_qualified_nominals_and_substitutes_generics() {
         artifact.data["root"]["body"]["fields"][0]["schema"]["item"]["kind"],
         "string"
     );
+}
+
+#[test]
+fn tagged_sum_json_round_trips_aliases_and_rejects_forged_envelopes() {
+    let root = workspace("tagged-sum-json");
+    fs::write(
+        root.join("main.mag"),
+        r#"
+          (type X {:value Int})
+          (type Y {:value Int})
+          (type XY (| X Y))
+          (type Alias XY)
+          (type Nested {:choice Alias :pair (+ String Alias)})
+          (def accept (fn [[value Nested]] -> Artifact
+            (artifact "test.tagged-sum/v1" value)))
+          (artifact "test.tagged-sum-schema/v1" (type-schema (type-tag Alias)))
+        "#,
+    )
+    .unwrap();
+    let loaded = load_with_inputs(&root, "main.mag", json!({})).unwrap();
+    let variants = loaded.artifact.data["root"]["variants"].as_array().unwrap();
+    assert_eq!(variants.len(), 2);
+    let first = variants[0]["tag"].as_str().unwrap();
+    let second = variants[1]["tag"].as_str().unwrap();
+    assert_ne!(first, second);
+    assert!(first.starts_with("sha256:"));
+    assert!(second.starts_with("sha256:"));
+
+    let input = json!({
+        "choice": {"type": first, "value": {"value": 1}},
+        "pair": ["kept", {"type": second, "value": {"value": 2}}]
+    });
+    let artifact = eval_fn(&loaded, "accept", input.clone()).unwrap();
+    assert_eq!(artifact.data, input);
+
+    for malformed in [
+        json!({"choice": {"value": {"value": 1}}, "pair": ["kept", {"type": second, "value": {"value": 2}}]}),
+        json!({"choice": {"type": first}, "pair": ["kept", {"type": second, "value": {"value": 2}}]}),
+        json!({"choice": {"type": first, "value": {"value": 1}, "extra": true}, "pair": ["kept", {"type": second, "value": {"value": 2}}]}),
+        json!({"choice": {"type": "sha256:forged", "value": {"value": 1}}, "pair": ["kept", {"type": second, "value": {"value": 2}}]}),
+        json!({"choice": {"type": first, "value": {"value": "wrong"}}, "pair": ["kept", {"type": second, "value": {"value": 2}}]}),
+        json!({"choice": {"value": 1}, "pair": ["kept", {"type": second, "value": {"value": 2}}]}),
+    ] {
+        assert!(eval_fn(&loaded, "accept", malformed).is_err());
+    }
 }
 
 #[test]

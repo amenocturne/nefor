@@ -2,11 +2,10 @@ use crate::ast::Value;
 use crate::checker::substitute;
 use crate::env::Env;
 use crate::error::MagError;
-use crate::schema::TypeSchema;
 use crate::types::MagType;
 use std::collections::{BTreeMap, HashMap};
 
-pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
+pub fn value_to_json(env: &Env, value: &Value) -> Result<serde_json::Value, MagError> {
     match value {
         Value::Unit => Ok(serde_json::Value::Null),
         Value::Str(v) => Ok(v.clone().into()),
@@ -24,21 +23,43 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
             "output": concrete_type_to_json(&evidence.output)?,
         })),
         Value::List(v) | Value::Vector(v) | Value::Product(v) => Ok(serde_json::Value::Array(
-            v.iter().map(value_to_json).collect::<Result<_, _>>()?,
+            v.iter()
+                .map(|value| value_to_json(env, value))
+                .collect::<Result<_, _>>()?,
         )),
         Value::Map(v) => Ok(serde_json::Value::Object(
             v.iter()
-                .map(|(k, v)| Ok((k.clone(), value_to_json(v)?)))
+                .map(|(key, value)| Ok((key.clone(), value_to_json(env, value)?)))
                 .collect::<Result<_, MagError>>()?,
         )),
         Value::Artifact(v) => {
             serde_json::to_value(v).map_err(|e| MagError::Eval(format!("serialize artifact: {e}")))
         }
-        Value::Typed(value, _) => value_to_json(value),
+        Value::Typed(value, MagType::Union(_)) => {
+            let (selected, payload) = selected_sum_payload(value).ok_or_else(|| {
+                MagError::Eval(
+                    "cannot serialize a sum without selected constructor evidence".into(),
+                )
+            })?;
+            let tag = crate::types::ConcreteType::resolve(env, selected)?.stable_id();
+            Ok(serde_json::json!({
+                "type": tag.as_str(),
+                "value": value_to_json(env, payload)?,
+            }))
+        }
+        Value::Typed(value, _) => value_to_json(env, value),
         other => Err(MagError::Eval(format!(
             "cannot serialize {} to JSON",
             other.type_name()
         ))),
+    }
+}
+
+fn selected_sum_payload(value: &Value) -> Option<(&MagType, &Value)> {
+    match value {
+        Value::Typed(inner, selected @ MagType::Named(_, _)) => Some((selected, inner)),
+        Value::Typed(inner, MagType::Union(_)) => selected_sum_payload(inner),
+        _ => None,
     }
 }
 
@@ -292,18 +313,37 @@ pub fn json_to_typed_value(
                     .collect::<Result<BTreeMap<_, _>, MagError>>()?,
             ))
         }
-        MagType::Union(variants) => {
-            let selected = variants
+        MagType::Union(_) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| MagError::Type(format!("expected tagged sum envelope for {ty}")))?;
+            if object.len() != 2 || !object.contains_key("type") || !object.contains_key("value") {
+                return Err(MagError::Type(format!(
+                    "expected exact tagged sum envelope {{type, value}} for {ty}"
+                )));
+            }
+            let tag = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    MagError::Type(format!("sum constructor tag for {ty} must be a string"))
+                })?;
+            let accepted = crate::types::ConcreteType::resolve(env, ty)?;
+            let crate::types::ConcreteType::Sum { arms } = accepted else {
+                return Err(MagError::Type(format!("{ty} did not normalize to a sum")));
+            };
+            let selected = arms
                 .iter()
-                .find(|variant| {
-                    TypeSchema::reify(env, variant).is_ok_and(|schema| {
-                        serde_json::to_string(value)
-                            .is_ok_and(|encoded| schema.validate_json(&encoded).ok)
-                    })
-                })
-                .ok_or_else(|| MagError::Type(format!("value does not conform to {ty}")))?;
+                .find(|arm| arm.stable_id().as_str() == tag)
+                .ok_or_else(|| {
+                    MagError::Type(format!("constructor {tag} is not a member of {ty}"))
+                })?;
+            let selected_type = selected.to_mag_type();
+            let payload = object
+                .get("value")
+                .ok_or_else(|| MagError::Type(format!("sum envelope for {ty} needs value")))?;
             Value::Typed(
-                std::sync::Arc::new(json_to_typed_value(env, value, selected)?),
+                std::sync::Arc::new(json_to_typed_value(env, payload, &selected_type)?),
                 ty.clone(),
             )
         }
