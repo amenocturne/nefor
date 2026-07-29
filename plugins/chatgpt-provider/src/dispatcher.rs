@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
@@ -51,10 +52,11 @@ pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// asking for tools; this prevents runaways.
 pub const TOOL_LOOP_MAX_ITERATIONS: u32 = 20;
 
-/// Retry read failures only while the failed attempt has not emitted
-/// visible output. Once a delta/reasoning/tool-call fragment is on the
-/// bus, re-POSTing would duplicate transcript/session-log state.
-const MAX_PRE_OUTPUT_STREAM_RETRIES: u32 = 3;
+/// Retry transient stream failures for at least this long, but only while
+/// the failed attempts have emitted no visible output. Once a
+/// delta/reasoning/tool-call fragment is on the bus, re-POSTing would
+/// duplicate transcript/session-log state.
+const PRE_OUTPUT_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 const LOGOUT_REFUSED_ENV_MESSAGE: &str =
     "no login to revoke — credentials come from the environment; restart the plugin without it";
@@ -2058,13 +2060,13 @@ fn should_retry_pre_output_stream_error(
     output_text: &str,
     reasoning_text: &str,
     tool_buf: &ToolCallBuffer,
-    retries: u32,
+    elapsed: Duration,
 ) -> bool {
     matches!(err, ChatgptError::ResponsesStreamRead(_))
         && output_text.is_empty()
         && reasoning_text.is_empty()
         && tool_buf.is_empty()
-        && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
+        && elapsed < PRE_OUTPUT_RETRY_BUDGET
 }
 
 fn response_failure_message(response: &Value) -> String {
@@ -2090,6 +2092,7 @@ fn response_failure_is_transient(response: &Value) -> bool {
         "temporarily unavailable",
         "server busy",
         "try again later",
+        "an error occurred while processing your request",
     ]
     .iter()
     .any(|needle| fingerprint.contains(needle))
@@ -2100,13 +2103,13 @@ fn should_retry_pre_output_response_failure(
     output_text: &str,
     reasoning_text: &str,
     tool_buf: &ToolCallBuffer,
-    retries: u32,
+    elapsed: Duration,
 ) -> bool {
     response_failure_is_transient(response)
         && output_text.is_empty()
         && reasoning_text.is_empty()
         && tool_buf.is_empty()
-        && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
+        && elapsed < PRE_OUTPUT_RETRY_BUDGET
 }
 
 fn spawn_turn(
@@ -2117,7 +2120,7 @@ fn spawn_turn(
 ) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let mut iterations: u32 = 0;
         let mut final_text = String::new();
         // Every loop path assigns this before break; the initial value
@@ -2135,6 +2138,7 @@ fn spawn_turn(
         let mut total_usage: Option<(u64, u64)> = None;
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
+        let mut pre_output_retry_started: Option<Instant> = None;
         let mut auth_401_recovery_stage: u8 = 0;
         let routing_session_id = logical_routing_id(
             ctx.chats
@@ -2591,7 +2595,9 @@ fn spawn_turn(
                                             &output_text,
                                             &reasoning_text,
                                             &tool_buf,
-                                            pre_output_stream_retries,
+                                            pre_output_retry_started
+                                                .map(|retry_started| retry_started.elapsed())
+                                                .unwrap_or(Duration::ZERO),
                                         );
                                     iter_errored = Some(response_failure_message(&response));
                                     break;
@@ -2614,7 +2620,9 @@ fn spawn_turn(
                                         &output_text,
                                         &reasoning_text,
                                         &tool_buf,
-                                        pre_output_stream_retries,
+                                        pre_output_retry_started
+                                            .map(|retry_started| retry_started.elapsed())
+                                            .unwrap_or(Duration::ZERO),
                                     );
                                 iter_errored = Some(format!("stream error: {e}"));
                                 break;
@@ -2673,11 +2681,13 @@ fn spawn_turn(
             if let Some(err_msg) = iter_errored {
                 if iter_retryable_before_output {
                     pre_output_stream_retries += 1;
+                    let retry_started = *pre_output_retry_started.get_or_insert_with(Instant::now);
                     iterations = iterations.saturating_sub(1);
                     tracing::warn!(
                         chat_id = %chat_id,
                         attempt = pre_output_stream_retries,
-                        max = MAX_PRE_OUTPUT_STREAM_RETRIES,
+                        elapsed_ms = retry_started.elapsed().as_millis() as u64,
+                        budget_ms = PRE_OUTPUT_RETRY_BUDGET.as_millis() as u64,
                         error = %err_msg,
                         "Responses stream failed before output; retrying turn iteration",
                     );
@@ -2701,7 +2711,6 @@ fn spawn_turn(
                 final_error = Some(err_msg);
                 break;
             }
-
             if iter_interrupted {
                 if !output_text.is_empty() {
                     let _ = ctx
@@ -3405,21 +3414,21 @@ mod tests {
             "",
             "",
             &empty_tools,
-            0,
+            Duration::ZERO,
         ));
         assert!(!should_retry_pre_output_stream_error(
             &ChatgptError::ResponsesStreamParse("bad frame".into()),
             "",
             "",
             &empty_tools,
-            0,
+            Duration::ZERO,
         ));
         assert!(!should_retry_pre_output_stream_error(
             &ChatgptError::ResponsesStreamRead("reset".into()),
             "visible",
             "",
             &empty_tools,
-            0,
+            Duration::ZERO,
         ));
 
         let mut tool_buf = ToolCallBuffer::default();
@@ -3434,14 +3443,14 @@ mod tests {
             "",
             "",
             &tool_buf,
-            0,
+            Duration::ZERO,
         ));
         assert!(!should_retry_pre_output_stream_error(
             &ChatgptError::ResponsesStreamRead("reset".into()),
             "",
             "",
             &empty_tools,
-            MAX_PRE_OUTPUT_STREAM_RETRIES,
+            PRE_OUTPUT_RETRY_BUDGET,
         ));
     }
 
@@ -3460,25 +3469,32 @@ mod tests {
             "",
             "",
             &empty_tools,
-            0,
+            Duration::ZERO,
         ));
         assert_eq!(
             response_failure_message(&overloaded),
             "Our servers are currently overloaded. Please try again later."
         );
+        assert!(should_retry_pre_output_response_failure(
+            &overloaded,
+            "",
+            "",
+            &empty_tools,
+            PRE_OUTPUT_RETRY_BUDGET - Duration::from_millis(1),
+        ));
         assert!(!should_retry_pre_output_response_failure(
             &overloaded,
             "visible",
             "",
             &empty_tools,
-            0,
+            Duration::ZERO,
         ));
         assert!(!should_retry_pre_output_response_failure(
             &overloaded,
             "",
             "",
             &empty_tools,
-            MAX_PRE_OUTPUT_STREAM_RETRIES,
+            PRE_OUTPUT_RETRY_BUDGET,
         ));
 
         let invalid = serde_json::json!({
@@ -3493,7 +3509,20 @@ mod tests {
             "",
             "",
             &empty_tools,
-            0,
+            Duration::ZERO,
+        ));
+
+        let generic_server_failure = serde_json::json!({
+            "error": {
+                "message": "An error occurred while processing your request. You can retry your request. Please include the request ID req_42."
+            }
+        });
+        assert!(should_retry_pre_output_response_failure(
+            &generic_server_failure,
+            "",
+            "",
+            &empty_tools,
+            Duration::ZERO,
         ));
     }
 
