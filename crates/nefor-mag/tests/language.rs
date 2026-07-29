@@ -245,6 +245,30 @@ fn immutable_host_inputs_expose_only_typed_projections() {
 }
 
 #[test]
+fn json_data_files_are_parsed_into_mag_values() {
+    let root = workspace("file-read-json");
+    let file = root.join("toolsets.json");
+    fs::write(&file, r#"{"read_only":["read_file","read_image"]}"#).unwrap();
+    fs::write(
+        root.join("main.mag"),
+        r#"
+          (def manifest (read-json "toolsets.json"))
+          (artifact "test.file-read-json/v1" (get manifest "read_only"))
+        "#,
+    )
+    .unwrap();
+
+    let loaded = load_with_inputs(&root, "main.mag", json!({})).unwrap();
+    assert_eq!(loaded.artifact.data, json!(["read_file", "read_image"]));
+
+    fs::write(&file, "not json").unwrap();
+    let error = load_with_inputs(&root, "main.mag", json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot parse JSON toolsets.json"), "{error}");
+}
+
+#[test]
 fn file_reads_are_immutable_for_the_loaded_program() {
     let root = workspace("file-read-snapshot");
     fs::write(root.join("value.txt"), "first").unwrap();

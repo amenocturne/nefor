@@ -584,10 +584,35 @@ async fn handle_tool_invoke(
         .get("args")
         .cloned()
         .unwrap_or(Value::Object(Map::new()));
-    let read_only = body
-        .get("read_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let allowlist = match body.get("allowlist") {
+        Some(Value::Array(values)) if values.iter().all(Value::is_string) => Some(values),
+        Some(_) => {
+            send_event(
+                out_tx,
+                tool_result_error_body(
+                    &outer_id,
+                    "tool.invoke field `allowlist` must be an array containing only tool-name strings",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        None => None,
+    };
+    if let Some(allowlist) = allowlist {
+        let allowed = allowlist.iter().any(|tool| tool.as_str() == Some(&name));
+        if !allowed {
+            send_event(
+                out_tx,
+                tool_result_error_body(
+                    &outer_id,
+                    &format!("tool `{name}` is not in this invocation's allowlist"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     let invoking_from = body.get("from").and_then(Value::as_str).map(str::to_owned);
     let invocation = body.get("invocation").cloned();
 
@@ -638,7 +663,7 @@ async fn handle_tool_invoke(
             );
             send_event(
                 out_tx,
-                permission_request_body(&outer_id, &name, &args, read_only),
+                permission_request_body(&outer_id, &name, &args, allowlist),
             )
             .await?;
         }
@@ -872,7 +897,7 @@ fn permission_request_body(
     id: &str,
     name: &str,
     args: &Value,
-    read_only: bool,
+    allowlist: Option<&Vec<Value>>,
 ) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
@@ -882,8 +907,8 @@ fn permission_request_body(
     m.insert("id".into(), Value::String(id.to_owned()));
     m.insert("tool".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args.clone());
-    if read_only {
-        m.insert("read_only".into(), Value::Bool(true));
+    if let Some(allowlist) = allowlist {
+        m.insert("allowlist".into(), Value::Array(allowlist.clone()));
     }
     m
 }
@@ -1228,6 +1253,184 @@ mod tests {
         assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-1"));
         assert_eq!(body.get("tool").and_then(Value::as_str), Some("read_file"));
         assert!(state.awaiting_approval.contains_key("prov-1"));
+    }
+
+    #[tokio::test]
+    async fn invoke_excluded_from_allowlist_is_rejected_before_policy() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let body = advertise_body(
+            "basic-tools",
+            json!([
+                {"name": "read_file", "description": "", "parameters": {}},
+                {"name": "write_file", "description": "", "parameters": {}}
+            ]),
+        );
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
+        let _register = rx.recv().await.unwrap();
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "cap-excluded",
+            "name": "write_file",
+            "args": {"path": "forbidden"},
+            "allowlist": ["read_file"]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+
+        let result: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(result["body"]["kind"], "tool.result");
+        assert_eq!(result["body"]["id"], "cap-excluded");
+        assert_eq!(
+            result["body"]["error"],
+            "tool `write_file` is not in this invocation's allowlist"
+        );
+        assert!(state.awaiting_approval.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "excluded tool must not be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn invocation_allowlist_is_a_strict_capability_boundary_in_all_modes() {
+        let cases = [
+            (
+                "empty",
+                json!([]),
+                GateMode::Safe,
+                "not in this invocation's allowlist",
+            ),
+            (
+                "malformed-member",
+                json!(["read_file", 7]),
+                GateMode::Safe,
+                "must be an array containing only tool-name strings",
+            ),
+            (
+                "yolo-excluded",
+                json!(["write_file"]),
+                GateMode::Yolo,
+                "not in this invocation's allowlist",
+            ),
+            (
+                "yolo-malformed",
+                json!(["read_file", null]),
+                GateMode::Yolo,
+                "must be an array containing only tool-name strings",
+            ),
+        ];
+
+        for (id, allowlist, mode, expected_error) in cases {
+            let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+            let mut state = make_state();
+            state.mode = mode;
+            let body = advertise_body(
+                "basic-tools",
+                json!([{"name": "read_file", "description": "", "parameters": {}}]),
+            );
+            handle_tools_advertise(&tx, &body, &mut state)
+                .await
+                .unwrap();
+            let _register = rx.recv().await.unwrap();
+
+            let invoke = json!({
+                "kind": "tool-gate.tool.invoke",
+                "id": id,
+                "name": "read_file",
+                "args": {"path": "README.md"},
+                "allowlist": allowlist,
+                "read_only": true
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+
+            let result: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+            assert_eq!(result["body"]["kind"], "tool.result", "case {id}");
+            assert!(
+                result["body"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(expected_error)),
+                "case {id}: {result}"
+            );
+            assert!(state.awaiting_approval.is_empty(), "case {id}");
+            assert!(state.pending.is_empty(), "case {id}");
+            assert!(rx.try_recv().is_err(), "case {id} must not forward");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_allowlist_preserves_unrestricted_compatibility_and_ignores_read_only() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let body = advertise_body(
+            "basic-tools",
+            json!([{"name": "read_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
+        let _register = rx.recv().await.unwrap();
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "legacy-unrestricted",
+            "name": "read_file",
+            "args": {"path": "README.md"},
+            "read_only": true
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+
+        let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
+        assert!(permission["body"].get("allowlist").is_none());
+        assert!(permission["body"].get("read_only").is_none());
+        assert!(state.awaiting_approval.contains_key("legacy-unrestricted"));
+    }
+
+    #[tokio::test]
+    async fn prompt_request_preserves_invocation_allowlist() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let body = advertise_body(
+            "basic-tools",
+            json!([{"name": "read_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
+        let _register = rx.recv().await.unwrap();
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "cap-read",
+            "name": "read_file",
+            "args": {"path": "README.md"},
+            "allowlist": ["read_file", "read_image"]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+
+        let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
+        assert_eq!(
+            permission["body"]["allowlist"],
+            json!(["read_file", "read_image"])
+        );
+        assert!(permission["body"].get("read_only").is_none());
     }
 
     #[tokio::test]

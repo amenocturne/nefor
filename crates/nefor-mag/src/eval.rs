@@ -1368,6 +1368,45 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             }
             Ok(Value::Str(s))
         }
+        "read-json" => {
+            arity(args, 1)?;
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| MagError::Eval("read-json path must be a string".into()))?;
+            let mut matches = std::iter::once(env.source_dir())
+                .chain(env.module_roots().iter().map(PathBuf::as_path))
+                .filter_map(|root| {
+                    let candidate = resolve_workspace_path(root, path).ok()?;
+                    candidate
+                        .is_file()
+                        .then(|| candidate.canonicalize().unwrap_or(candidate))
+                })
+                .collect::<Vec<_>>();
+            matches.sort();
+            matches.dedup();
+            let full = match matches.as_slice() {
+                [path] => path,
+                [] => {
+                    return Err(MagError::Eval(format!(
+                        "cannot find JSON data {path} in source or module roots"
+                    )))
+                }
+                paths => {
+                    return Err(MagError::Eval(format!(
+                        "JSON data {path} is ambiguous across source and module roots: {}",
+                        paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )))
+                }
+            };
+            let source = env.read_file(full, path)?;
+            let value = serde_json::from_str(&source)
+                .map_err(|error| MagError::Eval(format!("cannot parse JSON {path}: {error}")))?;
+            Ok(crate::json::json_to_value(&value))
+        }
         "require" => Err(MagError::Eval("require is a special form".into())),
         _ => Err(MagError::Eval(format!("unknown builtin {name}"))),
     }

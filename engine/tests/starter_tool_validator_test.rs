@@ -124,6 +124,7 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let lua_root = root.join("lua").display().to_string();
     let script = format!(
         r#"
+        NEFOR_CONFIG_DIR = "{starter}"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",

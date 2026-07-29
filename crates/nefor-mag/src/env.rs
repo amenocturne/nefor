@@ -195,6 +195,7 @@ impl Env {
             "foreign-evidence",
             "type-evidence",
             "read",
+            "read-json",
             "require",
             "artifact",
             "type-schema",

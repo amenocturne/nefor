@@ -1,0 +1,29 @@
+{
+  "read_only": [
+    "read_file",
+    "read_image",
+    "list_dir",
+    "search_text",
+    "python-read",
+    "instructions",
+    "discover_instruction_files",
+    "graph-status",
+    "await-run"
+  ],
+  "general": [
+    "read_file",
+    "read_image",
+    "list_dir",
+    "search_text",
+    "python-read",
+    "instructions",
+    "discover_instruction_files",
+    "edit_file",
+    "write_file",
+    "mag",
+    "mag-eval",
+    "graph-status",
+    "await-run",
+    "terminate-graph"
+  ]
+}

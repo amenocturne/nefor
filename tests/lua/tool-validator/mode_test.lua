@@ -1,4 +1,5 @@
 local tv = require("tool-validator")
+local tv_lib = require("libs.tool-validator")
 local json = nefor.json
 
 local function assert_eq(actual, expected, msg)
@@ -94,20 +95,20 @@ do
   assert_eq(calls[1].decision, "approve", "yolo decision is approve")
 end
 
--- yolo: full-approve happens before read-only and approved-plan gates.
+-- yolo still bypasses approval policy after capability membership succeeds.
 do
   fresh("yolo")
   feed({
     kind = "chat.tool.permission_request",
-    id = "perm-yolo-edit-readonly",
+    id = "perm-yolo-edit-capable",
     tool = "edit_file",
-    read_only = true,
+    allowlist = { "read_file", "edit_file" },
     args = { path = "some/file.lua", old_string = "a", new_string = "b" },
   })
   local calls = decode_calls()
-  assert_eq(#calls, 1, "yolo edit_file read-only emits one envelope")
-  assert_eq(calls[1].kind, "tool.permission_response", "yolo edit_file read-only approves")
-  assert_eq(calls[1].decision, "approve", "yolo edit_file read-only decision is approve")
+  assert_eq(#calls, 1, "yolo capable edit_file emits one envelope")
+  assert_eq(calls[1].kind, "tool.permission_response", "yolo capable edit_file approves")
+  assert_eq(calls[1].decision, "approve", "yolo capable edit_file decision is approve")
   assert_eq(calls[1].reason, nil, "yolo edit_file approval has no denial reason")
 end
 
@@ -140,6 +141,88 @@ do
   assert_eq(calls[1].kind, "tool.permission_response", "auto edit_file approves")
   assert_eq(calls[1].decision, "approve", "auto edit_file decision is approve")
   assert_eq(calls[1].args, nil, "auto edit_file approval has no policy args")
+end
+
+-- Read-only status is derived from the complete allowlist, not a wire flag.
+do
+  local validator = tv_lib.build { read_only_tools = { "read_file", "read_image" } }
+  validator._internals.set_mode("safe")
+  _test.calls_clear()
+  validator.receive_msg(make_entry({
+    kind = "chat.tool.permission_request",
+    id = "perm-read-only",
+    tool = "read_file",
+    allowlist = { "read_file", "read_image" },
+    args = { path = "README.md" },
+  }))
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "read-only allowlist emits one envelope")
+  assert_eq(calls[1].kind, "tool.permission_response", "read-only allowlist auto-approves")
+  assert_eq(calls[1].decision, "approve", "read-only allowlist decision is approve")
+end
+
+-- A mixed allowlist is write-capable even when the requested tool is itself
+-- read-only; it follows ordinary safe-mode policy and opens a popup.
+do
+  local validator = tv_lib.build { read_only_tools = { "read_file", "read_image" } }
+  validator._internals.set_mode("safe")
+  _test.calls_clear()
+  validator.receive_msg(make_entry({
+    kind = "chat.tool.permission_request",
+    id = "perm-mixed",
+    tool = "read_file",
+    allowlist = { "read_file", "write_file" },
+    args = { path = "README.md" },
+  }))
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "mixed allowlist emits one envelope")
+  assert_eq(calls[1].kind, "chat.tool.popup_request", "mixed allowlist is not read-only")
+end
+
+-- Capability validation is fail-closed before every mode-specific policy,
+-- including yolo. Missing allowlist is the legacy unrestricted shape.
+do
+  local validator = tv_lib.build { read_only_tools = { "read_file" } }
+  local cases = {
+    { id = "empty", mode = "safe", allowlist = {} },
+    { id = "malformed", mode = "safe", allowlist = { "read_file", 7 } },
+    { id = "excluded-yolo", mode = "yolo", allowlist = { "write_file" } },
+    { id = "malformed-yolo", mode = "yolo", allowlist = { "read_file", false } },
+  }
+  for _, case in ipairs(cases) do
+    validator._internals.reset()
+    validator._internals.set_mode(case.mode)
+    _test.calls_clear()
+    validator.receive_msg(make_entry({
+      kind = "chat.tool.permission_request",
+      id = case.id,
+      tool = "read_file",
+      allowlist = case.allowlist,
+      read_only = true,
+      args = { path = "README.md" },
+    }))
+    local calls = decode_calls()
+    assert_eq(#calls, 1, case.id .. " emits one envelope")
+    assert_eq(calls[1].kind, "tool.permission_response", case.id .. " responds directly")
+    assert_eq(calls[1].decision, "deny", case.id .. " denies")
+  end
+end
+
+-- Legacy read_only is ignored; absence of an authoritative allowlist remains
+-- unrestricted and follows normal policy rather than becoming read-only.
+do
+  local validator = tv_lib.build { read_only_tools = { "read_file" } }
+  validator._internals.set_mode("safe")
+  _test.calls_clear()
+  validator.receive_msg(make_entry({
+    kind = "chat.tool.permission_request",
+    id = "perm-obsolete-flag",
+    tool = "read_file",
+    read_only = true,
+    args = { path = "README.md" },
+  }))
+  local calls = decode_calls()
+  assert_eq(calls[1].kind, "chat.tool.popup_request", "missing allowlist preserves unrestricted compatibility")
 end
 
 print("tool_validator_mode_test: all assertions passed")

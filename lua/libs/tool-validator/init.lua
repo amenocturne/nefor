@@ -33,20 +33,15 @@
 --
 -- Other tools: defer to the user (popup) unless the agent is read-only.
 --
--- ## Read-only agents
---
--- When `read_only = true` rides through the permission_request, the
--- validator never shows a popup. bash is auto-approved (the role's
--- tool_allowlist already constrains what the agent can call; da
--- false-positives on compound read commands cause unnecessary
--- friction). Non-bash tools are auto-approved (tool-gate already
--- restricts them to the role's allowlist). This means read-only agents run fully
--- autonomously with no user interaction.
+-- Agent capability is defined solely by the invocation allowlist. A request is
+-- read-only exactly when every allowed tool belongs to the composition's
+-- canonical read-only inventory; no separate wire flag participates.
 --
 -- ## Registration seam
 --
--- `build{ auto_approve_tools = { ... }, bash_fastpaths = { ... } }` returns
--- the actor spec. Both are config-owned policy:
+-- `build{ read_only_tools, auto_approve_tools, bash_fastpaths }` returns
+-- the actor spec. `read_only_tools` is the canonical inventory supplied by the
+-- composition; the remaining seams are config-owned policy:
 --   * `auto_approve_tools` — tool names auto-approved unconditionally
 --     (e.g. a typed read-only wrapper that is schema-limited to safe
 --     actions). Checked after yolo, before the edit/write/bash rules.
@@ -103,11 +98,16 @@ local function auto_denial_reason(tool)
          "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
 end
 
--- build{ auto_approve_tools, bash_fastpaths } -> actor spec. State
+-- build{ read_only_tools, auto_approve_tools, bash_fastpaths } -> actor spec.
+-- State
 -- (da_cmd cache, gate_mode) is per-build so instances don't share.
 local function build(opts)
   opts = opts or {}
 
+  local read_only_tools = {}
+  for _, name in ipairs(opts.read_only_tools or {}) do
+    read_only_tools[name] = true
+  end
   local auto_approve = {}
   for _, name in ipairs(opts.auto_approve_tools or {}) do
     auto_approve[name] = true
@@ -215,11 +215,46 @@ local function build(opts)
     end
   end
 
+  local function validate_allowlist(allowlist, tool)
+    if allowlist == nil then return true, false end
+    if type(allowlist) ~= "table" then return false, false end
+
+    local count = 0
+    local contains_tool = false
+    for key, name in pairs(allowlist) do
+      if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or type(name) ~= "string" then
+        return false, false
+      end
+      count = count + 1
+      if name == tool then contains_tool = true end
+    end
+    for index = 1, count do
+      if allowlist[index] == nil then return false, false end
+    end
+    return contains_tool, true
+  end
+
+  local function allowlist_is_read_only(allowlist)
+    if type(allowlist) ~= "table" then return false end
+    for _, tool in ipairs(allowlist) do
+      if read_only_tools[tool] ~= true then
+        return false
+      end
+    end
+    return true
+  end
+
   local function handle_permission_request(body)
     local id = body.id
     if type(id) ~= "string" or #id == 0 then return end
     local tool = body.tool or body.name
     if type(tool) ~= "string" or #tool == 0 then return end
+
+    local capability_allows = validate_allowlist(body.allowlist, tool)
+    if not capability_allows then
+      emit_response(id, "deny", "tool invocation has malformed capability data or excludes the requested tool")
+      return
+    end
 
     if gate_mode == "yolo" then
       emit_response(id, "approve")
@@ -232,7 +267,7 @@ local function build(opts)
     end
 
     local args = body.args
-    local is_ro = body.read_only == true
+    local is_ro = allowlist_is_read_only(body.allowlist)
 
     if tool == "edit_file" then
       if is_ro then

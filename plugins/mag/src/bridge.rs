@@ -33,9 +33,9 @@
 //! (factories/run-tool.lua carries per-node gating alongside the call) — while
 //! the gate reads `{ id, name, args = <tool args> }` and forwards `args`
 //! verbatim to the owning tool plugin. So the inner `args` is lifted out, and
-//! `allowlist` / `da-policy` ride as top-level siblings (where the gate reads
-//! its other policy input, `read_only`; it ignores them today — threading them
-//! on the wire is this side's whole job, enforcement is the gate's).
+//! `allowlist` / `da-policy` ride as top-level siblings. The gate enforces
+//! allowlist membership and forwards the same inventory to approval
+//! classification.
 //!
 //! The kernel correlation id is kept as the gate's outer id: the gate echoes it
 //! on its `tool.result`, which the plugin's existing tool.result path feeds to
@@ -273,7 +273,7 @@ impl CapabilityBridge {
 /// forwarded as the args whole. The kernel correlation id rides through as the
 /// gate's outer id, so the gate's `tool.result` correlates straight back to the
 /// kernel's open request. Per-node gating (`allowlist` / `da-policy`) rides
-/// top-level, sibling to the gate's `read_only` policy input.
+/// top-level for runtime capability enforcement and approval classification.
 fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
     let request = body
         .get("args")
@@ -583,7 +583,7 @@ mod tests {
             Some(&json!({ "path": "." })),
             "the double-wrapped payload is unwrapped for the gate"
         );
-        // Per-node gating rides top-level, sibling to the gate's read_only.
+        // Per-node gating rides at the gate's top level.
         assert_eq!(
             gate.get("allowlist"),
             Some(&json!(["list_dir", "read_file"]))

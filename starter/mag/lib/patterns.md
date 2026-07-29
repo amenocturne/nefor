@@ -48,7 +48,7 @@ graph retrieval or hot graph mutation in this API.
         (as nefor.actors.AgentConfig {:id "worker"
          :model (nefor.contracts.no-identifier)
          :profile (nefor.contracts.identifier "standard") :provider "chatgpt"
-         :system "Answer the task." :tools ["read_file" "mag-eval"]
+         :system "Answer the task." :tools nefor.actors.general-tools ;; includes "mag-eval"
          :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
@@ -63,6 +63,13 @@ graph retrieval or hot graph mutation in this API.
            (nefor.graph.edge worker result)]))]
   (nefor.artifact.compile topology))
 ```
+
+`:tools` is the agent's capability boundary. Use
+`nefor.actors.read-only-tools` for investigation-only agents,
+`nefor.actors.general-tools` for common implementation agents, or author an
+explicit string list for a narrower/custom surface. The runtime gate rejects a
+model-emitted tool call that is not present in that invocation's allowlist,
+even when the tool is globally registered.
 
 `source<T>` is the only node kind allowed to have no incoming edge. It captures
 an initial value validated against its specialized `T`, then emits `T`.

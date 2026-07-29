@@ -108,6 +108,13 @@
      :input entry-in
      :output result}))))
 
+;; Base toolset shorthands for common delegated-agent capability profiles.
+;; Explicit custom :tools lists remain the right shape for narrower
+;; roles or config-specific tools.
+(require "nefor.toolsets")
+(def read-only-tools nefor.toolsets.read-only)
+(def general-tools nefor.toolsets.general)
+
 (def result-arm (fn [I O T]
   [[fragment (nefor.graph.Node I (| O nefor.contracts.AgentError))]
    [type (TypeTag T)]] -> (nefor.graph.Port T)

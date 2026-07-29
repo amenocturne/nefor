@@ -1,0 +1,6 @@
+;; MAG bindings for the config-owned neutral toolset manifest. The compiler's
+;; read-json parser validates JSON and converts its values into MAG data.
+
+(def manifest (read-json "nefor/toolsets.json"))
+(def read-only (get manifest "read_only"))
+(def general (get manifest "general"))
