@@ -18,6 +18,10 @@ pub const X_CODEX_INSTALLATION_ID: &str = "x-codex-installation-id";
 /// this on every Responses request.
 pub const SESSION_ID: &str = "session-id";
 
+/// Stable logical thread identifier. Codex sends this alongside
+/// `session-id` and uses the same thread identity for prompt caching.
+pub const THREAD_ID: &str = "thread-id";
+
 /// Server-issued sticky-routing token, replayed only within the turn that
 /// received it.
 pub const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
@@ -93,12 +97,17 @@ pub fn build_headers(
 pub fn add_turn_headers(
     headers: &mut HeaderMap,
     session_id: &str,
+    thread_id: &str,
     turn_state: Option<&str>,
 ) -> Result<(), ChatgptError> {
     headers.insert(
         SESSION_ID,
         HeaderValue::from_str(session_id)
             .map_err(|e| ChatgptError::InvalidHeader(e.to_string()))?,
+    );
+    headers.insert(
+        THREAD_ID,
+        HeaderValue::from_str(thread_id).map_err(|e| ChatgptError::InvalidHeader(e.to_string()))?,
     );
     if let Some(turn_state) = turn_state {
         headers.insert(

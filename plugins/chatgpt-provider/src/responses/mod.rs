@@ -16,7 +16,7 @@
 //!     installation_id,
 //!     "nefor_cli_rs".into(),
 //! );
-//! let mut turn = ResponsesTurnContext::new(chat_id);
+//! let mut turn = ResponsesTurnContext::new(session_id, thread_id);
 //! let mut stream = client.stream(&request, &auth_snapshot, &mut turn).await?;
 //! while let Some(event) = stream.next().await { ... }
 //! ```
@@ -49,19 +49,26 @@ use crate::error::ChatgptError;
 
 pub struct ResponsesTurnContext {
     session_id: String,
+    thread_id: String,
     turn_state: Option<String>,
 }
 
 impl ResponsesTurnContext {
-    pub fn new(session_id: impl Into<String>) -> Self {
+    pub fn new(session_id: impl Into<String>, thread_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            thread_id: thread_id.into(),
             turn_state: None,
         }
     }
 
     fn add_headers(&self, headers: &mut reqwest::header::HeaderMap) -> Result<(), ChatgptError> {
-        headers::add_turn_headers(headers, &self.session_id, self.turn_state.as_deref())
+        headers::add_turn_headers(
+            headers,
+            &self.session_id,
+            &self.thread_id,
+            self.turn_state.as_deref(),
+        )
     }
 
     fn capture_response_headers(&mut self, headers: &reqwest::header::HeaderMap) {
@@ -807,10 +814,17 @@ mod retry_tests {
 
     #[test]
     fn turn_context_replays_first_server_routing_token() {
-        let mut turn = ResponsesTurnContext::new("chat-42");
+        let mut turn = ResponsesTurnContext::new("session-42", "thread-42");
         let mut initial_headers = HeaderMap::new();
         turn.add_headers(&mut initial_headers).expect("headers");
-        assert_eq!(initial_headers.get(headers::SESSION_ID).unwrap(), "chat-42");
+        assert_eq!(
+            initial_headers.get(headers::SESSION_ID).unwrap(),
+            "session-42"
+        );
+        assert_eq!(
+            initial_headers.get(headers::THREAD_ID).unwrap(),
+            "thread-42"
+        );
         assert!(initial_headers.get(headers::X_CODEX_TURN_STATE).is_none());
 
         let mut response_headers = HeaderMap::new();

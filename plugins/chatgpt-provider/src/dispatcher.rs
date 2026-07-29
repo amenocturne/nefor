@@ -1172,9 +1172,38 @@ fn logical_routing_id(routing_session_id: Option<&str>, chat_id: &ChatId) -> Str
         .unwrap_or_else(|| chat_id.to_string())
 }
 
-fn prompt_cache_key(routing_session_id: &str) -> String {
-    let digest = Sha256::digest(routing_session_id.as_bytes());
-    format!("{digest:x}")
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderRoutingIdentity {
+    session_id: String,
+    thread_id: String,
+}
+
+fn deterministic_provider_uuid(namespace: &[u8], logical_routing_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace);
+    hasher.update([0]);
+    hasher.update(logical_routing_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 9562 UUIDv8: application-defined payload with standard
+    // version and variant bits. SHA-256 supplies the stable payload.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn provider_routing_identity(logical_routing_id: &str) -> ProviderRoutingIdentity {
+    ProviderRoutingIdentity {
+        session_id: deterministic_provider_uuid(
+            b"nefor.chatgpt-provider.session.v1",
+            logical_routing_id,
+        ),
+        thread_id: deterministic_provider_uuid(
+            b"nefor.chatgpt-provider.thread.v1",
+            logical_routing_id,
+        ),
+    }
 }
 
 fn reasoning_effort_wire(effort: ReasoningEffort) -> &'static str {
@@ -1705,8 +1734,11 @@ async fn compact_chat(
         summary: Some(ReasoningSummary::Concise),
     });
     let routing_session_id = logical_routing_id(snapshot.routing_session_id.as_deref(), chat_id);
-    let cache_key = prompt_cache_key(&routing_session_id);
-    let response_turn = ResponsesTurnContext::new(routing_session_id);
+    let provider_routing = provider_routing_identity(&routing_session_id);
+    let response_turn = ResponsesTurnContext::new(
+        provider_routing.session_id,
+        provider_routing.thread_id.clone(),
+    );
 
     let auth_snap = ctx.auth.snapshot().await;
     if !matches!(auth_snap.state, AuthState::Connected) {
@@ -1736,7 +1768,7 @@ async fn compact_chat(
         parallel_tool_calls: false,
         reasoning,
         service_tier: None,
-        prompt_cache_key: Some(cache_key),
+        prompt_cache_key: Some(provider_routing.thread_id),
         text: None,
     };
 
@@ -2149,8 +2181,10 @@ fn spawn_turn(
                 .as_deref(),
             &chat_id,
         );
-        let cache_key = prompt_cache_key(&routing_session_id);
-        let mut response_turn = ResponsesTurnContext::new(routing_session_id);
+        let provider_routing = provider_routing_identity(&routing_session_id);
+        let cache_key = provider_routing.thread_id.clone();
+        let mut response_turn =
+            ResponsesTurnContext::new(provider_routing.session_id, provider_routing.thread_id);
 
         loop {
             iterations += 1;
@@ -2873,15 +2907,39 @@ mod tests {
         assert_eq!(route_1, logical);
         assert_eq!(route_2, logical);
 
-        let cache_1 = prompt_cache_key(&route_1);
-        let cache_2 = prompt_cache_key(&route_2);
-        assert_eq!(cache_1, cache_2);
-        assert_eq!(cache_1.len(), 64, "SHA-256 yields a bounded opaque key");
+        let provider_1 = provider_routing_identity(&route_1);
+        let provider_2 = provider_routing_identity(&route_2);
+        assert_eq!(provider_1, provider_2);
+        assert_eq!(provider_1.session_id.len(), 36);
+        assert_eq!(provider_1.thread_id.len(), 36);
+        assert_ne!(provider_1.session_id, provider_1.thread_id);
+        assert_eq!(
+            uuid::Uuid::parse_str(&provider_1.session_id)
+                .expect("provider session UUID")
+                .get_version_num(),
+            8
+        );
+        assert_eq!(
+            uuid::Uuid::parse_str(&provider_1.thread_id)
+                .expect("provider thread UUID")
+                .get_version_num(),
+            8
+        );
         assert_ne!(
-            cache_1,
-            prompt_cache_key("session-42/r7/sibling.llm"),
+            provider_1,
+            provider_routing_identity("session-42/r7/sibling.llm"),
             "sibling agents must not share cache routing"
         );
+    }
+
+    #[test]
+    fn provider_routing_is_bounded_for_long_logical_actor_ids() {
+        let logical = format!("session-42/r7/{}.llm", "long-actor-name-".repeat(32));
+        assert!(logical.len() > 64);
+
+        let provider = provider_routing_identity(&logical);
+        assert_eq!(provider.session_id.len(), 36);
+        assert_eq!(provider.thread_id.len(), 36);
     }
 
     #[test]
@@ -3118,7 +3176,7 @@ mod tests {
                 .stream(
                     &request,
                     &first,
-                    &mut ResponsesTurnContext::new("test-session"),
+                    &mut ResponsesTurnContext::new("test-session", "test-thread"),
                 )
                 .await,
             Err(ChatgptError::ResponsesEndpoint { status: 401, .. })
@@ -3131,7 +3189,7 @@ mod tests {
             .stream(
                 &request,
                 &auth.snapshot().await,
-                &mut ResponsesTurnContext::new("test-session"),
+                &mut ResponsesTurnContext::new("test-session", "test-thread"),
             )
             .await
             .expect("retry");
