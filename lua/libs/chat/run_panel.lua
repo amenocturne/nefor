@@ -153,31 +153,35 @@ end
 -- members by the same namespace rule the panel groups by.
 M.group_of = group_of
 
--- Aggregate a group's member states into one status. Precedence, highest
--- first: killed (any member killed) → failed (any member failed) → running
--- (any member live — working and idle both count: an agent loop between
--- provider rounds is still a live loop) → done (run finished) → pending (no
--- member ready yet). `killed`/`failed` outrank `running` so a group with any
--- terminated member reads as terminated — the "killed if any member was
--- killed" rule, extended to run-failure teardown — even while a sibling is
--- still mid-flight.
-local LIVE_MEMBER_STATUS = { running = true, working = true, idle = true }
+-- Aggregate actor activity into workflow-node progress. The kernel also calls
+-- a newly constructed (but never fired) actor `idle`; `settled_at_ms`
+-- distinguishes that ready state from an activation that actually completed.
+-- An actor remains resident after settling, while a later busy event moves its
+-- workflow node back to running. Actor teardown is tracked separately.
+local LIVE_MEMBER_STATUS = { running = true, working = true }
 
 local function group_status(members, run_completed)
-  local any_killed, any_failed, any_running = false, false, false
+  local any_killed, any_failed, any_running, any_pending =
+    false, false, false, false
   local count = 0
   for _, m in ipairs(members) do
     count = count + 1
     if m.node.status == "killed" then any_killed = true
-    elseif m.node.status == "failed" then any_failed = true
-    elseif LIVE_MEMBER_STATUS[m.node.status] then any_running = true end
+    elseif m.node.status == "failed" or m.node.status == "error" then
+      any_failed = true
+    elseif LIVE_MEMBER_STATUS[m.node.status]
+        or (m.node.status == "idle" and m.node.settled_at_ms == nil) then
+      any_running = true
+    elseif m.node.status == "pending" then
+      any_pending = true
+    end
   end
   if count == 0 then return "pending" end
   if any_killed then return "killed" end
   if any_failed then return "failed" end
   if any_running then return "running" end
-  if run_completed then return "done" end
-  return "pending"
+  if any_pending and not run_completed then return "pending" end
+  return "done"
 end
 
 -- Build the ordered group model for a MAG run: a list of groups in stable
@@ -211,7 +215,7 @@ local function build_groups(run)
     for _, m in ipairs(b.members) do
       local s = m.node.started_at_ms
       if s and (first_start == nil or s < first_start) then first_start = s end
-      local f = m.node.finished_at_ms
+      local f = m.node.finished_at_ms or m.node.settled_at_ms
       if f and (last_finish == nil or f > last_finish) then last_finish = f end
     end
     b.first_start, b.last_finish = first_start, last_finish
@@ -569,7 +573,9 @@ function M.actor_idle(state, run_id, actor_id, now_ms)
       and state.runs[run_id].nodes[actor_id].status == "working") then
     return state
   end
-  return mark_actor(state, run_id, actor_id, now_ms, "idle")
+  return mark_actor(state, run_id, actor_id, now_ms, "idle", {
+    settled_at_ms = now_ms,
+  })
 end
 
 -- `reason` is the kernel's teardown taxonomy (mag-kernel observer.lua) and

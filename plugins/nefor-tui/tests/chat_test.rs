@@ -7741,6 +7741,81 @@ fn engine_with_cycling_group() -> Engine {
 }
 
 #[test]
+fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started",
+            "run_id": "investigate-1",
+            "run_name": "investigate",
+            "scope": "r5"
+        }),
+    );
+    for (id, factory) in [
+        ("task", "nefor.factory.source"),
+        ("investigator.llm", "nefor.factory.llm"),
+        ("result", "nefor.factory.output"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.actor_spawned",
+                "run_id": "investigate-1",
+                "id": id,
+                "factory": factory
+            }),
+        );
+    }
+
+    for kind in ["mag.actor_ready", "mag.actor_busy", "mag.actor_idle"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": kind, "run_id": "investigate-1", "id": "task" }),
+        );
+    }
+    for kind in ["mag.actor_ready", "mag.actor_busy"] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": kind,
+                "run_id": "investigate-1",
+                "id": "investigator.llm"
+            }),
+        );
+    }
+
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("MAG investigate (1/3)"),
+        "the settled task firing must count as completed while the run remains active:\n{snap}"
+    );
+    assert!(
+        snap.contains("✓ task 0s"),
+        "task must show its actual firing duration rather than the run lifetime:\n{snap}"
+    );
+    assert!(
+        snap.contains("● investigator") && snap.contains("○ result"),
+        "other nodes retain their independent running and pending states:\n{snap}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "investigate-1", "id": "task" }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("MAG investigate (0/3)") && snap.contains("● task"),
+        "a later firing moves the same resident actor back to running:\n{snap}"
+    );
+}
+
+#[test]
 fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let mut engine = engine_with_cycling_group();
 
@@ -7820,8 +7895,9 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
         "a fresh activation must reset the member timer:\n{snap}"
     );
 
-    // Group row: the WHOLE-RUN clock keeps ticking even with every member
-    // idle — the loop is alive between rounds.
+    // Once every member's latest firing settles, the workflow node is done
+    // even though its actors remain resident. Its elapsed time freezes at the
+    // final settle rather than continuing to mirror the run wall clock.
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.actor_idle", "run_id": "loop-1", "id": "lead.llm", "busy_ms": 2000 }),
@@ -7831,8 +7907,8 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("lead (2) 14s"),
-        "the group row must keep ticking the whole-run clock while members idle:\n{snap}"
+        snap.contains("MAG loop (1/1)") && snap.contains("✓ lead (2) 10s"),
+        "the settled group must be done with a frozen firing window:\n{snap}"
     );
     assert!(
         !snap.contains("working"),

@@ -816,6 +816,13 @@ do
     feed("mag", { kind = "mag.actor_spawned", run_id = run_id, id = actor.id, factory = actor.factory })
     feed("mag", { kind = "mag.actor_ready",   run_id = run_id, id = actor.id })
   end
+  feed("mag", { kind = "mag.actor_busy", run_id = run_id, id = "worker.entry" })
+  feed("mag", { kind = "mag.actor_idle", run_id = run_id, id = "worker.entry" })
+  assert_eq(lw._internals.state.active_runs[run_id].nodes["worker.entry"].status,
+    "done", "a settled firing is done while its actor remains resident")
+  feed("mag", { kind = "mag.actor_busy", run_id = run_id, id = "worker.entry" })
+  assert_eq(lw._internals.state.active_runs[run_id].nodes["worker.entry"].status,
+    "running", "a later firing moves the resident actor back to running")
   feed("mag", { kind = "mag.actor_killed", run_id = run_id, id = "worker.entry" })
   -- An event for a DIFFERENT run must not leak into this one's node table.
   feed("mag", { kind = "mag.actor_killed", run_id = "some-other-run", id = "worker.llm" })

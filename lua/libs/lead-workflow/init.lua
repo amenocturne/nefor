@@ -893,10 +893,11 @@ local function mark_mag_run_started(body)
 end
 
 -- Track one kernel actor lifecycle transition against its run's node table —
--- the same truth the chat surface's live panel tracks
--- (starter/chat/run_panel.lua): spawned → pending, ready → running, killed →
--- killed. The event's run_id names the run. A mid-run spawn (`mag.apply`)
--- appends a node the dispatch-time modification didn't carry.
+-- the same per-firing truth the chat surface tracks: spawned → pending,
+-- ready/busy → running, idle → done, killed → killed. A later firing moves a
+-- resident done actor back to running. The event's run_id names the run. A
+-- mid-run spawn (`mag.apply`) appends a node the dispatch-time modification
+-- didn't carry.
 local function mark_mag_actor(body, status)
   local run = mag_event_run(body)
   local actor_id, factory = body.id, body.factory
@@ -1909,6 +1910,14 @@ local function receive_msg(entry)
   end
   if kind == "mag.actor_ready" then
     mark_mag_actor(body, "running")
+    return
+  end
+  if kind == "mag.actor_busy" then
+    mark_mag_actor(body, "running")
+    return
+  end
+  if kind == "mag.actor_idle" then
+    mark_mag_actor(body, "done")
     return
   end
   if kind == "mag.actor_killed" then
