@@ -30,6 +30,19 @@ function M.system(text)
   return { role = "system", kind = "text", text = text, v = v }
 end
 
+function M.error(title, message, retryable)
+  local v = next_v()
+  log.log("entry", "create kind=error title=%s v=%d", title or "?", v)
+  return {
+    role = "system",
+    kind = "error",
+    title = title,
+    message = message,
+    retryable = retryable == true,
+    v = v,
+  }
+end
+
 function M.assistant_stream()
   local v = next_v()
   log.log("entry", "create kind=stream role=assistant v=%d", v)

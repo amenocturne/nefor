@@ -553,6 +553,48 @@ fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() 
 }
 
 #[test]
+fn structured_chat_error_is_readable_and_closes_the_provider_round() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.error.append",
+            "title": "Provider temporarily unavailable",
+            "message": "The model provider is overloaded right now. Please try again.",
+            "retryable": true,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "later answer" }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("Provider temporarily unavailable")
+            && out.contains("The model provider is overloaded right now.")
+            && out.contains("You can retry the request."),
+        "structured error should render as a concise actionable block:\n{out}"
+    );
+    assert!(
+        !out.contains("semantic_type_id") && !out.contains("nefor.contracts.AgentError"),
+        "runtime contract details leaked into the rendered chat:\n{out}"
+    );
+    let later = out.find("later answer").expect("later assistant answer");
+    assert!(
+        !out[later..].contains("gpt-test"),
+        "later assistant inherited stale failed-turn metadata:\n{out}"
+    );
+}
+
+#[test]
 fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

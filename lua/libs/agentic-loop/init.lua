@@ -873,34 +873,97 @@ local function handle_mag_run_started(body)
   emit(nil, { kind = "chat.lead.bound", chat_prefix = turn.chat_prefix })
 end
 
--- The relay text for a run result's inline `result` (the sink's final
--- answer riding mag.run_result): its text when it carries one. The encode
--- fallback excludes transcript_delta — the conversation record is history's
--- concern, never part of the answer text.
+local function typed_semantic_name(result)
+  if type(result) ~= "table" or type(result.semantic_type_id) ~= "string" then
+    return nil
+  end
+  return type(result.semantic_type) == "table" and result.semantic_type.name or nil
+end
+
+local function nested_message(value)
+  local current = value
+  for _ = 1, 8 do
+    if type(current) ~= "table" then return nil end
+    if type(current.message) == "string" and #current.message > 0 then
+      return current.message
+    end
+    current = current.value
+  end
+  return nil
+end
+
+local function last_output_text(value)
+  if type(value) ~= "table" then return nil end
+  local last = value.last_output
+  if type(last) == "string" and #last > 0 then return last end
+  if type(last) ~= "table" then return nil end
+  if type(last.text) == "string" and #last.text > 0 then return last.text end
+  if type(last.final_answer) == "string" and #last.final_answer > 0 then
+    return last.final_answer
+  end
+  return nil
+end
+
+local function error_display(raw, partial)
+  raw = type(raw) == "string" and raw
+      or "The agent run failed before producing a usable answer."
+  local lower = raw:lower()
+  if lower:find("overload", 1, true)
+      or lower:find("temporarily unavailable", 1, true) then
+    return {
+      title = "Provider temporarily unavailable",
+      message = "The model provider is overloaded right now. Please try again.",
+      retryable = true,
+      partial = partial,
+    }
+  end
+  if lower:find("write-capable agents", 1, true)
+      or lower:find("write-review", 1, true) then
+    return {
+      title = "Approval required",
+      message = "This workflow can modify files. Submit its plan for review and approve it before execution.",
+      retryable = false,
+      partial = partial,
+    }
+  end
+  if lower:find("semantic_type", 1, true)
+      or lower:find("constructor_id", 1, true)
+      or lower:find("arrival_id", 1, true) then
+    raw = "The agent run failed before producing a usable answer."
+  end
+  return {
+    title = "Agent run failed",
+    message = raw,
+    retryable = false,
+    partial = partial,
+  }
+end
+
+local function agent_error_display(result)
+  if typed_semantic_name(result) ~= "nefor.contracts.AgentError"
+      or type(result.value) ~= "table" then
+    return nil
+  end
+  return error_display(
+    nested_message(result.value.reason),
+    last_output_text(result.value)
+  )
+end
+
+-- The relay text for a successful run result's inline `result` (the sink's
+-- final answer riding mag.run_result). Typed AgentError is handled separately
+-- so its runtime envelope can never fall through to the JSON encode fallback.
 local function mag_result_text(result)
   if type(result) ~= "table" then return nil end
-  local semantic_name = type(result.semantic_type) == "table"
-    and result.semantic_type.name or nil
-  local typed = type(result.semantic_type_id) == "string"
+  local semantic_name = typed_semantic_name(result)
+  local typed = semantic_name ~= nil
   if typed and semantic_name ~= "nefor.contracts.AgentError" then
     if type(result.value) == "string" then return result.value end
     if type(result.value) == "table" and type(result.value.content) == "string" then
       return result.value.content
     end
-  elseif typed and semantic_name == "nefor.contracts.AgentError"
-      and type(result.value) == "table" then
-    local last = result.value.last_output
-    if type(last) == "string" then return last end
-    if type(last) == "table" then
-      if type(last.text) == "string" and #last.text > 0 then return last.text end
-      if type(last.final_answer) == "string" and #last.final_answer > 0 then
-        return last.final_answer
-      end
-    end
-    local reason = result.value.reason
-    if type(reason) == "table" and type(reason.message) == "string" then
-      return reason.message
-    end
+  elseif typed then
+    return nil
   end
   if type(result.text) == "string" and #result.text > 0 then
     return result.text
@@ -963,6 +1026,15 @@ local function record_turn(run_id, user_text, answer, transcript_delta)
   })
 end
 
+local function failure_transcript_delta(delta, marker)
+  local messages = transcript_messages(delta)
+  if messages == nil then return nil end
+  local out = {}
+  for i, message in ipairs(messages) do out[i] = message end
+  out[#out + 1] = { role = "assistant", content = marker }
+  return out
+end
+
 -- The assistant-slot placeholder for a turn that ended without a real answer.
 -- A user-initiated hard kill or the graceful "interrupted by
 -- user" settle) records the same honest marker the user saw; any other failure
@@ -983,7 +1055,7 @@ end
 --     gains the turn's transcript delta (bare `{ user, answer }` pair when
 --     the result carries none), and a turn_recorded marker rides the bus
 --     so /resume can rebuild it.
---   failed — surfaced in chat as a system line, AND the turn is recorded
+--   failed — surfaced in chat as a structured error, AND the turn is recorded
 --     with a placeholder answer so context survives (an interrupted lead
 --     turn settles here; without the record the next turn seeds blind).
 --   killed — turn aborted (hard kill): no transcript append,
@@ -997,6 +1069,37 @@ local function handle_mag_run_result(body)
   state.current_turn = nil
 
   if body.status == "completed" then
+    local agent_error = agent_error_display(body.result)
+    if agent_error ~= nil then
+      local marker = aborted_turn_marker(agent_error.message)
+      local delta = type(body.result) == "table"
+        and failure_transcript_delta(body.result.transcript_delta, marker) or nil
+      record_turn(run_id, turn.user_text, marker, delta)
+      if not turn.streamed and type(agent_error.partial) == "string"
+          and #agent_error.partial > 0 then
+        emit("nefor-tui", {
+          kind = "chat.message.append",
+          role = "assistant",
+          text = agent_error.partial,
+        })
+      end
+      emit("nefor-tui", {
+        kind = "chat.error.append",
+        title = agent_error.title,
+        message = agent_error.message,
+        retryable = agent_error.retryable,
+      })
+      nefor.log.warn("agentic-loop: lead turn returned AgentError", {
+        run_id = run_id,
+        error = agent_error.message,
+        history_len = #state.history,
+      })
+      fire_observers(state.complete_observers, run_id, "error")
+      flush_deferred()
+      flush_pending_user_inputs()
+      emit_idle_if_idle(run_id)
+      return
+    end
     local answer = mag_result_text(body.result) or ""
     local delta = type(body.result) == "table" and body.result.transcript_delta or nil
     record_turn(run_id, turn.user_text, answer, delta)
@@ -1037,11 +1140,12 @@ local function handle_mag_run_result(body)
   end
 
   -- failed (and anything else terminal we don't recognize).
-  local err_text = "[lead turn failed] " .. tostring(body.error or body.status or "unknown error")
+  local display = error_display(tostring(body.error or body.status or "unknown error"))
   emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "system",
-    text = err_text,
+    kind = "chat.error.append",
+    title = display.title,
+    message = display.message,
+    retryable = display.retryable,
   })
   -- Preserve context: record the turn with a placeholder answer so the user's
   -- message survives into the next turn's seed (an interrupted lead turn

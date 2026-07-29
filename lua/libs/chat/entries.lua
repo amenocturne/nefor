@@ -26,6 +26,29 @@ local function render_user_entry(entry, queued)
   )
 end
 
+local function render_error_entry(entry)
+  local rows = {
+    tui.text {
+      content = "✗ " .. (entry.title or "Something went wrong"),
+      style = STYLE.status_danger,
+      wrap = "word",
+    },
+    tui.text {
+      content = "  " .. (entry.message or "The operation failed."),
+      style = STYLE.status,
+      wrap = "word",
+    },
+  }
+  if entry.retryable then
+    rows[#rows + 1] = tui.text {
+      content = "  You can retry the request.",
+      style = STYLE.footer,
+      wrap = "word",
+    }
+  end
+  return tui.column { gap = 0, children = rows }
+end
+
 -- Reasoning rows above the assistant body. Three visual states:
 --   live  (streaming + body empty)  → "▼ thinking…"  + body
 --   expanded (Ctrl+O)               → "▼ reasoning"  + body
@@ -456,6 +479,9 @@ local function compaction_expanded(entry)
 end
 
 function M.render(entry, _i, expanded, queued, raw_tool_id)
+  if entry.kind == "error" then
+    return render_error_entry(entry)
+  end
   if entry.kind == "tool_call" then
     if expanded then return tool_expanded(entry, raw_tool_id == entry.id) end
     return tool_collapsed(entry)

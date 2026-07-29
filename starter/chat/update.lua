@@ -889,6 +889,18 @@ local function handle_message_append(msg, state)
   }), {}
 end
 
+local function handle_error_append(msg, state)
+  local title = type(msg.title) == "string" and msg.title or "Something went wrong"
+  local message = type(msg.message) == "string" and msg.message or "The operation failed."
+  local next_state = transcript.close_assistant_projection(state)
+  next_state = shallow_merge(next_state, {
+    pending = false,
+    turn_started_at = NIL_SENTINEL,
+  })
+  return transcript.push_entry(next_state,
+    Entry.error(title, message, msg.retryable)), {}
+end
+
 -- The transcript renders exactly one conversation: the lead's. Its
 -- binding arrives via `chat.lead.bound` (broadcast by the agentic-loop,
 -- and replayed from the session log on /resume) in one of two forms:
@@ -1546,6 +1558,7 @@ local handlers = {
   ["sessions.replay.end"]         = handle_replay_end,
   ["chat.reset"]                  = handle_chat_reset,
   ["chat.message.append"]         = handle_message_append,
+  ["chat.error.append"]           = handle_error_append,
   ["chat.queue.steered"]          = handle_queue_steered,
   ["chat.instruction.notice"]     = handle_instruction_notice,
   ["chat.lead.bound"]             = handle_lead_chat_bound,

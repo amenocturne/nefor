@@ -561,7 +561,7 @@ fn budget_allows(started: Instant, next_delay: Duration) -> bool {
 /// `attempt` is 0-indexed (0 for the first retry after the original
 /// failure, 1 for the next, …). When a server-supplied `Retry-After` is
 /// available it wins over the computed value.
-fn retry_delay(attempt: u32, retry_after_sec: Option<u64>) -> Duration {
+pub(crate) fn retry_delay(attempt: u32, retry_after_sec: Option<u64>) -> Duration {
     if let Some(s) = retry_after_sec {
         let ms = s.saturating_mul(1_000).min(RETRY_MAX_DELAY_MS);
         return Duration::from_millis(ms);

@@ -2027,6 +2027,48 @@ fn should_retry_pre_output_stream_error(
         && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
 }
 
+fn response_failure_message(response: &Value) -> String {
+    response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("response.failed")
+        .to_owned()
+}
+
+fn response_failure_is_transient(response: &Value) -> bool {
+    let error = response.get("error").unwrap_or(response);
+    let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+    let kind = error.get("type").and_then(Value::as_str).unwrap_or("");
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    let fingerprint = format!("{code} {kind} {message}").to_ascii_lowercase();
+
+    [
+        "overload",
+        "server_error",
+        "service_unavailable",
+        "temporarily unavailable",
+        "server busy",
+        "try again later",
+    ]
+    .iter()
+    .any(|needle| fingerprint.contains(needle))
+}
+
+fn should_retry_pre_output_response_failure(
+    response: &Value,
+    output_text: &str,
+    reasoning_text: &str,
+    tool_buf: &ToolCallBuffer,
+    retries: u32,
+) -> bool {
+    response_failure_is_transient(response)
+        && output_text.is_empty()
+        && reasoning_text.is_empty()
+        && tool_buf.is_empty()
+        && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
+}
+
 fn spawn_turn(
     ctx: DispatcherContext,
     chat_id: ChatId,
@@ -2488,13 +2530,15 @@ fn spawn_turn(
                                     break;
                                 }
                                 ResponseEvent::Failed { response } => {
-                                    let msg = response
-                                        .get("error")
-                                        .and_then(|e| e.get("message"))
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("response.failed")
-                                        .to_string();
-                                    iter_errored = Some(msg);
+                                    iter_retryable_before_output =
+                                        should_retry_pre_output_response_failure(
+                                            &response,
+                                            &output_text,
+                                            &reasoning_text,
+                                            &tool_buf,
+                                            pre_output_stream_retries,
+                                        );
+                                    iter_errored = Some(response_failure_message(&response));
                                     break;
                                 }
                                 ResponseEvent::Incomplete { response } => {
@@ -2580,8 +2624,13 @@ fn spawn_turn(
                         attempt = pre_output_stream_retries,
                         max = MAX_PRE_OUTPUT_STREAM_RETRIES,
                         error = %err_msg,
-                        "Responses stream read failed before output; retrying turn iteration",
+                        "Responses stream failed before output; retrying turn iteration",
                     );
+                    tokio::time::sleep(crate::responses::retry_delay(
+                        pre_output_stream_retries - 1,
+                        None,
+                    ))
+                    .await;
                     continue;
                 }
                 let _ = ctx
@@ -3272,6 +3321,58 @@ mod tests {
             "",
             &empty_tools,
             MAX_PRE_OUTPUT_STREAM_RETRIES,
+        ));
+    }
+
+    #[test]
+    fn response_failure_retry_gate_only_allows_transient_failures_before_output() {
+        let empty_tools = ToolCallBuffer::default();
+        let overloaded = serde_json::json!({
+            "error": {
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "type": "server_error",
+                "code": "service_unavailable"
+            }
+        });
+        assert!(should_retry_pre_output_response_failure(
+            &overloaded,
+            "",
+            "",
+            &empty_tools,
+            0,
+        ));
+        assert_eq!(
+            response_failure_message(&overloaded),
+            "Our servers are currently overloaded. Please try again later."
+        );
+        assert!(!should_retry_pre_output_response_failure(
+            &overloaded,
+            "visible",
+            "",
+            &empty_tools,
+            0,
+        ));
+        assert!(!should_retry_pre_output_response_failure(
+            &overloaded,
+            "",
+            "",
+            &empty_tools,
+            MAX_PRE_OUTPUT_STREAM_RETRIES,
+        ));
+
+        let invalid = serde_json::json!({
+            "error": {
+                "message": "Unsupported parameter",
+                "type": "invalid_request_error",
+                "code": "unsupported_parameter"
+            }
+        });
+        assert!(!should_retry_pre_output_response_failure(
+            &invalid,
+            "",
+            "",
+            &empty_tools,
+            0,
         ));
     }
 

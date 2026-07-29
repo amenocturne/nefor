@@ -630,8 +630,12 @@ do
     status = "failed", error = "provider exploded",
   })
   local calls = decode_calls()
-  local err_line = find_call(calls, "chat.message.append", "system", "provider exploded")
-  assert(err_line ~= nil, "failed turn surfaces the error in chat")
+  local err_line = find_kind(calls, "chat.error.append")
+  assert(err_line ~= nil, "failed turn surfaces a structured error in chat")
+  assert_eq(err_line.body.title, "Agent run failed",
+    "failed turn uses the stable error title")
+  assert_eq(err_line.body.message, "provider exploded",
+    "failed turn preserves its concise diagnostic")
   local history = agentic_loop.history()
   assert_eq(#history, 2, "failed turn records {user, placeholder} so context survives")
   assert_eq(history[1].content, "doomed", "failed turn preserves the user message")
@@ -674,8 +678,47 @@ do
       },
     },
   })
-  assert(find_call(decode_calls(), "chat.message.append", "assistant", "partial builder report") ~= nil,
+  local calls = decode_calls()
+  assert(find_call(calls, "chat.message.append", "assistant", "partial builder report") ~= nil,
     "typed AgentError preserves and renders the last completed provider output")
+  local generic_error = find_kind(calls, "chat.error.append")
+  assert(generic_error ~= nil, "typed AgentError emits a structured chat error")
+  assert_eq(generic_error.body.title, "Agent run failed",
+    "generic typed failure receives a stable user-facing title")
+
+  fresh_loop()
+  exec = begin_bound_turn("typed overload", "r-typed-overload")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
+    result = {
+      semantic_type_id = "sha256:agent-error",
+      semantic_type = { kind = "named", name = "nefor.contracts.AgentError" },
+      value = {
+        last_output = { text = "", tool_calls = {}, finish_reason = "tool_calls" },
+        reason = {
+          type = "sha256:provider-error",
+          value = {
+            message = "Our servers are currently overloaded. Please try again later.",
+            detail = { value = "", present = false },
+          },
+        },
+      },
+    },
+  })
+  calls = decode_calls()
+  local overload = find_kind(calls, "chat.error.append")
+  assert(overload ~= nil, "nested provider failure emits a structured chat error")
+  assert_eq(overload.body.title, "Provider temporarily unavailable",
+    "overload receives a concise user-facing title")
+  assert_eq(overload.body.message,
+    "The model provider is overloaded right now. Please try again.",
+    "overload hides the runtime contract envelope")
+  assert_eq(overload.body.retryable, true, "overload is marked retryable")
+  for _, call in ipairs(calls) do
+    local text = call.body.text
+    assert(type(text) ~= "string" or not text:find("semantic_type", 1, true),
+      "typed AgentError envelope must never be appended as chat text")
+  end
 end
 
 -- (interrupt preserves context) an interrupted lead turn settles failed with
