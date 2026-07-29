@@ -97,6 +97,12 @@ do
     "the MAG schema does not point at unreadable library implementation files")
   assert_true(string.find(mag_schema.description, "(require \"...\")", 1, true) ~= nil,
     "the MAG schema reinforces literal require syntax")
+  assert_true(string.find(mag_schema.description, "When to dispatch a graph", 1, true) == nil,
+    "the MAG schema leaves allocation policy to the system prompt")
+  assert_true(string.find(mag_schema.description, "Anything multi-file", 1, true) == nil,
+    "the MAG schema does not encode task-shape routing heuristics")
+  assert_true(string.find(mag_schema.description, "redo delegated work", 1, true) == nil,
+    "the MAG schema does not encode agent ownership policy")
 end
 
 local starter_profiles = require("config").active.orchestration_profiles

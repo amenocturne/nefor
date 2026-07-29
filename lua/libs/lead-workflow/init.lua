@@ -1448,20 +1448,7 @@ local function lead_workflow_tool_schemas()
         "canonical complete example: use literal (require \"...\") forms and " ..
         "never copy historical session files or use removed import/bare-helper syntax. " ..
         "For a one-off shell expression whose result you just need back, " ..
-        "use mag-eval instead — no file, no workspace ceremony.\n\n" ..
-        "When to dispatch a graph vs work directly: first identify what " ..
-        "is on the critical path for your next decision vs what is " ..
-        "self-contained sidecar work. Anything multi-file, multi-step, " ..
-        "or long-horizon runs as a graph; keep only glances and " ..
-        "single-file tweaks local. Use the composition's ready agent " ..
-        "constructor and put the self-contained goal, relevant paths, " ..
-        "constraints, and expected output in its task message. Agents do " ..
-        "not see your conversation. Give " ..
-        "parallel builders disjoint write sets. After dispatch, do not " ..
-        "poll graph-status — run outcomes (completion, failure, " ..
-        "interruption) are delivered to you by the runtime. Integrate " ..
-        "results as they arrive and prepare the next dispatch; do not " ..
-        "redo delegated work locally.",
+        "use mag-eval instead — no file, no workspace ceremony.",
       parameters  = {
         type = "object",
         properties = {
