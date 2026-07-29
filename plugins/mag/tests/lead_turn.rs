@@ -941,6 +941,12 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         chat_id.starts_with(&format!("{scope}/lead.llm@")),
         "chat handle {chat_id:?} carries the run scope {scope:?} + the llm actor id"
     );
+    let routing_session_id = format!("{SESSION_ID}/{scope}/lead.llm");
+    assert_eq!(
+        create.get("routing_session_id").and_then(Value::as_str),
+        Some(routing_session_id.as_str()),
+        "provider routing identity is stable for the logical actor"
+    );
     let system = create
         .get("system")
         .and_then(Value::as_str)
@@ -1060,6 +1066,12 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         .and_then(Value::as_str)
         .expect("round 2 chat_id")
         .to_owned();
+    assert_ne!(chat_id2, chat_id, "provider request handles stay per-round");
+    assert_eq!(
+        create2.get("routing_session_id").and_then(Value::as_str),
+        Some(routing_session_id.as_str()),
+        "round 2 reuses the actor routing identity"
+    );
     let mut continuation_appends = Vec::new();
     loop {
         let event = next_event(&mut reader, "correlated MAG continuation").await;

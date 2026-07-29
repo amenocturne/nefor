@@ -20,6 +20,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::auth::{
@@ -1154,6 +1155,26 @@ fn read_chat_id(body: &Map<String, Value>) -> Option<ChatId> {
         .map(ChatId::new)
 }
 
+fn read_routing_session_id(body: &Map<String, Value>) -> Option<String> {
+    body.get("routing_session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn logical_routing_id(routing_session_id: Option<&str>, chat_id: &ChatId) -> String {
+    routing_session_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| chat_id.to_string())
+}
+
+fn prompt_cache_key(routing_session_id: &str) -> String {
+    let digest = Sha256::digest(routing_session_id.as_bytes());
+    format!("{digest:x}")
+}
+
 fn reasoning_effort_wire(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::None => "none",
@@ -1292,6 +1313,7 @@ async fn handle_chat_create(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let routing_session_id = read_routing_session_id(body);
     let system = body
         .get("system")
         .and_then(Value::as_str)
@@ -1336,7 +1358,18 @@ async fn handle_chat_create(
         )
         .await
     {
-        Ok(()) => send_event(out_tx, chat_created_body(args, &chat_id)).await,
+        Ok(()) => {
+            if let Some(routing_session_id) = routing_session_id {
+                if let Err(error) = chats
+                    .set_routing_session_id(&chat_id, routing_session_id)
+                    .await
+                {
+                    send_event(out_tx, chat_error_body(args, &chat_id, error.to_string())).await?;
+                    return Ok(());
+                }
+            }
+            send_event(out_tx, chat_created_body(args, &chat_id)).await
+        }
         Err(e) => send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await,
     }
 }
@@ -1414,6 +1447,7 @@ async fn handle_chat_restore(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let routing_session_id = read_routing_session_id(body);
     let system = body
         .get("system")
         .and_then(Value::as_str)
@@ -1474,6 +1508,7 @@ async fn handle_chat_restore(
         .restore_messages(MessageRestore {
             id: chat_id.clone(),
             model,
+            routing_session_id,
             system,
             tool_overrides,
             tool_allowlist,
@@ -1667,6 +1702,9 @@ async fn compact_chat(
         effort: snapshot.reasoning_effort,
         summary: Some(ReasoningSummary::Concise),
     });
+    let routing_session_id = logical_routing_id(snapshot.routing_session_id.as_deref(), chat_id);
+    let cache_key = prompt_cache_key(&routing_session_id);
+    let response_turn = ResponsesTurnContext::new(routing_session_id);
 
     let auth_snap = ctx.auth.snapshot().await;
     if !matches!(auth_snap.state, AuthState::Connected) {
@@ -1696,7 +1734,7 @@ async fn compact_chat(
         parallel_tool_calls: false,
         reasoning,
         service_tier: None,
-        prompt_cache_key: None,
+        prompt_cache_key: Some(cache_key),
         text: None,
     };
 
@@ -1709,7 +1747,7 @@ async fn compact_chat(
             .await?;
             return Ok(());
         }
-        result = ctx.responses_client.compact(&req, &auth_snap) => result,
+        result = ctx.responses_client.compact(&req, &auth_snap, &response_turn) => result,
     };
 
     let compacted = match compacted {
@@ -2098,7 +2136,17 @@ fn spawn_turn(
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
         let mut auth_401_recovery_stage: u8 = 0;
-        let mut response_turn = ResponsesTurnContext::new(chat_id.to_string());
+        let routing_session_id = logical_routing_id(
+            ctx.chats
+                .routing_session_id(&chat_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref(),
+            &chat_id,
+        );
+        let cache_key = prompt_cache_key(&routing_session_id);
+        let mut response_turn = ResponsesTurnContext::new(routing_session_id);
 
         loop {
             iterations += 1;
@@ -2218,7 +2266,7 @@ fn spawn_turn(
                 stream: true,
                 include,
                 service_tier: None,
-                prompt_cache_key: None,
+                prompt_cache_key: Some(cache_key.clone()),
                 text,
             };
 
@@ -2803,6 +2851,62 @@ mod tests {
             provider_name: "chatgpt".into(),
             base_url: "https://example.invalid".into(),
         }
+    }
+
+    #[test]
+    fn logical_routing_and_cache_keys_are_stable_across_provider_rounds() {
+        let round_1 = ChatId::new("r7/worker.llm@r1");
+        let round_2 = ChatId::new("r7/worker.llm@r2");
+        let logical = "session-42/r7/worker.llm";
+
+        let route_1 = logical_routing_id(Some(logical), &round_1);
+        let route_2 = logical_routing_id(Some(logical), &round_2);
+        assert_eq!(route_1, logical);
+        assert_eq!(route_2, logical);
+
+        let cache_1 = prompt_cache_key(&route_1);
+        let cache_2 = prompt_cache_key(&route_2);
+        assert_eq!(cache_1, cache_2);
+        assert_eq!(cache_1.len(), 64, "SHA-256 yields a bounded opaque key");
+        assert_ne!(
+            cache_1,
+            prompt_cache_key("session-42/r7/sibling.llm"),
+            "sibling agents must not share cache routing"
+        );
+    }
+
+    #[test]
+    fn direct_provider_chats_fall_back_to_their_chat_id() {
+        let chat_id = ChatId::new("direct-chat");
+        assert_eq!(logical_routing_id(None, &chat_id), "direct-chat");
+    }
+
+    #[tokio::test]
+    async fn chat_create_preserves_the_logical_routing_identity() {
+        let chats = Arc::new(Chats::with_default_model(Some("test-model".into())));
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let body = serde_json::json!({
+            "chat_id": "r7/worker.llm@r2",
+            "routing_session_id": "session-42/r7/worker.llm"
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+
+        handle_chat_create(&args(), &chats, &out_tx, &body)
+            .await
+            .expect("create");
+        let created = out_rx.recv().await.expect("created event").to_line();
+        assert!(created.contains("chatgpt.chat.created"));
+
+        let snapshot = chats
+            .snapshot(&ChatId::new("r7/worker.llm@r2"))
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.routing_session_id.as_deref(),
+            Some("session-42/r7/worker.llm")
+        );
     }
 
     #[test]

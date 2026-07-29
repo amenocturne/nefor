@@ -251,6 +251,13 @@ local function new_run_context(meta)
           args[k] = v
         end
         args.chat_id = scope_chat_id(args.chat_id)
+        -- Provider chat handles are request-scoped (`@r<N>` changes on
+        -- every activation), while backend routing and prompt caching need
+        -- one stable identity for the logical actor conversation. Include
+        -- the Nefor session so identical graph scopes in concurrent
+        -- sessions never collide, then drop only the per-activation suffix.
+        local actor_chat_id = args.chat_id:gsub("@r%d+$", "")
+        args.routing_session_id = ctx.session_id .. "/" .. actor_chat_id
         out.args = args
       end
     end

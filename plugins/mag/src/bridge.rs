@@ -370,7 +370,13 @@ fn create_envelope(provider: &str, chat_id: &str, args: &Map<String, Value>) -> 
     // fields are omitted so the provider falls back to its own defaults.
     // `reasoning_effort` is the control-plane-resolved profile depth
     // (factories/llm.lua build_request); providers parse it off chat.create.
-    for key in ["model", "system", "tools", "reasoning_effort"] {
+    for key in [
+        "model",
+        "system",
+        "tools",
+        "reasoning_effort",
+        "routing_session_id",
+    ] {
         match args.get(key) {
             Some(v) if !v.is_null() => {
                 m.insert(key.into(), v.clone());

@@ -508,6 +508,7 @@ impl ResponsesClient {
         &self,
         request: &CompactRequest,
         auth: &AuthSnapshot,
+        turn: &ResponsesTurnContext,
     ) -> Result<Vec<ResponseItem>, ChatgptError> {
         let url = format!("{}/responses/compact", self.base_url.trim_end_matches('/'));
         let response = self
@@ -516,7 +517,7 @@ impl ResponsesClient {
                 |builder| builder.json(request),
                 auth,
                 "responses.compact",
-                None,
+                Some(turn),
             )
             .await?;
         let value: serde_json::Value = response.json().await.map_err(|e| {
