@@ -917,6 +917,15 @@ local function error_display(raw, partial)
       partial = partial,
     }
   end
+  if lower:find("auth not connected", 1, true)
+      or lower:find("login required", 1, true) then
+    return {
+      title = "Login required",
+      message = "Sign in to the ChatGPT provider before retrying this request.",
+      retryable = false,
+      partial = partial,
+    }
+  end
   if lower:find("write-capable agents", 1, true)
       or lower:find("write-review", 1, true) then
     return {

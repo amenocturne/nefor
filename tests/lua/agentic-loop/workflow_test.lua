@@ -648,6 +648,36 @@ do
   assert(exec2 ~= nil, "a failed turn releases the single-flight slot")
 end
 
+-- Authentication failures are user-facing state, not empty completions.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("needs login", "r-auth-error")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
+    result = {
+      semantic_type_id = "sha256:agent-error",
+      semantic_type = { kind = "named", name = "nefor.contracts.AgentError" },
+      value = {
+        last_output = nil,
+        reason = {
+          type = "sha256:provider-error",
+          value = {
+            message = "auth not connected; cannot complete turn",
+            detail = { value = "", present = false },
+          },
+        },
+      },
+    },
+  })
+  local error_event = find_kind(decode_calls(), "chat.error.append")
+  assert(error_event ~= nil, "auth failure emits a structured chat error")
+  assert_eq(error_event.body.title, "Login required",
+    "auth failure explains the required action")
+  assert_eq(error_event.body.message,
+    "Sign in to the ChatGPT provider before retrying this request.",
+    "auth failure does not masquerade as an empty completion")
+end
+
 -- Typed agent results decode their semantic success value rather than exposing
 -- the runtime envelope. A routed AgentError prefers its retained provider
 -- output so partial work remains visible to the user and future turns.
