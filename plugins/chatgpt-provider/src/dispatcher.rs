@@ -33,7 +33,9 @@ use crate::responses::request::{
     Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest, TextControls,
 };
 use crate::responses::stream::ResponseEvent;
-use crate::responses::{CompactRequest, ModelEntry, ResponsesClient, UsageSnapshot};
+use crate::responses::{
+    CompactRequest, ModelEntry, ResponsesClient, ResponsesTurnContext, UsageSnapshot,
+};
 use crate::state::{
     ChatId, ChatStats, Chats, ChatsError, Message, MessageRestore, ToolCall, ToolCallFunction,
     TurnToken,
@@ -2096,6 +2098,7 @@ fn spawn_turn(
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
         let mut auth_401_recovery_stage: u8 = 0;
+        let mut response_turn = ResponsesTurnContext::new(chat_id.to_string());
 
         loop {
             iterations += 1;
@@ -2256,7 +2259,11 @@ fn spawn_turn(
             }
             let auth_snap = ctx.auth.snapshot().await;
 
-            let mut stream = match ctx.responses_client.stream(&req, &auth_snap).await {
+            let mut stream = match ctx
+                .responses_client
+                .stream(&req, &auth_snap, &mut response_turn)
+                .await
+            {
                 Ok(s) => {
                     auth_401_recovery_stage = 0;
                     s
@@ -2994,7 +3001,13 @@ mod tests {
 
         let first = auth.snapshot().await;
         assert!(matches!(
-            client.stream(&request, &first).await,
+            client
+                .stream(
+                    &request,
+                    &first,
+                    &mut ResponsesTurnContext::new("test-session"),
+                )
+                .await,
             Err(ChatgptError::ResponsesEndpoint { status: 401, .. })
         ));
         let failed_token = first.tokens.expect("tokens").access_token;
@@ -3002,7 +3015,11 @@ mod tests {
             .await
             .expect("refresh");
         client
-            .stream(&request, &auth.snapshot().await)
+            .stream(
+                &request,
+                &auth.snapshot().await,
+                &mut ResponsesTurnContext::new("test-session"),
+            )
             .await
             .expect("retry");
         server_thread.join().expect("server thread");

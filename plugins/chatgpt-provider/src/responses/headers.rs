@@ -14,6 +14,14 @@ use crate::error::ChatgptError;
 /// headers are case-insensitive but we match exactly for parity.
 pub const X_CODEX_INSTALLATION_ID: &str = "x-codex-installation-id";
 
+/// Stable conversation routing identifier. Both Codex and OpenCode send
+/// this on every Responses request.
+pub const SESSION_ID: &str = "session-id";
+
+/// Server-issued sticky-routing token, replayed only within the turn that
+/// received it.
+pub const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
+
 /// ChatGPT-side account routing. Only present when the JWT id_token
 /// carried an `auth.chatgpt_account_id` claim (Plus / Team / Enterprise).
 pub const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
@@ -80,4 +88,24 @@ pub fn build_headers(
     );
 
     Ok(headers)
+}
+
+pub fn add_turn_headers(
+    headers: &mut HeaderMap,
+    session_id: &str,
+    turn_state: Option<&str>,
+) -> Result<(), ChatgptError> {
+    headers.insert(
+        SESSION_ID,
+        HeaderValue::from_str(session_id)
+            .map_err(|e| ChatgptError::InvalidHeader(e.to_string()))?,
+    );
+    if let Some(turn_state) = turn_state {
+        headers.insert(
+            X_CODEX_TURN_STATE,
+            HeaderValue::from_str(turn_state)
+                .map_err(|e| ChatgptError::InvalidHeader(e.to_string()))?,
+        );
+    }
+    Ok(())
 }

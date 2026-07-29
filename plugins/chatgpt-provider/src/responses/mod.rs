@@ -7,14 +7,17 @@
 //! Phase 4.
 //!
 //! ```ignore
-//! use chatgpt_provider::responses::{ResponsesClient, ResponsesApiRequest};
+//! use chatgpt_provider::responses::{
+//!     ResponsesApiRequest, ResponsesClient, ResponsesTurnContext,
+//! };
 //!
 //! let client = ResponsesClient::new(
 //!     "https://chatgpt.com/backend-api/codex".into(),
 //!     installation_id,
 //!     "nefor_cli_rs".into(),
 //! );
-//! let mut stream = client.stream(&request, &auth_snapshot).await?;
+//! let mut turn = ResponsesTurnContext::new(chat_id);
+//! let mut stream = client.stream(&request, &auth_snapshot, &mut turn).await?;
 //! while let Some(event) = stream.next().await { ... }
 //! ```
 
@@ -43,6 +46,34 @@ use serde::Deserialize;
 
 use crate::auth::AuthSnapshot;
 use crate::error::ChatgptError;
+
+pub struct ResponsesTurnContext {
+    session_id: String,
+    turn_state: Option<String>,
+}
+
+impl ResponsesTurnContext {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            turn_state: None,
+        }
+    }
+
+    fn add_headers(&self, headers: &mut reqwest::header::HeaderMap) -> Result<(), ChatgptError> {
+        headers::add_turn_headers(headers, &self.session_id, self.turn_state.as_deref())
+    }
+
+    fn capture_response_headers(&mut self, headers: &reqwest::header::HeaderMap) {
+        if self.turn_state.is_some() {
+            return;
+        }
+        self.turn_state = headers
+            .get(headers::X_CODEX_TURN_STATE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+    }
+}
 
 /// Minimal subset of the model metadata returned by
 /// `GET /models`. The real `ModelInfo` codex defines has 30+ fields;
@@ -222,13 +253,21 @@ impl ResponsesClient {
         &self,
         request: &ResponsesApiRequest,
         auth: &AuthSnapshot,
+        turn: &mut ResponsesTurnContext,
     ) -> Result<ResponseStream, ChatgptError> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
         let response = self
-            .post_with_retry(&url, |builder| builder.json(request), auth, "responses")
+            .post_with_retry(
+                &url,
+                |builder| builder.json(request),
+                auth,
+                "responses",
+                Some(turn),
+            )
             .await?;
 
+        turn.capture_response_headers(response.headers());
         let usage = UsageSnapshot::from_headers(response.headers());
         let byte_stream = response.bytes_stream();
         let parsed = parse_byte_stream(byte_stream);
@@ -267,6 +306,7 @@ impl ResponsesClient {
         build_body: F,
         auth: &AuthSnapshot,
         op: &str,
+        turn: Option<&ResponsesTurnContext>,
     ) -> Result<reqwest::Response, ChatgptError>
     where
         F: Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
@@ -274,7 +314,11 @@ impl ResponsesClient {
         let started = Instant::now();
         let mut attempt: u32 = 0;
         loop {
-            let headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
+            let mut headers =
+                headers::build_headers(auth, &self.installation_id, &self.originator)?;
+            if let Some(turn) = turn {
+                turn.add_headers(&mut headers)?;
+            }
             let builder = self.http.post(url).headers(headers);
             let send_result =
                 tokio::time::timeout(REQUEST_TIMEOUT, build_body(builder).send()).await;
@@ -472,6 +516,7 @@ impl ResponsesClient {
                 |builder| builder.json(request),
                 auth,
                 "responses.compact",
+                None,
             )
             .await?;
         let value: serde_json::Value = response.json().await.map_err(|e| {
@@ -757,6 +802,35 @@ mod retry_tests {
             started,
             Duration::from_millis(RETRY_BUDGET_MS + 1_000),
         ));
+    }
+
+    #[test]
+    fn turn_context_replays_first_server_routing_token() {
+        let mut turn = ResponsesTurnContext::new("chat-42");
+        let mut initial_headers = HeaderMap::new();
+        turn.add_headers(&mut initial_headers).expect("headers");
+        assert_eq!(initial_headers.get(headers::SESSION_ID).unwrap(), "chat-42");
+        assert!(initial_headers.get(headers::X_CODEX_TURN_STATE).is_none());
+
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            headers::X_CODEX_TURN_STATE,
+            HeaderValue::from_static("sticky-first"),
+        );
+        turn.capture_response_headers(&response_headers);
+
+        response_headers.insert(
+            headers::X_CODEX_TURN_STATE,
+            HeaderValue::from_static("sticky-later"),
+        );
+        turn.capture_response_headers(&response_headers);
+
+        let mut followup_headers = HeaderMap::new();
+        turn.add_headers(&mut followup_headers).expect("headers");
+        assert_eq!(
+            followup_headers.get(headers::X_CODEX_TURN_STATE).unwrap(),
+            "sticky-first"
+        );
     }
 }
 

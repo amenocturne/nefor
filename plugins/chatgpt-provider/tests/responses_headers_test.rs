@@ -4,7 +4,8 @@
 use chatgpt_provider::auth::store::{AccessToken, ChatgptAccountId, RefreshToken, TokenData};
 use chatgpt_provider::auth::{AuthSnapshot, AuthState};
 use chatgpt_provider::responses::headers::{
-    build_headers, CHATGPT_ACCOUNT_ID, ORIGINATOR, X_CODEX_INSTALLATION_ID,
+    add_turn_headers, build_headers, CHATGPT_ACCOUNT_ID, ORIGINATOR, SESSION_ID,
+    X_CODEX_INSTALLATION_ID, X_CODEX_TURN_STATE,
 };
 use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, USER_AGENT};
 
@@ -106,6 +107,26 @@ fn sets_versioned_user_agent() {
     let ua = v.to_str().unwrap();
     assert!(ua.starts_with("nefor-chatgpt-provider/"));
     assert!(ua.len() > "nefor-chatgpt-provider/".len());
+}
+
+#[test]
+fn adds_stable_session_routing_headers() {
+    let snap = snapshot_with_account();
+    let mut headers = build_headers(&snap, "install-1", "nefor_cli_rs").expect("headers");
+    add_turn_headers(&mut headers, "chat-42", Some("sticky-7")).expect("turn headers");
+
+    assert_eq!(headers.get(SESSION_ID).unwrap(), "chat-42");
+    assert_eq!(headers.get(X_CODEX_TURN_STATE).unwrap(), "sticky-7");
+}
+
+#[test]
+fn omits_turn_state_before_server_assigns_it() {
+    let snap = snapshot_with_account();
+    let mut headers = build_headers(&snap, "install-1", "nefor_cli_rs").expect("headers");
+    add_turn_headers(&mut headers, "chat-42", None).expect("turn headers");
+
+    assert_eq!(headers.get(SESSION_ID).unwrap(), "chat-42");
+    assert!(headers.get(X_CODEX_TURN_STATE).is_none());
 }
 
 #[test]
