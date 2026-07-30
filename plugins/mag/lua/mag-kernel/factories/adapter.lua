@@ -29,12 +29,12 @@
 -- waiting, no accumulation.
 --
 -- ── the boundary mapping (flagged) ──────────────────────────────────────────
---   Both inputs lift into ONE user-role turn message, the shape the provider
---   loop consumes (the canonical ProviderOut carries a `messages` array of
---   role-tagged turn messages — factories/tool-result.lua emits exactly this,
---   and factories/llm.lua extends its per-instance transcript with them):
---     { kind = "generic-provider.ProviderOut", from = id,
---       messages = { { role = "user", content = <lifted> } } }
+--   A single input lifts into one user-role turn message. A product assembled
+--   by the firing machine from separate routes lifts into one message per
+--   component, in product-position order. Each message carries that component's
+--   own semantic schema; a whole product arriving on one edge remains one
+--   message carrying the whole product schema. The provider boundary appends
+--   this native `messages` list to its transcript unchanged.
 --
 --   Per-input extraction is DISPATCHED ON THE DECLARED TAG, not sniffed from the
 --   value's shape (actor-model.md, Factories: "nothing selects inputs by
@@ -105,11 +105,28 @@ M.declaration = {
   signals = {},
 }
 
--- Lift one boundary input into the downstream provider turn. Dispatch on the
--- declared tag (a type fact), extract the turn content per input, wrap it as a
--- single user-role message. Pure: strings pass through, structured values pass
+-- Lift boundary inputs into downstream provider turns. Dispatch on each
+-- declared tag (a type fact), extract the turn content per input, and preserve
+-- the firing machine's product order. Pure: strings and structured values pass
 -- through verbatim for the provider layer to serialize.
-local function to_provider_out(tag, message, schema, arrival)
+local function selected_content(content, schema, arrival)
+  if type(schema) == "table" and type(schema.root) == "table"
+      and schema.root.kind == "union" and type(arrival) == "table"
+      and type(arrival.constructor_id) == "string" then
+    return { type = arrival.constructor_id, value = content }
+  end
+  return content
+end
+
+local function component_schema(schema, position)
+  local root = type(schema) == "table" and schema.root or nil
+  local components = type(root) == "table" and root.kind == "product" and root.components or nil
+  local component = type(components) == "table" and components[position] or nil
+  if component == nil then return schema end
+  return { version = schema.version, root = component }
+end
+
+local function turn_message(tag, message, schema, arrival)
   message = message or {}
   local content
   if tag == FINAL_ANSWER then
@@ -118,8 +135,6 @@ local function to_provider_out(tag, message, schema, arrival)
     -- the gate's rejection feedback ({ subject, reason }); the reason is the
     -- next turn — the producing llm's transcript already holds the draft
     content = message.reason
-  elseif tag == PROVIDER_OUT then
-    return message
   else
     -- Canonical typed messages carry `value`; retain the historical task seed
     -- shape only as an external-boundary fallback.
@@ -132,18 +147,26 @@ local function to_provider_out(tag, message, schema, arrival)
       content = message
     end
   end
-  if type(schema) == "table" and type(schema.root) == "table"
-      and schema.root.kind == "union" and type(arrival) == "table"
-      and type(arrival.constructor_id) == "string" then
-    content = { type = arrival.constructor_id, value = content }
+  return { role = "user", content = {
+    mag_type = schema,
+    value = selected_content(content, schema, arrival),
+  } }
+end
+
+local function to_provider_out(activation, schema)
+  local inputs = activation.messages or {}
+  if #inputs == 1 and inputs[1].tag == PROVIDER_OUT then return inputs[1].message end
+
+  local messages = {}
+  for position, input in ipairs(inputs) do
+    local input_schema = activation.whole and schema or component_schema(schema, position)
+    messages[position] = turn_message(
+      input.tag, input.message, input_schema, input.arrival)
   end
   return {
     kind = "generic-provider.ProviderOut",
-    value = { content = content },
-    messages = { { role = "user", content = {
-      mag_type = schema,
-      value = content,
-    } } },
+    value = { content = messages[1] and messages[1].content.value },
+    messages = messages,
   }
 end
 
@@ -164,8 +187,7 @@ function M.construct(id, params, emit, deps)
   -- kernel then emits mag.Unit along any dependency edges).
   function instance.deliver(activation)
     activation = activation or {}
-    local one = (activation.messages or {})[1] or {}
-    emit(sign(to_provider_out(one.tag, one.message, params.schema, one.arrival)))
+    emit(sign(to_provider_out(activation, params.schema)))
     return { status = "ok" }
   end
 
