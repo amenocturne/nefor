@@ -62,7 +62,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, mod in ipairs({ sink, human }) do
     local decl, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     assert_true(decl ~= nil and err == nil,
@@ -147,7 +147,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   reg:register({ declaration = sink.declaration, construct = sink.construct })
 
   local msgs, emit = capture()

@@ -7398,153 +7398,7 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
 }
 
 #[test]
-fn sidebar_cursor_skips_folded_members_and_space_opens_the_leaf_under_it() {
-    let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.run_started", "run_id": "mag-cur-1", "run_name": "demo", "scope": "r7" }),
-    );
-    for id in ["explorer.entry", "writer.draft"] {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "mag.actor_spawned", "run_id": "mag-cur-1", "id": id, "factory": "llm" }),
-        );
-    }
-
-    // Rows while folded (the default): header / explorer / writer — the
-    // hidden members are not rows, so one Down from the explorer group
-    // lands on the writer group, never on explorer.entry.
-    engine.handle_key(key("tab")).expect("tab");
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("down")).expect("down");
-    let out = render_str(&mut engine);
-    let cursor = cursor_styled_text(&out);
-    assert!(
-        cursor.contains("writer") && !cursor.contains("writer.draft"),
-        "cursor must skip the folded explorer members and land on the writer group: {cursor:?}"
-    );
-
-    // Ten more Downs clamp on the last row — still the writer group,
-    // because folded members are not rows. The full styled frame carries
-    // the (unchanged) highlight the incremental diff would skip.
-    for _ in 0..10 {
-        engine.handle_key(key("down")).expect("down");
-    }
-    let _ = render_str(&mut engine);
-    let cursor = cursor_styled_text(&engine.snapshot_ansi());
-    assert!(
-        cursor.contains("writer") && !cursor.contains("writer.draft"),
-        "cursor must clamp on the last visible row: {cursor:?}"
-    );
-
-    // Enter unfolds writer; Down reaches the now-visible leaf; Space
-    // opens ITS agent view (Enter on a leaf is now a no-op).
-    engine.handle_key(key("enter")).expect("enter");
-    engine.handle_key(key("down")).expect("down");
-    let out = render_str(&mut engine);
-    let cursor = cursor_styled_text(&out);
-    assert!(
-        cursor.contains("writer.draft"),
-        "after unfolding, Down must land on the member leaf: {cursor:?}"
-    );
-    engine.handle_key(key("enter")).expect("enter");
-    let out = render_str(&mut engine);
-    assert!(
-        !out.contains("[read-only]"),
-        "Enter on a leaf must be a no-op — view-opening moved to Space: {out:?}"
-    );
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("agent · writer.draft [read-only]"),
-        "Space on the leaf must open ITS agent view: {out:?}"
-    );
-    engine.handle_key(key("q")).expect("q");
-
-    // Ten Ups clamp back on row 1 (run header) — Enter there is a no-op
-    // (structure key on a non-group row); Space there observes the whole
-    // run, but this test only pins the Enter no-op.
-    for _ in 0..10 {
-        engine.handle_key(key("up")).expect("up");
-    }
-    engine.handle_key(key("enter")).expect("enter");
-    let out = render_str(&mut engine);
-    assert!(
-        !out.contains("[read-only]"),
-        "Enter on a run header row must stay a no-op: {out:?}"
-    );
-    let cursor = cursor_styled_text(&out);
-    assert!(
-        cursor.contains("MAG demo"),
-        "cursor must clamp on the first row: {cursor:?}"
-    );
-}
-
-#[test]
-fn scoped_streams_are_captured_per_actor_and_stay_out_of_the_transcript() {
-    let mut engine = engine_with_scoped_worker();
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.reasoning_delta",
-            "chat_id": "r2/worker.llm@r1",
-            "text": "PONDERING_DEEPLY",
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.delta",
-            "chat_id": "r2/worker.llm@r1",
-            "text": "HELLO_FROM_WORKER",
-        }),
-    );
-
-    // Foreign-chat guard unchanged: the lead transcript must not render
-    // the worker's stream (the collapsed sidebar can't leak it either).
-    let out = render_str(&mut engine);
-    assert!(
-        !out.contains("HELLO_FROM_WORKER") && !out.contains("PONDERING_DEEPLY"),
-        "foreign deltas must stay out of the lead transcript: {out:?}"
-    );
-
-    // Tab → unfold the worker group → cursor on the leaf → Space opens
-    // the agent view showing the captured buffer.
-    focus_worker_leaf(&mut engine);
-    engine.take_emit_queue(); // drain — the view must add nothing
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("agent · worker.llm [read-only]"),
-        "agent view popup with read-only marker expected: {out:?}"
-    );
-    assert!(
-        out.contains("HELLO_FROM_WORKER"),
-        "captured assistant delta missing from the timeline: {out:?}"
-    );
-    assert!(
-        out.contains("PONDERING_DEEPLY"),
-        "captured reasoning delta missing from the timeline: {out:?}"
-    );
-    assert!(
-        out.contains("— r1 —"),
-        "round marker expected in the timeline: {out:?}"
-    );
-    assert!(
-        out.contains("run auth-fix") && out.contains("last event"),
-        "header should carry run identity + last-activity diagnostic: {out:?}"
-    );
-    assert!(
-        engine.take_emit_queue().is_empty(),
-        "opening the agent view must not emit any envelope"
-    );
-}
-
-#[test]
-fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
+fn node_inspector_legacy_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt() {
     let mut engine = engine_with_scoped_worker();
     dispatch_event(
         &mut engine,
@@ -7628,86 +7482,6 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
     assert!(
         out.contains("zqz"),
         "prompt must receive keys again after leaving the sidebar: {out:?}"
-    );
-}
-
-#[test]
-fn stale_warning_flags_busy_and_silent_only() {
-    let mut engine = engine_with_scoped_worker();
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.delta",
-            "chat_id": "r2/worker.llm@r1",
-            "text": "EARLY_OUTPUT",
-        }),
-    );
-
-    // Unfold the group; fresh activity: no stale alarm on the working row.
-    let out = focus_worker_leaf(&mut engine);
-    assert!(
-        out.contains("worker.llm") && !out.contains('⚠'),
-        "fresh activity must not flag stale: {out:?}"
-    );
-
-    // Past the 30s silence threshold the WORKING row grows the alarm.
-    engine.advance_time(Duration::from_millis(31_000));
-    engine.handle_key(key("up")).expect("up");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("⚠ stale 3"),
-        "a busy-and-silent actor must carry the stale alarm on its row: {out:?}"
-    );
-
-    // And the agent-view header carries the same diagnostic.
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("⚠ last event 3") && out.contains("(delta)"),
-        "view header must warn about the stale last activity: {out:?}"
-    );
-    engine.handle_key(key("q")).expect("q");
-
-    // The activation settles: an IDLE actor with the same silent stream
-    // must NOT warn — idle-between-rounds is silence by design.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.actor_idle", "run_id": "sub-1", "id": "worker.llm" }),
-    );
-    let _ = render_str(&mut engine);
-    let snap = engine.snapshot();
-    assert!(
-        !snap.contains('⚠'),
-        "an idle (between-activations) actor must never warn:\n{snap}"
-    );
-}
-
-#[test]
-fn unscoped_and_unknown_scope_chat_ids_are_ignored_by_capture() {
-    let mut engine = engine_with_scoped_worker();
-
-    // Unscoped id (no "/") and an unknown scope: neither may crash nor
-    // land in the worker's buffer.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "plainchat-1", "text": "UNSCOPED" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r9/ghost.llm@r1", "text": "GHOST" }),
-    );
-
-    focus_worker_leaf(&mut engine);
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("no captured output yet"),
-        "worker buffer must be empty — nothing attributable arrived: {out:?}"
-    );
-    assert!(
-        !out.contains("UNSCOPED") && !out.contains("GHOST"),
-        "unattributable streams must not leak into the view: {out:?}"
     );
 }
 
@@ -7921,200 +7695,11 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
 /// distinct members that produced them, in chronological (capture) order.
 /// Also exercises tool-event capture from `tool-gate.tool.invoke`'s `from`
 /// field and the correlated `tool.result`.
-#[test]
-fn space_on_group_merges_llm_and_tool_events_attributed_by_member() {
-    let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
-    );
-    for id in ["worker.llm", "worker.run-tool"] {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": id, "factory": "llm" }),
-        );
-    }
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.actor_ready", "run_id": "sub-1", "id": "worker.llm" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.actor_busy", "run_id": "sub-1", "id": "worker.llm" }),
-    );
-
-    // Chronology: llm assistant delta (worker.llm), then the tool
-    // invoke+result the sibling run-tool actor emits.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r2/worker.llm@r1", "text": "LLM_SAYS_HI" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "tool-gate.tool.invoke",
-            "id": "r2/cap-1",
-            "from": "worker.run-tool",
-            "name": "bash",
-            "args": { "command": "cargotest" },
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "tool.result", "id": "r2/cap-1", "output": "TOOL_OK_OUTPUT" }),
-    );
-
-    // Tab focuses the sidebar; one Down lands on the (folded) worker group
-    // row; Space opens the composite — no unfold needed.
-    engine.handle_key(key("tab")).expect("tab");
-    let _ = render_str(&mut engine);
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-
-    assert!(
-        out.contains("agents · worker [read-only]"),
-        "composite header with group name + read-only marker expected: {out:?}"
-    );
-    assert!(
-        out.contains("LLM_SAYS_HI"),
-        "the member llm message must appear in the merged timeline: {out:?}"
-    );
-    assert!(
-        out.contains("bash") && out.contains("cargotest"),
-        "the tool invoke (name + args) must appear: {out:?}"
-    );
-    assert!(
-        out.contains("TOOL_OK_OUTPUT"),
-        "the correlated tool result output must appear: {out:?}"
-    );
-    // Attribution: both distinct members labelled in the merged view.
-    assert!(
-        out.contains("worker.llm") && out.contains("worker.run-tool"),
-        "both members must be attributed in the merged timeline: {out:?}"
-    );
-    // Chronological order: the llm line precedes the later tool line.
-    let llm_at = out.find("LLM_SAYS_HI").expect("llm line");
-    let tool_at = out.find("cargotest").expect("tool line");
-    assert!(
-        llm_at < tool_at,
-        "the earlier llm message must render before the later tool call: {out:?}"
-    );
-}
-
 /// Tool events attribute to the EMITTING actor named by `from`, not to a
 /// sibling: opening the run-tool leaf shows the tool call; the llm leaf,
 /// whose own stream carried no tool, does not.
-#[test]
-fn tool_events_attribute_to_the_emitting_actor_from_the_from_field() {
-    let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
-    );
-    for id in ["worker.llm", "worker.run-tool"] {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": id, "factory": "llm" }),
-        );
-    }
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "tool-gate.tool.invoke",
-            "id": "r2/cap-9",
-            "from": "worker.run-tool",
-            "name": "bash",
-            "args": { "command": "RUNTOOL_CMD" },
-        }),
-    );
-
-    // Focus, unfold the worker group, land on the FIRST member (run-tool
-    // sorts before... actually llm; navigate to run-tool explicitly).
-    engine.handle_key(key("tab")).expect("tab");
-    let _ = render_str(&mut engine);
-    engine.handle_key(key("down")).expect("down"); // → worker group
-    engine.handle_key(key("enter")).expect("enter"); // unfold
-    let _ = render_str(&mut engine);
-
-    // Members render seq-sorted: worker.llm (spawned first) then
-    // worker.run-tool. Down twice from the group reaches run-tool.
-    engine.handle_key(key("down")).expect("down"); // → worker.llm
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("agent · worker.llm [read-only]"),
-        "worker.llm leaf view expected: {out:?}"
-    );
-    assert!(
-        !out.contains("RUNTOOL_CMD"),
-        "the llm leaf must NOT carry the sibling's tool call: {out:?}"
-    );
-    engine.handle_key(key("q")).expect("q");
-    engine.handle_key(key("down")).expect("down"); // → worker.run-tool
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("agent · worker.run-tool [read-only]"),
-        "worker.run-tool leaf view expected: {out:?}"
-    );
-    assert!(
-        out.contains("RUNTOOL_CMD"),
-        "the tool call must land on the actor named by `from`: {out:?}"
-    );
-}
-
 /// Space on a run-header row observes the WHOLE run merged (documented
 /// run-header decision): every actor under the run, one timeline.
-#[test]
-fn space_on_run_header_opens_whole_run_view() {
-    let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": "worker.llm", "factory": "llm" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r2/worker.llm@r1", "text": "WHOLE_RUN_LINE" }),
-    );
-
-    engine.handle_key(key("tab")).expect("tab");
-    let _ = render_str(&mut engine);
-    // Cursor starts on the run-header row.
-    engine.handle_key(key("space")).expect("space");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("run · auth-fix [read-only]"),
-        "run-header Space must open the whole-run view: {out:?}"
-    );
-    assert!(
-        out.contains("WHOLE_RUN_LINE"),
-        "the whole-run view must merge member output: {out:?}"
-    );
-}
-
 /// Empty sidebar refuses focus, loudly: Tab with no rows keeps prompt
 /// focus AND raises a warning toast that explains the refusal.
 #[test]
@@ -8465,147 +8050,6 @@ fn slash_new_collapses_stale_scroll_region() {
 }
 
 #[test]
-fn scoped_instruction_notices_project_only_to_the_intended_surface() {
-    let mut engine = Engine::new(140, 40).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.session_start", "session_id": "session-1" }),
-    );
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "mag.run_started", "run_id": "lead-run", "run_name": "lead",
-            "session_id": "session-1", "scope": "r1", "principal": "lead"
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.instruction.notice",
-            "notice_id": "lead:session-1:git_repo:/workspace",
-            "path": "/workspace",
-            "dir": "/workspace",
-            "text": "Local instruction files available for /workspace\n- AGENTS.md",
-            "invocation": {
-                "session_id": "session-1", "run_id": "lead-run", "run_scope": "r1",
-                "actor_id": "lead.run-tool", "capability_id": "r1/cap-1", "principal": "lead"
-            }
-        }),
-    );
-    // Stable-id duplicate projects exactly once.
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.instruction.notice",
-            "notice_id": "lead:session-1:git_repo:/workspace",
-            "path": "/workspace",
-            "dir": "/workspace",
-            "text": "Local instruction files available for /workspace\n- AGENTS.md",
-            "invocation": {
-                "session_id": "session-1", "run_id": "lead-run", "run_scope": "r1",
-                "actor_id": "lead.run-tool", "capability_id": "r1/cap-2", "principal": "lead"
-            }
-        }),
-    );
-
-    let state = engine.state_table().expect("state");
-    let entries: mlua::Table = state.get("entries").expect("entries");
-    assert_eq!(entries.raw_len(), 1, "lead notice must project once");
-    let lead_entry: mlua::Table = entries.get(1).expect("lead instruction entry");
-    assert_eq!(lead_entry.get::<String>("kind").unwrap(), "agents_md");
-    drop(state);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "mag.run_started", "run_id": "sub-run", "run_name": "scout",
-            "session_id": "session-1", "scope": "r2", "principal": "subagent"
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.instruction.notice",
-            "notice_id": "subagent:session-1:sub-run:scout.run-tool:git_repo:/secret",
-            "path": "/secret",
-            "dir": "/secret",
-            "text": "Local instruction files available for /secret\n- CLAUDE.md",
-            "invocation": {
-                "session_id": "session-1", "run_id": "sub-run", "run_scope": "r2",
-                "actor_id": "scout.run-tool", "capability_id": "r2/cap-1", "principal": "subagent"
-            }
-        }),
-    );
-    let state = engine.state_table().expect("state");
-    let entries: mlua::Table = state.get("entries").expect("entries");
-    assert_eq!(
-        entries.raw_len(),
-        1,
-        "subagent notice must not enter main transcript"
-    );
-    let streams: mlua::Table = state.get("agent_streams").expect("agent streams");
-    let run: mlua::Table = streams.get("sub-run").expect("sub run stream");
-    let actor: mlua::Table = run.get("scout.run-tool").expect("matching actor stream");
-    let buffered: mlua::Table = actor.get("entries").expect("buffered entries");
-    let notice: mlua::Table = buffered.get(1).expect("instruction notice");
-    assert_eq!(notice.get::<String>("kind").unwrap(), "instruction");
-    assert_eq!(notice.get::<String>("path").unwrap(), "/secret");
-    drop(state);
-
-    // A self-consistent notice cannot promote the authoritative subagent run
-    // to lead, nor can changing any run-binding coordinate make it valid.
-    for (index, invocation) in [
-        json!({
-            "session_id": "session-1", "run_id": "sub-run", "run_scope": "r2",
-            "actor_id": "scout.run-tool", "capability_id": "r2/cap-9", "principal": "lead"
-        }),
-        json!({
-            "session_id": "other-session", "run_id": "sub-run", "run_scope": "r2",
-            "actor_id": "scout.run-tool", "capability_id": "r2/cap-9", "principal": "subagent"
-        }),
-        json!({
-            "session_id": "session-1", "run_id": "other-run", "run_scope": "r2",
-            "actor_id": "scout.run-tool", "capability_id": "r2/cap-9", "principal": "subagent"
-        }),
-        json!({
-            "session_id": "session-1", "run_id": "sub-run", "run_scope": "r9",
-            "actor_id": "scout.run-tool", "capability_id": "r9/cap-9", "principal": "subagent"
-        }),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        dispatch_event(
-            &mut engine,
-            json!({
-                "kind": "chat.instruction.notice", "notice_id": format!("forged-{index}"),
-                "path": format!("/forged-{index}"), "text": format!("private forged {index}"),
-                "invocation": invocation
-            }),
-        );
-    }
-    let state = engine.state_table().expect("state");
-    let entries: mlua::Table = state.get("entries").expect("entries");
-    assert_eq!(
-        entries.raw_len(),
-        1,
-        "forged notices cannot enter the transcript"
-    );
-    let streams: mlua::Table = state.get("agent_streams").expect("agent streams");
-    let run: mlua::Table = streams.get("sub-run").expect("sub run stream");
-    let actor: mlua::Table = run.get("scout.run-tool").expect("matching actor stream");
-    let buffered: mlua::Table = actor.get("entries").expect("buffered entries");
-    assert_eq!(
-        buffered.raw_len(),
-        1,
-        "forged notices cannot enter observability"
-    );
-}
-
-#[test]
 fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -8697,65 +8141,6 @@ fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
     for private in private_paths {
         assert!(!snapshot.contains(private), "{snapshot}");
     }
-}
-
-#[test]
-fn replayed_lead_instruction_notice_rebuilds_once_without_promoting_subagent_notice() {
-    let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.session_start", "session_id": "s" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.replay.start", "session_id": "s" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "mag.run_started", "run_id": "lead-old", "run_name": "lead",
-            "session_id": "s", "scope": "r1", "principal": "lead"
-        }),
-    );
-    let lead = json!({
-        "kind": "chat.instruction.notice", "notice_id": "lead:s:git_repo:/workspace",
-        "path": "/workspace", "text": "Local instruction files available for /workspace",
-        "invocation": {
-            "session_id": "s", "run_id": "lead-old", "run_scope": "r1",
-            "actor_id": "lead.run-tool", "capability_id": "r1/cap-1", "principal": "lead"
-        }
-    });
-    dispatch_event(&mut engine, lead.clone());
-    dispatch_event(&mut engine, lead);
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.instruction.notice", "notice_id": "subagent:s:old:worker:/private",
-            "path": "/private", "text": "Local instruction files available for /private",
-            "invocation": {
-                "session_id": "s", "run_id": "old", "run_scope": "r2",
-                "actor_id": "worker.run-tool", "capability_id": "r2/cap-1", "principal": "subagent"
-            }
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.replay.end", "session_id": "s" }),
-    );
-
-    let state = engine.state_table().expect("state");
-    let entries: mlua::Table = state.get("entries").expect("entries");
-    assert_eq!(entries.raw_len(), 1, "replayed lead notice rebuilds once");
-    let entry: mlua::Table = entries.get(1).expect("lead notice entry");
-    assert_eq!(entry.get::<String>("path").unwrap(), "/workspace");
-    let streams: mlua::Table = state.get("agent_streams").expect("agent streams");
-    assert_eq!(
-        streams.raw_len(),
-        0,
-        "replayed subagent panes are not rebuilt"
-    );
 }
 
 #[test]
@@ -9194,4 +8579,220 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     );
     dispatch_event(&mut cold, json!({ "kind": "sessions.replay.end" }));
     assert_eq!(label(&cold, "late").as_deref(), Some("Late attach catalog"));
+}
+
+// Generic factory-declared node inspector regressions.
+fn advertise_preview(
+    engine: &mut Engine,
+    implementation: &str,
+    preview: JsonValue,
+    bindings: JsonValue,
+) {
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "mag.hello",
+            "foreign_contracts": [{
+                "identity": format!("nefor.factory.{implementation}"),
+                "implementation": implementation,
+                "preview": preview,
+                "preview_bindings": bindings,
+            }]
+        }),
+    );
+}
+
+fn open_single_node(engine: &mut Engine, factory: &str, actor: &str) {
+    let _ = render_str(engine);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "preview-run", "run_name": "preview-demo", "scope": "rp"
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "preview-run", "id": actor, "factory": factory
+        }),
+    );
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(engine);
+    engine.handle_key(key("down")).expect("select group");
+    engine.handle_key(key("enter")).expect("unfold group");
+    let _ = render_str(engine);
+    engine.handle_key(key("down")).expect("select actor");
+    engine.handle_key(key("space")).expect("open inspector");
+}
+
+#[test]
+fn declared_preview_interprets_without_factory_specific_renderer_and_updates_live() {
+    let mut engine = Engine::new(120, 32).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "third-party",
+        json!({
+            "kind": "column", "gap": 1, "children": [
+                { "kind": "text", "value": { "binding": "lifecycle", "name": "status" }, "style": "status" },
+                { "kind": "stream", "source": { "binding": "stream", "name": "events", "schema": "table" },
+                  "item": { "kind": "cases", "values": {
+                      "line": { "kind": "text", "value": { "binding": "item", "name": "text" }, "wrap": "word" }
+                  } },
+                  "empty": { "kind": "text", "value": "waiting", "style": "dim" }
+                }
+            ]
+        }),
+        json!({ "events": { "kind": "stream", "schema": "table" } }),
+    );
+    open_single_node(&mut engine, "third-party", "custom.node");
+    let initial = render_snapshot(&mut engine);
+    assert!(
+        initial.contains("waiting"),
+        "empty declaration content must render: {initial}"
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.node_preview", "run_id": "preview-run", "id": "custom.node",
+            "operation": "append", "binding": "events", "observation_seq": 8,
+            "value": { "kind": "line", "text": "LIVE THIRD PARTY CONTENT" }
+        }),
+    );
+    let frame = render_snapshot(&mut engine);
+    assert!(
+        frame.contains("LIVE THIRD PARTY CONTENT"),
+        "open inspector must repaint live:\n{frame}"
+    );
+    assert!(
+        frame.contains("node · custom.node [read-only]"),
+        "shared shell identity missing:\n{frame}"
+    );
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "inspector observation must not emit"
+    );
+}
+
+#[test]
+fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_widths() {
+    let declaration = json!({
+        "kind": "column", "gap": 1, "children": [
+            { "kind": "text", "value": { "binding": "param", "name": "command" }, "style": "command", "wrap": "word" },
+            { "kind": "stream", "source": { "binding": "stream", "name": "terminal_events", "schema": "table" },
+              "item": { "kind": "cases", "values": {
+                  "stdout": { "kind": "text", "value": { "binding": "item", "name": "text" }, "style": "stdout", "wrap": "word" },
+                  "stderr": { "kind": "text", "value": { "binding": "item", "name": "text" }, "style": "stderr", "wrap": "word" }
+              } }
+            }
+        ]
+    });
+    for width in [58, 150] {
+        let mut engine = Engine::new(width, 28).expect("engine");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        advertise_preview(
+            &mut engine,
+            "terminalish",
+            declaration.clone(),
+            json!({ "terminal_events": { "kind": "stream", "schema": "table" } }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.run_started", "run_id": "preview-run", "run_name": "preview-demo", "scope": "rp"
+            }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.actor_spawned", "run_id": "preview-run", "id": "shell.node", "factory": "terminalish"
+            }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.modification_applied", "run_id": "preview-run", "modification": {
+                    "actors": [{ "id": "shell.node", "params": { "command": "printf 'EXACT COMMAND WITH SPACES'" } }]
+                }
+            }),
+        );
+        for (seq, stream, text) in [
+            (1, "stdout", "ALPHA-LINE\n"),
+            (2, "stderr", "ERROR-LINE\n"),
+            (
+                3,
+                "stdout",
+                "OMEGA-CONTENT-THAT-MUST-NOT-BE-CLIPPED-0123456789",
+            ),
+        ] {
+            dispatch_event(
+                &mut engine,
+                json!({
+                    "kind": "mag.node_preview", "run_id": "preview-run", "id": "shell.node",
+                    "operation": "append", "binding": "terminal_events", "observation_seq": seq,
+                    "value": { "kind": stream, "text": text }
+                }),
+            );
+        }
+        engine.handle_key(key("tab")).unwrap();
+        let _ = render_str(&mut engine);
+        engine.handle_key(key("down")).unwrap();
+        engine.handle_key(key("enter")).unwrap();
+        let _ = render_str(&mut engine);
+        engine.handle_key(key("down")).unwrap();
+        engine.handle_key(key("space")).unwrap();
+        let _ = render_str(&mut engine);
+        let frame = engine
+            .snapshot()
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect::<String>();
+        for expected in [
+            "printf'EXACTCOMMANDWITHSPACES'",
+            "ALPHA-LINE",
+            "ERROR-LINE",
+            "OMEGA-CONTENT-THAT-MUST-NOT-BE-CLIPPED-0123456789",
+        ] {
+            assert!(
+                frame.contains(expected),
+                "width {width} lost {expected}:\n{frame}"
+            );
+        }
+    }
+}
+
+#[test]
+fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
+    let mut engine = Engine::new(100, 26).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "readonly",
+        json!({ "kind": "text", "value": "immutable" }),
+        json!({}),
+    );
+    open_single_node(&mut engine, "readonly", "readonly.node");
+    let _ = render_str(&mut engine);
+    let before = engine.take_emit_queue();
+    engine.handle_key(key("x")).expect("ordinary key inert");
+    engine.handle_key(key("enter")).expect("enter inert");
+    engine.handle_key(key("pageup")).expect("scroll");
+    engine.handle_key(key("pagedown")).expect("scroll");
+    engine.handle_key(key("home")).expect("scroll top");
+    engine.handle_key(key("end")).expect("follow tail");
+    assert_eq!(
+        engine.take_emit_queue(),
+        before,
+        "inspector keys must not reach graph or prompt"
+    );
+    engine.handle_key(key("escape")).expect("close");
+    let frame = render_snapshot(&mut engine);
+    assert!(
+        !frame.contains("node · readonly.node"),
+        "escape must close inspector"
+    );
+    assert!(
+        frame.contains("Workflows · focused"),
+        "sidebar focus must be restored:\n{frame}"
+    );
 }

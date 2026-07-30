@@ -67,6 +67,7 @@ local firing = require("firing")
 local correlation = require("correlation")
 local kinds = require("kinds")
 local typed_value = require("typed-value")
+local preview = require("preview")
 
 local M = {}
 M.__index = M
@@ -114,6 +115,7 @@ local EVT_RUN_FAILED = kinds.run_failed
 -- ticking needs exactly these transitions.
 local EVT_ACTOR_BUSY = "mag.actor_busy"
 local EVT_ACTOR_IDLE = "mag.actor_idle"
+local EVT_NODE_PREVIEW = "mag.node_preview"
 -- The approval boundary's control-plane events (kinds.lua): the intercepted
 -- ApprovalRequest / ApprovalCancel emits surface under these kinds, run_id-
 -- stamped by the injected events sink like every other control-plane event —
@@ -195,6 +197,45 @@ function M:emitter(id)
   end
 end
 
+function M:preview_emitter(id)
+  return function(operation, binding, value)
+    local actor = self.inventory.get(id)
+    local declaration = actor and self.registry:declaration(actor.factory)
+    local validated = declaration and { bindings = declaration.preview_bindings }
+    local ok, err = preview.validate_update(validated, operation, binding, value)
+    if not ok then
+      self.log.warn(string.format(
+        "actor '%s' preview update rejected for binding '%s': %s",
+        tostring(id), tostring(binding), tostring(err)))
+      return false
+    end
+    self.events({ kind = EVT_NODE_PREVIEW, id = id, operation = operation,
+      binding = binding, value = preview.deep_copy(value) })
+    return true
+  end
+end
+
+function M:observe_endpoint(id, endpoint, binding, value)
+  self.events({
+    kind = EVT_NODE_PREVIEW,
+    id = id,
+    operation = "set",
+    binding_kind = endpoint,
+    binding = binding,
+    value = preview.deep_copy(value),
+  })
+  if binding ~= "last" then
+    self.events({
+      kind = EVT_NODE_PREVIEW,
+      id = id,
+      operation = "set",
+      binding_kind = endpoint,
+      binding = "last",
+      value = preview.deep_copy(value),
+    })
+  end
+end
+
 -- Dispatch one emitted, id-signed message. Reserved kinds are intercepted;
 -- any other kind is a declared output routed by the sender's routes.
 function M:on_emit(id, message)
@@ -264,6 +305,7 @@ function M:on_emit(id, message)
     observed.constructor_id = arrival.constructor_id
     observed.arrival_id = arrival.arrival_id
     self.persist_output(id, observed)
+    self:observe_endpoint(id, "output", kind, observed)
     if self.observe_output(id, kind, observed) == false then return end
     local boundary = self.result_boundary
     if boundary and boundary.actor == id and boundary.wire == kind then
@@ -578,11 +620,17 @@ function M:fire(dest_id, arrival, legacy_tag, legacy_message)
     })
   end
   local ports = self:machines_for(dest_id)
-  for _, machine in pairs(ports) do
+  for port, machine in pairs(ports) do
     if machine:accepts(arrival.protocol_wire) then
       local offered = machine.semantic and arrival or arrival.payload
       for _, activation in ipairs(machine:offer(
         arrival.from, arrival.protocol_wire, offered)) do
+        local values = {}
+        for index, message in ipairs(activation.messages or {}) do
+          values[index] = message.message
+        end
+        activation.observed_port = port
+        activation.observed_value = #values == 1 and values[1] or values
         self:activate(dest_id, activation)
       end
       return
@@ -731,6 +779,9 @@ function M:activate(id, activation)
     return
   end
   self:mark_busy(id)
+  if activation.observed_port then
+    self:observe_endpoint(id, "input", activation.observed_port, activation.observed_value)
+  end
   local completion = instance.deliver(activation)
   self:apply_completion(id, completion)
 end
@@ -864,6 +915,15 @@ end
 -- (open in this router) — even when the reply then drops on a dead requester
 -- — so a multi-run host can dispatch a response across run contexts and stop
 -- at the owner. An unknown id is not ours: returns false, ignored.
+function M:bus_observation(response)
+  response = response or {}
+  local entry = self.correlation:peek(response.id)
+  if not entry then return false end
+  local observe = self:preview_emitter(entry.requester)
+  observe(response.operation, response.binding, response.value)
+  return true
+end
+
 function M:bus_response(response)
   response = response or {}
   local entry = self.correlation:close(response.id)

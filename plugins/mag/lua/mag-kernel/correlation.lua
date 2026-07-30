@@ -34,6 +34,10 @@ function M:open(requester, ref)
   return id
 end
 
+function M:peek(request_id)
+  return self.pending[request_id]
+end
+
 -- Close a request by wire id; returns { requester, ref } or nil (unknown id —
 -- not ours, a duplicate reply, or already closed).
 function M:close(request_id)

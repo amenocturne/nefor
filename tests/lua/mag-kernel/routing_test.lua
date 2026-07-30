@@ -50,7 +50,7 @@ local function harness(factories)
   local bus = {}
   local events = {}
   local inv = inventory.new({ log = log })
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, decl in pairs(factories) do
     local _, err = reg:register({ declaration = decl, construct = function(id) return { id = id } end })
     assert_true(err == nil, "factory registers: " .. tostring(err))

@@ -69,7 +69,8 @@ function M.view(opts)
     child    = util.bordered_popup_shell(
       opts.scroll_key or "popup",
       body,
-      opts.border_style
+      opts.border_style,
+      opts.stick_to
     ),
   }
 end

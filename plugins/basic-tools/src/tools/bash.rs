@@ -14,9 +14,8 @@
 //!   when a hang would otherwise go unnoticed.
 //! - On timeout the child is killed and the call returns
 //!   [`ToolError::BashTimeout`].
-//! - Combined stdout+stderr is captured (interleaved-by-buffering, not
-//!   true PTY merge — sufficient for typical commands). Output above
-//!   [`MAX_OUTPUT_BYTES`] is truncated with a marker line at the end.
+//! - Stdout and stderr are retained completely in the final result and also
+//!   emitted incrementally as ordered observation chunks.
 //! - The exit code is appended to the output as a footer line. Non-zero
 //!   exit is NOT an error — many tools (grep, diff) signal "no match" via
 //!   exit code; the caller (LLM) reads the footer.
@@ -30,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::error::ToolError;
@@ -39,7 +38,11 @@ pub const NAME: &str = "bash";
 pub const DESCRIPTION: &str =
     "Run a shell command via /bin/sh -c. Returns combined stdout+stderr followed by an exit-code footer.";
 
-pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamChunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
 
 pub fn schema() -> Value {
     json!({
@@ -94,8 +97,16 @@ pub async fn run_cancellable(
     args: &Value,
     cancel: Option<oneshot::Receiver<()>>,
 ) -> Result<String, ToolError> {
+    run_cancellable_streaming(args, cancel, None).await
+}
+
+pub async fn run_cancellable_streaming(
+    args: &Value,
+    cancel: Option<oneshot::Receiver<()>>,
+    stream: Option<mpsc::UnboundedSender<StreamChunk>>,
+) -> Result<String, ToolError> {
     let parsed = parse_args(args)?;
-    run_command(parsed, cancel).await
+    run_command(parsed, cancel, stream).await
 }
 
 #[derive(Debug)]
@@ -169,6 +180,7 @@ fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
 async fn run_command(
     parsed: ParsedArgs,
     cancel: Option<oneshot::Receiver<()>>,
+    stream: Option<mpsc::UnboundedSender<StreamChunk>>,
 ) -> Result<String, ToolError> {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(&parsed.command);
@@ -216,11 +228,35 @@ async fn run_command(
                 let _ = pipe.shutdown().await;
             }
         };
-        let _ = tokio::join!(
-            feed,
-            stdout.read_to_end(&mut out_buf),
-            stderr.read_to_end(&mut err_buf)
-        );
+        let read_stdout = async {
+            let mut chunk = vec![0; 8192];
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) => {
+                        out_buf.extend_from_slice(&chunk[..size]);
+                        if let Some(tx) = &stream {
+                            let _ = tx.send(StreamChunk::Stdout(chunk[..size].to_vec()));
+                        }
+                    }
+                }
+            }
+        };
+        let read_stderr = async {
+            let mut chunk = vec![0; 8192];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) => {
+                        err_buf.extend_from_slice(&chunk[..size]);
+                        if let Some(tx) = &stream {
+                            let _ = tx.send(StreamChunk::Stderr(chunk[..size].to_vec()));
+                        }
+                    }
+                }
+            }
+        };
+        let _ = tokio::join!(feed, read_stdout, read_stderr);
         let status = child.wait().await;
         (out_buf, err_buf, status)
     };
@@ -290,6 +326,8 @@ fn status_code(status: &std::io::Result<std::process::ExitStatus>) -> String {
     }
 }
 
+/// Write complete retained output. Rendering and observation own their own
+/// performance policies; the capability result must not silently clip bytes.
 fn format_output(stdout: &[u8], stderr: &[u8], exit: String) -> String {
     let stdout_s = String::from_utf8_lossy(stdout);
     let stderr_s = String::from_utf8_lossy(stderr);
@@ -306,10 +344,6 @@ fn format_output(stdout: &[u8], stderr: &[u8], exit: String) -> String {
         if !out.ends_with('\n') {
             out.push('\n');
         }
-    }
-    if out.len() > MAX_OUTPUT_BYTES {
-        out.truncate(MAX_OUTPUT_BYTES);
-        out.push_str("\n[truncated]\n");
     }
     out.push_str(&format!("[exit {exit}]"));
     out
@@ -453,6 +487,39 @@ mod tests {
             .unwrap();
         assert!(out.contains("hi"));
         assert!(out.contains("[exit 0]"));
+    }
+
+    #[tokio::test]
+    async fn streams_stdout_and_stderr_without_changing_final_result() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let output = run_cancellable_streaming(
+            &json!({"command": "printf out; printf err >&2"}),
+            None,
+            Some(tx),
+        )
+        .await
+        .unwrap();
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Stdout(bytes) if bytes == b"out")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Stderr(bytes) if bytes == b"err")));
+        assert!(output.contains("out"));
+        assert!(output.contains("[stderr]\nerr"));
+        assert!(output.ends_with("[exit 0]"));
+    }
+
+    #[test]
+    fn does_not_clip_large_output() {
+        let bytes = vec![b'x'; 1024 * 1024 + 17];
+        let output = format_output(&bytes, &[], "0".into());
+        assert!(output.len() > 1024 * 1024);
+        assert!(!output.contains("[truncated]"));
     }
 
     #[test]

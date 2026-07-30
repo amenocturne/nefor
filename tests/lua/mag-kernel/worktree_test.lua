@@ -36,7 +36,7 @@ local function reply(ref, result, err)
 end
 
 do
-  local registry = Registry.new()
+  local registry = Registry.new({ require_preview = false })
   assert_true(registry:register({ declaration = create.declaration, construct = create.construct }),
     "create registers")
   assert_true(registry:register({ declaration = open.declaration, construct = open.construct }),

@@ -76,7 +76,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, mod in ipairs({ run_tool, tool_result }) do
     local decl, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     assert_true(decl ~= nil and err == nil,

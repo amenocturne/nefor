@@ -108,7 +108,7 @@ local function harness()
   local events = {}
   local bus = {}
   local persisted = {} -- { { id = <sender>, output = <message> }, ... }
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, f in ipairs({
     { declaration = human.declaration, construct = human.construct },
     { declaration = adapter.declaration, construct = adapter.construct },
@@ -372,7 +372,7 @@ end
 
 do
   local log = new_logger()
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, mod in ipairs({ llm, human, adapter, sink }) do
     local _, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     assert_true(err == nil, "shipped factory registers: " .. tostring(err))

@@ -230,6 +230,14 @@ impl CapabilityBridge {
         vec![gate_cancel(&self.gate, id)]
     }
 
+    /// Resolve a driven provider chat to its kernel correlation without consuming it.
+    /// Streaming telemetry uses this while the final reply still owns settlement.
+    pub fn request_id_for_chat(&self, chat_id: &str) -> Option<&str> {
+        self.pending
+            .get(chat_id)
+            .map(|pending| pending.request_id.as_str())
+    }
+
     /// Whether an inbound event kind is a provider reply the bridge may own.
     pub fn is_provider_reply(kind: &str) -> bool {
         kind.ends_with(RESULT_SUFFIX) || kind.ends_with(ERROR_SUFFIX)

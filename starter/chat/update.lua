@@ -7,7 +7,7 @@ local tui_lib = require("nefor-tui")
 local W       = tui_lib.widget
 
 local common        = require("libs.chat.common")
-local agent_streams = require("libs.chat.agent_streams")
+local preview_state = require("libs.chat.preview_state")
 local slash        = require("chat.slash")
 local sessions     = require("libs.chat.sessions")
 local at_path      = require("libs.chat.at_path")
@@ -135,7 +135,7 @@ local function prune_expired(state)
     -- Captured agent streams and sidebar fold state follow the run
     -- lifecycle: buffers, scope bindings, and fold entries for pruned
     -- runs go with them.
-    state = agent_streams.prune(state, pruned)
+    state = preview_state.prune(state, pruned)
     state = run_panel.prune_folds(state, pruned)
   end
   local toasts = state.toasts
@@ -206,7 +206,7 @@ local function handle_input_submit(msg, state)
       pending_assistant_projection = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
       runs = {}, sidebar_folds = {},
-      agent_streams = {}, scope_to_run = {},
+      node_previews = {}, preview_registry = {}, scope_to_run = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
       last_esc_ms = NIL_SENTINEL,
@@ -403,7 +403,7 @@ local function handle_input_submit(msg, state)
         pending_assistant_projection = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
         runs = {}, sidebar_folds = {},
-        agent_streams = {}, scope_to_run = {},
+        node_previews = {}, preview_registry = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
@@ -492,7 +492,7 @@ local function handle_input_submit(msg, state)
         entries = {}, in_flight = NIL_SENTINEL,
         pending_assistant_projection = NIL_SENTINEL,
         pending = false, runs = {}, sidebar_folds = {},
-        agent_streams = {}, scope_to_run = {},
+        node_previews = {}, preview_registry = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -767,7 +767,7 @@ local function handle_session_end(_msg, state)
     escape_token     = NIL_SENTINEL,
     escape_count     = NIL_SENTINEL,
     runs             = {},
-    agent_streams    = {},
+    node_previews    = {}, preview_registry = {},
     scope_to_run     = {},
     sidebar_folds    = {},
     lead_chat_id     = NIL_SENTINEL,
@@ -781,7 +781,7 @@ local function handle_session_start(msg, state)
   return shallow_merge(state, {
     session_id = msg.session_id,
     runs = {},
-    agent_streams = {}, scope_to_run = {},
+    node_previews = {}, preview_registry = {}, scope_to_run = {},
     lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
     instruction_notice_ids = {},
   }), {}
@@ -821,11 +821,9 @@ local function handle_instruction_notice(msg, state)
     return state, {}
   end
   if invocation.principal == "subagent" then
-    -- Historical agent panes are intentionally not rebuilt. Replayed
-    -- subagent notices are ignored and can never enter the transcript.
-    if state.replay_mode then return state, {} end
-    return agent_streams.record_instruction_notice(
-      state, invocation, notice_id, msg.text, msg.path, tui.now_ms()), {}
+    -- Instruction notices remain visible in the lead transcript only; actor
+    -- previews are populated by their declared telemetry and provider traffic.
+    return state, {}
   end
   if invocation.principal ~= "lead" then
     return state, {}
@@ -847,10 +845,6 @@ local function handle_message_append(msg, state)
   local text = msg.text or ""
   if #text == 0 then return state, {} end
   local role = msg.role or "system"
-  -- Agent-stream tap: scoped chat ids attribute the append to a MAG
-  -- actor's capture buffer. Sits before every transcript decision so
-  -- the transcript's own routing stays byte-identical.
-  state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
   -- The pending structured answer owns the provider round's chronological
   -- position. Same-turn transcript appends can arrive before its durable
   -- assistant projection; only an explicit terminal failure closes that ownership.
@@ -953,12 +947,7 @@ local function handle_lead_chat_bound(msg, state)
   }), {}
 end
 
--- The agent-stream taps below run BEFORE the foreign-chat guard: the
--- guard keeps foreign chats out of the LEAD transcript (unchanged),
--- while the capture buffers want exactly those foreign events.
 local function handle_stream_delta(msg, state)
-  state = agent_streams.record(state, msg.chat_id, "delta",
-    msg.text or msg.delta, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local t = msg.text or msg.delta or ""
   if #t == 0 then return state, {} end
@@ -966,15 +955,12 @@ local function handle_stream_delta(msg, state)
 end
 
 local function handle_stream_end(msg, state)
-  state = agent_streams.record(state, msg.chat_id, "stream_end", nil, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local next_state = transcript.reduce_assistant_event(state, msg)
   return next_state, {}
 end
 
 local function handle_reasoning_delta(msg, state)
-  state = agent_streams.record(state, msg.chat_id, "reasoning_delta",
-    msg.text or msg.delta, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local t = msg.text or msg.delta or ""
   if #t == 0 then return state, {} end
@@ -982,7 +968,6 @@ local function handle_reasoning_delta(msg, state)
 end
 
 local function handle_reasoning_end(msg, state)
-  state = agent_streams.record(state, msg.chat_id, "reasoning_end", nil, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   return transcript.finalize_reasoning(state, msg.duration_ms), {}
 end
@@ -1405,6 +1390,34 @@ end
 -- every event carries its `run_id` — panel state keys straight off it,
 -- so overlapping runs render independently.
 
+local function handle_mag_contracts(msg, state)
+  return preview_state.advertise(state, msg.foreign_contracts), {}
+end
+
+local function handle_mag_node_preview(msg, state)
+  if state.replay_mode then return state, {} end
+  local next = preview_state.observe(state, msg, tui.now_ms())
+  if next ~= state and state.popup and state.popup.variant == "node_inspector"
+      and state.popup.run_id == msg.run_id
+      and (state.popup.actor_id == nil or state.popup.actor_id == msg.id) then
+    local at_end = false
+    local ok, position = pcall(tui.scroll_position, "popup_node_inspector")
+    if ok and type(position) == "table" then
+      at_end = (position.offset or 0) >= math.max(0,
+        (position.content_height or 0) - (position.viewport_height or 0))
+    end
+    if not at_end then
+      next = shallow_merge(next, { popup = shallow_merge(state.popup, { unseen = true }) })
+    end
+  end
+  return next, {}
+end
+
+local function handle_mag_modification_applied(msg, state)
+  if state.replay_mode then return state, {} end
+  return preview_state.apply_modification(state, msg, tui.now_ms()), {}
+end
+
 local function handle_mag_run_started(msg, state)
   local run_id = msg.run_id
   if type(run_id) ~= "string" or run_id == "" then return state, {} end
@@ -1412,7 +1425,7 @@ local function handle_mag_run_started(msg, state)
   -- Scope bindings are safe replay state: lead instruction notices need the
   -- same run/scope validation while rebuilding the transcript. Historical run
   -- panels and agent streams remain intentionally unreconstructed.
-  state = agent_streams.set_scope(state, msg.scope, run_id)
+  state = preview_state.set_scope(state, msg.scope, run_id)
   if state.replay_mode then return state, {} end
   return run_panel.mag_run_started(state, run_id, msg.run_name, msg.principal, tui.now_ms()), {}
 end
@@ -1429,7 +1442,8 @@ local function handle_mag_actor_spawned(msg, state)
   local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return run_panel.actor_spawned(state, run_id, id, msg.factory, tui.now_ms()), {}
+  local next = run_panel.actor_spawned(state, run_id, id, msg.factory, tui.now_ms())
+  return preview_state.spawn(next, run_id, id, msg.factory, tui.now_ms()), {}
 end
 
 local function handle_mag_actor_ready(msg, state)
@@ -1437,7 +1451,8 @@ local function handle_mag_actor_ready(msg, state)
   local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return run_panel.actor_ready(state, run_id, id, tui.now_ms()), {}
+  local now = tui.now_ms()
+  return preview_state.lifecycle(run_panel.actor_ready(state, run_id, id, now), run_id, id, "idle", now), {}
 end
 
 -- The kernel's per-actor activity window (mag.actor_busy / mag.actor_idle):
@@ -1448,7 +1463,8 @@ local function handle_mag_actor_busy(msg, state)
   local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return run_panel.actor_busy(state, run_id, id, tui.now_ms()), {}
+  local now = tui.now_ms()
+  return preview_state.lifecycle(run_panel.actor_busy(state, run_id, id, now), run_id, id, "working", now), {}
 end
 
 local function handle_mag_actor_idle(msg, state)
@@ -1456,7 +1472,8 @@ local function handle_mag_actor_idle(msg, state)
   local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return run_panel.actor_idle(state, run_id, id, tui.now_ms()), {}
+  local now = tui.now_ms()
+  return preview_state.lifecycle(run_panel.actor_idle(state, run_id, id, now), run_id, id, "idle", now), {}
 end
 
 local function handle_mag_actor_killed(msg, state)
@@ -1464,7 +1481,8 @@ local function handle_mag_actor_killed(msg, state)
   local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return run_panel.actor_killed(state, run_id, id, tui.now_ms(), msg.reason), {}
+  local now = tui.now_ms()
+  return preview_state.lifecycle(run_panel.actor_killed(state, run_id, id, now, msg.reason), run_id, id, msg.reason == "run_failed" and "failed" or "killed", now), {}
 end
 
 local function handle_mag_modification_rejected(msg, state)
@@ -1485,7 +1503,8 @@ local function handle_mag_run_complete(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
-  return run_panel.mag_run_complete(state, run_id, "success", tui.now_ms()), {}
+  local now = tui.now_ms()
+  return preview_state.finish_run(run_panel.mag_run_complete(state, run_id, "success", now), run_id, "done", now), {}
 end
 
 -- A run that ended on an unhandled failure. Same linger→prune bookkeeping as
@@ -1495,27 +1514,11 @@ local function handle_mag_run_failed(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
-  return run_panel.mag_run_failed(state, run_id, "failed", tui.now_ms()), {}
+  local now = tui.now_ms()
+  return preview_state.finish_run(run_panel.mag_run_failed(state, run_id, "failed", now), run_id, "failed", now), {}
 end
 
 -- The tool gate broadcasts `tool-gate.tool.invoke { id, from, name, args }`
--- for every gated tool call and the correlated `tool.result { id,
--- output|error }`. `from` is the emitting actor id (e.g. `scout.run-tool`)
--- and `id` is scope-prefixed (`r<K>/cap-N`), so capture attributes the
--- invoke straight to (run, actor) and correlates the result back by id.
--- Buffers feed the composite view; unattributable ids (unknown scope) are
--- dropped exactly like the chat-stream taps.
-local function handle_gate_tool_invoke(msg, state)
-  if state.replay_mode then return state, {} end
-  return agent_streams.record_tool_invoke(
-    state, msg.from, msg.id, msg.name, msg.args, tui.now_ms()), {}
-end
-
-local function handle_gate_tool_result(msg, state)
-  if state.replay_mode then return state, {} end
-  return agent_streams.record_tool_result(
-    state, msg.id, msg.output, msg.error, tui.now_ms()), {}
-end
 
 local function handle_mouse_selection(msg, state)
   local text = msg.text or ""
@@ -1584,7 +1587,11 @@ local handlers = {
   ["chat.auth.status"]            = handle_auth_status,
   ["chat.tool.popup_request"]     = handle_tool_popup_request,
   ["tool-gate.mode_changed"]      = handle_gate_mode_changed,
+  ["mag.hello"]                   = handle_mag_contracts,
+  ["mag.loaded"]                  = handle_mag_contracts,
   ["mag.run_started"]             = handle_mag_run_started,
+  ["mag.node_preview"]            = handle_mag_node_preview,
+  ["mag.modification_applied"]    = handle_mag_modification_applied,
   ["mag.actor_spawned"]           = handle_mag_actor_spawned,
   ["mag.actor_ready"]             = handle_mag_actor_ready,
   ["mag.actor_busy"]              = handle_mag_actor_busy,
@@ -1594,8 +1601,6 @@ local handlers = {
   ["mag.modification_noop"]       = handle_mag_modification_noop,
   ["mag.run_complete"]            = handle_mag_run_complete,
   ["mag.run_failed"]              = handle_mag_run_failed,
-  ["tool-gate.tool.invoke"]       = handle_gate_tool_invoke,
-  ["tool.result"]                 = handle_gate_tool_result,
   ["mouse.selection"]             = handle_mouse_selection,
 }
 
@@ -1628,11 +1633,9 @@ local function route_keys_and_popups(msg, state)
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
   end
 
-  -- Agent view popup: read-only, so dismiss (q here, Esc via
-  -- handle_escape) and scroll (routed below) are the only verbs. Every
-  -- other key falls through to the no-op tail — structurally no path
-  -- from a keystroke to the actor.
-  if state.popup and state.popup.variant == "agent_view"
+  -- Node inspector: read-only, so dismiss (q here, Esc via
+  -- handle_escape) and scroll are the only verbs.
+  if state.popup and state.popup.variant == "node_inspector"
      and (kind == "key.q" or kind == "key.Q") then
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
   end
@@ -1811,18 +1814,18 @@ local function route_keys_and_popups(msg, state)
       if row == nil then return state, {} end
       if row.kind == "actor" then
         return shallow_merge(state, {
-          popup = { variant = "agent_view", run_id = row.run_id, actor_id = row.actor_id },
+          popup = { variant = "node_inspector", run_id = row.run_id, actor_id = row.actor_id },
         }), {}
       elseif row.kind == "group" then
         return shallow_merge(state, {
-          popup = { variant = "agent_view", run_id = row.run_id, group = row.group.name },
+          popup = { variant = "node_inspector", run_id = row.run_id, group = row.group.name },
         }), {}
       elseif row.kind == "run_header" then
         -- Run-header Space observes the WHOLE run merged (every actor
         -- under it) — the natural "observe this run" verb, more useful
         -- than a no-op.
         return shallow_merge(state, {
-          popup = { variant = "agent_view", run_id = row.run_id, whole_run = true },
+          popup = { variant = "node_inspector", run_id = row.run_id, whole_run = true },
         }), {}
       end
       return state, {}
@@ -1865,6 +1868,9 @@ local function route_keys_and_popups(msg, state)
   end
   if kind == "key.end" then
     route_scroll(function(k) tui.scroll_into_view(k) end)
+    if state.popup and state.popup.variant == "node_inspector" and state.popup.unseen then
+      return shallow_merge(state, { popup = shallow_merge(state.popup, { unseen = false }) }), {}
+    end
     return state, {}
   end
 

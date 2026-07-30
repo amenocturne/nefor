@@ -36,8 +36,10 @@
 local kinds = require("kinds")
 
 local M = {}
+local preview_components = require("preview-components")
 
 M.declaration = {
+  preview = preview_components.tool_exchange(),
   name = "tool-result",
   semantic = {
     input={kind="named",name="nefor.contracts.ToolHandle",arguments={}},
@@ -86,6 +88,8 @@ end
 -- construct(id, params, emit, deps) -> instance
 function M.construct(id, params, emit, deps)
   params = params or {}
+  deps = deps or {}
+  local observe = type(deps.preview) == "function" and deps.preview or function() return false end
 
   local function sign(message)
     message.from = id
@@ -105,6 +109,11 @@ function M.construct(id, params, emit, deps)
     local messages = {}
     for i, r in ipairs(results) do
       messages[i] = to_message(r)
+      observe("append", "tool_events", {
+        kind = r.error ~= nil and "error" or "result",
+        id = r.id,
+        value = r.error ~= nil and { error = r.error } or r.output,
+      })
     end
     emit(sign({ kind = "generic-provider.ProviderOut",
       value = { content = messages }, messages = messages }))

@@ -68,7 +68,7 @@ end
 -- Build the registry and seed the factories shipped with the kernel. The
 -- registry is read-only after seeding and shared by every run context.
 local function build_registry()
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = true })
   local function seed(mod)
     local _, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     if err then
@@ -149,6 +149,7 @@ local function new_run_context(meta)
     rule_ids = {},
     trigger_queue = {},
     emission_seq = 0,
+    observation_seq = 0,
     rule_error = nil,
     rule_failed = false,
   }
@@ -166,6 +167,9 @@ local function new_run_context(meta)
       return
     end
     event.run_id = ctx.run_id
+    ctx.observation_seq = ctx.observation_seq + 1
+    event.observation_seq = ctx.observation_seq
+    event.at_ms = type(nefor.now_ms) == "function" and nefor.now_ms() or nil
     if event.kind == observer.EVENTS.run_complete then
       -- Attach the path the sink's writer persisted this run (recorded by
       -- persist_output below) and stash the signal — result included — for
@@ -369,6 +373,7 @@ local function new_run_context(meta)
       writer = function(output)
         return persist_output(record.id, output)
       end,
+      preview = router:preview_emitter(record.id),
     }
     return registry:construct(record.factory, record.id, record.params, emit, deps)
   end)
@@ -758,6 +763,13 @@ return {
     local rf = ctx.run_failed
     ctx.run_failed = nil
     return rf
+  end,
+
+  bus_observation = function(observation)
+    for run_id, ctx in pairs(runs) do
+      if ctx.router:bus_observation(observation) then return run_id end
+    end
+    return nil
   end,
 
   -- Deliver a correlated capability response (tool.result-shaped:

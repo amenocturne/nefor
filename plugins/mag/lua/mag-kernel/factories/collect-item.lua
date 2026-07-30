@@ -1,5 +1,7 @@
 local M = {}
-M.declaration = { name="collect-item", type_variables={"T"},
+local preview_components = require("preview-components")
+M.declaration = {
+  preview = preview_components.input_output(), name="collect-item", type_variables={"T"},
   semantic={input={kind="variable",name="T"},output={kind="variable",name="T"},
     inputs={{wire="nefor.structured.Validated",type={kind="variable",name="T"}},
       {wire="nefor.agent.Result",type={kind="variable",name="T"}}},

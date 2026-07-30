@@ -50,8 +50,10 @@
 local kinds = require("kinds")
 
 local M = {}
+local preview_components = require("preview-components")
 
 M.declaration = {
+  preview = preview_components.human(),
   name = "human",
   semantic = {
     input={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},

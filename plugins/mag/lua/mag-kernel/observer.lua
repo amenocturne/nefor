@@ -85,7 +85,11 @@ function M.new(opts)
     modlog = opts.modlog,
   }, M)
   self.inventory.set_on_spawn(function(record)
-    self.emit_event({ kind = EVENTS.actor_spawned, id = record.id, factory = record.factory })
+    self.emit_event({
+      kind = EVENTS.actor_spawned,
+      id = record.id,
+      factory = record.factory,
+    })
   end)
   return self
 end

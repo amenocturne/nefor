@@ -66,6 +66,7 @@ function M.construct(id, params, emit, options)
 
   local instance = { id = id }
   local state = {}
+  local observe = type(options.preview) == "function" and options.preview or function() return false end
   local seed_len = #history
   local seq = 0
   local pending = nil
@@ -74,8 +75,16 @@ function M.construct(id, params, emit, options)
   local awaiting_continuation = false
   local steered_messages = {}
 
-  function state:append(message) history[#history + 1] = message end
+  function state:append(message)
+    history[#history + 1] = message
+    if type(message.tool_calls) == "table" then
+      for _, call in ipairs(message.tool_calls) do
+        observe("append", "transcript", { kind = "tool_call", value = call })
+      end
+    end
+  end
   function state:emit(message) emit(sign(message)) end
+  function state:observe(operation, binding, value) return observe(operation, binding, value) end
   function state:is_draining() return draining end
   function state:transcript_delta()
     local delta = {}

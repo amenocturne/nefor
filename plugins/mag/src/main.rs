@@ -154,6 +154,7 @@ const INTERRUPT_FAILURE: &str = "interrupted by user";
 /// gate answers its `<gate>.tool.invoke` with exactly this shape, keyed by the
 /// caller's id, so gated tool invocations correlate back through this path.
 const TOOL_RESULT_KIND: &str = "tool.result";
+const BASH_STREAM_KIND: &str = "tool.stream";
 
 /// Fallback tool-gate bus name when the spawn config passes no `--tool-gate`.
 /// The gate's name is composition-owned (starter/init.lua names the gate when
@@ -204,10 +205,10 @@ async fn run() -> Result<(), MagError> {
     // reasoner/factory types on both execute paths (replaces a hand-synced
     // allowlist; docs/ir.md division-of-responsibility).
     let factories = host.registry_names().unwrap_or_default();
-    let contracts = host.registry_contracts().unwrap_or_else(|error| {
-        tracing::warn!(%error, "failed to serialize registry contracts");
-        Value::Array(Vec::new())
-    });
+    // Registry declarations are startup invariants, not optional diagnostics.
+    // Refuse to advertise readiness if their immutable snapshot cannot cross
+    // the wire; otherwise actors could spawn before observers know their type.
+    let contracts = host.registry_contracts()?;
     send_event(
         &out_tx,
         hello_body(host.kernel_name().as_deref(), &factories, contracts),
@@ -497,6 +498,26 @@ async fn handle_event(
         Some(k) => k,
         None => return Ok(()),
     };
+    // Provider streaming is observational and keeps the bridge correlation open;
+    // the final result/error below remains the sole settlement path.
+    if kind.ends_with(".stream.delta") || kind.ends_with(".stream.reasoning_delta") {
+        if let (Some(chat_id), Some(text)) = (
+            body.get("chat_id").and_then(Value::as_str),
+            body.get("text").and_then(Value::as_str),
+        ) {
+            if let Some(request_id) = bridge.request_id_for_chat(chat_id) {
+                let event_kind = if kind.ends_with(".stream.reasoning_delta") {
+                    "reasoning"
+                } else {
+                    "assistant"
+                };
+                let value = serde_json::json!({ "kind": event_kind, "text": text });
+                let _ = host.bus_observation(request_id, "append", "transcript", &value)?;
+                flush_emits(out_tx, host, bridge).await?;
+            }
+        }
+        return Ok(());
+    }
     // Provider bridge inbound: a driven chat's streamed completion result (or
     // error), correlated by chat_id. Feeds the single final result back through
     // the kernel's capability channel. A reply for a chat we don't drive resolves
@@ -543,6 +564,9 @@ async fn handle_event(
         // A capability response correlated to a kernel-minted request id.
         // Unknown ids are dropped inside the kernel (no open correlation), so
         // forwarding every tool.result while any run is live is safe.
+        BASH_STREAM_KIND if !active.is_empty() => {
+            handle_tool_stream(out_tx, body, host, bridge).await
+        }
         TOOL_RESULT_KIND if !active.is_empty() => {
             handle_tool_result(out_tx, body, program.as_deref(), host, active, bridge).await
         }
@@ -1192,6 +1216,36 @@ async fn handle_interrupt_run(
     // The run stays alive on the tool leg (re-fire pending); a provider-leg
     // interrupt may have failed it synchronously — settle if so.
     settle_run(out_tx, host, active, bridge, program, &run_id).await
+}
+
+async fn handle_tool_stream(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    host: &LuaHost,
+    bridge: &mut CapabilityBridge,
+) -> Result<(), MagError> {
+    let id = match body.get("id").and_then(Value::as_str) {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+    let stream = match body.get("stream").and_then(Value::as_str) {
+        Some("stdout" | "stderr") => body
+            .get("stream")
+            .and_then(Value::as_str)
+            .unwrap_or("stdout"),
+        _ => return Ok(()),
+    };
+    let text = match body.get("text").and_then(Value::as_str) {
+        Some(text) => text,
+        None => return Ok(()),
+    };
+    let _ = host.bus_observation(
+        id,
+        "append",
+        "terminal_events",
+        &serde_json::json!({ "kind": stream, "text": text }),
+    )?;
+    flush_emits(out_tx, host, bridge).await
 }
 
 /// Route a capability response into the kernel (unblocking a deferred

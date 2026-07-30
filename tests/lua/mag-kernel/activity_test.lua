@@ -50,7 +50,7 @@ local function harness(factories)
   local bus = {}
   local now = { ms = 0 }
   local inv = inventory.new({ log = log })
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, f in pairs(factories) do
     local make = f.make
     local _, err = reg:register({
@@ -82,7 +82,9 @@ local function harness(factories)
     router:forget(id)
   end)
   router:set_construct(function(record)
-    return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
+    return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {
+      preview = router:preview_emitter(record.id),
+    })
   end)
   inv.set_deliver(function(to, from, content)
     content = content or {}
@@ -99,7 +101,7 @@ end
 local function events_for(h, id)
   local out = {}
   for _, e in ipairs(h.events) do
-    if e.id == id then out[#out + 1] = e end
+    if e.id == id and e.kind ~= "mag.node_preview" then out[#out + 1] = e end
   end
   return out
 end

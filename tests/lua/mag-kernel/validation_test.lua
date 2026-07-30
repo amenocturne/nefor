@@ -71,7 +71,7 @@ local function harness()
   local log, rec = new_logger()
   local events = {}
   local delivered = {} -- gate deliveries, for the bypass test
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
 
   local function simple_factory(name, inputs, outputs)
     return {

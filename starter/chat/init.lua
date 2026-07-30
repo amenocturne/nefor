@@ -235,10 +235,12 @@ local function initial_state()
     -- prompt widget's `focused` flag derives from this in view.lua.
     focus            = "prompt",
     sidebar_cursor   = 1,
-    -- Agent-stream capture (chat/agent_streams.lua): scope→run binding
-    -- from mag.run_started plus bounded per-actor stream buffers.
+    -- Generic current-session node previews: advertised declarations plus
+    -- materialized lifecycle/binding state. Scope maps provider chat ids back
+    -- to their owning run for full LLM observation traffic.
     scope_to_run     = {},
-    agent_streams    = {},
+    preview_registry = {},
+    node_previews    = {},
     popup            = nil,
     stats            = {},
     pending          = false,

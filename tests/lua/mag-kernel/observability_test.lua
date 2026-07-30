@@ -151,7 +151,7 @@ do
   end
 
   local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   reg:register({
     declaration = {
       name = "worker",
@@ -228,7 +228,7 @@ do
   -- Non-sink actor: its declared output persists through routing, keyed by id.
   local persisted = {}
   local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   reg:register({
     declaration = { name = "worker", params = {}, inputs = { input = "stub.In" }, outputs = { "stub.Out" } },
     construct = function(id) return { id = id } end,
@@ -275,7 +275,7 @@ end
 
 do
   local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   local delivered = {}
   reg:register({
     declaration = { name = "entry", params = {}, inputs = { input = "seed.In" }, outputs = {} },
@@ -316,6 +316,90 @@ do
   assert_eq(entry.outcome, "applied", "the initial modification is logged as applied")
   assert_eq(entry.modification, mod, "the logged entry carries the initial modification")
   assert_eq(entry.spawned[1], "entry", "the entry records the spawned actor id")
+end
+
+-- ==================================================================
+-- 5. preview telemetry is schema-checked at the kernel emitter boundary
+-- ==================================================================
+
+do
+  local preview = require("preview")
+  local events, warnings = {}, {}
+  local inv = inventory.new({ log = silent_log() })
+  local reg = Registry.new()
+  local declaration = {
+    name = "observed", params = {}, inputs = { named = "stub.In" }, outputs = { "stub.Out" },
+    preview = preview.column { children = {
+      preview.value { value = preview.state("status", "string") },
+      preview.stream { source = preview.stream_ref("items", { kind = "record", fields = { text = "string" } }),
+        item = preview.value { value = preview.item("text") } },
+    } },
+  }
+  local _, err = reg:register({ declaration = declaration, construct = function(id) return { id = id } end })
+  assert_eq(err, nil, "observed factory registers")
+  local router = routing.new({
+    inventory = inv, registry = reg, events = function(e) events[#events + 1] = e end,
+    log = { info = noop, error = noop, warn = function(message) warnings[#warnings + 1] = message end },
+  })
+  inv.apply({ actors = { actor_spec("O", "observed", {}, {}) } })
+  local observe = router:preview_emitter("O")
+  assert_true(observe("set", "status", "working"), "valid state set accepted")
+  assert_true(observe("append", "items", { text = "complete" }), "valid stream append accepted")
+  assert_true(not observe("append", "items", { text = 7 }), "invalid stream item rejected")
+  assert_true(not observe("set", "items", {}), "wrong operation rejected")
+  assert_true(not observe("update", "status", {}), "update rejected for non-record state")
+  assert_eq(#events, 2, "only valid observations reached the event sink")
+  assert_eq(#warnings, 3, "every malformed observation was isolated and logged")
+end
+
+-- ==================================================================
+-- 6. kernel observes every assembled activation and declared output, preserving
+-- named endpoint identity plus the generic `last` binding in wire order
+-- ==================================================================
+
+do
+  local preview = require("preview")
+  local events = {}
+  local inv = inventory.new({ log = silent_log() })
+  local reg = Registry.new()
+  local declaration = {
+    name = "endpoint-observed", params = {}, inputs = { named = "stub.In" }, outputs = { "stub.Out" },
+    preview = preview.column { children = {
+      preview.value { value = preview.input("named") },
+      preview.value { value = preview.input("last") },
+      preview.value { value = preview.output("stub.Out") },
+      preview.value { value = preview.output("last") },
+    } },
+  }
+  reg:register({ declaration = declaration, construct = function(id, _, emit)
+    local instance = { id = id }
+    function instance.deliver(activation)
+      emit({ kind = "stub.Out", from = id, value = activation.messages[1].message.value })
+      return "ok"
+    end
+    emit({ kind = "mag.ready", from = id })
+    return instance
+  end })
+  local router = routing.new({ inventory = inv, registry = reg, events = function(e) events[#events + 1] = e end })
+  router:set_construct(function(record)
+    return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {
+      preview = router:preview_emitter(record.id),
+    })
+  end)
+  inv.apply({ actors = { actor_spec("E", "endpoint-observed", {}, {}) } })
+  router:deliver("E", "source", "stub.In", { kind = "stub.In", value = "full-value" })
+  local observed = {}
+  for _, event in ipairs(events) do
+    if event.kind == "mag.node_preview" then observed[#observed + 1] = event end
+  end
+  assert_eq(#observed, 4, "named and last input/output observations emitted")
+  assert_eq(observed[1].binding_kind, "input", "input is observed before delivery")
+  assert_eq(observed[1].binding, "named", "named input port retained")
+  assert_eq(observed[2].binding, "last", "generic last input follows named input")
+  assert_eq(observed[3].binding_kind, "output", "declared output observed on emit")
+  assert_eq(observed[3].binding, "stub.Out", "named output wire retained")
+  assert_eq(observed[4].binding, "last", "generic last output follows named output")
+  assert_eq(observed[4].value.value, "full-value", "output observation is complete, not clipped")
 end
 
 print("mag-kernel observability_test: all cases passed")

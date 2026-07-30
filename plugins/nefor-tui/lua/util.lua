@@ -87,7 +87,7 @@ end
 -- height, wraps the body in `tui.scrollable` for overflow, and stacks
 -- an opaque `tui.fill { char = " " }` behind it so transcript content
 -- doesn't bleed through empty rows.
-function M.bordered_popup_shell(scroll_key, child, border_style)
+function M.bordered_popup_shell(scroll_key, child, border_style, stick_to)
   local function rule_row(left, right)
     return tui.constrained {
       max_height = 1,
@@ -119,6 +119,7 @@ function M.bordered_popup_shell(scroll_key, child, border_style)
               child = tui.scrollable {
                 key       = scroll_key,
                 scrollbar = "auto",
+                stick_to  = stick_to,
                 child     = child,
               },
             },

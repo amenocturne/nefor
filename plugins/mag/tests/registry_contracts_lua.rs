@@ -98,7 +98,7 @@ fn registry_exposes_qualified_serializable_contracts() {
             r#"
             local Registry = require("registry")
             return function()
-              local reg = Registry.new()
+              local reg = Registry.new({ require_preview = false })
               local decl, err = reg:register({
                 declaration = {
                   name = "example",
@@ -116,7 +116,7 @@ fn registry_exposes_qualified_serializable_contracts() {
                 construct = function() return {} end,
               })
               assert(decl ~= nil, err)
-              assert(reg:lookup("example") == reg:lookup("nefor.factory.example"))
+              assert(reg:lookup("example").declaration.name == reg:lookup("nefor.factory.example").declaration.name)
               local contracts = reg:contracts()
               assert(#contracts == 1)
               assert(contracts[1].identity == "nefor.factory.example")
@@ -153,7 +153,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
         .unwrap();
     lua.load(r#"
       local Registry = require("registry")
-      local reg = Registry.new()
+      local reg = Registry.new({ require_preview = false })
       local function p(name) return {kind="primitive",name=name} end
       local function v(name) return {kind="variable",name=name} end
       local function n(name,args) return {kind="named",name=name,arguments=args or {}} end

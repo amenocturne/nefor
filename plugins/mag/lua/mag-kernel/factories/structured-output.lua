@@ -3,9 +3,11 @@
 -- bounded correction policy.
 local boundary = require("factories.provider-boundary")
 local M = {}
+local preview_components = require("preview-components")
 local RESULT = "nefor.agent.Result"
 
 M.declaration = {
+  preview = preview_components.structured_output(),
   name = "structured-output",
   type_variables = { "T" },
   semantic = {
@@ -81,8 +83,9 @@ local function provider_error(detail)
   return { message = tostring(detail), detail = option(nil) }
 end
 
-function M.construct(id, params, emit)
+function M.construct(id, params, emit, deps)
   params = params or {}
+  deps = deps or {}
   if type(params.schema) ~= "table" then
     return nil, string.format("structured-output '%s': params.schema is required", tostring(id))
   end
@@ -115,6 +118,7 @@ function M.construct(id, params, emit)
   end
   return boundary.construct(id, params, emit, {
     name = "structured-output",
+    preview = deps.preview,
     on_turn_start = function(_)
       corrections = 0
       last_output = nefor.json.decode("null")
@@ -145,9 +149,12 @@ function M.construct(id, params, emit)
         state:fail("structured output was draining and could not start a correction round")
         return
       end
+      local violations = output_violations(validation)
+      state:observe("append", "transcript", { kind = "validation", value = {
+        attempt = corrections + 1, output = last_output, violations = violations,
+      } })
       if corrections >= params.max_corrections then
-        finish_error(state, params.validation_error_type,
-          { violations=output_violations(validation) })
+        finish_error(state, params.validation_error_type, { violations=violations })
         return
       end
       corrections = corrections + 1

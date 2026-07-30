@@ -3,8 +3,10 @@
 -- output.
 local boundary = require("factories.provider-boundary")
 local M = {}
+local preview_components = require("preview-components")
 
 M.declaration = {
+  preview = preview_components.transcript(),
   name = "llm",
   semantic = {
     input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
@@ -28,8 +30,10 @@ M.declaration = {
   signals = { "kill", "drain", "steer" },
 }
 
-function M.construct(id, params, emit)
+function M.construct(id, params, emit, deps)
+  deps = deps or {}
   return boundary.construct(id, params, emit, {
+    preview = deps.preview,
     name = "llm",
     steerable = true,
     on_steered_final = function(state, result)

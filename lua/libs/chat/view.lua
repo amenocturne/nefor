@@ -113,8 +113,8 @@ function M.render(state)
     state.popup.variant == "warning" or
     state.popup.variant == "error" or
     state.popup.variant == "terminate_workflow" or
-    -- Read-only agent view: prompt structurally inactive while open.
-    state.popup.variant == "agent_view"
+    -- Read-only node inspector: prompt structurally inactive while open.
+    state.popup.variant == "node_inspector"
   )
   -- Pane focus (Tab/Shift-Tab) gates the prompt the same way popups
   -- do: while the sidebar holds key focus the input drops `focused`,
@@ -214,7 +214,7 @@ function M.render(state)
       popups.login_picker(state),
       popups.tool_permission(state),
       popups.terminate_workflow(state),
-      popups.agent_view(state),
+      popups.node_inspector(state),
       -- Toast renders last so it sits above input, statusline, and
       -- every popup — non-blocking notifications must never be
       -- occluded by chrome below them.

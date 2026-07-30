@@ -4,7 +4,7 @@
 -- chat reducer calls.
 
 local common = require("libs.chat.common")
-local agent_streams = require("libs.chat.agent_streams")
+local preview_state = require("libs.chat.preview_state")
 local STYLE   = common.STYLE
 local CURSOR_ROW_STYLE = common.CURSOR_ROW_STYLE
 local shallow_merge = common.shallow_merge
@@ -294,7 +294,7 @@ local function actor_row_parts(actor_id, node, stream, now_ms)
   if node.status == "working" and stream ~= nil
       and stream.last_activity_ms ~= nil then
     local silent = now_ms - stream.last_activity_ms
-    if silent >= agent_streams.STALE_MS then
+    if silent >= preview_state.STALE_MS then
       stale_text = "    ⚠ stale " .. fmt_elapsed_ms(silent)
     end
   end
@@ -332,7 +332,7 @@ end
 function M.row_model(state, now_ms)
   local rows = {}
   local runs = state.runs or {}
-  local streams = state.agent_streams or {}
+  local streams = state.node_previews or {}
   local folds = state.sidebar_folds or {}
   for _, run_id in ipairs(runs_in_creation_order(runs)) do
     local run = runs[run_id]
@@ -709,7 +709,7 @@ end
 
 -- Drop fold entries for runs no longer live (the pruned run map), so fold
 -- state follows the run lifecycle exactly like the capture buffers do
--- (agent_streams.prune).
+-- (preview_state.prune).
 function M.prune_folds(state, runs)
   local folds = state.sidebar_folds
   if type(folds) ~= "table" then return state end

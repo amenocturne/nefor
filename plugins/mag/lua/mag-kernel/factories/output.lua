@@ -1,10 +1,12 @@
 local kinds = require("kinds")
 
 local M = {}
+local preview_components = require("preview-components")
 local VALUE = "nefor.graph.Value"
 local variable = { kind = "variable", name = "T" }
 
 M.declaration = {
+  preview = preview_components.output(),
   name = "output",
   type_variables = { "T" },
   semantic = {

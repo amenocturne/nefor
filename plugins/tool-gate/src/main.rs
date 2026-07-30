@@ -311,6 +311,8 @@ async fn dispatch_event(
         handle_tool_invoke(out_tx, body, state).await?;
     } else if kind == cancel_kind {
         handle_tool_cancel(out_tx, body, state).await?;
+    } else if kind == "tool.stream" {
+        handle_tool_stream(out_tx, body, state).await?;
     } else if kind == "tool.result" {
         handle_tool_result(out_tx, body, state).await?;
     } else if kind == "tool.permission_response" {
@@ -756,6 +758,23 @@ async fn handle_tool_cancel(
     }
     send_event(out_tx, tool_canceled_body(&outer_id)).await?;
     Ok(())
+}
+
+async fn handle_tool_stream(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    state: &GateState,
+) -> Result<(), TransportError> {
+    let inner_id = match body.get("id").and_then(Value::as_str) {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+    let Some(pending) = state.pending.get(inner_id) else {
+        return Ok(());
+    };
+    let mut out = body.clone();
+    out.insert("id".into(), Value::String(pending.outer_id.clone()));
+    send_event(out_tx, out).await
 }
 
 async fn handle_tool_result(

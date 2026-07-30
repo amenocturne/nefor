@@ -316,6 +316,22 @@ impl LuaHost {
         Ok((count, terminated))
     }
 
+    pub fn bus_observation(
+        &self,
+        id: &str,
+        operation: &str,
+        binding: &str,
+        value: &JsonValue,
+    ) -> Result<Option<String>, MagError> {
+        let observation = self.lua.create_table()?;
+        observation.set("id", id)?;
+        observation.set("operation", operation)?;
+        observation.set("binding", binding)?;
+        observation.set("value", self.lua.to_value(value)?)?;
+        let f: Function = self.kernel.get("bus_observation")?;
+        Ok(f.call::<Option<String>>(observation)?)
+    }
+
     /// Deliver a correlated capability response (tool.result-shaped) back to
     /// the requesting actor, advancing any deferred activation it unblocks.
     /// Correlation ids are run-scoped, so the kernel dispatches to the owning

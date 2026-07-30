@@ -59,7 +59,7 @@ local function harness(factories)
   local events = {}
   local constructed = {}
   local inv = inventory.new({ log = log })
-  local reg = Registry.new()
+  local reg = Registry.new({ require_preview = false })
   for _, f in pairs(factories) do
     local decl = f.declaration
     local make = f.make

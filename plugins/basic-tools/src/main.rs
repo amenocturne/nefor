@@ -303,9 +303,24 @@ async fn handle_tool_invoke(
     // bash gets the cancellable path (it holds a killable OS process); every
     // other tool is a pure fast read with nothing to abort.
     let outcome = if name == bash::NAME {
-        bash::run_cancellable(&args, cancel)
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let stream_out = out_tx.clone();
+        let stream_id = id.clone();
+        let forward = tokio::spawn(async move {
+            while let Some(chunk) = stream_rx.recv().await {
+                let (stream, bytes) = match chunk {
+                    bash::StreamChunk::Stdout(bytes) => ("stdout", bytes),
+                    bash::StreamChunk::Stderr(bytes) => ("stderr", bytes),
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                let _ = send_event(&stream_out, tool_stream_body(&stream_id, stream, &text)).await;
+            }
+        });
+        let result = bash::run_cancellable_streaming(&args, cancel, Some(stream_tx))
             .await
-            .map(Value::String)
+            .map(Value::String);
+        let _ = forward.await;
+        result
     } else {
         run_tool(&name, &args).await
     };
@@ -379,6 +394,15 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
     );
     m.insert("source".into(), Value::String(PLUGIN_NAME.into()));
     m.insert("tools".into(), Value::Array(tools));
+    m
+}
+
+fn tool_stream_body(id: &str, stream: &str, text: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String("tool.stream".into()));
+    m.insert("id".into(), Value::String(id.to_owned()));
+    m.insert("stream".into(), Value::String(stream.to_owned()));
+    m.insert("text".into(), Value::String(text.to_owned()));
     m
 }
 
