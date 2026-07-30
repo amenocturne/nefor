@@ -13,7 +13,8 @@
 //!   (interrupted vs error); chat.complete.result + chat.error
 //!   pass-through (lib leaves the prefixed kind alone so consumers can
 //!   do the agentic-loop coupling themselves).
-//! - translator.inbound — chat.input.submit / chat.interrupt_all drop;
+//! - translator.inbound — chat.input.submit / chat.interrupt_all /
+//!   chat.compaction.request drop;
 //!   canonical → prefixed renames; provider-target filter on
 //!   chat.auth.set, chat.login_requested, chat.logout_requested,
 //!   chat.model.list_requested, chat.model.set; env.from == name
@@ -438,6 +439,31 @@ fn inbound_drops_chat_input_submit() {
 }
 
 #[test]
+fn inbound_drops_canonical_compaction_request() {
+    let lua = lua_with_lib();
+    let v: Value = lua
+        .load(
+            r#"
+            local t = provider.translator("chatgpt")
+            return t.inbound({
+                type = "event", from = "nefor-tui",
+                body = {
+                    kind = "chat.compaction.request",
+                    provider = "chatgpt",
+                    trigger = "manual",
+                },
+            })
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert!(
+        matches!(v, Value::Nil),
+        "agentic-loop owns canonical history materialization and sends the prefixed chat.compact"
+    );
+}
+
+#[test]
 fn inbound_drops_chat_interrupt_all() {
     let lua = lua_with_lib();
     let v: Value = lua
@@ -793,6 +819,54 @@ fn replay_rebuild_folds_history_facts_into_single_restore() {
     assert_eq!(history_len, 2);
     assert_eq!(first_role, "user");
     assert_eq!(second_role, "assistant");
+}
+
+#[test]
+fn replay_rebuild_does_not_resurrect_deleted_ephemeral_chat() {
+    let lua = lua_with_lib();
+    let delivered: i64 = lua
+        .load(
+            r#"
+            provider.replay_rebuild({
+                type = "event", from = "sessions", replay = true,
+                body = { kind = "sessions.replay.start" },
+            }, "chatgpt")
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = {
+                    kind = "chatgpt.chat.create",
+                    chat_id = "agentic-loop.compact-1",
+                    model = "gpt-5.6-sol",
+                },
+            }, "chatgpt")
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = {
+                    kind = "chatgpt.chat.append",
+                    chat_id = "agentic-loop.compact-1",
+                    message = { role = "user", content = "old context" },
+                },
+            }, "chatgpt")
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = {
+                    kind = "chatgpt.chat.delete",
+                    chat_id = "agentic-loop.compact-1",
+                },
+            }, "chatgpt")
+            provider.replay_rebuild({
+                type = "event", from = "sessions", replay = false,
+                body = { kind = "sessions.replay.end" },
+            }, "chatgpt")
+            return #_delivered_log
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(
+        delivered, 0,
+        "a deleted temporary chat must not be rebuilt on session resume"
+    );
 }
 
 #[test]

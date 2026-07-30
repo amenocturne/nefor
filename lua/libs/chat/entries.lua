@@ -406,6 +406,8 @@ local function compaction_label(entry, glyph)
   local title = "context compacted"
   if entry.status == "pending" then
     title = "context compacting..."
+  elseif entry.status == "failed" then
+    title = "context compaction failed"
   end
   local parts = { glyph .. title }
   if type(entry.trigger) == "string" and #entry.trigger > 0 then

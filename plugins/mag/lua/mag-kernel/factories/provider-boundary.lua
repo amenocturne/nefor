@@ -128,6 +128,7 @@ function M.construct(id, params, emit, options)
       system = params.system,
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,
+      context_artifact = params.context_artifact,
       output_schema = params.schema,
       max_corrections = params.max_corrections,
       input = { messages = messages },

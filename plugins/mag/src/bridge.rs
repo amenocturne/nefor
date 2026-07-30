@@ -189,8 +189,11 @@ impl CapabilityBridge {
             .cloned()
             .unwrap_or_default();
 
-        let mut out = Vec::with_capacity(3);
+        let mut out = Vec::with_capacity(4);
         out.push(create_envelope(&provider, &chat_id, &args));
+        if let Some(artifact) = args.get("context_artifact").filter(|v| !v.is_null()) {
+            out.push(compaction_restore_envelope(&provider, &chat_id, artifact));
+        }
         for message in append_messages(&args) {
             out.push(append_envelope(&provider, &chat_id, message));
         }
@@ -406,6 +409,21 @@ fn append_envelope(provider: &str, chat_id: &str, message: Value) -> Map<String,
     m
 }
 
+fn compaction_restore_envelope(
+    provider: &str,
+    chat_id: &str,
+    artifact: &Value,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{provider}.chat.compaction.restore")),
+    );
+    m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
+    m.insert("model_context_artifact".into(), artifact.clone());
+    m
+}
+
 fn complete_envelope(
     provider: &str,
     chat_id: &str,
@@ -561,6 +579,61 @@ mod tests {
         assert!(bridge
             .take_reply("chatgpt-provider.chat.complete.result", &result)
             .is_none());
+    }
+
+    #[test]
+    fn provider_invoke_restores_compacted_context_before_appending_new_messages() {
+        let mut bridge = CapabilityBridge::new(GATE);
+        let artifact = json!({
+            "kind": "responses.compaction",
+            "items": [{
+                "type": "compaction",
+                "encrypted_content": "sealed-history"
+            }]
+        });
+        let out = bridge.translate_emit(obj(json!({
+            "kind": "tool.invoke",
+            "id": "corr-compact",
+            "name": "chatgpt-provider",
+            "args": {
+                "chat_id": "lead.llm@r2",
+                "context_artifact": artifact.clone(),
+                "input": {
+                    "messages": [{
+                        "role": "user",
+                        "content": "after compaction"
+                    }]
+                }
+            }
+        })));
+
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|e| e.get("kind").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "chatgpt-provider.chat.create",
+                "chatgpt-provider.chat.compaction.restore",
+                "chatgpt-provider.chat.append",
+                "chatgpt-provider.chat.complete",
+            ],
+            "fresh provider chats restore the native artifact before post-compaction messages"
+        );
+        assert_eq!(
+            out[1].get("chat_id").and_then(Value::as_str),
+            Some("lead.llm@r2")
+        );
+        assert_eq!(
+            out[1].get("model_context_artifact"),
+            Some(&artifact),
+            "the opaque artifact crosses the bridge without interpretation"
+        );
+        assert_eq!(
+            out[2]["message"]["content"], "after compaction",
+            "only the post-compaction transcript is appended after restoration"
+        );
     }
 
     #[test]

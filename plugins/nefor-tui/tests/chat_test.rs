@@ -3400,6 +3400,39 @@ fn slash_compact_renders_pending_entry_until_commit() {
 }
 
 #[test]
+fn slash_compact_replaces_pending_entry_with_failure() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "/compact");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.compaction.failed",
+            "provider": "chatgpt",
+            "model": "gpt-5.6-sol",
+            "trigger": "manual",
+            "message": "nothing to compact",
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("context compaction failed"),
+        "failed compaction should replace the pending label: {out:?}"
+    );
+    assert!(
+        out.contains("nothing to compact"),
+        "failed compaction should show the provider/orchestrator error: {out:?}"
+    );
+    assert!(
+        !out.contains("context compacting..."),
+        "failed compaction must not leave a permanent pending entry: {out:?}"
+    );
+}
+
+#[test]
 fn typing_slash_keeps_cursor_after_slash() {
     // Regression: when the user typed `/` from an empty input, the
     // appearance of the slash autocomplete dropdown shifted main_column's

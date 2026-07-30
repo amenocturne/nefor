@@ -511,6 +511,105 @@ do
   assert_eq(seeded[2].content, "the answer")
 end
 
+-- (/compact) canonical history is materialized into a temporary provider chat
+-- with an explicit id. The returned native artifact becomes the seed for
+-- future ephemeral MAG chats, while the full transcript stays available when
+-- the user later switches provider/model.
+do
+  fresh_loop()
+  local first = begin_bound_turn("before compaction", "r30")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = first.body.run_id,
+    status = "completed", result = { text = "remember this" },
+  })
+
+  _test.calls_clear()
+  send_to_loop("nefor-tui", {
+    kind = "chat.compaction.request",
+    provider = "mock",
+    trigger = "manual",
+  })
+  local calls = decode_calls()
+  local create = find_kind(calls, "mock.chat.create")
+  local compact = find_kind(calls, "mock.chat.compact")
+  assert(create ~= nil, "compaction materializes a temporary provider chat")
+  assert(compact ~= nil, "compaction sends the low-level provider request")
+  assert(type(create.body.chat_id) == "string" and #create.body.chat_id > 0,
+    "temporary compaction chat has an explicit id")
+  assert_eq(compact.body.chat_id, create.body.chat_id,
+    "chat.compact targets the materialized chat")
+  assert_eq(compact.target, "mock", "low-level compaction targets the active provider")
+
+  local appended = {}
+  for _, call in ipairs(calls) do
+    if call.body.kind == "mock.chat.append" then appended[#appended + 1] = call end
+  end
+  assert_eq(#appended, 2, "the full canonical pair is materialized for first compaction")
+  assert_eq(appended[1].body.chat_id, create.body.chat_id)
+  assert_eq(appended[1].body.message.content, "before compaction")
+  assert_eq(appended[2].body.message.content, "remember this")
+
+  local artifact = {
+    kind = "responses.compaction",
+    items = {
+      { type = "compaction", encrypted_content = "sealed-history" },
+    },
+  }
+  _test.calls_clear()
+  send_to_loop("mock", {
+    kind = "chat.compaction.commit",
+    chat_id = create.body.chat_id,
+    provider = "mock",
+    model = "test-model",
+    trigger = "manual",
+    model_context_artifact = artifact,
+  })
+  calls = decode_calls()
+  local deleted = find_kind(calls, "mock.chat.delete")
+  assert(deleted ~= nil, "the temporary compaction chat is deleted after commit")
+  assert_eq(deleted.body.chat_id, create.body.chat_id)
+  local recorded = find_kind(calls, "agentic_loop.compaction_recorded")
+  assert(recorded ~= nil, "the opaque compaction artifact gets a durable replay marker")
+  assert_eq(recorded.body.model_context_artifact.items[1].encrypted_content,
+    "sealed-history")
+
+  local second = begin_turn("after compaction")
+  local second_overlay = second.body.params_overlay["lead.llm"]
+  assert_eq(second_overlay.context_artifact.items[1].encrypted_content,
+    "sealed-history", "the next ephemeral chat restores the native artifact")
+  assert_eq(#second_overlay.history, 0,
+    "messages already represented by the artifact are not replayed again")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = second.body.run_id,
+    status = "completed", result = { text = "new answer" },
+  })
+
+  local third = begin_turn("same provider again")
+  local third_overlay = third.body.params_overlay["lead.llm"]
+  assert(third_overlay.context_artifact ~= nil,
+    "matching provider/model keeps using the compacted context")
+  assert_eq(#third_overlay.history, 2,
+    "only post-compaction messages accompany the restored artifact")
+  assert_eq(third_overlay.history[1].content, "after compaction")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = third.body.run_id,
+    status = "completed", result = { text = "third answer" },
+  })
+
+  send_to_loop("nefor-tui", {
+    kind = "chat.model.set",
+    provider = "other-provider",
+    model = "other-model",
+  })
+  local switched = begin_turn("cross-provider fallback")
+  local switched_overlay = switched.body.params_overlay["lead.llm"]
+  assert_eq(switched_overlay.context_artifact, nil,
+    "provider-specific native context is not sent across providers")
+  assert_eq(#switched_overlay.history, 6,
+    "the lossless canonical transcript backs a cross-provider switch")
+  assert_eq(switched_overlay.history[1].content, "before compaction")
+end
+
 -- (full-transcript recording) a completed turn whose result carries the llm's
 -- transcript_delta records the WHOLE turn — tool exchanges included — so the
 -- next turn's seed replays what the model saw, not just what it said.
@@ -1037,6 +1136,17 @@ do
     kind = "agentic_loop.turn_recorded",
     user = "old question", answer = "old answer",
   })
+  send_to_loop("engine", {
+    kind = "agentic_loop.compaction_recorded",
+    provider = "mock",
+    model = "test-model",
+    model_context_artifact = {
+      kind = "responses.compaction",
+      items = {
+        { type = "compaction", encrypted_content = "replayed-seal" },
+      },
+    },
+  })
   -- A marker carrying the turn's recorded transcript replays it verbatim —
   -- tool exchanges included (the delta-less marker above took the pair path).
   send_to_loop("engine", {
@@ -1062,9 +1172,13 @@ do
   assert_eq(history[5].role, "tool", "the replayed tool result keeps its role")
 
   local exec = begin_turn("post-resume")
-  local seeded = exec.body.params_overlay["lead.llm"].history
-  assert_eq(#seeded, 6, "the post-resume turn seeds the rebuilt history")
-  assert_eq(seeded[1].content, "old question")
+  local overlay = exec.body.params_overlay["lead.llm"]
+  assert_eq(overlay.context_artifact.items[1].encrypted_content, "replayed-seal",
+    "the post-resume turn restores the replayed compaction artifact")
+  local seeded = overlay.history
+  assert_eq(#seeded, 4,
+    "only messages recorded after the replayed compaction marker accompany it")
+  assert_eq(seeded[1].content, "tooled question")
 end
 
 -- (/new) chat.reset clears queue + history so the next turn is fresh.

@@ -48,12 +48,14 @@
 --   * `chat.interrupt_all`               — graceful interrupt + drop queues
 --   * `chat.reset`                       — /new: clear state + history
 --   * `chat.model.set`                   — runtime model switch
+--   * `chat.compaction.request`          — compact canonical model context
 --   * `mag.loaded` / `mag.error`         — the turn-program load handshake
 --   * `mag.run_started { run_id, scope }`— bind the transcript prefix
 --   * `mag.run_result { run_id, status }`— close the turn
 --   * `<gate>.tool.invoke` / `tool.result` (lead-scoped ids) — transcript
 --     tool events + observers
 --   * `agentic_loop.turn_recorded`       — replay: rebuild history
+--   * `agentic_loop.compaction_recorded` — replay: restore compacted context
 --   * `sessions.session_end`             — teardown
 
 local json = nefor.json
@@ -92,6 +94,12 @@ local state = {
   -- turn ends without one). Seeded into each turn's llm via params.history;
   -- rebuilt on /resume from turn_recorded markers.
   history = {},                 ---@type table
+  -- Provider-native context compacted through history[history_len]. The full
+  -- canonical transcript remains above as the lossless fallback for a later
+  -- provider/model switch; matching turns seed the opaque artifact plus only
+  -- messages recorded after its cutoff.
+  compaction = nil,             ---@type table|nil
+  pending_compaction = nil,     ---@type table|nil
 
   current_run_id = nil,         ---@type string|nil
   -- The in-flight turn: { run_id, user_text, scope, chat_prefix, streamed }.
@@ -475,9 +483,26 @@ local function submit_orchestrator_run(user_text)
     end
   end
 
+  local history = state.history
+  local context_artifact = nil
+  local compaction = state.compaction
+  if type(compaction) == "table"
+      and compaction.provider == state.config.provider
+      and compaction.model == state.config.model
+      and type(compaction.model_context_artifact) == "table"
+      and type(compaction.history_len) == "number" then
+    history = {}
+    for i = compaction.history_len + 1, #state.history do
+      history[#history + 1] = state.history[i]
+    end
+    context_artifact = deep_clone(compaction.model_context_artifact)
+  end
   local overlay_params = {
-    history = deep_clone(state.history),
+    history = deep_clone(history),
   }
+  if context_artifact ~= nil then
+    overlay_params.context_artifact = context_artifact
+  end
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
     overlay_params.provider = state.config.provider
   end
@@ -729,6 +754,138 @@ local function new_chat()
   state.pending_inputs_projected = 0
   state.pending_steer = nil
   state.history = {}
+  state.compaction = nil
+  state.pending_compaction = nil
+end
+
+local function compaction_failure(message, pending)
+  pending = pending or {}
+  emit("nefor-tui", {
+    kind = "chat.compaction.failed",
+    provider = pending.provider or state.config.provider,
+    model = pending.model or state.config.model,
+    trigger = pending.trigger or "manual",
+    message = message,
+  })
+end
+
+local function compaction_history_start(provider, model)
+  local compaction = state.compaction
+  if type(compaction) == "table"
+      and compaction.provider == provider
+      and compaction.model == model
+      and type(compaction.model_context_artifact) == "table"
+      and type(compaction.history_len) == "number" then
+    return compaction.history_len + 1, compaction.model_context_artifact
+  end
+  return 1, nil
+end
+
+local function handle_chat_compaction_request(body)
+  if state.pending_compaction ~= nil then
+    compaction_failure("context compaction is already in progress")
+    return
+  end
+  if state.current_run_id ~= nil then
+    compaction_failure("cannot compact context while a lead turn is running")
+    return
+  end
+  if #state.history == 0 then
+    compaction_failure("nothing to compact")
+    return
+  end
+
+  local provider = type(body.provider) == "string" and #body.provider > 0
+    and body.provider or state.config.provider
+  if type(provider) ~= "string" or #provider == 0 then
+    compaction_failure("no active provider to compact")
+    return
+  end
+  local model = state.config.model
+  local trigger = type(body.trigger) == "string" and #body.trigger > 0
+    and body.trigger or "manual"
+  local chat_id = "agentic-loop.compact-" .. envelope.uuid_lite()
+  local pending = {
+    chat_id = chat_id,
+    provider = provider,
+    model = model,
+    trigger = trigger,
+  }
+  state.pending_compaction = pending
+
+  emit(provider, {
+    kind = provider .. ".chat.create",
+    chat_id = chat_id,
+    model = model,
+    system = system_with_mag_context(state.config.system),
+    reasoning_effort = state.config.reasoning_effort,
+  })
+  local first_message, artifact = compaction_history_start(provider, model)
+  if artifact ~= nil then
+    emit(provider, {
+      kind = provider .. ".chat.compaction.restore",
+      chat_id = chat_id,
+      model_context_artifact = deep_clone(artifact),
+    })
+  end
+  for i = first_message, #state.history do
+    emit(provider, {
+      kind = provider .. ".chat.append",
+      chat_id = chat_id,
+      message = deep_clone(state.history[i]),
+    })
+  end
+  emit(provider, {
+    kind = provider .. ".chat.compact",
+    chat_id = chat_id,
+    trigger = trigger,
+  })
+end
+
+local function handle_chat_compaction_commit(body)
+  local pending = state.pending_compaction
+  if type(pending) ~= "table" or body.chat_id ~= pending.chat_id then return end
+  if type(body.provider) == "string" and body.provider ~= pending.provider then return end
+  local artifact = body.model_context_artifact
+  if type(artifact) ~= "table" or type(artifact.items) ~= "table" then
+    state.pending_compaction = nil
+    emit(pending.provider, {
+      kind = pending.provider .. ".chat.delete",
+      chat_id = pending.chat_id,
+    })
+    compaction_failure("provider returned an invalid compaction artifact", pending)
+    return
+  end
+
+  state.compaction = {
+    provider = pending.provider,
+    model = pending.model,
+    history_len = #state.history,
+    model_context_artifact = deep_clone(artifact),
+  }
+  state.pending_compaction = nil
+  emit(pending.provider, {
+    kind = pending.provider .. ".chat.delete",
+    chat_id = pending.chat_id,
+  })
+  emit(nil, {
+    kind = "agentic_loop.compaction_recorded",
+    provider = pending.provider,
+    model = pending.model,
+    model_context_artifact = deep_clone(artifact),
+  })
+end
+
+local function handle_chat_compaction_error(body)
+  local pending = state.pending_compaction
+  if type(pending) ~= "table" or body.chat_id ~= pending.chat_id then return false end
+  state.pending_compaction = nil
+  emit(pending.provider, {
+    kind = pending.provider .. ".chat.delete",
+    chat_id = pending.chat_id,
+  })
+  compaction_failure(tostring(body.message or body.error or "context compaction failed"), pending)
+  return true
 end
 
 -- Mid-chat /model picker. History is canonical here and seeded per turn
@@ -1235,6 +1392,8 @@ local function teardown_for_session_end()
   state.pending_inputs_projected = 0
   state.pending_steer       = nil
   state.history            = {}
+  state.compaction         = nil
+  state.pending_compaction = nil
   emit_idle_state("session-ended")
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
@@ -1421,7 +1580,8 @@ local function receive_msg(entry)
         or kind == "chat.interrupt"
         or kind == "chat.interrupt_all"
         or kind == "chat.model.set"
-        or kind == "chat.reasoning.set" then
+        or kind == "chat.reasoning.set"
+        or kind == "chat.compaction.request" then
       return
     end
     -- Canonical-history rebuild: each completed turn logged one
@@ -1441,6 +1601,19 @@ local function receive_msg(entry)
       end
       return
     end
+    if kind == "agentic_loop.compaction_recorded" then
+      if type(body.provider) == "string"
+          and type(body.model_context_artifact) == "table"
+          and type(body.model_context_artifact.items) == "table" then
+        state.compaction = {
+          provider = body.provider,
+          model = body.model,
+          history_len = #state.history,
+          model_context_artifact = deep_clone(body.model_context_artifact),
+        }
+      end
+      return
+    end
     -- Everything else during replay: kernel/turn lifecycle events are
     -- keyed to the (empty) live turn state and fall through harmlessly.
     return
@@ -1453,6 +1626,8 @@ local function receive_msg(entry)
   if kind == "chat.interrupt_all" then cancel_all(); return end
   if kind == "chat.model.set" then handle_chat_model_set(body); return end
   if kind == "chat.reasoning.set" then handle_chat_reasoning_set(body); return end
+  if kind == "chat.compaction.request" then handle_chat_compaction_request(body); return end
+  if kind == "chat.compaction.commit" then handle_chat_compaction_commit(body); return end
 
   -- Turn-program load handshake.
   if kind == "mag.loaded" then handle_lead_program_loaded(body); return end
@@ -1465,6 +1640,7 @@ local function receive_msg(entry)
 
   -- Lead-scoped tool + stream observation.
   if type(kind) == "string" then
+    if kind:match("%.chat%.error$") and handle_chat_compaction_error(body) then return end
     if kind:match("%.tool%.invoke$") then handle_gate_invoke(body); return end
     if kind == "tool.result" then handle_gate_result(body); return end
     if kind == "chat.stream.delta" or kind == "chat.stream.end" then
@@ -1544,6 +1720,8 @@ if nefor.bus and nefor.bus.on_event then
   -- both are no-ops.
   nefor.bus.on_event("sessions.replay.start", function(_entry)
     state.history = {}
+    state.compaction = nil
+    state.pending_compaction = nil
     restore_active_model_from_session_log()
   end)
 end
@@ -1572,6 +1750,8 @@ M._internals  = {
       load_id = nil,
     }
     state.history = {}
+    state.compaction = nil
+    state.pending_compaction = nil
     state.current_run_id = nil
     state.current_turn = nil
     state.deferred_queue = {}

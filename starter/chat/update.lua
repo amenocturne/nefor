@@ -1140,6 +1140,31 @@ local function handle_compaction_commit(msg, state)
   return transcript.push_entry(state, committed), {}
 end
 
+local function handle_compaction_failed(msg, state)
+  local failed = Entry.compaction({
+    provider = msg.provider,
+    model = msg.model,
+    trigger = msg.trigger,
+    status = "failed",
+    display_summary = msg.message or "Context compaction failed.",
+  })
+  local entries = {}
+  local replaced = false
+  for i = 1, #state.entries do entries[i] = state.entries[i] end
+  for i = #entries, 1, -1 do
+    local e = entries[i]
+    if type(e) == "table" and e.kind == "compaction" and e.status == "pending" then
+      entries[i] = failed
+      replaced = true
+      break
+    end
+  end
+  if replaced then
+    return shallow_merge(state, { entries = entries }), {}
+  end
+  return transcript.push_entry(state, failed), {}
+end
+
 local function handle_plan_approved(msg, state)
   local approved = (msg.approved == true)
   local key = msg.plan_id or msg.submitted_at
@@ -1578,6 +1603,7 @@ local handlers = {
   ["chat.graph_result.append"]    = handle_graph_result_append,
   ["chat.plan.append"]            = handle_plan_append,
   ["chat.compaction.commit"]      = handle_compaction_commit,
+  ["chat.compaction.failed"]      = handle_compaction_failed,
   ["lead-workflow.plan.approved"] = handle_plan_approved,
   ["chat.popup"]                  = handle_popup,
   ["chat.toast"]                  = handle_toast,

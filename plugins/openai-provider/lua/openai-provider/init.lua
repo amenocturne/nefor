@@ -259,11 +259,10 @@ function M.translator(name)
         effort = body.effort or body.reasoning_effort,
       }
     elseif k == "chat.compaction.request" then
-      if body.provider ~= name then return nil end
-      return {
-        kind    = kinds.chat_compact,
-        trigger = body.trigger or "manual",
-      }
+      -- Canonical history belongs to agentic-loop. It materializes a
+      -- temporary provider chat with an explicit chat_id, then sends the
+      -- low-level prefixed chat.compact request itself.
+      return nil
     end
 
     -- Pass-through for any other envelope (already-prefixed kinds like
@@ -468,6 +467,15 @@ local function replay_rebuild_immediate(env, name)
     return
   end
 
+  if k == prefix .. "chat.delete" then
+    local cid = body.chat_id
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
+    deliver_to_provider(name, body)
+    owned[cid] = nil
+    replay_skip[cid] = nil
+    return
+  end
+
   if k == "tool.result" then
     if body.error ~= nil then return end
     local result = body.result
@@ -526,6 +534,8 @@ end
 --                          binary's existing in-memory history.
 --   <prefix>.chat.append : delivered verbatim, gated on ownership so
 --                          coexisting providers don't double-feed.
+--   <prefix>.chat.delete : removes the replay plan/owned chat so ephemeral
+--                          MAG and compaction chats are not resurrected.
 --   tool.result          : synthesize an assistant <prefix>.chat.append
 --                          (text + tool_calls) so the assistant turn
 --                          lands in history. Covers the sub-agent /
@@ -640,6 +650,14 @@ function M.replay_rebuild(env, name)
       plan.saw_legacy = true
       append_plan_message(plan, body.message)
     end
+    return
+  end
+
+  if k == prefix .. "chat.delete" then
+    local cid = body.chat_id
+    if type(cid) ~= "string" then return end
+    batch.plans[cid] = nil
+    replay_skip[cid] = nil
     return
   end
 

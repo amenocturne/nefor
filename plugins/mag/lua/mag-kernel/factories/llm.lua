@@ -23,7 +23,7 @@ M.declaration = {
   params = {
     model = "string?", system = "string?", tools = "table?",
     profile = "string?", reasoning_effort = "string?",
-    provider = "string?", history = "table?",
+    provider = "string?", history = "table?", context_artifact = "table?",
   },
   inputs = { provider_out = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" },
