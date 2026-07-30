@@ -87,7 +87,7 @@ end
 -- height, wraps the body in `tui.scrollable` for overflow, and stacks
 -- an opaque `tui.fill { char = " " }` behind it so transcript content
 -- doesn't bleed through empty rows.
-function M.bordered_popup_shell(scroll_key, child, border_style, stick_to)
+function M.bordered_popup_shell(scroll_key, child, border_style, stick_to, header, footer)
   local function rule_row(left, right)
     return tui.constrained {
       max_height = 1,
@@ -105,6 +105,12 @@ function M.bordered_popup_shell(scroll_key, child, border_style, stick_to)
     max_width = 1,
     child = tui.fill { char = "│", style = border_style },
   }
+  local function inset(content)
+    return tui.padding {
+      left = 1, right = 1, top = 0, bottom = 0,
+      child = content,
+    }
+  end
   local body_bg = tui.fill { char = " " }
   local body_row = tui.row {
     gap = 0,
@@ -114,29 +120,24 @@ function M.bordered_popup_shell(scroll_key, child, border_style, stick_to)
         child = tui.stack {
           children = {
             body_bg,
-            tui.padding {
-              left = 1, right = 1, top = 0, bottom = 0,
-              child = tui.scrollable {
-                key       = scroll_key,
-                scrollbar = "auto",
-                stick_to  = stick_to,
-                child     = child,
-              },
-            },
+            inset(tui.scrollable {
+              key       = scroll_key,
+              scrollbar = "auto",
+              stick_to  = stick_to,
+              child     = child,
+            }),
           },
         },
       },
       side_bar,
     },
   }
-  return tui.column {
-    gap = 0,
-    children = {
-      rule_row("╭", "╮"),
-      tui.expanded { child = body_row },
-      rule_row("╰", "╯"),
-    },
-  }
+  local children = { rule_row("╭", "╮") }
+  if header ~= nil then children[#children + 1] = inset(header) end
+  children[#children + 1] = tui.expanded { child = body_row }
+  if footer ~= nil then children[#children + 1] = inset(footer) end
+  children[#children + 1] = rule_row("╰", "╯")
+  return tui.column { gap = 0, children = children }
 end
 
 return M

@@ -34,31 +34,26 @@ function M.view(opts)
   if type(opts) ~= "table" then
     error("popup.view: opts must be a table, got " .. type(opts))
   end
-  local children = {}
+  local child = util.resolve_content(opts.child)
+  local pad = opts.pad
+  if pad == nil then pad = 1 end
+  local body = child and tui.padding { value = pad, child = child } or nil
+  local header = nil
   if opts.title ~= nil then
     if type(opts.title) ~= "string" then
       error("popup.view: opts.title must be a string, got " .. type(opts.title))
     end
-    children[#children + 1] = tui.text {
+    header = tui.text {
       content = opts.title,
       style   = opts.title_style,
       wrap    = "none",
     }
   end
-  local child = util.resolve_content(opts.child)
-  if child ~= nil then children[#children + 1] = child end
-  if opts.footer ~= nil then
-    children[#children + 1] = util.resolve_content(opts.footer)
+  if opts.header ~= nil then
+    local supplied = util.resolve_content(opts.header)
+    header = header and tui.column { gap = opts.gap or 1, children = { header, supplied } } or supplied
   end
-
-  local pad = opts.pad
-  if pad == nil then pad = 1 end
-  local gap = opts.gap
-  if gap == nil then gap = 1 end
-  local body = tui.padding {
-    value = pad,
-    child = tui.column { gap = gap, children = children },
-  }
+  local footer = util.resolve_content(opts.footer)
 
   return tui.anchored {
     anchor   = opts.anchor or "center",
@@ -70,7 +65,9 @@ function M.view(opts)
       opts.scroll_key or "popup",
       body,
       opts.border_style,
-      opts.stick_to
+      opts.stick_to,
+      header,
+      footer
     ),
   }
 end

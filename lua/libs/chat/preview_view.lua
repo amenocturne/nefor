@@ -36,6 +36,33 @@ local function encode(value, depth, seen)
   return "{\n" .. indent .. table.concat(parts, ",\n" .. indent)
     .. "\n" .. string.rep("  ", depth) .. "}"
 end
+local function tool_value(value, result)
+  value = type(value) == "table" and value or { value = value }
+  local name = value.name or ((type(value["function"]) == "table") and value["function"].name)
+  local id = value.id or value.tool_call_id
+  local rows = {}
+  if result then
+    rows[#rows + 1] = "tool result" .. (id and (" · " .. tostring(id)) or "")
+    rows[#rows + 1] = encode(value.output or value.result or value.content or value.value or value)
+  else
+    rows[#rows + 1] = "tool call" .. (name and (" · " .. tostring(name)) or "")
+      .. (id and (" · " .. tostring(id)) or "")
+    local args = value.arguments or value.args
+      or ((type(value["function"]) == "table") and value["function"].arguments)
+    rows[#rows + 1] = encode(args ~= nil and args or value)
+  end
+  return table.concat(rows, "\n")
+end
+
+local function format_value(value, format)
+  if format == "tool_call" then return tool_value(value, false) end
+  if format == "tool_result" then return tool_value(value, true) end
+  if format == "validation" and type(value) == "table" then
+    return "validation attempt " .. tostring(value.attempt or "?") .. "\noutput:\n"
+      .. encode(value.output) .. "\nviolations:\n" .. encode(value.violations)
+  end
+  return encode(value)
+end
 M.format_value = encode
 
 local function resolve(ref, ctx)
@@ -105,7 +132,7 @@ render = function(desc, ctx)
     return tui.markdown { source = tostring(resolve(desc.value, ctx) or ""),
       theme = MARKDOWN_THEME, wrap = desc.wrap or "word", key = desc.key }
   elseif kind == "value" then
-    return tui.text { content = encode(resolve(desc.value, ctx)),
+    return tui.text { content = format_value(resolve(desc.value, ctx), desc.format),
       style = STYLE_NAMES[desc.style], wrap = desc.wrap or "word", key = desc.key }
   elseif kind == "stream" or kind == "list" then
     return render_collection(desc, ctx)

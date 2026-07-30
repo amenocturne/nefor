@@ -440,7 +440,8 @@ local function popup_shell(title, header, body, unseen)
     open = true, border_style = STYLE.popup_user, title_style = STYLE.popup_user,
     width = "90%", height = "90%", scroll_key = "popup_node_inspector", stick_to = "end",
     title = title,
-    child = tui.column { gap = 1, children = { header, body } },
+    header = header,
+    child = body,
     footer = tui.text { content = (unseen and "* unseen output · " or "")
       .. "Up/Down PgUp/PgDn Home/End scroll · Esc/Q close · read-only",
       style = unseen and STYLE.status_warn or STYLE.status_dim, wrap = "none" },

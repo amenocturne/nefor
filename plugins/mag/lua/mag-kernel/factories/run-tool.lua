@@ -165,8 +165,9 @@ function M.construct(id, params, emit, deps)
     }
     observe("append", "tool_events", {
       kind = activation.error ~= nil and "error" or "result",
-      id = ref.call_id,
-      value = activation.error ~= nil and { error = activation.error } or activation.result,
+      value = activation.error ~= nil
+        and { id = ref.call_id, name = ref.name, error = activation.error }
+        or { id = ref.call_id, name = ref.name, output = activation.result },
     })
     if batch.received >= batch.expected then
       complete_batch(ref.batch, batch)
@@ -198,8 +199,8 @@ function M.construct(id, params, emit, deps)
       local call_name = call.name
       local call_args = call.args or {}
       observe("append", "tool_events", {
-        kind = "call", id = call.id,
-        value = { name = call_name, arguments = call_args },
+        kind = "call",
+        value = { id = call.id, name = call_name, arguments = call_args },
       })
       emit(sign({
         kind = "capability.invoke",

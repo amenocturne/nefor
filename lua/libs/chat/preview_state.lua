@@ -100,7 +100,19 @@ function M.observe(state, msg, now_ms)
     if op == "append" then
       next.streams = copy_map(prev.streams)
       local values = copy_array(next.streams[msg.binding])
-      values[#values + 1] = { value = msg.value, seq = msg.observation_seq or math.huge, at_ms = msg.at_ms or now_ms }
+      local previous = values[#values]
+      local previous_value = previous and previous.value
+      if type(previous_value) == "table" and type(msg.value) == "table"
+          and previous_value.kind == msg.value.kind
+          and (msg.value.kind == "reasoning" or msg.value.kind == "assistant")
+          and type(previous_value.text) == "string" and type(msg.value.text) == "string" then
+        local joined = copy_map(previous_value)
+        joined.text = previous_value.text .. msg.value.text
+        values[#values] = { value = joined, seq = previous.seq,
+          at_ms = msg.at_ms or now_ms, last_seq = msg.observation_seq or previous.seq }
+      else
+        values[#values + 1] = { value = msg.value, seq = msg.observation_seq or math.huge, at_ms = msg.at_ms or now_ms }
+      end
       next.streams[msg.binding] = values
     else
       next.states = copy_map(prev.states)

@@ -111,6 +111,55 @@ fn preview_validation_rejects_recursive_and_schema_mismatches() {
 }
 
 #[test]
+fn every_shipped_factory_declares_a_valid_preview() {
+    let lua = lua_with_kernel_path();
+    lua.load(
+        r#"
+        local preview=require('preview')
+        local factories={
+          'stub','sink','source','output','human','llm','structured-output',
+          'collector','collect-item','collected-prompt','run-tool','tool-result',
+          'adapter','bash','worktree-create','worktree-open',
+        }
+        for _,name in ipairs(factories) do
+          local factory=require('factories.'..name)
+          assert(type(factory.declaration.preview)=='table', name..' preview missing')
+          local validated,err=preview.validate(factory.declaration.preview,factory.declaration)
+          assert(validated, name..': '..tostring(err))
+        end
+        "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn llm_and_structured_output_share_the_transcript_presentation() {
+    let lua = lua_with_kernel_path();
+    lua.load(
+        r#"
+        local llm=require('factories.llm').declaration.preview
+        local structured=require('factories.structured-output').declaration.preview
+        local transcript=structured.children[1]
+        assert(transcript.kind=='stream')
+        local function same(a,b)
+          if type(a)~=type(b) then return false end
+          if type(a)~='table' then return a==b end
+          for k,v in pairs(a) do if not same(v,b[k]) then return false end end
+          for k in pairs(b) do if a[k]==nil then return false end end
+          return true
+        end
+        assert(same(llm,transcript),'structured-output transcript drifted from llm')
+        assert(llm.item.values.reasoning.children[2].style=='reasoning')
+        assert(llm.item.values.tool_call.format=='tool_call')
+        assert(llm.item.values.tool_result.format=='tool_result')
+        "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
 fn mandatory_preview_rejects_missing_and_registry_contract_advertises_description() {
     let lua = lua_with_kernel_path();
     lua.load(

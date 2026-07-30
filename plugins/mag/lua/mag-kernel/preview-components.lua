@@ -29,19 +29,26 @@ local TRANSCRIPT_SCHEMA = { kind = "variant", tag = "kind", cases = {
   tool_result = { kind = "record", fields = { value = "data" } },
   validation = { kind = "record", fields = { value = "data" } },
 } }
+local function transcript_cases()
+  return preview.cases {
+    reasoning = preview.column { gap = 0, children = {
+      preview.text { value = "▼ reasoning", style = "dim", wrap = "none" },
+      preview.text { value = preview.item("text"), style = "reasoning", wrap = "word" },
+    } },
+    assistant = preview.markdown { value = preview.item("text"), theme = "assistant", wrap = "word" },
+    tool_call = preview.value { value = preview.item("value"), format = "tool_call", style = "tool_call", wrap = "word" },
+    tool_result = preview.value { value = preview.item("value"), format = "tool_result", style = "tool_result", wrap = "word" },
+    validation = preview.value { value = preview.item("value"), format = "validation", style = "error", wrap = "word" },
+  }
+end
+
 local function transcript()
   local events = preview.stream_ref("transcript", TRANSCRIPT_SCHEMA)
   return preview.stream {
     source = events,
     follow = "end",
     empty = preview.text { value = "No transcript yet.", style = "dim", wrap = "word" },
-    item = preview.cases {
-      reasoning = preview.markdown { value = preview.item("text"), theme = "reasoning", wrap = "word" },
-      assistant = preview.markdown { value = preview.item("text"), theme = "assistant", wrap = "word" },
-      tool_call = preview.value { value = preview.item("value"), format = "typed", style = "tool_call", wrap = "word" },
-      tool_result = preview.value { value = preview.item("value"), format = "typed", style = "tool_result", wrap = "word" },
-      validation = preview.value { value = preview.item("value"), format = "typed", style = "error", wrap = "word" },
-    },
+    item = transcript_cases(),
   }
 end
 
@@ -82,9 +89,9 @@ local function tool_exchange()
     source = events, follow = "end",
     empty = preview.text { value = "No tool activity yet.", style = "dim", wrap = "word" },
     item = preview.cases {
-      call = preview.value { value = preview.item("value"), format = "typed", style = "tool_call", wrap = "word" },
-      result = preview.value { value = preview.item("value"), format = "typed", style = "tool_result", wrap = "word" },
-      error = preview.value { value = preview.item("value"), format = "typed", style = "error", wrap = "word" },
+      call = preview.value { value = preview.item("value"), format = "tool_call", style = "tool_call", wrap = "word" },
+      result = preview.value { value = preview.item("value"), format = "tool_result", style = "tool_result", wrap = "word" },
+      error = preview.value { value = preview.item("value"), format = "tool_result", style = "error", wrap = "word" },
     },
   }
 end

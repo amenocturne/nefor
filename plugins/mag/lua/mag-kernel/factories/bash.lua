@@ -164,6 +164,7 @@ function M.construct(id, params, emit, deps)
       }
     end
     if type(activation.result) ~= "string" then
+      if preview_emit then preview_emit("set", "exit", { kind = "capability_error", error = "bash capability returned a non-text result" }) end
       return {
         status = "failed",
         failure = COMMAND_FAILED,

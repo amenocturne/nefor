@@ -111,8 +111,9 @@ function M.construct(id, params, emit, deps)
       messages[i] = to_message(r)
       observe("append", "tool_events", {
         kind = r.error ~= nil and "error" or "result",
-        id = r.id,
-        value = r.error ~= nil and { error = r.error } or r.output,
+        value = r.error ~= nil
+          and { id = r.id, name = r.name, error = r.error }
+          or { id = r.id, name = r.name, output = r.output },
       })
     end
     emit(sign({ kind = "generic-provider.ProviderOut",

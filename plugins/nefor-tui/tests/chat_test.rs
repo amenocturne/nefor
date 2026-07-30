@@ -8664,6 +8664,19 @@ fn declared_preview_interprets_without_factory_specific_renderer_and_updates_liv
         frame.contains("LIVE THIRD PARTY CONTENT"),
         "open inspector must repaint live:\n{frame}"
     );
+    let header_row = frame
+        .lines()
+        .position(|line| line.contains("node · custom.node"));
+    let body_row = frame
+        .lines()
+        .position(|line| line.contains("LIVE THIRD PARTY CONTENT"));
+    let footer_row = frame
+        .lines()
+        .position(|line| line.contains("Up/Down PgUp/PgDn"));
+    assert!(
+        matches!((header_row, body_row, footer_row), (Some(h), Some(b), Some(f)) if h < b && b < f),
+        "inspector must keep header above its flex body and pin the footer below it:\n{frame}"
+    );
     assert!(
         frame.contains("node · custom.node [read-only]"),
         "shared shell identity missing:\n{frame}"
@@ -8672,6 +8685,66 @@ fn declared_preview_interprets_without_factory_specific_renderer_and_updates_liv
         engine.take_emit_queue().is_empty(),
         "inspector observation must not emit"
     );
+}
+
+#[test]
+fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
+    let mut engine = Engine::new(110, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "transcriptish",
+        json!({
+            "kind": "stream", "source": { "binding": "stream", "name": "transcript", "schema": "table" },
+            "item": { "kind": "cases", "values": {
+                "reasoning": { "kind": "text", "value": { "binding": "item", "name": "text" }, "style": "reasoning" },
+                "assistant": { "kind": "markdown", "value": { "binding": "item", "name": "text" } },
+                "tool_call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
+                "tool_result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" }
+            } }
+        }),
+        json!({ "transcript": { "kind": "stream", "schema": "table" } }),
+    );
+    open_single_node(&mut engine, "transcriptish", "agent.node");
+    for (seq, value) in [
+        (1, json!({ "kind": "reasoning", "text": "reason " })),
+        (2, json!({ "kind": "reasoning", "text": "continued" })),
+        (
+            3,
+            json!({ "kind": "assistant", "text": "## Answer\ncomplete prose" }),
+        ),
+        (
+            4,
+            json!({ "kind": "tool_call", "value": { "id": "call-1", "name": "read_file", "arguments": { "path": "/a/complete/path" } } }),
+        ),
+        (
+            5,
+            json!({ "kind": "tool_result", "value": { "tool_call_id": "call-1", "content": "complete result body" } }),
+        ),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.node_preview", "run_id": "preview-run", "id": "agent.node",
+                "operation": "append", "binding": "transcript", "observation_seq": seq, "value": value
+            }),
+        );
+    }
+    let frame = render_snapshot(&mut engine);
+    for expected in [
+        "reason continued",
+        "Answer",
+        "complete prose",
+        "tool call · read_file · call-1",
+        "/a/complete/path",
+        "tool result · call-1",
+        "complete result body",
+    ] {
+        assert!(
+            frame.contains(expected),
+            "transcript lost {expected:?}:\n{frame}"
+        );
+    }
 }
 
 #[test]
