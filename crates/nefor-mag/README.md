@@ -107,6 +107,43 @@ Semantic type identities use compiler-created witnesses rather than strings:
 Unknown types fail at `type-tag`, and nominal values require explicit
 refinement with `(as Audit value)`.
 
+## Standalone compiler CLI
+
+`mag compile` exposes the same load-time evaluator and resident-rule checks as
+the runtime's `mag.load` path, but has no NCP transport, capability bridge, or
+run operation:
+
+```sh
+mag compile main.mag \
+  --source-dir ./program \
+  --module-root ./mag-libs \
+  --module-root ./project-libs \
+  --registry ./kernel-registry.json
+```
+
+`--module-root` and `--registry` are repeatable. With no module root, the source
+directory is the sole module root. A `.lua` registry is the same kernel
+definition file Nefor loads and must expose `registry_contracts`; loading it
+constructs only the immutable registry and cannot begin a run. A JSON registry
+is either the `foreign_contracts` array itself or an object containing that
+array, matching the immutable snapshot Nefor receives from its MAG kernel.
+Multiple files are concatenated in command-line order. The compiler does not
+supply a kernel or built-in factory registry; callers must provide the contracts
+their program uses.
+
+Stdout is exactly one compact JSON document. Both outcomes use envelope version
+`1`:
+
+```json
+{"version":1,"ok":true,"artifact":{"format":"...","data":{}},"hash":"..."}
+{"version":1,"ok":false,"error":{"code":"type_error","stage":"typecheck","message":"..."}}
+```
+
+Compilation failures exit `1`; argument/help handling uses clap's normal exit
+codes. Human-readable failure context goes to stderr, so subprocess consumers
+can parse stdout without filtering logs. The command only compiles and validates
+an artifact: there is deliberately no `run` or `execute` subcommand.
+
 The embedding API accepts immutable JSON inputs:
 
 ```rust,ignore

@@ -624,8 +624,8 @@ async fn handle_load(
                     .await
                 }
             };
-            if let Err(error) = validate_loaded_rules(&loaded, &artifact) {
-                return send_event(out_tx, error_body(in_reply_to, &error)).await;
+            if let Err(error) = nefor_mag::validate_loaded_rules(&loaded) {
+                return send_event(out_tx, error_body(in_reply_to, &error.to_string())).await;
             }
             // The registry's factory names ride along so the control plane can
             // validate reasoner/factory types against the kernel's source of
@@ -640,35 +640,6 @@ async fn handle_load(
         }
         Err(e) => send_event(out_tx, error_body(in_reply_to, &e.to_string())).await,
     }
-}
-
-fn validate_loaded_rules(program: &LoadedProgram, artifact: &Value) -> Result<(), String> {
-    if artifact.get("format").and_then(Value::as_str) != Some(GRAPH_MODIFICATION_FORMAT) {
-        return Ok(());
-    }
-    let data = artifact_data(artifact, GRAPH_MODIFICATION_FORMAT, "loaded program")?;
-    let rules = data
-        .get("rules")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for rule in rules {
-        let id = rule
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("<malformed>");
-        let function = rule
-            .get("fn")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("rule {id:?} missing function name"))?;
-        let input = rule
-            .get("on")
-            .and_then(|on| on.get("type"))
-            .ok_or_else(|| format!("rule {id:?} missing source semantic type"))?;
-        nefor_mag::validate_rule_fn_input(program, function, input)
-            .map_err(|error| format!("rule {id:?}: {error}"))?;
-    }
-    Ok(())
 }
 
 fn load_module_roots(body: &Map<String, Value>, source_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1834,7 +1805,7 @@ mod tests {
         )
         .expect("load program");
         let artifact = serde_json::to_value(&program.artifact).expect("artifact json");
-        validate_loaded_rules(&program, &artifact).expect("rules valid");
+        nefor_mag::validate_loaded_rules(&program).expect("rules valid");
         let modification = artifact_modification(&artifact).expect("normalize graph");
 
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

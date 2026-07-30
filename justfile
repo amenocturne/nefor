@@ -205,7 +205,9 @@ install-nefor channel="source":
       tar -xzf "$tmp/nefor.tar.gz" -C "$tmp"
       mkdir -p "$PREFIX/bin" "$LIBEXEC_BIN"
       install -m 0755 "$tmp/nefor-${target}/bin/nefor" "$PREFIX/bin/nefor"
+      install -m 0755 "$tmp/nefor-${target}/bin/mag" "$PREFIX/bin/mag"
       echo "  $PREFIX/bin/nefor"
+      echo "  $PREFIX/bin/mag"
       local installed=""
       for bin in "$tmp/nefor-${target}/share/nefor/plugins/"*; do
         install -m 0755 "$bin" "$LIBEXEC_BIN/$(basename "$bin")"
@@ -221,7 +223,9 @@ install-nefor channel="source":
         mkdir -p "$PREFIX/bin" "$LIBEXEC_BIN"
         cd "{{justfile_directory()}}"
         install -m 0755 "target/release/nefor" "$PREFIX/bin/nefor"
+        install -m 0755 "target/release/mag" "$PREFIX/bin/mag"
         echo "  $PREFIX/bin/nefor"
+        echo "  $PREFIX/bin/mag"
         # Derive runtime plugins from packages physically under plugins/.
         # Target names, not crate directories, are authoritative: the MAG
         # runtime directory is `mag`, while its binary is `mag-plugin`.

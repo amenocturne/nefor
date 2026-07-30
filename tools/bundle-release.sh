@@ -24,6 +24,11 @@ plugin_dir="$dist_dir/share/nefor/plugins"
 manifest="$dist_dir/share/nefor/plugins.manifest"
 mkdir -p "$dist_dir/bin" "$plugin_dir" "$dist_dir/share/nefor/starter"
 cp "$target_bin/nefor" "$dist_dir/bin/nefor"
+if [ ! -x "$target_bin/mag" ]; then
+  echo "missing compiler binary: $target_bin/mag" >&2
+  exit 1
+fi
+cp "$target_bin/mag" "$dist_dir/bin/mag"
 
 while IFS= read -r name; do
   [ -n "$name" ] || continue

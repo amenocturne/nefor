@@ -6,6 +6,7 @@ pub mod eval;
 pub mod json;
 pub mod lexer;
 pub mod parser;
+pub mod registry;
 pub mod schema;
 pub mod types;
 
@@ -187,6 +188,38 @@ pub fn validate_rule_fn_input(
         return Err(MagError::Type(format!(
             "rule function '{name}' input does not match its structural source type"
         )));
+    }
+    Ok(())
+}
+
+/// Validate every resident rule referenced by a graph-modification artifact.
+/// This is shared by `mag compile` and the runtime's `mag.load` path.
+pub fn validate_loaded_rules(program: &LoadedProgram) -> Result<(), MagError> {
+    if program.artifact.format != "nefor.graph-modification/v1" {
+        return Ok(());
+    }
+    let rules = program
+        .artifact
+        .data
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for rule in rules {
+        let id = rule
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<malformed>");
+        let function = rule
+            .get("fn")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| MagError::Type(format!("rule {id:?} missing function name")))?;
+        let input = rule
+            .get("on")
+            .and_then(|on| on.get("type"))
+            .ok_or_else(|| MagError::Type(format!("rule {id:?} missing source semantic type")))?;
+        validate_rule_fn_input(program, function, input)
+            .map_err(|error| MagError::Type(format!("rule {id:?}: {error}")))?;
     }
     Ok(())
 }

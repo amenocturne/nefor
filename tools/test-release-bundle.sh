@@ -30,4 +30,5 @@ if grep -qx 'mag' "$expected"; then
   exit 1
 fi
 test -x "$dist_dir/bin/nefor"
+test -x "$dist_dir/bin/mag"
 test -f "$dist_dir/share/nefor/starter/init.lua"
