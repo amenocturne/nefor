@@ -26,7 +26,7 @@ use crate::mouse::{
 use crate::reconciler::Reconciler;
 use crate::render::{extract_selection_text, Renderer, SelectionHighlight};
 use crate::scrollable::{
-    scroll_by_signed, DRAG_AUTO_SCROLL_EDGE_ROWS, DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS,
+    reveal_range, scroll_by_signed, DRAG_AUTO_SCROLL_EDGE_ROWS, DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS,
     DRAG_AUTO_SCROLL_STEP, WHEEL_STEP_ROWS,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -484,7 +484,8 @@ impl Engine {
         let key = match &cmd {
             ScrollCommand::To { key, .. }
             | ScrollCommand::By { key, .. }
-            | ScrollCommand::IntoView { key } => key.clone(),
+            | ScrollCommand::IntoView { key }
+            | ScrollCommand::Reveal { key, .. } => key.clone(),
         };
         let Some(root) = self.reconciler.root.as_mut() else {
             return Err(TuiError::InvalidDesc(format!(
@@ -519,6 +520,7 @@ impl Engine {
         let prev = st.scroll_y;
         match cmd {
             ScrollCommand::To { offset, .. } => {
+                st.reveal_range = None;
                 let max = st.scroll_y_max();
                 st.scroll_y = offset.min(max);
                 // Mirror was_at_* so stick_to handling stays consistent
@@ -534,12 +536,13 @@ impl Engine {
                 st.was_at_start = st.scroll_y == 0;
             }
             ScrollCommand::IntoView { .. } => {
-                // v1 minimal scope per spec: scroll to the bottom. Future
-                // iterations may resolve a focused-target's location
-                // within the scrollable.
+                st.reveal_range = None;
                 st.scroll_y = st.scroll_y_max();
                 st.was_at_end = true;
                 st.was_at_start = st.scroll_y == 0;
+            }
+            ScrollCommand::Reveal { start, end, .. } => {
+                reveal_range(st, start, end);
             }
         }
         let new_offset = st.scroll_y;

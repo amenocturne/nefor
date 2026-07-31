@@ -893,7 +893,7 @@ local function handle_session_start(msg, state)
   run_bindings = mag_run_bindings.new()
   return shallow_merge(state, {
     session_id = msg.session_id,
-    runs = {},
+    runs = os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1" and state.runs or {},
     node_previews = {}, preview_registry = {}, scope_to_run = {},
     lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
     instruction_notice_ids = {},
@@ -1994,8 +1994,49 @@ local function route_keys_and_popups(msg, state)
       local rows = run_panel.row_model(state, now)
       if #rows == 0 then return state, {} end
       local cur = run_panel.clamp_cursor(state.sidebar_cursor, #rows)
+      -- Wheel scrolling is passive: it moves only the viewport. On the next
+      -- navigation key, resume from the nearest visible row rather than
+      -- snapping the viewport back to an off-screen cursor.
+      local pos = tui.scroll_position("sidebar")
+      local viewport_start = pos.offset
+      local viewport_end = pos.offset + pos.viewport_size
+      local selected = rows[cur]
+      if selected.visual_end <= viewport_start then
+        for i, row in ipairs(rows) do
+          if row.visual_end > viewport_start then cur = i break end
+        end
+      elseif selected.visual_start >= viewport_end then
+        for i = #rows, 1, -1 do
+          if rows[i].visual_start < viewport_end then cur = i break end
+        end
+      end
       cur = cur + ((kind == "key.down") and 1 or -1)
       if cur < 1 then cur = 1 elseif cur > #rows then cur = #rows end
+      local row = rows[cur]
+      tui.scroll_reveal("sidebar", row.visual_start, row.visual_end)
+      return shallow_merge(state, { sidebar_cursor = cur }), {}
+    end
+    if kind == "key.home" or kind == "key.end" then
+      local rows = run_panel.row_model(state, now)
+      if #rows == 0 then return state, {} end
+      local cur = (kind == "key.home") and 1 or #rows
+      local row = rows[cur]
+      if kind == "key.home" then
+        tui.scroll_to("sidebar", 0)
+      else
+        tui.scroll_into_view("sidebar")
+      end
+      tui.scroll_reveal("sidebar", row.visual_start, row.visual_end)
+      return shallow_merge(state, { sidebar_cursor = cur }), {}
+    end
+    if kind == "key.pageup" or kind == "key.pagedown" then
+      local rows = run_panel.row_model(state, now)
+      if #rows == 0 then return state, {} end
+      local cur = run_panel.clamp_cursor(state.sidebar_cursor, #rows)
+      cur = cur + ((kind == "key.pagedown") and 10 or -10)
+      if cur < 1 then cur = 1 elseif cur > #rows then cur = #rows end
+      local row = rows[cur]
+      tui.scroll_reveal("sidebar", row.visual_start, row.visual_end)
       return shallow_merge(state, { sidebar_cursor = cur }), {}
     end
     if kind == "key.enter" then
@@ -2101,6 +2142,22 @@ function M.update(msg, state)
     next_state, effects = handler(msg, state)
   else
     next_state, effects = route_keys_and_popups(msg, state)
+  end
+  -- Model and geometry can change without a navigation key (actor events,
+  -- folds, linger pruning). Keep the focused selection valid and visible.
+  -- Mouse wheel events bypass Lua dispatch, so this does not fight passive
+  -- viewport scrolling; the next keyboard event deliberately resumes from
+  -- the nearest visible row in route_keys_and_popups.
+  if next_state.focus == "sidebar" then
+    local start, finish, cursor = run_panel.selected_visual_range(next_state, tui.now_ms())
+    if cursor ~= (next_state.sidebar_cursor or 1) then
+      next_state = shallow_merge(next_state, { sidebar_cursor = cursor })
+    end
+    local model_changed = kind:match("^mag%.") ~= nil or kind == "key.enter"
+      or state.focus ~= next_state.focus
+    if start ~= nil and model_changed then
+      tui.scroll_reveal("sidebar", start, finish)
+    end
   end
   return transcript.flush_graph_results_if_stable(next_state), effects
 end

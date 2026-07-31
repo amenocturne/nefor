@@ -1671,6 +1671,10 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
             _ => st.scroll_y.min(max),
         };
         st.scroll_y = scroll_y;
+        if let Some((start, end)) = st.reveal_range {
+            crate::scrollable::reveal_range(st, start, end);
+        }
+        let scroll_y = st.scroll_y;
         // Update edge bookkeeping so the next paint pass observes a
         // fresh `was_at_*` snapshot. Once content settles, content_height
         // stays small enough to fit, max == 0 so both edges are true.
@@ -3570,6 +3574,54 @@ mod tests {
             }
         }
         assert!(found_track, "track glyph should appear below thumb");
+    }
+
+    #[test]
+    fn scrollbar_thumb_lands_at_exact_top_middle_and_bottom() {
+        let desc = scrollable_with(long_column(20), "k", None, ScrollbarMode::Auto);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let bar_col = 9;
+
+        for (offset, expected_top) in [(0, 0), (7, 1), (15, 4)] {
+            if let Some(root) = rec.root.as_mut() {
+                if let InstanceState::Scrollable(s) = &mut root.state {
+                    s.scroll_y = offset;
+                    s.was_at_start = offset == 0;
+                    s.was_at_end = offset == 15;
+                }
+            }
+            let mut buf = FrameBuffer::new(10, 5);
+            layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+            let thumb_rows: Vec<_> = (0..5)
+                .filter(|row| cell_at(&buf, *row, bar_col) == "█")
+                .collect();
+            assert_eq!(thumb_rows, vec![expected_top], "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn scrollable_resize_fit_clamps_hides_bar_then_restores_overflow() {
+        let desc = scrollable_with(long_column(8), "k", None, ScrollbarMode::Auto);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut small = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut small);
+        if let Some(root) = rec.root.as_mut() {
+            if let InstanceState::Scrollable(s) = &mut root.state {
+                s.scroll_y = 3;
+            }
+        }
+
+        let mut large = FrameBuffer::new(10, 10);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 10, &mut large);
+        assert_eq!(scrollable_state(&rec).scroll_y, 0);
+        assert!((0..10).all(|row| cell_at(&large, row, 9) == " "));
+
+        let mut small_again = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut small_again);
+        assert_eq!(scrollable_state(&rec).scroll_y_max(), 3);
+        assert!((0..5).any(|row| cell_at(&small_again, row, 9) == "█"));
     }
 
     #[test]

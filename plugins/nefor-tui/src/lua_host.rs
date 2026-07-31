@@ -34,10 +34,10 @@ pub enum ScrollCommand {
     To { key: String, offset: u16 },
     /// Apply a relative delta (positive = down).
     By { key: String, delta: i32 },
-    /// Move the named scrollable's content so the focused/cursor target
-    /// is visible. v1 minimal scope: scroll to the bottom (matches the
-    /// chat-transcript "show me the latest" intent).
+    /// Move the named scrollable to its bottom (chat-transcript intent).
     IntoView { key: String },
+    /// Move only far enough to reveal a half-open vertical content range.
+    Reveal { key: String, start: u16, end: u16 },
 }
 
 /// Snapshot of every scrollable's current geometry, keyed by user_key.
@@ -617,6 +617,20 @@ fn install_tui(
         Ok(())
     })?;
     tui.set("scroll_into_view", scroll_into_view_fn)?;
+
+    let queue_for_reveal = Arc::clone(&scroll_queue);
+    let reveal_fn = lua.create_function(
+        move |_, (key, start, end): (String, u16, u16)| -> mlua::Result<()> {
+            if end < start {
+                return Err(mlua::Error::runtime(format!(
+                    "tui.scroll_reveal: `end` must be >= `start` (got {start}..{end})"
+                )));
+            }
+            lock(&queue_for_reveal).push(ScrollCommand::Reveal { key, start, end });
+            Ok(())
+        },
+    )?;
+    tui.set("scroll_reveal", reveal_fn)?;
 
     let positions_for_read = Arc::clone(&scroll_positions);
     let scroll_position_fn =

@@ -217,6 +217,35 @@ local function active_config()
   return {}
 end
 
+local function sidebar_fixture_runs()
+  if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") ~= "1" then return {} end
+  local nodes = {}
+  for i = 1, 20 do
+    nodes[string.format("fixture-%02d.member", i)] = {
+      reasoner = "test-fixture",
+      status = "pending",
+      started_at_ms = 0,
+      finished_at_ms = nil,
+      seq = i,
+    }
+  end
+  return {
+    ["sidebar-overflow-fixture"] = {
+      run_id = "sidebar-overflow-fixture",
+      run_name = "sidebar-overflow-fixture",
+      principal = "test",
+      total_nodes = 20,
+      started_at_ms = 0,
+      nodes = nodes,
+      completed_at_ms = nil,
+      status = nil,
+      rejected = 0,
+      noops = 0,
+      actor_seq = 20,
+    },
+  }
+end
+
 local function initial_state()
   local cfg = active_config()
   return {
@@ -236,6 +265,8 @@ local function initial_state()
     -- prompt widget's `focused` flag derives from this in view.lua.
     focus            = "prompt",
     sidebar_cursor   = 1,
+    runs             = sidebar_fixture_runs(),
+    sidebar_folds    = {},
     -- Generic current-session node previews: advertised declarations plus
     -- materialized lifecycle/binding state. Scope maps provider chat ids back
     -- to their owning run for full LLM observation traffic.

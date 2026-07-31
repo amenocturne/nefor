@@ -67,6 +67,10 @@ pub struct ScrollableState {
     /// gutter subtraction). Exposed to Lua via `tui.scrollable_inner_width`
     /// so height measurement uses the exact same width as real layout.
     pub inner_width: u16,
+    /// Passive reveal anchor maintained across geometry changes. Keyboard
+    /// navigation sets it; direct scrolling clears it so wheel input owns the
+    /// viewport until navigation chooses another row.
+    pub reveal_range: Option<(u16, u16)>,
 }
 
 impl ScrollableState {
@@ -133,11 +137,33 @@ pub const DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS: u64 = 60;
 /// The Lua API path (`apply_scroll_command`) used to mirror this update
 /// itself; sinking it here keeps wheel and `tui.scroll_by` symmetric.
 pub fn scroll_by_signed(state: &mut ScrollableState, delta: i32) {
+    state.reveal_range = None;
     let max = state.scroll_y_max();
     let next = (state.scroll_y as i32)
         .saturating_add(delta)
         .clamp(0, max as i32);
-    state.scroll_y = next as u16;
+    set_scroll_y(state, next as u16);
+}
+
+/// Move the viewport only as far as needed to reveal the half-open content
+/// range `[start, end)`. Callers describe content geometry; this function
+/// remains the single owner of offset, bounds, and sticky-anchor math.
+pub fn reveal_range(state: &mut ScrollableState, start: u16, end: u16) {
+    state.reveal_range = Some((start, end));
+    let viewport_end = state.scroll_y.saturating_add(state.viewport_height);
+    let next = if start < state.scroll_y {
+        start
+    } else if end > viewport_end {
+        end.saturating_sub(state.viewport_height)
+    } else {
+        state.scroll_y
+    };
+    set_scroll_y(state, next);
+}
+
+fn set_scroll_y(state: &mut ScrollableState, offset: u16) {
+    let max = state.scroll_y_max();
+    state.scroll_y = offset.min(max);
     state.was_at_end = state.scroll_y == max;
     state.was_at_start = state.scroll_y == 0;
 }
@@ -256,5 +282,39 @@ mod tests {
         scroll_by_signed(&mut s, 100);
         assert_eq!(s.scroll_y, 40);
         assert!(s.was_at_end, "landing at bottom must set was_at_end");
+    }
+
+    #[test]
+    fn reveal_range_moves_only_when_target_is_outside_viewport() {
+        let mut s = ScrollableState {
+            scroll_y: 10,
+            content_height: 50,
+            viewport_height: 8,
+            ..Default::default()
+        };
+        reveal_range(&mut s, 12, 13);
+        assert_eq!(s.scroll_y, 10, "visible middle row must not move");
+        reveal_range(&mut s, 4, 5);
+        assert_eq!(s.scroll_y, 4, "row above viewport aligns to top");
+        reveal_range(&mut s, 20, 21);
+        assert_eq!(s.scroll_y, 13, "row below viewport aligns to bottom");
+    }
+
+    #[test]
+    fn reveal_range_clamps_after_resize_and_for_short_content() {
+        let mut s = ScrollableState {
+            scroll_y: 30,
+            content_height: 40,
+            viewport_height: 15,
+            ..Default::default()
+        };
+        reveal_range(&mut s, 39, 40);
+        assert_eq!(s.scroll_y, 25, "reveal clamps to resized maximum");
+
+        s.content_height = 5;
+        s.viewport_height = 10;
+        reveal_range(&mut s, 4, 5);
+        assert_eq!(s.scroll_y, 0, "short content has no scroll offset");
+        assert!(s.was_at_start && s.was_at_end);
     }
 }

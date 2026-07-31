@@ -1,0 +1,464 @@
+{
+  "name": "starter-sidebar-overflow-remains-navigable",
+  "command": {
+    "argv": [
+      "bash",
+      "tests/tui/run-nefor-under-test.sh"
+    ],
+    "cwd": ".",
+    "cols": 100,
+    "rows": 16
+  },
+  "steps": [
+    {
+      "kind": "wait_text",
+      "text": "fixture-01",
+      "timeout_ms": 30000
+    },
+    {
+      "kind": "wait_not_text",
+      "text": "fixture-20",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Tab"
+    },
+    {
+      "kind": "wait_text",
+      "text": "Workflows · focused",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-02",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-03",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-04",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-05",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-06",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-07",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-08",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-09",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-10",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-11",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-12",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-13",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-14",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-15",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-16",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-17",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-18",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-19",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-20",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-20",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "wait_not_text",
+      "text": "fixture-01",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Down"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-20",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-19",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-18",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-17",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-16",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-15",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-14",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-13",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-12",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-11",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-10",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-09",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-08",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-07",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-06",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-05",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-04",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-03",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-02",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-01",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "wait_not_text",
+      "text": "fixture-20",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Up"
+    },
+    {
+      "kind": "wait_text",
+      "text": "fixture-01",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "key",
+      "key": "Tab"
+    },
+    {
+      "kind": "wait_not_text",
+      "text": "Workflows · focused",
+      "timeout_ms": 5000
+    },
+    {
+      "kind": "wait_idle",
+      "idle_ms": 1000,
+      "timeout_ms": 10000
+    },
+    {
+      "kind": "type",
+      "text": "the secret key is sidebar-ok"
+    },
+    {
+      "kind": "key",
+      "key": "Enter"
+    },
+    {
+      "kind": "wait_text",
+      "text": "secret key is now",
+      "timeout_ms": 30000
+    },
+    {
+      "kind": "wait_not_text",
+      "text": "[thinking",
+      "timeout_ms": 10000
+    },
+    {
+      "kind": "key",
+      "key": "CtrlC"
+    },
+    {
+      "kind": "wait_text",
+      "text": "NEFOR_EXIT_CODE=0",
+      "timeout_ms": 10000
+    },
+    {
+      "kind": "wait_exit",
+      "timeout_ms": 10000
+    },
+    {
+      "kind": "capture"
+    }
+  ]
+}

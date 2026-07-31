@@ -41,8 +41,13 @@ end
 function _G.tui.scroll_into_view(key)
   scroll_calls[#scroll_calls + 1] = { fn = "scroll_into_view", key = key }
 end
+function _G.tui.scroll_reveal(key, start, finish)
+  scroll_calls[#scroll_calls + 1] = {
+    fn = "scroll_reveal", key = key, start = start, finish = finish,
+  }
+end
 function _G.tui.scroll_position(key)
-  return { offset = 0, max = 100, key = key }
+  return { offset = 0, max = 100, viewport_size = 20, inner_width = 80, key = key }
 end
 function _G.tui.now_ms() return 0 end
 function _G.tui.dimensions() return { width = 120, height = 40 } end

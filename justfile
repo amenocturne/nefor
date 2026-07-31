@@ -71,6 +71,7 @@ test-tui-scenarios:
       tests/tui/starter-mock-smoke.json
       tests/tui/starter-mock-multi-turn.json
       tests/tui/starter-mode-commands.json
+      tests/tui/starter-sidebar-overflow.json
       tests/tui/starter-interrupt-recovery.json
     )
     for scenario in "${scenarios[@]}"; do
@@ -88,7 +89,8 @@ test-tui-scenarios:
         --env NEFOR_ENABLE_CHATGPT=0 \
         --env NEFOR_ENABLE_OLLAMA=0 \
         --env NEFOR_USE_REPO_PLUGIN_BINS=0 \
-        --env "NEFOR_TEST_FAST_MOCK=$fast_mock"
+        --env "NEFOR_TEST_FAST_MOCK=$fast_mock" \
+        --env "NEFOR_TEST_SIDEBAR_OVERFLOW=$([ "$scenario_name" = "starter-sidebar-overflow" ] && echo 1 || echo 0)"
     done
 
 # Backwards-compatible name for the full deterministic TUI scenario pack.

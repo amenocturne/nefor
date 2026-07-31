@@ -8294,6 +8294,157 @@ fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
     );
 }
 
+#[test]
+fn overflowing_sidebar_navigation_reveals_top_middle_and_bottom() {
+    let mut engine = Engine::new(120, 14).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "many-1", "run_name": "many" }),
+    );
+    for i in 1..=24 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.actor_spawned", "run_id": "many-1",
+                "id": format!("group{i:02}.llm"), "factory": "llm"
+            }),
+        );
+    }
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+
+    let pos = |engine: &Engine| -> (i64, i64) {
+        engine
+            .lua()
+            .load(r#"local p=tui.scroll_position("sidebar"); return p.offset,p.max"#)
+            .eval()
+            .expect("sidebar position")
+    };
+    let (top, max) = pos(&engine);
+    assert_eq!(top, 0);
+    assert!(max > 0, "long sidebar must overflow");
+    let top_frame = engine.snapshot();
+    let sidebar_bar = |frame: &str| -> Vec<usize> {
+        frame
+            .lines()
+            .enumerate()
+            .filter_map(|(row, line)| line.chars().skip(84).any(|cell| cell == '█').then_some(row))
+            .collect()
+    };
+    let top_thumb = sidebar_bar(&top_frame);
+    assert!(
+        !top_thumb.is_empty() && top_thumb[0] <= 1,
+        "overflowing sidebar must paint its thumb at the top:\n{top_frame}"
+    );
+
+    engine.handle_key(key("pagedown")).expect("first page down");
+    let _ = render_str(&mut engine);
+    engine
+        .handle_key(key("pagedown"))
+        .expect("second page down");
+    let _ = render_str(&mut engine);
+    let (middle, _) = pos(&engine);
+    assert!(
+        middle > 0 && middle < max,
+        "page navigation should reveal a middle row"
+    );
+
+    engine.handle_key(key("end")).expect("end");
+    let _ = render_str(&mut engine);
+    let (bottom, max) = pos(&engine);
+    assert_eq!(bottom, max, "End must reveal the final sidebar row");
+    let bottom_frame = engine.snapshot();
+    assert!(bottom_frame.contains("group24"));
+    let bottom_thumb = sidebar_bar(&bottom_frame);
+    assert!(
+        !bottom_thumb.is_empty() && bottom_thumb.last().copied() == Some(13),
+        "scrollbar thumb must land at the sidebar viewport bottom:\n{bottom_frame}"
+    );
+
+    engine.handle_key(key("down")).expect("bounded down");
+    let _ = render_str(&mut engine);
+    assert_eq!(pos(&engine).0, max, "Down at the final row stays bounded");
+
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Wheel,
+            x: 100,
+            y: 5,
+            button: Some("up"),
+            mods: vec![],
+        })
+        .expect("wheel sidebar up");
+    let _ = render_str(&mut engine);
+    let wheeled = pos(&engine).0;
+    assert_eq!(wheeled, max - 3, "wheel owns the viewport passively");
+    engine.handle_key(key("up")).expect("navigate after wheel");
+    let _ = render_str(&mut engine);
+    let after_key = pos(&engine).0;
+    assert!(
+        after_key <= wheeled,
+        "navigation resumes from the nearest visible row instead of snapping back down"
+    );
+
+    engine.handle_key(key("home")).expect("home");
+    let _ = render_str(&mut engine);
+    assert_eq!(pos(&engine).0, 0, "Home must reveal the first sidebar row");
+
+    engine.handle_resize(120, 40).expect("grow terminal");
+    let _ = render_str(&mut engine);
+    assert_eq!(
+        pos(&engine),
+        (0, 0),
+        "growing until content fits must clamp the offset and remove overflow"
+    );
+    let fitted = engine.snapshot();
+    assert!(
+        sidebar_bar(&fitted).is_empty(),
+        "auto scrollbar must disappear when resized content fits:\n{fitted}"
+    );
+
+    engine.handle_resize(120, 14).expect("shrink terminal");
+    let _ = render_str(&mut engine);
+    let (resized_offset, resized_max) = pos(&engine);
+    assert_eq!(
+        resized_offset, 0,
+        "top selection must remain visible after shrink"
+    );
+    assert!(resized_max > 0, "shrinking must restore sidebar overflow");
+    assert!(
+        !sidebar_bar(&engine.snapshot()).is_empty(),
+        "shrinking must restore the visible scrollbar"
+    );
+}
+
+#[test]
+fn short_sidebar_has_no_scroll_extent_and_keeps_content_width() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "short-1", "run_name": "short" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "short-1", "id": "worker.llm", "factory": "llm" }),
+    );
+    let _ = render_str(&mut engine);
+    let (offset, max, inner_width): (i64, i64, i64) = engine
+        .lua()
+        .load(r#"local p=tui.scroll_position("sidebar"); return p.offset,p.max,p.inner_width"#)
+        .eval()
+        .expect("sidebar position");
+    assert_eq!((offset, max), (0, 0));
+    assert_eq!(
+        inner_width, 36,
+        "auto scrollbar must not reserve a gutter or narrow the restored sidebar width"
+    );
+}
+
 // ── Run-result (mag workflow) rendering ──────────────────────────────────
 
 /// The collapsed run-result entry reads as a `mag workflow` line carrying

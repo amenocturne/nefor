@@ -357,30 +357,51 @@ function M.row_model(state, now_ms)
   local runs = state.runs or {}
   local streams = state.node_previews or {}
   local folds = state.sidebar_folds or {}
+  -- Content coordinates inside the scrollable. Padding contributes the first
+  -- row, then the two fixed title rows. Every navigable row owns its complete
+  -- painted range; callers never reconstruct layout from cursor indices.
+  local visual_y = 3
+  local first_run = true
+  local function append(row, height)
+    row.visual_start = visual_y
+    row.visual_end = visual_y + height
+    visual_y = row.visual_end
+    rows[#rows + 1] = row
+  end
   for _, run_id in ipairs(runs_in_creation_order(runs)) do
     local run = runs[run_id]
     if not is_expired(run, now_ms) then
+      if not first_run then visual_y = visual_y + 1 end
+      first_run = false
       local groups = build_groups(run)
-      rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run, groups = groups }
+      append({ kind = "run_header", run_id = run_id, run = run, groups = groups }, 1)
       local run_streams = streams[run_id] or {}
       local run_folds = folds[run_id] or {}
       for _, g in ipairs(groups) do
         local unfolded = run_folds[g.name] == true
-        rows[#rows + 1] = {
-          kind = "group", run_id = run_id, group = g,
-        }
+        append({ kind = "group", run_id = run_id, group = g }, 1)
         if unfolded then
           for _, m in ipairs(g.members) do
-            rows[#rows + 1] = {
+            local stream = run_streams[m.id]
+            local _, _, stale_text = actor_row_parts(m.id, m.node, stream, now_ms)
+            append({
               kind = "actor", run_id = run_id, actor_id = m.id,
-              node = m.node, stream = run_streams[m.id],
-            }
+              node = m.node, stream = stream,
+            }, stale_text ~= nil and 2 or 1)
           end
         end
       end
     end
   end
   return rows
+end
+
+function M.selected_visual_range(state, now_ms)
+  local rows = M.row_model(state, now_ms)
+  local cursor = M.clamp_cursor(state.sidebar_cursor, #rows)
+  local row = rows[cursor]
+  if row == nil then return nil, nil, cursor, rows end
+  return row.visual_start, row.visual_end, cursor, rows
 end
 
 -- Clamp a stored cursor against the current row model (rows shrink when
@@ -471,18 +492,14 @@ function M.panel(state)
   return tui.constrained {
     min_width = 28,
     max_width = 36,
-    child = tui.padding {
-      value = 1,
-      -- Drag-to-select scopes to this column. The sidebar doesn't
-      -- scroll, so the selection's content geometry equals the
-      -- column's painted rect — the engine paints into a rect-sized
-      -- scratch buffer and extracts plain text. Keyed so the engine
-      -- can re-resolve the captured widget across view rebuilds.
-      child = tui.column {
-        gap        = 0,
-        key        = "sidebar",
-        selectable = true,
-        children   = children,
+    child = tui.scrollable {
+      key = "sidebar",
+      stick_to = "start",
+      scrollbar = "auto",
+      selectable = true,
+      child = tui.padding {
+        value = 1,
+        child = tui.column { gap = 0, children = children },
       },
     },
   }
