@@ -35,7 +35,7 @@ local HELP_BODY = [[Keys:
   Up / Down    scroll transcript by one line
   PgUp / PgDn  scroll transcript by one page
   Home / End   jump to top / bottom
-  Ctrl+C       quit
+  Ctrl+C ×2    quit
   Ctrl+D       quit
 
 Slash commands:

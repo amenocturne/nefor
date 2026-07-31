@@ -21,6 +21,7 @@ local log          = require("libs.chat.log")
 local tool_display = require("libs.chat.tool_display")
 local height_cache = require("libs.chat.height_cache")
 local workflow_controls = require("libs.chat.workflow_controls")
+local exit_controls = require("libs.chat.exit_controls")
 local queued_input = require("libs.chat.queued_input")
 local mag_run_bindings = require("libs.mag-run-bindings")
 
@@ -612,12 +613,32 @@ local function handle_input_submit(msg, state)
   }
 end
 
-local function handle_exit(_msg, state)
+local function exit_effects(state)
   return state, {
     { kind = "send_to", target = "engine",
       body = { kind = "chat.interrupt_all" } },
     { kind = "exit" },
   }
+end
+
+local function handle_ctrl_c(_msg, state)
+  local next_state, decisions = exit_controls.press(state, tui.now_ms())
+  local effects = {}
+  for _, decision in ipairs(decisions) do
+    if decision.kind == "schedule_exit_timeout" then
+      effects[#effects + 1] = {
+        kind = "dispatch_after", delay_ms = decision.delay_ms,
+        body = { kind = "chat.exit_timeout", token = decision.token },
+      }
+    elseif decision.kind == "exit" then
+      return exit_effects(next_state)
+    end
+  end
+  return next_state, effects
+end
+
+local function handle_exit_timeout(msg, state)
+  return exit_controls.timeout(state, msg.token), {}
 end
 
 local function handle_toggle_sidebar(_msg, state)
@@ -1696,8 +1717,9 @@ end
 local handlers = {
   ["input.changed"]               = handle_input_changed,
   ["input.submit"]                = handle_input_submit,
-  ["key.ctrl_c"]                  = handle_exit,
-  ["key.ctrl_d"]                  = handle_exit,
+  ["key.ctrl_c"]                  = handle_ctrl_c,
+  ["chat.exit_timeout"]           = handle_exit_timeout,
+  ["key.ctrl_d"]                  = exit_effects,
   ["key.ctrl_b"]                  = handle_toggle_sidebar,
   ["key.tab"]                     = handle_focus_cycle,
   ["key.shift_tab"]               = handle_focus_cycle,
@@ -2043,6 +2065,12 @@ end
 function M.update(msg, state)
   state = prune_expired(state)
   local kind = msg.kind or ""
+  local user_action = kind:sub(1, 4) == "key."
+    or kind:sub(1, 6) == "input."
+    or kind:sub(1, 6) == "mouse."
+  if user_action and kind ~= "key.ctrl_c" then
+    state = exit_controls.reset(state)
+  end
   log.log("update", "dispatch kind=%s", kind)
   local handler = handlers[kind]
   if handler then return handler(msg, state) end

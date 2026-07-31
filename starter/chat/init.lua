@@ -264,6 +264,9 @@ local function initial_state()
     escape_token     = nil,
     escape_token_seq = 0,
     escape_count     = nil,
+    last_ctrl_c_ms   = nil,
+    exit_token       = nil,
+    exit_token_seq   = 0,
     runs             = {},
     toasts           = {},
     -- Hydrate from <data_root>/input-history so arrow-up in the chat
