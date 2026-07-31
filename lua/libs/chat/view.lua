@@ -52,6 +52,19 @@ local function thinking_widget(state)
   }
 end
 
+local function loading_widget(state)
+  local loading = state.resume_loading
+  if loading == nil then return nil end
+  local replayed = loading.replayed or 0
+  local body
+  if loading.total == nil then
+    body = "[loading session…]"
+  else
+    body = string.format("[loading session… %d/%d]", replayed, loading.total)
+  end
+  return tui.text { content = body, style = STYLE.system, wrap = "none" }
+end
+
 local function transcript(state)
   -- Welcome banner shows on a fresh surface only; the chat widget's
   -- `empty_view` slot accepts a fn returning the banner tree, which
@@ -120,7 +133,9 @@ function M.render(state)
   -- do: while the sidebar holds key focus the input drops `focused`,
   -- so the Rust router bubbles every key to the reducer's sidebar
   -- navigation instead of swallowing it into the text field.
-  local input_focused = not popup_owns_keys and state.focus ~= "sidebar"
+  local input_focused = not popup_owns_keys
+    and state.focus ~= "sidebar"
+    and state.resume_loading == nil
   local input_border_style
   if type(statusline.input_border_style) == "function" then
     input_border_style = statusline.input_border_style(state, input_focused)
@@ -137,9 +152,12 @@ function M.render(state)
   -- instead of reading as broken. Shows only while the draft is empty
   -- (a preserved draft stays visible), which is exactly the confusing
   -- case.
-  local prompt_placeholder = (not input_focused and state.focus == "sidebar")
-    and "— Tab to return"
-    or nil
+  local prompt_placeholder
+  if state.resume_loading ~= nil then
+    prompt_placeholder = "— rebuilding session"
+  elseif not input_focused and state.focus == "sidebar" then
+    prompt_placeholder = "— Tab to return"
+  end
   local input_field = W.prompt.view({
     state          = {
       value      = state.input_value,
@@ -183,6 +201,7 @@ function M.render(state)
     gap = 0,
     children = compact {
       blank_row(),
+      loading_widget(state),
       tui.expanded { child = transcript(state) },
       input_field,
       statusline.view(state),

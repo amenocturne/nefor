@@ -558,6 +558,8 @@ local function handle_input_submit(msg, state)
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
+        resume_loading = { session_id = id, replayed = 0 },
+        replay_mode = true,
       }), {
         sessions.emit_resume_request(id),
       }
@@ -919,12 +921,53 @@ local function handle_session_start(msg, state)
   }), {}
 end
 
-local function handle_replay_start(_msg, state)
-  return shallow_merge(state, { replay_mode = true }), {}
+local function handle_resume_loading(msg, state)
+  return shallow_merge(state, {
+    resume_loading = { session_id = msg.session_id, replayed = 0 },
+    replay_mode = true,
+  }), {}
+end
+
+local function handle_replay_start(msg, state)
+  if state.resume_loading == nil then
+    return shallow_merge(state, { replay_mode = true }), {}
+  end
+  local loading = state.resume_loading
+  return shallow_merge(state, {
+    replay_mode = true,
+    resume_loading = {
+      session_id = loading.session_id or msg.session_id,
+      replayed = loading.replayed or 0,
+      total = msg.count or 0,
+    },
+  }), {}
+end
+
+local function handle_replay_progress(msg, state)
+  if state.resume_loading == nil then return state, {} end
+  local previous = state.resume_loading.replayed or 0
+  local replayed = math.max(previous, msg.replayed or 0)
+  return shallow_merge(state, {
+    resume_loading = {
+      session_id = state.resume_loading.session_id or msg.session_id,
+      replayed = replayed,
+      total = msg.total or state.resume_loading.total,
+    },
+  }), {}
 end
 
 local function handle_replay_end(_msg, state)
-  return shallow_merge(state, { replay_mode = NIL_SENTINEL }), {}
+  if state.resume_loading == nil then
+    return shallow_merge(state, { replay_mode = NIL_SENTINEL }), {}
+  end
+  return state, {}
+end
+
+local function handle_resume_done(_msg, state)
+  return shallow_merge(state, {
+    replay_mode = NIL_SENTINEL,
+    resume_loading = NIL_SENTINEL,
+  }), {}
 end
 
 local function handle_chat_reset(_msg, state)
@@ -1773,8 +1816,11 @@ local handlers = {
   ["chat.escape_timeout"]         = handle_escape_timeout,
   ["sessions.session_end"]        = handle_session_end,
   ["sessions.session_start"]      = handle_session_start,
+  ["sessions.resume_loading"]     = handle_resume_loading,
   ["sessions.replay.start"]       = handle_replay_start,
+  ["sessions.replay.progress"]    = handle_replay_progress,
   ["sessions.replay.end"]         = handle_replay_end,
+  ["sessions.resume_done"]        = handle_resume_done,
   ["chat.reset"]                  = handle_chat_reset,
   ["chat.message.append"]         = handle_message_append,
   ["chat.error.append"]           = handle_error_append,
@@ -1961,6 +2007,8 @@ local function route_keys_and_popups(msg, state)
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           queued_entry_idx = NIL_SENTINEL,
+          resume_loading = { session_id = result.selected.id, replayed = 0 },
+          replay_mode = true,
         }), {
           sessions.emit_resume_request(result.selected.id),
         }

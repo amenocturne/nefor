@@ -307,6 +307,7 @@ fn resume_emits_lifecycle_markers_in_order() {
     let expected = vec![
         "emit:sessions.session_end",
         "emit:sessions.session_start",
+        "emit:sessions.resume_loading",
         "emit:sessions.replay.start",
         "emit:sessions.replay.end",
         "emit:sessions.resume_done",
@@ -652,6 +653,7 @@ fn resume_to_self_replays_log_so_chat_repaints() {
     let expected = vec![
         "emit:sessions.session_end",
         "emit:sessions.session_start",
+        "emit:sessions.resume_loading",
         "emit:sessions.replay.start",
         // The replayed entry — chat.input.submit was the seeded payload.
         "emit:chat.input.submit",
@@ -1291,6 +1293,69 @@ fn resume_skips_malformed_and_non_object_jsonl_rows() {
     assert!(
         kinds.iter().any(|k| k == "chat.message.append"),
         "valid row should still replay after malformed rows: {kinds:?}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
+fn resume_progress_is_monotonic_and_bounded() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let session_id = "11111111-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let mut rows = String::from("{\"_session\":true}\n");
+    for i in 0..10_000 {
+        rows.push_str(&format!(
+            "{{\"origin\":\"step\",\"payload\":\"{{\\\"type\\\":\\\"event\\\",\\\"body\\\":{{\\\"kind\\\":\\\"chat.stream.delta\\\",\\\"text\\\":\\\"{i}\\\"}}}}\"}}\n"
+        ));
+    }
+    std::fs::write(sessions_dir.join(format!("{session_id}.jsonl")), rows)
+        .expect("session fixture");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        _progress = {}
+        local json = nefor.json
+        nefor.engine.send = function(payload, _target)
+          local decoded = json.decode(payload)
+          if decoded.body.kind == "sessions.replay.progress" then
+            _progress[#_progress + 1] = decoded.body.replayed
+          end
+        end
+        local sessions = require("sessions")
+        sessions.init()
+        _trace = {}
+        sessions.resume("11111111-2222-4333-8444-555555555555")
+        "#,
+    )
+    .exec()
+    .expect("resume fixture");
+
+    let progress: Table = lua.globals().get("_progress").expect("progress");
+    let values: Vec<i64> = progress
+        .sequence_values()
+        .collect::<mlua::Result<_>>()
+        .expect("values");
+    assert!(!values.is_empty(), "large resumes should report progress");
+    assert!(
+        values.len() <= 100,
+        "progress updates must stay bounded: {}",
+        values.len()
+    );
+    assert!(
+        values.windows(2).all(|pair| pair[0] < pair[1]),
+        "progress must be strictly monotonic: {values:?}"
     );
 
     match prev.as_deref() {

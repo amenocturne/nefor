@@ -306,6 +306,73 @@ fn batched_stream_deltas_render_in_a_single_pass() {
 }
 
 #[test]
+fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_loading", "session_id": "resume-1" }),
+    );
+    let initial = render_str(&mut engine);
+    assert!(
+        initial.contains("loading session"),
+        "loading state must paint immediately: {initial:?}"
+    );
+    assert!(
+        initial.contains("rebuilding session"),
+        "input must read as unavailable while rebuilding: {initial:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.start", "session_id": "resume-1", "count": 200 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.progress", "session_id": "resume-1", "replayed": 64, "total": 200 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.progress", "session_id": "resume-1", "replayed": 32, "total": 200 }),
+    );
+    let progress = render_str(&mut engine);
+    assert!(
+        progress.contains("64/200"),
+        "progress must not regress: {progress:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.end", "session_id": "resume-1" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.progress", "session_id": "resume-1", "replayed": 96, "total": 200 }),
+    );
+    let draining = render_str(&mut engine);
+    assert!(
+        draining.contains("96/200"),
+        "loading must survive replay end while the TUI drain completes: {draining:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "resume-1", "replayed": 200 }),
+    );
+    let done = render_str(&mut engine);
+    assert!(
+        !done.contains("loading session"),
+        "resume_done must clear loading: {done:?}"
+    );
+    assert!(
+        !done.contains("rebuilding session"),
+        "resume_done must restore normal input: {done:?}"
+    );
+}
+
+#[test]
 fn streaming_delta_appends_to_transcript() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

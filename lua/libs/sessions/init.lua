@@ -16,9 +16,11 @@
 --
 --   sessions.session_start { session_id, from_resume? }
 --   sessions.session_end   { session_id }
---   sessions.replay.start  { session_id, count }
---   sessions.replay.end    { session_id }
---   sessions.resume_done   { session_id, replayed }
+--   sessions.resume_loading { session_id }
+--   sessions.replay.start   { session_id, count }
+--   sessions.replay.progress { session_id, replayed, total }
+--   sessions.replay.end     { session_id }
+--   sessions.resume_done    { session_id, replayed }
 --     ↑ emitted
 --
 --   sessions.resume_request { session_id }
@@ -273,15 +275,22 @@ local function count_replay_entries(path)
   return count
 end
 
+local MAX_PROGRESS_UPDATES = 100
+local MIN_PROGRESS_STEP = 32
+
 ---@param path string
+---@param total integer
+---@param session_id string
+---@param report_progress boolean
 ---@return integer count
-local function replay_jsonl(path)
+local function replay_jsonl(path, total, session_id, report_progress)
   local fh = io.open(path, "r")
   if not fh then return 0 end
 
   local count = 0
+  local progress_step = math.max(MIN_PROGRESS_STEP, math.ceil(total / MAX_PROGRESS_UPDATES))
+  local next_progress = progress_step
   for line in fh:lines() do
-    -- Skip the header (cheap substring; full parse only on entries).
     if line:sub(1, 12) ~= [[{"_session":]] then
       local ok, decoded = pcall(json.decode, line)
       -- Replay every step-origin entry — those are the dispatch hook's
@@ -298,6 +307,11 @@ local function replay_jsonl(path)
           target  = decoded.target,  -- may be nil (broadcast)
         })
         count = count + 1
+        if report_progress and count >= next_progress and count < total then
+          send_msg({ kind = "control", event = "sessions.replay.progress",
+                     extra = { session_id = session_id, replayed = count, total = total } })
+          next_progress = count + progress_step
+        end
       end
     end
   end
@@ -306,7 +320,9 @@ local function replay_jsonl(path)
 end
 
 ---@param target_session_id string
-local function do_resume(target_session_id)
+---@param show_loading boolean|nil
+local function do_resume(target_session_id, show_loading)
+  if show_loading == nil then show_loading = true end
   -- Same-id resume is a re-load, not a no-op. Chat.lua's `/resume`
   -- and picker handlers locally clear the transcript BEFORE emitting
   -- `sessions.resume_request` (the imminent replay is expected to
@@ -355,11 +371,19 @@ local function do_resume(target_session_id)
   -- (it sees the framing markers in entry order and flips the flag
   -- inline before calling `to_plugin` for each entry — bus.on_event
   -- subscribers fire too late for the same batch).
+  -- Loading starts before the full-file count pass so even a large
+  -- session whose total is not known yet produces an immediate frame.
+  if show_loading then
+    send_msg({ kind = "control", event = "sessions.resume_loading",
+               extra = { session_id = target_session_id } })
+  end
   local total = new_path and count_replay_entries(new_path) or 0
   replay_window.set(true)
   send_msg({ kind = "control", event = "sessions.replay.start",
              extra = { session_id = target_session_id, count = total } })
-  local replayed = new_path and replay_jsonl(new_path) or 0
+  local replayed = new_path
+    and replay_jsonl(new_path, total, target_session_id, show_loading)
+    or 0
   send_msg({ kind = "control", event = "sessions.replay.end",
              extra = { session_id = target_session_id } })
   replay_window.set(false)
@@ -393,7 +417,7 @@ local function do_init(resume_id)
   state.initialised = true
 
   if resume_id and resume_id ~= "" then
-    do_resume(resume_id)
+    do_resume(resume_id, false)
     return resume_id
   end
 
