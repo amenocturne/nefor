@@ -1549,6 +1549,46 @@ do
   assert_true(exec ~= nil, "yolo bypasses writer MAG execute approval gate")
 end
 
+-- A killed lead run invalidates its parked write-review correlation. A late
+-- verdict cannot approve dead work, and the next run can still request approval.
+do
+  fresh()
+  local session_id = sessions.current_id()
+  invoke_tool_with_metadata("dead-plan", "write-review",
+    { plan = "dead run plan", view = "inline" },
+    { invocation = invocation(session_id, "lead", "dead-run/cap-1") })
+  local plan = lw._internals.state.active_plan
+  assert_eq(plan.pending_firing_id, "dead-plan", "write-review parks the firing")
+  assert_eq(plan.pending_correlation, "dead-run/cap-1", "write-review records correlation")
+  assert_eq(plan.pending_run_id, "run-provenance", "write-review records owning run")
+
+  feed("mag", { kind = "mag.run_result", run_id = "run-provenance", status = "killed" })
+  assert_eq(lw._internals.state.active_plan, nil, "killed owner clears pending approval state")
+  _test.calls_clear()
+  feed("nefor-tui", { kind = "chat.command", name = "approve", args = "too late" })
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "dead-plan"
+  end), nil, "late approval for a dead run emits no verdict")
+
+  invoke_tool_with_metadata("cancelled-plan", "write-review",
+    { plan = "cancelled plan", view = "inline" },
+    { invocation = invocation(session_id, "lead", "cancelled-run/cap-1") })
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "cancelled-plan" })
+  assert_eq(lw._internals.state.active_plan, nil,
+    "hard cancellation clears the parked write-review state")
+
+  invoke_tool_with_metadata("fresh-plan", "write-review",
+    { plan = "fresh run plan", view = "inline" },
+    { invocation = invocation(session_id, "lead", "fresh-run/cap-1") })
+  assert_eq(lw._internals.state.active_plan.pending_firing_id, "fresh-plan",
+    "future write-review remains usable")
+  feed("nefor-tui", { kind = "chat.command", name = "approve", args = "ship" })
+  assert_true(find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "fresh-plan"
+      and c.body.output.status == "approved"
+  end) ~= nil, "future approval resolves normally")
+end
+
 -- ------------------------------------------------------------------
 -- session_end terminates active graph AND flushes the plan slot
 -- ------------------------------------------------------------------

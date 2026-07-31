@@ -3002,6 +3002,149 @@ fn statusline_shows_current_permission_mode() {
 }
 
 #[test]
+fn mag_human_approval_is_run_addressed_and_cancel_safe() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.approval_request", "run_id": "run-dead", "from": "gate-a",
+            "correlation": "approval-a", "prompt": "Ship it?", "subject": { "plan": "A" }
+        }),
+    );
+    assert!(render_str(&mut engine).contains("Ship it?"));
+
+    // The kernel emits this for hard kill, terminate, and run teardown. Once
+    // retracted, a key intended for the stale popup cannot reach the dead run.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.approval_cancel", "run_id": "run-dead", "from": "gate-a",
+            "correlation": "approval-a"
+        }),
+    );
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("a")).expect("late approval key");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "late approval must emit no mag.apply"
+    );
+
+    // A future request still works and carries both run and gate addressing.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.approval_request", "run_id": "run-live", "from": "gate-b",
+            "correlation": "approval-b", "prompt": "Continue?", "subject": { "plan": "B" }
+        }),
+    );
+    engine.handle_key(key("a")).expect("approve");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1);
+    let body = serde_json::Value::Object(emits[0].1.clone());
+    assert_eq!(body.get("kind").and_then(|v| v.as_str()), Some("mag.apply"));
+    assert_eq!(
+        body.get("run_id").and_then(|v| v.as_str()),
+        Some("run-live")
+    );
+    assert_eq!(
+        body.pointer("/modification/messages/0/to")
+            .and_then(|v| v.as_str()),
+        Some("gate-b")
+    );
+    assert_eq!(
+        body.pointer("/modification/messages/0/content/kind")
+            .and_then(|v| v.as_str()),
+        Some("mag.ApprovalReply")
+    );
+    assert_eq!(
+        body.pointer("/modification/messages/0/content/approved")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn mag_approval_cancel_only_retracts_its_correlated_popup() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for (run, gate, correlation, prompt) in [
+        ("run-a", "gate-a", "approval-a", "First approval"),
+        ("run-b", "gate-b", "approval-b", "Unrelated approval"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.approval_request", "run_id": run, "from": gate,
+                "correlation": correlation, "prompt": prompt, "subject": {}
+            }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.approval_cancel", "run_id": "run-a", "from": "gate-a",
+            "correlation": "approval-a"
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("Unrelated approval"),
+        "queued unrelated approval must advance: {out:?}"
+    );
+    engine.handle_key(key("d")).expect("deny unrelated");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1);
+    assert_eq!(
+        emits[0].1.get("run_id").and_then(|v| v.as_str()),
+        Some("run-b")
+    );
+    let body = serde_json::Value::Object(emits[0].1.clone());
+    assert_eq!(
+        body.pointer("/modification/messages/0/content/approved")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
+
+#[test]
+fn terminal_run_and_session_cleanup_retract_mag_approvals() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.approval_request", "run_id": "run-terminal", "from": "gate",
+            "correlation": "approval", "prompt": "Stale", "subject": {}
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_result", "run_id": "run-terminal", "status": "killed"
+        }),
+    );
+    assert!(!render_str(&mut engine).contains("Stale"));
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.approval_request", "run_id": "run-session", "from": "gate",
+            "correlation": "approval-session", "prompt": "Session stale", "subject": {}
+        }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "sessions.session_end" }));
+    assert!(!render_str(&mut engine).contains("Session stale"));
+    engine.handle_key(key("a")).expect("late session approval");
+    assert!(engine.take_emit_queue().is_empty());
+}
+
+#[test]
 fn tool_permission_request_opens_popup_with_approve_deny() {
     // Wire-shape contract: the event the popup listens for is
     // `chat.tool.popup_request` — emitted by starter/tool-validator

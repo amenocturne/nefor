@@ -47,6 +47,50 @@ local function pop_next_popup(state_tbl)
   return { popup = NIL_SENTINEL }
 end
 
+local function is_permission_popup(popup)
+  return type(popup) == "table" and popup.variant == "tool_permission"
+end
+
+local function enqueue_permission_popup(state, popup)
+  if is_permission_popup(state.popup) then
+    local queue = {}
+    for _, queued in ipairs(state.popup_queue or {}) do queue[#queue + 1] = queued end
+    queue[#queue + 1] = popup
+    return shallow_merge(state, { popup_queue = queue })
+  end
+  return shallow_merge(state, { popup = popup })
+end
+
+local function is_mag_approval(popup, run_id, correlation)
+  return is_permission_popup(popup)
+      and popup.permission_kind == "mag_approval"
+      and popup.run_id == run_id
+      and (correlation == nil or popup.correlation == correlation)
+end
+
+local function retract_mag_approvals(state, run_id, correlation)
+  local current_matches = is_mag_approval(state.popup, run_id, correlation)
+  local queue = {}
+  for _, popup in ipairs(state.popup_queue or {}) do
+    if not is_mag_approval(popup, run_id, correlation) then
+      queue[#queue + 1] = popup
+    end
+  end
+
+  local patch = {}
+  if current_matches then
+    local remaining = shallow_merge(state, {
+      popup_queue = #queue > 0 and queue or NIL_SENTINEL,
+    })
+    patch = pop_next_popup(remaining)
+  elseif #queue ~= #(state.popup_queue or {}) then
+    patch.popup_queue = #queue > 0 and queue or NIL_SENTINEL
+  else
+    return state
+  end
+  return shallow_merge(state, patch)
+end
+
 -- Per-model context window sizes reported by the provider's model list.
 -- Populated by chat.models.listed events; keyed by model id.
 local model_context_windows = {}
@@ -709,6 +753,37 @@ local function handle_escape_timeout(msg, state)
   return apply_control_decisions(workflow_controls.escape_timeout(state, msg.token))
 end
 
+local function permission_response(popup, approved)
+  if popup.permission_kind == "mag_approval" then
+    local reply = { kind = "mag.ApprovalReply", approved = approved }
+    if not approved then reply.reason = "Denied by user" end
+    return {
+      kind = "send_to", target = "mag",
+      body = {
+        kind = "mag.apply",
+        run_id = popup.run_id,
+        source = "chat.human_approval",
+        modification = { messages = { { to = popup.gate_id, content = reply } } },
+      },
+    }
+  end
+  return {
+    kind = "send_to", target = "engine",
+    body = {
+      kind = "tool.permission_response",
+      id = popup.id,
+      decision = approved and "approve" or "deny",
+    },
+  }
+end
+
+local function resolve_permission(state, approved)
+  local popup = state.popup
+  return shallow_merge(state, pop_next_popup(state)), {
+    permission_response(popup, approved),
+  }
+end
+
 local function handle_escape(_msg, state)
   -- 1a) Info / warning / error popups: Esc dismisses the popup only
   -- (toasts stay). Matches the same Enter/Q path in route_keys_and_popups.
@@ -723,11 +798,7 @@ local function handle_escape(_msg, state)
   if state.popup or has_toast then
     -- Tool permission ESC = deny.
     if state.popup and state.popup.variant == "tool_permission" then
-      local id = state.popup.id
-      return shallow_merge(state, pop_next_popup(state)), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "tool.permission_response", id = id, decision = "deny" } },
-      }
+      return resolve_permission(state, false)
     end
     return shallow_merge(state, { popup = NIL_SENTINEL, toasts = {} }), {}
   end
@@ -763,6 +834,7 @@ local function handle_session_end(_msg, state)
     turn_started_at  = NIL_SENTINEL,
     last_turn_duration_ms = NIL_SENTINEL,
     popup            = NIL_SENTINEL,
+    popup_queue      = NIL_SENTINEL,
     toasts           = {},
     completion       = NIL_SENTINEL,
     last_esc_ms      = NIL_SENTINEL,
@@ -1409,13 +1481,42 @@ local function handle_tool_popup_request(msg, state)
     body    = body,
     source  = msg.source,
   }
-  if state.popup and state.popup.variant == "tool_permission" then
-    local queue = {}
-    for _, q in ipairs(state.popup_queue or {}) do queue[#queue + 1] = q end
-    queue[#queue + 1] = new_popup
-    return shallow_merge(state, { popup_queue = queue }), {}
+  return enqueue_permission_popup(state, new_popup), {}
+end
+
+local function handle_mag_approval_request(msg, state)
+  if state.replay_mode then return state, {} end
+  if type(msg.run_id) ~= "string" or msg.run_id == ""
+      or type(msg.from) ~= "string" or msg.from == ""
+      or type(msg.correlation) ~= "string" or msg.correlation == "" then
+    return state, {}
   end
-  return shallow_merge(state, { popup = new_popup }), {}
+  local subject = msg.subject
+  local body = msg.prompt
+  if type(body) ~= "string" or body == "" then
+    if type(subject) == "table" then body = format_args(subject)
+    elseif subject ~= nil then body = tostring(subject)
+    else body = "Approval requested"
+    end
+  end
+  return enqueue_permission_popup(state, {
+    variant = "tool_permission",
+    permission_kind = "mag_approval",
+    tool = msg.prompt or "Human approval",
+    body = body,
+    id = msg.correlation,
+    correlation = msg.correlation,
+    run_id = msg.run_id,
+    gate_id = msg.from,
+    subject = msg.subject,
+  }), {}
+end
+
+local function handle_mag_approval_cancel(msg, state)
+  if type(msg.run_id) ~= "string" or type(msg.correlation) ~= "string" then
+    return state, {}
+  end
+  return retract_mag_approvals(state, msg.run_id, msg.correlation), {}
 end
 
 local function handle_gate_mode_changed(msg, state)
@@ -1548,7 +1649,8 @@ local function handle_mag_run_complete(msg, state)
   local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
   local now = tui.now_ms()
-  return preview_state.finish_run(run_panel.mag_run_complete(state, run_id, "success", now), run_id, "done", now), {}
+  local next = preview_state.finish_run(run_panel.mag_run_complete(state, run_id, "success", now), run_id, "done", now)
+  return retract_mag_approvals(next, run_id), {}
 end
 
 -- A run that ended on an unhandled failure. Same linger→prune bookkeeping as
@@ -1559,7 +1661,13 @@ local function handle_mag_run_failed(msg, state)
   local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
   local now = tui.now_ms()
-  return preview_state.finish_run(run_panel.mag_run_failed(state, run_id, "failed", now), run_id, "failed", now), {}
+  local next = preview_state.finish_run(run_panel.mag_run_failed(state, run_id, "failed", now), run_id, "failed", now)
+  return retract_mag_approvals(next, run_id), {}
+end
+
+local function handle_mag_run_result(msg, state)
+  if type(msg.run_id) ~= "string" then return state, {} end
+  return retract_mag_approvals(state, msg.run_id), {}
 end
 
 -- The tool gate broadcasts `tool-gate.tool.invoke { id, from, name, args }`
@@ -1635,6 +1743,8 @@ local handlers = {
   ["mag.hello"]                   = handle_mag_contracts,
   ["mag.loaded"]                  = handle_mag_contracts,
   ["mag.run_started"]             = handle_mag_run_started,
+  ["mag.approval_request"]        = handle_mag_approval_request,
+  ["mag.approval_cancel"]         = handle_mag_approval_cancel,
   ["mag.node_preview"]            = handle_mag_node_preview,
   ["mag.modification_applied"]    = handle_mag_modification_applied,
   ["mag.actor_spawned"]           = handle_mag_actor_spawned,
@@ -1646,6 +1756,7 @@ local handlers = {
   ["mag.modification_noop"]       = handle_mag_modification_noop,
   ["mag.run_complete"]            = handle_mag_run_complete,
   ["mag.run_failed"]              = handle_mag_run_failed,
+  ["mag.run_result"]              = handle_mag_run_result,
   ["mouse.selection"]             = handle_mouse_selection,
 }
 
@@ -1694,18 +1805,10 @@ local function route_keys_and_popups(msg, state)
   -- Tool permission popup keys.
   if state.popup and state.popup.variant == "tool_permission" then
     if kind == "key.a" or kind == "key.A" or kind == "key.enter" then
-      local id = state.popup.id
-      return shallow_merge(state, pop_next_popup(state)), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "tool.permission_response", id = id, decision = "approve" } },
-      }
+      return resolve_permission(state, true)
     end
     if kind == "key.d" or kind == "key.D" then
-      local id = state.popup.id
-      return shallow_merge(state, pop_next_popup(state)), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "tool.permission_response", id = id, decision = "deny" } },
-      }
+      return resolve_permission(state, false)
     end
   end
 

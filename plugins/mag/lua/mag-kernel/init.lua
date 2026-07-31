@@ -32,6 +32,7 @@ local structured_output = require("factories.structured-output")
 local collector = require("factories.collector")
 local collect_item = require("factories.collect-item")
 local collected_prompt = require("factories.collected-prompt")
+local retry_gate = require("factories.retry-gate")
 
 -- Shared per-node output persistence (lua/libs/output-persistence). The mag
 -- plugin host currently exposes only nefor.log (plugins/mag/src/kernel.rs,
@@ -85,6 +86,7 @@ local function build_registry()
   seed(collector)
   seed(collect_item)
   seed(collected_prompt)
+  seed(retry_gate)
   seed(run_tool)
   seed(tool_result)
   seed(adapter)
@@ -402,6 +404,15 @@ local function new_run_context(meta)
         return persist_output(record.id, output)
       end,
       preview = router:preview_emitter(record.id),
+      diagnostic = function(diagnostic)
+        diagnostic = diagnostic or {}
+        emit_event({
+          kind = "mag.diagnostic",
+          code = diagnostic.kind,
+          from = record.id,
+          gate = diagnostic.gate,
+        })
+      end,
     }
     return registry:construct(record.factory, record.id, record.params, emit, deps)
   end)

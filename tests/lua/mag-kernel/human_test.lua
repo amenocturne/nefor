@@ -20,7 +20,7 @@
 --     sink completes the run;
 --   * reply-before-construction REJECTS the modification (loud, at apply —
 --     a reply answers an outstanding request; nothing is parked or lost);
---   * reply at a dead gate stays a race-artifact drop;
+--   * reply at a dead gate rejects after kill retracts the request;
 --   * drain surfaces `mag.approval_cancel`;
 --   * apply-time validation accepts the gate template's wiring against the
 --     real shipped factories (llm / human / adapter / sink).
@@ -325,8 +325,8 @@ do
 end
 
 -- ==================================================================
--- (4) a reply at a DEAD gate is a race artifact: passes validation, drops at
--- delivery as a logged no-op, never escalates
+-- (4) a reply at a DEAD gate is rejected: kill retracted the request, so the
+-- dead run can no longer consume approval
 -- ==================================================================
 
 do
@@ -334,17 +334,27 @@ do
   assert_eq(h.obs:apply({ actors = gate_actors(), messages = { seed_message() } }).ok, true,
     "the constellation applies and the gate constructs")
   assert_eq(h.obs:apply({ kills = { "approve" } }).ok, true, "the kill applies")
+  local cancels = events_of_kind(h, "mag.approval_cancel")
+  assert_eq(#cancels, 1, "hard kill retracts the outstanding approval request")
+  assert_eq(cancels[1].correlation, "approve", "kill cancellation preserves correlation")
 
   local result = h.obs:apply({
     messages = { reply_message("approve", { approved = true, content = "late" }) },
   })
-  assert_eq(result.ok, true, "a reply at a dead gate passes validation (settled race semantics)")
-  local logged = false
-  for _, line in ipairs(h.log.info) do
-    if line:find("dead", 1, true) then logged = true end
-  end
-  assert_true(logged, "the dead-target drop is logged")
-  assert_eq(#events_of_kind(h, "mag.run_failed"), 0, "the race artifact never escalates")
+  assert_eq(result.ok, false, "late approval for a dead run is rejected")
+  assert_contains(result.error, "no outstanding approval request",
+    "late approval reports the retracted request")
+  assert_eq(#events_of_kind(h, "mag.run_failed"), 0,
+    "rejecting a late control-plane reply does not fail another run")
+
+  local fresh = harness()
+  assert_eq(fresh.obs:apply({ actors = gate_actors(), messages = { seed_message() } }).ok, true,
+    "a fresh run can open approval after the killed run")
+  assert_eq(fresh.obs:apply({
+    messages = { reply_message("approve", { approved = true, content = "fresh" }) },
+  }).ok, true, "future approval remains usable")
+  assert_eq(#events_of_kind(fresh, "mag.run_complete"), 1,
+    "future approval completes its independent run")
 end
 
 -- ==================================================================

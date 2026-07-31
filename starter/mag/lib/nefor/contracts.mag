@@ -72,6 +72,9 @@
                               :max_corrections Int})
 (type CollectorParams {:expected_senders (List String)})
 (type DynamicParams {})
+(type Continue [T] {:value T})
+(type Exhausted [T] {:value T})
+(type RetryGateParams {:max_retries Int})
 
 (foreign nefor.factory.adapter [T]
   {:params AdapterParams
@@ -127,6 +130,11 @@
   {:params CollectorParams
    :input T
    :output (List T)})
+
+(foreign nefor.factory.retry-gate [T]
+  {:params RetryGateParams
+   :input T
+   :output (| (Continue T) (Exhausted T))})
 
 (foreign nefor.factory.collect-item [T]
   {:params DynamicParams :input T :output T})

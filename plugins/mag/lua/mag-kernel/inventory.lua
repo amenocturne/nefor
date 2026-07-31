@@ -230,9 +230,10 @@ local function validate(self, mod)
     -- reply at a registered-but-unconstructed target (an actor spawned in
     -- this same modification included) is a control-plane protocol error,
     -- rejected loudly here; parking it would let a stale reply resolve a
-    -- FUTURE request the human never saw. A reply at a DEAD target stays a
-    -- race artifact (the gate resolved/was killed while the reply was in
-    -- flight) and drops at execution as a logged no-op, like any other send.
+    -- FUTURE request the human never saw. A reply at a DEAD target is also
+    -- rejected: the approval belongs to a request that kill already retracted,
+    -- so accepting it as a generic dead-target race would hide stale UI/control
+    -- plane state instead of reporting that no approval remains outstanding.
     -- Checked only when the composition wires a construction probe
     -- (set_is_constructed; the bare-VM fold path has no routing layer).
     if self.is_constructed
@@ -241,10 +242,10 @@ local function validate(self, mod)
       local unconstructed_alive = entry ~= nil
           and entry.state == ALIVE
           and not self.is_constructed(msg.to)
-      if entry == nil or unconstructed_alive then
+      local dead = entry ~= nil and entry.state == DEAD
+      if entry == nil or unconstructed_alive or dead then
         return nil, string.format(
-          "'%s' rejected: target '%s' has no outstanding approval request "
-          .. "(the actor never constructed — a reply answers a request)",
+          "'%s' rejected: target '%s' has no outstanding approval request",
           kinds.ApprovalReply, msg.to)
       end
     end

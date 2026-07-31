@@ -10,6 +10,7 @@
                    :da-policy nefor.contracts.DaPolicy
                    :max-corrections Int})
 (type ApprovalConfig {:id String :prompt String})
+(type RetryGateConfig {:id String :max-retries Int})
 (type BranchNode [I A B]
   {:id String
    :actors (List nefor.graph.Actor)
@@ -120,6 +121,32 @@
    [type (TypeTag T)]] -> (nefor.graph.Port T)
   (let [result (get fragment "output")]
     (nefor.graph.port (get result "actor") type (get result "wire")))))
+
+(def retry-gate (fn [T] [[config RetryGateConfig] [type (TypeTag T)]]
+  -> (BranchNode T (nefor.contracts.Continue T) (nefor.contracts.Exhausted T))
+  (let [id (get config "id")
+        actor-id (str id ".retry-gate")
+        input (nefor.graph.port actor-id type "nefor.retry.Input")
+        continued (nefor.graph.port actor-id
+                    (type-tag (nefor.contracts.Continue T))
+                    "nefor.retry.Continue")
+        exhausted (nefor.graph.port actor-id
+                    (type-tag (nefor.contracts.Exhausted T))
+                    "nefor.retry.Exhausted")]
+    (as (BranchNode T (nefor.contracts.Continue T) (nefor.contracts.Exhausted T))
+      {:id id
+       :actors [(nefor.graph.actor actor-id
+                  (specialize nefor.factory.retry-gate [T])
+                  (as nefor.contracts.RetryGateParams
+                    {:max_retries (get config "max-retries")})
+                  (nefor.graph.store-port input)
+                  [(nefor.graph.store-port continued)
+                   (nefor.graph.store-port exhausted)])]
+       :routes (as (List nefor.graph.StoredRoute) [])
+       :messages (as (List nefor.graph.Message) [])
+       :input input
+       :first continued
+       :second exhausted}))))
 
 (def approval-gate (fn [[config ApprovalConfig]]
   -> (BranchNode nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)

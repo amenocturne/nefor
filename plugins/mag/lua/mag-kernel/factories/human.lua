@@ -157,11 +157,18 @@ function M.construct(id, params, emit, deps)
   -- `mag.approval_cancel` event so the chat surface can retract the prompt.
   -- The completion ack is the reserved kinds.complete — no separate
   -- "Completed" kind.
+  local function cancel_pending()
+    if pending == nil then return end
+    emit(sign({ kind = kinds.ApprovalCancel, correlation = id }))
+    pending = nil
+  end
+
+  function instance.handle_kill()
+    cancel_pending()
+  end
+
   function instance.handle_drain()
-    if pending ~= nil then
-      emit(sign({ kind = kinds.ApprovalCancel, correlation = id }))
-      pending = nil
-    end
+    cancel_pending()
     emit(sign({ kind = kinds.complete }))
   end
 

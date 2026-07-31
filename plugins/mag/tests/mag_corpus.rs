@@ -366,6 +366,49 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         "the exact canonical patterns.md agent must compile against runtime contracts: {canonical_result:#?}"
     );
 
+    fs::write(
+        temp_root.join("retry-gate-graph.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.actors")
+(require "nefor.contracts")
+(require "nefor.graph")
+(def ignore-exhausted (fn [[value (nefor.contracts.Exhausted nefor.contracts.Task)]] -> Artifact
+  (artifact "nefor.graph-delta/v1" {})))
+(let [start (nefor.graph.source "start" (type-tag nefor.contracts.Task)
+              (as nefor.contracts.Task {:prompt "retry"}))
+      gate (nefor.actors.retry-gate
+             (as nefor.actors.RetryGateConfig {:id "retry" :max-retries 3})
+             (type-tag nefor.contracts.Task))
+      gate-node (as (nefor.graph.Node nefor.contracts.Task
+                      (nefor.contracts.Continue nefor.contracts.Task))
+                  {:id (get gate "id") :role "ordinary"
+                   :actors (get gate "actors") :routes (get gate "routes")
+                   :messages (get gate "messages") :input (get gate "input")
+                   :output (get gate "first")})
+      result (nefor.graph.output-for "result" gate-node)]
+  (nefor.artifact.compile-program
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start gate-node)
+         (nefor.graph.edge gate-node result)]))
+    [(nefor.graph.rule "exhausted-observer" (get gate "second") "ignore-exhausted")]))"#,
+    )
+    .expect("write retry gate graph regression");
+    let retry_gate = load(
+        &mut reader,
+        &mut stdin,
+        "retry-gate-graph",
+        &temp_root,
+        Path::new("retry-gate-graph.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        retry_gate.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "the typed RetryGate graph must compile against runtime contracts: {retry_gate:#?}"
+    );
+
     // A library fragment may expose a useful subset of a foreign actor's
     // runtime outputs. Bash advertises mag.Text plus mag.CommandFailed; the
     // ordinary shell wrapper deliberately exposes only mag.Text. Unknown

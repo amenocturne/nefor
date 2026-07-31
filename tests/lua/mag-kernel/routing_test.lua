@@ -51,8 +51,12 @@ local function harness(factories)
   local events = {}
   local inv = inventory.new({ log = log })
   local reg = Registry.new({ require_preview = false })
-  for _, decl in pairs(factories) do
-    local _, err = reg:register({ declaration = decl, construct = function(id) return { id = id } end })
+  for _, factory in pairs(factories) do
+    local entry = factory.declaration and factory or {
+      declaration = factory,
+      construct = function(id) return { id = id } end,
+    }
+    local _, err = reg:register(entry)
     assert_true(err == nil, "factory registers: " .. tostring(err))
   end
   local seq = 0
@@ -565,6 +569,133 @@ do
     assert_true(not (e.kind == "mag.run_failed" and e.from == "w2"),
       "a routed failure does not escalate to run-failed")
   end
+end
+
+-- ==================================================================
+-- RetryGate routes canonical branch records while preserving the original
+-- transport payload, then latches closed after the exhausted value.
+-- ==================================================================
+
+do
+  local retry_gate = require("factories.retry-gate")
+  local prior_semantic_type = nefor.semantic_type
+  local answer = { kind = "named", name = "test.Answer", arguments = {} }
+  local function branch(name)
+    return { kind = "named", name = name, arguments = { answer } }
+  end
+  local continue_type = branch("nefor.contracts.Continue")
+  local exhausted_type = branch("nefor.contracts.Exhausted")
+  local output_type = { kind = "union", items = { continue_type, exhausted_type } }
+
+  nefor.semantic_type = {
+    accepts = function() return true end,
+    id = function(value) return value.name or value.kind end,
+    validate_value = function(expected, value)
+      local valid = type(value) == "table" and value.value ~= nil
+        and (expected.name == "nefor.contracts.Continue"
+          or expected.name == "nefor.contracts.Exhausted")
+      return valid and { ok = true } or {
+        ok = false,
+        violations = { { path = "$", message = "expected branch record {value:T}" } },
+      }
+    end,
+  }
+
+  local function exercise(maximum)
+    local diagnostics = {}
+    local sink_decl = {
+      name = "retry-sink-" .. maximum,
+      inputs = { input = { "nefor.retry.Continue", "nefor.retry.Exhausted" } },
+      outputs = {},
+    }
+    local h = harness({
+      retry = retry_gate,
+      sink = sink_decl,
+    })
+    local received = {}
+    local sink_id = "sink-" .. maximum
+    local gate_id = "gate-" .. maximum
+    local sink_result = h.inv.apply({ actors = { {
+      id = sink_id,
+      factory = sink_decl.name,
+      params = {},
+      semantic_strict = true,
+      input = { wire = "retry.Branch", type_id = "test.Branch", type = output_type },
+      outputs = {},
+      routes = {},
+    } } })
+    assert_true(sink_result.ok, "typed retry sink registers: " .. tostring(sink_result.error))
+    local sink = { id = sink_id, emit = h.router:emitter(sink_id) }
+    sink.deliver = function(activation)
+      received[#received + 1] = activation.messages[1]
+      return "ok"
+    end
+    h.router:bind(sink_id, sink)
+    ready(h, sink)
+
+    local result = h.inv.apply({ actors = { {
+      id = gate_id,
+      factory = "retry-gate",
+      params = { max_retries = maximum },
+      semantic_strict = true,
+      evidence = {
+        version = 2,
+        identity = "nefor.factory.retry-gate",
+        arguments = { answer },
+        input = answer,
+        output = output_type,
+      },
+      input = { wire = "nefor.retry.Input", type_id = "test.Answer", type = answer },
+      outputs = {
+        { wire = "nefor.retry.Continue", type_id = "test.Continue", type = continue_type },
+        { wire = "nefor.retry.Exhausted", type_id = "test.Exhausted", type = exhausted_type },
+      },
+      routes = {
+        ["nefor.retry.Continue"] = { { actor = sink_id, wire = "nefor.retry.Continue" } },
+        ["nefor.retry.Exhausted"] = { { actor = sink_id, wire = "nefor.retry.Exhausted" } },
+      },
+    } } })
+    assert_true(result.ok, "typed retry gate registers: " .. tostring(result.error))
+    h.router:set_construct(function(record)
+      return h.reg:construct(record.factory, record.id, record.params,
+        h.router:emitter(record.id), {
+          diagnostic = function(value) diagnostics[#diagnostics + 1] = value end,
+        })
+    end)
+    return h, gate_id, received, diagnostics
+  end
+
+  for _, maximum in ipairs({ 0, 1, 3 }) do
+    local h, gate_id, received, diagnostics = exercise(maximum)
+    local payloads = {}
+    for index = 1, maximum + 1 do
+      payloads[index] = { maximum = maximum, index = index }
+      h.router:deliver(gate_id, "source", "nefor.retry.Input", { value = payloads[index] })
+    end
+    assert_eq(#received, maximum + 1, "max " .. maximum .. " emits one branch per accepted value")
+    for index = 1, maximum do
+      assert_eq(received[index].tag, "nefor.retry.Continue", "retry-budget values continue")
+      assert_true(rawequal(received[index].message.value, payloads[index]),
+        "continue transport preserves exact payload identity")
+      assert_true(rawequal(received[index].message.semantic_value.value, payloads[index]),
+        "continue semantic record contains the original value")
+    end
+    local exhausted = received[maximum + 1]
+    assert_eq(exhausted.tag, "nefor.retry.Exhausted", "the value after the retry budget exhausts")
+    assert_true(rawequal(exhausted.message.value, payloads[maximum + 1]),
+      "exhausted transport preserves exact payload identity")
+    assert_true(rawequal(exhausted.message.semantic_value.value, payloads[maximum + 1]),
+      "exhausted semantic record contains the original value")
+    assert_eq(#h.log.error, 0, "canonical branch records pass semantic-strict routing")
+
+    local late = { maximum = maximum, late = true }
+    h.router:deliver(gate_id, "source", "nefor.retry.Input", { value = late })
+    assert_eq(#received, maximum + 1, "a latched gate emits no branch for late input")
+    assert_eq(#diagnostics, 1, "a latched gate diagnoses late input")
+    assert_eq(diagnostics[1].kind, "late_input_after_exhaustion", "late diagnostic is specific")
+  end
+
+  nefor.semantic_type = prior_semantic_type
 end
 
 print("mag-kernel routing_test: all cases passed")

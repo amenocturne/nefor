@@ -516,6 +516,8 @@ local function resolve_web_review(firing_id, result)
   local plan = state.active_plan
   if type(plan) == "table" then
     plan.pending_firing_id = nil
+    plan.pending_correlation = nil
+    plan.pending_run_id = nil
     plan.reason = comments
   end
 
@@ -561,7 +563,7 @@ end
 -- The agentic-loop now sits idle waiting for the deferred tool.result.
 -- handle_chat_input resolves the ack when the user types /approve,
 -- /reject, or any other text.
-local function submit_plan(firing_id, args)
+local function submit_plan(firing_id, args, metadata)
   local plan = args and args.plan
   if type(plan) ~= "string" or #plan == 0 then
     emit_tool_result_err(firing_id, "write-review: args.plan must be a non-empty string")
@@ -590,13 +592,18 @@ local function submit_plan(firing_id, args)
   local auto_approved = (state.gate_mode == "auto")
   local immediately_approved = yolo_approved or auto_approved
 
+  local invocation = type(metadata) == "table" and metadata.invocation or nil
   state.active_plan = {
-    plan_id           = plan_id,
-    content           = plan,
-    submitted_at      = submitted_at,
-    pending_firing_id = (not immediately_approved) and firing_id or nil,
-    status            = immediately_approved and "approved" or "pending",
-    reason            = nil,
+    plan_id             = plan_id,
+    content             = plan,
+    submitted_at        = submitted_at,
+    pending_firing_id   = (not immediately_approved) and firing_id or nil,
+    pending_correlation = (not immediately_approved) and
+      type(invocation) == "table" and invocation.capability_id or nil,
+    pending_run_id      = (not immediately_approved) and
+      type(invocation) == "table" and invocation.run_id or nil,
+    status              = immediately_approved and "approved" or "pending",
+    reason              = nil,
   }
 
   -- Broadcast the plan-submission envelope so the chat surface can
@@ -721,6 +728,8 @@ local function handle_chat_input(body)
 
     local firing_id = plan.pending_firing_id
     plan.pending_firing_id = nil
+    plan.pending_correlation = nil
+    plan.pending_run_id = nil
     plan.status = verdict and "approved" or "rejected"
     plan.reason = reason
 
@@ -1055,9 +1064,27 @@ end
 -- The relayed content is the sink's final result carried INLINE on the reply
 -- (`body.result` — the model needs the answer, not a path); the persisted
 -- output file is the fallback when the reply predates the inline result.
+local function clear_pending_plan(plan)
+  if type(plan) ~= "table" or plan.status ~= "pending" then return false end
+  plan.pending_firing_id = nil
+  plan.pending_correlation = nil
+  plan.pending_run_id = nil
+  state.active_plan = nil
+  return true
+end
+
+local function clear_pending_plan_for_dead_run(run_id)
+  local plan = state.active_plan
+  if type(plan) ~= "table" or plan.pending_run_id ~= run_id then return false end
+  return clear_pending_plan(plan)
+end
+
 local function handle_mag_run_result(body)
   local run_id = body.run_id or body.in_reply_to
   if type(run_id) ~= "string" then return end
+  if body.status == "killed" or body.status == "failed" then
+    clear_pending_plan_for_dead_run(run_id)
+  end
   local attached = state.attached_mag_runs[run_id]
   if attached then
     state.attached_mag_runs[run_id] = nil
@@ -1797,6 +1824,7 @@ local function receive_msg(entry)
   -- only (nefor-tui emits it; replay never does).
   if kind == "chat.interrupt_all" then
     if replay_window.active() then return end
+    clear_pending_plan(state.active_plan)
     interrupt_active_runs()
     mag_eval.interrupt_all_runs()
     return
@@ -1807,6 +1835,11 @@ local function receive_msg(entry)
   -- lead-submitted standard run's dispatch_firing_id.
   if kind == "lead-workflow.tool.cancel" then
     if replay_window.active() then return end
+    local plan = state.active_plan
+    if type(plan) == "table" and (plan.pending_firing_id == body.id
+        or plan.pending_correlation == body.id) then
+      clear_pending_plan(plan)
+    end
     if run_registry:detach_waiter(body.id) then return end
     mag_eval.cancel(body.id)
     interrupt_attached_mag_by_firing(body.id)
