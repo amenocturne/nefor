@@ -435,7 +435,7 @@ impl Env {
         let key = path.to_path_buf();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let hit = state.file_reads.contains_key(&key);
-        let started = Instant::now();
+        let started = self.profile_started();
         let result = state.file_reads.entry(key.clone()).or_insert_with(|| {
             std::fs::read_to_string(&key)
                 .map_err(|error| format!("cannot read {requested}: {error}"))
@@ -450,7 +450,7 @@ impl Env {
                 counters.file_read_cache_misses = counters.file_read_cache_misses.saturating_add(1);
             }
         });
-        self.profile_phase(Phase::ModuleRead, started.elapsed());
+        self.profile_elapsed(Phase::ModuleRead, started);
         result
     }
 
@@ -508,9 +508,13 @@ impl Env {
         }
     }
 
-    pub(crate) fn profile_phase(&self, phase: Phase, elapsed: std::time::Duration) {
-        if let Some(profiler) = &self.profiler {
-            profiler.add_phase(phase, elapsed);
+    pub(crate) fn profile_started(&self) -> Option<Instant> {
+        self.profiler.as_ref().map(|_| Instant::now())
+    }
+
+    pub(crate) fn profile_elapsed(&self, phase: Phase, started: Option<Instant>) {
+        if let (Some(profiler), Some(started)) = (&self.profiler, started) {
+            profiler.add_phase(phase, started.elapsed());
         }
     }
 }

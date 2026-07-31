@@ -42,15 +42,16 @@ just bench-mag > tmp/mag-benchmark.json
 MAG_BENCH_SAMPLES=100 just bench-mag > tmp/mag-benchmark-100.json
 ```
 
-It is not part of `just test`. The JSON report retains raw wall-clock samples,
-min/median/mean/p90/p95/max distributions, median phase profiles, deterministic
-counters, artifact hashes, build/toolchain information, Git state, OS,
-architecture, and logical CPU count. It covers a trivial artifact, the shipped
-lead-turn program, linear graph scaling, product fan-in scaling, and an expected
-call-depth-limit failure. Successful samples assert stable artifacts and
-counters; there are deliberately no hardware-dependent pass/fail thresholds.
-Each iteration is a fresh compilation, not a claim about a cold OS filesystem
-cache.
+It is not part of `just test`. The JSON report retains raw unprofiled wall-clock
+samples, min/median/mean/p90/p95/max distributions, separately collected median
+phase profiles, deterministic counters, artifact hashes, build/toolchain
+information, Git state, OS, architecture, and logical CPU count. It covers a
+trivial artifact, the shipped lead-turn program, linear graph scaling, product
+fan-in scaling, and an expected call-depth-limit failure. Successful samples
+assert stable artifacts and counters; the failure case asserts the specific
+call-depth budget category. There are deliberately no hardware-dependent
+pass/fail thresholds. Each iteration is a fresh compilation, not a claim about
+a cold OS filesystem cache. `MAG_BENCH_SAMPLES` must be a positive integer.
 
 ## Follow-up cache design
 

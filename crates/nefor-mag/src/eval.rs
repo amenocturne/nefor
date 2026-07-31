@@ -1,12 +1,10 @@
 use crate::ast::{Artifact, Expr, FnValue, ForeignDecl, TypeDecl, Value};
 use crate::env::Env;
 use crate::error::MagError;
+use crate::profile::Phase;
 use crate::types::{ConcreteType, MagType};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
-
-use crate::profile::Phase;
 
 pub mod fuel {
     use crate::error::MagError;
@@ -265,7 +263,7 @@ fn eval_fn_form_with_binding(
         }
     }
     let return_type = parse_type(env, return_expr, &vars)?;
-    let checking_started = Instant::now();
+    let checking_started = env.profile_started();
     crate::checker::check_function_with_binding(
         env,
         binding,
@@ -274,7 +272,7 @@ fn eval_fn_form_with_binding(
         &return_type,
         body,
     )?;
-    env.profile_phase(Phase::Checking, checking_started.elapsed());
+    env.profile_elapsed(Phase::Checking, checking_started);
     Ok(Value::Fn(std::sync::Arc::new(FnValue {
         name: binding.map(str::to_owned),
         type_params,
@@ -1646,7 +1644,7 @@ fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
         return Ok(Value::Map(std::sync::Arc::new(defs)));
     }
     env.begin_module(name)?;
-    let resolve_started = Instant::now();
+    let resolve_started = env.profile_started();
     let relative = module_path(name)?;
     let mut matches = env
         .module_roots()
@@ -1676,21 +1674,21 @@ fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
             )))
         }
     };
-    env.profile_phase(Phase::ModuleResolve, resolve_started.elapsed());
-    let read_started = Instant::now();
+    env.profile_elapsed(Phase::ModuleResolve, resolve_started);
+    let read_started = env.profile_started();
     let content = std::fs::read_to_string(&path)
         .map_err(|e| MagError::Eval(format!("cannot read module {name}: {e}")))?;
-    env.profile_phase(Phase::ModuleRead, read_started.elapsed());
-    let lex_started = Instant::now();
+    env.profile_elapsed(Phase::ModuleRead, read_started);
+    let lex_started = env.profile_started();
     let tokens = crate::lexer::tokenize(&content)?;
-    env.profile_phase(Phase::ModuleLex, lex_started.elapsed());
-    let parse_started = Instant::now();
+    env.profile_elapsed(Phase::ModuleLex, lex_started);
+    let parse_started = env.profile_started();
     let exprs = crate::parser::parse(&tokens)?;
-    env.profile_phase(Phase::ModuleParse, parse_started.elapsed());
+    env.profile_elapsed(Phase::ModuleParse, parse_started);
     let mut module = env.module_env(name);
-    let eval_started = Instant::now();
+    let eval_started = env.profile_started();
     let result = eval_program(&mut module, &exprs);
-    env.profile_phase(Phase::ModuleEvaluate, eval_started.elapsed());
+    env.profile_elapsed(Phase::ModuleEvaluate, eval_started);
     match result {
         Ok(_) => {
             let defs = module.user_defs();

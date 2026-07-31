@@ -71,16 +71,16 @@ fn compile_impl(
         profiler.cloned(),
     );
     env.define("inputs", Value::HostInputs(inputs));
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let tokens = lexer::tokenize(source)?;
     record_phase(profiler, Phase::EntryLex, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let exprs = parser::parse(&tokens)?;
     record_phase(profiler, Phase::EntryParse, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let value = eval::eval_program(&mut env, &exprs)?;
     record_phase(profiler, Phase::EntryEvaluate, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let artifact = extract_artifact(value, "top-level program")?;
     record_phase(profiler, Phase::ArtifactConversion, started);
     Ok(artifact)
@@ -148,7 +148,7 @@ fn load_impl(
 ) -> Result<LoadedProgram, MagError> {
     let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
     let path = eval::resolve_workspace_path(source_dir, entry)?;
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let source = std::fs::read_to_string(&path)
         .map_err(|e| MagError::Eval(format!("cannot read program {}: {e}", path.display())))?;
     record_phase(profiler, Phase::EntryRead, started);
@@ -158,19 +158,19 @@ fn load_impl(
         profiler.cloned(),
     );
     env.define("inputs", Value::HostInputs(inputs));
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let tokens = lexer::tokenize(&source)?;
     record_phase(profiler, Phase::EntryLex, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let exprs = parser::parse(&tokens)?;
     record_phase(profiler, Phase::EntryParse, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let value = eval::eval_program(&mut env, &exprs)?;
     record_phase(profiler, Phase::EntryEvaluate, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let artifact = extract_artifact(value, "top-level program")?;
     record_phase(profiler, Phase::ArtifactConversion, started);
-    let started = Instant::now();
+    let started = phase_started(profiler);
     let encoded = serde_json::to_vec(&artifact)
         .map_err(|e| MagError::Eval(format!("serialize artifact: {e}")))?;
     let hash = format!("{:x}", Sha256::digest(encoded));
@@ -182,8 +182,12 @@ fn load_impl(
     })
 }
 
-fn record_phase(profiler: Option<&CompileProfiler>, phase: Phase, started: Instant) {
-    if let Some(profiler) = profiler {
+fn phase_started(profiler: Option<&CompileProfiler>) -> Option<Instant> {
+    profiler.map(|_| Instant::now())
+}
+
+fn record_phase(profiler: Option<&CompileProfiler>, phase: Phase, started: Option<Instant>) {
+    if let (Some(profiler), Some(started)) = (profiler, started) {
         profiler.add_phase(phase, started.elapsed());
     }
 }
@@ -301,7 +305,7 @@ fn validate_loaded_rules_impl(
     program: &LoadedProgram,
     profiler: Option<&CompileProfiler>,
 ) -> Result<(), MagError> {
-    let started = Instant::now();
+    let started = phase_started(profiler);
     if program.artifact.format != "nefor.graph-modification/v1" {
         record_phase(profiler, Phase::ResidentRuleValidation, started);
         return Ok(());

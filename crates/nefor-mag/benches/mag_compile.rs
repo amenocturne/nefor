@@ -37,6 +37,7 @@ struct Metadata {
 struct CaseReport {
     name: String,
     outcome: &'static str,
+    expected_error: Option<&'static str>,
     input_bytes: usize,
     artifact_hash: Option<String>,
     wall_ns: Vec<u64>,
@@ -62,15 +63,40 @@ struct Case {
     module_roots: Vec<PathBuf>,
     inputs: serde_json::Value,
     input_bytes: usize,
-    expect_success: bool,
+    expected_error: Option<ExpectedError>,
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedError {
+    CallDepthBudget,
+}
+
+impl ExpectedError {
+    fn category(self) -> &'static str {
+        match self {
+            Self::CallDepthBudget => "call_depth_budget",
+        }
+    }
+
+    fn matches(self, error: &nefor_mag::error::MagError) -> bool {
+        matches!(
+            (self, error),
+            (Self::CallDepthBudget, nefor_mag::error::MagError::Budget(message))
+                if message == "function call depth limit reached"
+        )
+    }
 }
 
 fn main() {
     let root = workspace_root();
-    let samples = std::env::var("MAG_BENCH_SAMPLES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_SAMPLES);
+    let samples = match std::env::var("MAG_BENCH_SAMPLES") {
+        Ok(value) => value
+            .parse::<std::num::NonZeroUsize>()
+            .unwrap_or_else(|_| panic!("MAG_BENCH_SAMPLES must be a positive integer: {value:?}"))
+            .get(),
+        Err(std::env::VarError::NotPresent) => DEFAULT_SAMPLES,
+        Err(error) => panic!("cannot read MAG_BENCH_SAMPLES: {error}"),
+    };
     let scratch = fresh_scratch();
     let cases = cases(&root, &scratch);
     let reports = cases
@@ -91,28 +117,24 @@ fn main() {
 
 fn run_case(case: &Case, samples: usize) -> CaseReport {
     for _ in 0..WARMUP {
-        let _ = compile(case);
+        assert_outcome(case, compile_unprofiled(case));
     }
     let mut wall_ns = Vec::with_capacity(samples);
     let mut profiles = Vec::with_capacity(samples);
     let mut expected_hash = None;
     for _ in 0..samples {
         let started = Instant::now();
-        let result = compile(case);
+        let result = compile_unprofiled(case);
         wall_ns.push(nanos(started.elapsed()));
-        match (case.expect_success, result) {
-            (true, Ok((program, profile))) => {
-                if let Some(expected) = &expected_hash {
-                    assert_eq!(expected, &program.hash, "{} artifact changed", case.name);
-                } else {
-                    expected_hash = Some(program.hash.clone());
-                }
-                profiles.push(profile);
-                black_box(program.artifact);
-            }
-            (false, Err(_)) => {}
-            (true, Err(error)) => panic!("{} failed: {error}", case.name),
-            (false, Ok(_)) => panic!("{} unexpectedly succeeded", case.name),
+        if let Some(program) = assert_outcome(case, result) {
+            check_artifact(case, &mut expected_hash, &program);
+            black_box(program.artifact);
+
+            let (profiled, profile) = compile_profiled(case)
+                .unwrap_or_else(|error| panic!("{} profiled compile failed: {error}", case.name));
+            check_artifact(case, &mut expected_hash, &profiled);
+            profiles.push(profile);
+            black_box(profiled.artifact);
         }
     }
     let counters = profiles.first().map(|profile| profile.counters.clone());
@@ -121,11 +143,12 @@ fn run_case(case: &Case, samples: usize) -> CaseReport {
     }
     CaseReport {
         name: case.name.clone(),
-        outcome: if case.expect_success {
+        outcome: if case.expected_error.is_none() {
             "success"
         } else {
             "expected_failure"
         },
+        expected_error: case.expected_error.map(ExpectedError::category),
         input_bytes: case.input_bytes,
         artifact_hash: expected_hash,
         distribution_ns: distribution(&wall_ns),
@@ -135,7 +158,51 @@ fn run_case(case: &Case, samples: usize) -> CaseReport {
     }
 }
 
-fn compile(
+fn assert_outcome(
+    case: &Case,
+    result: Result<nefor_mag::LoadedProgram, nefor_mag::error::MagError>,
+) -> Option<nefor_mag::LoadedProgram> {
+    match (case.expected_error, result) {
+        (None, Ok(program)) => Some(program),
+        (Some(expected), Err(error)) if expected.matches(&error) => None,
+        (None, Err(error)) => panic!("{} failed: {error}", case.name),
+        (Some(expected), Err(error)) => panic!(
+            "{} failed with {error}, expected {}",
+            case.name,
+            expected.category()
+        ),
+        (Some(expected), Ok(_)) => panic!(
+            "{} unexpectedly succeeded; expected {}",
+            case.name,
+            expected.category()
+        ),
+    }
+}
+
+fn check_artifact(
+    case: &Case,
+    expected_hash: &mut Option<String>,
+    program: &nefor_mag::LoadedProgram,
+) {
+    if let Some(expected) = expected_hash {
+        assert_eq!(expected, &program.hash, "{} artifact changed", case.name);
+    } else {
+        *expected_hash = Some(program.hash.clone());
+    }
+}
+
+fn compile_unprofiled(case: &Case) -> Result<nefor_mag::LoadedProgram, nefor_mag::error::MagError> {
+    let program = nefor_mag::load_with_inputs_and_module_roots(
+        &case.source_dir,
+        &case.entry,
+        case.inputs.clone(),
+        &case.module_roots,
+    )?;
+    nefor_mag::validate_loaded_rules(&program)?;
+    Ok(program)
+}
+
+fn compile_profiled(
     case: &Case,
 ) -> Result<(nefor_mag::LoadedProgram, CompileProfile), nefor_mag::error::MagError> {
     let profiler = nefor_mag::profile::CompileProfiler::new();
@@ -158,7 +225,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
         "(artifact \"bench.trivial/v1\" {})",
         vec![scratch.into()],
         json!({}),
-        true,
+        None,
     ));
 
     let lead = root.join("starter/agentic-loop/lead-turn.mag");
@@ -173,7 +240,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
         module_roots: vec![root.join("starter/mag/lib")],
         inputs: json!({"foreign_contracts": contracts.clone()}),
         input_bytes: fs::metadata(lead).map(|m| m.len() as usize).unwrap_or(0),
-        expect_success: true,
+        expected_error: None,
     });
 
     for size in [2, 4, 8] {
@@ -184,7 +251,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
             &source,
             vec![scratch.into(), root.join("starter/mag/lib")],
             json!({"foreign_contracts": contracts.clone()}),
-            true,
+            None,
         ));
     }
     for size in [2, 8, 16] {
@@ -195,7 +262,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
             &source,
             vec![scratch.into(), root.join("starter/mag/lib")],
             json!({"foreign_contracts": contracts.clone()}),
-            true,
+            None,
         ));
     }
     cases.push(write_case(
@@ -204,7 +271,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
         &recursive_limit(),
         vec![scratch.into()],
         json!({}),
-        false,
+        Some(ExpectedError::CallDepthBudget),
     ));
     cases
 }
@@ -215,7 +282,7 @@ fn write_case(
     source: &str,
     module_roots: Vec<PathBuf>,
     inputs: serde_json::Value,
-    expect_success: bool,
+    expected_error: Option<ExpectedError>,
 ) -> Case {
     let entry = format!("{name}.mag");
     fs::write(scratch.join(&entry), source).expect("write benchmark case");
@@ -226,7 +293,7 @@ fn write_case(
         module_roots,
         inputs,
         input_bytes: source.len(),
-        expect_success,
+        expected_error,
     }
 }
 
