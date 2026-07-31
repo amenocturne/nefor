@@ -310,7 +310,9 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
             maybe_env = in_rx.recv() => match maybe_env {
                 Some(Ok(env)) => {
                     let mut shutdown = false;
-                    process_envelope(&mut engine, env, &mut shutdown);
+                    if process_envelope(&mut engine, env, &mut shutdown) {
+                        paint(&mut engine, &mut tty_main, &mut last_render)?;
+                    }
                     if shutdown { break; }
                     // Drain any further pending envelopes in this tick
                     // before we paint. Post batch-protocol refactor the
@@ -326,7 +328,8 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                     // try_recv-style drain absorbs the burst into a
                     // single state-mutation pass, then the post-loop
                     // `render_if_dirty` paints the final transcript
-                    // exactly once.
+                    // exactly once, except for the already-throttled
+                    // resume-progress control envelopes painted below.
                     //
                     // Cap the drain at MAX_DRAIN_PER_TICK so a sustained
                     // high-rate stream (a runaway provider streaming
@@ -345,7 +348,9 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                     while drained < MAX_DRAIN_PER_TICK {
                         match in_rx.try_recv() {
                             Ok(Ok(e)) => {
-                                process_envelope(&mut engine, e, &mut shutdown);
+                                if process_envelope(&mut engine, e, &mut shutdown) {
+                                    paint(&mut engine, &mut tty_main, &mut last_render)?;
+                                }
                                 if shutdown { break; }
                                 drained += 1;
                             }
@@ -457,11 +462,7 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
         drain_emits_to_writer(&mut engine, &out_tx).await?;
 
         if last_render.elapsed() >= MIN_RENDER_INTERVAL {
-            if let Some(bytes) = engine.render_if_dirty()? {
-                tty_main.write_all(&bytes)?;
-                tty_main.flush()?;
-                last_render = std::time::Instant::now();
-            }
+            paint(&mut engine, &mut tty_main, &mut last_render)?;
         }
         if engine.exit_requested() {
             break;
@@ -477,19 +478,34 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     Ok(())
 }
 
+fn paint(
+    engine: &mut Engine,
+    tty: &mut impl std::io::Write,
+    last_render: &mut std::time::Instant,
+) -> Result<(), TuiError> {
+    if let Some(bytes) = engine.render_if_dirty()? {
+        tty.write_all(&bytes)?;
+        tty.flush()?;
+        *last_render = std::time::Instant::now();
+    }
+    Ok(())
+}
+
 /// Dispatch one inbound envelope to the engine. System messages are
 /// either a shutdown signal (sets `shutdown = true`) or post-handshake
 /// noise; `Body::Event` envelopes flow into the Lua reducer via
-/// `dispatch_envelope_body`. Extracted from the main loop so the
-/// in-tick drain that batches a burst of envelopes can apply identical
-/// handling per envelope.
-fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) {
+/// `dispatch_envelope_body`. Returns whether this envelope is a bounded
+/// resume-progress control point that should be painted during a replay
+/// drain instead of being coalesced into its terminal state.
+fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) -> bool {
     match env.body {
         Body::System(SystemBody::Shutdown { .. }) => {
             *shutdown = true;
+            false
         }
         Body::System(_) => {
             tracing::debug!("post-handshake system message ignored");
+            false
         }
         Body::Event(map) => {
             let kind = map.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
@@ -497,6 +513,7 @@ fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) {
             if let Err(e) = engine.dispatch_envelope_from(&map, env.from.as_str()) {
                 tracing::warn!(error = %e, kind = kind, "engine.dispatch_envelope_from");
             }
+            matches!(kind, "sessions.replay.progress" | "sessions.resume_done")
         }
     }
 }
@@ -529,4 +546,72 @@ async fn drain_emits_to_writer(
 /// to the front) has one place to live.
 fn canonical_body(map: JsonMap<String, JsonValue>) -> JsonMap<String, JsonValue> {
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RESUME_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { progress = nil },
+          view = function(s)
+            return tui.text { content = s.progress or "ready" }
+          end,
+          update = function(msg, s)
+            if msg.kind == "sessions.resume_loading" then
+              return { progress = "loading session" }, {}
+            elseif msg.kind == "sessions.replay.progress" then
+              return { progress = tostring(msg.replayed) .. "/" .. tostring(msg.total) }, {}
+            elseif msg.kind == "sessions.resume_done" then
+              return { progress = nil }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    fn event(body: &str) -> Envelope {
+        Envelope::parse_line(&format!(
+            r#"{{"type":"event","from":"sessions","ts":"2026-01-01T00:00:00Z","body":{body}}}"#
+        ))
+        .expect("event envelope")
+    }
+
+    #[test]
+    fn replay_drain_paints_numeric_progress_before_resume_cleanup() {
+        let mut engine = Engine::new(80, 24).expect("engine");
+        engine.load_scenario(RESUME_SCENARIO).expect("scenario");
+        let _ = engine.render_if_dirty().expect("initial render");
+        let mut shutdown = false;
+        let mut frames = Vec::new();
+        let mut last_render = std::time::Instant::now();
+
+        let envelopes = [
+            event(r#"{"kind":"sessions.resume_loading","session_id":"resume-1"}"#),
+            event(r#"{"kind":"chat.message.append","text":"one"}"#),
+            event(r#"{"kind":"chat.message.append","text":"two"}"#),
+            event(
+                r#"{"kind":"sessions.replay.progress","session_id":"resume-1","replayed":64,"total":200}"#,
+            ),
+            event(r#"{"kind":"chat.message.append","text":"three"}"#),
+            event(r#"{"kind":"sessions.resume_done","session_id":"resume-1","replayed":200}"#),
+        ];
+
+        for envelope in envelopes {
+            if process_envelope(&mut engine, envelope, &mut shutdown) {
+                paint(&mut engine, &mut frames, &mut last_render).expect("intermediate paint");
+            }
+        }
+
+        let rendered = String::from_utf8(frames).expect("rendered ANSI is UTF-8");
+        assert!(
+            rendered.contains("64/200"),
+            "numeric progress must reach the terminal during one replay drain: {rendered:?}"
+        );
+        assert!(
+            !shutdown,
+            "the replay batch must not be mistaken for shutdown"
+        );
+    }
 }
