@@ -572,6 +572,114 @@ do
 end
 
 -- ==================================================================
+-- Semantic routing keeps provider-native turn messages while dropping
+-- unrelated transport fields from the canonical payload.
+-- ==================================================================
+
+do
+  local prior_semantic_type = nefor.semantic_type
+  local provider_input = {
+    kind = "named", name = "nefor.contracts.ProviderInput", arguments = {},
+  }
+  nefor.semantic_type = {
+    accepts = function() return true end,
+    id = function(value) return value.name or value.kind end,
+    validate_value = function(_, value)
+      return type(value) == "table" and value.content ~= nil
+        and { ok = true }
+        or { ok = false, violations = { { path = "$.content", message = "required" } } }
+    end,
+  }
+
+  local producer_decl = {
+    name = "provider-input-producer",
+    inputs = { input = "test.Start" },
+    outputs = { "generic-provider.ProviderOut" },
+  }
+  local consumer_decl = {
+    name = "provider-input-consumer",
+    inputs = { input = "generic-provider.ProviderOut" },
+    outputs = {},
+  }
+  local h = harness({ producer = producer_decl, consumer = consumer_decl })
+  local received = {}
+
+  local consumer_result = h.inv.apply({ actors = { {
+    id = "provider-consumer",
+    factory = consumer_decl.name,
+    params = {},
+    semantic_strict = true,
+    input = {
+      wire = "generic-provider.ProviderOut",
+      type_id = "nefor.contracts.ProviderInput",
+      type = provider_input,
+    },
+    outputs = {},
+    routes = {},
+  } } })
+  assert_true(consumer_result.ok, "typed provider consumer registers")
+  local consumer = { id = "provider-consumer", emit = h.router:emitter("provider-consumer") }
+  consumer.deliver = function(activation)
+    received[#received + 1] = activation.messages[1].message
+    return "ok"
+  end
+  h.router:bind("provider-consumer", consumer)
+  ready(h, consumer)
+
+  local producer_result = h.inv.apply({ actors = { {
+    id = "provider-producer",
+    factory = producer_decl.name,
+    params = {},
+    semantic_strict = true,
+    input = { wire = "test.Start", type_id = "test.Start", type = provider_input },
+    outputs = { {
+      wire = "generic-provider.ProviderOut",
+      type_id = "nefor.contracts.ProviderInput",
+      type = provider_input,
+    } },
+    routes = {
+      ["generic-provider.ProviderOut"] = { {
+        actor = "provider-consumer",
+        wire = "generic-provider.ProviderOut",
+      } },
+    },
+  } } })
+  assert_true(producer_result.ok, "typed provider producer registers")
+  local producer = { id = "provider-producer", emit = h.router:emitter("provider-producer") }
+  producer.deliver = function() return "ok" end
+  h.router:bind("provider-producer", producer)
+  ready(h, producer)
+
+  local turn_messages = { {
+    role = "user",
+    content = { value = { prompt = "inspect the repository" } },
+  } }
+  local tool_calls = { {
+    id = "call-1", name = "read_file", args = { path = "README.md" },
+  } }
+  producer.emit({
+    kind = "generic-provider.ProviderOut",
+    value = { content = { prompt = "inspect the repository" } },
+    messages = turn_messages,
+    calls = tool_calls,
+    transcript_delta = { { role = "assistant", content = "private transcript" } },
+    result = { raw = "private provider response" },
+  })
+
+  assert_eq(#received, 1, "provider input routes once")
+  assert_true(rawequal(received[1].messages, turn_messages),
+    "provider-native turn messages survive semantic routing")
+  assert_true(rawequal(received[1].calls, tool_calls),
+    "tool-call correlation handles survive semantic routing")
+  assert_eq(received[1].transcript_delta, nil,
+    "transcript metadata stays off the routed provider input")
+  assert_eq(received[1].result, nil,
+    "raw provider responses stay off the routed provider input")
+
+  nefor.semantic_type = prior_semantic_type
+end
+
+-- ==================================================================
 -- RetryGate routes canonical branch records while preserving the original
 -- transport payload, then latches closed after the exhausted value.
 -- ==================================================================

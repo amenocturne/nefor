@@ -990,7 +990,16 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
 
     // Turn 1, round 1: the only appended message is the task (empty seed).
     let append_kind = format!("{PROVIDER}.chat.append");
-    let append = next_event_of_kind(&mut reader, &append_kind).await;
+    let append = loop {
+        let event = next_event(&mut reader, "initial provider input").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some(kind) if kind == append_kind => break event,
+            Some(kind) if kind == format!("{PROVIDER}.chat.complete") => {
+                panic!("provider turn completed before receiving its initial input: {event:?}")
+            }
+            _ => {}
+        }
+    };
     assert_eq!(
         append.pointer_str("/message/content/value/prompt"),
         Some("what is in the repo?"),

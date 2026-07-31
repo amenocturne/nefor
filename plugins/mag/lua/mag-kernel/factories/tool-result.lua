@@ -105,7 +105,8 @@ function M.construct(id, params, emit, deps)
   function instance.deliver(activation)
     activation = activation or {}
     local message = ((activation.messages or {})[1] or {}).message or {}
-    local results = message.results or {}
+    local value = type(message.value) == "table" and message.value or {}
+    local results = message.results or value.results or {}
     local messages = {}
     for i, r in ipairs(results) do
       messages[i] = to_message(r)
