@@ -814,13 +814,21 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
             if let Some(result) = caller.memoized_call(fun, args) {
                 return Ok(result);
             }
+            let mut overridden_names = fun
+                .closure
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<HashSet<_>>();
+            overridden_names.extend(fun.name.iter().map(String::as_str));
+            overridden_names.extend(fun.params.iter().map(String::as_str));
+            overridden_names.extend(fun.type_params.iter().map(String::as_str));
             let (expected_return, type_bindings) = crate::checker::check_call(caller, fun, args)
                 .map_err(|error| match &fun.name {
                     Some(name) => MagError::Type(format!("calling {name}: {error}")),
                     None => error,
                 })?;
             let mut env = caller.child_for_call();
-            for (name, value) in caller.snapshot() {
+            for (name, value) in caller.snapshot_excluding(&overridden_names) {
                 env.define(&name, value);
             }
             for (k, v) in &fun.closure {
@@ -830,11 +838,11 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
                 env.define(name, Value::Fn(fun.clone()));
             }
             env.push_scope();
-            for (p, v) in fun.params.iter().zip(args) {
-                env.define(p, v.clone());
-            }
             for (name, ty) in type_bindings {
                 env.define(&name, Value::Type(ty));
+            }
+            for (p, v) in fun.params.iter().zip(args) {
+                env.define(p, v.clone());
             }
             let mut out = Value::Unit;
             for expr in &fun.body {
@@ -1744,6 +1752,81 @@ fn maybe_require(env: &mut Env, items: &[Expr]) -> Option<Result<Value, MagError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn constant_function(name: &str, closure: Vec<(String, Value)>) -> Value {
+        Value::Fn(std::sync::Arc::new(FnValue {
+            name: None,
+            type_params: vec![],
+            params: vec![],
+            param_types: vec![],
+            return_type: MagType::Int,
+            body: vec![Expr::Symbol(name.into())],
+            closure,
+        }))
+    }
+
+    fn typed_int(value: Value) -> i64 {
+        match value {
+            Value::Typed(value, _) => match value.as_ref() {
+                Value::Int(value) => *value,
+                other => panic!("expected typed Int, got {other:?}"),
+            },
+            other => panic!("expected typed Int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lexical_closure_overrides_colliding_caller_binding() {
+        let mut caller = Env::new();
+        caller.define("value", Value::Int(99));
+        let function = constant_function("value", vec![("value".into(), Value::Int(1))]);
+        let _fuel = fuel::install(100);
+
+        assert_eq!(typed_int(apply(&caller, &function, &[]).unwrap()), 1);
+    }
+
+    #[test]
+    fn caller_binding_remains_a_fallback_when_closure_does_not_capture_name() {
+        let mut caller = Env::new();
+        caller.define("late", Value::Int(42));
+        let function = constant_function("late", vec![]);
+        let _fuel = fuel::install(100);
+
+        assert_eq!(typed_int(apply(&caller, &function, &[]).unwrap()), 42);
+    }
+
+    #[test]
+    fn nested_closure_shadowing_keeps_the_innermost_binding() {
+        let function = constant_function(
+            "value",
+            vec![
+                ("value".into(), Value::Int(1)),
+                ("value".into(), Value::Int(2)),
+            ],
+        );
+        let _fuel = fuel::install(100);
+
+        assert_eq!(typed_int(apply(&Env::new(), &function, &[]).unwrap()), 2);
+    }
+
+    #[test]
+    fn value_parameters_override_same_named_generic_bindings() {
+        let function = Value::Fn(std::sync::Arc::new(FnValue {
+            name: None,
+            type_params: vec!["T".into()],
+            params: vec!["T".into()],
+            param_types: vec![MagType::Var("T".into())],
+            return_type: MagType::Var("T".into()),
+            body: vec![Expr::Symbol("T".into())],
+            closure: vec![],
+        }));
+        let _fuel = fuel::install(100);
+
+        assert_eq!(
+            typed_int(apply(&Env::new(), &function, &[Value::Int(7)]).unwrap()),
+            7
+        );
+    }
 
     #[test]
     fn repeated_call_reuses_the_cached_shared_result_without_spending_fuel() {

@@ -313,10 +313,15 @@ impl Env {
             })
     }
     pub fn snapshot(&self) -> Vec<(String, Value)> {
+        self.snapshot_excluding(&HashSet::new())
+    }
+    pub fn snapshot_excluding(&self, excluded: &HashSet<&str>) -> Vec<(String, Value)> {
         let snapshot = self
             .scopes
             .iter()
-            .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .flat_map(|scope| scope.iter())
+            .filter(|(name, _)| !excluded.contains(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         self.profile_counters(|counters| {
             counters.environment_snapshots = counters.environment_snapshots.saturating_add(1);
