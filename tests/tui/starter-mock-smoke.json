@@ -14,6 +14,7 @@
     {"kind": "wait_not_text", "text": "[thinking", "timeout_ms": 10000},
     {"kind": "wait_idle", "idle_ms": 500, "timeout_ms": 10000},
     {"kind": "key", "key": "CtrlC"},
+    {"kind": "key", "key": "CtrlC"},
     {"kind": "wait_text", "text": "NEFOR_EXIT_CODE=0", "timeout_ms": 10000},
     {"kind": "wait_exit", "timeout_ms": 10000},
     {"kind": "capture"}

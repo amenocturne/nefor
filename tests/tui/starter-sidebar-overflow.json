@@ -2,6 +2,8 @@
   "name": "starter-sidebar-overflow-remains-navigable",
   "command": {
     "argv": [
+      "env",
+      "NEFOR_TEST_SIDEBAR_OVERFLOW=1",
       "bash",
       "tests/tui/run-nefor-under-test.sh"
     ],
@@ -443,6 +445,10 @@
       "kind": "wait_not_text",
       "text": "[thinking",
       "timeout_ms": 10000
+    },
+    {
+      "kind": "key",
+      "key": "CtrlC"
     },
     {
       "kind": "key",

@@ -891,9 +891,28 @@ end
 
 local function handle_session_start(msg, state)
   run_bindings = mag_run_bindings.new()
+  local runs = state.runs
+  if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1" and next(runs or {}) == nil then
+    local nodes = {}
+    for i = 1, 20 do
+      nodes[string.format("fixture-%02d.member", i)] = {
+        reasoner = "test-fixture", status = "pending", started_at_ms = 0,
+        finished_at_ms = nil, seq = i,
+      }
+    end
+    runs = {
+      ["sidebar-overflow-fixture"] = {
+        run_id = "sidebar-overflow-fixture", run_name = "sidebar-overflow-fixture",
+        principal = "test", total_nodes = 20, started_at_ms = 0, nodes = nodes,
+        completed_at_ms = nil, status = nil, rejected = 0, noops = 0, actor_seq = 20,
+      },
+    }
+  elseif os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") ~= "1" then
+    runs = {}
+  end
   return shallow_merge(state, {
     session_id = msg.session_id,
-    runs = os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1" and state.runs or {},
+    runs = runs,
     node_previews = {}, preview_registry = {}, scope_to_run = {},
     lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
     instruction_notice_ids = {},

@@ -362,6 +362,7 @@ function M.row_model(state, now_ms)
   -- painted range; callers never reconstruct layout from cursor indices.
   local visual_y = 3
   local first_run = true
+  local fixture_mode = os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1"
   local function append(row, height)
     row.visual_start = visual_y
     row.visual_end = visual_y + height
@@ -370,7 +371,7 @@ function M.row_model(state, now_ms)
   end
   for _, run_id in ipairs(runs_in_creation_order(runs)) do
     local run = runs[run_id]
-    if not is_expired(run, now_ms) then
+    if fixture_mode or not is_expired(run, now_ms) then
       if not first_run then visual_y = visual_y + 1 end
       first_run = false
       local groups = build_groups(run)

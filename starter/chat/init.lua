@@ -248,6 +248,10 @@ end
 
 local function initial_state()
   local cfg = active_config()
+  local fixture_runs = sidebar_fixture_runs()
+  if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1" and next(fixture_runs) == nil then
+    error("sidebar overflow fixture environment was visible but fixture construction failed")
+  end
   return {
     entries          = {},
     in_flight        = nil,
@@ -265,7 +269,7 @@ local function initial_state()
     -- prompt widget's `focused` flag derives from this in view.lua.
     focus            = "prompt",
     sidebar_cursor   = 1,
-    runs             = sidebar_fixture_runs(),
+    runs             = fixture_runs,
     sidebar_folds    = {},
     -- Generic current-session node previews: advertised declarations plus
     -- materialized lifecycle/binding state. Scope maps provider chat ids back

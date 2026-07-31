@@ -1153,8 +1153,8 @@ fn absolute_path_submit_is_plain_chat_not_slash_command() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("/home/example/.local/share/nefor/clipboard-i")
-            && out.contains("mages/paste.png"),
+        out.contains("/home/example/.local/share/nefor/clipboa")
+            && out.contains("rd-images/paste.png"),
         "absolute-path user echo missing: {out:?}"
     );
 }
@@ -1657,8 +1657,8 @@ fn mag_run_failed_prunes_after_linger() {
         "failed run should be pruned past the linger window: {out:?}"
     );
     assert!(
-        out.contains("(no active runs)"),
-        "empty-state hint missing after a failed run prunes: {out:?}"
+        out.contains("Space: inspect last completed run"),
+        "completed-run inspection hint missing after a failed run prunes: {out:?}"
     );
 }
 
@@ -2098,8 +2098,8 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
         "completed run should be hidden past linger window without a dispatch: {out:?}"
     );
     assert!(
-        out.contains("(no active runs)"),
-        "empty-state hint missing after linger window: {out:?}"
+        out.contains("Space: inspect last completed run"),
+        "completed-run inspection hint missing after linger window: {out:?}"
     );
 }
 
@@ -2155,8 +2155,8 @@ fn graph_run_complete_removes_run_after_linger_window() {
     );
     // The empty-state hint should now show in the sidebar.
     assert!(
-        out.contains("(no active runs)"),
-        "empty-state hint missing after prune: {out:?}"
+        out.contains("Space: inspect last completed run"),
+        "completed-run inspection hint missing after prune: {out:?}"
     );
 }
 
@@ -3173,23 +3173,19 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
     // anchored 60% sizing the popup span is 14 rows tall starting at
     // row 5 (centered in 24).
     let rows: Vec<&str> = snap.lines().collect();
-    let popup_top_idx = rows
+    let popup_body_idx = rows
         .iter()
-        .position(|r| r.contains('╭'))
-        .expect("popup top rule");
-    // Char-indexed columns — `str::find` returns byte offsets, but
-    // multi-byte UTF-8 box-drawing glyphs (each 3 bytes) make those
-    // offsets 3× the visible column. Walk chars to get the visible
-    // column index instead.
-    let popup_top_chars: Vec<char> = rows[popup_top_idx].chars().collect();
-    let popup_left_col = popup_top_chars
+        .position(|r| r.contains("│ Keys:"))
+        .expect("first bordered popup body row");
+    let popup_body_chars: Vec<char> = rows[popup_body_idx].chars().collect();
+    let popup_left_col = popup_body_chars
         .iter()
-        .position(|&c| c == '╭')
-        .expect("popup top rule column");
-    let popup_right_col = popup_top_chars
+        .position(|&c| c == '│')
+        .expect("popup left border column");
+    let popup_right_col = popup_body_chars
         .iter()
-        .rposition(|&c| c == '╮')
-        .expect("popup top right corner column");
+        .rposition(|&c| c == '│')
+        .expect("popup right border column");
 
     // Every body row of the popup must carry side bars at the popup's
     // left + right edges. Iterate until we hit the popup's bottom rule
@@ -3198,7 +3194,7 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
     // overflow regression that motivated the scrollable wrap).
     let mut body_rows_seen = 0;
     let mut popup_bottom_idx: Option<usize> = None;
-    for (i, row) in rows.iter().enumerate().skip(popup_top_idx + 1) {
+    for (i, row) in rows.iter().enumerate().skip(popup_body_idx) {
         let chars: Vec<char> = row.chars().collect();
         if popup_left_col < chars.len() && chars[popup_left_col] == '╰' {
             // Hit the popup's bottom rule — stop and verify bottom-right.
@@ -3223,7 +3219,7 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
     }
     assert!(
         popup_bottom_idx.is_some(),
-        "popup bottom rule `╰────╯` not found below top rule at row {popup_top_idx} — \
+        "popup bottom rule `╰────╯` not found below first body row {popup_body_idx} — \
          the help popup must be fully enclosed (top + bottom rules):\n{snap}"
     );
     assert!(
@@ -6446,20 +6442,17 @@ fn popup_paints_opaque_background_over_transcript() {
         .map(|i| title_row + i)
         .expect("popup bottom border row missing");
 
-    // Identify popup column range from the title row. The popup's
-    // outer borders are the LAST `│` to the left of the title text
-    // and the FIRST `│` to the right.
-    let title_line = lines[title_row];
-    let title_byte = title_line
-        .find("permission requested")
-        .expect("title text in row");
-    let left_border = title_line[..title_byte]
-        .rfind('│')
-        .expect("popup left border on title row");
-    let right_border = title_line[title_byte..]
-        .find('│')
-        .map(|i| title_byte + i)
-        .expect("popup right border on title row");
+    // Resolve popup columns from its top border; the title deliberately
+    // overlays the first interior row and therefore has no side bars.
+    let top_chars: Vec<char> = lines[popup_top].chars().collect();
+    let left_border = top_chars
+        .iter()
+        .position(|&c| c == '╭')
+        .expect("popup left border on top row");
+    let right_border = top_chars
+        .iter()
+        .rposition(|&c| c == '╮')
+        .expect("popup right border on top row");
 
     // Walk every popup INTERIOR row and slice out only the popup's
     // columns. Anything OUTSIDE that slice (transcript bubbles to the
@@ -6472,8 +6465,9 @@ fn popup_paints_opaque_background_over_transcript() {
         .take(popup_bottom)
         .skip(popup_top + 1)
     {
-        if right_border > left_border + '│'.len_utf8() && row.len() > right_border {
-            let interior = &row[left_border + '│'.len_utf8()..right_border];
+        let chars: Vec<char> = row.chars().collect();
+        if right_border > left_border + 1 && chars.len() > right_border {
+            let interior: String = chars[left_border + 1..right_border].iter().collect();
             assert!(
                 !interior.contains("MARKER-LEAK-LINE"),
                 "transcript text leaked into popup interior at row {idx}: \
