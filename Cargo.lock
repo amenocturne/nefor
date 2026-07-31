@@ -131,6 +131,7 @@ name = "basic-tools-plugin"
 version = "0.4.0"
 dependencies = [
  "clap",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",

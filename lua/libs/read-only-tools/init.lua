@@ -54,7 +54,6 @@ local json = nefor.json
 local envelope = require("core.envelope")
 local emit_as  = envelope.emit_as
 local instruction_files = require("libs.instruction-files")
-local tool_output_dump = require("tool-gate.tool_output_dump")
 local tool_display = require("libs.chat.tool_display")
 
 local INSTRUCTIONS_DIR = (rawget(_G, "NEFOR_CONFIG_DIR") or ".") .. "/instructions"
@@ -184,8 +183,22 @@ local function tool_search_text(firing_id, args)
     return
   end
   -- Truncate to cap lines defensively (rg's --max-count is per-file,
-  -- not total). One line per match is the expected shape.
-  local MAX_OUTPUT_BYTES = 256 * 1024
+  -- not total), and keep search output below the generic spill threshold.
+  -- The grep fallback can return an arbitrarily large matching line.
+  local MAX_OUTPUT_BYTES = 24 * 1024
+  local MAX_LINE_BYTES = 4 * 1024
+  local function bounded_line(line)
+    if #line <= MAX_LINE_BYTES then return line end
+    local cut = MAX_LINE_BYTES
+    while cut > 0 do
+      local byte = line:byte(cut + 1)
+      if byte == nil or byte < 0x80 or byte >= 0xC0 then break end
+      cut = cut - 1
+    end
+    return line:sub(1, cut) .. string.format(
+      "[... search_text line truncated: %d bytes omitted]", #line - cut)
+  end
+
   local truncated = {}
   local n = 0
   local total_bytes = 0
@@ -195,24 +208,15 @@ local function tool_search_text(firing_id, args)
       truncated[#truncated + 1] = "[...truncated, raise max_results]"
       break
     end
-    total_bytes = total_bytes + #line + 1
-    if total_bytes > MAX_OUTPUT_BYTES then
-      truncated[#truncated + 1] = "[...truncated at 256KB]"
+    line = bounded_line(line)
+    if total_bytes + #line + 1 > MAX_OUTPUT_BYTES then
+      truncated[#truncated + 1] = "[... search_text output truncated at 24 KiB limit]"
       break
     end
+    total_bytes = total_bytes + #line + 1
     truncated[#truncated + 1] = line
   end
-  local output = table.concat(truncated, "\n")
-  if tool_output_dump.should_dump(output) then
-    local summary = tool_output_dump.dump(nil, firing_id, output, {
-      tool = "search_text",
-    })
-    if summary then
-      emit_ok(firing_id, summary)
-      return
-    end
-  end
-  emit_ok(firing_id, output)
+  emit_ok(firing_id, table.concat(truncated, "\n"))
 end
 
 local function tool_python_read(firing_id, _args)

@@ -6,7 +6,8 @@
 use std::io;
 use std::path::Path;
 
-use grep_regex::RegexMatcherBuilder;
+use grep_matcher::Matcher;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
@@ -23,6 +24,7 @@ pub const DESCRIPTION: &str = "Search for a regex pattern in files under a path 
 const DEFAULT_MAX_RESULTS: usize = 200;
 const MAX_MAX_RESULTS: usize = 2000;
 const MAX_RESULT_LINE_BYTES: usize = 4 * 1024;
+const MAX_TOTAL_OUTPUT_BYTES: usize = 24 * 1024;
 
 pub fn schema() -> Value {
     json!({
@@ -247,12 +249,17 @@ fn search(args: ParsedArgs) -> Result<String, ToolError> {
     let search_path = resolve_path(&args.path, args.cwd.as_deref());
     let root = Path::new(&search_path);
 
-    let mut results: Vec<String> = Vec::new();
+    let mut results = SearchResults::new(args.max_results);
 
     if root.is_file() {
         let path_str = root.to_string_lossy();
-        let mut sink = MatchSink::new(&path_str, &mut results, args.max_results, args.files_only);
-        let _ = searcher.search_path(&matcher, root, &mut sink);
+        let mut sink = MatchSink::new(&path_str, &matcher, &mut results, args.files_only);
+        searcher
+            .search_path(&matcher, root, &mut sink)
+            .map_err(|e| ToolError::Io {
+                path: search_path.clone(),
+                message: e.to_string(),
+            })?;
     } else {
         let mut walk_builder = WalkBuilder::new(root);
         walk_builder.hidden(true); // skip hidden files (rg default)
@@ -297,56 +304,113 @@ fn search(args: ParsedArgs) -> Result<String, ToolError> {
         walk_builder.sort_by_file_path(|a, b| a.cmp(b));
 
         for entry in walk_builder.build() {
-            if results.len() >= args.max_results {
+            if results.at_limit() {
                 break;
             }
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(e) => {
+                    return Err(ToolError::Io {
+                        path: search_path.clone(),
+                        message: e.to_string(),
+                    })
+                }
             };
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
             let path_str = entry.path().to_string_lossy();
-            let mut sink =
-                MatchSink::new(&path_str, &mut results, args.max_results, args.files_only);
-            let _ = searcher.search_path(&matcher, entry.path(), &mut sink);
+            let mut sink = MatchSink::new(&path_str, &matcher, &mut results, args.files_only);
+            searcher
+                .search_path(&matcher, entry.path(), &mut sink)
+                .map_err(|e| ToolError::Io {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    message: e.to_string(),
+                })?;
         }
     }
 
-    if results.is_empty() {
+    if results.lines.is_empty() {
         return Ok("(no matches)".into());
     }
 
-    let truncated = results.len() >= args.max_results;
-    let mut output = results.join("\n");
-    if truncated {
-        output.push_str("\n[...truncated, raise max_results]");
+    Ok(results.finish())
+}
+
+struct SearchResults {
+    lines: Vec<String>,
+    bytes: usize,
+    max_results: usize,
+    truncated: bool,
+}
+
+impl SearchResults {
+    fn new(max_results: usize) -> Self {
+        Self {
+            lines: Vec::new(),
+            bytes: 0,
+            max_results,
+            truncated: false,
+        }
     }
-    Ok(output)
+
+    fn at_limit(&self) -> bool {
+        self.lines.len() >= self.max_results || self.truncated
+    }
+
+    fn push(&mut self, line: String) -> bool {
+        if self.lines.len() >= self.max_results {
+            self.truncated = true;
+            return false;
+        }
+        let separator = usize::from(!self.lines.is_empty());
+        if self.bytes + separator + line.len() > MAX_TOTAL_OUTPUT_BYTES {
+            self.truncated = true;
+            return false;
+        }
+        self.bytes += separator + line.len();
+        self.lines.push(line);
+        true
+    }
+
+    fn finish(mut self) -> String {
+        if self.lines.len() >= self.max_results {
+            self.truncated = true;
+        }
+        let mut output = self.lines.join("\n");
+        if self.truncated {
+            output.push_str("\n[...truncated: search_text output reached result/24 KiB limit]");
+        }
+        output
+    }
 }
 
 struct MatchSink<'a> {
     path: &'a str,
-    results: &'a mut Vec<String>,
-    max: usize,
+    matcher: &'a RegexMatcher,
+    results: &'a mut SearchResults,
     files_only: bool,
     file_recorded: bool,
 }
 
 impl<'a> MatchSink<'a> {
-    fn new(path: &'a str, results: &'a mut Vec<String>, max: usize, files_only: bool) -> Self {
+    fn new(
+        path: &'a str,
+        matcher: &'a RegexMatcher,
+        results: &'a mut SearchResults,
+        files_only: bool,
+    ) -> Self {
         Self {
             path,
+            matcher,
             results,
-            max,
             files_only,
             file_recorded: false,
         }
     }
 
     fn at_limit(&self) -> bool {
-        self.results.len() >= self.max
+        self.results.at_limit()
     }
 }
 
@@ -365,9 +429,32 @@ impl Sink for MatchSink<'_> {
             return Ok(false);
         }
         let line_num = mat.line_number().unwrap_or(0);
-        let content = bounded_line_preview(mat.bytes());
-        self.results
-            .push(format!("{}:{}:{}", self.path, line_num, content));
+        let bytes = trim_line_end(mat.bytes());
+        if bytes.len() <= MAX_RESULT_LINE_BYTES {
+            self.results.push(format!(
+                "{}:{}:{}",
+                self.path,
+                line_num,
+                String::from_utf8_lossy(bytes)
+            ));
+        } else {
+            let absolute_line_offset = mat.absolute_byte_offset();
+            let path = self.path;
+            let results = &mut self.results;
+            self.matcher
+                .find_iter(bytes, |found| {
+                    let preview = bounded_match_preview(bytes, found.start(), found.end());
+                    results.push(format!(
+                        "{}:{}:byte {}..{}:{}",
+                        path,
+                        line_num,
+                        absolute_line_offset + found.start() as u64,
+                        absolute_line_offset + found.end() as u64,
+                        preview
+                    ))
+                })
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         Ok(!self.at_limit())
     }
 
@@ -414,6 +501,39 @@ fn bounded_line_preview(bytes: &[u8]) -> String {
         "{}[... search_text line truncated: {} bytes omitted from this matching line]",
         preview,
         bytes.len().saturating_sub(end)
+    )
+}
+
+fn bounded_match_preview(bytes: &[u8], match_start: usize, match_end: usize) -> String {
+    let match_len = match_end.saturating_sub(match_start);
+    let kept_match_len = match_len.min(MAX_RESULT_LINE_BYTES);
+    let surrounding = MAX_RESULT_LINE_BYTES - kept_match_len;
+    let mut start = match_start.saturating_sub(surrounding / 2);
+    let mut end = (start + MAX_RESULT_LINE_BYTES).min(bytes.len());
+    start = end.saturating_sub(MAX_RESULT_LINE_BYTES);
+
+    while start < match_start && !is_utf8_boundary_byte(bytes[start]) {
+        start += 1;
+    }
+    while end > start && end < bytes.len() && !is_utf8_boundary_byte(bytes[end]) {
+        end -= 1;
+    }
+
+    let prefix = if start > 0 {
+        format!("[... {} bytes omitted before match]", start)
+    } else {
+        String::new()
+    };
+    let suffix = if end < bytes.len() {
+        format!("[... {} bytes omitted after match]", bytes.len() - end)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}{}{}",
+        prefix,
+        String::from_utf8_lossy(&bytes[start..end]),
+        suffix
     )
 }
 
@@ -593,7 +713,91 @@ mod tests {
             out.len()
         );
         assert!(out.contains("prefix-needle-"));
-        assert!(out.contains("search_text line truncated"));
+        assert!(out.contains("bytes omitted"));
+        assert!(out.contains("byte "));
+    }
+
+    #[tokio::test]
+    async fn huge_one_line_json_reports_each_match_with_bounded_excerpts() {
+        let dir = TempDir::new().unwrap();
+        let huge_line = format!(
+            "{{\"head\":\"{}\",\"first\":\"needle-one\",\"middle\":\"{}\",\"second\":\"needle-two\",\"tail\":\"{}\"}}",
+            "a".repeat(1024 * 1024),
+            "b".repeat(1024 * 1024),
+            "c".repeat(1024 * 1024)
+        );
+        fs::write(dir.path().join("huge.json"), huge_line).unwrap();
+
+        let out = run(&json!({
+            "pattern": "needle-(one|two)",
+            "path": dir.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+
+        assert!(out.contains("needle-one"));
+        assert!(out.contains("needle-two"));
+        assert_eq!(out.matches(":byte ").count(), 2);
+        assert!(out.len() < 12 * 1024);
+    }
+
+    #[tokio::test]
+    async fn huge_line_preview_preserves_unicode_at_excerpt_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let huge_line = format!("{}needle{}", "界".repeat(2000), "€".repeat(2000));
+        fs::write(dir.path().join("unicode.json"), huge_line).unwrap();
+
+        let out = run(&json!({
+            "pattern": "needle",
+            "path": dir.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+
+        assert!(out.contains("界"));
+        assert!(out.contains("€"));
+        assert!(!out.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn total_output_is_bounded_below_spill_threshold() {
+        let dir = TempDir::new().unwrap();
+        let mut huge_line = String::new();
+        for i in 0..100 {
+            huge_line.push_str(&format!(
+                "{}needle-{i}{}",
+                "x".repeat(5000),
+                "y".repeat(5000)
+            ));
+        }
+        fs::write(dir.path().join("spill.txt"), huge_line).unwrap();
+
+        let out = run(&json!({
+            "pattern": "needle-[0-9]+",
+            "path": dir.path().to_str().unwrap(),
+            "max_results": 200
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            out.len() < 32 * 1024,
+            "bounded search output must not spill again"
+        );
+        assert!(out.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_small_lines_keep_the_existing_shape() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("normal.txt");
+        fs::write(&path, "alpha needle omega\n").unwrap();
+
+        let out = run(&json!({ "pattern": "needle", "path": path }))
+            .await
+            .unwrap();
+        assert_eq!(out, format!("{}:1:alpha needle omega", path.display()));
+        assert!(!out.contains(":byte "));
     }
 
     #[tokio::test]
