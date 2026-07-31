@@ -979,7 +979,15 @@ local function handle_session_stats(msg, state)
   for k, v in pairs(msg) do
     if k ~= "kind" then stats[k] = v end
   end
-  local s = shallow_merge(next_state, { stats = stats })
+  local current_context_tokens = msg.last_turn_context_tokens
+    or msg.last_turn_input_tokens
+    or msg.context_tokens
+    or msg.prompt_tokens
+  local patch = { stats = stats }
+  if current_context_tokens ~= nil then
+    patch.current_context_tokens = current_context_tokens
+  end
+  local s = shallow_merge(next_state, patch)
   if msg.model then
     local mt = msg.max_context_tokens
       or model_context_windows[msg.model]
@@ -1113,6 +1121,20 @@ local function handle_plan_append(msg, state)
 end
 
 local function handle_compaction_commit(msg, state)
+  if type(msg.model_context_artifact) ~= "table" then return state, {} end
+  local pending_idx
+  for i = #state.entries, 1, -1 do
+    local e = state.entries[i]
+    if type(e) == "table" and e.kind == "compaction" and e.status == "pending" then
+      pending_idx = i
+      if (e.provider ~= nil and msg.provider ~= e.provider)
+          or (e.model ~= nil and msg.model ~= e.model) then
+        return state, {}
+      end
+      break
+    end
+  end
+
   local committed = Entry.compaction({
     chat_id = msg.chat_id,
     provider = msg.provider,
@@ -1124,20 +1146,15 @@ local function handle_compaction_commit(msg, state)
     metadata = msg.metadata,
   })
   local entries = {}
-  local replaced = false
   for i = 1, #state.entries do entries[i] = state.entries[i] end
-  for i = #entries, 1, -1 do
-    local e = entries[i]
-    if type(e) == "table" and e.kind == "compaction" and e.status == "pending" then
-      entries[i] = committed
-      replaced = true
-      break
-    end
+  if pending_idx ~= nil then entries[pending_idx] = committed end
+  local next_state
+  if pending_idx ~= nil then
+    next_state = shallow_merge(state, { entries = entries })
+  else
+    next_state = transcript.push_entry(state, committed)
   end
-  if replaced then
-    return shallow_merge(state, { entries = entries }), {}
-  end
-  return transcript.push_entry(state, committed), {}
+  return shallow_merge(next_state, { current_context_tokens = NIL_SENTINEL }), {}
 end
 
 local function handle_compaction_failed(msg, state)

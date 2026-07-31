@@ -243,6 +243,7 @@ local function initial_state()
     node_previews    = {},
     popup            = nil,
     stats            = {},
+    current_context_tokens = nil,
     pending          = false,
     turn_started_at  = nil,
     last_turn_duration_ms = nil,

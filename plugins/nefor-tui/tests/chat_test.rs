@@ -3357,6 +3357,21 @@ fn slash_compact_renders_pending_entry_until_commit() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats",
+            "model": "mock-model",
+            "last_turn_context_tokens": 80_000,
+            "max_context_tokens": 128_000,
+        }),
+    );
+    let before = render_str(&mut engine);
+    assert!(
+        before.contains("ctx 80k/128k"),
+        "precondition: statusline should show the completed turn's context: {before:?}"
+    );
+
     submit_text(&mut engine, "/compact");
 
     let out = render_str(&mut engine);
@@ -3376,10 +3391,11 @@ fn slash_compact_renders_pending_entry_until_commit() {
         &mut engine,
         json!({
             "kind": "chat.compaction.commit",
-            "provider": "chatgpt",
-            "model": "gpt-5.5",
+            "provider": "mock-plugin",
+            "model": "mock-model",
             "trigger": "manual",
             "display_summary": "Kept the important bits.",
+            "model_context_artifact": { "kind": "responses.compaction" },
             "metadata": { "before_items": 7, "after_items": 2 },
         }),
     );
@@ -3389,6 +3405,19 @@ fn slash_compact_renders_pending_entry_until_commit() {
         out.contains("context compacted"),
         "commit should replace the pending label: {out:?}"
     );
+    let snapshot = engine.snapshot();
+    let separator_row = snapshot
+        .lines()
+        .find(|line| line.contains("context compacted · manual · mock-plugin/mock-model"))
+        .expect("completed compaction separator row");
+    assert!(
+        separator_row.matches('─').count() >= 8,
+        "completed compaction label should share a full-width separator row: {separator_row:?}"
+    );
+    assert!(
+        out.contains("ctx 128k") && !out.contains("ctx 80k/128k"),
+        "commit should clear the stale current-context count immediately: {out:?}"
+    );
     assert!(
         out.contains("Kept the important bits."),
         "commit summary should be rendered: {out:?}"
@@ -3396,6 +3425,40 @@ fn slash_compact_renders_pending_entry_until_commit() {
     assert!(
         !out.contains("context compacting..."),
         "pending compaction entry should be replaced, not duplicated: {out:?}"
+    );
+}
+
+#[test]
+fn invalid_compaction_commit_keeps_pending_entry_and_context_tokens() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats",
+            "model": "mock-model",
+            "last_turn_context_tokens": 80_000,
+            "max_context_tokens": 128_000,
+        }),
+    );
+    submit_text(&mut engine, "/compact");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.compaction.commit",
+            "provider": "mock-plugin",
+            "model": "mock-model",
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(out.contains("context compacting..."), "{out:?}");
+    assert!(!out.contains("context compacted"), "{out:?}");
+    assert!(
+        out.contains("ctx 80k/128k"),
+        "rejected commit must not clear the current-context count: {out:?}"
     );
 }
 

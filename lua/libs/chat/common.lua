@@ -222,6 +222,7 @@ M.STYLE = {
   input_border_unfocused= { fg = C.status_dim },
   body_default    = nil,
   system          = { fg = C.system, italic = true },
+  compaction_separator = { fg = C.user, bold = true },
   status          = { fg = C.system },
   status_dim      = { fg = C.status_dim },
   status_warn     = { fg = C.status_warn },

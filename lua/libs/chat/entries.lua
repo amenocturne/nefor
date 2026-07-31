@@ -426,14 +426,34 @@ local function compaction_label(entry, glyph)
   return table.concat(parts, " · ")
 end
 
-local function compaction_collapsed(entry)
-  local rows = {
+local function compaction_separator(entry, glyph)
+  local label = compaction_label(entry, glyph)
+  return tui.row { gap = 1, children = {
     tui.text {
-      content = compaction_label(entry, "▸ "),
-      style   = STYLE.system,
+      content = label,
+      style   = STYLE.compaction_separator,
       wrap    = "none",
     },
+    tui.expanded { child = tui.fill {
+      char = "─",
+      style = STYLE.compaction_separator,
+    } },
+  } }
+end
+
+local function compaction_header(entry, glyph)
+  if entry.status == "complete" then
+    return compaction_separator(entry, glyph)
+  end
+  return tui.text {
+    content = compaction_label(entry, glyph),
+    style   = STYLE.system,
+    wrap    = "none",
   }
+end
+
+local function compaction_collapsed(entry)
+  local rows = { compaction_header(entry, "▸ ") }
   if type(entry.display_summary) == "string" and #entry.display_summary > 0 then
     rows[#rows + 1] = tui.text {
       content = "  " .. entry.display_summary,
@@ -453,13 +473,7 @@ local function compaction_expanded(entry)
     end
     artifact = slim
   end
-  local rows = {
-    tui.text {
-      content = compaction_label(entry, "▼ "),
-      style   = STYLE.system,
-      wrap    = "none",
-    },
-  }
+  local rows = { compaction_header(entry, "▼ ") }
   if type(entry.display_summary) == "string" and #entry.display_summary > 0 then
     rows[#rows + 1] = tui.text {
       content = "  " .. entry.display_summary,

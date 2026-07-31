@@ -102,7 +102,7 @@ function M.compaction(opts)
     model = opts.model,
     strategy = opts.strategy,
     trigger = opts.trigger,
-    status = opts.status,
+    status = opts.status or "complete",
     display_summary = opts.display_summary,
     model_context_artifact = opts.model_context_artifact,
     metadata = opts.metadata,
