@@ -1,16 +1,19 @@
 -- nefor-pm — pure-Lua plugin manager.
 --
 -- Public API:
---   pm.install(specs)        ensure each spec is on disk, write lockfile.
---                            Synchronous: blocks until every clone/build
---                            finishes so init.lua can rely on plugins
---                            being present immediately after the call.
+--   pm.install(specs)        reproduce the exact commits in the lockfile;
+--                            resolve and pin refs only when no lock exists.
+--   pm.update(specs)         explicitly resolve refs again and move their pins.
+--                            Both operations are synchronous, so init.lua can
+--                            rely on plugins being present when they return.
 --   pm.load(name)            plain `require(name)`. Resolution is Lua's job —
 --                            pm.install has already augmented package.path so
 --                            installed plugins' dirs are searched.
 --   pm.bin(name[, binname])  resolve <plugin_dir>/bin/<binname> (default: name).
 --   pm.require(name)         alias of pm.load — never triggers install.
---   pm.sync_checkout(opts)   ensure a managed git checkout is present at a ref.
+--   pm.sync_checkout(opts)   ensure a managed git checkout is present at a ref;
+--                            optional `lockfile` makes its commit authoritative.
+--   pm.update_checkout(opts) explicitly move that managed-checkout pin.
 --   pm.engine_ref()          returns (ref, ref_kind) derived from nefor.version:
 --                            exact semver → ("vX.Y.Z", "tag"); otherwise ("main", "branch").
 --
@@ -239,7 +242,13 @@ local function read_lockfile()
   if body == "" then return {} end
   local ok, decoded = pcall(nefor.json.decode, body)
   if not ok or type(decoded) ~= "table" then
-    return {}
+    error("nefor-pm: lockfile is invalid: " .. lockfile_path(), 0)
+  end
+  for name, entry in pairs(decoded) do
+    if type(name) ~= "string" or type(entry) ~= "table"
+        or not is_string(entry.ref) or not is_string(entry.commit) then
+      error("nefor-pm: lockfile has an invalid entry: " .. tostring(name), 0)
+    end
   end
   return decoded
 end
@@ -396,7 +405,7 @@ local function normalize_sparse_paths(paths)
   return out
 end
 
-local function sync_checkout(opts)
+local function sync_checkout(opts, update)
   if not is_table(opts) then
     error("nefor-pm.sync_checkout: opts must be a table", 0)
   end
@@ -423,6 +432,19 @@ local function sync_checkout(opts)
     ref      = ref,
     ref_kind = ref_kind,
   }
+  local pin_path = opts.lockfile
+  local pin
+  if is_string(pin_path) then
+    local lock_read = require_fs().read_file(pin_path)
+    if lock_read.ok and is_string(lock_read.content) then
+      pin = lock_read.content:match("^%s*(%x+)%s*$")
+      if not pin then fail(label, "checkout lock is invalid: " .. pin_path) end
+    end
+  end
+  if pin and not update then
+    spec.ref = pin
+    spec.ref_kind = "commit"
+  end
   local sparse_paths = normalize_sparse_paths(opts.sparse)
   local fs = require_fs()
   local parent_mk = fs.mkdir_p(parent_dir(opts.dir))
@@ -430,7 +452,10 @@ local function sync_checkout(opts)
     fail(label, "cannot create checkout parent: " .. tostring(parent_mk.error))
   end
 
-  if not is_cloned(opts.dir) then
+  local head_now = is_cloned(opts.dir) and current_commit(opts.dir) or nil
+  if head_now == spec.ref then
+    -- Exact local pins are complete without network access.
+  elseif not is_cloned(opts.dir) then
     local args = { "clone", "--depth", "1" }
     if sparse_paths then
       args[#args + 1] = "--filter=blob:none"
@@ -448,6 +473,11 @@ local function sync_checkout(opts)
     end
   else
     update_to_ref(label, spec, opts.dir)
+  end
+
+  if is_string(pin_path) and (not pin or update) then
+    local write = require_fs().write_file(pin_path, (current_commit(opts.dir) or "") .. "\n")
+    if not write.ok then fail(label, "cannot write checkout lock: " .. tostring(write.error)) end
   end
 
   if sparse_paths then
@@ -516,7 +546,16 @@ local function flatten_subtree(label, target_dir, spec_path)
   run_or_die(label, { "rmdir", staging })
 end
 
-local function install_spec(spec, lock)
+local function pinned_spec(spec, entry)
+  if not (entry and is_string(entry.commit)) then return spec end
+  local pinned = {}
+  for k, v in pairs(spec) do pinned[k] = v end
+  pinned.ref = entry.commit
+  pinned.ref_kind = "commit"
+  return pinned
+end
+
+local function install_spec(spec, lock, update)
   local label = spec.name
   local fs = require_fs()
 
@@ -567,33 +606,30 @@ local function install_spec(spec, lock)
   ensure_on_path(plugins_root())
 
   local entry = lock[spec.name]
+  local desired = update and spec or pinned_spec(spec, entry)
   local build_hash = compute_build_hash(spec)
 
-  -- Idempotency: same ref AND same build_hash AND clone exists → skip.
+  -- The lock commit is authoritative for ordinary installs. Validate HEAD
+  -- before touching the network; an exact local pin is a complete success.
   local fresh_clone = false
-  if not is_cloned(target_dir) then
-    clone(label, spec, target_dir)
-    fresh_clone = true
+  local head_now = is_cloned(target_dir) and current_commit(target_dir) or nil
+  if head_now ~= desired.ref then
+    if not is_cloned(target_dir) then
+      clone(label, desired, target_dir)
+      fresh_clone = true
+    else
+      update_to_ref(label, desired, target_dir)
+    end
     if spec.path then
       flatten_subtree(label, target_dir, spec.path)
     end
-  else
-    local head_now = current_commit(target_dir)
-    local need_update = true
-    if entry and entry.ref == spec.ref and entry.commit and entry.commit == head_now then
-      need_update = false
-    end
-    if need_update then
-      update_to_ref(label, spec, target_dir)
-      if spec.path then
-        flatten_subtree(label, target_dir, spec.path)
-      end
-    end
   end
 
+  local installed_commit = current_commit(target_dir)
   local need_build = spec.build ~= nil and (
     fresh_clone
     or not entry
+    or entry.commit ~= installed_commit
     or entry.build_hash ~= build_hash
   )
 
@@ -621,30 +657,38 @@ local function install_spec(spec, lock)
 
   return {
     ref        = spec.ref,
-    commit     = current_commit(target_dir),
+    commit     = installed_commit,
     build_hash = build_hash,
   }
 end
 
-function M.install(specs)
+local function apply_specs(specs, update)
   if not is_table(specs) then
-    error("nefor-pm.install: specs must be a list of tables", 0)
+    error("nefor-pm: specs must be a list of tables", 0)
   end
   local lock = read_lockfile()
   local new_lock = {}
-  -- Preserve entries for plugins not mentioned in this install call (so a
-  -- partial install doesn't wipe sibling lock state). Specs override.
+  -- Preserve entries for plugins not mentioned in this operation (so a
+  -- partial install or update doesn't wipe sibling lock state).
   for k, v in pairs(lock) do new_lock[k] = v end
 
   for i, raw in ipairs(specs) do
     local spec = parse_spec(raw, i)
-    local entry = install_spec(spec, lock)
+    local entry = install_spec(spec, lock, update)
     if entry ~= nil then
       new_lock[spec.name] = entry
     end
   end
 
   write_lockfile(new_lock)
+end
+
+function M.install(specs)
+  apply_specs(specs, false)
+end
+
+function M.update(specs)
+  apply_specs(specs, true)
 end
 
 -- pm.bin still uses the registry to find a plugin's dir (the binary's
@@ -680,7 +724,11 @@ function M.require(name)
 end
 
 function M.sync_checkout(opts)
-  return sync_checkout(opts)
+  return sync_checkout(opts, false)
+end
+
+function M.update_checkout(opts)
+  return sync_checkout(opts, true)
 end
 
 function M.bin(name, binary_name)

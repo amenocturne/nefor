@@ -122,11 +122,18 @@ pm.install({
 - The bootstrap path uses `git` directly — same cross-platform constraint
   the rest of the pm honours (`git` is the only binary the bootstrap
   invokes, and it's available on every developer machine).
-- Behaviour is version-synchronising: a cached checkout is fetched and
-  force-checked-out to the ref selected from `nefor.version` on each boot.
+- The lockfile is authoritative. `pm.install` reproduces its exact commits and
+  does not move a valid local pin or fetch unnecessarily. With no lock entry,
+  the first install resolves the requested ref and records the resulting commit.
+  Use `pm.update(specs)` explicitly to resolve refs again and move pins; restoring
+  an older lockfile rolls the next install back to those commits.
+- Managed bootstrap checkouts likewise validate an exact release tag locally
+  before using the network. Missing or mismatched state fails rather than
+  silently running a different revision.
 - The engine binary must be installed separately — this bootstrap only
   fetches the _Lua_ side of nefor. Use your platform's package manager
   for the engine itself (or build from source via `cargo install`).
-- After `nefor-pm` is loaded, use `pm.sync_checkout({...})` for any other
-  managed upstream checkout that must stay aligned with a branch, tag, or
-  commit.
+- After `nefor-pm` is loaded, use `pm.sync_checkout({...})` for another managed
+  checkout. Pass `lockfile = "/path/to/commit.lock"` to persist and reuse its
+  exact commit; only `pm.update_checkout({...})` moves that pin. Without a
+  lockfile, `sync_checkout` retains its direct ref-synchronising behavior.

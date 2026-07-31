@@ -784,6 +784,122 @@ fn install_clones_and_creates_lockfile() {
 }
 
 #[test]
+fn install_reproduces_existing_lock_without_moving_until_update() {
+    let work = tempfile::tempdir().expect("workdir");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let pinned = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&origin)
+        .output()
+        .expect("read pinned commit");
+    assert!(pinned.status.success());
+    let pinned = String::from_utf8(pinned.stdout)
+        .expect("utf8 commit")
+        .trim()
+        .to_owned();
+
+    std::fs::write(origin.join("README.md"), "new head\n").expect("update README");
+    run_git(&origin, &["add", "README.md"]);
+    run_git(&origin, &["commit", "-m", "new head", "--quiet"]);
+    let moved = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&origin)
+        .output()
+        .expect("read moved commit");
+    assert!(moved.status.success());
+    let moved = String::from_utf8(moved.stdout)
+        .expect("utf8 commit")
+        .trim()
+        .to_owned();
+
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let plugins = data.path().join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(
+        plugins.join("nefor-pm.lock.json"),
+        format!("{{\"pinned\":{{\"ref\":\"main\",\"commit\":\"{pinned}\"}}}}\n"),
+    )
+    .expect("seed lock");
+
+    let lua = lua_with_pm();
+    let install = format!(
+        r#"local pm = require("nefor-pm"); pm.install({{{{ name = "pinned", url = "{}", branch = "main" }}}})"#,
+        url
+    );
+    lua.load(&install).exec().expect("fresh install from lock");
+
+    let checkout = plugins.join("pinned");
+    let checkout_head = || {
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&checkout)
+            .output()
+            .expect("read checkout head");
+        assert!(head.status.success());
+        String::from_utf8_lossy(&head.stdout).trim().to_owned()
+    };
+    assert_eq!(checkout_head(), pinned, "fresh install must honor lock");
+    lua.load(&install).exec().expect("ordinary sync");
+    assert_eq!(checkout_head(), pinned, "ordinary sync must not move lock");
+
+    let update = format!(
+        r#"local pm = require("nefor-pm"); pm.update({{{{ name = "pinned", url = "{}", branch = "main" }}}})"#,
+        url
+    );
+    lua.load(&update).exec().expect("explicit update");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&checkout)
+        .output()
+        .expect("read checkout head");
+    assert!(head.status.success());
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), moved);
+    let lock = std::fs::read_to_string(plugins.join("nefor-pm.lock.json")).expect("lock");
+    assert!(
+        lock.contains(&moved),
+        "explicit update must move lock: {lock}"
+    );
+}
+
+#[test]
+fn install_uses_valid_pin_offline_and_rejects_invalid_pin() {
+    let work = tempfile::tempdir().expect("workdir");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+    let install = format!(
+        r#"local pm = require("nefor-pm"); pm.install({{{{ name = "offline", url = "{}", branch = "main" }}}})"#,
+        url
+    );
+    lua.load(&install).exec().expect("initial install");
+
+    std::fs::remove_dir_all(&origin).expect("remove origin to simulate offline");
+    lua.load(&install)
+        .exec()
+        .expect("exact local pin must not fetch while offline");
+
+    let checkout = data.path().join("plugins").join("offline");
+    run_git(&checkout, &["checkout", "--detach", "HEAD~0"]);
+    std::fs::write(checkout.join("README.md"), "dirty but same commit\n").expect("dirty checkout");
+    run_git(&checkout, &["add", "README.md"]);
+    run_git(&checkout, &["config", "user.email", "test@example.com"]);
+    run_git(&checkout, &["config", "user.name", "Test"]);
+    run_git(
+        &checkout,
+        &["commit", "-m", "wrong local commit", "--quiet"],
+    );
+    let err = lua
+        .load(&install)
+        .exec()
+        .expect_err("wrong local commit with no origin must fail loudly");
+    assert!(err.to_string().contains("nefor-pm[offline]"), "{err}");
+}
+
+#[test]
 fn sync_checkout_updates_existing_checkout_to_requested_tag() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
@@ -1104,6 +1220,21 @@ fn install_skips_clone_when_lockfile_matches_head() {
         mtime_before, mtime_after,
         ".git/HEAD mtime must not change on idempotent re-install"
     );
+}
+
+#[test]
+fn install_invalid_lockfile_fails_loudly() {
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let plugins = data.path().join("plugins");
+    std::fs::create_dir_all(&plugins).expect("plugins dir");
+    std::fs::write(plugins.join("nefor-pm.lock.json"), "not json\n").expect("lock");
+    let lua = lua_with_pm();
+    let err = lua
+        .load(r#"local pm = require("nefor-pm"); pm.install({})"#)
+        .exec()
+        .expect_err("invalid lock must fail");
+    assert!(err.to_string().contains("lockfile is invalid"), "{err}");
 }
 
 #[test]

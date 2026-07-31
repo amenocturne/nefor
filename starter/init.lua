@@ -109,12 +109,20 @@ local function ensure_upstream_checkout(pm_root)
   elseif not path_exists(pm_root .. "/.git") then
     error("nefor bootstrap: " .. pm_root .. " exists but is not a git checkout")
   else
-    if not run("git -C " .. root .. " fetch --depth 1 origin " .. fetch_ref) then
-      error("nefor bootstrap: git fetch failed for ref " .. UPSTREAM_REF)
-    end
-    -- This tree is a managed cache; keep Lua assets matched to the binary version.
-    if not run("git -C " .. root .. " checkout --force FETCH_HEAD") then
-      error("nefor bootstrap: git checkout failed for ref " .. UPSTREAM_REF)
+    -- A release checkout already at its exact local tag is authoritative and
+    -- needs no network. The shell comparison deliberately resolves annotated
+    -- tags to commits before comparing them with HEAD.
+    local exact_local_pin = UPSTREAM_REF:match("^v%d+%.%d+%.%d+$")
+      and run("test \"$(git -C " .. root .. " rev-parse HEAD)\" = "
+           .. "\"$(git -C " .. root .. " rev-parse " .. ref .. "^{commit})\"")
+    if not exact_local_pin then
+      if not run("git -C " .. root .. " fetch --depth 1 origin " .. fetch_ref) then
+        error("nefor bootstrap: git fetch failed for ref " .. UPSTREAM_REF
+              .. "; no valid exact local pin is available")
+      end
+      if not run("git -C " .. root .. " checkout --force FETCH_HEAD") then
+        error("nefor bootstrap: git checkout failed for ref " .. UPSTREAM_REF)
+      end
     end
   end
 
