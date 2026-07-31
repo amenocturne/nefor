@@ -217,6 +217,17 @@ local function reset_transcript_scroll()
   end
 end
 
+local function close_and_flush_lead_unit(state)
+  return transcript.flush_graph_results(transcript.close_lead_unit(state))
+end
+
+local function flush_before_transcript_replace(state)
+  -- The old session owns these results. Materialize them before replacing the
+  -- visible transcript so they can neither be discarded as pending state nor
+  -- appear as if they belonged to the selected session's replay.
+  return transcript.flush_graph_results(state)
+end
+
 local function handle_input_changed(msg, state)
   local result = W.prompt.handle(prompt_widget_opts(state), msg)
   if result and result.state then
@@ -245,10 +256,12 @@ local function handle_input_submit(msg, state)
     return state, { { kind = "exit" } }
   end
   if cmd == "new" or cmd == "clear" then
+    state = flush_before_transcript_replace(state)
     reset_transcript_scroll()
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL,
-      pending_assistant_projection = NIL_SENTINEL, input_value = "",
+      pending_assistant_projection = NIL_SENTINEL,
+      pending_graph_results = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
       runs = {}, sidebar_folds = {},
       node_previews = {}, preview_registry = {}, scope_to_run = {},
@@ -442,10 +455,12 @@ local function handle_input_submit(msg, state)
         started_at_ms = tui.now_ms(),
         ttl_ms = 3000,
       }
+      state = flush_before_transcript_replace(state)
       reset_transcript_scroll()
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL,
-        pending_assistant_projection = NIL_SENTINEL, input_value = "",
+        pending_assistant_projection = NIL_SENTINEL,
+        pending_graph_results = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
         runs = {}, sidebar_folds = {},
         node_previews = {}, preview_registry = {}, scope_to_run = {},
@@ -531,11 +546,13 @@ local function handle_input_submit(msg, state)
   if cmd == "resume" then
     if args and #args > 0 then
       local id = args:match("^([%w%-]+)") or args
+      state = flush_before_transcript_replace(state)
       reset_transcript_scroll()
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
         pending_assistant_projection = NIL_SENTINEL,
+        pending_graph_results = NIL_SENTINEL,
         pending = false, runs = {}, sidebar_folds = {},
         node_previews = {}, preview_registry = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
@@ -739,7 +756,7 @@ local function apply_control_decisions(state, decisions, metadata)
         kind = "send_to", target = "engine", body = { kind = "chat.steer" },
       }
     elseif decision.kind == "hard_stop_lead" then
-      state = transcript.close_assistant_projection(state)
+      state = close_and_flush_lead_unit(state)
       effects[#effects + 1] = {
         kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt", drop_queued = true },
@@ -848,6 +865,7 @@ end
 
 local function handle_session_end(_msg, state)
   run_bindings = mag_run_bindings.new()
+  state = close_and_flush_lead_unit(state)
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
     pending_assistant_projection = NIL_SENTINEL,
@@ -891,7 +909,7 @@ local function handle_replay_end(_msg, state)
 end
 
 local function handle_chat_reset(_msg, state)
-  return transcript.close_assistant_projection(state), {}
+  return close_and_flush_lead_unit(state), {}
 end
 
 -- ── inbound chat-contract events ──────────────────────────────────────
@@ -953,7 +971,9 @@ local function handle_message_append(msg, state)
   end
   if role == "assistant" then
     local next_state, handled = transcript.reduce_assistant_event(state, msg)
-    if handled then return next_state, {} end
+    if handled then
+      return transcript.flush_graph_results_if_stable(next_state), {}
+    end
   end
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
@@ -986,8 +1006,9 @@ local function handle_error_append(msg, state)
     pending = false,
     turn_started_at = NIL_SENTINEL,
   })
-  return transcript.push_entry(next_state,
-    Entry.error(title, message, msg.retryable)), {}
+  next_state = transcript.push_entry(next_state,
+    Entry.error(title, message, msg.retryable))
+  return transcript.flush_graph_results(next_state), {}
 end
 
 -- The transcript renders exactly one conversation: the lead's. Its
@@ -1052,7 +1073,7 @@ end
 local function handle_stream_end(msg, state)
   if is_foreign_chat(msg, state) then return state, {} end
   local next_state = transcript.reduce_assistant_event(state, msg)
-  return next_state, {}
+  return transcript.flush_graph_results_if_stable(next_state), {}
 end
 
 local function handle_reasoning_delta(msg, state)
@@ -1173,11 +1194,13 @@ local function handle_tool_register(msg, state)
 end
 
 local function handle_tool_end(msg, state)
-  return transcript.attach_tool_end(state, msg.id or "", msg.output or "", msg.error == true), {}
+  local next_state = transcript.attach_tool_end(
+    state, msg.id or "", msg.output or "", msg.error == true)
+  return transcript.flush_graph_results_if_stable(next_state), {}
 end
 
 local function handle_graph_result_append(msg, state)
-  return transcript.push_entry(state,
+  return transcript.append_graph_result(state,
     Entry.graph_result(
       msg.run_id or "",
       msg.status or "success",
@@ -2073,8 +2096,13 @@ function M.update(msg, state)
   end
   log.log("update", "dispatch kind=%s", kind)
   local handler = handlers[kind]
-  if handler then return handler(msg, state) end
-  return route_keys_and_popups(msg, state)
+  local next_state, effects
+  if handler then
+    next_state, effects = handler(msg, state)
+  else
+    next_state, effects = route_keys_and_popups(msg, state)
+  end
+  return transcript.flush_graph_results_if_stable(next_state), effects
 end
 
 return M

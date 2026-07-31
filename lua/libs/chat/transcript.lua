@@ -28,6 +28,46 @@ function M.push_entry(state, entry)
   return shallow_merge(state, { entries = new_entries })
 end
 
+local function has_open_tool(entries)
+  for i = #entries, 1, -1 do
+    local entry = entries[i]
+    if entry.kind == "tool_call" and entry.output == nil then return true end
+    if entry.role == "assistant" or entry.role == "user" then return false end
+  end
+  return false
+end
+
+function M.lead_unit_open(state)
+  return state.pending == true
+    or state.in_flight ~= nil
+    or state.pending_assistant_projection ~= nil
+    or has_open_tool(state.entries or {})
+end
+
+function M.append_graph_result(state, entry)
+  if not M.lead_unit_open(state) then return M.push_entry(state, entry) end
+  local buffered = {}
+  for i, value in ipairs(state.pending_graph_results or {}) do buffered[i] = value end
+  buffered[#buffered + 1] = entry
+  return shallow_merge(state, { pending_graph_results = buffered })
+end
+
+function M.flush_graph_results(state)
+  local buffered = state.pending_graph_results or {}
+  if #buffered == 0 then return state end
+  local entries = state.entries
+  for _, entry in ipairs(buffered) do entries = append_entry(entries, entry) end
+  return shallow_merge(state, {
+    entries = entries,
+    pending_graph_results = NIL_SENTINEL,
+  })
+end
+
+function M.flush_graph_results_if_stable(state)
+  if M.lead_unit_open(state) then return state end
+  return M.flush_graph_results(state)
+end
+
 function M.append_assistant_delta(state, delta)
   if state.in_flight ~= nil and state.entries[state.in_flight] then
     local e = state.entries[state.in_flight]
@@ -165,6 +205,28 @@ end
 function M.close_assistant_projection(state)
   if state.pending_assistant_projection == nil then return state end
   return shallow_merge(state, { pending_assistant_projection = NIL_SENTINEL })
+end
+
+function M.close_lead_unit(state)
+  local entries = state.entries or {}
+  local closed_entries = entries
+  for i = 1, #entries do
+    local entry = entries[i]
+    if entry.kind == "tool_call" and entry.output == nil then
+      if closed_entries == entries then
+        closed_entries = {}
+        for j = 1, #entries do closed_entries[j] = entries[j] end
+      end
+      closed_entries[i] = Entry.set_output(entry, "interrupted", true)
+    end
+  end
+  return shallow_merge(state, {
+    entries = closed_entries,
+    in_flight = NIL_SENTINEL,
+    pending_assistant_projection = NIL_SENTINEL,
+    pending = false,
+    turn_started_at = NIL_SENTINEL,
+  })
 end
 
 -- Canonical entry-state transition for assistant events shared by every chat

@@ -223,6 +223,7 @@ local function initial_state()
     entries          = {},
     in_flight        = nil,
     pending_assistant_projection = nil,
+    pending_graph_results = nil,
     -- The lead conversation's binding, set by `chat.lead.bound`: either
     -- an exact chat_id or a chat_prefix (the lead's kernel turn-programs
     -- mint a scoped chat handle per round; the run-scoped prefix is the

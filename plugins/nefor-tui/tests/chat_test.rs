@@ -414,6 +414,165 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
 }
 
 #[test]
+fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
+    let mut engine = Engine::new(120, 80).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "lead answer" }),
+    );
+    for (run_id, run_name) in [("run-first", "first"), ("run-second", "second")] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.graph_result.append",
+                "run_id": run_id,
+                "run_name": run_name,
+                "status": "success",
+            }),
+        );
+    }
+    let open = render_str(&mut engine);
+    assert!(
+        open.contains("lead answer") && !open.contains("mag workflow"),
+        "results must remain hidden while the lead stream is open:\n{open}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 10 }),
+    );
+    let streamed = render_str(&mut engine);
+    let first = streamed.find("first").expect("first result");
+    let second = streamed.find("second").expect("second result");
+    assert!(
+        first < second,
+        "stream completion must flush graph results in FIFO order:\n{streamed}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "tool-1", "name": "mag", "input": {} }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "run-tool",
+            "run_name": "tool-result",
+            "status": "success",
+        }),
+    );
+    let tool_open = render_str(&mut engine);
+    assert!(
+        !tool_open.contains("tool-result"),
+        "result must remain hidden while the lead tool is open:\n{tool_open}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "tool-1", "output": "done" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("tool-result"),
+        "tool completion must flush its buffered graph result:\n{out}"
+    );
+}
+
+#[test]
+fn chat_reset_closes_the_lead_unit_and_preserves_buffered_graph_results() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "unfinished" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "preserved",
+            "run_name": "preserved-result",
+            "status": "failed",
+        }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("preserved-result"),
+        "reset closes the interrupted lead unit without losing its graph result:\n{out}"
+    );
+}
+
+#[test]
+fn replayed_reset_and_session_end_preserve_buffered_results() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "replayed",
+            "run_name": "replayed-result",
+            "status": "cancelled",
+        }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
+
+    let replayed = render_str(&mut engine);
+    assert!(
+        replayed.contains("replayed-result"),
+        "replaying a reset must deterministically retain the preceding result:\n{replayed}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "old session lead" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "old-session",
+            "run_name": "must-not-leak",
+            "status": "success",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+
+    let new_session = render_str(&mut engine);
+    assert!(
+        new_session.contains("must-not-leak"),
+        "session end must flush an old session's buffered result before switching:\n{new_session}"
+    );
+}
+
+#[test]
 fn structured_answer_keeps_footer_across_interleaved_steered_user_append() {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
