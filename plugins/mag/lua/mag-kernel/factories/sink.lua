@@ -5,19 +5,12 @@
 -- wire and it lowers with `routes: {}`, so nothing routes downstream. On activation it does the
 -- two jobs a terminal owes the control plane:
 --
---   1. Persist the final output. Output persistence is the kernel's
---      responsibility (docs/ir.md, division-of-responsibility table), not the
---      factory's — so the sink does NOT hard-wire a file path or an io.open.
---      It calls an INJECTED writer function. The seam: `deps.writer` is a
---      `fn(final_output)` supplied by the kernel wiring when it materializes
---      the sink (NOT authored in the MAG modification's params — MAG params
---      are plain JSON data; kernel-injected capabilities travel in `deps`, a
---      construct argument distinct from params, and the writer is a kernel-side
---      closure over the run's output location). Absent a writer, persistence is
---      skipped and flagged on the run-complete signal (`persisted = false`), so
---      a mis-wired kernel is observable rather than silent.
+--   1. Select the persisted final output. The sink strips transcript metadata
+--      from the persisted form while retaining it in the control-plane result.
+--      The kernel's terminal settlement boundary performs the actual write, so
+--      persistence and completion share one first-write-wins decision.
 --
---   2. Signal run completion to the control plane via `emit`, using the
+--   2. Propose run completion to the control plane via `emit`, using the
 --      reserved kind `mag.RunComplete` (flagged for review). A signal is just
 --      a message with a reserved kind (actor-model.md, Signals); this one
 --      carries the final result and whether it was persisted, so the control
@@ -51,8 +44,7 @@ M.declaration = {
     outputs={{wire=kinds.Unit,type={kind="primitive",name="Unit"}}},
   },
 
-  -- No authored params. `writer` is injected by the kernel wiring at construct
-  -- time via `deps` (see the seam note above); it is not part of the MAG program.
+  -- No authored params; terminal persistence belongs to the kernel boundary.
   params = {},
 
   inputs = {
@@ -75,10 +67,6 @@ function M.construct(id, params, emit, deps)
   params = params or {}
   deps = deps or {}
 
-  -- Kernel-injected persistence seam. `fn(final_output) -> ()`. Travels in
-  -- `deps`, kept out of the authored `params` (see the seam note above).
-  local writer = deps.writer
-
   local function sign(message)
     message.from = id
     return message
@@ -88,8 +76,7 @@ function M.construct(id, params, emit, deps)
 
   -- deliver(activation) -> completion (routing.lua, the kernel⇄factory
   -- contract). Single input: fires per arriving FinalAnswer. Synchronous —
-  -- persist via the injected writer, signal run completion, and return a
-  -- successful completion.
+  -- propose run completion and return a successful activation completion.
   function instance.deliver(activation)
     activation = activation or {}
     local final = ((activation.messages or {})[1] or {}).message
@@ -104,19 +91,14 @@ function M.construct(id, params, emit, deps)
         if k ~= "transcript_delta" then to_persist[k] = v end
       end
     end
-    local persisted = false
-    if type(writer) == "function" then
-      writer(to_persist)
-      persisted = true
-    end
-
     -- Run-complete signal: the reserved terminal MESSAGE kind for the control
     -- plane (kinds.RunComplete). Routing surfaces it as the mag.run_complete
     -- lifecycle event — two names, two channels (kinds.lua).
     emit(sign({
       kind = kinds.RunComplete,
       result = final,
-      persisted = persisted,
+      persist_result = to_persist,
+      persisted = false,
     }))
     return { status = "ok" }
   end

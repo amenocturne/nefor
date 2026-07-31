@@ -116,6 +116,7 @@ local EVT_RUN_FAILED = kinds.run_failed
 local EVT_ACTOR_BUSY = "mag.actor_busy"
 local EVT_ACTOR_IDLE = "mag.actor_idle"
 local EVT_NODE_PREVIEW = "mag.node_preview"
+local EVT_EMISSION_IGNORED = "mag.emission_ignored"
 -- The approval boundary's control-plane events (kinds.lua): the intercepted
 -- ApprovalRequest / ApprovalCancel emits surface under these kinds, run_id-
 -- stamped by the injected events sink like every other control-plane event —
@@ -145,6 +146,7 @@ function M.new(opts)
     events = opts.events or noop,
     persist_output = opts.persist_output or noop,
     observe_output = opts.observe_output or noop,
+    settle_result = opts.settle_result or function() return true end,
     -- Injected clock for the busy-window stamps (mag.actor_idle's busy_ms).
     -- init.lua wires the host's nefor.now_ms; pure unit tests pass a fake or
     -- take the zero default.
@@ -166,6 +168,7 @@ function M.new(opts)
     ready = {}, -- id -> true once the factory confirmed ready
     busy = {}, -- id -> busy-since stamp while an activation window is open
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
+    generations = {}, -- id -> emitter generation currently authorized to speak
     result_boundary = nil, -- compiled StoredPort; structural, never a factory
     arrival_seq = 0,
   }, M)
@@ -192,8 +195,10 @@ end
 -- The outbound sink for one actor id — its entire world for emitting
 -- (actor-model.md). Hand this to a factory's construct as `emit`.
 function M:emitter(id)
+  local generation = (self.generations[id] or 0) + 1
+  self.generations[id] = generation
   return function(message)
-    self:on_emit(id, message)
+    self:on_emit(id, message, generation)
   end
 end
 
@@ -238,9 +243,28 @@ end
 
 -- Dispatch one emitted, id-signed message. Reserved kinds are intercepted;
 -- any other kind is a declared output routed by the sender's routes.
-function M:on_emit(id, message)
+function M:on_emit(id, message, generation)
   message = message or {}
   local kind = message.kind
+  local actor = self.inventory.get(id)
+  local current_generation = self.generations[id]
+  local dead = not actor or actor.state ~= "alive"
+  local signal_bus_envelope = self.signaling[id] and kind ~= READY
+    and kind ~= CAP_INVOKE and kind ~= COMPLETE and kind ~= FAILED
+    and kind ~= RUN_COMPLETE and kind ~= APPROVAL_REQUEST
+    and kind ~= APPROVAL_CANCEL
+  if generation ~= nil and (generation ~= current_generation
+      or (dead and not signal_bus_envelope)) then
+    self.events({
+      kind = EVT_EMISSION_IGNORED,
+      from = id,
+      message_kind = kind,
+      reason = generation ~= current_generation and "stale_generation" or "actor_dead",
+      generation = generation,
+      current_generation = current_generation,
+    })
+    return false
+  end
   if kind == READY then
     self:on_ready(id)
   elseif kind == CAP_INVOKE then
@@ -304,9 +328,6 @@ function M:on_emit(id, message)
     observed.semantic_type_id = arrival.type_id
     observed.constructor_id = arrival.constructor_id
     observed.arrival_id = arrival.arrival_id
-    self.persist_output(id, observed)
-    self:observe_endpoint(id, "output", kind, observed)
-    if self.observe_output(id, kind, observed) == false then return end
     local boundary = self.result_boundary
     if boundary and boundary.actor == id and boundary.wire == kind then
       local host = nefor and nefor.semantic_type
@@ -323,13 +344,12 @@ function M:on_emit(id, message)
         })
         return
       end
-      self.events({
-        kind = EVT_RUN_COMPLETE,
-        from = id,
-        result = observed,
-        persisted = true,
-      })
+      if not self.settle_result(id, observed) then return false end
+    else
+      self.persist_output(id, observed)
     end
+    self:observe_endpoint(id, "output", kind, observed)
+    if self.observe_output(id, kind, observed) == false then return false end
     self:route_output(id, kind, observed, arrival)
   end
 end
@@ -431,12 +451,7 @@ end
 -- control plane as a `mag.run_complete` lifecycle event. The sink declares no
 -- outputs, so there is nothing to route.
 function M:on_run_complete(id, message)
-  self.events({
-    kind = EVT_RUN_COMPLETE,
-    from = id,
-    result = message.result,
-    persisted = message.persisted,
-  })
+  self.settle_result(id, message.result, message.persist_result)
 end
 
 -- Route one id-signed output along the sender's routes[tag]. A tag with no

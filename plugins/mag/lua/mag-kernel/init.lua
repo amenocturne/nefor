@@ -144,6 +144,8 @@ local function new_run_context(meta)
     principal = meta.principal,
     last_output_path = nil,
     run_complete = nil,
+    run_complete_taken = false,
+    terminal_settlement = nil,
     run_failed = nil,
     rules = {},
     rule_ids = {},
@@ -179,13 +181,8 @@ local function new_run_context(meta)
       -- flag surfaced to the control plane is recomputed from that truth.
       event.output_path = ctx.last_output_path
       event.persisted = ctx.last_output_path ~= nil
-      if not ctx.rule_error then
-        ctx.run_complete = {
-          output_path = ctx.last_output_path,
-          persisted = event.persisted,
-          result = event.result,
-        }
-      end
+      -- Terminal acceptance is owned by settle_result below; event
+      -- publication cannot replace or repopulate the accepted value.
     elseif event.kind == observer.EVENTS.run_failed then
       -- An unhandled actor failure (routing.lua apply_completion). Stash it
       -- for take_run_failed so the host fails the run with the detail
@@ -221,6 +218,36 @@ local function new_run_context(meta)
     if type(persisted) == "table" and type(persisted.output_path) == "string" then
       ctx.last_output_path = persisted.output_path
     end
+  end
+
+  -- The sole terminal linearization point. Persistence and completion become
+  -- visible together, and the accepted value remains latched after host take.
+  local function settle_result(node_id, result, persisted_result)
+    if ctx.rule_error then return false end
+    if ctx.terminal_settlement then
+      emit_event({
+        kind = "mag.terminal_settlement_ignored",
+        from = node_id,
+        accepted_from = ctx.terminal_settlement.from,
+        reason = "already_settled",
+      })
+      return false
+    end
+    persist_output(node_id, persisted_result or result)
+    local completion = {
+      output_path = ctx.last_output_path,
+      persisted = ctx.last_output_path ~= nil,
+      result = result,
+    }
+    ctx.terminal_settlement = { from = node_id, completion = completion }
+    ctx.run_complete = completion
+    emit_event({
+      kind = observer.EVENTS.run_complete,
+      from = node_id,
+      result = result,
+      persisted = completion.persisted,
+    })
+    return true
   end
 
   -- Injected host bus seam. Routing hands this tool.invoke-shaped envelopes
@@ -296,6 +323,7 @@ local function new_run_context(meta)
     end,
     events = emit_event,
     persist_output = persist_output,
+    settle_result = settle_result,
     observe_output = function(actor, wire, output)
       if ctx.rule_failed then return false end
       ctx.emission_seq = ctx.emission_seq + 1
@@ -746,8 +774,9 @@ return {
     if not ctx then
       return nil
     end
+    if ctx.run_complete_taken then return nil end
     local rc = ctx.run_complete
-    ctx.run_complete = nil
+    if rc then ctx.run_complete_taken = true end
     return rc
   end,
 
