@@ -808,7 +808,8 @@ end
 -- actor list ({ id, factory, … }); node summaries carry the factory under the
 -- `reasoner` key, matching what the chat surface renders (chat/run_panel.lua
 -- maps kernel factory → reasoner the same way).
-register_active_run = function(run_id, actors, terminal, firing_id, run_name, session_id)
+register_active_run = function(run_id, actors, terminal, firing_id, run_name, session_id,
+    dispatcher_id)
   local nodes_order, nodes = {}, {}
   for _, actor in ipairs(actors or {}) do
     local id = tostring(actor.id or "")
@@ -828,6 +829,7 @@ register_active_run = function(run_id, actors, terminal, firing_id, run_name, se
     session_id = session_id,
     terminal = terminal,
     dispatch_firing_id = firing_id,
+    dispatcher_id = dispatcher_id,
     nodes_order = nodes_order,
     nodes = nodes,
   })
@@ -1243,7 +1245,26 @@ local function resolve_invocation(metadata, direct_default_principal)
     session_id = invocation.session_id,
     principal = invocation.principal,
     invocation = invocation,
+    dispatcher_id = invocation.principal == "subagent" and invocation.actor_id or nil,
   }
+end
+
+local function run_control_context(metadata)
+  local provenance, err = resolve_invocation(metadata)
+  if not provenance then return nil, err end
+  return {
+    session_id = provenance.session_id,
+    dispatcher_id = provenance.dispatcher_id,
+    owning_run_id = provenance.invocation and provenance.invocation.run_id or nil,
+  }, nil
+end
+
+local function authorize_control_target(context, run_id)
+  if context.dispatcher_id ~= nil and context.owning_run_id == run_id then
+    return nil, RunRegistry.authority_error("run_control_self",
+      "an agent cannot control its owning run", run_id)
+  end
+  return run_registry:authorize(run_id, context.session_id, context.dispatcher_id)
 end
 
 local function interrupt_attached_mag_by_firing(firing_id)
@@ -1258,19 +1279,24 @@ local function interrupt_attached_mag_by_firing(firing_id)
   return false
 end
 
-local function invocation_session_id(metadata)
-  local provenance = resolve_invocation(metadata)
-  return provenance and provenance.session_id or nil
-end
-
 await_run = function(firing_id, args, metadata)
-  local provenance, provenance_error = resolve_invocation(metadata)
-  if not provenance then
+  local context, provenance_error = run_control_context(metadata)
+  if not context then
     emit_await_outcome(firing_id, RunRegistry.typed_error(
       "await_run_session_ended", provenance_error, args and args.run_id))
     return
   end
-  local result = run_registry:await(args and args.run_id, provenance.session_id, firing_id)
+  local run, err = authorize_control_target(context, args and args.run_id)
+  local result
+  if not run then
+    result = { immediate = err }
+  elseif run.phase == "terminal" then
+    result = { immediate = run.canonical }
+  else
+    run.waiters[firing_id] = true
+    run_registry.waiter_runs[firing_id] = run.run_id
+    result = { waiting = true, run = run }
+  end
   if result.immediate then emit_await_outcome(firing_id, result.immediate) end
 end
 
@@ -1281,7 +1307,15 @@ terminate_graph = function(firing_id, args, metadata)
     return
   end
 
-  local run, lookup_err = run_registry:lookup(run_id, invocation_session_id(metadata))
+  local context, context_error = run_control_context(metadata)
+  if not context then
+    emit_tool_result_ok(firing_id, {
+      canceled = false, run_id = run_id, status = "run_control_invalid_provenance",
+      notice = context_error,
+    })
+    return
+  end
+  local run, lookup_err = authorize_control_target(context, run_id)
   if not run or run.phase == "terminal" then
     emit_tool_result_ok(firing_id, {
       canceled = false,
@@ -1307,41 +1341,55 @@ terminate_graph = function(firing_id, args, metadata)
   })
 end
 
-graph_status = function(firing_id, args)
-  local now = os.time()
-  local cooldown = 60
-  if state.last_graph_status_at and (now - state.last_graph_status_at) < cooldown then
-    emit_tool_result_err(firing_id,
-      "graph-status blocked: you called it less than " .. cooldown .. "s ago. " ..
-      "Graph results arrive automatically — do not poll. " ..
-      "Stop calling graph-status and wait for the result to arrive, or address the user.")
+graph_status = function(firing_id, args, metadata)
+  local context, context_error = run_control_context(metadata)
+  if not context then
+    emit_tool_result_err(firing_id, "graph-status: " .. tostring(context_error))
     return
   end
-  state.last_graph_status_at = now
-
-  local run_id = args and args.run_id
-  if type(run_id) == "string" and run_id ~= "" then
-    local run = state.active_runs[run_id]
-    if run then
-      emit_tool_result_ok(firing_id, { active = true, run = summarize_run(run) })
+  if context.dispatcher_id == nil then
+    local now = os.time()
+    local cooldown = 60
+    if state.last_graph_status_at and (now - state.last_graph_status_at) < cooldown then
+      emit_tool_result_err(firing_id,
+        "graph-status blocked: you called it less than " .. cooldown .. "s ago. " ..
+        "Graph results arrive automatically — do not poll. " ..
+        "Stop calling graph-status and wait for the result to arrive, or address the user.")
       return
     end
-    for i = #state.completed_runs, 1, -1 do
-      local run = state.completed_runs[i]
-      if run.run_id == run_id then
-        emit_tool_result_ok(firing_id, { active = false, run = summarize_run(run) })
-        return
-      end
+    state.last_graph_status_at = now
+  end
+  local run_id = args and args.run_id
+  if type(run_id) == "string" and run_id ~= "" then
+    local run, lookup_err = authorize_control_target(context, run_id)
+    if run then
+      emit_tool_result_ok(firing_id, { active = run.phase ~= "terminal", run = summarize_run(run) })
+      return
     end
-    emit_tool_result_ok(firing_id, { active = false, run_id = run_id, status = "unknown", notice = "graph run not found" })
+    emit_tool_result_ok(firing_id, {
+      active = false,
+      run_id = run_id,
+      status = lookup_err and lookup_err.error_code or "unknown",
+      notice = lookup_err and lookup_err.error or "graph run not found",
+      error_code = lookup_err and lookup_err.error_code or nil,
+    })
     return
   end
 
-  local active = {}
-  for _, run in pairs(state.active_runs) do active[#active + 1] = summarize_run(run) end
+  local active, recent = {}, {}
+  local visible = context.dispatcher_id and run_registry:direct_runs(context.dispatcher_id) or nil
+  if visible then
+    for _, run in ipairs(visible) do
+      local summary = summarize_run(run)
+      if run.phase == "terminal" then recent[#recent + 1] = summary
+      else active[#active + 1] = summary end
+    end
+  else
+    for _, run in pairs(state.active_runs) do active[#active + 1] = summarize_run(run) end
+    for _, run in ipairs(state.completed_runs) do recent[#recent + 1] = summarize_run(run) end
+  end
   table.sort(active, function(a, b) return tostring(a.dispatched_at) < tostring(b.dispatched_at) end)
-  local recent = {}
-  for _, run in ipairs(state.completed_runs) do recent[#recent + 1] = summarize_run(run) end
+  table.sort(recent, function(a, b) return tostring(a.dispatched_at) < tostring(b.dispatched_at) end)
   emit_tool_result_ok(firing_id, { active = active, recent = recent })
 end
 
@@ -1404,10 +1452,12 @@ local function lead_workflow_tool_schemas()
       name        = "await-run",
       display = { label = "Await run", primary = { arg = "run_id" }, result = { kind = "content" } },
       description =
-        "Block until a previously acknowledged lead-dispatched MAG run reaches its canonical " ..
-        "terminal result. Use this when your next step depends on completion. This attaches to " ..
-        "the existing run and does not poll graph-status or cancel it. Cancellation detaches " ..
-        "only this waiter; use terminate-graph separately to stop the run.",
+        "Block until a previously acknowledged detached MAG run reaches its canonical " ..
+        "terminal result. The root lead may address same-session runs globally; a non-root " ..
+        "agent may address only runs that exact actor directly dispatched. This attaches to " ..
+        "the existing run and does not poll graph-status or cancel it. Use this when your next " ..
+        "step depends on completion. Cancellation detaches only this waiter; use terminate-graph " ..
+        "separately to stop the run.",
       parameters  = {
         type = "object",
         properties = {
@@ -1530,7 +1580,7 @@ end
 -- mag.run_complete) stream on the bus; the terminal mag.run_result (carrying
 -- the sink's output PATH) closes the run and relays a fresh model turn in
 -- receive_msg.
-local function begin_mag_load(firing_id, action, args, ws, session_id, routing)
+local function begin_mag_load(firing_id, action, args, ws, session_id, routing, dispatcher_id)
   local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
   local run_id = action == "execute" and run_registry:mint_run_id()
     or ("mag-load-" .. envelope.uuid_lite())
@@ -1544,6 +1594,7 @@ local function begin_mag_load(firing_id, action, args, ws, session_id, routing)
     run_name   = graph_name,
     session_id = session_id,
     routing    = routing or "lead",
+    dispatcher_id = dispatcher_id,
   }
 
   emit_as(SOURCE_NAME, "mag", {
@@ -1621,7 +1672,7 @@ submit_loaded_run = function(pending, body, error_prefix, attached)
     return true
   end
   register_active_run(pending.run_id, actors, terminal_id,
-    pending.firing_id, pending.run_name, pending.session_id)
+    pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id)
   emit_as(SOURCE_NAME, "mag", exec)
   emit_tool_result_ok(pending.firing_id, {
     status = "executing",
@@ -1754,8 +1805,10 @@ local function mag_handler(firing_id, args, metadata)
 
   -- Compile and execute both go through the mag plugin's load handshake;
   -- the mag.loaded reply resolves them (resume_pending_load).
-  local routing = provenance.principal == "lead" and "lead" or "attached"
-  begin_mag_load(firing_id, action, args, ws, session_id, routing)
+  -- File-based MAG execution is detached for every caller. Non-root authority
+  -- is recorded against the kernel-stamped actor that made this invocation.
+  local routing = "lead"
+  begin_mag_load(firing_id, action, args, ws, session_id, routing, provenance.dispatcher_id)
 end
 
 local TOOL_HANDLERS = {

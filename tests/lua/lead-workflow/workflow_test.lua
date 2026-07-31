@@ -268,13 +268,13 @@ local function invoke_tool_with_metadata(id, name, args, metadata)
   })
 end
 
-local function invocation(session_id, principal, capability_id)
+local function invocation(session_id, principal, capability_id, actor_id, run_id)
   capability_id = capability_id or "r-provenance/cap-1"
   return {
     session_id = session_id,
-    run_id = "run-provenance",
+    run_id = run_id or "run-provenance",
     run_scope = capability_id:match("^([^/]+)/") or "r-provenance",
-    actor_id = principal == "lead" and "lead.run-tool" or "worker.run-tool",
+    actor_id = actor_id or (principal == "lead" and "lead.run-tool" or "worker.run-tool"),
     capability_id = capability_id,
     principal = principal,
   }
@@ -2064,6 +2064,96 @@ do
     "post-session file responses register no active run")
 end
 
+-- Non-root run control is direct-dispatch authority, not graph ancestry. The
+-- same actor may await/status/terminate its detached run; every other actor,
+-- including the owning run and descendants, receives the same denial.
+do
+  fresh()
+  local registry = lw._internals.run_registry
+  local direct_actor = "parent.run-tool"
+  local sibling_actor = "sibling.run-tool"
+  local child_actor = "child.run-tool"
+  local direct_id = registry:mint_run_id()
+  lw._internals.register_active_run(direct_id,
+    { { id = "worker", foreign = "llm" } }, "worker", "dispatch-direct",
+    "direct", sessions.current_id(), direct_actor)
+  local sibling_id = registry:mint_run_id()
+  lw._internals.register_active_run(sibling_id,
+    { { id = "sibling", foreign = "llm" } }, "sibling", "dispatch-sibling",
+    "sibling", sessions.current_id(), sibling_actor)
+  local grandchild_id = registry:mint_run_id()
+  lw._internals.register_active_run(grandchild_id,
+    { { id = "grandchild", foreign = "llm" } }, "grandchild", "dispatch-grandchild",
+    "grandchild", sessions.current_id(), child_actor)
+
+  local function metadata_for(actor, owning_run)
+    return { invocation = invocation(sessions.current_id(), "subagent",
+      "scope/cap-" .. actor:gsub("[^%w]", "-"), actor, owning_run) }
+  end
+  local direct = metadata_for(direct_actor, "parent-run")
+  local sibling = metadata_for(sibling_actor, "sibling-run")
+  local child = metadata_for(child_actor, direct_id)
+
+  _test.calls_clear()
+  invoke_tool_with_metadata("direct-status", "graph-status", { run_id = direct_id }, direct)
+  local reply = find_call(decode_calls(), function(c) return c.body.id == "direct-status" end)
+  assert_true(reply ~= nil and reply.body.output.run.run_id == direct_id,
+    "subagent may status a detached run it directly dispatched")
+
+  invoke_tool_with_metadata("direct-wait", "await-run", { run_id = direct_id }, direct)
+  assert_eq(registry.waiter_runs["direct-wait"], direct_id,
+    "subagent may await a detached run it directly dispatched")
+  invoke_tool_with_metadata("direct-kill", "terminate-graph", { run_id = direct_id }, direct)
+  assert_true(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.kill_run" and c.body.run_id == direct_id
+  end) ~= nil, "subagent may terminate a detached run it directly dispatched")
+
+  local denied = {
+    { label = "self", actor = direct_actor, target = direct_id },
+    { label = "ancestor", actor = direct_actor, target = "mag-run-ancestor" },
+    { label = "sibling", actor = direct_actor, target = sibling_id },
+    { label = "grandchild", actor = direct_actor, target = grandchild_id },
+    { label = "tool", actor = direct_actor, target = "mag-run-attached-tool" },
+    { label = "descendant", actor = child_actor, target = direct_id },
+  }
+  for _, case in ipairs(denied) do
+    local md = metadata_for(case.actor, case.target)
+    for _, tool in ipairs({ "await-run", "graph-status", "terminate-graph" }) do
+      _test.calls_clear()
+      invoke_tool_with_metadata(case.label .. "-" .. tool, tool,
+        { run_id = case.target }, md)
+      local result = find_call(decode_calls(), function(c)
+        return c.body.kind == "tool.result" and c.body.id == case.label .. "-" .. tool
+      end)
+      assert_true(result ~= nil, case.label .. " " .. tool .. " fails immediately")
+      local code = result.body.error_code
+        or (result.body.output and (result.body.output.error_code or result.body.output.status))
+      assert_true(code == "run_control_unauthorized" or code == "run_control_self"
+          or code == "await_run_unknown",
+        case.label .. " " .. tool .. " has a stable structured denial")
+    end
+  end
+
+  _test.calls_clear()
+  invoke_tool_with_metadata("direct-list", "graph-status", {}, direct)
+  reply = find_call(decode_calls(), function(c) return c.body.id == "direct-list" end)
+  assert_eq(#reply.body.output.active, 1, "unscoped subagent status lists only direct runs")
+  assert_eq(reply.body.output.active[1].run_id, direct_id,
+    "unscoped filtering excludes sibling and grandchild runs")
+
+  -- Model-supplied caller_id cannot forge the kernel-stamped actor identity.
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "forged", name = "graph-status",
+    caller_id = direct_actor, invocation = sibling.invocation, args = { run_id = direct_id } })
+  reply = find_call(decode_calls(), function(c) return c.body.id == "forged" end)
+  assert_eq(reply.body.output.error_code, "run_control_unauthorized",
+    "forged caller metadata is ignored in favor of stamped invocation provenance")
+
+  registry:reset()
+  assert_eq(next(registry.dispatcher_runs), nil, "session reset clears dispatcher ownership")
+  assert_eq(next(registry.run_dispatchers), nil, "session reset clears reverse ownership")
+end
+
 -- ------------------------------------------------------------------
 -- double-Esc interrupts DETACHED dispatched runs (the tag-blocking incident)
 -- ------------------------------------------------------------------
@@ -2239,18 +2329,17 @@ do
     action = "execute", file = "provenance-attached.mag",
   }, { caller_id = "r-agent/cap-1", invocation = invocation(owning_session, "subagent", "r-agent/cap-1") })
   feed_loaded(read_only_modification())
-  local attached_exec = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
-  assert_true(attached_exec ~= nil and lw._internals.state.active_runs[attached_exec.body.run_id] == nil,
-    "subagent provenance keeps file mag attached and out of the awaitable registry")
-  assert_eq(find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "provenance-mag-agent"
-  end), nil, "attached file mag does not acknowledge before terminal completion")
-  _test.calls_clear()
-  feed("mag", { kind = "mag.run_result", run_id = attached_exec.body.run_id,
-    status = "completed", result = { text = "attached result" } })
+  local detached_exec = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
+  assert_true(detached_exec ~= nil and lw._internals.state.active_runs[detached_exec.body.run_id] ~= nil,
+    "subagent file mag is detached and registered under its direct dispatcher")
+  assert_eq(lw._internals.run_registry.run_dispatchers[detached_exec.body.run_id],
+    "worker.run-tool", "kernel-stamped actor owns the detached file run")
   assert_true(find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result" and c.body.id == "provenance-mag-agent"
-  end) ~= nil, "attached file mag settles its graph-agent capability")
+  end) ~= nil, "detached file mag acknowledges its stable run handle immediately")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = detached_exec.body.run_id,
+    status = "completed", result = { text = "detached result" } })
 
   fresh()
   owning_session = sessions.current_id()

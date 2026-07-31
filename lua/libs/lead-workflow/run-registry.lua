@@ -36,6 +36,15 @@ local function typed_error(code, message, run_id, status)
   }
 end
 
+local function authority_error(code, message, run_id)
+  return {
+    error_code = code,
+    error = "run-control[" .. code .. "]: " .. message,
+    run_id = run_id,
+    status = "denied",
+  }
+end
+
 local function canonical_outcome(body, run)
   local status = body.status
   if status == "completed" then
@@ -70,6 +79,8 @@ function M.new(opts)
     tombstones = {},
     tombstone_order = {},
     waiter_runs = {},
+    dispatcher_runs = {},
+    run_dispatchers = {},
   }, M)
 end
 
@@ -95,6 +106,15 @@ end
 function M:expire(run)
   self.runs[run.run_id] = nil
   self.active_runs[run.run_id] = nil
+  local dispatcher = self.run_dispatchers[run.run_id]
+  if dispatcher then
+    local owned = self.dispatcher_runs[dispatcher]
+    if owned then
+      owned[run.run_id] = nil
+      if next(owned) == nil then self.dispatcher_runs[dispatcher] = nil end
+    end
+    self.run_dispatchers[run.run_id] = nil
+  end
   remove_value(self.terminal_order, run.run_id)
   remove_value(self.completed_runs, run)
   self:add_tombstone(run.run_id, run.session_id)
@@ -133,6 +153,7 @@ function M:register(spec)
     updated_at = self.now(),
     terminal = spec.terminal,
     dispatch_firing_id = spec.dispatch_firing_id,
+    dispatcher_id = spec.dispatcher_id,
     nodes_order = spec.nodes_order or {},
     nodes = spec.nodes or {},
     waiters = {},
@@ -141,7 +162,37 @@ function M:register(spec)
   }
   self.runs[run_id] = run
   self.active_runs[run_id] = run
+  if spec.dispatcher_id ~= nil then
+    assert(type(spec.dispatcher_id) == "string" and spec.dispatcher_id ~= "",
+      "run-registry: dispatcher_id must be a non-empty string")
+    local owned = self.dispatcher_runs[spec.dispatcher_id]
+    if not owned then
+      owned = {}
+      self.dispatcher_runs[spec.dispatcher_id] = owned
+    end
+    owned[run_id] = true
+    self.run_dispatchers[run_id] = spec.dispatcher_id
+  end
   return run
+end
+
+function M:authorize(run_id, session_id, dispatcher_id)
+  local run, err = self:lookup(run_id, session_id)
+  if not run then return nil, err end
+  if dispatcher_id ~= nil and self.run_dispatchers[run_id] ~= dispatcher_id then
+    return nil, authority_error("run_control_unauthorized",
+      "non-root agents may control only detached runs they directly dispatched", run_id)
+  end
+  return run, nil
+end
+
+function M:direct_runs(dispatcher_id)
+  local out = {}
+  for run_id in pairs(self.dispatcher_runs[dispatcher_id] or {}) do
+    local run = self.runs[run_id]
+    if run then out[#out + 1] = run end
+  end
+  return out
 end
 
 function M:get(run_id)
@@ -195,8 +246,8 @@ function M:lookup(run_id, session_id)
     "no lead-dispatched run is known for this handle", run_id)
 end
 
-function M:await(run_id, session_id, firing_id)
-  local run, err = self:lookup(run_id, session_id)
+function M:await(run_id, session_id, firing_id, dispatcher_id)
+  local run, err = self:authorize(run_id, session_id, dispatcher_id)
   if not run then return { immediate = err } end
   if run.phase == "terminal" then
     return { immediate = run.canonical }
@@ -290,9 +341,12 @@ function M:reset()
   self.tombstones = {}
   self.tombstone_order = {}
   self.waiter_runs = {}
+  self.dispatcher_runs = {}
+  self.run_dispatchers = {}
 end
 
 M.valid_handle = valid_handle
 M.typed_error = typed_error
+M.authority_error = authority_error
 
 return M
