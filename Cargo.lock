@@ -1591,6 +1591,7 @@ dependencies = [
  "futures",
  "mlua",
  "nefor-protocol",
+ "nefor-tui",
  "serde",
  "serde_json",
  "tempfile",
