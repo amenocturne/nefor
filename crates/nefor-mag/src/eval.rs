@@ -814,23 +814,13 @@ fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
             if let Some(result) = caller.memoized_call(fun, args) {
                 return Ok(result);
             }
-            let mut overridden_names = fun
-                .closure
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<HashSet<_>>();
-            overridden_names.extend(fun.name.iter().map(String::as_str));
-            overridden_names.extend(fun.params.iter().map(String::as_str));
-            overridden_names.extend(fun.type_params.iter().map(String::as_str));
             let (expected_return, type_bindings) = crate::checker::check_call(caller, fun, args)
                 .map_err(|error| match &fun.name {
                     Some(name) => MagError::Type(format!("calling {name}: {error}")),
                     None => error,
                 })?;
             let mut env = caller.child_for_call();
-            for (name, value) in caller.snapshot_excluding(&overridden_names) {
-                env.define(&name, value);
-            }
+            env.define_type_declarations_from(caller);
             for (k, v) in &fun.closure {
                 env.define(k, v.clone());
             }
@@ -1786,13 +1776,16 @@ mod tests {
     }
 
     #[test]
-    fn caller_binding_remains_a_fallback_when_closure_does_not_capture_name() {
+    fn caller_only_late_binding_is_invisible() {
         let mut caller = Env::new();
         caller.define("late", Value::Int(42));
         let function = constant_function("late", vec![]);
         let _fuel = fuel::install(100);
 
-        assert_eq!(typed_int(apply(&caller, &function, &[]).unwrap()), 42);
+        assert!(matches!(
+            apply(&caller, &function, &[]),
+            Err(MagError::Unresolved(name)) if name == "late"
+        ));
     }
 
     #[test]
@@ -1826,6 +1819,19 @@ mod tests {
             typed_int(apply(&Env::new(), &function, &[Value::Int(7)]).unwrap()),
             7
         );
+    }
+
+    #[test]
+    fn memoized_result_is_independent_of_caller_only_bindings() {
+        let function = constant_function("value", vec![("value".into(), Value::Int(1))]);
+        let mut first_caller = Env::new();
+        first_caller.define("value", Value::Int(99));
+        let mut second_caller = first_caller.child_for_call();
+        second_caller.define("value", Value::Int(100));
+        let _fuel = fuel::install(100);
+
+        assert_eq!(typed_int(apply(&first_caller, &function, &[]).unwrap()), 1);
+        assert_eq!(typed_int(apply(&second_caller, &function, &[]).unwrap()), 1);
     }
 
     #[test]

@@ -312,15 +312,19 @@ impl Env {
                 _ => None,
             })
     }
-    pub fn snapshot(&self) -> Vec<(String, Value)> {
-        self.snapshot_excluding(&HashSet::new())
+    // Nominal declarations are the compilation-wide type namespace, not dynamic values.
+    pub fn define_type_declarations_from(&mut self, source: &Self) {
+        for (name, value) in source.scopes.iter().flat_map(|scope| scope.iter()) {
+            if matches!(value, Value::TypeDecl(_)) {
+                self.define(name, value.clone());
+            }
+        }
     }
-    pub fn snapshot_excluding(&self, excluded: &HashSet<&str>) -> Vec<(String, Value)> {
+    pub fn snapshot(&self) -> Vec<(String, Value)> {
         let snapshot = self
             .scopes
             .iter()
             .flat_map(|scope| scope.iter())
-            .filter(|(name, _)| !excluded.contains(name.as_str()))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         self.profile_counters(|counters| {
