@@ -88,6 +88,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacing_registration_closes_old_waiter_and_wakes_new_waiter() {
+        let broker = ToolBroker::new();
+        let old_rx = broker.register("call_1".into()).await;
+        let new_rx = broker.register("call_1".into()).await;
+
+        assert!(old_rx.await.is_err(), "replaced waiter must be released");
+        assert!(
+            broker
+                .deliver(ToolResult {
+                    id: "call_1".into(),
+                    output: Some("new".into()),
+                    error: None,
+                })
+                .await
+        );
+        assert_eq!(
+            new_rx.await.expect("replacement waiter").output.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
     async fn deliver_without_register_returns_false() {
         let broker = ToolBroker::new();
         let delivered = broker

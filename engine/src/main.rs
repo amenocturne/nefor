@@ -45,8 +45,8 @@ use crate::events::EventBus;
 use crate::lua::bindings::EngineOps;
 use crate::lua::LuaHost;
 use crate::ncp::{
-    resolve_plugin_root, spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry, PluginSpec,
-    SharedPluginRegistry,
+    resolve_plugin_root, spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry, PluginRoot,
+    PluginSpec, SharedPluginRegistry,
 };
 
 #[tokio::main]
@@ -196,6 +196,14 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+fn require_plugin_root(root: Option<PluginRoot>) -> anyhow::Result<PluginRoot> {
+    root.ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
+        )
+    })
+}
+
 /// Standard run loop — broker until shutdown.
 async fn run_serve(
     host: LuaHost,
@@ -214,15 +222,7 @@ async fn run_serve(
         return Ok(());
     }
 
-    let plugin_root = match resolve_plugin_root(plugin_dir_override) {
-        Some(r) => r,
-        None => {
-            tracing::error!(
-                "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
-            );
-            return Ok(());
-        }
-    };
+    let plugin_root = require_plugin_root(resolve_plugin_root(plugin_dir_override))?;
     tracing::info!(plugin_root = %plugin_root.as_path().display(), "plugin root resolved");
 
     let mut broker = Broker::new(Arc::clone(&shared), host);
@@ -443,6 +443,15 @@ mod dispatch_tests {
                 ncp::PluginKind::Command(vec!["echo".into()])
             },
         }
+    }
+
+    #[test]
+    fn unresolved_plugin_root_is_an_explicit_startup_error() {
+        let err = require_plugin_root(None).expect_err("serve startup must fail");
+        assert_eq!(
+            err.to_string(),
+            "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
+        );
     }
 
     #[test]

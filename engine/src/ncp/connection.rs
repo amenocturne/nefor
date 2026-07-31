@@ -155,20 +155,35 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
 ) -> std::io::Result<ReadLine> {
     use tokio::io::AsyncBufReadExt;
 
-    // `read_until` honors the BufReader's internal 64 KiB buffer — single
-    // syscall per buffer-fill, then byte scans in user space. The previous
-    // implementation called `read_exact` one byte at a time, which defeated
-    // the buffer (per-byte poll wake-up + tokio runtime crossings) and
-    // showed up as visible typing latency on the keystroke→render path.
-    let mut buf = Vec::with_capacity(256);
-    let n = reader.read_until(b'\n', &mut buf).await?;
-    if n == 0 {
+    // Inspect the BufReader's bounded chunks before copying them. `read_until`
+    // only checks the cap after it has allocated the complete line, which lets
+    // an unterminated peer-controlled frame grow without bound.
+    let mut bytes = Vec::with_capacity(256);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+
+        let chunk_len = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if chunk_len > max.saturating_sub(bytes.len()) {
+            return Ok(ReadLine::TooLong);
+        }
+
+        bytes.extend_from_slice(&available[..chunk_len]);
+        reader.consume(chunk_len);
+        if bytes.ends_with(b"\n") {
+            break;
+        }
+    }
+
+    if bytes.is_empty() {
         return Ok(ReadLine::Ok(0));
     }
-    if buf.len() > max {
-        return Ok(ReadLine::TooLong);
-    }
-    match String::from_utf8(buf) {
+    match String::from_utf8(bytes) {
         Ok(s) => {
             out.push_str(&s);
             Ok(ReadLine::Ok(out.len()))
@@ -347,6 +362,40 @@ pub async fn run_exit_watcher(
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn capped_reader_rejects_oversized_unterminated_input_at_the_boundary() {
+        let max = 32;
+        let (mut client, server) = duplex(128);
+        client.write_all(&vec![b'x'; max + 1]).await.unwrap();
+
+        let mut reader = BufReader::with_capacity(8, server);
+        let mut line = String::new();
+        let result = read_line_capped(&mut reader, &mut line, max).await.unwrap();
+
+        assert!(matches!(result, ReadLine::TooLong));
+        assert!(line.is_empty(), "oversized input must not enter the String");
+        assert!(
+            reader.buffer().len() <= 8,
+            "only the bounded BufReader chunk may remain allocated"
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_reader_accepts_a_line_exactly_at_the_limit() {
+        let max = 32;
+        let (mut client, server) = duplex(128);
+        let payload = vec![b'x'; max - 1];
+        client.write_all(&payload).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+
+        let mut reader = BufReader::with_capacity(8, server);
+        let mut line = String::new();
+        let result = read_line_capped(&mut reader, &mut line, max).await.unwrap();
+
+        assert!(matches!(result, ReadLine::Ok(n) if n == max));
+        assert_eq!(line.as_bytes(), [payload.as_slice(), b"\n"].concat());
+    }
 
     #[tokio::test]
     async fn reader_emits_lines_verbatim() {

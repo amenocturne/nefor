@@ -1454,6 +1454,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evicted_plugin_is_removed_without_an_abnormal_exit_report() {
+        let shared = shared_state();
+        let host = build_host(&shared, "function dispatch(current) end");
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+
+        let (_plugin, transport, exit_tx) = make_transport_with_exit();
+        broker.attach_transport(transport, pn("evicted"));
+        let abnormal_exits = broker.abnormal_exits_handle();
+        let run = tokio::spawn(broker.run());
+
+        exit_tx.send(ExitOutcome::Evicted).expect("report eviction");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("broker stops after its last connection is evicted")
+            .expect("join ok");
+
+        assert_eq!(outcome, BrokerStopReason::AllPluginsGone);
+        assert!(lock_shared(&shared).conns.is_empty());
+        assert!(abnormal_exits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn handle_exit_with_crash_emits_engine_plugin_failed_then_shuts_down() {
         // Two plugins: 'a' is the victim, 'b' stays alive long enough for
         // the synthetic envelope to flow through dispatch. The hook
