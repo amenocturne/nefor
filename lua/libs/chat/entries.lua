@@ -146,8 +146,20 @@ local function tool_header(entry, glyph)
   if entry.output == nil and not entry.error then header = header .. " …" end
   return header
 end
+local function collapsed_tool_header(entry)
+  if entry.name ~= "mag" then return tool_header(entry, "▸ ") end
+  local args = entry.raw_input
+  if args == nil then args = entry.input_table or entry.input end
+  local action = type(args) == "table" and args.action or nil
+  if action == nil then action = "compile" end
+  local p = semantic_projection(entry)
+  local header = "▸ mag " .. tostring(action)
+  if p and p.primary and p.primary ~= "" then header = header .. " · " .. p.primary end
+  if entry.output == nil and not entry.error then header = header .. " …" end
+  return header
+end
 local function tool_collapsed(entry)
-  local rows = { tui.text { content = tool_header(entry, "▸ "), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
+  local rows = { tui.text { content = collapsed_tool_header(entry), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
   if entry.error then
     rows[#rows + 1] = tui.text { content = "  error:", style = STYLE.status_danger, wrap = "none" }
     local output_text

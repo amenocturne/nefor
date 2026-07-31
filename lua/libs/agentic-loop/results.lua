@@ -5,11 +5,16 @@
 local M = {}
 
 -- Format a deferred kernel-run completion into a user-role message.
--- The `[mag_run(run_id=…) result]` / `[mag_run(run_id=…) FAILED]` tag is
--- load-bearing: the lead saw the dispatch ack promise a tagged follow-up,
--- and surfaces (mock provider, tests) key on the marker shape.
+-- The `[mag_run(…) result]` / `[mag_run(…) FAILED]` tag is load-bearing:
+-- the lead saw the dispatch ack promise a tagged follow-up, and surfaces
+-- (mock provider, tests) key on the marker shape. A readable run_name leads
+-- when available; the opaque run_id always remains for exact control.
 function M.format_deferred(completion)
   local run_id = completion.run_id or "?"
+  local run_name = completion.run_name
+  local identity = type(run_name) == "string" and run_name ~= ""
+    and ("run_name=" .. run_name .. ", run_id=" .. tostring(run_id))
+    or ("run_id=" .. tostring(run_id))
   if completion.status == "success" then
     local output = completion.output
     local content_available = completion.content_available
@@ -17,7 +22,7 @@ function M.format_deferred(completion)
       content_available = type(output) == "string" and output:find("%S") ~= nil
     end
     if not content_available then
-      return "[mag_run(run_id=" .. tostring(run_id) .. ") result]\n" ..
+      return "[mag_run(" .. identity .. ") result]\n" ..
              "The MAG run you submitted earlier finished, but no usable " ..
              "result content was available. Tell the user that the result " ..
              "content is unavailable and do not infer or fabricate findings " ..
@@ -25,7 +30,7 @@ function M.format_deferred(completion)
              "when one exists, is already visible in the run result. Do not " ..
              "re-run the program unless the user asks you to."
     end
-    return "[mag_run(run_id=" .. tostring(run_id) .. ") result]\n" ..
+    return "[mag_run(" .. identity .. ") result]\n" ..
            "The MAG run you submitted earlier has finished. " ..
            "Use the output below to answer the user's original request at " ..
            "the resolution it needs. Make the response sufficient to " ..
@@ -40,7 +45,7 @@ function M.format_deferred(completion)
            "--- output ---\n" ..
            tostring(output)
   else
-    return "[mag_run(run_id=" .. tostring(run_id) .. ") FAILED]\n" ..
+    return "[mag_run(" .. identity .. ") FAILED]\n" ..
            "The MAG run you submitted earlier failed. Tell the user " ..
            "the run errored and offer to retry; do not silently " ..
            "re-run or fabricate a result.\n\n" ..

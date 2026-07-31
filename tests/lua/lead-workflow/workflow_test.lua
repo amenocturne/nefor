@@ -527,6 +527,8 @@ do
   assert_eq(reply.body.output.hash, "sha256:read-only", "reply carries the program hash")
   assert_eq(exec.body.run_id, reply.body.output.run_id,
     "mag.execute run_id matches the reply run_id")
+  assert_eq(reply.body.output.run_name, "auth-login-map",
+    "execute acknowledgment prefers the readable program name")
 
   -- Active run tracks the structural result actor from artifact metadata.
   local run = lw._internals.state.active_runs[reply.body.output.run_id]
@@ -538,6 +540,10 @@ do
     return c.body.kind == "tool.result" and c.body.id == "firing-graph-status-actors"
   end)
   assert_true(status ~= nil, "graph-status returns the active run")
+  assert_eq(status.body.output.run.run_name, "auth-login-map",
+    "graph-status includes the same readable run name")
+  assert_eq(status.body.output.run.run_id, reply.body.output.run_id,
+    "graph-status retains the opaque handle for disambiguation")
   local nodes = status.body.output.run.nodes
   assert_eq(nodes[1].id, "worker.entry", "actor ids preserved in run summaries")
   assert_eq(nodes[2].reasoner, "nefor.factory.llm",
@@ -1643,7 +1649,7 @@ do
   agentic_loop._internals.state.current_turn = { scope = "r7" }
   feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-77",
     caller_id = "r7/cap-1", from = "lead.llm", name = "mag-eval",
-    args = { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+    args = { intent = "  Inspect\t files\n", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
   local load = latest_mag_load()
   assert_true(load ~= nil, "lead eval starts a compile handshake")
   assert_eq(find_call(decode_calls(), function(c) return c.body.kind == "tool.result" end), nil,
@@ -1662,6 +1668,10 @@ do
   assert_eq(ack.body.output.engine, "mag-kernel", "lead eval names the standard engine")
   assert_eq(ack.body.output.hash, "sha256:eval", "lead eval ack carries compile hash")
   assert_eq(ack.body.output.run_id, exec.body.run_id, "ack handle equals execute run id")
+  assert_eq(exec.body.run_name, "Inspect files", "eval intent is the canonical readable run name")
+  assert_eq(ack.body.output.run_name, "Inspect files", "eval acknowledgment prefers the same run name")
+  assert_true(load.body.entry:match("^eval/eval%-%d+%.mag$") ~= nil,
+    "eval keeps its internal filename separate from the readable run name")
   local run_id = exec.body.run_id
   assert_true(lw._internals.state.active_runs[run_id] ~= nil,
     "lead eval is registered in standard active_runs")
@@ -1685,6 +1695,9 @@ do
   local queued = agentic_loop._internals.state.pending_user_inputs[1]
   assert_true(type(queued) == "string" and queued:find("the eval output", 1, true) ~= nil,
     "terminal output reaches the deferred graph completion channel")
+  assert_true(queued:find("run_name=Inspect files", 1, true) ~= nil
+      and queued:find("run_id=" .. run_id, 1, true) ~= nil,
+    "completion prefers the readable name while retaining the opaque handle")
 
   -- Graph-agent caller: a foreign caller_id remains attached and receives no
   -- acknowledgment until its terminal result.

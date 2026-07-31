@@ -863,6 +863,7 @@ local function summarize_run(run)
   if type(run) ~= "table" then return nil end
   return {
     run_id = run.run_id,
+    run_name = run.run_name,
     status = run.status,
     dispatched_at = run.dispatched_at,
     updated_at = run.updated_at,
@@ -1013,13 +1014,14 @@ end
 -- (agentic-loop's deferred-queue + flush → new user-role turn).
 -- `format_deferred` frames the sink content. The output path stays on the
 -- visible graph-result block instead of being duplicated in the model input.
-local function relay_kernel_completion(run_id, ok, content, err)
+local function relay_kernel_completion(run_id, run_name, ok, content, err)
   local al = require("agentic-loop")
   if type(al.relay_run_completion) ~= "function" then return end
   if ok then
     local content_available = type(content) == "string" and content:find("%S") ~= nil
     al.relay_run_completion({
       run_id            = run_id,
+      run_name          = run_name,
       status            = "success",
       content_available = content_available,
       output            = content_available and content or nil,
@@ -1027,6 +1029,7 @@ local function relay_kernel_completion(run_id, ok, content, err)
   else
     al.relay_run_completion({
       run_id = run_id,
+      run_name = run_name,
       status = "failed",
       error  = err,
     })
@@ -1146,14 +1149,14 @@ local function handle_mag_run_result(body)
     -- A TUI termination is already a user decision. Settlement and visibility
     -- still happen, but feeding the kill back as a task would restart the lead.
     if run.terminate_reason ~= "user-tui-termination" then
-      relay_kernel_completion(run_id, false, nil, err)
+      relay_kernel_completion(run_id, run.run_name, false, nil, err)
     end
     return
   end
   emit_mag_result_block(run, "success", body.output_path, nil)
   local content = mag_result_text(body.result)
     or read_output_file(body.output_path)
-  relay_kernel_completion(run_id, true, content, nil)
+  relay_kernel_completion(run_id, run.run_name, true, content, nil)
 end
 
 -- Double-Esc entry point (`chat.interrupt_all`). The `mag` execute tool is
@@ -1623,6 +1626,7 @@ submit_loaded_run = function(pending, body, error_prefix, attached)
   emit_tool_result_ok(pending.firing_id, {
     status = "executing",
     run_id = pending.run_id,
+    run_name = pending.run_name,
     hash = body.hash,
     engine = "mag-kernel",
     message = "Program submitted to the MAG actor kernel. Use await-run with this run_id when " ..

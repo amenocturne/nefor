@@ -137,6 +137,14 @@ local function opaque_suffix()
   return envelope.uuid_lite()
 end
 
+local function normalize_run_name(intent)
+  local normalized = intent:gsub("[%z\1-\31\127]", " ")
+    :gsub("%s+", " ")
+    :match("^%s*(.-)%s*$")
+  if normalized == "" then return nil end
+  return normalized
+end
+
 local function tool_ok(firing_id, output)
   emit_as(SOURCE_NAME, nil, { kind = "tool.result", id = firing_id, output = output })
 end
@@ -218,8 +226,9 @@ function M.handle(firing_id, args, metadata)
   end
 
   state.seq = state.seq + 1
-  local run_name = "eval-" .. tostring(state.seq)
-  local rel = "eval/" .. run_name .. ".mag"
+  local eval_name = "eval-" .. tostring(state.seq)
+  local run_name = normalize_run_name(intent)
+  local rel = "eval/" .. eval_name .. ".mag"
   mkdir_p(ws .. "/eval")
   local fh, open_err = io.open(ws .. "/" .. rel, "w")
   if not fh then

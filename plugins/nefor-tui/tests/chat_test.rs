@@ -2252,6 +2252,67 @@ fn ctrl_o_toggles_expanded_details() {
     );
 }
 
+#[test]
+fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_header() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "mag",
+            "display": {
+                "label": "MAG",
+                "primary": { "arg": "file" },
+                "arguments": [{ "label": "action", "arg": "action" }],
+                "result": { "kind": "content" }
+            }
+        }] }),
+    );
+    for (id, input) in [
+        (
+            "mag-write",
+            json!({ "action": "write", "file": "draft.mag", "content": "graph" }),
+        ),
+        ("mag-compile", json!({ "file": "check.mag" })),
+        (
+            "mag-execute",
+            json!({ "action": "execute", "file": "ship.mag" }),
+        ),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.tool.start", "id": id, "name": "mag", "input": input }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.tool.end", "id": id, "output": "done" }),
+        );
+    }
+
+    let collapsed = render_str(&mut engine);
+    for expected in [
+        "▸ mag write · draft.mag",
+        "▸ mag compile · check.mag",
+        "▸ mag execute · ship.mag",
+    ] {
+        assert!(
+            collapsed.contains(expected),
+            "missing {expected:?}: {collapsed:?}"
+        );
+    }
+
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let expanded = render_str(&mut engine);
+    assert!(expanded.contains("▼ mag · draft.mag"), "{expanded:?}");
+    assert!(expanded.contains("  action: write"), "{expanded:?}");
+    assert!(
+        !expanded.contains("▼ mag write · draft.mag"),
+        "expanded MAG header must keep the shared tool-header shape: {expanded:?}"
+    );
+}
+
 /// Bug-B regression: a denied tool call (`chat.tool.end` with
 /// `error = true`) flips the expanded tool block to a clearly denied
 /// state — `error:` label in red, then the error message — instead
