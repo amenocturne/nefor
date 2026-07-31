@@ -400,6 +400,7 @@ local function new_run_context(meta)
   router:set_construct(function(record)
     local emit = router:emitter(record.id)
     local deps = {
+      persistence_owned_by_kernel = true,
       writer = function(output)
         return persist_output(record.id, output)
       end,

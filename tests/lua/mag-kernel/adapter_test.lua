@@ -235,7 +235,11 @@ do
   end)
   entry.deliver({ shape = "product", messages = {
     { tag = "task", message = { value = { prompt = "go" } } },
-    { tag = "generic-provider.FinalAnswer", message = { final_answer = "done" },
+    { tag = "generic-provider.FinalAnswer", message = {
+        value = { content = string.rep("v", 2048) },
+        transcript_delta = { { role = "tool", content = string.rep("x", 2 * 1024 * 1024) } },
+        result = { raw_log = string.rep("y", 2 * 1024 * 1024) },
+      },
       arrival = { constructor_id = "final-id" } },
   } })
 
@@ -247,6 +251,12 @@ do
     "provider request position one retains the Task envelope")
   assert_eq(invoke.request.input.messages[2].content.value.type, "final-id",
     "provider request position two retains constructor identity")
+  assert_eq(#invoke.request.input.messages[2].content.value.value.content, 2048,
+    "downstream provider receives the canonical final value")
+  assert_eq(invoke.request.input.messages[2].content.value.value.transcript_delta, nil,
+    "downstream provider receives no worker transcript metadata")
+  assert_eq(invoke.request.input.messages[2].content.value.value.result, nil,
+    "downstream provider receives no raw provider result")
 end
 
 print("mag-kernel adapter_test: all assertions passed")

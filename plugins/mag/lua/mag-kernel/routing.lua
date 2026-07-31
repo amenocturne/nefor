@@ -167,6 +167,7 @@ function M.new(opts)
     machines = {}, -- id -> { port -> firing machine }
     ready = {}, -- id -> true once the factory confirmed ready
     busy = {}, -- id -> busy-since stamp while an activation window is open
+    control_metadata = {}, -- arrival id -> control-plane-only result metadata
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
     generations = {}, -- id -> emitter generation currently authorized to speak
     result_boundary = nil, -- compiled StoredPort; structural, never a factory
@@ -323,7 +324,11 @@ function M:on_emit(id, message, generation)
       return
     end
     local observed = {}
-    for key, value in pairs(message) do observed[key] = value end
+    for key, value in pairs(arrival.payload) do observed[key] = value end
+    local metadata = self.control_metadata[arrival.arrival_id]
+    if metadata and metadata.transcript_delta ~= nil then
+      observed.transcript_delta = metadata.transcript_delta
+    end
     observed.semantic_type = arrival.type
     observed.semantic_type_id = arrival.type_id
     observed.constructor_id = arrival.constructor_id
@@ -431,8 +436,26 @@ function M:factory_arrival(id, wire, payload)
         tostring(id), tostring(wire), tostring(detail))
     end
   end
+  local routed_payload = payload
+  if actor.semantic_strict then
+    routed_payload = {
+      kind = wire,
+      value = payload.value,
+    }
+    if payload.semantic_value ~= nil then
+      routed_payload.semantic_value = payload.semantic_value
+    end
+  end
+  local arrival_id = self:next_arrival_id()
+  local inherited_metadata = payload.arrival_id and self.control_metadata[payload.arrival_id]
+  if payload.transcript_delta ~= nil then
+    self.control_metadata[arrival_id] = { transcript_delta = payload.transcript_delta }
+  elseif inherited_metadata ~= nil then
+    self.control_metadata[arrival_id] = inherited_metadata
+  end
+  local control_metadata = self.control_metadata[arrival_id]
   return typed_value.factory({
-    arrival_id = self:next_arrival_id(),
+    arrival_id = arrival_id,
     from = id,
     edge_id = "factory:" .. tostring(id) .. ":" .. tostring(wire),
     type_id = actual_type_id,
@@ -442,7 +465,8 @@ function M:factory_arrival(id, wire, payload)
     constructor_id = constructor_id,
     protocol_wire = wire,
     product_position = -1,
-    payload = payload,
+    payload = routed_payload,
+    control_metadata = control_metadata,
   })
 end
 

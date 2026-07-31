@@ -18,6 +18,7 @@ local function build(fields)
     protocol_wire = assert(fields.protocol_wire, "typed arrival needs protocol_wire"),
     product_position = fields.product_position or -1,
     payload = fields.payload,
+    control_metadata = fields.control_metadata,
   }
   trusted[arrival] = true
   return arrival
@@ -47,6 +48,7 @@ function M.routed(source, destination, declared_type)
     protocol_wire = assert(destination.wire, "compiled route needs destination wire"),
     product_position = destination.product_position,
     payload = source.payload,
+    control_metadata = source.control_metadata,
   })
 end
 

@@ -128,24 +128,19 @@ end
 
 local function turn_message(tag, message, schema, arrival)
   message = message or {}
-  local content
-  if tag == FINAL_ANSWER then
+  local content = message.value
+  if tag == REJECTED and type(content) == "table" and content.reason ~= nil then
+    content = content.reason
+  elseif content == nil and tag == FINAL_ANSWER then
+    -- Legacy/non-strict factory tests still exercise the old provider envelope.
     content = message.final_answer or message.text or message.result
-  elseif tag == REJECTED then
-    -- the gate's rejection feedback ({ subject, reason }); the reason is the
-    -- next turn — the producing llm's transcript already holds the draft
+  elseif content == nil and tag == REJECTED then
     content = message.reason
-  else
-    -- Canonical typed messages carry `value`; retain the historical task seed
-    -- shape only as an external-boundary fallback.
-    local value = message.value
-    if value ~= nil then
-      content = value
-    elseif message.prompt ~= nil then
-      content = { prompt = message.prompt }
-    else
-      content = message
-    end
+  elseif content == nil and message.prompt ~= nil then
+    -- Initial task injection is the only untyped compatibility boundary.
+    content = { prompt = message.prompt }
+  elseif content == nil then
+    content = message
   end
   return { role = "user", content = {
     mag_type = schema,

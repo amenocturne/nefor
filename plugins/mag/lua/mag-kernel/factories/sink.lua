@@ -91,6 +91,9 @@ function M.construct(id, params, emit, deps)
         if k ~= "transcript_delta" then to_persist[k] = v end
       end
     end
+    if type(deps.writer) == "function" and not deps.persistence_owned_by_kernel then
+      deps.writer(to_persist)
+    end
     -- Run-complete signal: the reserved terminal MESSAGE kind for the control
     -- plane (kinds.RunComplete). Routing surfaces it as the mag.run_complete
     -- lifecycle event — two names, two channels (kinds.lua).
@@ -98,7 +101,7 @@ function M.construct(id, params, emit, deps)
       kind = kinds.RunComplete,
       result = final,
       persist_result = to_persist,
-      persisted = false,
+      persisted = type(deps.writer) == "function",
     }))
     return { status = "ok" }
   end
