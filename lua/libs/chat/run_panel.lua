@@ -72,8 +72,7 @@ local function sorted_keys(m)
 end
 
 local function fmt_elapsed_ms(ms)
-  if ms == nil then return "" end
-  return string.format("%ds", math.floor(ms / 1000))
+  return common.humanize_duration_ms(ms) or ""
 end
 M.fmt_elapsed_ms = fmt_elapsed_ms
 

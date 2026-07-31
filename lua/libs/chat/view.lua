@@ -36,9 +36,9 @@ local function thinking_widget(state)
   if not state.pending then return nil end
   if state.in_flight ~= nil then return nil end
   local elapsed_ms = state.turn_started_at and (tui.now_ms() - state.turn_started_at) or 0
-  local secs = math.floor(elapsed_ms / 1000)
-  local body = secs > 0
-    and string.format("[thinking... %ds]", secs)
+  local duration = common.humanize_duration_ms(elapsed_ms)
+  local body = elapsed_ms >= 1000
+    and string.format("[thinking... %s]", duration)
     or  "[thinking...]"
   return tui.row {
     gap = 0,

@@ -106,11 +106,25 @@ end
 
 function M.humanize_duration_ms(ms)
   if ms == nil then return nil end
-  if ms < 1000 then return tostring(math.floor(ms)) .. "ms" end
-  if ms < 60000 then return string.format("%ds", math.floor(ms / 1000)) end
-  local m = math.floor(ms / 60000)
-  local s = math.floor((ms % 60000) / 1000)
-  return string.format("%dm%02ds", m, s)
+  ms = math.max(0, math.floor(ms))
+  if ms < 1000 then return tostring(ms) .. "ms" end
+
+  local remaining = math.floor(ms / 1000)
+  local units = {
+    { suffix = "d", seconds = 86400 },
+    { suffix = "h", seconds = 3600 },
+    { suffix = "m", seconds = 60 },
+    { suffix = "s", seconds = 1 },
+  }
+  local parts = {}
+  for _, unit in ipairs(units) do
+    local value = math.floor(remaining / unit.seconds)
+    if value > 0 then
+      parts[#parts + 1] = tostring(value) .. unit.suffix
+      remaining = remaining % unit.seconds
+    end
+  end
+  return table.concat(parts)
 end
 
 function M.humanize_tokens(n)

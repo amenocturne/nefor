@@ -9741,3 +9741,100 @@ fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
         "sidebar focus must be restored:\n{frame}"
     );
 }
+
+#[test]
+fn compact_duration_formatter_covers_unit_boundaries() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+
+    for (milliseconds, expected) in [
+        (0_u64, "0ms"),
+        (999, "999ms"),
+        (1_000, "1s"),
+        (59_999, "59s"),
+        (60_000, "1m"),
+        (61_000, "1m1s"),
+        (3_600_000, "1h"),
+        (18_615_000, "5h10m15s"),
+        (86_400_000, "1d"),
+        (176_461_000, "2d1h1m1s"),
+    ] {
+        let actual: String = engine
+            .lua()
+            .load(format!(
+                "return require('libs.chat.common').humanize_duration_ms({milliseconds})"
+            ))
+            .eval()
+            .expect("format duration");
+        assert_eq!(actual, expected, "{milliseconds}ms");
+    }
+}
+
+#[test]
+fn running_and_completed_workflow_rows_use_compact_durations() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "long-1", "run_name": "long-work" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "long-1", "id": "worker.llm", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "long-1", "id": "worker.llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "long-1", "id": "worker.llm" }),
+    );
+
+    engine.advance_time(Duration::from_millis(310_000));
+    let _ = render_str(&mut engine);
+    let running = engine.snapshot();
+    assert!(
+        running.contains("● worker 5m10s"),
+        "running workflow row must stay compact:\n{running}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_idle", "run_id": "long-1", "id": "worker.llm" }),
+    );
+    let _ = render_str(&mut engine);
+    let completed = engine.snapshot();
+    assert!(
+        completed.contains("✓ worker 5m10s"),
+        "completed workflow row must freeze the same compact duration:\n{completed}"
+    );
+}
+
+#[test]
+fn assistant_and_workflow_result_footers_share_compact_durations() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "text": "long answer", "model": "test", "duration_ms": 18_615_000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append", "run_id": "long-result",
+            "run_name": "long-result", "status": "success", "nodes": [],
+            "duration_ms": 18_615_000, "output": "done"
+        }),
+    );
+
+    let _ = render_str(&mut engine);
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot.matches("5h10m15s").count(),
+        2,
+        "assistant and workflow result footers must share the formatter:\n{snapshot}"
+    );
+}
