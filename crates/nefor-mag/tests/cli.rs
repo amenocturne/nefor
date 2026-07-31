@@ -111,6 +111,20 @@ fn compiles_with_caller_supplied_module_root_and_registry() {
 }
 
 #[test]
+fn profile_is_opt_in_and_machine_readable() {
+    let fixture = Fixture::new("profile");
+    fixture.write("main.mag", "(artifact \"test.profile/v1\" {})");
+
+    let ordinary = json_stdout(&run(&compile_args(&fixture.root, &[])));
+    assert!(ordinary.get("profile").is_none());
+
+    let profiled = json_stdout(&run(&compile_args(&fixture.root, &["--profile"])));
+    assert_eq!(profiled["ok"], true);
+    assert!(profiled["profile"]["phases"]["entry_evaluate_ns"].is_u64());
+    assert_eq!(profiled["profile"]["counters"]["evaluator_steps"], 4);
+}
+
+#[test]
 fn syntax_type_and_graph_failures_are_structured() {
     for (name, source, code, stage) in [
         ("syntax", "(artifact", "syntax_parse", "parse"),

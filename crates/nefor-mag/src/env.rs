@@ -1,9 +1,11 @@
 use crate::ast::{FnValue, TypeDecl, Value};
 use crate::error::MagError;
+use crate::profile::{CompileProfiler, Phase};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const MEMOIZED_CALL_LIMIT: usize = 16_384;
 
@@ -139,6 +141,7 @@ pub struct Env {
     module: String,
     state: Arc<Mutex<CompilationState>>,
     imports: HashSet<String>,
+    profiler: Option<CompileProfiler>,
 }
 
 impl Default for Env {
@@ -154,6 +157,7 @@ impl Env {
             vec![PathBuf::from(".")],
             "main",
             Arc::new(Mutex::new(CompilationState::default())),
+            None,
         )
     }
     fn new_in(
@@ -161,6 +165,7 @@ impl Env {
         module_roots: Vec<PathBuf>,
         module: &str,
         state: Arc<Mutex<CompilationState>>,
+        profiler: Option<CompileProfiler>,
     ) -> Self {
         let mut env = Self {
             scopes: vec![HashMap::new()],
@@ -169,6 +174,7 @@ impl Env {
             module: module.into(),
             state,
             imports: HashSet::new(),
+            profiler,
         };
         for name in [
             "str",
@@ -244,11 +250,19 @@ impl Env {
         path: &Path,
         module_roots: Vec<PathBuf>,
     ) -> Self {
+        Self::new_with_stdlib_source_dir_module_roots_and_profiler(path, module_roots, None)
+    }
+    pub fn new_with_stdlib_source_dir_module_roots_and_profiler(
+        path: &Path,
+        module_roots: Vec<PathBuf>,
+        profiler: Option<CompileProfiler>,
+    ) -> Self {
         Self::new_in(
             path,
             module_roots,
             "main",
             Arc::new(Mutex::new(CompilationState::default())),
+            profiler,
         )
     }
     pub fn source_dir(&self) -> &Path {
@@ -299,10 +313,18 @@ impl Env {
             })
     }
     pub fn snapshot(&self) -> Vec<(String, Value)> {
-        self.scopes
+        let snapshot = self
+            .scopes
             .iter()
             .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .collect()
+            .collect::<Vec<_>>();
+        self.profile_counters(|counters| {
+            counters.environment_snapshots = counters.environment_snapshots.saturating_add(1);
+            counters.environment_snapshot_bindings = counters
+                .environment_snapshot_bindings
+                .saturating_add(snapshot.len() as u64);
+        });
+        snapshot
     }
     pub fn child_for_call(&self) -> Self {
         Self {
@@ -312,6 +334,7 @@ impl Env {
             module: self.module.clone(),
             state: self.state.clone(),
             imports: self.imports.clone(),
+            profiler: self.profiler.clone(),
         }
     }
     pub fn user_defs(&self) -> BTreeMap<String, Value> {
@@ -327,12 +350,20 @@ impl Env {
             .collect()
     }
     pub fn module_cached(&self, name: &str) -> Option<BTreeMap<String, Value>> {
-        self.state
+        let cached = self
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .loaded
             .get(name)
-            .cloned()
+            .cloned();
+        self.profile_counters(|counters| {
+            counters.module_requests = counters.module_requests.saturating_add(1);
+            if cached.is_some() {
+                counters.module_cache_hits = counters.module_cache_hits.saturating_add(1);
+            }
+        });
+        cached
     }
     pub fn loaded_modules(&self) -> Vec<(String, BTreeMap<String, Value>)> {
         self.state
@@ -370,6 +401,9 @@ impl Env {
         m.loading.pop();
         m.loaded.insert(name.into(), defs.clone());
         drop(m);
+        self.profile_counters(|counters| {
+            counters.modules_loaded = counters.modules_loaded.saturating_add(1);
+        });
         self.install_module(name, defs);
     }
     pub fn install_module(&mut self, name: &str, defs: BTreeMap<String, Value>) {
@@ -389,6 +423,7 @@ impl Env {
             self.module_roots.clone(),
             name,
             self.state.clone(),
+            self.profiler.clone(),
         );
         if let Ok(inputs) = self.lookup("inputs") {
             env.define("inputs", inputs.clone());
@@ -399,16 +434,30 @@ impl Env {
     pub fn read_file(&self, path: &Path, requested: &str) -> Result<String, MagError> {
         let key = path.to_path_buf();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = state.file_reads.contains_key(&key);
+        let started = Instant::now();
         let result = state.file_reads.entry(key.clone()).or_insert_with(|| {
             std::fs::read_to_string(&key)
                 .map_err(|error| format!("cannot read {requested}: {error}"))
         });
-        result.clone().map_err(MagError::Eval)
+        let result = result.clone().map_err(MagError::Eval);
+        drop(state);
+        self.profile_counters(|counters| {
+            counters.file_read_requests = counters.file_read_requests.saturating_add(1);
+            if hit {
+                counters.file_read_cache_hits = counters.file_read_cache_hits.saturating_add(1);
+            } else {
+                counters.file_read_cache_misses = counters.file_read_cache_misses.saturating_add(1);
+            }
+        });
+        self.profile_phase(Phase::ModuleRead, started.elapsed());
+        result
     }
 
     pub fn memoized_call(&self, function: &Arc<FnValue>, args: &[Value]) -> Option<Value> {
         let args = args.iter().map(MemoArg::new).collect::<Option<Vec<_>>>()?;
-        self.state
+        let cached = self
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .memoized_calls
@@ -416,7 +465,15 @@ impl Env {
                 function: function.clone(),
                 args,
             })
-            .cloned()
+            .cloned();
+        self.profile_counters(|counters| {
+            if cached.is_some() {
+                counters.memoized_call_hits = counters.memoized_call_hits.saturating_add(1);
+            } else {
+                counters.memoized_call_misses = counters.memoized_call_misses.saturating_add(1);
+            }
+        });
+        cached
     }
 
     pub fn memoize_call(&self, function: &Arc<FnValue>, args: &[Value], result: &Value) {
@@ -436,5 +493,24 @@ impl Env {
             },
             result.clone(),
         );
+        drop(state);
+        self.profile_counters(|counters| {
+            counters.memoized_call_stores = counters.memoized_call_stores.saturating_add(1);
+        });
+    }
+
+    pub(crate) fn profile_counters(
+        &self,
+        update: impl FnOnce(&mut crate::profile::OperationCounters),
+    ) {
+        if let Some(profiler) = &self.profiler {
+            profiler.update_counters(update);
+        }
+    }
+
+    pub(crate) fn profile_phase(&self, phase: Phase, elapsed: std::time::Duration) {
+        if let Some(profiler) = &self.profiler {
+            profiler.add_phase(phase, elapsed);
+        }
     }
 }

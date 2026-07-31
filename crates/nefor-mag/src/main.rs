@@ -40,6 +40,10 @@ struct CompileArgs {
     /// Registry definition (.lua) or JSON contract snapshot; repeat to combine contracts
     #[arg(long = "registry")]
     registries: Vec<PathBuf>,
+
+    /// Include phase timings and deterministic operation counters in the success envelope
+    #[arg(long)]
+    profile: bool,
 }
 
 #[derive(Serialize)]
@@ -54,6 +58,8 @@ struct Envelope<T> {
 struct Success {
     artifact: nefor_mag::ast::Artifact,
     hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<nefor_mag::profile::CompileProfile>,
 }
 
 #[derive(Serialize)]
@@ -104,17 +110,33 @@ fn compile(args: CompileArgs) -> Result<Success, Diagnostic> {
     }
     let contracts = load_registries(&args.registries)?;
     let inputs = serde_json::json!({ "foreign_contracts": contracts });
-    let loaded = nefor_mag::load_with_inputs_and_module_roots(
-        &args.source_dir,
-        &args.entry,
-        inputs,
-        &module_roots,
-    )
+    let profiler = args.profile.then(nefor_mag::profile::CompileProfiler::new);
+    let loaded = if let Some(profiler) = &profiler {
+        nefor_mag::load_with_profiler(
+            &args.source_dir,
+            &args.entry,
+            inputs,
+            &module_roots,
+            profiler,
+        )
+    } else {
+        nefor_mag::load_with_inputs_and_module_roots(
+            &args.source_dir,
+            &args.entry,
+            inputs,
+            &module_roots,
+        )
+    }
     .map_err(mag_diagnostic)?;
-    nefor_mag::validate_loaded_rules(&loaded).map_err(mag_diagnostic)?;
+    if let Some(profiler) = &profiler {
+        nefor_mag::validate_loaded_rules_profiled(&loaded, profiler).map_err(mag_diagnostic)?;
+    } else {
+        nefor_mag::validate_loaded_rules(&loaded).map_err(mag_diagnostic)?;
+    }
     Ok(Success {
         artifact: loaded.artifact,
         hash: loaded.hash,
+        profile: profiler.map(|profiler| profiler.snapshot()),
     })
 }
 

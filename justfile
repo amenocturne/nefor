@@ -130,6 +130,10 @@ fmt:
 build:
     cargo build --workspace --release
 
+# Opt-in optimized MAG compiler benchmark; writes a metadata-rich JSON report to stdout.
+bench-mag *args:
+    cargo bench -p nefor-mag --bench mag_compile -- {{args}}
+
 # Print the workspace version — the single source of truth (Cargo.toml
 # [workspace.package]). The pre-push hook derives the release tag from this, so
 # bumping it here (and pushing) is all it takes to cut v<version>.

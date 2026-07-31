@@ -6,6 +6,7 @@ pub mod eval;
 pub mod json;
 pub mod lexer;
 pub mod parser;
+pub mod profile;
 pub mod registry;
 pub mod schema;
 pub mod types;
@@ -13,8 +14,10 @@ pub mod types;
 use ast::{Artifact, Value};
 use env::Env;
 use error::MagError;
+use profile::{CompileProfile, CompileProfiler, Phase};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::time::Instant;
 
 const EVALUATION_STEP_LIMIT: u64 = 100_000;
 
@@ -40,12 +43,47 @@ pub fn compile_with_inputs_and_module_roots(
     inputs: serde_json::Value,
     module_roots: &[std::path::PathBuf],
 ) -> Result<Artifact, MagError> {
+    compile_impl(source, source_dir, inputs, module_roots, None)
+}
+
+pub fn compile_profiled(
+    source: &str,
+    source_dir: &Path,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+) -> Result<(Artifact, CompileProfile), MagError> {
+    let profiler = CompileProfiler::new();
+    let artifact = compile_impl(source, source_dir, inputs, module_roots, Some(&profiler))?;
+    Ok((artifact, profiler.snapshot()))
+}
+
+fn compile_impl(
+    source: &str,
+    source_dir: &Path,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+    profiler: Option<&CompileProfiler>,
+) -> Result<Artifact, MagError> {
     let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
-    let mut env =
-        Env::new_with_stdlib_source_dir_and_module_roots(source_dir, module_roots.to_vec());
+    let mut env = Env::new_with_stdlib_source_dir_module_roots_and_profiler(
+        source_dir,
+        module_roots.to_vec(),
+        profiler.cloned(),
+    );
     env.define("inputs", Value::HostInputs(inputs));
-    let exprs = parser::parse(&lexer::tokenize(source)?)?;
-    extract_artifact(eval::eval_program(&mut env, &exprs)?, "top-level program")
+    let started = Instant::now();
+    let tokens = lexer::tokenize(source)?;
+    record_phase(profiler, Phase::EntryLex, started);
+    let started = Instant::now();
+    let exprs = parser::parse(&tokens)?;
+    record_phase(profiler, Phase::EntryParse, started);
+    let started = Instant::now();
+    let value = eval::eval_program(&mut env, &exprs)?;
+    record_phase(profiler, Phase::EntryEvaluate, started);
+    let started = Instant::now();
+    let artifact = extract_artifact(value, "top-level program")?;
+    record_phase(profiler, Phase::ArtifactConversion, started);
+    Ok(artifact)
 }
 
 #[derive(Debug, Clone)]
@@ -77,23 +115,77 @@ pub fn load_with_inputs_and_module_roots(
     inputs: serde_json::Value,
     module_roots: &[std::path::PathBuf],
 ) -> Result<LoadedProgram, MagError> {
+    load_impl(source_dir, entry, inputs, module_roots, None)
+}
+
+pub fn load_profiled(
+    source_dir: &Path,
+    entry: &str,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+) -> Result<(LoadedProgram, CompileProfile), MagError> {
+    let profiler = CompileProfiler::new();
+    let program = load_with_profiler(source_dir, entry, inputs, module_roots, &profiler)?;
+    Ok((program, profiler.snapshot()))
+}
+
+pub fn load_with_profiler(
+    source_dir: &Path,
+    entry: &str,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+    profiler: &CompileProfiler,
+) -> Result<LoadedProgram, MagError> {
+    load_impl(source_dir, entry, inputs, module_roots, Some(profiler))
+}
+
+fn load_impl(
+    source_dir: &Path,
+    entry: &str,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+    profiler: Option<&CompileProfiler>,
+) -> Result<LoadedProgram, MagError> {
     let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
     let path = eval::resolve_workspace_path(source_dir, entry)?;
+    let started = Instant::now();
     let source = std::fs::read_to_string(&path)
         .map_err(|e| MagError::Eval(format!("cannot read program {}: {e}", path.display())))?;
-    let mut env =
-        Env::new_with_stdlib_source_dir_and_module_roots(source_dir, module_roots.to_vec());
+    record_phase(profiler, Phase::EntryRead, started);
+    let mut env = Env::new_with_stdlib_source_dir_module_roots_and_profiler(
+        source_dir,
+        module_roots.to_vec(),
+        profiler.cloned(),
+    );
     env.define("inputs", Value::HostInputs(inputs));
-    let exprs = parser::parse(&lexer::tokenize(&source)?)?;
-    let artifact = extract_artifact(eval::eval_program(&mut env, &exprs)?, "top-level program")?;
+    let started = Instant::now();
+    let tokens = lexer::tokenize(&source)?;
+    record_phase(profiler, Phase::EntryLex, started);
+    let started = Instant::now();
+    let exprs = parser::parse(&tokens)?;
+    record_phase(profiler, Phase::EntryParse, started);
+    let started = Instant::now();
+    let value = eval::eval_program(&mut env, &exprs)?;
+    record_phase(profiler, Phase::EntryEvaluate, started);
+    let started = Instant::now();
+    let artifact = extract_artifact(value, "top-level program")?;
+    record_phase(profiler, Phase::ArtifactConversion, started);
+    let started = Instant::now();
     let encoded = serde_json::to_vec(&artifact)
         .map_err(|e| MagError::Eval(format!("serialize artifact: {e}")))?;
     let hash = format!("{:x}", Sha256::digest(encoded));
+    record_phase(profiler, Phase::ArtifactSerializeHash, started);
     Ok(LoadedProgram {
         env,
         artifact,
         hash,
     })
+}
+
+fn record_phase(profiler: Option<&CompileProfiler>, phase: Phase, started: Instant) {
+    if let Some(profiler) = profiler {
+        profiler.add_phase(phase, started.elapsed());
+    }
 }
 
 pub fn eval_fn(
@@ -195,7 +287,23 @@ pub fn validate_rule_fn_input(
 /// Validate every resident rule referenced by a graph-modification artifact.
 /// This is shared by `mag compile` and the runtime's `mag.load` path.
 pub fn validate_loaded_rules(program: &LoadedProgram) -> Result<(), MagError> {
+    validate_loaded_rules_impl(program, None)
+}
+
+pub fn validate_loaded_rules_profiled(
+    program: &LoadedProgram,
+    profiler: &CompileProfiler,
+) -> Result<(), MagError> {
+    validate_loaded_rules_impl(program, Some(profiler))
+}
+
+fn validate_loaded_rules_impl(
+    program: &LoadedProgram,
+    profiler: Option<&CompileProfiler>,
+) -> Result<(), MagError> {
+    let started = Instant::now();
     if program.artifact.format != "nefor.graph-modification/v1" {
+        record_phase(profiler, Phase::ResidentRuleValidation, started);
         return Ok(());
     }
     let rules = program
@@ -206,6 +314,12 @@ pub fn validate_loaded_rules(program: &LoadedProgram) -> Result<(), MagError> {
         .cloned()
         .unwrap_or_default();
     for rule in rules {
+        if let Some(profiler) = profiler {
+            profiler.update_counters(|counters| {
+                counters.resident_rules_validated =
+                    counters.resident_rules_validated.saturating_add(1);
+            });
+        }
         let id = rule
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -221,6 +335,7 @@ pub fn validate_loaded_rules(program: &LoadedProgram) -> Result<(), MagError> {
         validate_rule_fn_input(program, function, input)
             .map_err(|error| MagError::Type(format!("rule {id:?}: {error}")))?;
     }
+    record_phase(profiler, Phase::ResidentRuleValidation, started);
     Ok(())
 }
 

@@ -144,6 +144,9 @@ codes. Human-readable failure context goes to stderr, so subprocess consumers
 can parse stdout without filtering logs. The command only compiles and validates
 an artifact: there is deliberately no `run` or `execute` subcommand.
 
+Compiler profiling, the opt-in release benchmark target, and cache-design
+constraints are documented in [`../../docs/mag-performance.md`](../../docs/mag-performance.md).
+
 The embedding API accepts immutable JSON inputs:
 
 ```rust,ignore

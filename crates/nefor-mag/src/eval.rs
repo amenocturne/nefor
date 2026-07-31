@@ -4,6 +4,9 @@ use crate::error::MagError;
 use crate::types::{ConcreteType, MagType};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
+
+use crate::profile::Phase;
 
 pub mod fuel {
     use crate::error::MagError;
@@ -117,6 +120,9 @@ pub fn eval_program(env: &mut Env, exprs: &[Expr]) -> Result<Value, MagError> {
 fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, MagError> {
     let _depth = fuel::enter_expr()?;
     fuel::step()?;
+    env.profile_counters(|counters| {
+        counters.evaluator_steps = counters.evaluator_steps.saturating_add(1);
+    });
     match expr {
         Expr::Str(v) => Ok(Value::Str(v.clone())),
         Expr::Int(v) => Ok(Value::Int(*v)),
@@ -259,6 +265,7 @@ fn eval_fn_form_with_binding(
         }
     }
     let return_type = parse_type(env, return_expr, &vars)?;
+    let checking_started = Instant::now();
     crate::checker::check_function_with_binding(
         env,
         binding,
@@ -267,6 +274,7 @@ fn eval_fn_form_with_binding(
         &return_type,
         body,
     )?;
+    env.profile_phase(Phase::Checking, checking_started.elapsed());
     Ok(Value::Fn(std::sync::Arc::new(FnValue {
         name: binding.map(str::to_owned),
         type_params,
@@ -790,6 +798,12 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
 }
 
 fn apply(caller: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
+    caller.profile_counters(|counters| {
+        counters.function_calls = counters.function_calls.saturating_add(1);
+        if matches!(f, Value::BuiltinFn(_)) {
+            counters.builtin_calls = counters.builtin_calls.saturating_add(1);
+        }
+    });
     match f {
         Value::Fn(fun) => {
             let _call_depth = fuel::enter_call()?;
@@ -1632,6 +1646,7 @@ fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
         return Ok(Value::Map(std::sync::Arc::new(defs)));
     }
     env.begin_module(name)?;
+    let resolve_started = Instant::now();
     let relative = module_path(name)?;
     let mut matches = env
         .module_roots()
@@ -1661,11 +1676,21 @@ fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
             )))
         }
     };
+    env.profile_phase(Phase::ModuleResolve, resolve_started.elapsed());
+    let read_started = Instant::now();
     let content = std::fs::read_to_string(&path)
         .map_err(|e| MagError::Eval(format!("cannot read module {name}: {e}")))?;
-    let exprs = crate::parser::parse(&crate::lexer::tokenize(&content)?)?;
+    env.profile_phase(Phase::ModuleRead, read_started.elapsed());
+    let lex_started = Instant::now();
+    let tokens = crate::lexer::tokenize(&content)?;
+    env.profile_phase(Phase::ModuleLex, lex_started.elapsed());
+    let parse_started = Instant::now();
+    let exprs = crate::parser::parse(&tokens)?;
+    env.profile_phase(Phase::ModuleParse, parse_started.elapsed());
     let mut module = env.module_env(name);
+    let eval_started = Instant::now();
     let result = eval_program(&mut module, &exprs);
+    env.profile_phase(Phase::ModuleEvaluate, eval_started.elapsed());
     match result {
         Ok(_) => {
             let defs = module.user_defs();

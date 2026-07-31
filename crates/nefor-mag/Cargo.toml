@@ -11,6 +11,10 @@ repository.workspace = true
 name = "mag"
 path = "src/main.rs"
 
+[[bench]]
+name = "mag_compile"
+harness = false
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
