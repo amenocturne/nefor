@@ -2,6 +2,8 @@
 
 Headless CLI plugin for nefor. Surfaces `agentic-loop` as a stdin/stdout interface — same agentic workflow as the TUI, different surface.
 
+The composition must call `configure { readiness = ... }` with its required plugin names, complete required tool-name catalog, source-to-tool diagnostics, and optional timeout. Prompt submission is held until all required plugin liveness events and one complete `tool-gate` public catalog have been observed; timeout exits with the missing plugins, tools, and expected advertisement sources rather than hanging.
+
 ## Usage
 
 ```sh

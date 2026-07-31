@@ -1153,6 +1153,74 @@ fn resume_sets_global_history_replay_flag_during_replay_burst() {
 }
 
 #[test]
+fn large_resume_replays_complete_burst_without_progress_workaround() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let target_id = "99999999-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
+    let target_path = sessions_dir.join(format!("{target_id}.jsonl"));
+    let mut preseed = format!(
+        "{{\"_session\":true,\"session_id\":\"{target_id}\",\"started_at\":\"2026-05-04T00:00:00.000Z\"}}\n"
+    );
+    const ROWS: usize = 10_000;
+    for index in 0..ROWS {
+        let envelope = serde_json::json!({
+            "type": "event",
+            "from": "agentic-loop",
+            "body": { "kind": "chat.stream.delta", "text": format!("row-{index}") }
+        });
+        let row = serde_json::json!({
+            "ts": "2026-05-04T00:00:00.001Z",
+            "origin": "step",
+            "payload": envelope.to_string(),
+        });
+        preseed.push_str(&row.to_string());
+        preseed.push('\n');
+    }
+    std::fs::write(&target_path, preseed).expect("seed large target");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    let script = format!(
+        r#"
+        local json = nefor.json
+        _resume_done_replayed = nil
+        nefor.engine.send = function(payload, _target)
+            local decoded = json.decode(payload)
+            if decoded.body.kind == "sessions.resume_done" then
+                _resume_done_replayed = decoded.body.replayed
+            end
+        end
+        sessions = require("sessions")
+        sessions.init()
+        sessions.resume("{target_id}")
+        "#
+    );
+    let started = std::time::Instant::now();
+    lua.load(&script).exec().expect("large resume");
+    let elapsed = started.elapsed();
+    let replayed: i64 = lua
+        .load("return _resume_done_replayed")
+        .eval()
+        .expect("replayed");
+    assert_eq!(replayed, ROWS as i64);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "10k-row focused reproduction stalled for {elapsed:?}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
 fn resume_skips_malformed_and_non_object_jsonl_rows() {
     // Session logs are append-only files; a truncated or manually edited row
     // should not abort resume. Only valid object rows with origin=="step" are

@@ -423,15 +423,35 @@ actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
 }))
 
 if startup.prompt ~= nil then
-  local submitted = false
-  nefor.bus.on_event("basic-tools.hello", function(_env)
-    if submitted then return end
-    submitted = true
-    nefor.engine.send(nefor.json.encode({
-      type = "event",
-      from = "startup",
-      ts   = nefor.engine.now(),
-      body = { kind = "chat.input.submit", text = startup.prompt },
-    }))
-  end)
+  require("libs.startup-readiness").wait {
+    required_plugins = {
+      cfg.default_provider, "mag", "tool-gate", "git-worktree", "basic-tools",
+    },
+    required_tools = {
+      "read_file", "read_image", "write_file", "edit_file", "bash", "search_text",
+      "git_worktree_create", "git_worktree_open", "list_dir", "python-read",
+      "instructions", "discover_instruction_files", "graph-status", "await-run",
+      "terminate-graph", "write-review", "mag", "mag-eval",
+    },
+    tool_sources = {
+      ["basic-tools"] = { "read_file", "read_image", "write_file", "edit_file", "bash", "search_text" },
+      ["git-worktree"] = { "git_worktree_create", "git_worktree_open" },
+      ["read-only-tools"] = { "list_dir", "python-read", "instructions", "discover_instruction_files" },
+      ["lead-workflow"] = { "graph-status", "await-run", "terminate-graph", "write-review", "mag", "mag-eval" },
+    },
+    timeout_ms = tonumber(os.getenv("NEFOR_STARTUP_TIMEOUT_MS")) or 10000,
+    on_ready = function()
+      nefor.engine.send(nefor.json.encode({
+        type = "event",
+        from = "startup",
+        ts   = nefor.engine.now(),
+        body = { kind = "chat.input.submit", text = startup.prompt },
+      }))
+    end,
+    on_error = function(message)
+      io.stderr:write("nefor: " .. message .. "\n")
+      io.stderr:flush()
+      nefor.engine.exit(1)
+    end,
+  }
 end

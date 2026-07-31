@@ -94,6 +94,20 @@ actor.spawn(sessions)
 sessions.init()
 
 local agentic_cli = require("libs.cli")
+agentic_cli.configure {
+  readiness = {
+    required_plugins = { cfg.provider.name, "mag", "tool-gate", "basic-tools" },
+    required_tools = {
+      "read_file", "read_image", "write_file", "edit_file", "bash", "search_text",
+      "graph-status", "await-run", "terminate-graph", "write-review", "mag", "mag-eval",
+    },
+    tool_sources = {
+      ["basic-tools"] = { "read_file", "read_image", "write_file", "edit_file", "bash", "search_text" },
+      ["lead-workflow"] = { "graph-status", "await-run", "terminate-graph", "write-review", "mag", "mag-eval" },
+    },
+    timeout_ms = tonumber(os.getenv("NEFOR_STARTUP_TIMEOUT_MS")) or 10000,
+  },
+}
 
 -- ------------------------------------------------------------------
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).

@@ -12,30 +12,36 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn run_lua_test(lua: &Lua, path: &std::path::Path) {
+    let src =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    if let Err(e) = lua.load(&src).set_name(path.display().to_string()).exec() {
+        panic!("{} failed:\n{e}", path.display());
+    }
+}
+
 #[test]
 fn starter_startup_parser_and_mode_application() {
     let lua = Lua::new();
     let root = repo_root();
     let starter = root.join("starter").display().to_string();
+    let lua_root = root.join("lua").display().to_string();
     let script = format!(
         r#"package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")"#,
     );
     lua.load(&script).exec().expect("set package.path");
 
-    let test_path = root.join("tests/lua/starter/startup_test.lua");
-    let src = std::fs::read_to_string(&test_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
-    if let Err(e) = lua
-        .load(&src)
-        .set_name(test_path.display().to_string())
-        .exec()
-    {
-        panic!("starter_startup_test.lua failed:\n{e}");
-    }
+    run_lua_test(&lua, &root.join("tests/lua/starter/startup_test.lua"));
+    run_lua_test(
+        &lua,
+        &root.join("tests/lua/starter/startup_readiness_test.lua"),
+    );
 
     let init = std::fs::read_to_string(root.join("starter/init.lua")).expect("read starter init");
     let gate = init

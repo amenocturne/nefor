@@ -289,26 +289,30 @@ local function install_stream_json_format()
   nefor.bus.on_event("tool.*", emit_env)
 end
 
--- Run modes.
---
--- Both modes defer the first action until all plugins are ready. The
--- cli function itself runs synchronously on the main thread BEFORE the
--- broker enters its run loop — meaning any envelopes we emit at this
--- point are dropped (target plugins haven't sent their `ready` yet, so
--- their NCP layer ignores incoming traffic). We wait for the last
--- plugin in the spawn chain (`basic-tools`) to fire `basic-tools.ready`
--- via `nefor.bus.on_event`; that guarantees every upstream plugin
--- (provider, mag, tool-gate) is also up. Only then do we submit /
--- read_line.
+-- Run modes defer the first prompt until startup-readiness has observed
+-- every required plugin hello and tool-gate's complete public catalog. This
+-- is intentionally independent of spawn and advertisement ordering.
 
--- Sentinel kind whose arrival means "every plugin is up". Tied to the
--- spawn order in cli-config/init.lua: basic-tools is last in the chain
--- and emits `basic-tools.hello` immediately after its NCP handshake,
--- so by the time we see it everyone upstream is ready too. Switching
--- providers / shuffling spawn order MUST update this.
-local READY_SENTINEL = "basic-tools.hello"
+local readiness = require("libs.startup-readiness")
+local readiness_config = nil
 
--- Single-shot: register on_complete, wait for ready sentinel, submit
+local function wait_until_ready(on_ready)
+  assert(type(readiness_config) == "table",
+    "agentic-cli readiness is not configured by the composition")
+  readiness.wait {
+    required_plugins = readiness_config.required_plugins,
+    required_tools = readiness_config.required_tools,
+    tool_sources = readiness_config.tool_sources,
+    timeout_ms = readiness_config.timeout_ms,
+    on_ready = on_ready,
+    on_error = function(message)
+      write_stderr("agentic-cli: " .. message .. "\n")
+      nefor.engine.exit(1)
+    end,
+  }
+end
+
+-- Single-shot: register on_complete, wait for the readiness barrier, submit
 -- once, return. on_complete prints the final output (text or JSON)
 -- and exits.
 --
@@ -379,10 +383,7 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
     emit_completion(status)
   end)
 
-  local fired = false
-  nefor.bus.on_event(READY_SENTINEL, function(_env)
-    if fired then return end
-    fired = true
+  wait_until_ready(function()
     agentic_workflow.submit(prompt)
   end)
 end
@@ -463,13 +464,7 @@ local function run_repl(format, json_state, gate)
     read_and_submit()
   end)
 
-  -- Kick off the loop on the ready sentinel.
-  local fired = false
-  nefor.bus.on_event(READY_SENTINEL, function(_env)
-    if fired then return end
-    fired = true
-    read_and_submit()
-  end)
+  wait_until_ready(read_and_submit)
 end
 
 function M.run(argv)
@@ -541,6 +536,13 @@ function M.run(argv)
     run_repl(opts.format, state, gate)
   end
   return 0
+end
+
+function M.configure(opts)
+  assert(type(opts) == "table", "agentic-cli.configure: options table required")
+  readiness_config = opts.readiness
+  assert(type(readiness_config) == "table",
+    "agentic-cli.configure: readiness table required")
 end
 
 function M._parse_argv(argv) return parse_argv(argv) end
