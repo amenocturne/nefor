@@ -217,7 +217,10 @@ pub enum SseEvent {
     /// `choices[0].finish_reason` arrived; the assistant message is done.
     /// Some providers emit this on a chunk that also carries a final
     /// content delta — callers should treat both fields as independent.
-    Finish(String),
+    Finish {
+        reason: String,
+        usage: Option<Usage>,
+    },
     /// Final usage report (input/output token totals).
     Usage(Usage),
     /// `data: [DONE]` sentinel.
@@ -437,16 +440,20 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
         }
     }
 
+    let usage = value
+        .get("usage")
+        .and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok());
     if let Some(reason) = first_choice
         .and_then(|c| c.get("finish_reason"))
         .and_then(|r| r.as_str())
     {
-        return SseEvent::Finish(reason.to_owned());
+        return SseEvent::Finish {
+            reason: reason.to_owned(),
+            usage,
+        };
     }
-    if let Some(usage) = value.get("usage") {
-        if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-            return SseEvent::Usage(u);
-        }
+    if let Some(usage) = usage {
+        return SseEvent::Usage(usage);
     }
     SseEvent::Empty
 }
@@ -526,7 +533,29 @@ mod tests {
     #[test]
     fn parse_sse_chunk_handles_finish_reason() {
         let payload = r#"{"choices":[{"delta":{},"finish_reason":"stop","index":0}]}"#;
-        assert_eq!(parse_sse_chunk(payload), SseEvent::Finish("stop".into()));
+        assert_eq!(
+            parse_sse_chunk(payload),
+            SseEvent::Finish {
+                reason: "stop".into(),
+                usage: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sse_chunk_preserves_finish_reason_and_usage_in_same_frame() {
+        let payload = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#;
+        assert_eq!(
+            parse_sse_chunk(payload),
+            SseEvent::Finish {
+                reason: "stop".into(),
+                usage: Some(Usage {
+                    prompt_tokens: 12,
+                    completion_tokens: 34,
+                    total_tokens: 46,
+                }),
+            }
+        );
     }
 
     #[test]
@@ -739,7 +768,10 @@ mod tests {
     fn parse_sse_chunk_tool_calls_finish_reason() {
         let payload = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}"#;
         match parse_sse_chunk(payload) {
-            SseEvent::Finish(reason) => assert_eq!(reason, "tool_calls"),
+            SseEvent::Finish { reason, usage } => {
+                assert_eq!(reason, "tool_calls");
+                assert!(usage.is_none());
+            }
             other => panic!("expected Finish, got {other:?}"),
         }
     }

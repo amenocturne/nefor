@@ -634,8 +634,11 @@ where
                 outcome.reasoning_text.push_str(&text);
                 on_reasoning(ReasoningEvent::Delta(&text));
             }
-            SseEvent::Finish(reason) => {
+            SseEvent::Finish { reason, usage } => {
                 outcome.finish_reason = Some(reason);
+                if usage.is_some() {
+                    outcome.usage = usage;
+                }
                 // Reasoning-only turn (Gemma 3 edge case): finish
                 // arrives without any content. Still close the
                 // reasoning channel so the chat plugin renders the

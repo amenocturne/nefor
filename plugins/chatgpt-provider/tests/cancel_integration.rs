@@ -322,3 +322,141 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }
+
+#[tokio::test]
+async fn clean_eof_requires_terminal_event_and_next_submissions_settle() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_srv = hits.clone();
+
+    let server = tokio::spawn(async move {
+        let responses = [
+            // Before output: retryable because nothing user-visible escaped.
+            String::new(),
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"retried\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n".into(),
+            // After partial output: terminal error, never replay the visible prefix.
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n".into(),
+            // A semantic terminal event makes the following transport EOF valid.
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"after-error\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r3\"}}\n\n".into(),
+        ];
+        for body in responses {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut stream).await;
+            hits_srv.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let args = Arc::new(ServeArgs {
+        provider_name: PROVIDER.into(),
+        base_url: format!("http://{addr}"),
+    });
+    let chats = Arc::new(Chats::with_default_model(None));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Arc::new(
+        AuthStore::load_from_disk(&dir.path().join("auth.json"))
+            .await
+            .expect("auth store"),
+    );
+    let _ = auth.apply_auth_set("test-token".into()).await;
+    let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(256);
+    let ctx = DispatcherContext {
+        args,
+        chats,
+        auth,
+        catalog: Arc::new(ToolCatalog::new()),
+        broker: Arc::new(ToolBroker::new()),
+        responses_client: Arc::new(ResponsesClient::new(
+            format!("http://{addr}"),
+            "test-installation".into(),
+            "nefor_test".into(),
+        )),
+        out_tx,
+    };
+    let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
+    let loop_handle = tokio::spawn(run_dispatch_loop(ctx, in_rx));
+
+    async fn submit(in_tx: &mpsc::Sender<Result<Envelope, TransportError>>, id: &str) {
+        in_tx
+            .send(Ok(event_env(
+                &kind("chat.create"),
+                &[
+                    ("chat_id", Value::String(id.into())),
+                    ("model", Value::String("test-model".into())),
+                ],
+            )))
+            .await
+            .expect("create");
+        in_tx
+            .send(Ok(event_env(
+                &kind("chat.append"),
+                &[
+                    ("chat_id", Value::String(id.into())),
+                    ("message", serde_json::json!({"role":"user","content":"hi"})),
+                ],
+            )))
+            .await
+            .expect("append");
+        in_tx
+            .send(Ok(event_env(
+                &kind("chat.complete"),
+                &[("chat_id", Value::String(id.into()))],
+            )))
+            .await
+            .expect("complete");
+    }
+
+    submit(&in_tx, "before-output").await;
+    let retried = wait_for_kind(
+        &mut out_rx,
+        &kind("chat.complete.result"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("pre-output EOF retries and settles");
+    assert_eq!(retried["chat_id"], "before-output");
+    assert_eq!(retried["output"]["text"], "retried");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    submit(&in_tx, "after-partial").await;
+    let failed = wait_for_kind(
+        &mut out_rx,
+        &kind("chat.complete.result"),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("partial EOF settles as an error");
+    assert_eq!(failed["chat_id"], "after-partial");
+    assert_eq!(failed["output"]["finish_reason"], "error");
+    assert!(failed["output"]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("before a terminal event")));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        3,
+        "visible output disables retry"
+    );
+
+    submit(&in_tx, "after-terminal").await;
+    let completed = wait_for_kind(
+        &mut out_rx,
+        &kind("chat.complete.result"),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("provider remains usable after scoped EOF error");
+    assert_eq!(completed["chat_id"], "after-terminal");
+    assert_eq!(completed["output"]["text"], "after-error");
+    assert_ne!(completed["output"]["finish_reason"], "error");
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+    drop(in_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}

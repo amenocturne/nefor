@@ -75,6 +75,11 @@ pub enum ChatgptError {
     #[error("responses SSE stream read error: {0}")]
     ResponsesStreamRead(String),
 
+    /// The transport closed cleanly without a semantic terminal event.
+    /// A clean EOF is not proof that the Responses API completed the turn.
+    #[error("responses SSE stream ended before a terminal event")]
+    ResponsesStreamEnded,
+
     /// A complete SSE frame arrived, but did not match the schema this
     /// provider understands. Retrying the same request is unlikely to
     /// change the payload shape, so callers should surface this.

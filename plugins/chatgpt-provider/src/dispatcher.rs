@@ -2094,8 +2094,10 @@ fn should_retry_pre_output_stream_error(
     tool_buf: &ToolCallBuffer,
     elapsed: Duration,
 ) -> bool {
-    matches!(err, ChatgptError::ResponsesStreamRead(_))
-        && output_text.is_empty()
+    matches!(
+        err,
+        ChatgptError::ResponsesStreamRead(_) | ChatgptError::ResponsesStreamEnded
+    ) && output_text.is_empty()
         && reasoning_text.is_empty()
         && tool_buf.is_empty()
         && elapsed < PRE_OUTPUT_RETRY_BUDGET
@@ -2661,7 +2663,21 @@ fn spawn_turn(
                                 iter_errored = Some(format!("stream error: {e}"));
                                 break;
                             }
-                            None => break,
+                            None => {
+                                let e = ChatgptError::ResponsesStreamEnded;
+                                iter_retryable_before_output =
+                                    should_retry_pre_output_stream_error(
+                                        &e,
+                                        &output_text,
+                                        &reasoning_text,
+                                        &tool_buf,
+                                        pre_output_retry_started
+                                            .map(|retry_started| retry_started.elapsed())
+                                            .unwrap_or(Duration::ZERO),
+                                    );
+                                iter_errored = Some(format!("stream error: {e}"));
+                                break;
+                            }
                         }
                     }
                 }
@@ -3470,6 +3486,20 @@ mod tests {
         assert!(should_retry_pre_output_stream_error(
             &ChatgptError::ResponsesStreamRead("reset".into()),
             "",
+            "",
+            &empty_tools,
+            Duration::ZERO,
+        ));
+        assert!(should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamEnded,
+            "",
+            "",
+            &empty_tools,
+            Duration::ZERO,
+        ));
+        assert!(!should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamEnded,
+            "visible",
             "",
             &empty_tools,
             Duration::ZERO,

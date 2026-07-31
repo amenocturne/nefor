@@ -321,6 +321,12 @@ impl Chats {
         chat.restored = true;
 
         let mut g = self.inner.lock().await;
+        if matches!(
+            g.get(&restore.id).map(|existing| &existing.turn),
+            Some(TurnState::InFlight(_))
+        ) {
+            return Err(ChatsError::Busy(restore.id));
+        }
         g.insert(restore.id, chat);
         Ok(())
     }
@@ -814,6 +820,36 @@ mod tests {
             .await
             .expect_err("second create");
         assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_an_inflight_chat_without_replacing_its_turn() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("busy");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        let turn = c.begin_turn(&id).await.expect("begin turn");
+
+        let err = c
+            .restore(ChatRestore {
+                id: id.clone(),
+                model: None,
+                tools_enabled: None,
+                tool_allowlist: None,
+                reasoning_effort: None,
+                system: None,
+                history: vec![Message::user("replacement")],
+            })
+            .await
+            .expect_err("restore must reject busy chat");
+
+        assert!(matches!(err, ChatsError::Busy(busy) if busy == id));
+        assert!(
+            c.cancel_turn(&id).await,
+            "original turn must remain cancellable"
+        );
+        assert!(turn.is_cancelled());
     }
 
     #[tokio::test]
