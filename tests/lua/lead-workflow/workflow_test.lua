@@ -257,6 +257,141 @@ local function invoke_tool(id, name, args)
   })
 end
 
+local function tool_result(id)
+  return find_call(decode_calls(), function(call)
+    return call.body.kind == "tool.result" and call.body.id == id
+  end)
+end
+
+local function table_size(values)
+  local size = 0
+  for _ in pairs(values) do size = size + 1 end
+  return size
+end
+
+-- graph-status throttles repeated snapshots of the same target without
+-- serializing inspection of distinct concurrent runs or the all-runs view.
+do
+  fresh()
+  lw._internals.set_graph_status_now(function() return 100 end)
+
+  invoke_tool("status-a-first", "graph-status", { run_id = "A" })
+  invoke_tool("status-b", "graph-status", { run_id = "B" })
+  invoke_tool("status-a-repeat", "graph-status", { run_id = "A" })
+
+  assert_true(tool_result("status-a-first").body.output ~= nil,
+    "first status query for A is allowed")
+  assert_true(tool_result("status-b").body.output ~= nil,
+    "status query for B is independent of A")
+  local repeated = tool_result("status-a-repeat")
+  assert_true(repeated.body.error ~= nil,
+    "repeated status query for A inside the cooldown is blocked")
+  assert_true(string.find(repeated.body.error, "run_id A", 1, true) ~= nil,
+    "anti-polling diagnostic identifies the blocked run")
+end
+
+do
+  fresh()
+  lw._internals.set_graph_status_now(function() return 100 end)
+
+  invoke_tool("status-all-first", "graph-status", {})
+  invoke_tool("status-a-after-all", "graph-status", { run_id = "A" })
+  assert_true(tool_result("status-all-first").body.output ~= nil,
+    "all-runs status query is allowed")
+  assert_true(tool_result("status-a-after-all").body.output ~= nil,
+    "per-run query is independent of all-runs query")
+
+  fresh()
+  lw._internals.set_graph_status_now(function() return 100 end)
+  invoke_tool("status-a-before-all", "graph-status", { run_id = "A" })
+  invoke_tool("status-all-after-a", "graph-status", {})
+  assert_true(tool_result("status-a-before-all").body.output ~= nil,
+    "per-run status query is allowed")
+  assert_true(tool_result("status-all-after-a").body.output ~= nil,
+    "all-runs query is independent of per-run query")
+end
+
+do
+  fresh()
+  local now = 100
+  lw._internals.set_graph_status_now(function() return now end)
+  invoke_tool("status-expiry-first", "graph-status", { run_id = "expired-run" })
+  now = 159
+  invoke_tool("status-expiry-blocked", "graph-status", { run_id = "expired-run" })
+  now = 160
+  invoke_tool("status-expiry-allowed", "graph-status", { run_id = "expired-run" })
+  assert_true(tool_result("status-expiry-blocked").body.error ~= nil,
+    "same target remains blocked before 60 seconds")
+  assert_true(tool_result("status-expiry-allowed").body.output ~= nil,
+    "same target is allowed at cooldown expiry")
+end
+
+do
+  fresh()
+  lw._internals.set_graph_status_now(function() return 100 end)
+  local completed = lw._internals.run_registry:register({
+    run_id = "mag-run-completed-A",
+    run_name = "completed A",
+    session_id = sessions.current_id(),
+    terminal = "worker",
+  })
+  lw._internals.run_registry:settle(completed.run_id,
+    { status = "completed", result = { text = "done" } })
+
+  invoke_tool("status-completed-first", "graph-status", { run_id = completed.run_id })
+  invoke_tool("status-completed-repeat", "graph-status", { run_id = completed.run_id })
+  assert_eq(tool_result("status-completed-first").body.output.run.status, "completed",
+    "completed runs retain normal graph-status semantics")
+  assert_true(tool_result("status-completed-repeat").body.error ~= nil,
+    "completed run ids use the same target-key cooldown")
+end
+
+do
+  fresh()
+  local now = 100
+  lw._internals.set_graph_status_now(function() return now end)
+  local limit = lw._internals.graph_status_cooldown_limit
+  invoke_tool("status-unknown-first", "graph-status", { run_id = "mag-run-missing" })
+  invoke_tool("status-unknown-repeat", "graph-status", { run_id = "mag-run-missing" })
+  assert_eq(tool_result("status-unknown-first").body.output.status, "await_run_unknown",
+    "unknown run ids retain authority-aware graph-status semantics")
+  assert_true(tool_result("status-unknown-repeat").body.error ~= nil,
+    "unknown run ids use the same target-key cooldown")
+
+  for index = 1, limit + 1 do
+    invoke_tool("status-unknown-" .. index, "graph-status",
+      { run_id = string.format("mag-run-unknown-%03d", index) })
+    local result = tool_result("status-unknown-" .. index)
+    assert_eq(result.body.output.status, "await_run_unknown",
+      "unknown run ids retain authority-aware graph-status semantics")
+  end
+  assert_eq(table_size(lw._internals.state.graph_status_cooldowns), limit,
+    "arbitrary unknown ids cannot grow cooldown state beyond its bound")
+  assert_eq(lw._internals.state.graph_status_cooldowns["run:mag-run-unknown-001"], nil,
+    "bounded cooldown state evicts the oldest target")
+  assert_true(lw._internals.state.graph_status_cooldowns[
+    "run:" .. string.format("mag-run-unknown-%03d", limit + 1)] ~= nil,
+    "bounded cooldown state retains the newest target")
+
+  now = 160
+  lw._internals.set_graph_status_now(function() return now end)
+  invoke_tool("status-after-prune", "graph-status", { run_id = "mag-run-after-prune" })
+  assert_eq(table_size(lw._internals.state.graph_status_cooldowns), 1,
+    "expired cooldown entries are pruned before a new target is recorded")
+end
+
+do
+  fresh()
+  lw._internals.set_graph_status_now(function() return 100 end)
+  invoke_tool("status-before-reset", "graph-status", { run_id = "reset-run" })
+  lw._internals.reset()
+  lw._internals.set_graph_status_now(function() return 100 end)
+  _test.calls_clear()
+  invoke_tool("status-after-reset", "graph-status", { run_id = "reset-run" })
+  assert_true(tool_result("status-after-reset").body.output ~= nil,
+    "lead-workflow reset clears graph-status cooldown state")
+end
+
 local function invoke_tool_with_metadata(id, name, args, metadata)
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
@@ -1617,6 +1752,10 @@ do
   })
   assert_eq(lw._internals.state.active_plan.status, "pending",
     "plan slot is pending before session_end")
+  lw._internals.set_graph_status_now(function() return 100 end)
+  invoke_tool("status-at-session-end", "graph-status", { run_id = run_id })
+  assert_true(next(lw._internals.state.graph_status_cooldowns) ~= nil,
+    "graph-status cooldown exists before session_end")
   _test.calls_clear()
 
   -- Direct invocation matches the bus.on_event subscriber the actor
@@ -1635,6 +1774,8 @@ do
     "active_runs cleared after termination")
   assert_eq(lw._internals.state.active_plan, nil,
     "active_plan flushed at session_end — no carry-over approval")
+  assert_eq(next(lw._internals.state.graph_status_cooldowns), nil,
+    "graph-status cooldown state is cleared at session_end")
 end
 
 -- (mag-eval caller routing and ownership) The gate-facing firing id is an

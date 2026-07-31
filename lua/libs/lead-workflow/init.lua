@@ -149,6 +149,10 @@ local state = {
   completed_runs = run_registry.completed_runs,
   completed_run_limit = 64,
 
+  -- One anti-polling timestamp per graph-status target. The all-runs snapshot
+  -- has its own key, independent of every explicit run id.
+  graph_status_cooldowns = {},
+
   -- The single in-flight plan slot. Lifetime is one verdict turn:
   -- created by write-review, decided by /approve or /reject, flushed
   -- on the next user message after the verdict (or immediately when
@@ -1341,29 +1345,80 @@ terminate_graph = function(firing_id, args, metadata)
   })
 end
 
+local GRAPH_STATUS_COOLDOWN_SECONDS = 60
+local GRAPH_STATUS_COOLDOWN_LIMIT = 256
+local GRAPH_STATUS_ALL_KEY = "all-runs"
+local graph_status_now = os.time
+
+local function graph_status_target(run_id)
+  if type(run_id) == "string" and run_id ~= "" then
+    return "run:" .. run_id, "run_id " .. run_id
+  end
+  return GRAPH_STATUS_ALL_KEY, "all runs"
+end
+
+local function prune_graph_status_cooldowns(now)
+  local cooldowns = state.graph_status_cooldowns
+  local count = 0
+  local oldest_key
+  local oldest_at
+  for key, checked_at in pairs(cooldowns) do
+    if (now - checked_at) >= GRAPH_STATUS_COOLDOWN_SECONDS then
+      cooldowns[key] = nil
+    else
+      count = count + 1
+      if oldest_at == nil or checked_at < oldest_at
+          or (checked_at == oldest_at and key < oldest_key) then
+        oldest_key = key
+        oldest_at = checked_at
+      end
+    end
+  end
+  return count, oldest_key
+end
+
 graph_status = function(firing_id, args, metadata)
   local context, context_error = run_control_context(metadata)
   if not context then
     emit_tool_result_err(firing_id, "graph-status: " .. tostring(context_error))
     return
   end
-  if context.dispatcher_id == nil then
-    local now = os.time()
-    local cooldown = 60
-    if state.last_graph_status_at and (now - state.last_graph_status_at) < cooldown then
-      emit_tool_result_err(firing_id,
-        "graph-status blocked: you called it less than " .. cooldown .. "s ago. " ..
-        "Graph results arrive automatically — do not poll. " ..
-        "Stop calling graph-status and wait for the result to arrive, or address the user.")
+  local now = graph_status_now()
+  local run_id = args and args.run_id
+  local authorized_run
+  local lookup_err
+  if type(run_id) == "string" and run_id ~= "" then
+    authorized_run, lookup_err = authorize_control_target(context, run_id)
+    if lookup_err and (lookup_err.error_code == "run_control_unauthorized"
+        or lookup_err.error_code == "run_control_self") then
+      emit_tool_result_ok(firing_id, {
+        active = false,
+        run_id = run_id,
+        status = lookup_err.error_code,
+        notice = lookup_err.error,
+        error_code = lookup_err.error_code,
+      })
       return
     end
-    state.last_graph_status_at = now
   end
-  local run_id = args and args.run_id
+  local target_key, target_label = graph_status_target(run_id)
+  local cooldown_count, oldest_key = prune_graph_status_cooldowns(now)
+  if state.graph_status_cooldowns[target_key] ~= nil then
+    emit_tool_result_err(firing_id,
+      "graph-status blocked for " .. target_label .. ": you called it less than " ..
+      GRAPH_STATUS_COOLDOWN_SECONDS .. "s ago. " ..
+      "Graph results arrive automatically — do not poll. " ..
+      "Stop calling graph-status and wait for the result to arrive, or address the user.")
+    return
+  end
+  if cooldown_count >= GRAPH_STATUS_COOLDOWN_LIMIT then
+    state.graph_status_cooldowns[oldest_key] = nil
+  end
+  state.graph_status_cooldowns[target_key] = now
+
   if type(run_id) == "string" and run_id ~= "" then
-    local run, lookup_err = authorize_control_target(context, run_id)
-    if run then
-      emit_tool_result_ok(firing_id, { active = run.phase ~= "terminal", run = summarize_run(run) })
+    if authorized_run then
+      emit_tool_result_ok(firing_id, { active = authorized_run.phase ~= "terminal", run = summarize_run(authorized_run) })
       return
     end
     emit_tool_result_ok(firing_id, {
@@ -1396,6 +1451,7 @@ end
 local function terminate_active_graph(session_id)
   invalidate_pending_mag_loads(nil)
   state.active_plan = nil
+  state.graph_status_cooldowns = {}
 
   session_id = session_id or sessions.current_id()
   if type(session_id) ~= "string" or session_id == "" then return end
@@ -2074,11 +2130,17 @@ local M = {
     run_web_review = run_web_review,
     run_registry = run_registry,
     await_run = await_run,
+    graph_status_cooldown_limit = GRAPH_STATUS_COOLDOWN_LIMIT,
+    set_graph_status_now = function(now_fn)
+      graph_status_now = now_fn or os.time
+    end,
     reset = function()
       state.active_run_id = nil
       run_registry:reset()
       state.active_runs = run_registry.active_runs
       state.completed_runs = run_registry.completed_runs
+      state.graph_status_cooldowns = {}
+      graph_status_now = os.time
       state.active_plan = nil
       state.gate_mode = "safe"
       state.kernel_factories = {}
