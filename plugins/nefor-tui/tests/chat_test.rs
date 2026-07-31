@@ -8784,6 +8784,131 @@ fn declared_preview_interprets_without_factory_specific_renderer_and_updates_liv
 }
 
 #[test]
+fn generic_input_and_output_preview_references_materialize_endpoint_observations() {
+    let mut engine = Engine::new(100, 26).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "endpoints",
+        json!({ "kind": "column", "children": [
+            { "kind": "text", "value": { "binding": "input", "name": "request" } },
+            { "kind": "text", "value": { "binding": "output", "name": "response" } }
+        ] }),
+        json!({
+            "request": { "kind": "input" },
+            "response": { "kind": "output" }
+        }),
+    );
+    open_single_node(&mut engine, "endpoints", "endpoint.node");
+    for (binding_kind, binding, value) in [
+        ("input", "request", "GENERIC INPUT OBSERVED"),
+        ("output", "response", "GENERIC OUTPUT OBSERVED"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.node_preview", "run_id": "preview-run", "id": "endpoint.node",
+                "operation": "set", "binding_kind": binding_kind,
+                "binding": binding, "value": value
+            }),
+        );
+    }
+    let frame = render_snapshot(&mut engine);
+    assert!(frame.contains("GENERIC INPUT OBSERVED"), "{frame}");
+    assert!(frame.contains("GENERIC OUTPUT OBSERVED"), "{frame}");
+}
+
+#[test]
+fn completed_preview_remains_inspectable_after_linger_and_is_bounded_to_latest_run() {
+    let mut engine = Engine::new(110, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "retained",
+        json!({ "kind": "text", "value": { "binding": "output", "name": "result" } }),
+        json!({ "result": { "kind": "output" } }),
+    );
+    open_single_node(&mut engine, "retained", "retained.node");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.node_preview", "run_id": "preview-run", "id": "retained.node",
+            "operation": "set", "binding_kind": "output", "binding": "result",
+            "value": "RETAINED COMPLETED OUTPUT"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_complete", "run_id": "preview-run", "status": "success"
+        }),
+    );
+    engine
+        .handle_key(key("escape"))
+        .expect("close live inspector");
+    engine.advance_time(Duration::from_millis(2_001));
+    let quiet = render_snapshot(&mut engine);
+    assert!(
+        !quiet.contains("MAG preview-demo"),
+        "completed run must leave the active list:\n{quiet}"
+    );
+    assert!(
+        quiet.contains("Space: inspect last completed run"),
+        "bounded archive route missing:\n{quiet}"
+    );
+    engine.handle_key(key("tab")).expect("return to prompt");
+    engine
+        .handle_key(key("tab"))
+        .expect("focus completed-run archive target");
+    let focused = render_snapshot(&mut engine);
+    assert!(
+        !focused.contains("can't focus an empty sidebar"),
+        "discoverable archive target must remain focusable:\n{focused}"
+    );
+
+    engine
+        .handle_key(key("space"))
+        .expect("open retained completed run");
+    let concise = render_snapshot(&mut engine);
+    assert!(concise.contains("run · preview-demo"), "{concise}");
+    assert!(
+        !concise.contains("RETAINED COMPLETED OUTPUT"),
+        "details must remain progressive:\n{concise}"
+    );
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("reveal completed node details");
+    let detailed = render_snapshot(&mut engine);
+    assert!(detailed.contains("RETAINED COMPLETED OUTPUT"), "{detailed}");
+
+    engine.handle_key(key("escape")).expect("close archive");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "newer-run", "run_name": "newer", "scope": "newer"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_complete", "run_id": "newer-run", "status": "success"
+        }),
+    );
+    engine.advance_time(Duration::from_millis(2_001));
+    engine.handle_key(key("down")).expect("dispatch prune");
+    let state = engine.state_table().expect("state");
+    let runs: mlua::Table = state.get("runs").expect("runs");
+    assert!(runs
+        .get::<Option<mlua::Table>>("preview-run")
+        .unwrap()
+        .is_none());
+    assert!(runs
+        .get::<Option<mlua::Table>>("newer-run")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
     let mut engine = Engine::new(110, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -8793,7 +8918,7 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
         json!({
             "kind": "stream", "source": { "binding": "stream", "name": "transcript", "schema": "table" },
             "item": { "kind": "cases", "values": {
-                "reasoning": { "kind": "text", "value": { "binding": "item", "name": "text" }, "style": "reasoning" },
+                "reasoning": { "kind": "value", "value": { "binding": "item", "name": "text" }, "format": "reasoning", "style": "reasoning" },
                 "assistant": { "kind": "markdown", "value": { "binding": "item", "name": "text" } },
                 "tool_call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
                 "tool_result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" }
@@ -8828,17 +8953,42 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
     }
     let frame = render_snapshot(&mut engine);
     for expected in [
-        "reason continued",
+        "▸ reasoning",
         "Answer",
         "complete prose",
-        "tool call · read_file · call-1",
-        "/a/complete/path",
-        "tool result · call-1",
-        "complete result body",
+        "▸ read_file · call-1",
+        "path: string",
+        "✓ tool result · call-1",
+        "hidden",
     ] {
         assert!(
             frame.contains(expected),
-            "transcript lost {expected:?}:\n{frame}"
+            "concise transcript lost {expected:?}:\n{frame}"
+        );
+    }
+    for hidden in [
+        "reason continued",
+        "/a/complete/path",
+        "complete result body",
+    ] {
+        assert!(
+            !frame.contains(hidden),
+            "default transcript leaked verbose detail {hidden:?}:\n{frame}"
+        );
+    }
+
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("reveal preview details");
+    let expanded = render_snapshot(&mut engine);
+    for expected in [
+        "reason continued",
+        "/a/complete/path",
+        "complete result body",
+    ] {
+        assert!(
+            expanded.contains(expected),
+            "expanded transcript lost {expected:?}:\n{expanded}"
         );
     }
 }
@@ -8928,6 +9078,67 @@ fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_wi
             );
         }
     }
+}
+
+#[test]
+fn appended_preview_output_does_not_steal_manual_scroll_position() {
+    let mut engine = Engine::new(100, 26).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "scrolling",
+        json!({
+            "kind": "stream", "source": { "binding": "stream", "name": "events", "schema": "table" },
+            "item": { "kind": "cases", "values": {
+                "line": { "kind": "text", "value": { "binding": "item", "name": "text" }, "wrap": "word" }
+            } }
+        }),
+        json!({ "events": { "kind": "stream", "schema": "table" } }),
+    );
+    open_single_node(&mut engine, "scrolling", "scroll.node");
+    for seq in 1..=50 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.node_preview", "run_id": "preview-run", "id": "scroll.node",
+                "operation": "append", "binding": "events", "observation_seq": seq,
+                "value": { "kind": "line", "text": format!("line {seq:02}") }
+            }),
+        );
+    }
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("home")).expect("scroll to top");
+    let _ = render_str(&mut engine);
+    let before: i64 = engine
+        .lua()
+        .load(r#"return tui.scroll_position("popup_node_inspector").offset"#)
+        .eval()
+        .expect("offset before append");
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.node_preview", "run_id": "preview-run", "id": "scroll.node",
+            "operation": "append", "binding": "events", "observation_seq": 51,
+            "value": { "kind": "line", "text": "new tail output" }
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let after: i64 = engine
+        .lua()
+        .load(r#"return tui.scroll_position("popup_node_inspector").offset"#)
+        .eval()
+        .expect("offset after append");
+    assert_eq!(
+        after, before,
+        "appended output must preserve ordinary reading position"
+    );
+    let state = engine.state_table().expect("state");
+    let popup: mlua::Table = state.get("popup").expect("popup");
+    assert!(
+        popup.get::<bool>("unseen").unwrap_or(false),
+        "append away from the tail should mark unseen output"
+    );
 }
 
 #[test]

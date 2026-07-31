@@ -438,12 +438,12 @@ end
 local function popup_shell(title, header, body, unseen)
   return W.popup.view({
     open = true, border_style = STYLE.popup_user, title_style = STYLE.popup_user,
-    width = "90%", height = "90%", scroll_key = "popup_node_inspector", stick_to = "end",
+    width = "90%", height = "90%", scroll_key = "popup_node_inspector",
     title = title,
     header = header,
     child = body,
     footer = tui.text { content = (unseen and "* unseen output · " or "")
-      .. "Up/Down PgUp/PgDn Home/End scroll · Esc/Q close · read-only",
+      .. "Ctrl+O details · Up/Down PgUp/PgDn Home/End scroll · Esc/Q close · read-only",
       style = unseen and STYLE.status_warn or STYLE.status_dim, wrap = "none" },
   })
 end
@@ -486,12 +486,13 @@ local function aggregate_inspector(state, p, now_ms)
   end
   table.sort(member_parts)
   local children, last_actor = {}, nil
-  for _, item in ipairs(items) do
+  for index, item in ipairs(items) do
     if item.actor_id ~= last_actor then
       children[#children + 1] = tui.text { content = "· " .. item.actor_id, style = STYLE.popup_user, wrap = "none" }
       last_actor = item.actor_id
     end
-    children[#children + 1] = preview_view.activity(item)
+    local node = preview_state.node(state, p.run_id, item.actor_id) or {}
+    children[#children + 1] = preview_view.activity(item, state, node, index == #items)
   end
   if #children == 0 then children[1] = tui.text { content = "No observed activity yet.", style = STYLE.status_dim } end
   local header = tui.column { gap = 0, children = {
@@ -507,6 +508,29 @@ end
 function M.node_inspector(state)
   if not state.popup or state.popup.variant ~= "node_inspector" then return nil end
   local p, now_ms = state.popup, tui.now_ms()
+  if p.completed_archive and state.expanded_details == true then
+    local run_nodes = (state.node_previews or {})[p.run_id] or {}
+    local ids = {}
+    for actor_id in pairs(run_nodes) do ids[#ids + 1] = actor_id end
+    table.sort(ids)
+    local children = {}
+    for _, actor_id in ipairs(ids) do
+      children[#children + 1] = tui.text {
+        content = "· " .. actor_id, style = STYLE.popup_user, wrap = "none" }
+      children[#children + 1] = preview_view.node(state, p.run_id, actor_id)
+    end
+    if #children == 0 then children[1] = tui.text {
+      content = "No node previews were captured.", style = STYLE.status_dim } end
+    local run = (state.runs or {})[p.run_id]
+    local header = tui.column { gap = 0, children = {
+      tui.text { content = "run " .. run_ident_of(run, p.run_id)
+        .. " · completed node details", style = STYLE.footer },
+      tui.text { content = tostring(#ids) .. " nodes", style = STYLE.status },
+      tui.text { content = string.rep("─", 48), style = STYLE.footer },
+    } }
+    return popup_shell("── run · " .. run_ident_of(run, p.run_id)
+      .. " [read-only] ──", header, tui.column { gap = 1, children = children }, p.unseen)
+  end
   if p.actor_id then return node_inspector(state, p, now_ms) end
   return aggregate_inspector(state, p, now_ms)
 end

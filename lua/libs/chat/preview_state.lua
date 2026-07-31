@@ -85,6 +85,11 @@ local function binding_kind(state, node, name)
   return contract and contract.preview_bindings and contract.preview_bindings[name]
 end
 
+local function binding_accepts(declared, kind)
+  return declared and (declared.kind == kind
+    or (type(declared.kinds) == "table" and declared.kinds[kind] == true))
+end
+
 function M.observe(state, msg, now_ms)
   local run_id, actor_id = msg.run_id, msg.id
   local node = (((state.node_previews or {})[run_id] or {})[actor_id])
@@ -92,12 +97,20 @@ function M.observe(state, msg, now_ms)
   local declared = binding_kind(state, node, msg.binding)
   if not declared then return state end
   local op = msg.operation
-  if (op == "append" and declared.kind ~= "stream") or
-      ((op == "set" or op == "update") and declared.kind ~= "state") then return state end
+  local endpoint = msg.binding_kind
+  if endpoint ~= nil then
+    if op ~= "set" or (endpoint ~= "input" and endpoint ~= "output")
+        or not binding_accepts(declared, endpoint) then return state end
+  elseif (op == "append" and not binding_accepts(declared, "stream")) or
+      ((op == "set" or op == "update") and not binding_accepts(declared, "state")) then return state end
   return put_node(state, run_id, actor_id, function(prev)
     local next = copy_map(prev)
     next.last_activity_ms, next.last_activity_kind = now_ms, "preview." .. tostring(op)
-    if op == "append" then
+    if endpoint ~= nil then
+      local values = endpoint == "input" and "inputs" or "outputs"
+      next[values] = copy_map(prev[values])
+      next[values][msg.binding] = msg.value
+    elseif op == "append" then
       next.streams = copy_map(prev.streams)
       local values = copy_array(next.streams[msg.binding])
       local previous = values[#values]

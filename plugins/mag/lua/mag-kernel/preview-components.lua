@@ -31,10 +31,7 @@ local TRANSCRIPT_SCHEMA = { kind = "variant", tag = "kind", cases = {
 } }
 local function transcript_cases()
   return preview.cases {
-    reasoning = preview.column { gap = 0, children = {
-      preview.text { value = "▼ reasoning", style = "dim", wrap = "none" },
-      preview.text { value = preview.item("text"), style = "reasoning", wrap = "word" },
-    } },
+    reasoning = preview.value { value = preview.item("text"), format = "reasoning", style = "reasoning", wrap = "word" },
     assistant = preview.markdown { value = preview.item("text"), theme = "assistant", wrap = "word" },
     tool_call = preview.value { value = preview.item("value"), format = "tool_call", style = "tool_call", wrap = "word" },
     tool_result = preview.value { value = preview.item("value"), format = "tool_result", style = "tool_result", wrap = "word" },

@@ -604,10 +604,12 @@ local function handle_focus_cycle(msg, state)
     return shallow_merge(state, { focus = "prompt" }), {}
   end
   if not state.show_sidebar then return state, {} end
-  -- Empty sidebar refuses focus, loudly: focusing a pane with no
-  -- navigable rows would read as a dead key, so keep prompt focus and
-  -- raise a warning toast that explains the refusal.
-  if #run_panel.row_model(state, tui.now_ms()) == 0 then
+  -- Empty sidebar refuses focus unless it exposes the bounded completed-run
+  -- inspection target. That target has no ordinary row, but focusing the pane
+  -- is still how its visible Space hint becomes actionable.
+  local now = tui.now_ms()
+  if #run_panel.row_model(state, now) == 0
+      and run_panel.recent_completed(state.runs, now) == nil then
     local toasts = {}
     for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
     toasts[#toasts + 1] = {
@@ -1676,8 +1678,14 @@ local function route_keys_and_popups(msg, state)
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
   end
 
-  -- Node inspector: read-only, so dismiss (q here, Esc via
-  -- handle_escape) and scroll are the only verbs.
+  -- Node inspector: read-only, so dismiss, scroll, and the shared detail
+  -- toggle are the only verbs. Keeping Ctrl+O aligned with lead chat makes
+  -- full reasoning/tool payloads deliberately accessible without making
+  -- debug-shaped output the default.
+  if state.popup and state.popup.variant == "node_inspector"
+      and kind == "key.ctrl_o" then
+    return handle_toggle_expand(msg, state)
+  end
   if state.popup and state.popup.variant == "node_inspector"
      and (kind == "key.q" or kind == "key.Q") then
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
@@ -1854,7 +1862,14 @@ local function route_keys_and_popups(msg, state)
     if kind == "key.space" then
       local rows = run_panel.row_model(state, now)
       local row = rows[run_panel.clamp_cursor(state.sidebar_cursor, #rows)]
-      if row == nil then return state, {} end
+      if row == nil then
+        local run_id = run_panel.recent_completed(state.runs, now)
+        if run_id == nil then return state, {} end
+        return shallow_merge(state, {
+          popup = { variant = "node_inspector", run_id = run_id,
+            whole_run = true, completed_archive = true },
+        }), {}
+      end
       if row.kind == "actor" then
         return shallow_merge(state, {
           popup = { variant = "node_inspector", run_id = row.run_id, actor_id = row.actor_id },

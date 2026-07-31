@@ -53,6 +53,21 @@ fn preview_dsl_is_plain_serializable_data_and_validates_bindings() {
             .unwrap(),
         "stream"
     );
+    for (name, kind) in [("command", "param"), ("input", "input"), ("Out", "output")] {
+        let description: Value = lua
+            .load(format!(
+                "local p=require('preview'); return p.value {{ value=p.{kind}('{name}') }}"
+            ))
+            .eval()
+            .unwrap();
+        let validated: mlua::Table = validate.call((description, declaration.clone())).unwrap();
+        let declared: mlua::Table = validated
+            .get::<mlua::Table>("bindings")
+            .unwrap()
+            .get(name)
+            .unwrap();
+        assert_eq!(declared.get::<String>("kind").unwrap(), kind);
+    }
 
     let bad: Value = lua
         .load("local p=require('preview'); return p.text { value=p.param('missing') }")
@@ -150,7 +165,8 @@ fn llm_and_structured_output_share_the_transcript_presentation() {
           return true
         end
         assert(same(llm,transcript),'structured-output transcript drifted from llm')
-        assert(llm.item.values.reasoning.children[2].style=='reasoning')
+        assert(llm.item.values.reasoning.format=='reasoning')
+        assert(llm.item.values.reasoning.style=='reasoning')
         assert(llm.item.values.tool_call.format=='tool_call')
         assert(llm.item.values.tool_result.format=='tool_result')
         "#,

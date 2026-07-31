@@ -123,29 +123,51 @@ local function validate_schema(schema, path, visiting)
   return true
 end
 
+local function declare_binding(bindings, name, kind, schema, path)
+  local prior = bindings[name]
+  if prior == nil then
+    bindings[name] = { kind = kind, schema = schema }
+    return true
+  end
+  if prior.kind == kind then
+    if kind == "state" or kind == "stream" then
+      return fail(path, "duplicate preview binding " .. string.format("%q", name))
+    end
+    return true
+  end
+  prior.kinds = prior.kinds or { [prior.kind] = true }
+  prior.kinds[kind] = true
+  prior.kind = nil
+  prior.schema = nil
+  return true
+end
+
 local function validate_binding(ref, declaration, bindings, path, item_schema)
   for field in pairs(ref) do if not BINDING_FIELDS[field] then return fail(path.."."..tostring(field), "unknown binding field") end end
   local kind, name = ref.binding, ref.name
   if type(name) ~= "string" or name == "" then return fail(path .. ".name", "must be a non-empty string") end
   if kind == "param" then
     if (declaration.params or {})[name] == nil then return fail(path, "unknown param binding " .. string.format("%q", name)) end
+    return declare_binding(bindings, name, kind, nil, path)
   elseif kind == "input" then
     if name ~= "last" and (declaration.inputs or {})[name] == nil then return fail(path, "unknown input binding " .. string.format("%q", name)) end
+    return declare_binding(bindings, name, kind, nil, path)
   elseif kind == "output" then
     local found = name == "last"
     for _, wire in ipairs(declaration.outputs or {}) do if wire == name then found = true end end
     if not found then return fail(path, "unknown output binding " .. string.format("%q", name)) end
+    return declare_binding(bindings, name, kind, nil, path)
   elseif kind == "lifecycle" then
     if not LIFECYCLE[name] then return fail(path, "unknown lifecycle binding " .. string.format("%q", name)) end
+    return declare_binding(bindings, name, kind, nil, path)
   elseif kind == "item" then
     if not item_schema then return fail(path, "item binding outside a collection template") end
     if not schema_field(item_schema, name) then return fail(path, "unknown item field " .. string.format("%q", name)) end
+    return declare_binding(bindings, name, kind, nil, path)
   elseif kind == "state" or kind == "stream" then
     local ok, err = validate_schema(ref.schema, path..".schema")
     if not ok then return nil, err end
-    local prior = bindings[name]
-    if prior then return fail(path, "duplicate preview binding " .. string.format("%q", name)) end
-    bindings[name] = { kind = kind, schema = ref.schema }
+    return declare_binding(bindings, name, kind, ref.schema, path)
   else
     return fail(path, "unknown binding kind " .. tostring(kind))
   end

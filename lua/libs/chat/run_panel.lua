@@ -86,11 +86,34 @@ local function is_expired(run, now_ms)
      and (now_ms - run.completed_at_ms) > M.LINGER_MS
 end
 
+-- Completed runs leave the active row model after the linger window, but the
+-- newest expired run remains structurally retained as a bounded inspection
+-- target. A newer completion replaces it; session reset clears the run map.
+-- This keeps the main panel quiet without making the just-finished preview
+-- unreachable or accumulating an unbounded debug history.
+local function newest_expired_id(runs, now_ms)
+  local newest_id, newest_at
+  for run_id, run in pairs(runs or {}) do
+    if is_expired(run, now_ms) and (newest_at == nil
+        or run.completed_at_ms > newest_at
+        or (run.completed_at_ms == newest_at and run_id > newest_id)) then
+      newest_id, newest_at = run_id, run.completed_at_ms
+    end
+  end
+  return newest_id
+end
+
+function M.recent_completed(runs, now_ms)
+  local run_id = newest_expired_id(runs, now_ms)
+  return run_id, run_id and runs[run_id] or nil
+end
+
 function M.prune(runs, now_ms)
   if runs == nil then return {} end
+  local retained = newest_expired_id(runs, now_ms)
   local pruned = nil
   for run_id, run in pairs(runs) do
-    if is_expired(run, now_ms) then
+    if is_expired(run, now_ms) and run_id ~= retained then
       if pruned == nil then
         pruned = {}
         for k, v in pairs(runs) do pruned[k] = v end
@@ -417,10 +440,11 @@ local function panel_children(state, now_ms)
     end
   end
   if #children == 0 then
+    local recent_id = M.recent_completed(state.runs, now_ms)
     children[#children + 1] = tui.text {
-      content = "(no active runs)",
+      content = recent_id and "Space: inspect last completed run" or "(no active runs)",
       style   = STYLE.status_dim,
-      wrap    = "none",
+      wrap    = "word",
     }
   end
   return children

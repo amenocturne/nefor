@@ -36,28 +36,72 @@ local function encode(value, depth, seen)
   return "{\n" .. indent .. table.concat(parts, ",\n" .. indent)
     .. "\n" .. string.rep("  ", depth) .. "}"
 end
-local function tool_value(value, result)
-  value = type(value) == "table" and value or { value = value }
-  local name = value.name or ((type(value["function"]) == "table") and value["function"].name)
-  local id = value.id or value.tool_call_id
-  local rows = {}
-  if result then
-    rows[#rows + 1] = "tool result" .. (id and (" · " .. tostring(id)) or "")
-    rows[#rows + 1] = encode(value.output or value.result or value.content or value.value or value)
-  else
-    rows[#rows + 1] = "tool call" .. (name and (" · " .. tostring(name)) or "")
-      .. (id and (" · " .. tostring(id)) or "")
-    local args = value.arguments or value.args
-      or ((type(value["function"]) == "table") and value["function"].arguments)
-    rows[#rows + 1] = encode(args ~= nil and args or value)
+local function value_size(value)
+  if value == nil then return 0 end
+  if type(value) == "string" then return #value end
+  if type(nefor) == "table" and type(nefor.json) == "table"
+      and type(nefor.json.encode) == "function" then
+    local ok, encoded = pcall(nefor.json.encode, value)
+    if ok and type(encoded) == "string" then return #encoded end
   end
-  return table.concat(rows, "\n")
+  return #encode(value)
 end
 
-local function format_value(value, format)
-  if format == "tool_call" then return tool_value(value, false) end
-  if format == "tool_result" then return tool_value(value, true) end
+local function size_text(bytes)
+  if bytes < 1024 then return tostring(bytes) .. " B" end
+  return string.format("%.1f KiB", bytes / 1024)
+end
+
+local function tool_parts(value)
+  value = type(value) == "table" and value or { value = value }
+  local fn = type(value["function"]) == "table" and value["function"] or nil
+  return value, value.name or (fn and fn.name), value.id or value.tool_call_id,
+    value.arguments or value.args or (fn and fn.arguments)
+end
+
+local function tool_value(value, result, ctx)
+  local expanded = ctx.state.expanded_details == true
+  local original, name, id, args = tool_parts(value)
+  if result then
+    local output = original.output or original.result or original.content or original.value or original
+    local label = "✓ tool result" .. (id and (" · " .. tostring(id)) or "")
+    if not expanded then return label .. " · " .. size_text(value_size(output)) .. " hidden" end
+    return label .. "\n" .. encode(output)
+  end
+  local label = "▸ " .. tostring(name or "tool") .. (id and (" · " .. tostring(id)) or "")
+  if not expanded then
+    local display = require("libs.chat.tool_display")
+    local contract = type(ctx.state.tool_displays) == "table"
+      and ctx.state.tool_displays[name] or nil
+    local projection = display.project(contract, args, nil, false, name)
+    local fields = {}
+    for _, field in ipairs((projection and projection.arguments) or {}) do
+      fields[#fields + 1] = field.label .. ": " .. field.value
+    end
+    return #fields > 0 and (label .. " · " .. table.concat(fields, " · ")) or label
+  end
+  return "▼ " .. tostring(name or "tool") .. (id and (" · " .. tostring(id)) or "")
+    .. "\n" .. encode(args ~= nil and args or original)
+end
+
+local function reasoning_value(value, ctx)
+  local text = tostring(value or "")
+  local expanded = ctx.state.expanded_details == true
+  local working = ctx.node.status == "working" or ctx.node.status == "running"
+  local live = working and ctx.is_last
+  if not expanded and not live then return "▸ reasoning" end
+  return (live and "▼ thinking…" or "▼ reasoning") .. "\n  "
+    .. text:gsub("\n", "\n  ")
+end
+
+local function format_value(value, format, ctx)
+  if format == "reasoning" then return reasoning_value(value, ctx) end
+  if format == "tool_call" then return tool_value(value, false, ctx) end
+  if format == "tool_result" then return tool_value(value, true, ctx) end
   if format == "validation" and type(value) == "table" then
+    if ctx.state.expanded_details ~= true then
+      return "validation attempt " .. tostring(value.attempt or "?") .. " · details hidden"
+    end
     return "validation attempt " .. tostring(value.attempt or "?") .. "\noutput:\n"
       .. encode(value.output) .. "\nviolations:\n" .. encode(value.violations)
   end
@@ -87,7 +131,7 @@ local render
 local function render_collection(desc, ctx)
   local values = resolve(desc.source, ctx) or {}
   local children = {}
-  for _, wrapped in ipairs(values) do
+  for index, wrapped in ipairs(values) do
     local item = wrapped.value ~= nil and wrapped.value or wrapped
     local template = desc.item
     if template and template.kind == "cases" then
@@ -95,7 +139,7 @@ local function render_collection(desc, ctx)
     end
     if template then children[#children + 1] = render(template, {
       state = ctx.state, node = ctx.node, run = ctx.run, run_id = ctx.run_id,
-      actor_id = ctx.actor_id, item = item,
+      actor_id = ctx.actor_id, item = item, is_last = index == #values,
     }) end
   end
   if #children == 0 and desc.empty then children[1] = render(desc.empty, ctx) end
@@ -132,7 +176,7 @@ render = function(desc, ctx)
     return tui.markdown { source = tostring(resolve(desc.value, ctx) or ""),
       theme = MARKDOWN_THEME, wrap = desc.wrap or "word", key = desc.key }
   elseif kind == "value" then
-    return tui.text { content = format_value(resolve(desc.value, ctx), desc.format),
+    return tui.text { content = format_value(resolve(desc.value, ctx), desc.format, ctx),
       style = STYLE_NAMES[desc.style], wrap = desc.wrap or "word", key = desc.key }
   elseif kind == "stream" or kind == "list" then
     return render_collection(desc, ctx)
@@ -152,9 +196,20 @@ function M.node(state, run_id, actor_id)
     run = (state.runs or {})[run_id], run_id = run_id, actor_id = actor_id })
 end
 
-function M.activity(item)
+function M.activity(item, state, node, is_last)
   local value = item.item and item.item.value
-  local label = type(value) == "table" and value.kind or item.binding
+  local kind = type(value) == "table" and value.kind or nil
+  if kind == "reasoning" then
+    return tui.text { content = reasoning_value(value.text, {
+      state = state, node = node or {}, is_last = is_last,
+    }), style = STYLE.reasoning, wrap = "word" }
+  elseif kind == "tool_call" or kind == "tool_result" then
+    return tui.text { content = tool_value(value.value, kind == "tool_result", {
+      state = state, node = node or {},
+    }), style = kind == "tool_result" and STYLE.status_ok or STYLE.system,
+      wrap = "word" }
+  end
+  local label = kind or item.binding
   local content
   if type(value) == "table" and type(value.text) == "string" then content = value.text
   elseif type(value) == "table" and value.value ~= nil then content = encode(value.value)
