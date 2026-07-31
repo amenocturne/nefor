@@ -5,6 +5,7 @@
 //! the VM and installs every `nefor.*` table; `LuaHost::load_init` reads and
 //! runs the user's `init.lua` with typed error reporting.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,10 @@ pub struct LuaHost {
     /// Stdin-pump receiver shared with `nefor.io.read_line`. Empty until
     /// CLI dispatch mode installs a pump via [`LuaHost::attach_stdin_pump`].
     stdin_pump: SharedStdinPump,
+    /// FIFO of Lua callbacks scheduled through `nefor.engine.defer`.
+    /// The broker executes at most one per event-loop turn, giving long
+    /// operations a cooperative boundary without moving the VM off-thread.
+    cooperative_tasks: bindings::CooperativeTasks,
 }
 
 impl LuaHost {
@@ -91,6 +96,7 @@ impl LuaHost {
         let lua = Lua::new();
         let subscriptions: SharedSubscriptions = Arc::new(Mutex::new(EventSubscriptions::new()));
         let stdin_pump: SharedStdinPump = Arc::new(Mutex::new(StdinPump::empty()));
+        let cooperative_tasks = Arc::new(Mutex::new(VecDeque::new()));
         install_nefor_surface(
             &lua,
             Arc::clone(&bus),
@@ -100,6 +106,7 @@ impl LuaHost {
             EngineMode::Serve,
             Arc::clone(&stdin_pump),
             data_dir,
+            Arc::clone(&cooperative_tasks),
         )
         .map_err(LuaError::VmInit)?;
         Ok(Self {
@@ -113,6 +120,7 @@ impl LuaHost {
             current_log_mirrored: 0,
             subscriptions,
             stdin_pump,
+            cooperative_tasks,
         })
     }
 
@@ -180,6 +188,33 @@ impl LuaHost {
             Err(p) => p.into_inner(),
         };
         guard.set_rx(rx);
+    }
+
+    pub fn run_one_cooperative_task(&self) -> Result<bool, LuaError> {
+        let task = self
+            .cooperative_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front();
+        let Some(task) = task else {
+            return Ok(false);
+        };
+        let callback_result = self.lua.registry_value::<mlua::Function>(&task);
+        let cleanup_result = self.lua.remove_registry_value(task);
+        let callback = callback_result?;
+        cleanup_result?;
+        if let Err(error) = callback.call::<()>(()) {
+            tracing::error!(error = %error, "cooperative Lua task failed");
+        }
+        Ok(true)
+    }
+
+    pub fn has_cooperative_tasks(&self) -> bool {
+        !self
+            .cooperative_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
     }
 
     /// Borrow the inner Lua VM. Exposed for follow-up bindings and tests.
@@ -511,10 +546,11 @@ fn install_nefor_surface(
     mode: EngineMode,
     stdin_pump: SharedStdinPump,
     data_dir: crate::paths::DataDir,
+    cooperative_tasks: bindings::CooperativeTasks,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor.set("version", env!("NEFOR_VERSION"))?;
-    bindings::install_engine(lua, &nefor, engine_ops)?;
+    bindings::install_engine(lua, &nefor, engine_ops, cooperative_tasks)?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
     bindings::install_fs(lua, &nefor, data_dir)?;
     bindings::install_json(lua, &nefor)?;

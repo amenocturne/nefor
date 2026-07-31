@@ -29,14 +29,10 @@
 --
 -- ## Replay window
 --
--- `replay.start` / `replay.end` frame the burst of replayed envelopes.
--- The runtime gate (in `ncp.lua`) suppresses bus→Rust forwarding inside
--- the window so Rust plugins never see replayed traffic; pure-Lua
--- actors get the replay normally via `nefor.bus.on_event` and rebuild
--- their state. Sessions itself ALSO drops persistence between the
--- markers — pure-Lua actors may emit derived envelopes during state
--- rebuild, and persisting those would duplicate state on next resume.
--- The persist rule is "live traffic only."
+-- Replay uses short `replay.start` / `replay.end` frames around each bounded
+-- chunk. The broker may dispatch live traffic between chunks without marking
+-- it as replay. Within a chunk, the frame and replayed entries are appended
+-- synchronously and retain exact positional provenance.
 --
 -- ## On-disk path
 --
@@ -70,6 +66,12 @@ local state = {
   -- state rebuild, and persisting those would duplicate state on the
   -- next resume. The rule is "persist live traffic only."
   in_replay_window = false,
+
+  -- Monotonic owner token for cooperative replay continuations. Session
+  -- switches and shutdown invalidate queued work before touching files.
+  replay_generation = 0,
+  ---@type string|nil
+  replay_session_id = nil,
 }
 
 ---@return string|nil
@@ -251,72 +253,129 @@ local function persist_envelope(entry)
   end
 end
 
--- Resume — re-broadcast every step-origin entry to its original target.
---
--- Pre-pass: count the step-origin entries that would be replayed. Used
--- to populate `sessions.replay.start { count }`. Cheaper than buffering
--- the whole file: one extra read of the JSONL with a substring check
--- before per-line decode (decode is unavoidable to filter step-origin).
----@param path string
----@return integer count
-local function count_replay_entries(path)
-  local fh = io.open(path, "r")
-  if not fh then return 0 end
-  local count = 0
-  for line in fh:lines() do
-    if line:sub(1, 12) ~= [[{"_session":]] then
-      local ok, decoded = pcall(json.decode, line)
-      if ok and type(decoded) == "table" and decoded.origin == "step" then
-        count = count + 1
-      end
-    end
-  end
-  fh:close()
-  return count
+-- Resume is a one-pass cooperative scan. Progress is file-byte progress,
+-- measured from the reader cursor, so no synchronous counting pre-pass is
+-- needed and malformed/plugin-origin rows still advance the denominator.
+local REPLAY_CHUNK_BYTES = 256 * 1024
+local REPLAY_CHUNK_ENTRIES = 64
+local MAX_PROGRESS_UPDATES = 100
+
+local function file_size(fh)
+  local start = fh:seek()
+  local total = fh:seek("end")
+  if start == nil or total == nil or fh:seek("set", start) == nil then return nil end
+  return total
 end
 
-local MAX_PROGRESS_UPDATES = 100
-local MIN_PROGRESS_STEP = 32
+local function cancel_replay()
+  state.replay_session_id = nil
+  state.replay_generation = state.replay_generation + 1
+  replay_window.set(false)
+end
 
----@param path string
----@param total integer
+---@param path string|nil
 ---@param session_id string
 ---@param report_progress boolean
----@return integer count
-local function replay_jsonl(path, total, session_id, report_progress)
-  local fh = io.open(path, "r")
-  if not fh then return 0 end
+---@param generation integer
+---@param finish fun(replayed: integer)
+local function begin_replay(path, session_id, report_progress, generation, finish)
+  local fh = path and io.open(path, "r") or nil
+  local total = fh and file_size(fh) or 0
+  if total == nil then
+    if fh then fh:close() end
+    fh = nil
+    total = 0
+  end
 
-  local count = 0
-  local progress_step = math.max(MIN_PROGRESS_STEP, math.ceil(total / MAX_PROGRESS_UPDATES))
+  state.replay_session_id = session_id
+
+  if not fh then
+    send_msg({ kind = "control", event = "sessions.replay.start",
+               extra = { session_id = session_id, count = total } })
+    send_msg({ kind = "control", event = "sessions.replay.end",
+               extra = { session_id = session_id } })
+    finish(0)
+    return
+  end
+
+  local progress_step = math.max(1, math.ceil(total / MAX_PROGRESS_UPDATES))
   local next_progress = progress_step
-  for line in fh:lines() do
-    if line:sub(1, 12) ~= [[{"_session":]] then
-      local ok, decoded = pcall(json.decode, line)
-      -- Replay every step-origin entry — those are the dispatch hook's
-      -- outbound emissions. Both targeted (`target` set) and broadcast
-      -- (`target` nil) shapes round-trip via send_msg's
-      -- replay_envelope path: nefor.engine.send(payload, target?) with
-      -- target=nil broadcasts and a string targets one peer. Plugin-
-      -- origin entries are inputs — we don't re-emit them, peers re-
-      -- announce themselves on connect.
-      if ok and type(decoded) == "table" and decoded.origin == "step" then
-        send_msg({
-          kind    = "replay_envelope",
-          payload = decoded.payload,
-          target  = decoded.target,  -- may be nil (broadcast)
-        })
-        count = count + 1
-        if report_progress and count >= next_progress and count < total then
-          send_msg({ kind = "control", event = "sessions.replay.progress",
-                     extra = { session_id = session_id, replayed = count, total = total } })
-          next_progress = count + progress_step
+  local delivered = 0
+
+  local function step()
+    if generation ~= state.replay_generation then
+      fh:close()
+      return
+    end
+
+    local chunk_start = fh:seek() or 0
+    local replayed_entries = 0
+    local replay_entries = {}
+    while replayed_entries < REPLAY_CHUNK_ENTRIES do
+      local cursor = fh:seek() or chunk_start
+      if cursor >= total then break end
+
+      local line, read_error = fh:read("*l")
+      if line == nil then
+        if read_error and nefor.log then
+          nefor.log.error("sessions.resume: failed while reading session file", {
+            path = path, error = tostring(read_error),
+          })
+        end
+        break
+      end
+
+      local after = fh:seek() or cursor
+      if after > total then break end
+
+      if line:sub(1, 12) ~= [[{"_session":]] then
+        local ok, decoded = pcall(json.decode, line)
+        if ok and type(decoded) == "table" and decoded.origin == "step"
+            and type(decoded.payload) == "string" then
+          replay_entries[#replay_entries + 1] = decoded
+          replayed_entries = replayed_entries + 1
         end
       end
+
+      if after - chunk_start >= REPLAY_CHUNK_BYTES then break end
     end
+
+    local replayed = fh:seek() or chunk_start
+    local complete = replayed >= total
+    local progress_due = report_progress and replayed >= next_progress and replayed < total
+
+    -- Each replay chunk gets its own positional replay frame. Live traffic
+    -- can run between continuations without inheriting replay provenance.
+    -- The byte budget is checked at record boundaries: replay remains
+    -- lossless for valid JSONL, so one unusually large record may make a
+    -- single chunk larger than REPLAY_CHUNK_BYTES.
+    replay_window.set(true)
+    send_msg({ kind = "control", event = "sessions.replay.start",
+               extra = { session_id = session_id, count = total } })
+    for _, decoded in ipairs(replay_entries) do
+      send_msg({ kind = "replay_envelope", payload = decoded.payload,
+                 target = decoded.target })
+      delivered = delivered + 1
+    end
+    send_msg({ kind = "control", event = "sessions.replay.end",
+               extra = { session_id = session_id } })
+    replay_window.set(false)
+
+    if progress_due then
+      send_msg({ kind = "control", event = "sessions.replay.progress",
+                 extra = { session_id = session_id, replayed = replayed, total = total } })
+      next_progress = replayed + progress_step
+    end
+
+    if complete then
+      fh:close()
+      finish(delivered)
+      return
+    end
+    nefor.engine.defer(step)
   end
-  fh:close()
-  return count
+
+  nefor.engine.defer(step)
 end
 
 ---@param target_session_id string
@@ -334,6 +393,8 @@ local function do_resume(target_session_id, show_loading)
   -- traffic is what `replay_jsonl` reads, and `should_prune_session`
   -- stays false when the file has content (so no prune happens).
   --
+  cancel_replay()
+
   -- 1. Announce end of outgoing session. Cold-start `--session` resume
   -- has no outgoing session yet.
   if state.current_session_id then
@@ -362,35 +423,22 @@ local function do_resume(target_session_id, show_loading)
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = target_session_id, from_resume = true } })
 
-  -- 4. Replay framed by start/end markers. Per-wrapper replay-skip
-  -- (core.history_replay) suppresses bus→peer side effects inside the
-  -- window; pure-Lua actors get the replay normally and rebuild
-  -- state. Sessions' own persistence path also drops envelopes inside
-  -- the window — see `in_replay_window` flag toggled in receive_msg.
-  -- The window flag's `to_plugin`-side toggle is owned by ncp.dispatch
-  -- (it sees the framing markers in entry order and flips the flag
-  -- inline before calling `to_plugin` for each entry — bus.on_event
-  -- subscribers fire too late for the same batch).
-  -- Loading starts before the full-file count pass so even a large
-  -- session whose total is not known yet produces an immediate frame.
+  -- 4. Replay each bounded chunk in its own start/end frame. This keeps
+  -- replay provenance exact while the broker admits live traffic between
+  -- continuations: unrelated entries can only land between frames.
+  -- Loading starts before the single-pass scan, whose byte total is read
+  -- from the already-open file without walking its contents.
   if show_loading then
     send_msg({ kind = "control", event = "sessions.resume_loading",
                extra = { session_id = target_session_id } })
   end
-  local total = new_path and count_replay_entries(new_path) or 0
-  replay_window.set(true)
-  send_msg({ kind = "control", event = "sessions.replay.start",
-             extra = { session_id = target_session_id, count = total } })
-  local replayed = new_path
-    and replay_jsonl(new_path, total, target_session_id, show_loading)
-    or 0
-  send_msg({ kind = "control", event = "sessions.replay.end",
-             extra = { session_id = target_session_id } })
-  replay_window.set(false)
-
-  -- 5. Coalesced "we're back" signal.
-  send_msg({ kind = "control", event = "sessions.resume_done",
-             extra = { session_id = target_session_id, replayed = replayed } })
+  local generation = state.replay_generation
+  begin_replay(new_path, target_session_id, show_loading, generation, function(replayed)
+    if generation ~= state.replay_generation then return end
+    state.replay_session_id = nil
+    send_msg({ kind = "control", event = "sessions.resume_done",
+               extra = { session_id = target_session_id, replayed = replayed } })
+  end)
 end
 
 local function do_new()
@@ -398,6 +446,8 @@ local function do_new()
 end
 
 local function do_shutdown()
+  cancel_replay()
+  state.in_replay_window = false
   send_msg({ kind = "control", event = "sessions.session_end",
              extra = { session_id = state.current_session_id } })
   close_and_prune_if_empty()
@@ -527,6 +577,8 @@ return {
       state.should_prune_session  = true
       state.initialised           = false
       state.in_replay_window      = false
+      state.replay_generation     = state.replay_generation + 1
+      state.replay_session_id     = nil
     end,
   },
 }

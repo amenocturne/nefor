@@ -18,7 +18,7 @@ pub mod plugins;
 pub mod process;
 
 pub use bus::{install_bus, EventSubscriptions, SharedSubscriptions};
-pub use engine::{install_engine, EngineOps, SendTarget};
+pub use engine::{install_engine, CooperativeTasks, EngineOps, SendTarget};
 pub use fs::install_fs;
 pub use io::{install_io, spawn_stdin_pump, SharedStdinPump, StdinPump};
 pub use json::install_json;

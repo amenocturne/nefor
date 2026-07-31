@@ -554,12 +554,23 @@ impl Broker {
             self.drain_engine_envelopes();
 
             // If we're past the shutdown deadline, force-close everything
-            // and exit.
+            // before running any further cooperative Lua work.
             if let Some(deadline) = shutdown_deadline {
                 if Instant::now() >= deadline {
                     self.force_close_all();
                     return BrokerStopReason::Shutdown;
                 }
+            }
+
+            // Run one deferred Lua continuation per broker turn while live.
+            // Each continuation may publish one bounded replay chunk;
+            // draining its tail now makes progress visible before the next
+            // chunk runs.
+            if shutdown_deadline.is_none() && self.host.has_cooperative_tasks() {
+                if let Err(error) = self.host.run_one_cooperative_task() {
+                    tracing::error!(error = %error, "cooperative Lua task errored at VM level");
+                }
+                self.drain_pending_dispatch();
             }
 
             // If the engine said to shut down and there are no connections
@@ -575,7 +586,9 @@ impl Broker {
                 return BrokerStopReason::AllPluginsGone;
             }
 
-            let sleep_dur = if let Some(deadline) = shutdown_deadline {
+            let sleep_dur = if self.host.has_cooperative_tasks() {
+                Duration::ZERO
+            } else if let Some(deadline) = shutdown_deadline {
                 deadline.saturating_duration_since(Instant::now())
             } else {
                 Duration::from_millis(500)
@@ -593,8 +606,8 @@ impl Broker {
                     shutdown_deadline = Some(Instant::now() + Duration::from_millis(grace_ms));
                     self.begin_shutdown();
                 }
-                _ = tokio::time::sleep(sleep_dur), if shutdown_deadline.is_some() => {
-                    // Loop iteration to re-check the shutdown deadline above.
+                _ = tokio::time::sleep(sleep_dur), if shutdown_deadline.is_some() || self.host.has_cooperative_tasks() => {
+                    // Loop iteration to re-check shutdown or advance a deferred task.
                 }
             }
         }
@@ -673,11 +686,14 @@ impl Broker {
             first_msg,
         );
 
-        // Drain any other messages that have already arrived. `try_recv`
-        // is non-blocking; we stop as soon as the channel is empty so the
-        // tick boundary stays bounded by what's actually pending. New
-        // messages that arrive after this point ride the next tick.
-        while let Ok((id, msg)) = self.inbound_rx.try_recv() {
+        // Drain only a bounded burst. A continuously busy producer must not
+        // monopolize the broker turn and starve deferred work, exits, or
+        // shutdown handling.
+        const MAX_INBOUND_PER_TURN: usize = 256;
+        for _ in 1..MAX_INBOUND_PER_TURN {
+            let Ok((id, msg)) = self.inbound_rx.try_recv() else {
+                break;
+            };
             sort(
                 &self.conns_by_id,
                 &mut batched_lines,
@@ -864,6 +880,10 @@ impl Broker {
         // would arrive after EOF.
         self.events_bus
             .emit(&EventName::from(SHUTDOWN), EventPayload::None);
+        // Lifecycle subscribers publish through `nefor.engine.send`, which
+        // only appends to the bus log. Route that tail before queuing Close
+        // so peers observe final session events before EOF.
+        self.drain_pending_dispatch();
 
         // Close every connection's writer channel. Writer tasks drain their
         // queues, flush, and exit. The shutdown-grace deadline in the run

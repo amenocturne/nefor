@@ -31,9 +31,12 @@
 //! implementation wires to the broker + event log; the test implementation
 //! records calls for assertion.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, RegistryKey, Table, Value};
+
+pub type CooperativeTasks = Arc<Mutex<VecDeque<RegistryKey>>>;
 use nefor_protocol::{PluginName, Timestamp};
 
 /// Outbound routing decision produced by a dispatch call.
@@ -124,8 +127,29 @@ pub trait EngineOps: Send + Sync {
 }
 
 /// Install `nefor.engine.send` onto `nefor_tbl`.
-pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> mlua::Result<()> {
+pub fn install_engine(
+    lua: &Lua,
+    nefor_tbl: &Table,
+    ops: Arc<dyn EngineOps>,
+    cooperative_tasks: CooperativeTasks,
+) -> mlua::Result<()> {
     let engine = lua.create_table()?;
+
+    let task_lua = lua.clone();
+    let defer_fn = lua.create_function(move |_, callback: Value| {
+        let Value::Function(callback) = callback else {
+            return Err(mlua::Error::runtime(
+                "nefor.engine.defer: callback must be a function",
+            ));
+        };
+        let key = task_lua.create_registry_value(callback)?;
+        let mut tasks = cooperative_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.push_back(key);
+        Ok(())
+    })?;
+    engine.set("defer", defer_fn)?;
 
     let ops_for_send = Arc::clone(&ops);
     let send_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
@@ -398,9 +422,33 @@ mod tests {
         let lua = Lua::new();
         let ops = RecordOps::new();
         let nefor = lua.create_table().unwrap();
-        install_engine(&lua, &nefor, Arc::clone(&ops) as Arc<dyn EngineOps>).unwrap();
+        install_engine(
+            &lua,
+            &nefor,
+            Arc::clone(&ops) as Arc<dyn EngineOps>,
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+        .unwrap();
         lua.globals().set("nefor", nefor).unwrap();
         (lua, ops)
+    }
+
+    #[test]
+    fn engine_defer_queues_without_running_inline() {
+        let (lua, _ops) = setup();
+        lua.load(
+            r#"
+            deferred_ran = false
+            nefor.engine.defer(function() deferred_ran = true end)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let ran: bool = lua.globals().get("deferred_ran").unwrap();
+        assert!(
+            !ran,
+            "deferred work must not cross the synchronous dispatch boundary"
+        );
     }
 
     #[test]
