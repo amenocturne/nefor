@@ -257,8 +257,7 @@ impl CapabilityBridge {
         }
 
         let mut result = body
-            .get("output")
-            .or_else(|| body.get("result"))
+            .get("result")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| provider_result(body));
@@ -667,14 +666,14 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_nested_output_settles_text_and_tool_calls_once() {
+    fn canonical_nested_result_settles_text_and_tool_calls_once() {
         let mut bridge = CapabilityBridge::new("tool-gate");
-        bridge.translate_emit(provider_invoke("req-output", "chatgpt", json!([])));
+        bridge.translate_emit(provider_invoke("req-result", "chatgpt", json!([])));
         let terminal = event(
-            "req-output",
+            "req-result",
             "chatgpt",
             "completed",
-            json!({"output": {
+            json!({"result": {
                 "text": "typed answer",
                 "finish_reason": "tool_calls",
                 "tool_calls": [{

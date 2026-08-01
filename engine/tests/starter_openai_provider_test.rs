@@ -98,6 +98,21 @@ fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events(
         assert(#tools.result.tool_calls == 1)
         assert(tools.result.tool_calls[1].name == "read_file")
         assert(tools.result.tool_calls[1].arguments.path == "x")
+        local early_error = t.outbound({{
+          type = "event", from = "chatgpt-provider",
+          body = {{
+            kind = "chatgpt-provider.turn.error", chat_id = "request-1",
+            message = "stream failed",
+          }},
+        }})
+        assert(early_error == nil)
+
+        local failed = translate({{
+          text = "partial", finish_reason = "error", error = "stream failed",
+        }})
+        assert(failed.event == "failed")
+        assert(failed.error == "stream failed")
+        assert(failed.result.text == "partial")
         "#,
         chatgpt = chatgpt_lua.display(),
         openai = openai_lua.display(),

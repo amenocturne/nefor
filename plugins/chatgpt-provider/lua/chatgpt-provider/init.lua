@@ -89,7 +89,7 @@ local function translator(name)
     elseif kind == t.kinds.session_stats then
       event = "usage"
     elseif kind == t.kinds.turn_error or kind == t.kinds.chat_error then
-      event = "error"
+      return nil
     elseif kind == t.kinds.chat_complete_result then
       event = body.finish_reason == "error" and "failed"
         or body.finish_reason == "interrupted" and "interrupted"
