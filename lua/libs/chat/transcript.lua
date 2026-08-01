@@ -157,6 +157,9 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
 
   local e = state.entries[state.in_flight]
   if e then
+    if e.reasoning ~= nil and e.reasoning.streaming == true then
+      e = Entry.finalize_reasoning(e)
+    end
     local opts = { model = model or e.model, duration_ms = duration_ms or e.duration_ms }
     if final_text and #final_text > 0 then opts.text = final_text end
     local new_entry = Entry.finalize(e, opts)
