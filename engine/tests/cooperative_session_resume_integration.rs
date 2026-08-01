@@ -17,6 +17,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const SESSION_ID: &str = "cooperative-resume";
 const REPLAY_ENTRIES: usize = 130;
 
+fn format_replay_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -328,9 +340,14 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
                 "partial numeric progress must cause an actual render"
             );
             let frame = tui.snapshot();
+            let progress = format!(
+                "bytes {} / {}",
+                format_replay_bytes(replayed),
+                format_replay_bytes(total)
+            );
             assert!(
-                frame.contains(&format!("{replayed}/{total}")),
-                "partial frame must show numeric progress: {frame:?}"
+                frame.contains(&progress),
+                "partial frame must show byte progress: {frame:?}"
             );
             assert!(
                 frame.contains("loading session") && frame.contains("rebuilding session"),
