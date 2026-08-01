@@ -702,13 +702,20 @@ mod tests {
     }
 
     async fn recv_result_body(rx: &mut mpsc::Receiver<PluginOutgoing>) -> Map<String, Value> {
-        let msg = timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("timed out waiting for tool.result")
-            .expect("tool.result message");
-        match msg.body {
-            Body::Event(body) => body,
-            Body::System(other) => panic!("expected event body, got {other:?}"),
+        loop {
+            let msg = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for tool.result")
+                .expect("tool.result message");
+            match msg.body {
+                Body::Event(body)
+                    if body.get("kind").and_then(Value::as_str) == Some("tool.result") =>
+                {
+                    return body;
+                }
+                Body::Event(_) => {}
+                Body::System(other) => panic!("expected event body, got {other:?}"),
+            }
         }
     }
 
