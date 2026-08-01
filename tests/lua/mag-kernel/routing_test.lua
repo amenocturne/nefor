@@ -594,11 +594,11 @@ do
   local producer_decl = {
     name = "provider-input-producer",
     inputs = { input = "test.Start" },
-    outputs = { "generic-provider.ProviderInput" },
+    outputs = { "generic-provider.ProviderOut" },
   }
   local consumer_decl = {
     name = "provider-input-consumer",
-    inputs = { input = "generic-provider.ProviderInput" },
+    inputs = { input = "generic-provider.ProviderOut" },
     outputs = {},
   }
   local h = harness({ producer = producer_decl, consumer = consumer_decl })
@@ -610,7 +610,7 @@ do
     params = {},
     semantic_strict = true,
     input = {
-      wire = "generic-provider.ProviderInput",
+      wire = "generic-provider.ProviderOut",
       type_id = "nefor.contracts.ProviderInput",
       type = provider_input,
     },
@@ -633,14 +633,14 @@ do
     semantic_strict = true,
     input = { wire = "test.Start", type_id = "test.Start", type = provider_input },
     outputs = { {
-      wire = "generic-provider.ProviderInput",
+      wire = "generic-provider.ProviderOut",
       type_id = "nefor.contracts.ProviderInput",
       type = provider_input,
     } },
     routes = {
-      ["generic-provider.ProviderInput"] = { {
+      ["generic-provider.ProviderOut"] = { {
         actor = "provider-consumer",
-        wire = "generic-provider.ProviderInput",
+        wire = "generic-provider.ProviderOut",
       } },
     },
   } } })
@@ -658,7 +658,7 @@ do
     id = "call-1", name = "read_file", args = { path = "README.md" },
   } }
   producer.emit({
-    kind = "generic-provider.ProviderInput",
+    kind = "generic-provider.ProviderOut",
     value = { content = { prompt = "inspect the repository" } },
     messages = turn_messages,
     calls = tool_calls,

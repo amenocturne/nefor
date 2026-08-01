@@ -68,7 +68,7 @@ local function harness()
   reg:register({
     declaration = {
       name = "capture-sink",
-      inputs = { input = "generic-provider.ProviderInput" },
+      inputs = { input = "generic-provider.ProviderOut" },
       outputs = {},
       signals = {},
     },
@@ -112,10 +112,10 @@ local function harness()
         routes = { ["generic-tool.ToolHandle"] = { { actor = "tr", wire = "generic-tool.ToolHandle" } } } },
       { id = "tr", factory = "tool-result", params = {},
         evidence={version=2,identity="nefor.factory.tool-result",arguments={},input={kind="named",name="nefor.contracts.ToolHandle",arguments={}},output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-        input={type={kind="named",name="nefor.contracts.ToolHandle",arguments={}},wire="generic-tool.ToolHandle"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"}},
-        routes = { ["generic-provider.ProviderInput"] = { { actor = "cap", wire = "generic-provider.ProviderInput" } } } },
+        input={type={kind="named",name="nefor.contracts.ToolHandle",arguments={}},wire="generic-tool.ToolHandle"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
+        routes = { ["generic-provider.ProviderOut"] = { { actor = "cap", wire = "generic-provider.ProviderOut" } } } },
       { id = "cap", factory = "capture-sink", params = {}, routes = {},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"},outputs={} },
+        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={} },
     },
   })
   assert_true(res.ok, "constellation applies: " .. tostring(res.error))

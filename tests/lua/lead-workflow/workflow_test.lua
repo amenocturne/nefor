@@ -220,7 +220,7 @@ local function read_only_modification()
     actors = {
       { id = "worker.entry", factory = "adapter",
         params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderInput"] = { { actor = "worker.llm", wire = "generic-provider.ProviderInput" } } } },
+        routes = { ["generic-provider.ProviderOut"] = { { actor = "worker.llm", wire = "generic-provider.ProviderOut" } } } },
       { id = "worker.llm", factory = "llm",
         params = { system = "Answer the task.", provider = "chatgpt",
                    profile = "standard", tools = { "read_file" } },
@@ -793,7 +793,7 @@ local function lead_turn_modification()
           { actor = "lead.entry", wire = "task" },
         } } },
       { id = "lead.entry", factory = "adapter", params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderInput"] = { { actor = "lead.llm", wire = "generic-provider.ProviderInput" } } } },
+        routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } } },
       { id = "lead.llm", factory = "llm", params = {},
         routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },

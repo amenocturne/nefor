@@ -52,7 +52,7 @@
     :profile (nefor.contracts.no-identifier) :provider "mock-provider"
     :system "Summarize the ordered worker results." :tools []
     :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
-  (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderInput" (type-tag Summary)))
+  (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderOut" (type-tag Summary)))
 (def result (nefor.graph.output "result"
   (type-tag (| Summary nefor.contracts.AgentError))))
 (def summary-input (get prompt "input"))

@@ -40,7 +40,7 @@
 (def collected-prompt (fn [T] [[id String] [type (TypeTag T)]]
   -> (nefor.graph.Node (List T) nefor.contracts.ProviderInput)
   (let [input (nefor.graph.port id (type-tag (List T)) "nefor.dynamic.Collected")
-        output (nefor.graph.port id (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderInput")]
+        output (nefor.graph.port id (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderOut")]
     (as (nefor.graph.Node (List T) nefor.contracts.ProviderInput)
       {:id id :role "ordinary" :actors [(nefor.graph.actor id (specialize nefor.factory.collected-prompt [T])
                   (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)

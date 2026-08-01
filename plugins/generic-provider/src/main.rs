@@ -3,8 +3,8 @@
 //! Owns five canonical types every provider-shaped reasoner ecosystem
 //! agrees on:
 //!
-//! - `generic-provider.ProviderRequest`   — the standard chat-completion request.
-//! - `generic-provider.ProviderInput`  — the standard chat-completion response.
+//! - `generic-provider.ProviderIn`   — the standard chat-completion request.
+//! - `generic-provider.ProviderOut`  — the standard chat-completion response.
 //! - `generic-provider.ChatHistory`  — provider-shaped reasoner state.
 //! - `generic-provider.NoState`      — unit/empty state for stateless reasoners.
 //! - `generic-provider.FinalAnswer`  — the escape-edge type emitted by `tool_split`.
@@ -12,14 +12,14 @@
 //! On startup the plugin sends a `combinators.register` declaring just
 //! these types (with no implementations of its own). Concrete provider
 //! plugins (openai-provider, anthropic-provider, …) separately declare
-//! `Into<generic-provider.ProviderRequest, <them>.RawRequest>` and
-//! `Into<<them>.RawResponse, generic-provider.ProviderInput>` against
+//! `Into<generic-provider.ProviderIn, <them>.RawRequest>` and
+//! `Into<<them>.RawResponse, generic-provider.ProviderOut>` against
 //! MAG. The cross-namespace `Into.out` lane is what makes
 //! this hub-and-spoke shape work without a many-to-many adapter mesh.
 //!
 //! This plugin is a passive type-registry hub. It does not run models, it
 //! does not hold sessions, and it does not own combinator implementations.
-//! The job of routing a graph node referencing `ProviderRequest`/`ProviderInput`
+//! The job of routing a graph node referencing `ProviderIn`/`ProviderOut`
 //! to a specific concrete provider belongs to the Lua glue layer (see the
 //! parent agent-and-reasoner-types spec, §5 decoupling table — the glue
 //! layer is the only place allowed to know multiple sides simultaneously).
@@ -32,7 +32,7 @@
 //! shape. Treat them as a community contract, not a spec rule.
 //!
 //! ```jsonc
-//! // generic-provider.ProviderRequest — the chat-completion request
+//! // generic-provider.ProviderIn — the chat-completion request
 //! {
 //!   "messages": [
 //!     { "role": "user" | "assistant" | "system" | "tool",
@@ -44,7 +44,7 @@
 //!   "tools"?: [ { "name": "...", "description": "...", "schema": {...} } ]
 //! }
 //!
-//! // generic-provider.ProviderInput — successful chat-completion response
+//! // generic-provider.ProviderOut — successful chat-completion response
 //! {
 //!   "text": "<assistant message text, may be empty if tool-only>",
 //!   "tool_calls"?: [
@@ -55,7 +55,7 @@
 //! }
 //!
 //! // generic-provider.ChatHistory
-//! { "messages": [ /* same shape as ProviderRequest.messages */ ] }
+//! { "messages": [ /* same shape as ProviderIn.messages */ ] }
 //!
 //! // generic-provider.NoState
 //! {}
@@ -82,8 +82,8 @@ const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Bare names — the registry's `combinators.register` parser prepends our
 /// namespace (`generic-provider`) at install time.
 const CANONICAL_TYPES: &[&str] = &[
-    "ProviderRequest",
-    "ProviderInput",
+    "ProviderIn",
+    "ProviderOut",
     "ChatHistory",
     "NoState",
     "FinalAnswer",
@@ -286,8 +286,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "ProviderRequest",
-                "ProviderInput",
+                "ProviderIn",
+                "ProviderOut",
                 "ChatHistory",
                 "NoState",
                 "FinalAnswer"
@@ -333,8 +333,8 @@ mod tests {
         // these five tags. Pin the set so a spec-side rename cannot
         // silently drift.
         let expected: std::collections::BTreeSet<&str> = [
-            "ProviderRequest",
-            "ProviderInput",
+            "ProviderIn",
+            "ProviderOut",
             "ChatHistory",
             "NoState",
             "FinalAnswer",

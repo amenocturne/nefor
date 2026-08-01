@@ -20,7 +20,7 @@
 //! - `<prefix>.chat.complete { chat_id }` — send the chat's history to
 //!   the upstream model, stream deltas, append the assistant message,
 //!   reply with `<prefix>.chat.complete.result { chat_id, output }`
-//!   where `output` follows `generic-provider.ProviderInput`'s shape.
+//!   where `output` follows `generic-provider.ProviderOut`'s shape.
 //! - `<prefix>.chat.delete  { chat_id }` — drop the chat.
 //!
 //! ### Legacy wire API (compat for nefor-chat)
@@ -1714,7 +1714,7 @@ fn spawn_turn(
 
         // Explicit `chat.complete` path: emit a closing
         // `<prefix>.chat.complete.result` carrying the
-        // generic-provider.ProviderInput-shaped output. Legacy
+        // generic-provider.ProviderOut-shaped output. Legacy
         // `<prefix>.prompt` path skips it — the chat plugin reads
         // stream.end directly and doesn't speak the chat.* protocol
         // yet.
@@ -2415,7 +2415,7 @@ fn chat_error_body_msg(config: &Config, chat_id: &ChatId, message: String) -> Ma
 
 /// Emit a `<prefix>.chat.complete.result` body.
 ///
-/// `output` follows the `generic-provider.ProviderInput` shape (per the
+/// `output` follows the `generic-provider.ProviderOut` shape (per the
 /// Schelling-point docstring on generic-provider/main.rs):
 /// `{ text, tool_calls?, finish_reason?, usage?, reasoning? }`.
 ///
@@ -2527,8 +2527,8 @@ fn goodbye_body(config: &Config) -> Map<String, Value> {
 /// concrete provider plugins to declare:
 ///
 /// ```text
-/// Into<generic-provider.ProviderRequest,  openai-provider.RawRequest>   -- canonical → upstream
-/// Into<openai-provider.RawResponse,  generic-provider.ProviderInput> -- upstream → canonical
+/// Into<generic-provider.ProviderIn,  openai-provider.RawRequest>   -- canonical → upstream
+/// Into<openai-provider.RawResponse,  generic-provider.ProviderOut> -- upstream → canonical
 /// ```
 ///
 /// The combinators-spec §4.1 currently states `Into.in` must be a bare
@@ -2543,7 +2543,7 @@ fn goodbye_body(config: &Config) -> Map<String, Value> {
 /// the two specs/implementations.
 ///
 /// We *also* include the safe (always-valid) direction
-/// `Into<openai-provider.RawResponse, generic-provider.ProviderInput>`
+/// `Into<openai-provider.RawResponse, generic-provider.ProviderOut>`
 /// (bare in → cross-namespace out) which both specs allow today, so a
 /// half-working state is still useful.
 fn register_body() -> Map<String, Value> {
@@ -2562,7 +2562,7 @@ fn register_body() -> Map<String, Value> {
         // NOTE: `in` is cross-namespace here. Today's registry will
         // reject this; intentional. See docstring above.
         register_into_entry(
-            "generic-provider.ProviderRequest",
+            "generic-provider.ProviderIn",
             "RawRequest",
             "into.completion_request_to_raw_request",
         ),
@@ -2570,7 +2570,7 @@ fn register_body() -> Map<String, Value> {
         // cross-namespace out).
         register_into_entry(
             "RawResponse",
-            "generic-provider.ProviderInput",
+            "generic-provider.ProviderOut",
             "into.raw_response_to_completion_event",
         ),
     ];
@@ -4942,12 +4942,12 @@ mod tests {
             .expect("impls array");
         assert_eq!(impls.len(), 2);
 
-        // Entry 0: Into<generic-provider.ProviderRequest -> RawRequest>
+        // Entry 0: Into<generic-provider.ProviderIn -> RawRequest>
         let e0 = impls[0].as_object().expect("obj");
         assert_eq!(e0.get("trait").and_then(Value::as_str), Some("Into"));
         assert_eq!(
             e0.get("in").and_then(Value::as_str),
-            Some("generic-provider.ProviderRequest")
+            Some("generic-provider.ProviderIn")
         );
         assert_eq!(e0.get("out").and_then(Value::as_str), Some("RawRequest"));
         assert!(e0
@@ -4956,13 +4956,13 @@ mod tests {
             .map(|s| !s.is_empty())
             .unwrap_or(false));
 
-        // Entry 1: Into<RawResponse -> generic-provider.ProviderInput>
+        // Entry 1: Into<RawResponse -> generic-provider.ProviderOut>
         let e1 = impls[1].as_object().expect("obj");
         assert_eq!(e1.get("trait").and_then(Value::as_str), Some("Into"));
         assert_eq!(e1.get("in").and_then(Value::as_str), Some("RawResponse"));
         assert_eq!(
             e1.get("out").and_then(Value::as_str),
-            Some("generic-provider.ProviderInput")
+            Some("generic-provider.ProviderOut")
         );
     }
 

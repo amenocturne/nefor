@@ -167,9 +167,9 @@ end
 
 do
   -- shape.accepts is the primitive: one output tag on one edge vs an input shape.
-  assert_true(shape.accepts("generic-provider.ProviderInput", "generic-provider.ProviderInput"),
+  assert_true(shape.accepts("generic-provider.ProviderOut", "generic-provider.ProviderOut"),
     "single input accepts its exact tag")
-  assert_true(not shape.accepts("generic-provider.ProviderInput", "other.Tag"),
+  assert_true(not shape.accepts("generic-provider.ProviderOut", "other.Tag"),
     "single input rejects a different tag")
 
   local union_in = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" }
@@ -177,7 +177,7 @@ do
     "union input accepts either variant (a)")
   assert_true(shape.accepts(union_in, "generic-provider.FinalAnswer"),
     "union input accepts either variant (b)")
-  assert_true(not shape.accepts(union_in, "generic-provider.ProviderInput"),
+  assert_true(not shape.accepts(union_in, "generic-provider.ProviderOut"),
     "union input rejects a non-variant tag")
 
   local product_in = { product = { "explore.Findings", "review.Notes" } }

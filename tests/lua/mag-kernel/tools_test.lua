@@ -92,7 +92,7 @@ do
   -- tool-result: ToolHandle in, ProviderInput out.
   local tr = reg:declaration("tool-result")
   assert_eq(tr.inputs.handle, "generic-tool.ToolHandle", "tool-result input is ToolHandle")
-  assert_eq(tr.outputs[1], "generic-provider.ProviderInput", "tool-result output is ProviderInput")
+  assert_eq(tr.outputs[1], "generic-provider.ProviderOut", "tool-result output is ProviderInput")
   assert_eq(#tr.signals, 0, "tool-result declares no signals (synchronous)")
 end
 
@@ -252,7 +252,7 @@ do
   }))
   assert_eq(c.status, "ok", "synchronous adaptation returns a successful completion")
 
-  local out = find_kind(msgs, "generic-provider.ProviderInput")
+  local out = find_kind(msgs, "generic-provider.ProviderOut")
   assert_true(out ~= nil, "tool-result emits a ProviderInput turn")
   assert_eq(out.from, "tr", "ProviderInput is id-signed")
   assert_eq(#out.messages, 3, "one tool message per aggregated result")
@@ -282,7 +282,7 @@ do
   local linst = llm.construct("dx.llm", { provider = "p" }, lemit)
   linst.deliver({
     shape = "single",
-    messages = { { from = "up", tag = "generic-provider.ProviderInput", message = { messages = {} } } },
+    messages = { { from = "up", tag = "generic-provider.ProviderOut", message = { messages = {} } } },
   })
   local invoke = find_kind(lm, "capability.invoke")
   linst.deliver({

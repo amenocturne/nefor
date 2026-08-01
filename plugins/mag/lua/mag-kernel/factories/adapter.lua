@@ -3,10 +3,10 @@
 --
 -- Every agent template (crates/nefor-mag eval_agent; plugins/mag/docs/lowering.md,
 -- "the entry adapter's role") opens with an `entry` node of factory `adapter`,
--- params `{ seed = "provider-in" }`, wired `IN -> generic-provider.ProviderInput`.
+-- params `{ seed = "provider-in" }`, wired `IN -> generic-provider.ProviderOut`.
 -- Its job is the boundary type shift: whatever crosses into the agent — the
 -- program's initial task seed, or an upstream agent's FinalAnswer — is lifted
--- into the `generic-provider.ProviderInput` turn the downstream `llm` consumes.
+-- into the `generic-provider.ProviderOut` turn the downstream `llm` consumes.
 -- This is why the same template instantiates against `mag.Task` (agent 1) and
 -- `generic-provider.FinalAnswer` (agent 2) unchanged: the entry adapter absorbs
 -- the difference (two-agents.mag, "Boundary contract").
@@ -15,7 +15,7 @@
 -- the loader's eval_agent, which authors this node; flagged):
 --   input   ( task | generic-provider.FinalAnswer | human.Rejected )
 --           union — fires on any
---   output  generic-provider.ProviderInput              the next provider turn
+--   output  generic-provider.ProviderOut              the next provider turn
 --
 -- The union input is the whole point of the boundary: `task` is the initial
 -- activation content the loader seeds a source agent with (crates/nefor-mag
@@ -63,7 +63,7 @@ local M = {}
 local preview_components = require("preview-components")
 
 local FINAL_ANSWER = "generic-provider.FinalAnswer"
-local PROVIDER_INPUT = "generic-provider.ProviderInput"
+local PROVIDER_INPUT = "generic-provider.ProviderOut"
 local REJECTED = "human.Rejected"
 local AGENT_RESULT = "nefor.agent.Result"
 
@@ -81,7 +81,7 @@ M.declaration = {
       {wire=PROVIDER_INPUT,type={kind="variable",name="T"}},
       {wire=AGENT_RESULT,type={kind="variable",name="T"}},
     },
-    outputs = {{ wire = "generic-provider.ProviderInput", type = {
+    outputs = {{ wire = "generic-provider.ProviderOut", type = {
       kind="named", name="nefor.contracts.ProviderInput", arguments={}
     }}},
   },
@@ -99,7 +99,7 @@ M.declaration = {
   },
 
   outputs = {
-    "generic-provider.ProviderInput",
+    "generic-provider.ProviderOut",
   },
 
   signals = {},
@@ -159,7 +159,7 @@ local function to_provider_input(activation, schema)
       input.tag, input.message, input_schema, input.arrival)
   end
   return {
-    kind = "generic-provider.ProviderInput",
+    kind = "generic-provider.ProviderOut",
     value = { content = messages[1] and messages[1].content.value },
     messages = messages,
   }

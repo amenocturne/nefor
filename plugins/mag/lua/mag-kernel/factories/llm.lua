@@ -14,7 +14,7 @@ M.declaration = {
       {kind="named",name="nefor.contracts.ToolCalls",arguments={}},
       {kind="named",name="nefor.contracts.FinalAnswer",arguments={}},
     }},
-    inputs={{wire="generic-provider.ProviderInput",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
+    inputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
     outputs={
       {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}},
       {wire="generic-provider.FinalAnswer",type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}},
@@ -25,7 +25,7 @@ M.declaration = {
     profile = "string?", reasoning_effort = "string?",
     provider = "string?", history = "table?", context_artifact = "table?",
   },
-  inputs = { provider_input = "generic-provider.ProviderInput" },
+  inputs = { provider_input = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" },
   signals = { "kill", "drain", "steer" },
 }

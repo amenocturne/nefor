@@ -3,7 +3,7 @@
 -- A factory declares the input shapes it accepts and the output tags it
 -- produces (see plugins/mag/docs/actor-model.md, Factories; docs/ir.md,
 -- Firing). Type tags are fully-qualified name strings exactly as the
--- compiler's `qualify_type` emits them (`generic-provider.ProviderInput`,
+-- compiler's `qualify_type` emits them (`generic-provider.ProviderOut`,
 -- `mag.Task`). Composition type-checks against these declared
 -- shapes; nothing sniffs a runtime value's shape.
 --
@@ -13,7 +13,7 @@
 --   product `(A + B)`    fires on all        — kernel assembles one activation
 --
 -- Plain representation (readable tables — no metatables, no behavior):
---   single  -> a string tag                       "generic-provider.ProviderInput"
+--   single  -> a string tag                       "generic-provider.ProviderOut"
 --   union   -> a list of tags                      { "A", "B" }
 --   product -> a struct keyed by `product`         { product = { "A", "B" } }
 --
