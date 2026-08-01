@@ -343,8 +343,8 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
     );
     let progress = render_str(&mut engine);
     assert!(
-        progress.contains("64/200"),
-        "progress must not regress: {progress:?}"
+        progress.contains("bytes 64 B / 200 B") && progress.contains("32.0"),
+        "byte progress must be labeled, human-readable, and monotonic: {progress:?}"
     );
     assert!(
         !progress.contains("concealed replay fixture"),
@@ -361,7 +361,7 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
     );
     let draining = render_str(&mut engine);
     assert!(
-        draining.contains("96/200"),
+        draining.contains("bytes 96 B / 200 B") && draining.contains("48.0"),
         "loading must survive replay end while the TUI drain completes: {draining:?}"
     );
 
@@ -382,6 +382,57 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
         done.contains("concealed replay fixture"),
         "resume_done must reveal the transcript reconstructed during loading: {done:?}"
     );
+}
+
+#[test]
+fn resume_loading_formats_byte_boundaries_and_clamps_progress() {
+    let cases = [
+        (0_i64, 0_i64, "bytes 0 B / 0 B · 0.0%"),
+        (50, -10, "bytes 0 B / 0 B · 0.0%"),
+        (1023, 1023, "bytes 1023 B / 1023 B · 100.0%"),
+        (1024, 2048, "bytes 1.0 KiB / 2.0 KiB · 50.0%"),
+        (
+            1_048_575,
+            1_048_575,
+            "bytes 1024.0 KiB / 1024.0 KiB · 100.0%",
+        ),
+        (3000, 2048, "bytes 2.0 KiB / 2.0 KiB · 100.0%"),
+        (1_048_576, 2_097_152, "bytes 1.0 MiB / 2.0 MiB · 50.0%"),
+        (
+            1_073_741_823,
+            1_073_741_823,
+            "bytes 1024.0 MiB / 1024.0 MiB · 100.0%",
+        ),
+        (
+            1_073_741_824,
+            2_147_483_648,
+            "bytes 1.0 GiB / 2.0 GiB · 50.0%",
+        ),
+    ];
+
+    for (replayed, total, expected) in cases {
+        let mut engine = Engine::new(100, 24).expect("engine");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "sessions.resume_loading", "session_id": "resume-1" }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "sessions.replay.progress",
+                "session_id": "resume-1",
+                "replayed": replayed,
+                "total": total,
+            }),
+        );
+        let rendered = render_str(&mut engine);
+        assert!(
+            rendered.contains(expected.trim_end_matches('%')),
+            "expected {expected:?} for {replayed}/{total}: {rendered:?}"
+        );
+    }
 }
 
 #[test]

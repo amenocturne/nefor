@@ -52,15 +52,27 @@ local function thinking_widget(state)
   }
 end
 
+local function format_bytes(bytes)
+  if bytes < 1024 then return string.format("%d B", bytes) end
+  if bytes < 1024 * 1024 then return string.format("%.1f KiB", bytes / 1024) end
+  if bytes < 1024 * 1024 * 1024 then return string.format("%.1f MiB", bytes / (1024 * 1024)) end
+  return string.format("%.1f GiB", bytes / (1024 * 1024 * 1024))
+end
+
 local function loading_widget(state)
   local loading = state.resume_loading
   if loading == nil then return nil end
-  local replayed = loading.replayed or 0
   local body
   if loading.total == nil then
     body = "[loading session…]"
   else
-    body = string.format("[loading session… %d/%d]", replayed, loading.total)
+    local total = math.max(0, loading.total)
+    local replayed = math.min(math.max(0, loading.replayed or 0), total)
+    local percentage = total > 0 and replayed / total * 100 or 0
+    body = string.format(
+      "[loading session… bytes %s / %s · %.1f%%]",
+      format_bytes(replayed), format_bytes(total), percentage
+    )
   end
   return tui.text { content = body, style = STYLE.system, wrap = "none" }
 end

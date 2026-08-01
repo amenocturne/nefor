@@ -562,7 +562,11 @@ mod tests {
             if msg.kind == "sessions.resume_loading" then
               return { progress = "loading session" }, {}
             elseif msg.kind == "sessions.replay.progress" then
-              return { progress = tostring(msg.replayed) .. "/" .. tostring(msg.total) }, {}
+              local percentage = msg.total > 0 and msg.replayed / msg.total * 100 or 0
+              return { progress = string.format(
+                "loading session bytes %d / %d · %.1f%%",
+                msg.replayed, msg.total, percentage
+              ) }, {}
             elseif msg.kind == "sessions.resume_done" then
               return { progress = nil }, {}
             end
@@ -606,8 +610,8 @@ mod tests {
 
         let rendered = String::from_utf8(frames).expect("rendered ANSI is UTF-8");
         assert!(
-            rendered.contains("64/200"),
-            "numeric progress must reach the terminal during one replay drain: {rendered:?}"
+            rendered.contains("loading session bytes 64 / 200") && rendered.contains("32.0%"),
+            "labeled byte progress must reach the terminal during one replay drain: {rendered:?}"
         );
         assert!(
             !shutdown,
