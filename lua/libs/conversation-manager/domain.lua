@@ -1,0 +1,223 @@
+local M = {}
+
+-- The fold is the sole transcript authority: events are immutable facts, while
+-- lookup maps are derived indexes removed from the neutral read model.
+local terminal_conversation = { completed = true, interrupted = true, failed = true }
+local chunk_kinds = { text = true, reasoning = true, native = true, tool_call = true }
+local roles = { system = true, user = true, assistant = true, tool = true }
+
+local function copy(value, seen)
+  if type(value) ~= "table" then return value end
+  seen = seen or {}
+  if seen[value] then return seen[value] end
+  local out = {}
+  seen[value] = out
+  for key, item in pairs(value) do out[copy(key, seen)] = copy(item, seen) end
+  return out
+end
+M.copy = copy
+
+local function equal(a, b, seen)
+  if type(a) ~= type(b) then return false end
+  if type(a) ~= "table" then return a == b end
+  seen = seen or {}
+  if seen[a] == b then return true end
+  seen[a] = b
+  for key, value in pairs(a) do if not equal(value, b[key], seen) then return false end end
+  for key in pairs(b) do if a[key] == nil then return false end end
+  return true
+end
+M.equal = equal
+
+local function err(code, context)
+  return nil, { code = code, context = context or {} }
+end
+M.error = err
+
+local function nonempty(value)
+  return type(value) == "string" and value ~= ""
+end
+
+local function require_id(event, field)
+  if nonempty(event[field]) then return true end
+  return err("invalid_" .. field, { kind = event.kind, field = field, value = event[field] })
+end
+
+local function find_message(conversation, id)
+  return conversation.message_by_id[id]
+end
+
+local function find_exchange(conversation, id)
+  return conversation.exchange_by_id[id]
+end
+
+local function require_live(conversation, event)
+  if terminal_conversation[conversation.status] then
+    return err("conversation_terminal", { conversation_id = conversation.id, status = conversation.status, kind = event.kind })
+  end
+  return true
+end
+
+local handlers = {}
+
+handlers.created = function(conversation, event)
+  if conversation then return err("created_more_than_once", { conversation_id = event.conversation_id }) end
+  if event.sequence ~= 1 then return err("created_not_first", { conversation_id = event.conversation_id, sequence = event.sequence }) end
+  return {
+    id = event.conversation_id,
+    status = "active",
+    provenance = copy(event.provenance or {}),
+    messages = {}, message_by_id = {},
+    exchanges = {}, exchange_by_id = {},
+    retries = {}, events = {}, last_sequence = 0,
+  }
+end
+
+handlers.provenance_updated = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  if type(event.provenance) ~= "table" then return err("invalid_provenance", { kind = event.kind }) end
+  for key, value in pairs(event.provenance) do c.provenance[key] = copy(value) end
+  return c
+end
+
+handlers.message_started = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  ok, e = require_id(event, "message_id"); if not ok then return nil, e end
+  if c.message_by_id[event.message_id] then return err("message_id_conflict", { message_id = event.message_id }) end
+  if not roles[event.role] then return err("invalid_role", { message_id = event.message_id, role = event.role }) end
+  local message = { id = event.message_id, role = event.role, status = "open", chunks = {}, attempts = {} }
+  c.messages[#c.messages + 1] = message; c.message_by_id[message.id] = message
+  return c
+end
+
+handlers.content_chunk_appended = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local message = find_message(c, event.message_id)
+  if not message then return err("message_not_found", { message_id = event.message_id }) end
+  if message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  if type(event.chunk) ~= "table" or not chunk_kinds[event.chunk.kind] then
+    return err("invalid_content_chunk", { message_id = event.message_id, chunk_kind = type(event.chunk) == "table" and event.chunk.kind or nil })
+  end
+  message.chunks[#message.chunks + 1] = copy(event.chunk)
+  return c
+end
+
+handlers.tool_exchange_started = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  ok, e = require_id(event, "exchange_id"); if not ok then return nil, e end
+  if c.exchange_by_id[event.exchange_id] then return err("exchange_id_conflict", { exchange_id = event.exchange_id }) end
+  local message = find_message(c, event.message_id)
+  if not message then return err("message_not_found", { message_id = event.message_id }) end
+  if message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  local exchange = { id = event.exchange_id, message_id = event.message_id, tool_name = event.tool_name, status = "call_open", call_chunks = {} }
+  c.exchanges[#c.exchanges + 1] = exchange; c.exchange_by_id[exchange.id] = exchange
+  return c
+end
+
+handlers.tool_call_fragment_appended = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local exchange = find_exchange(c, event.exchange_id)
+  if not exchange then return err("exchange_not_found", { exchange_id = event.exchange_id }) end
+  if exchange.status ~= "call_open" then return err("tool_call_not_open", { exchange_id = event.exchange_id, status = exchange.status }) end
+  local message = find_message(c, exchange.message_id)
+  if message.status ~= "open" then return err("message_not_open", { message_id = message.id, status = message.status }) end
+  local chunk = { kind = "tool_call", exchange_id = exchange.id, data = copy(event.fragment) }
+  exchange.call_chunks[#exchange.call_chunks + 1] = copy(event.fragment)
+  message.chunks[#message.chunks + 1] = chunk
+  return c
+end
+
+handlers.tool_call_completed = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local exchange = find_exchange(c, event.exchange_id)
+  if not exchange then return err("exchange_not_found", { exchange_id = event.exchange_id }) end
+  if exchange.status ~= "call_open" then return err("tool_call_not_open", { exchange_id = event.exchange_id, status = exchange.status }) end
+  exchange.status = "call_completed"; exchange.call = copy(event.call)
+  return c
+end
+
+local function finish_exchange(c, event, status, field)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local exchange = find_exchange(c, event.exchange_id)
+  if not exchange then return err("exchange_not_found", { exchange_id = event.exchange_id }) end
+  if exchange.status ~= "call_completed" then
+    local terminal = exchange.status == "result" or exchange.status == "error"
+    local code = terminal and "tool_exchange_terminal" or "tool_call_incomplete"
+    return err(code, { exchange_id = event.exchange_id, status = exchange.status })
+  end
+  exchange.status = status; exchange[field] = copy(event[field])
+  return c
+end
+handlers.tool_result_recorded = function(c, e) return finish_exchange(c, e, "result", "result") end
+handlers.tool_error_recorded = function(c, e) return finish_exchange(c, e, "error", "error") end
+
+handlers.message_completed = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local message = find_message(c, event.message_id)
+  if not message then return err("message_not_found", { message_id = event.message_id }) end
+  if message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  for _, exchange in ipairs(c.exchanges) do
+    if exchange.message_id == message.id and exchange.status == "call_open" then
+      return err("tool_call_incomplete", { exchange_id = exchange.id, message_id = message.id })
+    end
+  end
+  message.status = "completed"; message.completion = copy(event.completion or {})
+  return c
+end
+
+handlers.retry_started = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  ok, e = require_id(event, "retry_id"); if not ok then return nil, e end
+  for _, retry in ipairs(c.retries) do if retry.id == event.retry_id then return err("retry_id_conflict", { retry_id = event.retry_id }) end end
+  local message = find_message(c, event.message_id)
+  if message and message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  local retry = { id = event.retry_id, message_id = event.message_id, reason = copy(event.reason), provenance = copy(event.provenance or {}) }
+  c.retries[#c.retries + 1] = retry
+  if message then message.attempts[#message.attempts + 1] = retry end
+  return c
+end
+
+local function terminate(status)
+  return function(c, event)
+    local ok, e = require_live(c, event); if not ok then return nil, e end
+    if status == "completed" then
+      for _, message in ipairs(c.messages) do if message.status == "open" then return err("open_message_at_completion", { message_id = message.id }) end end
+      for _, exchange in ipairs(c.exchanges) do
+        if exchange.status ~= "result" and exchange.status ~= "error" then return err("open_exchange_at_completion", { exchange_id = exchange.id, status = exchange.status }) end
+      end
+    end
+    c.status = status; c.terminal = copy(event.detail or {})
+    return c
+  end
+end
+handlers.conversation_completed = terminate("completed")
+handlers.conversation_interrupted = terminate("interrupted")
+handlers.conversation_failed = terminate("failed")
+
+function M.fold(conversation, event)
+  if type(event) ~= "table" then return err("invalid_event", { value_type = type(event) }) end
+  if not nonempty(event.event_id) then return err("invalid_event_id", { kind = event.kind }) end
+  if not nonempty(event.conversation_id) then return err("invalid_conversation_id", { kind = event.kind }) end
+  if type(event.sequence) ~= "number" or event.sequence % 1 ~= 0 or event.sequence < 1 then return err("invalid_sequence", { sequence = event.sequence }) end
+  local handler = handlers[event.kind]
+  if not handler then return err("unknown_event_kind", { kind = event.kind }) end
+  if not conversation and event.kind ~= "created" then return err("created_required", { conversation_id = event.conversation_id, kind = event.kind }) end
+  if conversation then
+    if event.conversation_id ~= conversation.id then return err("conversation_id_mismatch", { expected = conversation.id, actual = event.conversation_id }) end
+    if event.sequence ~= conversation.last_sequence + 1 then return err("noncontiguous_sequence", { conversation_id = conversation.id, expected = conversation.last_sequence + 1, actual = event.sequence }) end
+  end
+  local next_conversation = copy(conversation)
+  local folded, e = handler(next_conversation, event); if not folded then return nil, e end
+  folded.last_sequence = event.sequence
+  folded.events[#folded.events + 1] = copy(event)
+  return folded
+end
+
+function M.read_model(conversation)
+  if not conversation then return nil end
+  local out = copy(conversation)
+  out.message_by_id = nil; out.exchange_by_id = nil
+  return out
+end
+
+return M

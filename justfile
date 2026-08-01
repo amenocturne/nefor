@@ -22,6 +22,7 @@ fmt-check:
 # Core confidence set for engine, starter Lua, and tool plumbing changes.
 test-fast:
     cargo test -p nefor --lib
+    cargo test -p nefor --test conversation_manager_test
     cargo test -p nefor --test starter_tool_gate_test
     cargo test -p nefor --test read_only_tools_test
     cargo test -p tool-gate-plugin

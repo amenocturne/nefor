@@ -1,0 +1,147 @@
+local manager = require("libs.conversation-manager")
+local domain = manager.domain
+
+local function fail(message) error(message, 2) end
+local function eq(actual, expected, message)
+  if not domain.equal(actual, expected) then fail((message or "values differ") .. ": expected " .. tostring(expected) .. ", got " .. tostring(actual)) end
+end
+local function ok(value, e, message) if not value then fail((message or "unexpected error") .. ": " .. tostring(e and e.code)) end return value end
+local function append(store, fact) return ok(store:append(fact)) end
+local function rejects(store, fact, code)
+  local value, e = store:append(fact)
+  eq(value, nil, "rejection has no value"); eq(e.code, code, "precise error code")
+  return e
+end
+local function fact(id, conversation_id, kind, extra)
+  local out = { event_id = id, conversation_id = conversation_id, kind = kind }
+  for key, value in pairs(extra or {}) do out[key] = value end
+  return out
+end
+local function create(store, id, purpose)
+  return append(store, fact(id .. ":created", id, "created", { provenance = {
+    provider = "openai", model = "one", native_chat = "native:" .. id,
+    session = "session", parent = "parent", run = "run:" .. id,
+    actor = id, purpose = purpose,
+  } }))
+end
+
+-- Every event variant participates in one canonical fold, preserving chunks as facts.
+do
+  local store = manager.new(); create(store, "lead", "lead")
+  append(store, fact("p", "lead", "provenance_updated", { provenance = { provider = "anthropic", model = "two" } }))
+  append(store, fact("m", "lead", "message_started", { message_id = "assistant:1", role = "assistant" }))
+  local chunks = {
+    { kind = "text", data = "hel" }, { kind = "reasoning", data = "why" },
+    { kind = "native", data = { type = "citation", index = 4 } }, { kind = "text", data = "lo" },
+  }
+  for index, chunk in ipairs(chunks) do append(store, fact("c" .. index, "lead", "content_chunk_appended", { message_id = "assistant:1", chunk = chunk })) end
+  append(store, fact("x", "lead", "tool_exchange_started", { exchange_id = "exchange:1", message_id = "assistant:1", tool_name = "read" }))
+  append(store, fact("xf1", "lead", "tool_call_fragment_appended", { exchange_id = "exchange:1", fragment = '{"pa' }))
+  append(store, fact("xf2", "lead", "tool_call_fragment_appended", { exchange_id = "exchange:1", fragment = 'th":"x"}' }))
+  append(store, fact("xc", "lead", "tool_call_completed", { exchange_id = "exchange:1", call = { path = "x" } }))
+  append(store, fact("xr", "lead", "tool_result_recorded", { exchange_id = "exchange:1", result = { text = "data" } }))
+  append(store, fact("retry", "lead", "retry_started", { retry_id = "retry:1", message_id = "assistant:1", reason = "rate_limit", provenance = { model = "three" } }))
+  append(store, fact("mc", "lead", "message_completed", { message_id = "assistant:1", completion = { finish_reason = "stop" } }))
+  local done = append(store, fact("done", "lead", "conversation_completed", { detail = { usage = 12 } }))
+  eq(done.status, "completed"); eq(done.provenance.provider, "anthropic"); eq(done.id, "lead", "provenance switch does not move identity")
+  eq(#done.messages[1].chunks, 6, "native chunks and fragmented tool-call chunks remain individual")
+  for index, chunk in ipairs(chunks) do eq(done.messages[1].chunks[index], chunk, "chunk order preserved") end
+  eq(done.messages[1].chunks[5].kind, "tool_call"); eq(done.messages[1].chunks[6].data, 'th":"x"}')
+  eq(done.exchanges[1].status, "result"); eq(#done.retries, 1)
+  rejects(store, fact("late", "lead", "provenance_updated", { provenance = { model = "late" } }), "conversation_terminal")
+end
+
+-- Tool errors are the other exactly-once terminal exchange outcome.
+do
+  local store = manager.new(); create(store, "error-chat", "agent")
+  append(store, fact("m", "error-chat", "message_started", { message_id = "m", role = "assistant" }))
+  append(store, fact("x", "error-chat", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "bash" }))
+  append(store, fact("xc", "error-chat", "tool_call_completed", { exchange_id = "x", call = {} }))
+  append(store, fact("xe", "error-chat", "tool_error_recorded", { exchange_id = "x", error = { code = "exit", message = "1" } }))
+  rejects(store, fact("xr", "error-chat", "tool_result_recorded", { exchange_id = "x", result = {} }), "tool_exchange_terminal")
+end
+
+-- Invalid transitions are table-driven and failed facts never consume sequence.
+local invalid_cases = {
+  { "created required", function(s) end, fact("e", "c", "message_started", { message_id = "m", role = "user" }), "created_required" },
+  { "created twice", function(s) create(s, "c", "lead") end, fact("e", "c", "created"), "created_more_than_once" },
+  { "unknown kind", function(s) create(s, "c", "lead") end, fact("e", "c", "wat"), "unknown_event_kind" },
+  { "bad role", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "robot" }), "invalid_role" },
+  { "missing message", function(s) create(s, "c", "lead") end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "text", data = "x" } }), "message_not_found" },
+  { "bad chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "image" } }), "invalid_content_chunk" },
+  { "duplicate message id", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "message_started", { message_id = "m", role = "user" }), "message_id_conflict" },
+  { "duplicate exchange id", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })); append(s, fact("x", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" })) end, fact("e", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" }), "exchange_id_conflict" },
+  { "result before call complete", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })); append(s, fact("x", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" })) end, fact("e", "c", "tool_result_recorded", { exchange_id = "x", result = {} }), "tool_call_incomplete" },
+  { "message completion with fragmented call", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })); append(s, fact("x", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" })) end, fact("e", "c", "message_completed", { message_id = "m" }), "tool_call_incomplete" },
+  { "append after exact completion", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })); append(s, fact("mc", "c", "message_completed", { message_id = "m" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "text", data = "late" } }), "message_not_open" },
+  { "complete with open message", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "conversation_completed"), "open_message_at_completion" },
+}
+for _, case in ipairs(invalid_cases) do
+  local store = manager.new(); case[2](store); local before = store:get("c"); rejects(store, case[3], case[4]); eq(store:get("c"), before, case[1] .. " is atomic")
+end
+
+-- Idempotency is exact fact equality; event ids are globally unique.
+do
+  local store = manager.new(); local created = fact("same", "a", "created", { provenance = { purpose = "lead" } })
+  local first = append(store, created); local second, e, duplicate = store:append(domain.copy(created))
+  ok(second, e); eq(duplicate, true); eq(second, first); eq(second.last_sequence, 1)
+  rejects(store, fact("same", "a", "created", { provenance = { purpose = "agent" } }), "event_id_conflict")
+  rejects(store, fact("same", "b", "created"), "event_id_conflict")
+  rejects(store, { event_id = "sequenced", conversation_id = "a", kind = "provenance_updated", sequence = 2, provenance = {} }, "sequence_manager_owned")
+end
+
+-- Interruption and failure retain partial open state; retry remains visible before terminality.
+for _, terminal in ipairs({ "conversation_interrupted", "conversation_failed" }) do
+  local store = manager.new(); create(store, terminal, "agent")
+  append(store, fact("m", terminal, "message_started", { message_id = "partial", role = "assistant" }))
+  append(store, fact("chunk", terminal, "content_chunk_appended", { message_id = "partial", chunk = { kind = "text", data = "partial" } }))
+  append(store, fact("retry", terminal, "retry_started", { retry_id = "r", message_id = "partial", reason = "transient" }))
+  local ended = append(store, fact("end", terminal, terminal, { detail = { reason = "stop" } }))
+  eq(ended.messages[1].status, "open"); eq(ended.messages[1].chunks[1].data, "partial"); eq(#ended.retries, 1)
+  rejects(store, fact("late", terminal, "message_completed", { message_id = "partial" }), "conversation_terminal")
+end
+
+-- Serialized event replay is exactly the live store, including arrays and all facts.
+do
+  local live = manager.new(); create(live, "serialized", "temporary")
+  append(live, fact("m", "serialized", "message_started", { message_id = "m", role = "assistant" }))
+  append(live, fact("c", "serialized", "content_chunk_appended", { message_id = "m", chunk = { kind = "reasoning", data = "r" } }))
+  append(live, fact("mc", "serialized", "message_completed", { message_id = "m" }))
+  local events = live:get("serialized").events
+  local encoded = nefor.json.encode(events); local decoded = nefor.json.decode(encoded)
+  local replayed = manager.new(); ok(replayed:replay(decoded))
+  eq(replayed:get("serialized"), live:get("serialized"), "serialized replay equals live state deeply")
+  local bad = domain.copy(events); bad[2].sequence = 9
+  local _, e = manager.new():replay(bad); eq(e.code, "noncontiguous_sequence")
+end
+
+-- Heavily interleaved chats never share messages, exchanges, sequence, or provenance.
+do
+  local store = manager.new()
+  local chats = {
+    { "lead", "lead" }, { "agent-a", "agent" }, { "agent-b", "agent" },
+    { "temp", "temporary" }, { "compact", "compaction" },
+  }
+  for _, chat in ipairs(chats) do create(store, chat[1], chat[2]) end
+  for round = 1, 4 do
+    for index = #chats, 1, -1 do
+      local id = chats[index][1]; local mid = id .. ":m:" .. round
+      append(store, fact(id .. ":start:" .. round, id, "message_started", { message_id = mid, role = round % 2 == 0 and "assistant" or "user" }))
+    end
+    for index, chat in ipairs(chats) do
+      local id = chat[1]; local mid = id .. ":m:" .. round
+      append(store, fact(id .. ":chunk:" .. round, id, "content_chunk_appended", { message_id = mid, chunk = { kind = "text", data = id .. ":" .. round } }))
+      append(store, fact(id .. ":complete:" .. round, id, "message_completed", { message_id = mid }))
+    end
+  end
+  for _, chat in ipairs(chats) do
+    local conversation = store:get(chat[1]); eq(conversation.last_sequence, 13); eq(#conversation.messages, 4)
+    eq(conversation.provenance.purpose, chat[2]); eq(conversation.messages[3].chunks[1].data, chat[1] .. ":3")
+    for _, message in ipairs(conversation.messages) do if message.id:sub(1, #chat[1]) ~= chat[1] then fail("cross-chat message leakage") end end
+  end
+  local listed = store:list(); eq(#listed, 5); eq(listed[1].id, "agent-a", "neutral list is deterministic")
+  listed[1].messages[1].chunks[1].data = "mutated"
+  eq(store:get("agent-a").messages[1].chunks[1].data, "agent-a:1", "reads cannot mutate store")
+end
+
+print("conversation_manager_domain_test: all assertions passed")
