@@ -9547,8 +9547,8 @@ fn completed_preview_remains_inspectable_after_linger_and_is_bounded_to_latest_r
 }
 
 #[test]
-fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
-    let mut engine = Engine::new(110, 30).expect("engine");
+fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
+    let mut engine = Engine::new(110, 48).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     advertise_preview(
         &mut engine,
@@ -9559,7 +9559,9 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
                 "reasoning": { "kind": "value", "value": { "binding": "item", "name": "text" }, "format": "reasoning", "style": "reasoning" },
                 "assistant": { "kind": "markdown", "value": { "binding": "item", "name": "text" } },
                 "tool_call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
-                "tool_result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" }
+                "tool_result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" },
+                "call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
+                "result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" }
             } }
         }),
         json!({ "transcript": { "kind": "stream", "schema": "table" } }),
@@ -9574,11 +9576,19 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
         ),
         (
             4,
-            json!({ "kind": "tool_call", "value": { "id": "call-1", "name": "read_file", "arguments": { "path": "/a/complete/path" } } }),
+            json!({ "kind": "tool_call", "value": { "id": "call-1", "name": "skill", "arguments": { "name": ["dev"], "debug_wrapper": "CALL-WRAPPER-MUST-STAY-HIDDEN" } } }),
         ),
         (
             5,
-            json!({ "kind": "tool_result", "value": { "tool_call_id": "call-1", "content": "complete result body" } }),
+            json!({ "kind": "tool_result", "value": { "id": "call-1", "name": "skill", "output": "# Dev skill\nLARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN\nfull workflow body" } }),
+        ),
+        (
+            6,
+            json!({ "kind": "call", "value": { "id": "discover-raw-id", "name": "discover_instruction_files", "arguments": { "path": "/project", "scope": "auto" } } }),
+        ),
+        (
+            7,
+            json!({ "kind": "result", "value": { "id": "discover-raw-id", "name": "discover_instruction_files", "output": "CLAUDE.md\nLARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN\n" } }),
         ),
     ] {
         dispatch_event(
@@ -9594,9 +9604,11 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
         "▸ reasoning",
         "Answer",
         "complete prose",
-        "▸ read_file · call-1",
-        "path: string",
-        "✓ tool result · call-1",
+        "▸ skill",
+        "name: array",
+        "✓ skill · completed",
+        "▸ discover_instruction_files",
+        "✓ discover_instruction_files · completed",
         "hidden",
     ] {
         assert!(
@@ -9606,8 +9618,12 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
     }
     for hidden in [
         "reason continued",
-        "/a/complete/path",
-        "complete result body",
+        "call-1",
+        "discover-raw-id",
+        "CALL-WRAPPER-MUST-STAY-HIDDEN",
+        "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
+        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+        "full workflow body",
     ] {
         assert!(
             !frame.contains(hidden),
@@ -9621,12 +9637,66 @@ fn transcript_preview_coalesces_deltas_and_renders_readable_tools() {
     let expanded = render_snapshot(&mut engine);
     for expected in [
         "reason continued",
-        "/a/complete/path",
-        "complete result body",
+        "call-1",
+        "discover-raw-id",
+        "CALL-WRAPPER-MUST-STAY-HIDDEN",
+        "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
+        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+        "full workflow body",
     ] {
         assert!(
             expanded.contains(expected),
             "expanded transcript lost {expected:?}:\n{expanded}"
+        );
+    }
+
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("collapse node details");
+    engine
+        .handle_key(key("escape"))
+        .expect("close node inspector");
+    engine.handle_key(key("up")).expect("select group");
+    engine
+        .handle_key(key("space"))
+        .expect("open group inspector");
+    let group = render_snapshot(&mut engine);
+    for expected in [
+        "chronological activity",
+        "▸ skill",
+        "✓ skill · completed",
+        "▸ discover_instruction_files",
+        "✓ discover_instruction_files · completed",
+    ] {
+        assert!(
+            group.contains(expected),
+            "group preview lost {expected:?}:\n{group}"
+        );
+    }
+    for hidden in [
+        "call-1",
+        "discover-raw-id",
+        "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
+        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+    ] {
+        assert!(
+            !group.contains(hidden),
+            "default group preview leaked {hidden:?}:\n{group}"
+        );
+    }
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("expand group details");
+    let detailed_group = render_snapshot(&mut engine);
+    for expected in [
+        "call-1",
+        "discover-raw-id",
+        "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
+        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+    ] {
+        assert!(
+            detailed_group.contains(expected),
+            "detailed group preview lost {expected:?}:\n{detailed_group}"
         );
     }
 }

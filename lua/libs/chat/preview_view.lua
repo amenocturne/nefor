@@ -64,11 +64,13 @@ local function tool_value(value, result, ctx)
   local original, name, id, args = tool_parts(value)
   if result then
     local output = original.output or original.result or original.content or original.value or original
-    local label = "✓ tool result" .. (id and (" · " .. tostring(id)) or "")
-    if not expanded then return label .. " · " .. size_text(value_size(output)) .. " hidden" end
-    return label .. "\n" .. encode(output)
+    local label = "✓ " .. tostring(name or "tool")
+    if not expanded then
+      return label .. " · completed · " .. size_text(value_size(output)) .. " hidden"
+    end
+    return label .. (id and (" · " .. tostring(id)) or "") .. "\n" .. encode(output)
   end
-  local label = "▸ " .. tostring(name or "tool") .. (id and (" · " .. tostring(id)) or "")
+  local label = "▸ " .. tostring(name or "tool")
   if not expanded then
     local display = require("libs.chat.tool_display")
     local contract = type(ctx.state.tool_displays) == "table"
@@ -203,11 +205,13 @@ function M.activity(item, state, node, is_last)
     return tui.text { content = reasoning_value(value.text, {
       state = state, node = node or {}, is_last = is_last,
     }), style = STYLE.reasoning, wrap = "word" }
-  elseif kind == "tool_call" or kind == "tool_result" then
-    return tui.text { content = tool_value(value.value, kind == "tool_result", {
+  elseif kind == "tool_call" or kind == "call"
+      or kind == "tool_result" or kind == "result" or kind == "error" then
+    local result = kind == "tool_result" or kind == "result" or kind == "error"
+    return tui.text { content = tool_value(value.value, result, {
       state = state, node = node or {},
-    }), style = kind == "tool_result" and STYLE.status_ok or STYLE.system,
-      wrap = "word" }
+    }), style = result and (kind == "error" and STYLE.tool_error or STYLE.status_ok)
+      or STYLE.system, wrap = "word" }
   end
   local label = kind or item.binding
   local content
