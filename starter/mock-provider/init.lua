@@ -874,7 +874,6 @@ local function complete_request(body)
     local remaining = resp.pre_delay_ms
     while remaining > 0 do
       if run.cancelled then
-        nefor.emit("completion.event", { request_id = chat_id, event = "error", message = "interrupted" })
         if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
         return
       end
@@ -915,7 +914,6 @@ local function complete_request(body)
   -- persisted after this handler returns.
   if not completed then
     if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
-    nefor.emit("completion.event", { request_id = chat_id, event = "error", message = "interrupted" })
     return
   end
 
