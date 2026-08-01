@@ -331,6 +331,10 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
     );
     dispatch_event(
         &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "concealed replay fixture" }),
+    );
+    dispatch_event(
+        &mut engine,
         json!({ "kind": "sessions.replay.progress", "session_id": "resume-1", "replayed": 64, "total": 200 }),
     );
     dispatch_event(
@@ -341,6 +345,10 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
     assert!(
         progress.contains("64/200"),
         "progress must not regress: {progress:?}"
+    );
+    assert!(
+        !progress.contains("concealed replay fixture"),
+        "replayed history must remain concealed while progress paints: {progress:?}"
     );
 
     dispatch_event(
@@ -369,6 +377,10 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
     assert!(
         !done.contains("rebuilding session"),
         "resume_done must restore normal input: {done:?}"
+    );
+    assert!(
+        done.contains("concealed replay fixture"),
+        "resume_done must reveal the transcript reconstructed during loading: {done:?}"
     );
 }
 

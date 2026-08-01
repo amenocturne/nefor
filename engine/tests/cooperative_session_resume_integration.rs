@@ -336,6 +336,12 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
                 frame.contains("loading session") && frame.contains("rebuilding session"),
                 "partial frame must remain visibly unavailable: {frame:?}"
             );
+            for message in &replayed_messages {
+                assert!(
+                    !frame.contains(message),
+                    "partial progress frame must conceal replayed fixture history {message:?}: {frame:?}"
+                );
+            }
             assert!(
                 !lifecycle
                     .iter()
@@ -439,6 +445,10 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
     assert!(
         !completed.contains("rebuilding session"),
         "input must be restored after resume_done"
+    );
+    assert!(
+        completed.contains(expected_messages.last().expect("final fixture message")),
+        "completed frame must reveal the resumed transcript tail: {completed:?}"
     );
 
     shutdown.shutdown(0).await;

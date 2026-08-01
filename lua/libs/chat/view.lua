@@ -77,14 +77,15 @@ local function transcript(state)
   if state.in_flight == nil and not state.pending and not state.replay_mode then
     empty_view = statusline.welcome_banner
   end
+  local concealed = state.resume_loading ~= nil
   return W.chat.view({
-    key          = "transcript",
-    entries      = function() return state.entries or {} end,
+    key          = concealed and "transcript-loading" or "transcript",
+    entries      = function() return concealed and {} or (state.entries or {}) end,
     render_entry = function(e, i)
       local queued = (state.queued_entry_idx == i)
       return entries_mod.render(e, i, state.expanded_details, queued, state.raw_tool_id)
     end,
-    append       = thinking_widget(state),
+    append       = concealed and nil or thinking_widget(state),
     empty_view   = empty_view,
   })
 end
