@@ -15,6 +15,7 @@
 //! chat-completions SSE parser.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::{
     AuthSnapshot, AuthState, AuthStore, LoginLease, LoginStartOutcome, LogoutOutcome,
@@ -823,9 +824,59 @@ fn spawn_usage_fetch(
     });
 }
 
+#[derive(Clone)]
+struct DirectCompletion {
+    owner: u64,
+    chats: Arc<Chats>,
+    chat_id: ChatId,
+}
+
+#[derive(Default)]
+struct DirectCompletions {
+    runs: Mutex<HashMap<String, DirectCompletion>>,
+    next_owner: AtomicU64,
+}
+
+impl DirectCompletions {
+    async fn begin(
+        &self,
+        request_id: String,
+        chats: Arc<Chats>,
+        chat_id: ChatId,
+    ) -> Result<DirectCompletion, String> {
+        let mut runs = self.runs.lock().await;
+        if runs.contains_key(&request_id) {
+            return Err(format!(
+                "completion request `{request_id}` is already in flight"
+            ));
+        }
+        let run = DirectCompletion {
+            owner: self.next_owner.fetch_add(1, Ordering::Relaxed),
+            chats,
+            chat_id,
+        };
+        runs.insert(request_id, run.clone());
+        Ok(run)
+    }
+
+    async fn get(&self, request_id: &str) -> Option<DirectCompletion> {
+        self.runs.lock().await.get(request_id).cloned()
+    }
+
+    async fn finish(&self, request_id: &str, owner: u64) -> bool {
+        let mut runs = self.runs.lock().await;
+        if runs.get(request_id).is_some_and(|run| run.owner == owner) {
+            runs.remove(request_id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Shared state threaded through every dispatch handler. Bundles the
-/// seven Arc'd singletons that every event path needs so function
-/// signatures stay short.
+/// shared dependencies that every event path needs so function signatures
+/// stay short.
 #[derive(Clone)]
 pub struct DispatcherContext {
     pub args: Arc<ServeArgs>,
@@ -835,6 +886,30 @@ pub struct DispatcherContext {
     pub broker: Arc<ToolBroker>,
     pub responses_client: Arc<ResponsesClient>,
     pub out_tx: mpsc::Sender<PluginOutgoing>,
+    direct_completions: Arc<DirectCompletions>,
+}
+
+impl DispatcherContext {
+    pub fn new(
+        args: Arc<ServeArgs>,
+        chats: Arc<Chats>,
+        auth: Arc<AuthStore>,
+        catalog: Arc<ToolCatalog>,
+        broker: Arc<ToolBroker>,
+        responses_client: Arc<ResponsesClient>,
+        out_tx: mpsc::Sender<PluginOutgoing>,
+    ) -> Self {
+        Self {
+            args,
+            chats,
+            auth,
+            catalog,
+            broker,
+            responses_client,
+            out_tx,
+            direct_completions: Arc::new(DirectCompletions::default()),
+        }
+    }
 }
 
 /// Top-level event loop. Returns on `Body::System(Shutdown)`, stdin
@@ -961,12 +1036,13 @@ async fn dispatch_event(
         "completion.request" => handle_completion_request(ctx, body).await,
         "completion.cancel" => {
             if let Some(request_id) = read_request_id(body) {
-                if !ctx
-                    .chats
-                    .cancel_turn(&ChatId::new(request_id.clone()))
-                    .await
-                {
-                    tracing::debug!(%request_id, "completion.cancel for unknown or finished request; no-op");
+                let owned = ctx.direct_completions.get(&request_id).await;
+                if let Some(owned) = owned {
+                    if !owned.chats.cancel_turn(&owned.chat_id).await {
+                        tracing::debug!(%request_id, "completion.cancel for finished request; no-op");
+                    }
+                } else {
+                    tracing::debug!(%request_id, "completion.cancel for unknown request; no-op");
                 }
             }
             Ok(())
@@ -1446,13 +1522,18 @@ async fn handle_completion_request(
             return Ok(());
         }
     };
-    if let Err(error) = ctx
-        .chats
+    let system = body
+        .get("system")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let direct_chats = Arc::new(Chats::with_default_model(ctx.chats.default_model().await));
+    if let Err(error) = direct_chats
         .restore_messages(MessageRestore {
             id: chat_id.clone(),
             model,
             routing_session_id,
-            system: None,
+            system,
             tool_overrides,
             tool_allowlist: None,
             reasoning_effort,
@@ -1466,7 +1547,7 @@ async fn handle_completion_request(
         .await?;
         return Ok(());
     }
-    let cancel = match ctx.chats.begin_turn(&chat_id).await {
+    let cancel = match direct_chats.begin_turn(&chat_id).await {
         Ok(cancel) => cancel,
         Err(error) => {
             send_completion_event(ctx, Some(&request_id), "failed", |event| {
@@ -1476,12 +1557,29 @@ async fn handle_completion_request(
             return Ok(());
         }
     };
+    let completion = match ctx
+        .direct_completions
+        .begin(request_id.clone(), direct_chats.clone(), chat_id.clone())
+        .await
+    {
+        Ok(completion) => completion,
+        Err(error) => {
+            direct_chats.end_turn(&chat_id).await;
+            send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                event.insert("error".into(), Value::String(error));
+            })
+            .await?;
+            return Ok(());
+        }
+    };
+    let mut direct_ctx = ctx.clone();
+    direct_ctx.chats = direct_chats;
     spawn_turn(
-        ctx.clone(),
+        direct_ctx,
         chat_id,
         cancel,
         body.get("output_schema").cloned(),
-        true,
+        Some((request_id, completion)),
     );
     Ok(())
 }
@@ -1814,7 +1912,7 @@ async fn handle_chat_complete(
         }
     };
     let output_schema = body.get("output_schema").cloned();
-    spawn_turn(ctx.clone(), chat_id, cancel, output_schema, false);
+    spawn_turn(ctx.clone(), chat_id, cancel, output_schema, None);
     Ok(())
 }
 
@@ -2334,7 +2432,7 @@ fn spawn_turn(
     chat_id: ChatId,
     cancel: TurnToken,
     output_schema: Option<Value>,
-    delete_when_done: bool,
+    direct_request: Option<(String, DirectCompletion)>,
 ) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -3003,8 +3101,8 @@ fn spawn_turn(
         // lands.
         if cancel.is_suppressed() {
             ctx.chats.end_turn(&chat_id).await;
-            if delete_when_done {
-                let _ = ctx.chats.delete(&chat_id).await;
+            if let Some((request_id, owner)) = &direct_request {
+                ctx.direct_completions.finish(request_id, owner.owner).await;
             }
             return;
         }
@@ -3065,8 +3163,8 @@ fn spawn_turn(
         let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
 
         ctx.chats.end_turn(&chat_id).await;
-        if delete_when_done {
-            let _ = ctx.chats.delete(&chat_id).await;
+        if let Some((request_id, owner)) = &direct_request {
+            ctx.direct_completions.finish(request_id, owner.owner).await;
         }
     });
 }
@@ -3111,6 +3209,44 @@ mod tests {
             provider_name: "chatgpt".into(),
             base_url: "https://example.invalid".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn direct_completions_are_owner_aware_and_isolated() {
+        let runs = DirectCompletions::default();
+        let chats_a = Arc::new(Chats::with_default_model(Some("model".into())));
+        let chats_b = Arc::new(Chats::with_default_model(Some("model".into())));
+        let first = runs
+            .begin("same".into(), chats_a.clone(), ChatId::new("same"))
+            .await
+            .expect("first");
+        let other = runs
+            .begin("other".into(), chats_b, ChatId::new("other"))
+            .await
+            .expect("other");
+
+        assert!(runs
+            .begin("same".into(), chats_a, ChatId::new("same"))
+            .await
+            .is_err());
+        assert!(runs.finish("same", first.owner).await);
+        let replacement = runs
+            .begin(
+                "same".into(),
+                Arc::new(Chats::with_default_model(Some("model".into()))),
+                ChatId::new("same"),
+            )
+            .await
+            .expect("safe reuse");
+        assert!(
+            !runs.finish("same", first.owner).await,
+            "stale cleanup cannot remove replacement"
+        );
+        assert_eq!(
+            runs.get("same").await.expect("replacement").owner,
+            replacement.owner
+        );
+        assert_eq!(runs.get("other").await.expect("other").owner, other.owner);
     }
 
     #[test]

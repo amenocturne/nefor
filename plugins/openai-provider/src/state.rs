@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -30,9 +30,22 @@ use tokio_util::sync::CancellationToken;
 /// This registry is deliberately separate from `Chats`: a direct request
 /// already contains its complete history and must not create durable provider
 /// state or participate in chat replay.
+#[derive(Debug, Clone)]
+pub struct CompletionRun {
+    owner: u64,
+    cancel: CancellationToken,
+}
+
+impl CompletionRun {
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+}
+
 #[derive(Default)]
 pub struct CompletionRuns {
-    inner: Mutex<HashMap<String, CancellationToken>>,
+    inner: Mutex<HashMap<String, CompletionRun>>,
+    next_owner: AtomicU64,
 }
 
 impl CompletionRuns {
@@ -40,26 +53,38 @@ impl CompletionRuns {
         Self::default()
     }
 
-    pub async fn begin(&self, request_id: String) -> Result<CancellationToken, String> {
+    pub async fn begin(&self, request_id: String) -> Result<CompletionRun, String> {
         let mut runs = self.inner.lock().await;
         if runs.contains_key(&request_id) {
             return Err(format!(
                 "completion request `{request_id}` is already in flight"
             ));
         }
-        let cancel = CancellationToken::new();
-        runs.insert(request_id, cancel.clone());
-        Ok(cancel)
+        let run = CompletionRun {
+            owner: self.next_owner.fetch_add(1, Ordering::Relaxed),
+            cancel: CancellationToken::new(),
+        };
+        runs.insert(request_id, run.clone());
+        Ok(run)
     }
 
-    pub async fn finish(&self, request_id: &str) {
-        self.inner.lock().await.remove(request_id);
+    pub async fn finish(&self, request_id: &str, run: &CompletionRun) -> bool {
+        let mut runs = self.inner.lock().await;
+        if runs
+            .get(request_id)
+            .is_some_and(|live| live.owner == run.owner)
+        {
+            runs.remove(request_id);
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn cancel(&self, request_id: &str) -> bool {
-        let cancel = self.inner.lock().await.remove(request_id);
-        if let Some(cancel) = cancel {
-            cancel.cancel();
+        let runs = self.inner.lock().await;
+        if let Some(run) = runs.get(request_id) {
+            run.cancel.cancel();
             true
         } else {
             false
@@ -792,31 +817,43 @@ mod tests {
     use crate::openai::{ToolCall, ToolCallFunction};
 
     #[tokio::test]
-    async fn completion_runs_cancel_only_the_matching_request_and_allow_restart() {
+    async fn completion_runs_hold_cancelled_ids_until_owned_cleanup() {
         let runs = CompletionRuns::new();
         let first = runs.begin("req-1".into()).await.expect("first request");
         let second = runs.begin("req-2".into()).await.expect("second request");
 
         assert!(runs.cancel("req-1").await);
-        assert!(first.is_cancelled());
-        assert!(!second.is_cancelled());
-        assert!(!runs.cancel("req-1").await, "late cancel is a no-op");
+        assert!(first.cancellation_token().is_cancelled());
+        assert!(!second.cancellation_token().is_cancelled());
+        assert!(
+            runs.begin("req-1".into()).await.is_err(),
+            "cancelled id stays reserved until its task finishes"
+        );
+        assert!(!runs.cancel("missing").await);
 
-        let restarted = runs
+        assert!(runs.finish("req-1", &first).await);
+        let replacement = runs
             .begin("req-1".into())
             .await
-            .expect("request id is reusable after cancellation");
-        assert!(!restarted.is_cancelled());
-        runs.finish("req-1").await;
-        runs.finish("req-2").await;
+            .expect("request id is reusable after owned cleanup");
+        assert!(
+            !runs.finish("req-1", &first).await,
+            "stale cleanup cannot detach the replacement"
+        );
+        assert!(runs.cancel("req-1").await);
+        assert!(replacement.cancellation_token().is_cancelled());
+        assert!(!second.cancellation_token().is_cancelled());
+
+        assert!(runs.finish("req-1", &replacement).await);
+        assert!(runs.finish("req-2", &second).await);
     }
 
     #[tokio::test]
     async fn completion_runs_reject_duplicate_inflight_ids_but_not_finished_ids() {
         let runs = CompletionRuns::new();
-        runs.begin("req".into()).await.expect("begin");
+        let run = runs.begin("req".into()).await.expect("begin");
         assert!(runs.begin("req".into()).await.is_err());
-        runs.finish("req").await;
+        assert!(runs.finish("req", &run).await);
         assert!(runs.begin("req".into()).await.is_ok());
     }
 

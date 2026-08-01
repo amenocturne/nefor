@@ -106,15 +106,15 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
 
     emit_startup_events(&args, &auth, &chats, &responses_client, &out_tx).await?;
 
-    let ctx = DispatcherContext {
-        args: args.clone(),
+    let ctx = DispatcherContext::new(
+        args.clone(),
         chats,
         auth,
         catalog,
         broker,
         responses_client,
-        out_tx: out_tx.clone(),
-    };
+        out_tx.clone(),
+    );
     run_dispatch_loop(ctx, in_rx).await?;
 
     emit_goodbye(&args, &out_tx, "stream closed").await;

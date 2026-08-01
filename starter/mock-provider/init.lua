@@ -135,7 +135,7 @@ local FINAL_RELAY_PREFIX = ""
 --
 -- The marker shape comes from `agentic-loop.results.format_deferred`;
 -- the ack text from lead-workflow's mag execute tool.result.
-local DEFERRED_RESULT_MARKER = "%[mag_run%(run_id="
+local DEFERRED_RESULT_MARKER = "%[mag_run%([^)]*run_id="
 local DEFERRED_FAILURE_MARKER = "%[mag_run%(run_id=[^)]*%) FAILED%]"
 local SUBMITTED_ACK_MARKER = "submitted to the MAG actor kernel"
 
@@ -284,8 +284,8 @@ local function flatten_content(content)
   return table.concat(parts, " ")
 end
 
-local function pick_response_for(chat_id)
-  local history = chats[chat_id] or {}
+local function pick_response_for(history)
+  history = history or {}
 
   -- Find the most recent user message and detect whether a tool message
   -- has landed (chat-orchestrator wrap node, second turn).
@@ -725,14 +725,19 @@ end
 -- chunk boundary and break early. Keyed by chat_id so concurrent chats
 -- (one per active kernel actor) don't mistakenly cancel each other.
 local interrupted = {}
+local completion_runs = {}
 
-local function emit_reasoning(chat_id, id)
+local function is_cancelled(cancellation, request_id)
+  return cancellation.cancelled or cancellation[request_id]
+end
+
+local function emit_reasoning(chat_id, id, cancellation)
   -- Emit reasoning chunks ahead of the content stream, then a
   -- reasoning_end carrying the full accumulated text. Mirrors what
   -- openai-provider does on a real Qwen 3 turn.
   local full = ""
   for i, chunk in ipairs(CANNED_REASONING_CHUNKS) do
-    if interrupted[chat_id] then return false end
+    if is_cancelled(cancellation, chat_id) then return false end
     full = full .. chunk
     nefor.emit("stream.reasoning_delta", {
       id      = id,
@@ -741,7 +746,7 @@ local function emit_reasoning(chat_id, id)
     })
     if i < #CANNED_REASONING_CHUNKS then pace() end
   end
-  if interrupted[chat_id] then return false end
+  if is_cancelled(cancellation, chat_id) then return false end
   nefor.emit("stream.reasoning_end", {
     id          = id,
     chat_id     = chat_id,
@@ -752,24 +757,17 @@ local function emit_reasoning(chat_id, id)
 end
 
 -- Emit the full response stream. Returns `(completed, partial)` where
--- `completed` is true if the stream ran to completion, false if
--- `interrupted[chat_id]` flipped mid-stream; `partial` is the substring
--- actually emitted as `stream.delta` chunks so far (the full text on
--- completion, the prefix-up-to-the-cancel-boundary on interrupt). The
--- caller persists `partial` into the chat history so the next turn's
--- context shows what the model said before being cut off — mirrors
--- openai-provider's `outcome.full_text` push on `outcome.interrupted`
--- (plugins/openai-provider/src/main.rs:751-755). Without this, the
--- model on the next turn has no record of its own interrupted attempt,
--- so the user's "you started thinking wrongly" follow-up has nothing
--- to anchor against.
-local function emit_stream(chat_id, text, opts)
+-- `completed` is true if the stream ran to completion and `partial` is
+-- the substring emitted before cancellation. Direct requests discard that
+-- request-local partial value when the handler returns.
+local function emit_stream(chat_id, text, opts, cancellation)
   if type(text) ~= "string" or #text == 0 then return true, "" end
   opts = opts or {}
+  cancellation = cancellation or interrupted
   local id = "resp-" .. chat_id
 
   if opts.with_reasoning then
-    if not emit_reasoning(chat_id, id) then return false, "" end
+    if not emit_reasoning(chat_id, id, cancellation) then return false, "" end
   end
 
   -- Stream the response in small fixed-size chunks paced to ~200 tok/s
@@ -782,7 +780,7 @@ local function emit_stream(chat_id, text, opts)
   local cp_i = 1
   local emitted = ""
   while cp_i <= cp_count do
-    if interrupted[chat_id] then return false, emitted end
+    if is_cancelled(cancellation, chat_id) then return false, emitted end
     local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
     local byte_start = utf8.offset(text, cp_i)
     local byte_after_stop = utf8.offset(text, cp_stop + 1)
@@ -797,7 +795,7 @@ local function emit_stream(chat_id, text, opts)
     cp_i = cp_stop + 1
     if cp_i <= cp_count then pace() end
   end
-  if interrupted[chat_id] then return false, emitted end
+  if is_cancelled(cancellation, chat_id) then return false, emitted end
   nefor.emit("stream.end", {
     id            = id,
     chat_id       = chat_id,
@@ -825,12 +823,12 @@ local function complete_request(body)
   local request = type(body.request) == "table" and body.request or body
   local input = type(request.input) == "table" and request.input or {}
   local messages = type(input.messages) == "table" and input.messages or request.messages
-  chats[chat_id] = {}
+  local history = {}
   if type(request.system) == "string" and #request.system > 0 then
-    table.insert(chats[chat_id], { role = "system", content = request.system })
+    table.insert(history, { role = "system", content = request.system })
   end
   for _, message in ipairs(type(messages) == "table" and messages or {}) do
-    table.insert(chats[chat_id], {
+    table.insert(history, {
       role         = message.role,
       content      = flatten_content(message.content),
       tool_call_id = message.tool_call_id,
@@ -838,13 +836,18 @@ local function complete_request(body)
     })
   end
 
-  -- Clear any leftover interrupt flag from a prior turn on this
-  -- chat_id; the flag is set by the `<NAME>.interrupt` handler when
-  -- /cancel fires mid-stream and is consumed by emit_stream's per-
-  -- chunk check below.
-  interrupted[chat_id] = nil
+  if completion_runs[chat_id] then
+    nefor.emit("completion.event", {
+      request_id = chat_id,
+      event = "error",
+      message = "completion request `" .. chat_id .. "` is already in flight",
+    })
+    return
+  end
+  local run = { cancelled = false }
+  completion_runs[chat_id] = run
 
-  local resp = pick_response_for(chat_id)
+  local resp = pick_response_for(history)
   -- The starter's agent boundary is typed: successful terminal text must be
   -- a bare JSON FinalAnswer value. Tool-call and error turns use their own
   -- wire shapes and deliberately bypass this encoding. Keep `resp.text`
@@ -870,9 +873,9 @@ local function complete_request(body)
   if pacing_enabled() and type(resp.pre_delay_ms) == "number" and resp.pre_delay_ms > 0 then
     local remaining = resp.pre_delay_ms
     while remaining > 0 do
-      if interrupted[chat_id] then
+      if run.cancelled then
         nefor.emit("completion.event", { request_id = chat_id, event = "error", message = "interrupted" })
-        if not chats[chat_id] then chats[chat_id] = {} end
+        if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
         return
       end
       local slice = remaining > 100 and 100 or remaining
@@ -891,13 +894,7 @@ local function complete_request(body)
       event = "error",
       message = resp.error_message or "mock provider error",
     })
-    -- Echo the assistant turn into history so subsequent turns see
-    -- the failed attempt; content stays empty.
-    if not chats[chat_id] then chats[chat_id] = {} end
-    table.insert(chats[chat_id], {
-      role    = "assistant",
-      content = "",
-    })
+    if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
     return
   end
 
@@ -909,34 +906,16 @@ local function complete_request(body)
   -- before the loop ran out (full text on completion, cancel-boundary
   -- prefix on interrupt — used to seed history below).
   local completed = true
-  local partial = ""
   if type(resp.text) == "string" and #resp.text > 0 then
-    completed, partial = emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning })
+    completed = emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning }, run)
   end
 
-  -- Cancelled mid-stream: emit `<name>.chat.error` with msg "interrupted"
-  -- so the wrapper translates it into a `[interrupted]` system message
-  -- (mirrors openai-provider's turn.error("interrupted") path) and skip
-  -- the result wire — the agentic-loop's pending entry closes via
-  -- chat.error → tool.result{error="interrupted"}.
-  --
-  -- Persist `partial` (the prefix actually streamed before the cancel
-  -- flag flipped) into chat history so the NEXT turn's `pick_response_for`
-  -- — and any real-LLM equivalent — sees what the model said before
-  -- being cut off. Without this, a "/cancel + 'you were thinking
-  -- wrong'" follow-up has no anchor in context. Mirrors openai-
-  -- provider's push_assistant on outcome.interrupted
-  -- (plugins/openai-provider/src/main.rs around line 751). Skip the
-  -- push entirely when the cancel landed before any chunks (partial
-  -- empty) — an empty assistant message confuses both the OpenAI wire
-  -- shape (content: null vs "") and any history-walking heuristic.
+  -- Cancelled mid-stream: emit an interrupted completion event and skip
+  -- the result wire. Direct completion history is request-local and is not
+  -- persisted after this handler returns.
   if not completed then
-    interrupted[chat_id] = nil
+    if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
     nefor.emit("completion.event", { request_id = chat_id, event = "error", message = "interrupted" })
-    if not chats[chat_id] then chats[chat_id] = {} end
-    if type(partial) == "string" and #partial > 0 then
-      table.insert(chats[chat_id], { role = "assistant", content = partial })
-    end
     return
   end
 
@@ -967,22 +946,15 @@ local function complete_request(body)
     result     = output,
   })
 
-  -- Echo the assistant turn into our local history so subsequent
-  -- chat.complete calls (cycle re-fires) see it.
-  if not chats[chat_id] then chats[chat_id] = {} end
-  table.insert(chats[chat_id], {
-    role       = "assistant",
-    content    = result_text or "",
-    tool_calls = resp.tool_calls,
-  })
+  if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
 end
 
 nefor.on(NAME .. ".completion.request", complete_request)
 
 nefor.on(NAME .. ".completion.cancel", function(body)
   local request_id = body and body.request_id
-  if type(request_id) == "string" then
-    interrupted[request_id] = true
+  if type(request_id) == "string" and completion_runs[request_id] then
+    completion_runs[request_id].cancelled = true
     nefor.log("completion.cancel request_id=" .. request_id)
   end
 end)
@@ -1017,6 +989,7 @@ end)
 nefor.on(NAME .. ".reset", function()
   chats = {}
   interrupted = {}
+  completion_runs = {}
 end)
 
 -- Tool-result accumulation is handled kernel-side (the tool-result

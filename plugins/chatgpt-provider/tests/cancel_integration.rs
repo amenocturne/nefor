@@ -130,13 +130,15 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     let addr = listener.local_addr().expect("addr");
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_srv = hits.clone();
+    let (request_tx, mut request_rx) = mpsc::channel::<String>(2);
 
     let server = tokio::spawn(async move {
         // conn1: send only the response headers, then hold the byte
         // stream open until the client aborts the connection (cancel
         // drops the reqwest stream → EOF here).
         let (mut s1, _) = listener.accept().await.expect("accept 1");
-        let _ = read_request(&mut s1).await;
+        let request = read_request(&mut s1).await;
+        let _ = request_tx.send(request).await;
         hits_srv.fetch_add(1, Ordering::SeqCst);
         let headers =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
@@ -151,7 +153,8 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
 
         // conn2: full streaming response with a delta + completion.
         let (mut s2, _) = listener.accept().await.expect("accept 2");
-        let _ = read_request(&mut s2).await;
+        let request = read_request(&mut s2).await;
+        let _ = request_tx.send(request).await;
         hits_srv.fetch_add(1, Ordering::SeqCst);
         let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n\
                     data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
@@ -188,15 +191,7 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     ));
 
     let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(256);
-    let ctx = DispatcherContext {
-        args,
-        chats,
-        auth,
-        catalog,
-        broker,
-        responses_client,
-        out_tx,
-    };
+    let ctx = DispatcherContext::new(args, chats, auth, catalog, broker, responses_client, out_tx);
 
     let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
     let loop_handle = tokio::spawn(run_dispatch_loop(ctx, in_rx));
@@ -206,7 +201,8 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
         .send(Ok(event_env(
             &kind("completion.request"),
             &[
-                ("request_id", Value::String("c1".into())),
+                ("request_id", Value::String("shared-id".into())),
+                ("system", Value::String("top-level system".into())),
                 ("model", Value::String("test-model".into())),
                 (
                     "messages",
@@ -225,12 +221,41 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
         spin_until(&hits, 1, Duration::from_secs(5)).await,
         "c1 completion should POST to the backend",
     );
+    let request = request_rx.recv().await.expect("captured request");
+    assert_eq!(
+        request.matches("top-level system").count(),
+        1,
+        "top-level system prompt must occur exactly once: {request}"
+    );
+    assert_eq!(
+        request.matches("be concise").count(),
+        1,
+        "inline system prompt must occur exactly once: {request}"
+    );
+
+    // A persistent chat may use the same id without replacing or owning
+    // the request-local completion state.
+    in_tx
+        .send(Ok(event_env(
+            &kind("chat.create"),
+            &[
+                ("chat_id", Value::String("shared-id".into())),
+                ("model", Value::String("chat-model".into())),
+                ("system", Value::String("persistent system".into())),
+            ],
+        )))
+        .await
+        .expect("create colliding persistent chat");
+    let created = wait_for_kind(&mut out_rx, &kind("chat.created"), Duration::from_secs(1))
+        .await
+        .expect("colliding chat id remains available");
+    assert_eq!(created["chat_id"], "shared-id");
 
     // --- 2. cancel c1, plus an unknown-id cancel (must be a no-op) ---
     in_tx
         .send(Ok(event_env(
             &kind("completion.cancel"),
-            &[("request_id", Value::String("c1".into()))],
+            &[("request_id", Value::String("shared-id".into()))],
         )))
         .await
         .expect("send cancel c1");
@@ -353,19 +378,19 @@ async fn clean_eof_requires_terminal_event_and_next_submissions_settle() {
     );
     let _ = auth.apply_auth_set("test-token".into()).await;
     let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(256);
-    let ctx = DispatcherContext {
+    let ctx = DispatcherContext::new(
         args,
         chats,
         auth,
-        catalog: Arc::new(ToolCatalog::new()),
-        broker: Arc::new(ToolBroker::new()),
-        responses_client: Arc::new(ResponsesClient::new(
+        Arc::new(ToolCatalog::new()),
+        Arc::new(ToolBroker::new()),
+        Arc::new(ResponsesClient::new(
             format!("http://{addr}"),
             "test-installation".into(),
             "nefor_test".into(),
         )),
         out_tx,
-    };
+    );
     let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
     let loop_handle = tokio::spawn(run_dispatch_loop(ctx, in_rx));
 

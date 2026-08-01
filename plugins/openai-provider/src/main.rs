@@ -941,7 +941,7 @@ async fn dispatch_completion_request(
             return Ok(());
         }
     };
-    if !request_history_has_model_input(&messages) {
+    if !completion_request_has_model_input(&messages) {
         send_event(
             out_tx,
             completion_error_body(
@@ -952,14 +952,16 @@ async fn dispatch_completion_request(
         .await?;
         return Ok(());
     }
+    let messages = completion_request_messages(body, messages);
 
-    let cancel = match completions.begin(request_id.clone()).await {
-        Ok(cancel) => cancel,
+    let run = match completions.begin(request_id.clone()).await {
+        Ok(run) => run,
         Err(message) => {
             send_event(out_tx, completion_error_body(&request_id, &message)).await?;
             return Ok(());
         }
     };
+    let cancel = run.cancellation_token();
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -967,7 +969,7 @@ async fn dispatch_completion_request(
         .map(str::to_owned)
         .or_else(|| config.model.clone());
     let Some(model) = model else {
-        completions.finish(&request_id).await;
+        completions.finish(&request_id, &run).await;
         send_event(
             out_tx,
             completion_error_body(&request_id, "no model configured"),
@@ -1060,7 +1062,7 @@ async fn dispatch_completion_request(
         )
         .await;
 
-        completions.finish(&request_id).await;
+        completions.finish(&request_id, &run).await;
         if cancel.is_cancelled() {
             return;
         }
@@ -2085,6 +2087,28 @@ fn non_empty_message_content(role: &str, content: Option<String>) -> Result<Stri
         .ok_or_else(|| format!("{role} message `content` must be non-empty"))
 }
 
+fn completion_request_messages(body: &Map<String, Value>, messages: Vec<Message>) -> Vec<Message> {
+    let Some(system) = body
+        .get("system")
+        .and_then(Value::as_str)
+        .filter(|system| !system.trim().is_empty())
+    else {
+        return messages;
+    };
+
+    let mut request_messages = Vec::with_capacity(messages.len() + 1);
+    request_messages.push(Message::system(system));
+    request_messages.extend(messages);
+    request_messages
+}
+
+fn completion_request_has_model_input(history: &[Message]) -> bool {
+    history.iter().any(|message| match message {
+        Message::User { content } | Message::Tool { content, .. } => !content.trim().is_empty(),
+        Message::System { .. } | Message::Assistant { .. } => false,
+    })
+}
+
 fn request_history_has_model_input(history: &[Message]) -> bool {
     history.iter().any(|message| match message {
         Message::User { content } | Message::Tool { content, .. } => !content.trim().is_empty(),
@@ -2707,6 +2731,45 @@ mod tests {
             event.get("message").and_then(Value::as_str),
             Some("upstream failed")
         );
+    }
+
+    #[test]
+    fn direct_completion_prepends_top_level_system_once_before_request_messages() {
+        let body = make_event_body(
+            "ollama.completion.request",
+            &[("system", Value::String("top-level system".into()))],
+        );
+        let messages = vec![Message::system("message system"), Message::user("question")];
+
+        let request_messages = completion_request_messages(&body, messages);
+
+        assert_eq!(request_messages.len(), 3);
+        assert_eq!(request_messages[0].role(), "system");
+        assert_eq!(request_messages[0].content(), Some("top-level system"));
+        assert_eq!(request_messages[1].content(), Some("message system"));
+        assert_eq!(request_messages[2].content(), Some("question"));
+        assert_eq!(
+            request_messages
+                .iter()
+                .filter(|message| message.content() == Some("top-level system"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn direct_completion_model_input_requires_non_empty_user_or_tool_message() {
+        assert!(!completion_request_has_model_input(&[
+            Message::system("instructions"),
+            Message::assistant("prior answer"),
+        ]));
+        assert!(completion_request_has_model_input(&[Message::user(
+            "question"
+        )]));
+        assert!(completion_request_has_model_input(&[Message::Tool {
+            content: "tool result".into(),
+            tool_call_id: "call-1".into(),
+        }]));
     }
 
     #[test]
