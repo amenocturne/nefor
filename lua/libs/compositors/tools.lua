@@ -126,6 +126,7 @@ function M.gate_spec(gate_name, command)
     command     = command,
     from_plugin = from_plugin,
     to_plugin   = to_plugin,
+    to_plugin_readonly = true,
     receive_msg = function(_) end,
   }
 end

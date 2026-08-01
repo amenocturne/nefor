@@ -119,6 +119,9 @@ function M.spawn(spec)
   if spec.to_plugin ~= nil and type(spec.to_plugin) ~= "function" then
     error("actor.spawn: spec.to_plugin must be a function or nil", 2)
   end
+  if spec.to_plugin_readonly ~= nil and type(spec.to_plugin_readonly) ~= "boolean" then
+    error("actor.spawn: spec.to_plugin_readonly must be a boolean or nil", 2)
+  end
 
   M.actors[#M.actors + 1] = spec
 
@@ -132,8 +135,9 @@ function M.spawn(spec)
       ncp.spawn {
         name        = spec.name,
         command     = spec.command,
-        from_plugin = spec.from_plugin,
-        to_plugin   = spec.to_plugin,
+        from_plugin    = spec.from_plugin,
+        to_plugin      = spec.to_plugin,
+        to_plugin_readonly = spec.to_plugin_readonly,
       }
     else
       nefor.plugins.spawn { name = spec.name, command = spec.command }
@@ -279,6 +283,7 @@ function M.identity_spec(name, command)
     command     = command,
     from_plugin = from_plugin,
     to_plugin   = to_plugin,
+    to_plugin_readonly = true,
     receive_msg = function(_) end,
   }
 end

@@ -719,6 +719,30 @@ local function test_spawn_rejects_unknown_field()
     "unknown field 'mystery'", "unknown field rejected")
 end
 
+local function test_spawn_accepts_readonly_capability_without_leaking_it()
+  reset()
+  install_spawn_stub()
+  ncp.spawn({
+    name = "p",
+    command = { "/bin/echo" },
+    to_plugin = function(_) end,
+    to_plugin_readonly = true,
+  })
+  assert_eq(#spawn_calls, 1, "engine spawn invoked once")
+  assert_eq(spawn_calls[1].to_plugin_readonly, nil,
+    "Lua wrapper capability must not leak to engine spawn")
+end
+
+local function test_spawn_rejects_non_boolean_readonly_capability()
+  reset()
+  install_spawn_stub()
+  assert_spawn_errors_with({
+    name = "p",
+    command = { "/bin/echo" },
+    to_plugin_readonly = "yes",
+  }, "must be a boolean", "readonly capability type checked")
+end
+
 local function test_spawn_accepts_the_four_valid_fields_without_error()
   reset()
   install_spawn_stub()
@@ -1110,6 +1134,70 @@ local function test_dispatch_copy_preserves_empty_json_array_identity()
   assert_true(nefor.json.is_array(seen), "deep-copied [] retains JSON array identity")
 end
 
+local function test_pure_wrappers_share_and_cache_while_mutating_wrapper_isolated()
+  reset()
+  _test.set_plugins({ "src", "mutating", "pure-a", "pure-b" })
+  local pure_a_kind
+  local pure_b_kind
+  ncp._test_set_transforms("mutating", {
+    to_plugin = function(envs) envs[1].body.kind = "mutated" end,
+  })
+  ncp._test_set_transforms("pure-a", {
+    to_plugin_readonly = true,
+    to_plugin = function(envs) pure_a_kind = envs[1].body.kind end,
+  })
+  ncp._test_set_transforms("pure-b", {
+    to_plugin_readonly = true,
+    to_plugin = function(envs) pure_b_kind = envs[1].body.kind end,
+  })
+  ready_each({ "src", "mutating", "pure-a", "pure-b" })
+  _test.calls_clear()
+  drive_inbound("src", make_event({ kind = "original", nested = { values = { 1, 2, 3 } } }))
+  assert_eq(pure_a_kind, "original", "mutating wrapper cannot alias pure wrapper body")
+  assert_eq(pure_b_kind, "original", "all pure wrappers see the immutable logical value")
+  local stats = ncp._test_stats()
+  assert_eq(stats.deep_copy_roots, 1, "only the conservative mutating boundary clones")
+end
+
+local function test_default_broadcast_reuses_one_serialization()
+  reset()
+  _test.set_plugins({ "src", "a", "b", "c" })
+  ready_each({ "src", "a", "b", "c" })
+  _test.calls_clear()
+  local before = ncp._test_stats()
+  drive_inbound("src", make_event({ kind = "benchmark", payload = string.rep("x", 4096) }))
+  local after = ncp._test_stats()
+  assert_eq(after.deep_copy_roots - before.deep_copy_roots, 0,
+    "identity broadcast performs no recursive body clones")
+  assert_eq(after.encodes - before.encodes, 2,
+    "one ingress bus encode plus one cached outbound encode")
+  assert_eq(after.encode_cache_hits - before.encode_cache_hits, 2,
+    "second and third default recipients reuse serialized output")
+end
+
+local function test_sizeable_broadcast_batch_work_counters()
+  reset()
+  _test.set_plugins({ "src", "a", "b", "c" })
+  ready_each({ "src", "a", "b", "c" })
+  _test.calls_clear()
+  local before = ncp._test_stats()
+  local payload = string.rep("0123456789abcdef", 256)
+  for i = 1, 200 do
+    drive_inbound("src", make_event({
+      kind = "benchmark.batch",
+      sequence = i,
+      nested = { payload = payload, empty = json.decode("[]") },
+    }))
+  end
+  local after = ncp._test_stats()
+  assert_eq(after.deep_copy_roots - before.deep_copy_roots, 0,
+    "200 sizeable identity broadcasts avoid the previous 600 copy roots")
+  assert_eq(after.encodes - before.encodes, 400,
+    "200 ingress encodes plus 200 cached outbound encodes replace 800 total encodes")
+  assert_eq(after.encode_cache_hits - before.encode_cache_hits, 400,
+    "two recipients reuse each of 200 serialized outbound envelopes")
+end
+
 local tests = {
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
   { name = "ready_with_wrong_version_triggers_error", fn = test_ready_with_wrong_version_triggers_error },
@@ -1135,6 +1223,8 @@ local tests = {
   { name = "spawn_rejects_args_field_with_hint", fn = test_spawn_rejects_args_field_with_hint },
   { name = "spawn_rejects_cwd_field_with_hint", fn = test_spawn_rejects_cwd_field_with_hint },
   { name = "spawn_rejects_unknown_field", fn = test_spawn_rejects_unknown_field },
+  { name = "spawn_accepts_readonly_capability_without_leaking_it", fn = test_spawn_accepts_readonly_capability_without_leaking_it },
+  { name = "spawn_rejects_non_boolean_readonly_capability", fn = test_spawn_rejects_non_boolean_readonly_capability },
   { name = "spawn_accepts_the_four_valid_fields_without_error", fn = test_spawn_accepts_the_four_valid_fields_without_error },
   { name = "engine_plugin_failed_routes_to_chat_popup", fn = test_engine_plugin_failed_routes_to_chat_popup },
   { name = "engine_plugin_failed_drops_when_chat_not_connected", fn = test_engine_plugin_failed_drops_when_chat_not_connected },
@@ -1146,6 +1236,9 @@ local tests = {
   { name = "replay_window_does_not_starve_nefor_tui", fn = test_replay_window_does_not_starve_nefor_tui },
   { name = "to_plugin_receives_full_batch_in_one_call", fn = test_to_plugin_receives_full_batch_in_one_call },
   { name = "dispatch_copy_preserves_empty_json_array_identity", fn = test_dispatch_copy_preserves_empty_json_array_identity },
+  { name = "pure_wrappers_share_and_cache_while_mutating_wrapper_isolated", fn = test_pure_wrappers_share_and_cache_while_mutating_wrapper_isolated },
+  { name = "default_broadcast_reuses_one_serialization", fn = test_default_broadcast_reuses_one_serialization },
+  { name = "sizeable_broadcast_batch_work_counters", fn = test_sizeable_broadcast_batch_work_counters },
 }
 
 for _, t in ipairs(tests) do

@@ -112,8 +112,21 @@ local ENGINE_VERSION = "0.1.0"
 local ready_plugins = {}
 
 -- Per-plugin envelope callbacks, keyed by plugin name.
---   { from_plugin = function|nil, to_plugin = function|nil }
+--   { from_plugin = function|nil, to_plugin = function|nil,
+--     to_plugin_readonly = boolean }
+-- `to_plugin_readonly` promises that the callback only inspects envelopes. The
+-- conservative default is false so custom wrappers retain mutation isolation.
 local plugin_transforms = {}
+
+-- Lightweight counters expose representation work to focused tests and
+-- synthetic benchmarks without changing delivery behavior.
+local work_stats = {
+  decodes = 0,
+  encodes = 0,
+  deep_copy_roots = 0,
+  deep_copy_tables = 0,
+  encode_cache_hits = 0,
+}
 
 -- FIFO queue of `chat.popup` envelope tables awaiting nefor-tui's ready.
 local pending_chat_popups = {}
@@ -131,12 +144,14 @@ local dispatch_hwm = 0
 -- ------------------------------------------------------------------
 
 local function try_decode(s)
+  work_stats.decodes = work_stats.decodes + 1
   local ok, v = pcall(json.decode, s)
   if not ok then return nil, tostring(v) end
   return v, nil
 end
 
 local function encode(v)
+  work_stats.encodes = work_stats.encodes + 1
   return json.encode(v)
 end
 
@@ -146,11 +161,13 @@ end
 -- the dispatch loop calls each wrapper with the same envelope table.
 -- JSON-shaped values are safe to deep-copy with this naive walk (no
 -- metatables, no cycles).
-local function deep_copy(v)
+local function deep_copy(v, is_root)
   if type(v) ~= "table" then return v end
+  if is_root then work_stats.deep_copy_roots = work_stats.deep_copy_roots + 1 end
+  work_stats.deep_copy_tables = work_stats.deep_copy_tables + 1
   local out = {}
   for k, vv in pairs(v) do
-    out[k] = deep_copy(vv)
+    out[k] = deep_copy(vv, false)
   end
   -- mlua marks decoded JSON arrays with a private metatable so an empty
   -- `[]` remains distinguishable from `{}`. Preserve it while isolating
@@ -260,7 +277,7 @@ end
 -- per-envelope inner step of the framework default (when a wrapper has
 -- no `to_plugin` override) and by no-override peers iterating their own
 -- batches via the framework default.
-local function default_deliver_for(target, env, entry_target)
+local function default_deliver_for(target, env, entry_target, encoded_cache)
   -- Default to_plugin: deliver the envelope verbatim to `target`,
   -- subject to:
   --   * skip if env.from == target (don't echo a peer's emission back
@@ -287,12 +304,19 @@ local function default_deliver_for(target, env, entry_target)
 
   -- Strip framework-only fields (`replay`, …) when encoding for the
   -- wire; the protocol parser rejects unknown envelope fields.
-  pcall(nefor.engine.deliver, target, encode({
-    type = env.type,
-    from = env.from,
-    ts   = env.ts,
-    body = env.body,
-  }))
+  local payload = encoded_cache and encoded_cache[env]
+  if payload then
+    work_stats.encode_cache_hits = work_stats.encode_cache_hits + 1
+  else
+    payload = encode({
+      type = env.type,
+      from = env.from,
+      ts   = env.ts,
+      body = env.body,
+    })
+    if encoded_cache then encoded_cache[env] = payload end
+  end
+  pcall(nefor.engine.deliver, target, payload)
 end
 
 -- Fan a per-peer batch of envelopes (already deep-copied for this
@@ -304,7 +328,7 @@ end
 -- delivery path consults it to filter peers other than the addressee.
 -- Wrapper overrides don't see entry_target directly; if a wrapper needs
 -- targeting, it inspects env.body.kind / env.from and delivers itself.
-local function call_to_plugin_for_batch(target, envs, entry_targets)
+local function call_to_plugin_for_batch(target, envs, entry_targets, encoded_cache)
   if #envs == 0 then return end
   local t = plugin_transforms[target]
   local cb = t and t.to_plugin
@@ -321,7 +345,7 @@ local function call_to_plugin_for_batch(target, envs, entry_targets)
   end
 
   for i, env in ipairs(envs) do
-    default_deliver_for(target, env, entry_targets[i])
+    default_deliver_for(target, env, entry_targets[i], encoded_cache)
   end
 end
 
@@ -357,11 +381,14 @@ replay_prior_events = function(target, current_log)
             current_replay = false
           end
           local from = (type(decoded.from) == "string") and decoded.from or "engine"
+          local transform = plugin_transforms[target]
+          local pure = transform == nil or transform.to_plugin == nil
+              or transform.to_plugin_readonly == true
           envs[#envs + 1] = {
             type   = decoded.type,
             from   = from,
             ts     = decoded.ts,
-            body   = deep_copy(decoded.body),
+            body   = pure and decoded.body or deep_copy(decoded.body, true),
             replay = current_replay,
           }
           entry_targets[#entry_targets + 1] = entry.target
@@ -633,19 +660,30 @@ function M.dispatch(current_log)
         end
         local current_replay = replay_window.active()
         local from = (type(decoded.from) == "string") and decoded.from or "engine"
+        local shared_env = {
+          type   = decoded.type,
+          from   = from,
+          ts     = decoded.ts,
+          body   = decoded.body,
+          replay = current_replay,
+        }
         for _, name in ipairs(plugins_snapshot) do
           if ready_plugins[name] then
-            -- Deep-copy the body per peer so a wrapper that mutates
-            -- env.body inside its loop doesn't leak into another peer's
-            -- view of the same envelope.
+            local transform = plugin_transforms[name]
+            local pure = transform == nil or transform.to_plugin == nil
+                or transform.to_plugin_readonly == true
             local envs = per_peer_envs[name]
-            envs[#envs + 1] = {
-              type   = decoded.type,
-              from   = from,
-              ts     = decoded.ts,
-              body   = deep_copy(decoded.body),
-              replay = current_replay,
-            }
+            if pure then
+              envs[#envs + 1] = shared_env
+            else
+              envs[#envs + 1] = {
+                type   = decoded.type,
+                from   = from,
+                ts     = decoded.ts,
+                body   = deep_copy(decoded.body, true),
+                replay = current_replay,
+              }
+            end
             local tgts = per_peer_targets[name]
             tgts[#tgts + 1] = entry.target
           end
@@ -659,9 +697,10 @@ function M.dispatch(current_log)
   -- Fire each peer's batched to_plugin once. Order across peers
   -- mirrors `plugins_snapshot` (registration order), the same order
   -- the per-entry loop used pre-refactor.
+  local encoded_cache = {}
   for _, name in ipairs(plugins_snapshot) do
     if ready_plugins[name] then
-      call_to_plugin_for_batch(name, per_peer_envs[name], per_peer_targets[name])
+      call_to_plugin_for_batch(name, per_peer_envs[name], per_peer_targets[name], encoded_cache)
     end
   end
 
@@ -677,6 +716,7 @@ local SPAWN_VALID_KEYS = {
   command     = true,
   from_plugin = true,
   to_plugin   = true,
+  to_plugin_readonly = true,
 }
 
 function M.spawn(cfg)
@@ -689,6 +729,10 @@ function M.spawn(cfg)
 
   local from_plugin = cfg.from_plugin
   local to_plugin   = cfg.to_plugin
+  local to_plugin_readonly = cfg.to_plugin_readonly
+  if to_plugin_readonly ~= nil and type(to_plugin_readonly) ~= "boolean" then
+    error("ncp.spawn: 'to_plugin_readonly' must be a boolean or nil", 2)
+  end
   if from_plugin ~= nil and type(from_plugin) ~= "function" then
     error("ncp.spawn: 'from_plugin' must be a function or nil", 2)
   end
@@ -716,8 +760,9 @@ function M.spawn(cfg)
   -- knows the peer is "owned" by a wrapper. A nil callback = framework
   -- default applies.
   plugin_transforms[cfg.name] = {
-    from_plugin = from_plugin,
-    to_plugin   = to_plugin,
+    from_plugin    = from_plugin,
+    to_plugin      = to_plugin,
+    to_plugin_readonly = to_plugin_readonly == true,
   }
 
   nefor.plugins.spawn({
@@ -735,7 +780,20 @@ function M._reset()
   plugin_transforms  = {}
   pending_chat_popups = {}
   dispatch_hwm       = 0
+  work_stats = {
+    decodes = 0,
+    encodes = 0,
+    deep_copy_roots = 0,
+    deep_copy_tables = 0,
+    encode_cache_hits = 0,
+  }
   M._current_log_ref = nil
+end
+
+function M._test_stats()
+  local out = {}
+  for k, v in pairs(work_stats) do out[k] = v end
+  return out
 end
 
 function M._test_set_transforms(name, transforms)
