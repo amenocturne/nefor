@@ -1,9 +1,10 @@
 local M = {}
 
--- The fold is the sole transcript authority: events are immutable facts, while
--- lookup maps are derived indexes removed from the neutral read model.
+-- Within this domain, the fold is the sole transcript authority: events are
+-- immutable facts, while lookup maps are derived indexes removed from the
+-- neutral read model.
 local terminal_conversation = { completed = true, interrupted = true, failed = true }
-local chunk_kinds = { text = true, reasoning = true, native = true, tool_call = true }
+local chunk_kinds = { text = true, reasoning = true, native = true }
 local roles = { system = true, user = true, assistant = true, tool = true }
 
 local function copy(value, seen)
@@ -63,6 +64,7 @@ local handlers = {}
 handlers.created = function(conversation, event)
   if conversation then return err("created_more_than_once", { conversation_id = event.conversation_id }) end
   if event.sequence ~= 1 then return err("created_not_first", { conversation_id = event.conversation_id, sequence = event.sequence }) end
+  if event.provenance ~= nil and type(event.provenance) ~= "table" then return err("invalid_provenance", { kind = event.kind }) end
   return {
     id = event.conversation_id,
     status = "active",
@@ -170,6 +172,7 @@ handlers.retry_started = function(c, event)
   ok, e = require_id(event, "retry_id"); if not ok then return nil, e end
   for _, retry in ipairs(c.retries) do if retry.id == event.retry_id then return err("retry_id_conflict", { retry_id = event.retry_id }) end end
   local message = find_message(c, event.message_id)
+  if event.message_id ~= nil and not message then return err("message_not_found", { message_id = event.message_id }) end
   if message and message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
   local retry = { id = event.retry_id, message_id = event.message_id, reason = copy(event.reason), provenance = copy(event.provenance or {}) }
   c.retries[#c.retries + 1] = retry

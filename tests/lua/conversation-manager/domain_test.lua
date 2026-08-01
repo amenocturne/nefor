@@ -69,15 +69,26 @@ local invalid_cases = {
   { "bad role", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "robot" }), "invalid_role" },
   { "missing message", function(s) create(s, "c", "lead") end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "text", data = "x" } }), "message_not_found" },
   { "bad chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "image" } }), "invalid_content_chunk" },
+  { "tool call through generic chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "tool_call", data = "{}" } }), "invalid_content_chunk" },
   { "duplicate message id", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "message_started", { message_id = "m", role = "user" }), "message_id_conflict" },
   { "duplicate exchange id", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })); append(s, fact("x", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" })) end, fact("e", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" }), "exchange_id_conflict" },
   { "result before call complete", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })); append(s, fact("x", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" })) end, fact("e", "c", "tool_result_recorded", { exchange_id = "x", result = {} }), "tool_call_incomplete" },
   { "message completion with fragmented call", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })); append(s, fact("x", "c", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "t" })) end, fact("e", "c", "message_completed", { message_id = "m" }), "tool_call_incomplete" },
   { "append after exact completion", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })); append(s, fact("mc", "c", "message_completed", { message_id = "m" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "text", data = "late" } }), "message_not_open" },
   { "complete with open message", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "conversation_completed"), "open_message_at_completion" },
+  { "dangling retry message", function(s) create(s, "c", "lead") end, fact("e", "c", "retry_started", { retry_id = "r", message_id = "missing" }), "message_not_found" },
 }
 for _, case in ipairs(invalid_cases) do
   local store = manager.new(); case[2](store); local before = store:get("c"); rejects(store, case[3], case[4]); eq(store:get("c"), before, case[1] .. " is atomic")
+end
+
+-- Creation validates provenance at the boundary, while retries may deliberately be conversation-level.
+do
+  local store = manager.new()
+  rejects(store, fact("created", "bad-provenance", "created", { provenance = "not-a-table" }), "invalid_provenance")
+  create(store, "conversation-retry", "lead")
+  local retried = append(store, fact("retry", "conversation-retry", "retry_started", { retry_id = "r", reason = "transport" }))
+  eq(retried.retries[1].message_id, nil); eq(#retried.retries, 1)
 end
 
 -- Idempotency is exact fact equality; event ids are globally unique.
@@ -101,18 +112,39 @@ for _, terminal in ipairs({ "conversation_interrupted", "conversation_failed" })
   rejects(store, fact("late", terminal, "message_completed", { message_id = "partial" }), "conversation_terminal")
 end
 
--- Serialized event replay is exactly the live store, including arrays and all facts.
+-- Serialized replay reconstructs the complete modeled domain, including interleaved chats and partial state.
 do
-  local live = manager.new(); create(live, "serialized", "temporary")
+  local live = manager.new(); create(live, "serialized", "temporary"); create(live, "partial", "agent")
+  append(live, fact("p", "serialized", "provenance_updated", { provenance = { provider = "anthropic", model = "two" } }))
   append(live, fact("m", "serialized", "message_started", { message_id = "m", role = "assistant" }))
-  append(live, fact("c", "serialized", "content_chunk_appended", { message_id = "m", chunk = { kind = "reasoning", data = "r" } }))
+  append(live, fact("native", "serialized", "content_chunk_appended", { message_id = "m", chunk = { kind = "native", data = { citation = 1 } } }))
+  append(live, fact("x", "serialized", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "read" }))
+  append(live, fact("xf", "serialized", "tool_call_fragment_appended", { exchange_id = "x", fragment = '{"path":"x"}' }))
+  append(live, fact("xc", "serialized", "tool_call_completed", { exchange_id = "x", call = { path = "x" } }))
+  append(live, fact("xr", "serialized", "tool_result_recorded", { exchange_id = "x", result = { text = "data" } }))
+  append(live, fact("retry", "serialized", "retry_started", { retry_id = "retry", message_id = "m", reason = "rate_limit" }))
   append(live, fact("mc", "serialized", "message_completed", { message_id = "m" }))
-  local events = live:get("serialized").events
+  append(live, fact("done", "serialized", "conversation_completed", { detail = { usage = 12 } }))
+  append(live, fact("pm", "partial", "message_started", { message_id = "m", role = "assistant" }))
+  append(live, fact("pc", "partial", "content_chunk_appended", { message_id = "m", chunk = { kind = "reasoning", data = "unfinished" } }))
+
+  local events = {}
+  local serialized_events = live:get("serialized").events
+  local partial_events = live:get("partial").events
+  local longest = math.max(#serialized_events, #partial_events)
+  for index = 1, longest do
+    if serialized_events[index] then events[#events + 1] = serialized_events[index] end
+    if partial_events[index] then events[#events + 1] = partial_events[index] end
+  end
   local encoded = nefor.json.encode(events); local decoded = nefor.json.decode(encoded)
   local replayed = manager.new(); ok(replayed:replay(decoded))
-  eq(replayed:get("serialized"), live:get("serialized"), "serialized replay equals live state deeply")
-  local bad = domain.copy(events); bad[2].sequence = 9
-  local _, e = manager.new():replay(bad); eq(e.code, "noncontiguous_sequence")
+  eq(replayed:list(), live:list(), "serialized replay equals live state deeply")
+
+  local existing = manager.new(); create(existing, "existing", "lead")
+  local before = existing:list()
+  local bad = domain.copy(decoded); bad[#bad].sequence = 99
+  local value, e = existing:replay(bad)
+  eq(value, nil); eq(e.code, "noncontiguous_sequence"); eq(existing:list(), before, "failed replay is atomic")
 end
 
 -- Heavily interleaved chats never share messages, exchanges, sequence, or provenance.
@@ -142,6 +174,22 @@ do
   local listed = store:list(); eq(#listed, 5); eq(listed[1].id, "agent-a", "neutral list is deterministic")
   listed[1].messages[1].chunks[1].data = "mutated"
   eq(store:get("agent-a").messages[1].chunks[1].data, "agent-a:1", "reads cannot mutate store")
+end
+
+-- Conversation-local entity indexes permit the same message, exchange, and retry ids in different chats.
+do
+  local store = manager.new(); create(store, "local-a", "agent"); create(store, "local-b", "agent")
+  for _, id in ipairs({ "local-a", "local-b" }) do
+    append(store, fact(id .. ":m", id, "message_started", { message_id = "shared-message", role = "assistant" }))
+    append(store, fact(id .. ":x", id, "tool_exchange_started", { exchange_id = "shared-exchange", message_id = "shared-message", tool_name = "read" }))
+    append(store, fact(id .. ":xf", id, "tool_call_fragment_appended", { exchange_id = "shared-exchange", fragment = id }))
+    append(store, fact(id .. ":xc", id, "tool_call_completed", { exchange_id = "shared-exchange", call = { source = id } }))
+    append(store, fact(id .. ":xr", id, "tool_result_recorded", { exchange_id = "shared-exchange", result = { source = id } }))
+    append(store, fact(id .. ":retry", id, "retry_started", { retry_id = "shared-retry", message_id = "shared-message" }))
+  end
+  eq(store:get("local-a").exchanges[1].call_chunks[1], "local-a")
+  eq(store:get("local-b").exchanges[1].call_chunks[1], "local-b")
+  eq(store:get("local-a").retries[1].id, "shared-retry"); eq(store:get("local-b").retries[1].id, "shared-retry")
 end
 
 print("conversation_manager_domain_test: all assertions passed")
