@@ -59,13 +59,23 @@ local function tool_parts(value)
     value.arguments or value.args or (fn and fn.arguments)
 end
 
+local function concise_error(value)
+  local text = encode(value):gsub("%s+", " ")
+  local limit = 160
+  if #text <= limit then return text end
+  return text:sub(1, limit) .. "…"
+end
+
 local function tool_value(value, result, ctx)
   local expanded = ctx.state.expanded_details == true
   local original, name, id, args = tool_parts(value)
   if result then
-    local output = original.output or original.result or original.content or original.value or original
-    local label = "✓ " .. tostring(name or "tool")
+    local failed = original.error ~= nil
+    local output = failed and original.error
+      or original.output or original.result or original.content or original.value or original
+    local label = (failed and "✗ " or "✓ ") .. tostring(name or "tool")
     if not expanded then
+      if failed then return label .. " · failed · " .. concise_error(output) end
       return label .. " · completed · " .. size_text(value_size(output)) .. " hidden"
     end
     return label .. (id and (" · " .. tostring(id)) or "") .. "\n" .. encode(output)
@@ -76,6 +86,12 @@ local function tool_value(value, result, ctx)
     local contract = type(ctx.state.tool_displays) == "table"
       and ctx.state.tool_displays[name] or nil
     local projection = display.project(contract, args, nil, false, name)
+    if projection then
+      label = "▸ " .. tostring(projection.label or name or "tool")
+      if projection.primary and projection.primary ~= "" then
+        label = label .. " · " .. projection.primary
+      end
+    end
     local fields = {}
     for _, field in ipairs((projection and projection.arguments) or {}) do
       fields[#fields + 1] = field.label .. ": " .. field.value

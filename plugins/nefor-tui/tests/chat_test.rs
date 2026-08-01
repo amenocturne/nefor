@@ -9548,8 +9548,16 @@ fn completed_preview_remains_inspectable_after_linger_and_is_bounded_to_latest_r
 
 #[test]
 fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
-    let mut engine = Engine::new(110, 48).expect("engine");
+    let mut engine = Engine::new(110, 72).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+            { "name": "skill", "display": { "label": "Load skill", "primary": { "arg": "name" }, "result": { "kind": "receipt", "text": "skill loaded" } } },
+            { "name": "list_dir", "display": { "label": "List directory", "primary": { "arg": "path" }, "result": { "kind": "content" } } },
+            { "name": "run_tool", "display": { "label": "Run tool", "primary": { "arg": "name" }, "result": { "kind": "content" } } }
+        ] }),
+    );
     advertise_preview(
         &mut engine,
         "transcriptish",
@@ -9561,7 +9569,8 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
                 "tool_call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
                 "tool_result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" },
                 "call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
-                "result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" }
+                "result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" },
+                "error": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result", "style": "error" }
             } }
         }),
         json!({ "transcript": { "kind": "stream", "schema": "table" } }),
@@ -9584,11 +9593,19 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
         ),
         (
             6,
-            json!({ "kind": "call", "value": { "id": "discover-raw-id", "name": "discover_instruction_files", "arguments": { "path": "/project", "scope": "auto" } } }),
+            json!({ "kind": "call", "value": { "id": "list-raw-id", "name": "list_dir", "arguments": { "path": "/project/src", "debug_wrapper": "LIST-WRAPPER-MUST-STAY-HIDDEN" } } }),
         ),
         (
             7,
-            json!({ "kind": "result", "value": { "id": "discover-raw-id", "name": "discover_instruction_files", "output": "CLAUDE.md\nLARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN\n" } }),
+            json!({ "kind": "result", "value": { "id": "list-raw-id", "name": "list_dir", "output": "(f) lib.rs\nLARGE-LIST-RESULT-MUST-STAY-HIDDEN\n" } }),
+        ),
+        (
+            8,
+            json!({ "kind": "call", "value": { "id": "error-raw-id", "name": "run_tool", "arguments": { "name": "deploy", "secret": "ERROR-CALL-MUST-STAY-HIDDEN" } } }),
+        ),
+        (
+            9,
+            json!({ "kind": "error", "value": { "id": "error-raw-id", "name": "run_tool", "error": "permission denied: concise cause. XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN" } }),
         ),
     ] {
         dispatch_event(
@@ -9604,11 +9621,12 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
         "▸ reasoning",
         "Answer",
         "complete prose",
-        "▸ skill",
-        "name: array",
+        "▸ Load skill · dev",
         "✓ skill · completed",
-        "▸ discover_instruction_files",
-        "✓ discover_instruction_files · completed",
+        "▸ List directory · /project/src",
+        "✓ list_dir · completed",
+        "▸ Run tool · deploy",
+        "✗ run_tool · failed · permission denied: concise cause.",
         "hidden",
     ] {
         assert!(
@@ -9619,10 +9637,14 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
     for hidden in [
         "reason continued",
         "call-1",
-        "discover-raw-id",
+        "list-raw-id",
+        "error-raw-id",
         "CALL-WRAPPER-MUST-STAY-HIDDEN",
+        "LIST-WRAPPER-MUST-STAY-HIDDEN",
+        "ERROR-CALL-MUST-STAY-HIDDEN",
         "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
-        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+        "LARGE-LIST-RESULT-MUST-STAY-HIDDEN",
+        "HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN",
         "full workflow body",
     ] {
         assert!(
@@ -9638,10 +9660,14 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
     for expected in [
         "reason continued",
         "call-1",
-        "discover-raw-id",
+        "list-raw-id",
+        "error-raw-id",
         "CALL-WRAPPER-MUST-STAY-HIDDEN",
+        "LIST-WRAPPER-MUST-STAY-HIDDEN",
+        "ERROR-CALL-MUST-STAY-HIDDEN",
         "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
-        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+        "LARGE-LIST-RESULT-MUST-STAY-HIDDEN",
+        "HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN",
         "full workflow body",
     ] {
         assert!(
@@ -9663,10 +9689,12 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
     let group = render_snapshot(&mut engine);
     for expected in [
         "chronological activity",
-        "▸ skill",
+        "▸ Load skill · dev",
         "✓ skill · completed",
-        "▸ discover_instruction_files",
-        "✓ discover_instruction_files · completed",
+        "▸ List directory · /project/src",
+        "✓ list_dir · completed",
+        "▸ Run tool · deploy",
+        "✗ run_tool · failed · permission denied: concise cause.",
     ] {
         assert!(
             group.contains(expected),
@@ -9675,9 +9703,11 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
     }
     for hidden in [
         "call-1",
-        "discover-raw-id",
+        "list-raw-id",
+        "error-raw-id",
         "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
-        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+        "LARGE-LIST-RESULT-MUST-STAY-HIDDEN",
+        "HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN",
     ] {
         assert!(
             !group.contains(hidden),
@@ -9687,12 +9717,12 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
     engine
         .handle_key(key("ctrl_o"))
         .expect("expand group details");
+    engine.handle_key(key("end")).expect("scroll group details");
     let detailed_group = render_snapshot(&mut engine);
     for expected in [
-        "call-1",
-        "discover-raw-id",
-        "LARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN",
-        "LARGE-DISCOVER-RESULT-MUST-STAY-HIDDEN",
+        "error-raw-id",
+        "ERROR-CALL-MUST-STAY-HIDDEN",
+        "HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN",
     ] {
         assert!(
             detailed_group.contains(expected),
