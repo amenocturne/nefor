@@ -201,37 +201,24 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
     let loop_handle = tokio::spawn(run_dispatch_loop(ctx, in_rx));
 
-    // --- 1. start a completion on c1 ---
+    // --- 1. start one canonical single-shot completion ---
     in_tx
         .send(Ok(event_env(
-            &kind("chat.create"),
+            &kind("completion.request"),
             &[
-                ("chat_id", Value::String("c1".into())),
+                ("request_id", Value::String("c1".into())),
                 ("model", Value::String("test-model".into())),
-            ],
-        )))
-        .await
-        .expect("send create c1");
-    in_tx
-        .send(Ok(event_env(
-            &kind("chat.append"),
-            &[
-                ("chat_id", Value::String("c1".into())),
                 (
-                    "message",
-                    serde_json::json!({"role": "user", "content": "hi"}),
+                    "messages",
+                    serde_json::json!([
+                        {"role":"system","content":"be concise"},
+                        {"role":"user","content":"hi"}
+                    ]),
                 ),
             ],
         )))
         .await
-        .expect("send append c1");
-    in_tx
-        .send(Ok(event_env(
-            &kind("chat.complete"),
-            &[("chat_id", Value::String("c1".into()))],
-        )))
-        .await
-        .expect("send complete c1");
+        .expect("send completion c1");
 
     // The turn must genuinely reach the server before we cancel.
     assert!(
@@ -242,15 +229,15 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     // --- 2. cancel c1, plus an unknown-id cancel (must be a no-op) ---
     in_tx
         .send(Ok(event_env(
-            &kind("chat.cancel"),
-            &[("chat_id", Value::String("c1".into()))],
+            &kind("completion.cancel"),
+            &[("request_id", Value::String("c1".into()))],
         )))
         .await
         .expect("send cancel c1");
     in_tx
         .send(Ok(event_env(
-            &kind("chat.cancel"),
-            &[("chat_id", Value::String("ghost".into()))],
+            &kind("completion.cancel"),
+            &[("request_id", Value::String("ghost".into()))],
         )))
         .await
         .expect("send cancel ghost");
@@ -385,31 +372,21 @@ async fn clean_eof_requires_terminal_event_and_next_submissions_settle() {
     async fn submit(in_tx: &mpsc::Sender<Result<Envelope, TransportError>>, id: &str) {
         in_tx
             .send(Ok(event_env(
-                &kind("chat.create"),
+                &kind("completion.request"),
                 &[
-                    ("chat_id", Value::String(id.into())),
+                    ("request_id", Value::String(id.into())),
                     ("model", Value::String("test-model".into())),
+                    (
+                        "messages",
+                        serde_json::json!([
+                            {"role":"system","content":"be concise"},
+                            {"role":"user","content":"hi"}
+                        ]),
+                    ),
                 ],
             )))
             .await
-            .expect("create");
-        in_tx
-            .send(Ok(event_env(
-                &kind("chat.append"),
-                &[
-                    ("chat_id", Value::String(id.into())),
-                    ("message", serde_json::json!({"role":"user","content":"hi"})),
-                ],
-            )))
-            .await
-            .expect("append");
-        in_tx
-            .send(Ok(event_env(
-                &kind("chat.complete"),
-                &[("chat_id", Value::String(id.into()))],
-            )))
-            .await
-            .expect("complete");
+            .expect("completion request");
     }
 
     submit(&in_tx, "before-output").await;

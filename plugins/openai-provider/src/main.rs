@@ -20,7 +20,7 @@
 //! - `<prefix>.chat.complete { chat_id }` — send the chat's history to
 //!   the upstream model, stream deltas, append the assistant message,
 //!   reply with `<prefix>.chat.complete.result { chat_id, output }`
-//!   where `output` follows `generic-provider.ProviderOut`'s shape.
+//!   where `output` follows `generic-provider.ProviderInput`'s shape.
 //! - `<prefix>.chat.delete  { chat_id }` — drop the chat.
 //!
 //! ### Legacy wire API (compat for nefor-chat)
@@ -39,7 +39,7 @@
 //!
 //! On startup we declare two bare types (`RawRequest`, `RawResponse`)
 //! and two `Into` conversions against `generic-provider`'s canonical
-//! types (`ProviderIn`, `ProviderOut`). See the `register_body`
+//! types (`ProviderRequest`, `ProviderInput`). See the `register_body`
 //! constructor for the literal shape and the spec gap that this plugin
 //! intentionally exercises (`Into.in` cross-namespace).
 
@@ -57,7 +57,9 @@ use openai_provider::broker::{ToolBroker, ToolResult};
 use openai_provider::catalog::ToolCatalog;
 use openai_provider::config::Config;
 use openai_provider::openai::{Message, ModelInfo, ToolCall};
-use openai_provider::state::{ChatId, ChatRestore, ChatStats, Chats, ChatsError, TurnToken};
+use openai_provider::state::{
+    ChatId, ChatRestore, ChatStats, Chats, ChatsError, CompletionRuns, TurnToken,
+};
 use openai_provider::stream::{
     list_models, run_chat_stream_with_retry_progress_and_format, ReasoningEvent, RetryProgress,
     StreamError,
@@ -144,11 +146,20 @@ async fn run() -> Result<(), LlmError> {
     send_event(&out_tx, auth_status_body(&config, &initial_snap)).await?;
 
     let chats = Arc::new(Chats::with_default_model(config.model.clone()));
+    let completions = Arc::new(CompletionRuns::new());
     let catalog = Arc::new(ToolCatalog::new());
     let broker = Arc::new(ToolBroker::new());
 
     run_dispatch_loop(
-        &chats, &auth, &catalog, &broker, &config, &client, &out_tx, &mut in_rx,
+        &chats,
+        &completions,
+        &auth,
+        &catalog,
+        &broker,
+        &config,
+        &client,
+        &out_tx,
+        &mut in_rx,
     )
     .await?;
 
@@ -161,6 +172,7 @@ async fn run() -> Result<(), LlmError> {
 #[allow(clippy::too_many_arguments)]
 async fn run_dispatch_loop(
     chats: &Arc<Chats>,
+    completions: &Arc<CompletionRuns>,
     auth: &Arc<AuthStore>,
     catalog: &Arc<ToolCatalog>,
     broker: &Arc<ToolBroker>,
@@ -183,9 +195,17 @@ async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            dispatch_event(
-                                chats, auth, catalog, broker, config, client, out_tx,
-                                &env.from, map,
+                            dispatch_event_with_completions(
+                                chats,
+                                completions,
+                                auth,
+                                catalog,
+                                broker,
+                                config,
+                                client,
+                                out_tx,
+                                &env.from,
+                                map,
                             )
                             .await?;
                         }
@@ -206,6 +226,42 @@ async fn run_dispatch_loop(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_event_with_completions(
+    chats: &Arc<Chats>,
+    completions: &Arc<CompletionRuns>,
+    auth: &Arc<AuthStore>,
+    catalog: &Arc<ToolCatalog>,
+    broker: &Arc<ToolBroker>,
+    config: &Config,
+    client: &reqwest::Client,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    from: &PluginName,
+    body: &Map<String, Value>,
+) -> Result<(), LlmError> {
+    let kind = match body.get("kind").and_then(Value::as_str) {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+
+    let prefix = config.event_prefix();
+    if kind == format!("{prefix}completion.request") {
+        dispatch_completion_request(completions, auth, config, client, out_tx, body).await?;
+        return Ok(());
+    }
+    if kind == format!("{prefix}completion.cancel") {
+        if let Some(request_id) = body.get("request_id").and_then(Value::as_str) {
+            completions.cancel(request_id).await;
+        }
+        return Ok(());
+    }
+
+    dispatch_event(
+        chats, auth, catalog, broker, config, client, out_tx, from, body,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -827,6 +883,274 @@ async fn dispatch_event(
     Ok(())
 }
 
+async fn dispatch_completion_request(
+    completions: &Arc<CompletionRuns>,
+    auth: &Arc<AuthStore>,
+    config: &Config,
+    client: &reqwest::Client,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+) -> Result<(), LlmError> {
+    let Some(request_id) = body
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+    else {
+        send_event(
+            out_tx,
+            completion_error_body("", "completion.request missing `request_id`"),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let messages = match body.get("messages").and_then(Value::as_array) {
+        Some(items) => {
+            let mut messages = Vec::with_capacity(items.len());
+            for item in items {
+                match parse_provider_message(Some(item)) {
+                    Ok(parsed) if parsed.tool_call_failures.is_empty() => {
+                        messages.push(parsed.message)
+                    }
+                    Ok(_) => {
+                        send_event(
+                            out_tx,
+                            completion_error_body(
+                                &request_id,
+                                "invalid tool call in completion history",
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(message) => {
+                        send_event(out_tx, completion_error_body(&request_id, &message)).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            messages
+        }
+        None => {
+            send_event(
+                out_tx,
+                completion_error_body(&request_id, "completion.request missing `messages`"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if !request_history_has_model_input(&messages) {
+        send_event(
+            out_tx,
+            completion_error_body(
+                &request_id,
+                "completion request needs at least one non-empty user or tool message",
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let cancel = match completions.begin(request_id.clone()).await {
+        Ok(cancel) => cancel,
+        Err(message) => {
+            send_event(out_tx, completion_error_body(&request_id, &message)).await?;
+            return Ok(());
+        }
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .or_else(|| config.model.clone());
+    let Some(model) = model else {
+        completions.finish(&request_id).await;
+        send_event(
+            out_tx,
+            completion_error_body(&request_id, "no model configured"),
+        )
+        .await?;
+        return Ok(());
+    };
+    let reasoning_effort = body
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let response_format = body.get("output_schema").map(|schema| {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "mag_output", "strict": true, "schema": schema},
+        })
+    });
+    let mut tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(extra) = body.get("extra_tools").and_then(Value::as_array) {
+        tools.extend(extra.iter().cloned());
+    }
+    let tools = if tools.is_empty() { None } else { Some(tools) };
+
+    let completions = Arc::clone(completions);
+    let auth = Arc::clone(auth);
+    let config = config.clone();
+    let client = client.clone();
+    let out_tx = out_tx.clone();
+    tokio::spawn(async move {
+        let token = auth.token().await;
+        let id_for_text = request_id.clone();
+        let tx_for_text = out_tx.clone();
+        let id_for_reasoning = request_id.clone();
+        let tx_for_reasoning = out_tx.clone();
+        let id_for_retry = request_id.clone();
+        let tx_for_retry = out_tx.clone();
+        let result = run_chat_stream_with_retry_progress_and_format(
+            &client,
+            &config.chat_endpoint(),
+            token.as_deref(),
+            &config.auth_header,
+            &model,
+            &messages,
+            tools.as_deref(),
+            reasoning_effort.as_deref(),
+            response_format.as_ref(),
+            cancel.clone(),
+            move |text| {
+                let _ = tx_for_text.try_send(PluginOutgoing::event(completion_event_body(
+                    &id_for_text,
+                    "text_delta",
+                    [("text", Value::String(text.to_owned()))],
+                )));
+            },
+            move |event| {
+                let (event, text) = match event {
+                    ReasoningEvent::Delta(text) => ("reasoning_delta", text),
+                    ReasoningEvent::End { text } => ("reasoning_end", text),
+                };
+                let _ = tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
+                    &id_for_reasoning,
+                    event,
+                    [("text", Value::String(text.to_owned()))],
+                )));
+            },
+            move |progress| {
+                let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body(
+                    &id_for_retry,
+                    "retry",
+                    [
+                        ("attempt", Value::Number(progress.retry_index().into())),
+                        (
+                            "delay_ms",
+                            Value::Number((progress.next_delay.as_millis() as u64).into()),
+                        ),
+                        (
+                            "error",
+                            progress
+                                .status
+                                .map(|status| Value::String(format!("HTTP {status}")))
+                                .unwrap_or(Value::String("transient provider error".into())),
+                        ),
+                    ],
+                )));
+            },
+        )
+        .await;
+
+        completions.finish(&request_id).await;
+        if cancel.is_cancelled() {
+            return;
+        }
+        match result {
+            Ok(outcome) => {
+                if let Some(usage) = outcome.usage {
+                    let _ = out_tx
+                        .send(PluginOutgoing::event(completion_event_body(
+                            &request_id,
+                            "usage",
+                            [
+                                ("prompt_tokens", Value::Number(usage.prompt_tokens.into())),
+                                (
+                                    "completion_tokens",
+                                    Value::Number(usage.completion_tokens.into()),
+                                ),
+                                ("model", Value::String(model.clone())),
+                            ],
+                        )))
+                        .await;
+                }
+                for call in &outcome.tool_calls {
+                    let arguments = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+                    let _ = out_tx
+                        .send(PluginOutgoing::event(completion_event_body(
+                            &request_id,
+                            "tool_call",
+                            [
+                                ("id", Value::String(call.id.clone())),
+                                ("name", Value::String(call.function.name.clone())),
+                                ("arguments", arguments),
+                            ],
+                        )))
+                        .await;
+                }
+                let _ = out_tx
+                    .send(PluginOutgoing::event(completion_event_body(
+                        &request_id,
+                        "completed",
+                        [
+                            ("text", Value::String(outcome.full_text)),
+                            ("reasoning", Value::String(outcome.reasoning_text)),
+                            (
+                                "finish_reason",
+                                outcome
+                                    .finish_reason
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null),
+                            ),
+                        ],
+                    )))
+                    .await;
+            }
+            Err(error) => {
+                let _ = out_tx
+                    .send(PluginOutgoing::event(completion_error_body(
+                        &request_id,
+                        &error.to_string(),
+                    )))
+                    .await;
+            }
+        }
+    });
+    Ok(())
+}
+
+fn completion_event_body<const N: usize>(
+    request_id: &str,
+    event: &str,
+    fields: [(&str, Value); N],
+) -> Map<String, Value> {
+    let mut body = Map::new();
+    body.insert("kind".into(), Value::String("completion.event".into()));
+    body.insert("request_id".into(), Value::String(request_id.to_owned()));
+    body.insert("event".into(), Value::String(event.to_owned()));
+    for (name, value) in fields {
+        body.insert(name.to_owned(), value);
+    }
+    body
+}
+
+fn completion_error_body(request_id: &str, message: &str) -> Map<String, Value> {
+    completion_event_body(
+        request_id,
+        "error",
+        [("message", Value::String(message.to_owned()))],
+    )
+}
+
 /// Begin a completion turn for `chat_id`. Routes both the explicit
 /// `<prefix>.chat.complete` path and the legacy default-chat
 /// `<prefix>.prompt` path.
@@ -1390,7 +1714,7 @@ fn spawn_turn(
 
         // Explicit `chat.complete` path: emit a closing
         // `<prefix>.chat.complete.result` carrying the
-        // generic-provider.ProviderOut-shaped output. Legacy
+        // generic-provider.ProviderInput-shaped output. Legacy
         // `<prefix>.prompt` path skips it — the chat plugin reads
         // stream.end directly and doesn't speak the chat.* protocol
         // yet.
@@ -2091,7 +2415,7 @@ fn chat_error_body_msg(config: &Config, chat_id: &ChatId, message: String) -> Ma
 
 /// Emit a `<prefix>.chat.complete.result` body.
 ///
-/// `output` follows the `generic-provider.ProviderOut` shape (per the
+/// `output` follows the `generic-provider.ProviderInput` shape (per the
 /// Schelling-point docstring on generic-provider/main.rs):
 /// `{ text, tool_calls?, finish_reason?, usage?, reasoning? }`.
 ///
@@ -2195,7 +2519,7 @@ fn goodbye_body(config: &Config) -> Map<String, Value> {
 
 /// Build the `combinators.register` body announcing our two bare types
 /// (`RawRequest`, `RawResponse`) plus four `Into` conversions against
-/// `generic-provider`'s canonical `ProviderIn`/`ProviderOut`.
+/// `generic-provider`'s canonical `ProviderRequest`/`ProviderInput`.
 ///
 /// ## Spec gap (intentional)
 ///
@@ -2203,8 +2527,8 @@ fn goodbye_body(config: &Config) -> Map<String, Value> {
 /// concrete provider plugins to declare:
 ///
 /// ```text
-/// Into<generic-provider.ProviderIn,  openai-provider.RawRequest>   -- canonical → upstream
-/// Into<openai-provider.RawResponse,  generic-provider.ProviderOut> -- upstream → canonical
+/// Into<generic-provider.ProviderRequest,  openai-provider.RawRequest>   -- canonical → upstream
+/// Into<openai-provider.RawResponse,  generic-provider.ProviderInput> -- upstream → canonical
 /// ```
 ///
 /// The combinators-spec §4.1 currently states `Into.in` must be a bare
@@ -2219,7 +2543,7 @@ fn goodbye_body(config: &Config) -> Map<String, Value> {
 /// the two specs/implementations.
 ///
 /// We *also* include the safe (always-valid) direction
-/// `Into<openai-provider.RawResponse, generic-provider.ProviderOut>`
+/// `Into<openai-provider.RawResponse, generic-provider.ProviderInput>`
 /// (bare in → cross-namespace out) which both specs allow today, so a
 /// half-working state is still useful.
 fn register_body() -> Map<String, Value> {
@@ -2238,16 +2562,16 @@ fn register_body() -> Map<String, Value> {
         // NOTE: `in` is cross-namespace here. Today's registry will
         // reject this; intentional. See docstring above.
         register_into_entry(
-            "generic-provider.ProviderIn",
+            "generic-provider.ProviderRequest",
             "RawRequest",
-            "into.provider_in_to_raw_request",
+            "into.completion_request_to_raw_request",
         ),
         // openai's wire → canonical (allowed by current spec; bare in,
         // cross-namespace out).
         register_into_entry(
             "RawResponse",
-            "generic-provider.ProviderOut",
-            "into.raw_response_to_provider_out",
+            "generic-provider.ProviderInput",
+            "into.raw_response_to_completion_event",
         ),
     ];
     m.insert("implementations".into(), Value::Array(impls));
@@ -2339,6 +2663,50 @@ mod tests {
 
     fn from_plugin(name: &str) -> PluginName {
         PluginName::new(name).expect("valid plugin name")
+    }
+
+    #[test]
+    fn completion_events_are_provider_neutral_and_request_correlated() {
+        let event = completion_event_body(
+            "req-42",
+            "tool_call",
+            [
+                ("id", Value::String("call-1".into())),
+                ("name", Value::String("read_file".into())),
+                ("arguments", serde_json::json!({"path": "x"})),
+            ],
+        );
+        assert_eq!(
+            event.get("kind").and_then(Value::as_str),
+            Some("completion.event")
+        );
+        assert_eq!(
+            event.get("request_id").and_then(Value::as_str),
+            Some("req-42")
+        );
+        assert_eq!(
+            event.get("event").and_then(Value::as_str),
+            Some("tool_call")
+        );
+        assert_eq!(event.get("id").and_then(Value::as_str), Some("call-1"));
+    }
+
+    #[test]
+    fn completion_errors_are_terminal_and_request_correlated() {
+        let event = completion_error_body("req-err", "upstream failed");
+        assert_eq!(
+            event.get("kind").and_then(Value::as_str),
+            Some("completion.event")
+        );
+        assert_eq!(
+            event.get("request_id").and_then(Value::as_str),
+            Some("req-err")
+        );
+        assert_eq!(event.get("event").and_then(Value::as_str), Some("error"));
+        assert_eq!(
+            event.get("message").and_then(Value::as_str),
+            Some("upstream failed")
+        );
     }
 
     #[test]
@@ -4574,12 +4942,12 @@ mod tests {
             .expect("impls array");
         assert_eq!(impls.len(), 2);
 
-        // Entry 0: Into<generic-provider.ProviderIn -> RawRequest>
+        // Entry 0: Into<generic-provider.ProviderRequest -> RawRequest>
         let e0 = impls[0].as_object().expect("obj");
         assert_eq!(e0.get("trait").and_then(Value::as_str), Some("Into"));
         assert_eq!(
             e0.get("in").and_then(Value::as_str),
-            Some("generic-provider.ProviderIn")
+            Some("generic-provider.ProviderRequest")
         );
         assert_eq!(e0.get("out").and_then(Value::as_str), Some("RawRequest"));
         assert!(e0
@@ -4588,13 +4956,13 @@ mod tests {
             .map(|s| !s.is_empty())
             .unwrap_or(false));
 
-        // Entry 1: Into<RawResponse -> generic-provider.ProviderOut>
+        // Entry 1: Into<RawResponse -> generic-provider.ProviderInput>
         let e1 = impls[1].as_object().expect("obj");
         assert_eq!(e1.get("trait").and_then(Value::as_str), Some("Into"));
         assert_eq!(e1.get("in").and_then(Value::as_str), Some("RawResponse"));
         assert_eq!(
             e1.get("out").and_then(Value::as_str),
-            Some("generic-provider.ProviderOut")
+            Some("generic-provider.ProviderInput")
         );
     }
 
@@ -4688,7 +5056,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_complete_result_body_carries_provider_out_shaped_output() {
+    fn chat_complete_result_body_carries_completion_event_shaped_output() {
         let cid = ChatId::new("c-1");
         let calls = vec![ToolCall {
             id: "call_1".into(),

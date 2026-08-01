@@ -266,6 +266,34 @@ fn stream_delta_body(prefix: &str, id: &str, chat_id: &ChatId, text: &str) -> Ma
     make_event(format!("{prefix}stream.delta"), m)
 }
 
+fn stream_tool_call_delta_body(
+    prefix: &str,
+    chat_id: &ChatId,
+    item_id: Option<&str>,
+    fragment: &str,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    if let Some(item_id) = item_id {
+        m.insert("tool_call_id".into(), Value::String(item_id.to_owned()));
+    }
+    m.insert("fragment".into(), Value::String(fragment.to_owned()));
+    make_event(format!("{prefix}stream.tool_call_delta"), m)
+}
+
+fn stream_retry_body(
+    args: &ServeArgs,
+    chat_id: &ChatId,
+    attempt: u32,
+    message: &str,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    m.insert("attempt".into(), Value::Number(attempt.into()));
+    m.insert("message".into(), Value::String(message.to_owned()));
+    make_event(format!("{}stream.retry", args.event_prefix()), m)
+}
+
 fn stream_reasoning_delta_body(
     prefix: &str,
     id: &str,
@@ -445,7 +473,7 @@ fn chat_complete_result_body(
     // The turn's failure detail, threaded so a consumer of the single terminal
     // result (the mag capability bridge) sees WHY a finish_reason "error"
     // round died without also tracking the separate turn.error/chat.error
-    // events. Carried in the output (the ProviderOut consumers read) and
+    // events. Carried in the output (the ProviderInput consumers read) and
     // top-level (envelope-level symmetry with finish_reason).
     if let Some(e) = error {
         output.insert("error".into(), Value::String(e.to_owned()));
@@ -930,6 +958,19 @@ async fn dispatch_event(
     };
 
     match suffix {
+        "completion.request" => handle_completion_request(ctx, body).await,
+        "completion.cancel" => {
+            if let Some(request_id) = read_request_id(body) {
+                if !ctx
+                    .chats
+                    .cancel_turn(&ChatId::new(request_id.clone()))
+                    .await
+                {
+                    tracing::debug!(%request_id, "completion.cancel for unknown or finished request; no-op");
+                }
+            }
+            Ok(())
+        }
         "chat.create" => handle_chat_create(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "chat.restore" => handle_chat_restore(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "chat.append" => handle_chat_append(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
@@ -1150,6 +1191,14 @@ async fn dispatch_event(
 // Per-event handlers.
 // ---------------------------------------------------------------------
 
+fn read_request_id(body: &Map<String, Value>) -> Option<String> {
+    body.get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 fn read_chat_id(body: &Map<String, Value>) -> Option<ChatId> {
     body.get("chat_id")
         .and_then(Value::as_str)
@@ -1320,6 +1369,140 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
         }
         other => Err(format!("chat.append message has unknown role `{other}`")),
     }
+}
+
+async fn handle_completion_request(
+    ctx: &DispatcherContext,
+    body: &Map<String, Value>,
+) -> Result<(), ChatgptError> {
+    let request_id = match read_request_id(body) {
+        Some(id) => id,
+        None => {
+            send_completion_event(ctx, None, "failed", |event| {
+                event.insert(
+                    "error".into(),
+                    Value::String("completion.request missing `request_id`".into()),
+                );
+            })
+            .await?;
+            return Ok(());
+        }
+    };
+    let chat_id = ChatId::new(request_id.clone());
+    let messages = match body.get("messages").and_then(Value::as_array) {
+        Some(messages) => messages,
+        None => {
+            send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                event.insert(
+                    "error".into(),
+                    Value::String("completion.request `messages` must be an array".into()),
+                );
+            })
+            .await?;
+            return Ok(());
+        }
+    };
+    let mut history = Vec::with_capacity(messages.len());
+    for message in messages {
+        match parse_provider_message(Some(message)) {
+            Ok(parsed) if parsed.tool_call_failures.is_empty() => history.push(parsed.message),
+            Ok(_) => {
+                send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                    event.insert(
+                        "error".into(),
+                        Value::String("completion.request contains a malformed tool call".into()),
+                    );
+                })
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                    event.insert("error".into(), Value::String(error));
+                })
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let routing_session_id = body
+        .get("routing_session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let tool_overrides = body.get("tools").map(ToolCatalog::parse_tools);
+    let reasoning_effort = match parse_reasoning_effort(body.get("reasoning_effort")) {
+        Ok(value) => value,
+        Err(error) => {
+            send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                event.insert("error".into(), Value::String(error));
+            })
+            .await?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = ctx
+        .chats
+        .restore_messages(MessageRestore {
+            id: chat_id.clone(),
+            model,
+            routing_session_id,
+            system: None,
+            tool_overrides,
+            tool_allowlist: None,
+            reasoning_effort,
+            history,
+        })
+        .await
+    {
+        send_completion_event(ctx, Some(&request_id), "failed", |event| {
+            event.insert("error".into(), Value::String(error.to_string()));
+        })
+        .await?;
+        return Ok(());
+    }
+    let cancel = match ctx.chats.begin_turn(&chat_id).await {
+        Ok(cancel) => cancel,
+        Err(error) => {
+            send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                event.insert("error".into(), Value::String(error.to_string()));
+            })
+            .await?;
+            return Ok(());
+        }
+    };
+    spawn_turn(
+        ctx.clone(),
+        chat_id,
+        cancel,
+        body.get("output_schema").cloned(),
+        true,
+    );
+    Ok(())
+}
+
+async fn send_completion_event(
+    ctx: &DispatcherContext,
+    request_id: Option<&str>,
+    event: &str,
+    fill: impl FnOnce(&mut Map<String, Value>),
+) -> Result<(), ChatgptError> {
+    let mut body = Map::new();
+    if let Some(request_id) = request_id {
+        body.insert("request_id".into(), Value::String(request_id.to_owned()));
+    }
+    body.insert("event".into(), Value::String(event.to_owned()));
+    fill(&mut body);
+    send_event(
+        &ctx.out_tx,
+        make_event(format!("{}completion.event", ctx.args.event_prefix()), body),
+    )
+    .await
 }
 
 async fn handle_chat_create(
@@ -1631,7 +1814,7 @@ async fn handle_chat_complete(
         }
     };
     let output_schema = body.get("output_schema").cloned();
-    spawn_turn(ctx.clone(), chat_id, cancel, output_schema);
+    spawn_turn(ctx.clone(), chat_id, cancel, output_schema, false);
     Ok(())
 }
 
@@ -2151,6 +2334,7 @@ fn spawn_turn(
     chat_id: ChatId,
     cancel: TurnToken,
     output_schema: Option<Value>,
+    delete_when_done: bool,
 ) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -2491,6 +2675,7 @@ fn spawn_turn(
 
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         iter_interrupted = true;
                         break;
@@ -2556,6 +2741,13 @@ fn spawn_turn(
                                 }
                                 ResponseEvent::FunctionCallArgumentsDelta { delta, item_id } => {
                                     tool_buf.on_args_delta(item_id.as_deref(), &delta);
+                                    let body = stream_tool_call_delta_body(
+                                        &ctx.args.event_prefix(),
+                                        &chat_id,
+                                        item_id.as_deref(),
+                                        &delta,
+                                    );
+                                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                 }
                                 ResponseEvent::FunctionCallArgumentsDone {
                                     arguments,
@@ -2741,6 +2933,9 @@ fn spawn_turn(
                         error = %err_msg,
                         "Responses stream failed before output; retrying turn iteration",
                     );
+                    let retry_body =
+                        stream_retry_body(&ctx.args, &chat_id, pre_output_stream_retries, &err_msg);
+                    let _ = ctx.out_tx.send(PluginOutgoing::event(retry_body)).await;
                     tokio::time::sleep(crate::responses::retry_delay(
                         pre_output_stream_retries - 1,
                         None,
@@ -2808,6 +3003,9 @@ fn spawn_turn(
         // lands.
         if cancel.is_suppressed() {
             ctx.chats.end_turn(&chat_id).await;
+            if delete_when_done {
+                let _ = ctx.chats.delete(&chat_id).await;
+            }
             return;
         }
 
@@ -2867,6 +3065,9 @@ fn spawn_turn(
         let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
 
         ctx.chats.end_turn(&chat_id).await;
+        if delete_when_done {
+            let _ = ctx.chats.delete(&chat_id).await;
+        }
     });
 }
 
@@ -3023,7 +3224,7 @@ mod tests {
             body.get("finish_reason").and_then(Value::as_str),
             Some("error")
         );
-        // The detail rides in the output (what ProviderOut consumers read) and
+        // The detail rides in the output (what ProviderInput consumers read) and
         // top-level, so the single terminal result explains WHY the round died.
         let output = body
             .get("output")

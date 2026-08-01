@@ -5,13 +5,13 @@ M.declaration = {
   semantic={input={kind="list",item={kind="variable",name="T"}},
     output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
     inputs={{wire="nefor.dynamic.Collected",type={kind="list",item={kind="variable",name="T"}}}},
-    outputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}}}, params={},
-  inputs={values="nefor.dynamic.Collected"}, outputs={"generic-provider.ProviderOut"}, signals={} }
+    outputs={{wire="generic-provider.ProviderInput",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}}}, params={},
+  inputs={values="nefor.dynamic.Collected"}, outputs={"generic-provider.ProviderInput"}, signals={} }
 function M.construct(id, params, emit)
   local instance={id=id}
   function instance.deliver(a)
     local content=a.messages[1].message.value
-    emit({kind="generic-provider.ProviderOut",from=id,value={content=content},
+    emit({kind="generic-provider.ProviderInput",from=id,value={content=content},
       messages={{role="user",content=content}}})
     return {status="ok"}
   end

@@ -26,6 +26,47 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+/// In-flight direct completions keyed by their caller-owned request id.
+/// This registry is deliberately separate from `Chats`: a direct request
+/// already contains its complete history and must not create durable provider
+/// state or participate in chat replay.
+#[derive(Default)]
+pub struct CompletionRuns {
+    inner: Mutex<HashMap<String, CancellationToken>>,
+}
+
+impl CompletionRuns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn begin(&self, request_id: String) -> Result<CancellationToken, String> {
+        let mut runs = self.inner.lock().await;
+        if runs.contains_key(&request_id) {
+            return Err(format!(
+                "completion request `{request_id}` is already in flight"
+            ));
+        }
+        let cancel = CancellationToken::new();
+        runs.insert(request_id, cancel.clone());
+        Ok(cancel)
+    }
+
+    pub async fn finish(&self, request_id: &str) {
+        self.inner.lock().await.remove(request_id);
+    }
+
+    pub async fn cancel(&self, request_id: &str) -> bool {
+        let cancel = self.inner.lock().await.remove(request_id);
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 use crate::openai::{Message, ToolCall};
 
 /// Newtype wrapper for chat ids so we can't accidentally pass a model
@@ -749,6 +790,35 @@ fn close_pending_tool_calls(repaired: &mut Vec<Message>, pending: &mut Vec<Strin
 mod tests {
     use super::*;
     use crate::openai::{ToolCall, ToolCallFunction};
+
+    #[tokio::test]
+    async fn completion_runs_cancel_only_the_matching_request_and_allow_restart() {
+        let runs = CompletionRuns::new();
+        let first = runs.begin("req-1".into()).await.expect("first request");
+        let second = runs.begin("req-2".into()).await.expect("second request");
+
+        assert!(runs.cancel("req-1").await);
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert!(!runs.cancel("req-1").await, "late cancel is a no-op");
+
+        let restarted = runs
+            .begin("req-1".into())
+            .await
+            .expect("request id is reusable after cancellation");
+        assert!(!restarted.is_cancelled());
+        runs.finish("req-1").await;
+        runs.finish("req-2").await;
+    }
+
+    #[tokio::test]
+    async fn completion_runs_reject_duplicate_inflight_ids_but_not_finished_ids() {
+        let runs = CompletionRuns::new();
+        runs.begin("req".into()).await.expect("begin");
+        assert!(runs.begin("req".into()).await.is_err());
+        runs.finish("req").await;
+        assert!(runs.begin("req".into()).await.is_ok());
+    }
 
     #[tokio::test]
     async fn create_then_append_and_snapshot_round_trips_through_history() {

@@ -12,10 +12,10 @@
 -- responds with:
 --   <name>.stream.delta { id, chat_id, text }   (one or more)
 --   <name>.stream.end   { id, chat_id, text, model, duration_ms, finish_reason? }
---   <name>.chat.complete.result { chat_id, output: ProviderOut }
+--   <name>.chat.complete.result { chat_id, output: ProviderInput }
 --   <name>.chat.error   { chat_id, message }    (error-shaped close)
 --
--- ProviderOut shape (matching openai-provider's chat_complete_result_body):
+-- ProviderInput shape (matching openai-provider's chat_complete_result_body):
 --   { text, tool_calls?: [{id, name, arguments: object}], finish_reason?, usage }
 --
 -- ### Response selection (state machine, applied in order)
@@ -819,37 +819,24 @@ nefor.on_ready_ok(function()
   nefor.emit("auth.status", { state = "connected" })
 end)
 
-nefor.on(NAME .. ".chat.create", function(body)
-  local chat_id = body.chat_id
-  if type(chat_id) ~= "string" then return end
+local function complete_request(body)
+  local chat_id = body.request_id
+  if type(chat_id) ~= "string" or chat_id == "" then return end
+  local request = type(body.request) == "table" and body.request or body
+  local input = type(request.input) == "table" and request.input or {}
+  local messages = type(input.messages) == "table" and input.messages or request.messages
   chats[chat_id] = {}
-  if type(body.system) == "string" and #body.system > 0 then
-    table.insert(chats[chat_id], { role = "system", content = body.system })
+  if type(request.system) == "string" and #request.system > 0 then
+    table.insert(chats[chat_id], { role = "system", content = request.system })
   end
-  nefor.log("chat.create chat_id=" .. chat_id)
-end)
-
-nefor.on(NAME .. ".chat.append", function(body)
-  local chat_id = body.chat_id
-  local message = body.message
-  if type(chat_id) ~= "string" or type(message) ~= "table" then return end
-  if not chats[chat_id] then chats[chat_id] = {} end
-  table.insert(chats[chat_id], {
-    role            = message.role,
-    content         = flatten_content(message.content),
-    tool_call_id    = message.tool_call_id,
-    tool_calls      = message.tool_calls,
-  })
-  nefor.log(string.format(
-    "chat.append chat_id=%s role=%s content_len=%d",
-    chat_id,
-    tostring(message.role),
-    type(message.content) == "string" and #message.content or 0))
-end)
-
-nefor.on(NAME .. ".chat.complete", function(body)
-  local chat_id = body.chat_id
-  if type(chat_id) ~= "string" then return end
+  for _, message in ipairs(type(messages) == "table" and messages or {}) do
+    table.insert(chats[chat_id], {
+      role         = message.role,
+      content      = flatten_content(message.content),
+      tool_call_id = message.tool_call_id,
+      tool_calls   = message.tool_calls,
+    })
+  end
 
   -- Clear any leftover interrupt flag from a prior turn on this
   -- chat_id; the flag is set by the `<NAME>.interrupt` handler when
@@ -884,7 +871,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
     local remaining = resp.pre_delay_ms
     while remaining > 0 do
       if interrupted[chat_id] then
-        nefor.emit("chat.error", { chat_id = chat_id, message = "interrupted" })
+        nefor.emit("completion.event", { request_id = chat_id, event = "error", message = "interrupted" })
         if not chats[chat_id] then chats[chat_id] = {} end
         return
       end
@@ -899,8 +886,9 @@ nefor.on(NAME .. ".chat.complete", function(body)
   -- chat.error into `tool.result { error }` for the agentic-loop's
   -- run-error path, which is the rendering target the brief asks for.
   if resp.finish_reason == "error" then
-    nefor.emit("chat.error", {
-      chat_id = chat_id,
+    nefor.emit("completion.event", {
+      request_id = chat_id,
+      event = "error",
       message = resp.error_message or "mock provider error",
     })
     -- Echo the assistant turn into history so subsequent turns see
@@ -944,7 +932,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
   -- shape (content: null vs "") and any history-walking heuristic.
   if not completed then
     interrupted[chat_id] = nil
-    nefor.emit("chat.error", { chat_id = chat_id, message = "interrupted" })
+    nefor.emit("completion.event", { request_id = chat_id, event = "error", message = "interrupted" })
     if not chats[chat_id] then chats[chat_id] = {} end
     if type(partial) == "string" and #partial > 0 then
       table.insert(chats[chat_id], { role = "assistant", content = partial })
@@ -952,7 +940,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
     return
   end
 
-  -- chat.complete.result with ProviderOut shape.
+  -- chat.complete.result with ProviderInput shape.
   local output = {
     text          = result_text or "",
     finish_reason = resp.finish_reason,
@@ -973,9 +961,10 @@ nefor.on(NAME .. ".chat.complete", function(body)
     for _, chunk in ipairs(CANNED_REASONING_CHUNKS) do full = full .. chunk end
     output.reasoning = full
   end
-  nefor.emit("chat.complete.result", {
-    chat_id = chat_id,
-    output  = output,
+  nefor.emit("completion.event", {
+    request_id = chat_id,
+    event      = "completed",
+    result     = output,
   })
 
   -- Echo the assistant turn into our local history so subsequent
@@ -986,6 +975,16 @@ nefor.on(NAME .. ".chat.complete", function(body)
     content    = result_text or "",
     tool_calls = resp.tool_calls,
   })
+end
+
+nefor.on(NAME .. ".completion.request", complete_request)
+
+nefor.on(NAME .. ".completion.cancel", function(body)
+  local request_id = body and body.request_id
+  if type(request_id) == "string" then
+    interrupted[request_id] = true
+    nefor.log("completion.cancel request_id=" .. request_id)
+  end
 end)
 
 -- Cancellation hook. The chat-side `chat.interrupt` envelope is

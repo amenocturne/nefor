@@ -119,9 +119,8 @@ const APPLIED_KIND: &str = "mag.applied";
 
 /// Kill a live run outright — the control plane's interrupt surface (the
 /// TUI's Esc path). Ends the run's kernel context through the fold (kill
-/// handlers run, so in-flight provider requests are cancelled — the dying
-/// llm's `<provider>.chat.cancel` reaches the bus) and settles the pending
-/// execute as `mag.run_result status:"killed"`. A kill for a run that is
+/// handlers run, so in-flight capabilities emit cancellation) and settles the
+/// pending execute as `mag.run_result status:"killed"`. A kill for a run that is
 /// not live is a logged no-op (monotone lifecycles: kill on dead, no-op).
 const KILL_RUN_KIND: &str = "mag.kill_run";
 const KILL_ALL_RUNS_KIND: &str = "mag.kill_all_runs";
@@ -498,34 +497,26 @@ async fn handle_event(
         Some(k) => k,
         None => return Ok(()),
     };
-    // Provider streaming is observational and keeps the bridge correlation open;
-    // the final result/error below remains the sole settlement path.
-    if kind.ends_with(".stream.delta") || kind.ends_with(".stream.reasoning_delta") {
-        if let (Some(chat_id), Some(text)) = (
-            body.get("chat_id").and_then(Value::as_str),
-            body.get("text").and_then(Value::as_str),
-        ) {
-            if let Some(request_id) = bridge.request_id_for_chat(chat_id) {
-                let event_kind = if kind.ends_with(".stream.reasoning_delta") {
-                    "reasoning"
-                } else {
-                    "assistant"
-                };
-                let value = serde_json::json!({ "kind": event_kind, "text": text });
-                let _ = host.bus_observation(request_id, "append", "transcript", &value)?;
-                flush_emits(out_tx, host, bridge).await?;
-            }
+    // Canonical provider events correlate themselves by request_id. Terminal
+    // events settle the kernel capability; streaming and other telemetry remain
+    // observational and keep the request open. Unknown and late ids are ignored.
+    if let Some(request_id) = bridge.provider_request_id(kind, body) {
+        if let Some(text) = body.get("text").and_then(Value::as_str) {
+            let event_kind = if body.get("event").and_then(Value::as_str) == Some("reasoning_delta")
+            {
+                "reasoning"
+            } else {
+                "assistant"
+            };
+            let value = serde_json::json!({ "kind": event_kind, "text": text });
+            let _ = host.bus_observation(request_id, "append", "transcript", &value)?;
+            flush_emits(out_tx, host, bridge).await?;
+        }
+        if let Some(reply) = bridge.take_reply(kind, body) {
+            return handle_provider_reply(out_tx, reply, program.as_deref(), host, active, bridge)
+                .await;
         }
         return Ok(());
-    }
-    // Provider bridge inbound: a driven chat's streamed completion result (or
-    // error), correlated by chat_id. Feeds the single final result back through
-    // the kernel's capability channel. A reply for a chat we don't drive resolves
-    // to nothing and is ignored inside the bridge, so this is safe to check ahead
-    // of the mag protocol arms (the suffixes never collide with a mag.* kind).
-    if CapabilityBridge::is_provider_reply(kind) {
-        return handle_provider_reply(out_tx, kind, body, program.as_deref(), host, active, bridge)
-            .await;
     }
     let in_reply_to = body.get("id").and_then(Value::as_str);
     match kind {
@@ -1027,12 +1018,9 @@ async fn handle_apply(
     tracing::info!(source = %source, run_id = %run_id, "mag.apply accepted");
 
     let state = host.apply(&run_id, &modification)?;
-    // Forward the lifecycle events + any abort/cancel envelopes the apply queued.
-    // A kill hands the dying `llm` its final message — the `<provider>.chat.cancel`
-    // envelope keyed by the chat_id handle (factories/llm.lua handle_kill) — which
-    // takes the raw-emit path to the kernel's queue (routing.lua on_emit) and
-    // reaches the bus here verbatim: not a `tool.invoke`, so the bridge forwards
-    // it untouched to the provider that owns that chat.
+    // Forward lifecycle events and capability cancellations before acknowledging
+    // the apply. The bridge selects canonical provider or tool-gate cancellation
+    // from its request ownership.
     flush_emits(out_tx, host, bridge).await?;
     send_event(
         out_tx,
@@ -1045,9 +1033,8 @@ async fn handle_apply(
 }
 
 /// Kill one live run: end its kernel context — reaping its actors through
-/// the fold, so kill handlers run and their abort/cancel envelopes (a
-/// mid-flight llm's `<provider>.chat.cancel`) reach the bus — then settle
-/// the pending execute with `mag.run_result status:"killed"`. The cancel
+/// the fold, so kill handlers run and capability cancellations reach the bus —
+/// then settle the pending execute with `mag.run_result status:"killed"`. The
 /// envelopes are flushed BEFORE the terminal reply so a consumer that
 /// treats the reply as "turn closed" observes the aborts first. A kill for
 /// a run without a live execute is a logged no-op.
@@ -1246,36 +1233,22 @@ async fn handle_tool_result(
     }
 }
 
-/// Route a provider bridge reply (a driven chat's `chat.complete.result` or
-/// `chat.error`) into the kernel as the correlated capability response. The
-/// single final result feeds `kernel.bus_response`; a `chat.delete` then frees
-/// the provider-side chat. The reply may re-fire the requesting actor (a next
-/// turn → a fresh provider `tool.invoke` the bridge drives again) or complete the
-/// run, so forward whatever it produced and settle. A reply for a chat we don't
-/// drive resolves to `None` and is a no-op.
+/// Route one canonical terminal provider event into the kernel as the
+/// correlated capability response. The reply may re-fire the requesting actor
+/// or complete the run, so forward whatever the kernel produced and settle.
 async fn handle_provider_reply(
     out_tx: &mpsc::Sender<PluginOutgoing>,
-    kind: &str,
-    body: &Map<String, Value>,
+    reply: bridge::ProviderReply,
     program: Option<&LoadedProgram>,
     host: &LuaHost,
     active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
-    let reply = match bridge.take_reply(kind, body) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
     let advanced = host.bus_response(
         &reply.request_id,
         reply.result.as_ref(),
         reply.error.as_deref(),
     )?;
-    send_event(
-        out_tx,
-        bridge::delete_envelope(&reply.provider, &reply.chat_id),
-    )
-    .await?;
     flush_emits(out_tx, host, bridge).await?;
     match advanced {
         Some(run_id) => settle_run(out_tx, host, active, bridge, program, &run_id).await,

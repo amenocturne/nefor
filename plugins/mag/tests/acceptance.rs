@@ -16,7 +16,7 @@
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
 //! full provider loop (`llm → run-tool → tool-result → llm`),
 //! with `a1.llm` declared as the structural result boundary. Each agent is seeded with a
-//! `generic-provider.ProviderOut`, so both fire their `llm` turn straight off
+//! `generic-provider.ProviderInput`, so both fire their `llm` turn straight off
 //! the initial messages with no `adapter` factory needed (the shipped kernel registers
 //! no `adapter`; the entry adapter of the design fixture is elided by seeding
 //! the `llm` input directly).
@@ -133,7 +133,7 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 /// Build the two-agent modification. Each agent `aN` is a full provider loop:
 /// `aN.llm → aN.run-tool → aN.tool-result → aN.llm`. `a1.llm` is the declared
 /// result on `generic-provider.FinalAnswer`. Both `llm`s are seeded with a
-/// `generic-provider.ProviderOut` so they fire off the initial messages.
+/// `generic-provider.ProviderInput` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
     fn named(name: &str) -> Value {
         json!({"kind":"named","name":name,"arguments":[]})
@@ -151,7 +151,7 @@ fn two_agent_modification() -> Value {
                 "id": format!("{prefix}.llm"),
                 "factory": "llm",
                 "evidence": evidence("nefor.factory.llm",provider_input.clone(),json!({"kind":"union","items":[tool_calls.clone(),final_answer.clone()]})),
-                "input":{"wire":"generic-provider.ProviderOut","type":provider_input.clone()},
+                "input":{"wire":"generic-provider.ProviderInput","type":provider_input.clone()},
                 "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"generic-provider.FinalAnswer","type":final_answer}],
                 "params": { "model": "opus", "provider": PROVIDER, "system": "work" },
                 "routes": {
@@ -179,11 +179,11 @@ fn two_agent_modification() -> Value {
                 "factory": "tool-result",
                 "evidence": evidence("nefor.factory.tool-result",tool_handle.clone(),provider_input.clone()),
                 "input":{"wire":"generic-tool.ToolHandle","type":tool_handle},
-                "outputs":[{"wire":"generic-provider.ProviderOut","type":provider_input}],
+                "outputs":[{"wire":"generic-provider.ProviderInput","type":provider_input}],
                 "params": {},
-                "routes": { "generic-provider.ProviderOut": [{
+                "routes": { "generic-provider.ProviderInput": [{
                     "actor": format!("{prefix}.llm"),
-                    "wire": "generic-provider.ProviderOut"
+                    "wire": "generic-provider.ProviderInput"
                 }] }
             }),
         ]
@@ -194,8 +194,8 @@ fn two_agent_modification() -> Value {
     json!({
         "actors": actors,
         "messages": [
-            { "to": "a1.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go" }] } },
-            { "to": "a2.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go" }] } }
+            { "to": "a1.llm", "content": { "kind": "generic-provider.ProviderInput", "messages": [{ "role": "user", "content": "go" }] } },
+            { "to": "a2.llm", "content": { "kind": "generic-provider.ProviderInput", "messages": [{ "role": "user", "content": "go" }] } }
         ],
         "kills": [],
         "rules": [],
@@ -515,7 +515,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
 
     // ── SIX STEPS #3: the survivor's every node output persisted, typed per
     //    the declared contracts (llm ToolCalls/FinalAnswer, run-tool ToolHandle,
-    //    tool-result ProviderOut). ─────────────────────────────────────────────
+    //    tool-result ProviderInput). ─────────────────────────────────────────────
     for node in ["a1.llm", "a1.run-tool", "a1.tool-result"] {
         assert!(
             node_output(node).exists(),

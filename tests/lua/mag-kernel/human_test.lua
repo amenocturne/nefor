@@ -73,19 +73,19 @@ end
 -- ------------------------------------------------------------------
 
 -- A deterministic stand-in for the produce llm: same declared boundary
--- (ProviderOut in, FinalAnswer out) but synchronous — each firing emits
+-- (ProviderInput in, FinalAnswer out) but synchronous — each firing emits
 -- "draft <n>" instead of a provider round-trip.
 local function producer_factory()
   return {
     declaration = {
       name = "producer",
       params = {},
-      inputs = { provider_out = "generic-provider.ProviderOut" },
+      inputs = { provider_input = "generic-provider.ProviderInput" },
       outputs = { "generic-provider.FinalAnswer" },
       semantic = {
         input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
         output={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},
-        inputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
+        inputs={{wire="generic-provider.ProviderInput",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
         outputs={{wire="generic-provider.FinalAnswer",type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}}},
       },
     },
@@ -168,7 +168,7 @@ local function gate_actors()
     {
       id = "produce", factory = "producer", params = {},
       evidence={version=2,identity="nefor.factory.producer",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}},
-      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
+      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"},outputs={{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
       routes = { ["generic-provider.FinalAnswer"] = { { actor = "approve", wire = "generic-provider.FinalAnswer" } } },
     },
     {
@@ -183,8 +183,8 @@ local function gate_actors()
     {
       id = "rework", factory = "adapter", params = { seed = "provider-in" },
       evidence={version=2,identity="nefor.factory.adapter",arguments={{kind="named",name="test.Rejected",arguments={}}},input={kind="named",name="test.Rejected",arguments={}},output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-      input={type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
-      routes = { ["generic-provider.ProviderOut"] = { { actor = "produce", wire = "generic-provider.ProviderOut" } } },
+      input={type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"}},
+      routes = { ["generic-provider.ProviderInput"] = { { actor = "produce", wire = "generic-provider.ProviderInput" } } },
     },
     { id = "out", factory = "sink", params = {}, routes = {},
       evidence={version=2,identity="nefor.factory.sink",arguments={{kind="named",name="test.Approved",arguments={}}},input={kind="named",name="test.Approved",arguments={}},output={kind="primitive",name="Unit"}},
@@ -196,7 +196,7 @@ local function seed_message()
   return {
     to = "produce",
     content = {
-      kind = "generic-provider.ProviderOut",
+      kind = "generic-provider.ProviderInput",
       messages = { { role = "user", content = "write the plan" } },
     },
   }
@@ -396,14 +396,14 @@ do
       {
         id = "entry", factory = "adapter", params = { seed = "provider-in" },
         evidence={version=2,identity="nefor.factory.adapter",arguments={{kind="named",name="test.Task",arguments={}}},input={kind="named",name="test.Task",arguments={}},output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-        input={type={kind="named",name="test.Task",arguments={}},wire="task"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "review.produce", wire = "generic-provider.ProviderOut" } } },
+        input={type={kind="named",name="test.Task",arguments={}},wire="task"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"}},
+        routes = { ["generic-provider.ProviderInput"] = { { actor = "review.produce", wire = "generic-provider.ProviderInput" } } },
       },
       {
         id = "review.produce", factory = "llm",
         params = { provider = "chatgpt-provider", model = "opus" },
         evidence={version=2,identity="nefor.factory.llm",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.ToolCalls",arguments={}},{kind="named",name="nefor.contracts.FinalAnswer",arguments={}}}}},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
+        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
         routes = { ["generic-provider.FinalAnswer"] = { { actor = "review.approve", wire = "generic-provider.FinalAnswer" } } },
       },
       {
@@ -418,8 +418,8 @@ do
       {
         id = "review.rework", factory = "adapter", params = { seed = "provider-in" },
         evidence={version=2,identity="nefor.factory.adapter",arguments={{kind="named",name="test.Rejected",arguments={}}},input={kind="named",name="test.Rejected",arguments={}},output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-        input={type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "review.produce", wire = "generic-provider.ProviderOut" } } },
+        input={type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"}},
+        routes = { ["generic-provider.ProviderInput"] = { { actor = "review.produce", wire = "generic-provider.ProviderInput" } } },
       },
       { id = "sink", factory = "sink", params = {}, routes = {},
         evidence={version=2,identity="nefor.factory.sink",arguments={{kind="named",name="test.Approved",arguments={}}},input={kind="named",name="test.Approved",arguments={}},output={kind="primitive",name="Unit"}},

@@ -219,7 +219,7 @@ pub struct TurnToken {
 }
 
 impl TurnToken {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cancel: CancellationToken::new(),
             suppress: Arc::new(AtomicBool::new(false)),

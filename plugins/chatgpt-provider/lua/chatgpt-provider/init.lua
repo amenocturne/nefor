@@ -1,67 +1,117 @@
--- chatgpt-provider Lua translator.
---
--- The chatgpt-provider Rust binary emits the same prefixed event kinds
--- as openai-provider (chat.create/append/complete, stream.delta,
--- auth.status, etc.), so the openai-provider Lua translator works
--- byte-for-byte against our wire. This module is a thin re-export so
--- the compositor can load us by name (`require("chatgpt-provider")`)
--- without learning about openai-provider directly.
-
 local oa = require("openai-provider")
 
--- Wrap the shared translator to add a provider-owned cancel helper.
---
--- Cancellation for this provider is keyed by the completion's chat_id —
--- the caller-supplied request id: the binary runs at most one in-flight
--- completion per chat, so the chat_id IS the request handle (no parallel
--- id is invented). The helper owns the `<prefix>.chat.cancel` envelope
--- shape once so factories call `cancel(request_id)` instead of
--- hand-rolling the body. It is the honor side of the runtime's cancel
--- protocol: fire-and-forget, idempotent on the binary side (an unknown
--- or already-finished request id is a logged no-op there).
+local function copy(value)
+  local out = {}
+  for key, item in pairs(value or {}) do out[key] = item end
+  return out
+end
+
 local function translator(name)
   local t = oa.translator(name)
-  local chat_cancel_kind = name .. ".chat.cancel"
-  local usage_requested_kind = name .. ".usage.requested"
-  local usage_updated_kind = name .. ".usage.updated"
-  local usage_error_kind = name .. ".usage.error"
+  local prefix = name .. "."
   local base_outbound = t.outbound
   local base_inbound = t.inbound
-  t.kinds.chat_cancel = chat_cancel_kind
-  t.kinds.usage_requested = usage_requested_kind
-  t.kinds.usage_updated = usage_updated_kind
-  t.kinds.usage_error = usage_error_kind
+
+  t.kinds.completion_request = prefix .. "completion.request"
+  t.kinds.completion_cancel = prefix .. "completion.cancel"
+  t.kinds.completion_event = prefix .. "completion.event"
+  t.kinds.stream_tool_call_delta = prefix .. "stream.tool_call_delta"
+  t.kinds.usage_requested = prefix .. "usage.requested"
+  t.kinds.usage_updated = prefix .. "usage.updated"
+  t.kinds.usage_error = prefix .. "usage.error"
+
+  t.complete = function(request)
+    assert(type(request) == "table", "chatgpt-provider.complete: request required")
+    assert(type(request.request_id) == "string" and #request.request_id > 0,
+      "chatgpt-provider.complete: request_id required")
+    assert(type(request.messages) == "table",
+      "chatgpt-provider.complete: complete messages/history required")
+    local body = copy(request)
+    body.kind = t.kinds.completion_request
+    return body
+  end
+
   t.cancel = function(request_id)
     assert(type(request_id) == "string" and #request_id > 0,
-      "chatgpt-provider.cancel: request_id (chat_id) required")
-    return { kind = chat_cancel_kind, chat_id = request_id }
+      "chatgpt-provider.cancel: request_id required")
+    return { kind = t.kinds.completion_cancel, request_id = request_id }
   end
-  t.outbound = function(env)
-    local kind = type(env) == "table"
-      and type(env.body) == "table"
-      and env.body.kind
-      or nil
-    if kind == usage_updated_kind or kind == usage_error_kind then
-      local body = {}
-      for k, v in pairs(env.body) do body[k] = v end
-      body.kind = (kind == usage_updated_kind) and "chat.usage.updated" or "chat.usage.error"
-      body.provider = name
-      return body
-    end
-    return base_outbound(env)
-  end
+
   t.inbound = function(env)
     local body = type(env) == "table" and env.body or nil
+    if type(body) == "table" and body.kind == "ProviderRequest" then
+      if body.provider ~= nil and body.provider ~= name then return nil end
+      if body.cancel == true then return t.cancel(body.request_id) end
+      return t.complete(body)
+    end
     if type(body) == "table" and body.kind == "chat.usage.requested" then
       if body.provider ~= name then return nil end
-      return { kind = usage_requested_kind }
+      return { kind = t.kinds.usage_requested }
     end
     return base_inbound(env)
   end
+
+  t.outbound = function(env)
+    local body = type(env) == "table" and env.body or nil
+    local kind = type(body) == "table" and body.kind or nil
+    if type(kind) ~= "string" then return base_outbound(env) end
+
+    if kind == t.kinds.completion_event then
+      if type(body.request_id) ~= "string" or #body.request_id == 0 then return nil end
+      return copy(body)
+    end
+
+    if kind == t.kinds.usage_updated or kind == t.kinds.usage_error then
+      local translated = copy(body)
+      translated.kind = kind == t.kinds.usage_updated and "chat.usage.updated" or "chat.usage.error"
+      translated.provider = name
+      return translated
+    end
+
+    local request_id = body.request_id or body.chat_id
+    if type(request_id) ~= "string" or #request_id == 0 then
+      return base_outbound(env)
+    end
+
+    local event
+    if kind == t.kinds.completion_event then
+      event = body.event
+    elseif kind == t.kinds.stream_delta then
+      event = "text_delta"
+    elseif kind == t.kinds.stream_reasoning_delta then
+      event = "reasoning_delta"
+    elseif kind == t.kinds.stream_reasoning_end then
+      event = "reasoning_completed"
+    elseif kind == t.kinds.stream_tool_call_delta then
+      event = "tool_call_delta"
+    elseif kind == t.kinds.stream_retry then
+      event = "retry"
+    elseif kind == t.kinds.session_stats then
+      event = "usage"
+    elseif kind == t.kinds.turn_error or kind == t.kinds.chat_error then
+      event = "error"
+    elseif kind == t.kinds.chat_complete_result then
+      event = body.finish_reason == "error" and "failed"
+        or body.finish_reason == "interrupted" and "interrupted"
+        or "completed"
+    elseif kind == t.kinds.stream_end then
+      return nil
+    else
+      return base_outbound(env)
+    end
+
+    local translated = copy(body)
+    translated.kind = "ProviderInput"
+    translated.provider = name
+    translated.request_id = request_id
+    translated.chat_id = nil
+    translated.event = event
+    return translated
+  end
+
   return t
 end
 
 return {
-  translator     = translator,
-  replay_rebuild = oa.replay_rebuild,
+  translator = translator,
 }

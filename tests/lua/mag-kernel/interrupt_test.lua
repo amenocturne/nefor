@@ -54,13 +54,13 @@ end
 -- A run-scoped router with the REAL factories, wired the way init.lua wires a
 -- run context: registry:construct as the lazy-construction hook, kill through
 -- the fold (dispatch_kill → forget), and capturing bus/events sinks. `sink` is
--- a tiny capture factory standing in for the terminal node so ProviderOut is
+-- a tiny capture factory standing in for the terminal node so ProviderInput is
 -- observable.
 local function harness()
   local log = noop_logger()
   local bus = {}
   local events = {}
-  local captured_provider_out = {}
+  local captured_provider_input = {}
 
   local reg = Registry.new({ require_preview = false })
   reg:register({ declaration = run_tool.declaration, construct = run_tool.construct })
@@ -68,7 +68,7 @@ local function harness()
   reg:register({
     declaration = {
       name = "capture-sink",
-      inputs = { input = "generic-provider.ProviderOut" },
+      inputs = { input = "generic-provider.ProviderInput" },
       outputs = {},
       signals = {},
     },
@@ -78,7 +78,7 @@ local function harness()
         id = id,
         deliver = function(activation)
           local m = ((activation.messages or {})[1] or {}).message
-          captured_provider_out[#captured_provider_out + 1] = m
+          captured_provider_input[#captured_provider_input + 1] = m
           return { status = "ok" }
         end,
       }
@@ -103,7 +103,7 @@ local function harness()
     return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
   end)
 
-  -- run-tool --ToolHandle--> tool-result --ProviderOut--> capture-sink.
+  -- run-tool --ToolHandle--> tool-result --ProviderInput--> capture-sink.
   local res = inv.apply({
     actors = {
       { id = "rt", factory = "run-tool", params = {},
@@ -112,17 +112,17 @@ local function harness()
         routes = { ["generic-tool.ToolHandle"] = { { actor = "tr", wire = "generic-tool.ToolHandle" } } } },
       { id = "tr", factory = "tool-result", params = {},
         evidence={version=2,identity="nefor.factory.tool-result",arguments={},input={kind="named",name="nefor.contracts.ToolHandle",arguments={}},output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-        input={type={kind="named",name="nefor.contracts.ToolHandle",arguments={}},wire="generic-tool.ToolHandle"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "cap", wire = "generic-provider.ProviderOut" } } } },
+        input={type={kind="named",name="nefor.contracts.ToolHandle",arguments={}},wire="generic-tool.ToolHandle"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"}},
+        routes = { ["generic-provider.ProviderInput"] = { { actor = "cap", wire = "generic-provider.ProviderInput" } } } },
       { id = "cap", factory = "capture-sink", params = {}, routes = {},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={} },
+        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderInput"},outputs={} },
     },
   })
   assert_true(res.ok, "constellation applies: " .. tostring(res.error))
 
   return {
     inv = inv, router = router, bus = bus, events = events,
-    provider_out = captured_provider_out,
+    provider_input = captured_provider_input,
   }
 end
 
@@ -155,8 +155,8 @@ do
 
   -- 2. synthetic settle routed through run-tool → tool-result → sink as a
   --    failed tool result the model can read.
-  assert_eq(#h.provider_out, 1, "the interrupted result reached the sink as one ProviderOut turn")
-  local turn = h.provider_out[1]
+  assert_eq(#h.provider_input, 1, "the interrupted result reached the sink as one ProviderInput turn")
+  local turn = h.provider_input[1]
   assert_eq(#turn.messages, 1, "one tool-role message for the interrupted call")
   assert_eq(turn.messages[1].role, "tool", "the interrupted result is a tool-role turn")
   assert_eq(turn.messages[1].content, "[tool error] interrupted by user",
@@ -181,7 +181,7 @@ do
   local settled = h.router:interrupt("interrupted by user")
   assert_eq(settled, 0, "no open correlations → nothing to settle")
   assert_true(find_kind(h.bus, "tool.cancel") == nil, "no tool.cancel when nothing is in flight")
-  assert_eq(#h.provider_out, 0, "no tool result routed when nothing was interrupted")
+  assert_eq(#h.provider_input, 0, "no tool result routed when nothing was interrupted")
 end
 
 -- ==================================================================
@@ -213,7 +213,7 @@ do
 
   -- 2. NO re-fire: no tool result reached the sink — the llm gets no reply to
   --    absorb and answer on. This is the difference from the graceful interrupt.
-  assert_eq(#h.provider_out, 0,
+  assert_eq(#h.provider_input, 0,
     "cancel_inflight delivers no reply — the actor does not re-fire")
 
   -- 3. the actors are untouched by the primitive itself (the HOST reaps the run

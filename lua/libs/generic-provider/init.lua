@@ -8,15 +8,15 @@
 --
 -- ## Types
 --
--- - `generic-provider.ProviderIn`  — chat-completion request shape
--- - `generic-provider.ProviderOut` — chat-completion response shape
+-- - `generic-provider.ProviderRequest`  — chat-completion request shape
+-- - `generic-provider.ProviderInput` — chat-completion response shape
 -- - `generic-provider.ChatHistory` — provider-shaped reasoner state
 -- - `generic-provider.NoState`     — unit/empty state for stateless reasoners
 -- - `generic-provider.FinalAnswer` — escape-edge type emitted by `tool_split`
 --
 -- Concrete provider plugins (openai-provider, mock-plugin, …) declare
--- `Into<generic-provider.ProviderIn, <them>.RawRequest>` and
--- `Into<<them>.RawResponse, generic-provider.ProviderOut>` against
+-- `Into<generic-provider.ProviderRequest, <them>.RawRequest>` and
+-- `Into<<them>.RawResponse, generic-provider.ProviderInput>` against
 -- combinators, referring to these tags by their fully-qualified names.
 --
 -- ## How `declare()` works
@@ -41,16 +41,16 @@ local M = {}
 -- Canonical type-name constants. Bare names are what concrete plugins
 -- list in their declared `types[]`; dotted forms are what they reference
 -- cross-namespace (e.g. in graph edges or `Into.in`/`out`).
-M.PROVIDER_IN   = FROM .. ".ProviderIn"
-M.PROVIDER_OUT  = FROM .. ".ProviderOut"
+M.PROVIDER_REQUEST   = FROM .. ".ProviderRequest"
+M.PROVIDER_INPUT  = FROM .. ".ProviderInput"
 M.CHAT_HISTORY  = FROM .. ".ChatHistory"
 M.NO_STATE      = FROM .. ".NoState"
 M.FINAL_ANSWER  = FROM .. ".FinalAnswer"
 
 -- Bare-name list emitted in `combinators.register`'s `types[]`.
 local BARE_TYPES = {
-  "ProviderIn",
-  "ProviderOut",
+  "ProviderRequest",
+  "ProviderInput",
   "ChatHistory",
   "NoState",
   "FinalAnswer",

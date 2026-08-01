@@ -183,7 +183,7 @@ local function lead_artifact()
       {
         id = "lead.entry", foreign = "nefor.factory.adapter",
         params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } },
+        routes = { ["generic-provider.ProviderInput"] = { { actor = "lead.llm", wire = "generic-provider.ProviderInput" } } },
       },
       {
         id = "lead.llm", foreign = "nefor.factory.llm",

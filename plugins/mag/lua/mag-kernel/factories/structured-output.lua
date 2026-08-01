@@ -19,7 +19,7 @@ M.declaration = {
         {kind="named",name="nefor.contracts.AgentError",arguments={}},
       }},
     }},
-    inputs = {{ wire="generic-provider.ProviderOut", type={kind="named",
+    inputs = {{ wire="generic-provider.ProviderInput", type={kind="named",
       name="nefor.contracts.ProviderInput",arguments={}} }},
     outputs = {
       {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}},
@@ -36,7 +36,7 @@ M.declaration = {
     provider_error_type = "string", validation_error_type = "string",
     max_corrections = "number",
   },
-  inputs = { provider_out = "generic-provider.ProviderOut" },
+  inputs = { provider_input = "generic-provider.ProviderInput" },
   outputs = { "generic-tool.ToolCalls", RESULT },
   signals = { "kill", "drain" },
 }

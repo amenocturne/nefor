@@ -87,7 +87,7 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }, emit)
         assert(actor, err)
 
-        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
           messages = {{ role = "user", content = "plan" }}
         }}}})
         assert(emitted[#emitted].kind == "capability.invoke")
@@ -100,7 +100,7 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }} }})
         assert(emitted[#emitted - 1].kind == "generic-tool.ToolCalls")
 
-        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
           messages = {{ role = "tool", content = "done", tool_call_id = "call-1" }}
         }}}})
         actor.deliver({ kind = "reply", result = { text = "not json" } })
@@ -140,7 +140,7 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
-        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
         actor.deliver({ kind = "reply", result = { text = "1" } })
@@ -175,7 +175,7 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
-        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
         actor.deliver({ kind = "reply", result = { text = "1", raw = "candidate" } })
@@ -218,7 +218,7 @@ fn tagged_result_preserves_the_selected_constructor_without_a_selector() {
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
-        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut",
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput",
           message = { messages = {{ role = "user", content = "answer" }} } }}})
         actor.deliver({ kind = "reply",
           result = { text = [[{"type":"left-tag","value":{"answer":42}}]] } })
@@ -249,7 +249,7 @@ fn ordinary_string_output_accepts_the_empty_string() {
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
-        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
         actor.deliver({ kind = "reply", result = { text = [[""]] } })
@@ -280,7 +280,7 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
             provider_error_type = "provider-error-tag",
             validation_error_type = "validation-error-tag"
           }, function(message) emitted[#emitted + 1] = message end))
-          actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+          actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
             messages = {{ role = "user", content = "answer" }}
           }}}})
           return actor, emitted
@@ -338,7 +338,7 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         after_tool.deliver({ kind = "reply", result = { marker = "tool-round", tool_calls = {{
           id = "call-1", name = "read_file", args = { path = "x" }
         }} }})
-        after_tool.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+        after_tool.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
           messages = {{ role = "tool", content = "done", tool_call_id = "call-1" }}
         }}}})
         after_tool.deliver({ kind = "reply", error = "post-tool provider failure" })
@@ -373,7 +373,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end))
         local function activate(content)
-          actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+          actor.deliver({ messages = {{ tag = "generic-provider.ProviderInput", message = {
             messages = {{ role = "user", content = content }}
           }}}})
         end

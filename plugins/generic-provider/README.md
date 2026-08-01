@@ -4,8 +4,8 @@ NCP plugin: type-registry hub for the canonical provider protocol.
 
 Owns five canonical types that every provider-shaped reasoner agrees on:
 
-- `generic-provider.ProviderIn` -- standard chat-completion request
-- `generic-provider.ProviderOut` -- standard chat-completion response
+- `generic-provider.ProviderRequest` -- standard chat-completion request
+- `generic-provider.ProviderInput` -- standard chat-completion response
 - `generic-provider.ChatHistory` -- provider-shaped reasoner state
 - `generic-provider.NoState` -- unit/empty state for stateless reasoners
 - `generic-provider.FinalAnswer` -- escape-edge type emitted by `tool_split`

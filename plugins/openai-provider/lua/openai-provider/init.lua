@@ -80,6 +80,9 @@ function M.translator(name)
     chat_append             = prefix .. "chat.append",
     chat_restore            = prefix .. "chat.restore",
     chat_cancel             = prefix .. "chat.cancel",
+    completion_request      = prefix .. "completion.request",
+    completion_cancel       = prefix .. "completion.cancel",
+    completion_event        = prefix .. "completion.event",
     hello                   = prefix .. "hello",
     ready                   = prefix .. "ready",
     goodbye                 = prefix .. "goodbye",
@@ -108,7 +111,11 @@ function M.translator(name)
     local k = body.kind
     if type(k) ~= "string" then return body end
 
-    if k == kinds.stream_delta then
+    if k == "completion.event" then
+      if type(body.request_id) ~= "string" or body.request_id == "" then return nil end
+      body.kind = kinds.completion_event
+      return body
+    elseif k == kinds.stream_delta then
       body.kind = "chat.stream.delta"
       return body
     elseif k == kinds.stream_reasoning_delta then
@@ -206,6 +213,15 @@ function M.translator(name)
 
     local k = body.kind
     if type(k) ~= "string" then return body end
+
+    if k == kinds.completion_request then
+      if type(body.request_id) ~= "string" or body.request_id == "" then return nil end
+      if type(body.messages) ~= "table" then return nil end
+      return body
+    elseif k == kinds.completion_cancel then
+      if type(body.request_id) ~= "string" or body.request_id == "" then return nil end
+      return body
+    end
 
     if k == "chat.history.create" or k == "chat.history.message" then
       return nil
@@ -571,6 +587,10 @@ function M.replay_rebuild(env, name)
   local body = env.body
   local k = body.kind
   if type(k) ~= "string" then return end
+
+  -- Direct completions are replay-inert: each request already carried its
+  -- complete history and must never be reissued during session restore.
+  if k == "completion.request" or k == "completion.cancel" or k == "completion.event" then return end
 
   local prefix = name .. "."
   local owned = owned_for(name)

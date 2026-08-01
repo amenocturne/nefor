@@ -71,7 +71,7 @@ Two obligations:
   type-checks against declared contracts; nothing selects inputs by sniffing
   their shape. In a cyclic composition (the agentic loop), which output exits
   the cycle is a type fact — a declared algebraic type, built from sums and
-  products, e.g. `ProviderOut -> (ToolCalls | FinalAnswer)` — never a
+  products, e.g. `ProviderInput -> (ToolCalls | FinalAnswer)` — never a
   position heuristic. The input side carries firing semantics the same way:
   single type fires per message, union fires on any, product fires on all
   (see ir.md, Firing).

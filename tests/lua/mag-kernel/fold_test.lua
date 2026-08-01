@@ -60,7 +60,7 @@ do
   local res = inv.apply({
     actors = {
       actor_spec("docs-explorer.entry", "adapter", { seed = "provider-in" },
-        { ["generic-provider.ProviderOut"] = { { actor = "docs-explorer.llm", wire = "generic-provider.ProviderOut" } } }),
+        { ["generic-provider.ProviderInput"] = { { actor = "docs-explorer.llm", wire = "generic-provider.ProviderInput" } } }),
       actor_spec("docs-explorer.llm", "llm", { model = "opus" }, {}),
     },
     messages = {
@@ -77,9 +77,9 @@ do
 
   local entry = inv.get("docs-explorer.entry")
   assert_eq(entry.factory, "adapter", "factory retained")
-  assert_eq(entry.routes["generic-provider.ProviderOut"][1].actor, "docs-explorer.llm",
+  assert_eq(entry.routes["generic-provider.ProviderInput"][1].actor, "docs-explorer.llm",
     "route destination actor retained verbatim, kernel-side")
-  assert_eq(entry.routes["generic-provider.ProviderOut"][1].wire, "generic-provider.ProviderOut",
+  assert_eq(entry.routes["generic-provider.ProviderInput"][1].wire, "generic-provider.ProviderInput",
     "route destination wire retained verbatim, kernel-side")
   assert_eq(#entry.mailbox, 1, "message queued in the bare-VM mailbox (no deliver hook)")
   assert_eq(entry.mailbox[1].prompt, "go", "queued message content preserved")

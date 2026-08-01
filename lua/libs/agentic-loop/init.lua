@@ -355,7 +355,7 @@ end
 --   * source actor — the initial Unit message's target and task-value owner;
 --   * entry actor — the source value's destination;
 --   * lead llm — the llm-factory actor the entry adapter routes
---     `generic-provider.ProviderOut` into (the overlay + binding target).
+--     `generic-provider.ProviderInput` into (the overlay + binding target).
 -- Derivation over hardcoding keeps the program hackable: rename the agent
 -- in lead-turn.mag and the spawner follows.
 local function derive_program_seams(modification)
@@ -383,14 +383,14 @@ local function derive_program_seams(modification)
   for _, actor in ipairs(modification.actors or {}) do
     if actor.id == entry_actor then
       local dests = type(actor.routes) == "table"
-        and actor.routes["generic-provider.ProviderOut"] or nil
+        and actor.routes["generic-provider.ProviderInput"] or nil
       local destination = type(dests) == "table" and dests[1] or nil
       llm_actor = type(destination) == "table" and destination.actor or nil
     end
   end
   if type(llm_actor) ~= "string" then
     return nil, "turn-program entry actor '" .. tostring(entry_actor)
-      .. "' routes no ProviderOut (no lead llm actor)"
+      .. "' routes no ProviderInput (no lead llm actor)"
   end
   return { source_actor = source_actor, entry_actor = entry_actor, llm_actor = llm_actor }, nil
 end

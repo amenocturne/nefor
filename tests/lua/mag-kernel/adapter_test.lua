@@ -5,7 +5,7 @@
 -- nefor.log surface, points package.path at plugins/mag/lua/mag-kernel/). Tests the
 -- factory in isolation: a capturing `emit` stands in for the kernel outbound.
 -- The adapter is the agent's boundary type shift — it lifts either the initial
--- task seed OR an upstream agent's FinalAnswer into the `ProviderOut` turn the
+-- task seed OR an upstream agent's FinalAnswer into the `ProviderInput` turn the
 -- downstream `llm` consumes. Both directions are asserted here.
 
 local Registry = require("registry")
@@ -52,7 +52,7 @@ local function single(from, tag, message)
 end
 
 -- ==================================================================
--- declaration: union input, ProviderOut output, no signals
+-- declaration: union input, ProviderInput output, no signals
 -- ==================================================================
 
 do
@@ -68,7 +68,7 @@ do
   assert_true(tags["task"], "boundary input accepts the initial task seed")
   assert_true(tags["generic-provider.FinalAnswer"], "boundary input accepts an upstream FinalAnswer")
 
-  assert_eq(decl.outputs[1], "generic-provider.ProviderOut", "adapter output is the provider turn")
+  assert_eq(decl.outputs[1], "generic-provider.ProviderInput", "adapter output is the provider turn")
   assert_eq(#decl.signals, 0, "adapter is synchronous — declares no signal handlers")
 end
 
@@ -86,7 +86,7 @@ do
 end
 
 -- ==================================================================
--- task seed in -> ProviderOut out (source agent's initial activation)
+-- task seed in -> ProviderInput out (source agent's initial activation)
 -- ==================================================================
 
 do
@@ -97,9 +97,9 @@ do
     "task", { kind = "task", prompt = "explore the codebase" }))
   assert_eq(completion.status, "ok", "synchronous shift returns a successful completion")
 
-  local out = find_kind(msgs, "generic-provider.ProviderOut")
-  assert_true(out ~= nil, "the task seed lifts into a ProviderOut turn")
-  assert_eq(out.from, "docs-explorer.entry", "ProviderOut is id-signed")
+  local out = find_kind(msgs, "generic-provider.ProviderInput")
+  assert_true(out ~= nil, "the task seed lifts into a ProviderInput turn")
+  assert_eq(out.from, "docs-explorer.entry", "ProviderInput is id-signed")
   assert_eq(#out.messages, 1, "one turn message for the downstream provider")
   assert_eq(out.messages[1].role, "user", "the seed becomes a user-role turn")
   assert_eq(out.messages[1].content.mag_type.root.name, "Task",
@@ -109,7 +109,7 @@ do
 end
 
 -- ==================================================================
--- FinalAnswer in -> ProviderOut out (upstream agent hand-off)
+-- FinalAnswer in -> ProviderInput out (upstream agent hand-off)
 -- ==================================================================
 
 do
@@ -119,9 +119,9 @@ do
   -- final_answer preferred when present.
   inst.deliver(single("docs-explorer.llm", "generic-provider.FinalAnswer",
     { kind = "generic-provider.FinalAnswer", final_answer = "found the bug in foo.rs", text = "raw text" }))
-  local out = find_kind(msgs, "generic-provider.ProviderOut")
-  assert_true(out ~= nil, "an upstream FinalAnswer lifts into a ProviderOut turn")
-  assert_eq(out.from, "code-writer.entry", "ProviderOut is id-signed")
+  local out = find_kind(msgs, "generic-provider.ProviderInput")
+  assert_true(out ~= nil, "an upstream FinalAnswer lifts into a ProviderInput turn")
+  assert_eq(out.from, "code-writer.entry", "ProviderInput is id-signed")
   assert_eq(out.messages[1].role, "user", "the hand-off becomes a user-role turn")
   assert_eq(out.messages[1].content.value, "found the bug in foo.rs",
     "final_answer is preferred as the turn content")
@@ -173,7 +173,7 @@ do
       arrival = { constructor_id = "error-id" } },
   } })
 
-  local out = find_kind(msgs, "generic-provider.ProviderOut")
+  local out = find_kind(msgs, "generic-provider.ProviderInput")
   assert_eq(#out.messages, 3, "every product component becomes one provider message")
   assert_eq(out.messages[1].content.mag_type.root.name, "Task",
     "position one carries the Task schema")
@@ -205,7 +205,7 @@ do
   inst.deliver({ shape = "product", whole = true, messages = {
     { tag = "task", message = { value = { { prompt = "go" }, "done" } } },
   } })
-  local out = find_kind(msgs, "generic-provider.ProviderOut")
+  local out = find_kind(msgs, "generic-provider.ProviderInput")
   assert_eq(#out.messages, 1, "a whole product remains one provider message")
   assert_eq(out.messages[1].content.mag_type.root.kind, "product",
     "the whole-product message carries the whole schema")
@@ -229,7 +229,7 @@ do
   local adapter_messages, adapter_emit = capture()
   local entry = adapter.construct("fan-in.entry", { schema = product_schema }, function(message)
     adapter_emit(message)
-    if message.kind == "generic-provider.ProviderOut" then
+    if message.kind == "generic-provider.ProviderInput" then
       provider.deliver(single("fan-in.entry", message.kind, message))
     end
   end)

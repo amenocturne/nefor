@@ -59,11 +59,11 @@ local function make(id, params)
   return instance, msgs
 end
 
--- A graph activation carrying one ProviderOut message.
+-- A graph activation carrying one ProviderInput message.
 local function turn(message)
   return {
     shape = "single",
-    messages = { { from = "upstream", tag = "generic-provider.ProviderOut", message = message } },
+    messages = { { from = "upstream", tag = "generic-provider.ProviderInput", message = message } },
   }
 end
 
@@ -75,8 +75,8 @@ do
   local reg = Registry.new({ require_preview = false })
   local decl, err = reg:register({ declaration = llm.declaration, construct = llm.construct })
   assert_true(decl ~= nil and err == nil, "llm factory registers cleanly")
-  assert_eq(reg:declared_input("llm", "provider_out"), "generic-provider.ProviderOut",
-    "declares a single generic-provider.ProviderOut input")
+  assert_eq(reg:declared_input("llm", "provider_input"), "generic-provider.ProviderInput",
+    "declares a single generic-provider.ProviderInput input")
 
   local outs = {}
   for _, t in ipairs(reg:declaration("llm").outputs) do outs[t] = true end
@@ -251,7 +251,7 @@ do
     },
   })
 
-  -- The tool result comes back as the next ProviderOut turn (tool-result.lua).
+  -- The tool result comes back as the next ProviderInput turn (tool-result.lua).
   instance.deliver(turn({ messages = {
     { role = "tool", tool_call_id = "call-1", name = "list_dir", content = "dir-listing" },
   } }))

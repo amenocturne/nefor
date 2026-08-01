@@ -44,10 +44,10 @@
         entry-in (nefor.graph.port entry-id input-type input-wire)
         entry-out (nefor.graph.port entry-id
                     (type-tag nefor.contracts.ProviderInput)
-                    "generic-provider.ProviderOut")
+                    "generic-provider.ProviderInput")
         llm-in (nefor.graph.port llm-id
                   (type-tag nefor.contracts.ProviderInput)
-                  "generic-provider.ProviderOut")
+                  "generic-provider.ProviderInput")
         tool-calls (nefor.graph.port llm-id
                      (type-tag nefor.contracts.ToolCalls)
                      "generic-tool.ToolCalls")
@@ -65,7 +65,7 @@
                     "generic-tool.ToolHandle")
         result-out (nefor.graph.port tool-result-id
                      (type-tag nefor.contracts.ProviderInput)
-                     "generic-provider.ProviderOut")]
+                     "generic-provider.ProviderInput")]
 
     (as (nefor.graph.Node I (| O nefor.contracts.AgentError)) {:id id :role "ordinary" :actors
        [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [I])

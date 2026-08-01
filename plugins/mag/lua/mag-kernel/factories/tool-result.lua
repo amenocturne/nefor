@@ -10,16 +10,16 @@
 --
 -- Contract (reconciled against tests/fixtures/two-agents.modification.json —
 -- `run-tool` routes `generic-tool.ToolHandle` here, and this node routes
--- `generic-provider.ProviderOut` onward, back into the llm; flagged):
+-- `generic-provider.ProviderInput` onward, back into the llm; flagged):
 --   input   generic-tool.ToolHandle       (single; fires per handle)
---   output  generic-provider.ProviderOut  (the next provider turn's input)
+--   output  generic-provider.ProviderInput  (the next provider turn's input)
 --
 -- ── adaptation shape (flagged) ───────────────────────────────────────────────
 --   The ToolHandle carries `results = { { id, name, output, error }, … }` (the
 --   run-tool aggregation). Each becomes one tool-role message keyed by the
 --   model's `tool_call_id`, so the provider can pair a result to the call that
 --   produced it:
---     { kind="generic-provider.ProviderOut", from=id,
+--     { kind="generic-provider.ProviderInput", from=id,
 --       messages = { { role="tool", tool_call_id=<id>, name=<tool>,
 --                      content=<string|structured>, error=<e?> }, … } }
 --   `content` is the tool output: a string passes through; a structured output
@@ -45,7 +45,7 @@ M.declaration = {
     input={kind="named",name="nefor.contracts.ToolHandle",arguments={}},
     output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
     inputs={{wire="generic-tool.ToolHandle",type={kind="named",name="nefor.contracts.ToolHandle",arguments={}}}},
-    outputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
+    outputs={{wire="generic-provider.ProviderInput",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
   },
 
   params = {},
@@ -55,7 +55,7 @@ M.declaration = {
   },
 
   outputs = {
-    "generic-provider.ProviderOut",
+    "generic-provider.ProviderInput",
   },
 
   signals = {},
@@ -100,7 +100,7 @@ function M.construct(id, params, emit, deps)
 
   -- deliver(activation) -> completion (routing.lua, the kernel⇄factory
   -- contract). Single input: fires per ToolHandle. Synchronous — adapt the
-  -- aggregated results into a ProviderOut turn and return a successful
+  -- aggregated results into a ProviderInput turn and return a successful
   -- completion (the kernel then emits mag.Unit along any dependency edges).
   function instance.deliver(activation)
     activation = activation or {}
@@ -117,7 +117,7 @@ function M.construct(id, params, emit, deps)
           or { id = r.id, name = r.name, output = r.output },
       })
     end
-    emit(sign({ kind = "generic-provider.ProviderOut",
+    emit(sign({ kind = "generic-provider.ProviderInput",
       value = { content = messages }, messages = messages }))
     return { status = "ok" }
   end
