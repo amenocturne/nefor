@@ -60,6 +60,53 @@ fn repo_root() -> PathBuf {
 /// would have produced it, so the next live turn (a fresh
 /// `<prefix>.chat.complete`) sees full prior context.
 #[test]
+fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    let root = repo_root();
+    let openai_lua = root.join("plugins/openai-provider/lua");
+    let chatgpt_lua = root.join("plugins/chatgpt-provider/lua");
+    lua.load(format!(
+        r#"
+        package.path = table.concat({{
+          "{chatgpt}/?.lua", "{chatgpt}/?/init.lua",
+          "{openai}/?.lua", "{openai}/?/init.lua", package.path,
+        }}, ";")
+        local t = require("chatgpt-provider").translator("chatgpt-provider")
+        local function translate(output)
+          return t.outbound({{
+            type = "event", from = "chatgpt-provider",
+            body = {{
+              kind = "chatgpt-provider.chat.complete.result",
+              chat_id = "request-1", finish_reason = output.finish_reason,
+              output = output,
+            }},
+          }})
+        end
+        local text = translate({{ text = "canonical answer", finish_reason = "stop" }})
+        assert(text.kind == "chatgpt-provider.completion.event")
+        assert(text.request_id == "request-1" and text.chat_id == nil)
+        assert(text.event == "completed" and text.output == nil)
+        assert(text.result.text == "canonical answer")
+        assert(text.result.finish_reason == "stop")
+
+        local tools = translate({{
+          text = "", finish_reason = "tool_calls",
+          tool_calls = {{{{ id = "call-1", name = "read_file", arguments = {{ path = "x" }} }}}},
+        }})
+        assert(tools.event == "completed")
+        assert(#tools.result.tool_calls == 1)
+        assert(tools.result.tool_calls[1].name == "read_file")
+        assert(tools.result.tool_calls[1].arguments.path == "x")
+        "#,
+        chatgpt = chatgpt_lua.display(),
+        openai = openai_lua.display(),
+    ))
+    .exec()
+    .expect("translate ChatGPT terminals");
+}
+
+#[test]
 fn replay_window_re_feeds_chat_history_into_provider_binary() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");

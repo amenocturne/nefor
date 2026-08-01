@@ -101,11 +101,16 @@ local function translator(name)
     end
 
     local translated = copy(body)
-    translated.kind = "ProviderInput"
-    translated.provider = name
+    translated.kind = t.kinds.completion_event
     translated.request_id = request_id
     translated.chat_id = nil
     translated.event = event
+    if kind == t.kinds.chat_complete_result then
+      translated.result = copy(body.output)
+      translated.output = nil
+      translated.finish_reason = nil
+      translated.error = translated.result.error or body.error
+    end
     return translated
   end
 

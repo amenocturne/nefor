@@ -17,6 +17,7 @@ const PROVIDER_EVENT: &str = "completion.event";
 struct PendingProvider {
     provider: String,
     stream_id: String,
+    model: Option<Value>,
     observed_stream: bool,
     tool_calls: Vec<Value>,
 }
@@ -74,6 +75,8 @@ impl CapabilityBridge {
             return vec![body];
         };
 
+        let model = request.get("model").cloned();
+
         // The kernel's ProviderInput wrapper is an internal activation shape;
         // the provider protocol owns one canonical top-level message history.
         if let Some(input) = request.remove("input") {
@@ -97,6 +100,7 @@ impl CapabilityBridge {
             PendingProvider {
                 provider,
                 stream_id,
+                model,
                 observed_stream: false,
                 tool_calls: Vec::new(),
             },
@@ -155,7 +159,11 @@ impl CapabilityBridge {
             "reasoning_end" | "reasoning_completed" => "chat.stream.reasoning_end",
             "usage" => "chat.session.stats",
             "retry" => "chat.toast",
-            "completed" | "result" if pending.observed_stream => "chat.stream.end",
+            "completed" | "result" | "failed" | "error" | "interrupted"
+                if pending.observed_stream =>
+            {
+                "chat.stream.end"
+            }
             _ => return None,
         };
         let stream_id = pending.stream_id.clone();
@@ -190,12 +198,17 @@ impl CapabilityBridge {
             projected.remove("text");
             projected.remove("reasoning");
             projected.remove("result");
+            if let Some(model) = body
+                .get("result")
+                .and_then(Value::as_object)
+                .and_then(|result| result.get("model"))
+                .or(pending.model.as_ref())
+            {
+                projected.insert("model".into(), model.clone());
+            }
             if let Some(result) = body.get("result").and_then(Value::as_object) {
                 if let Some(usage) = result.get("usage") {
                     projected.insert("usage".into(), usage.clone());
-                }
-                if let Some(model) = result.get("model") {
-                    projected.insert("model".into(), model.clone());
                 }
             }
         }
@@ -216,17 +229,26 @@ impl CapabilityBridge {
                 .push(call);
             return None;
         }
-        if !matches!(event, "completed" | "result" | "failed" | "error") {
+        if !matches!(
+            event,
+            "completed" | "result" | "failed" | "error" | "interrupted"
+        ) {
             return None;
         }
 
         let pending = self.pending_providers.remove(&request_id)?;
-        if matches!(event, "failed" | "error") {
+        if matches!(event, "failed" | "error" | "interrupted") {
             let error = body
                 .get("error")
                 .or_else(|| body.get("message"))
                 .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "provider completion error".to_owned());
+                .unwrap_or_else(|| {
+                    if event == "interrupted" {
+                        "provider completion interrupted".to_owned()
+                    } else {
+                        "provider completion error".to_owned()
+                    }
+                });
             return Some(ProviderReply {
                 request_id,
                 result: None,
@@ -235,7 +257,8 @@ impl CapabilityBridge {
         }
 
         let mut result = body
-            .get("result")
+            .get("output")
+            .or_else(|| body.get("result"))
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(|| provider_result(body));
@@ -641,6 +664,233 @@ mod tests {
             .unwrap();
         assert_eq!(reply.error.as_deref(), Some("overloaded"));
         assert!(reply.result.is_none());
+    }
+
+    #[test]
+    fn chatgpt_nested_output_settles_text_and_tool_calls_once() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke("req-output", "chatgpt", json!([])));
+        let terminal = event(
+            "req-output",
+            "chatgpt",
+            "completed",
+            json!({"output": {
+                "text": "typed answer",
+                "finish_reason": "tool_calls",
+                "tool_calls": [{
+                    "id": "call-1", "name": "read_file", "arguments": {"path": "x"}
+                }]
+            }}),
+        );
+        let result = bridge
+            .take_reply(terminal["kind"].as_str().unwrap(), &terminal)
+            .expect("nested output settles")
+            .result
+            .expect("successful result");
+        assert_eq!(result["text"], "typed answer");
+        assert_eq!(result["finish_reason"], "tool_calls");
+        assert_eq!(result["tool_calls"][0]["name"], "read_file");
+        assert!(bridge
+            .take_reply(terminal["kind"].as_str().unwrap(), &terminal)
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_nested_result_and_top_level_shapes_settle_once() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke("req-result", "provider-a", json!([])));
+        let result = event(
+            "req-result",
+            "provider-a",
+            "completed",
+            json!({"result": {"text": "nested result", "finish_reason": "stop"}}),
+        );
+        assert_eq!(
+            bridge
+                .take_reply(result["kind"].as_str().unwrap(), &result)
+                .unwrap()
+                .result
+                .unwrap(),
+            json!({"text": "nested result", "finish_reason": "stop"})
+        );
+
+        bridge.translate_emit(provider_invoke("req-top", "provider-b", json!([])));
+        let top = event(
+            "req-top",
+            "provider-b",
+            "completed",
+            json!({"text": "top-level", "finish_reason": "stop"}),
+        );
+        assert_eq!(
+            bridge
+                .take_reply(top["kind"].as_str().unwrap(), &top)
+                .unwrap()
+                .result
+                .unwrap(),
+            json!({"text": "top-level", "finish_reason": "stop"})
+        );
+    }
+
+    #[test]
+    fn terminal_tool_calls_do_not_duplicate_aggregated_stream_calls() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke("req-tools", "provider-a", json!([])));
+        let split = event(
+            "req-tools",
+            "provider-a",
+            "tool_call",
+            json!({"id": "call-1", "name": "read_file", "arguments": {"path": "x"}}),
+        );
+        assert!(bridge
+            .take_reply(split["kind"].as_str().unwrap(), &split)
+            .is_none());
+        let done = event(
+            "req-tools",
+            "provider-a",
+            "completed",
+            json!({"result": {"finish_reason": "tool_calls", "tool_calls": [{
+                "id": "call-1", "name": "read_file", "arguments": {"path": "x"}
+            }]}}),
+        );
+        let result = bridge
+            .take_reply(done["kind"].as_str().unwrap(), &done)
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(result["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn abnormal_stream_close_projects_request_owned_model_and_settles_once() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke_with_stream(
+            "req-interrupted",
+            "run/lead.llm@round-1",
+            "provider-a",
+            json!([]),
+        ));
+        let delta = event(
+            "req-interrupted",
+            "provider-a",
+            "text_delta",
+            json!({"text": "partial"}),
+        );
+        assert!(bridge
+            .project_event(delta["kind"].as_str().unwrap(), &delta)
+            .is_some());
+        let interrupted = event(
+            "req-interrupted",
+            "provider-a",
+            "interrupted",
+            json!({"message": "stopped by user"}),
+        );
+        let projected = bridge
+            .project_event(interrupted["kind"].as_str().unwrap(), &interrupted)
+            .expect("abnormal terminal closes visible stream");
+        assert_eq!(projected["kind"], "chat.stream.end");
+        assert_eq!(projected["chat_id"], "run/lead.llm@round-1");
+        assert_eq!(projected["model"], "opus");
+        assert!(projected.get("request_id").is_none());
+        assert!(projected.get("text").is_none());
+        assert!(bridge
+            .take_reply(interrupted["kind"].as_str().unwrap(), &interrupted)
+            .is_some());
+        assert!(bridge
+            .take_reply(interrupted["kind"].as_str().unwrap(), &interrupted)
+            .is_none());
+    }
+
+    #[test]
+    fn interrupted_event_settles_as_error_and_suppresses_late_events() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke_with_stream(
+            "req-interrupted",
+            "run/lead.llm@round-1",
+            "provider-a",
+            json!([]),
+        ));
+        let delta = event(
+            "req-interrupted",
+            "provider-a",
+            "text_delta",
+            json!({"text": "partial"}),
+        );
+        let projected = bridge
+            .project_event(delta["kind"].as_str().unwrap(), &delta)
+            .expect("partial observation projects");
+        assert_eq!(projected["chat_id"], "run/lead.llm@round-1");
+
+        let interrupted = event(
+            "req-interrupted",
+            "provider-a",
+            "interrupted",
+            json!({"message": "stopped by user", "text": "provider terminal text"}),
+        );
+        let projected_end = bridge
+            .project_event(interrupted["kind"].as_str().unwrap(), &interrupted)
+            .expect("interrupted closes the visible stream");
+        assert_eq!(projected_end["kind"], "chat.stream.end");
+        assert_eq!(projected_end["model"], "opus");
+        let reply = bridge
+            .take_reply(interrupted["kind"].as_str().unwrap(), &interrupted)
+            .expect("interrupted is terminal");
+        assert_eq!(reply.request_id, "req-interrupted");
+        assert_eq!(reply.error.as_deref(), Some("stopped by user"));
+        assert!(reply.result.is_none());
+
+        let late_delta = event(
+            "req-interrupted",
+            "provider-a",
+            "text_delta",
+            json!({"text": "late"}),
+        );
+        let late_end = event(
+            "req-interrupted",
+            "provider-a",
+            "completed",
+            json!({"text": "late terminal"}),
+        );
+        for late in [&late_delta, &late_end] {
+            let kind = late["kind"].as_str().unwrap();
+            assert!(bridge.project_event(kind, late).is_none());
+            assert!(bridge.take_reply(kind, late).is_none());
+        }
+    }
+
+    #[test]
+    fn cancellation_uses_request_id_while_projection_uses_logical_stream_id() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke_with_stream(
+            "run/capability-7",
+            "run/lead.llm@round-4",
+            "provider-a",
+            json!([]),
+        ));
+        let delta = event(
+            "run/capability-7",
+            "provider-a",
+            "reasoning_delta",
+            json!({"text": "why"}),
+        );
+        let projected = bridge
+            .project_event(delta["kind"].as_str().unwrap(), &delta)
+            .expect("reasoning projects");
+        assert_eq!(projected["chat_id"], "run/lead.llm@round-4");
+        assert!(projected.get("request_id").is_none());
+
+        let cancel = bridge.translate_emit(obj(json!({
+            "kind": "tool.cancel", "id": "run/capability-7"
+        })));
+        assert_eq!(
+            cancel,
+            vec![obj(json!({
+                "kind": "provider-a.completion.cancel",
+                "request_id": "run/capability-7"
+            }))]
+        );
+        assert!(!serde_json::to_string(&cancel)
+            .expect("serialize cancel")
+            .contains("run/lead.llm@round-4"));
     }
 
     #[test]

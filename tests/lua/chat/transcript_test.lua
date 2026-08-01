@@ -145,4 +145,44 @@ eq(#terminal_again.entries, 2, "terminal close is idempotent")
 eq(terminal_again.entries[1].text, "provider answer")
 eq(terminal_again.entries[2].text, "durable answer")
 
+local reasoning_only = transcript.append_reasoning_delta({
+  entries = {}, pending = true, turn_started_at = 900,
+}, "partial reasoning")
+reasoning_only = transcript.reduce_assistant_event(reasoning_only, {
+  kind = "chat.stream.end", model = "reasoning-model",
+})
+reasoning_only = transcript.reduce_assistant_event(reasoning_only, {
+  kind = "chat.session.stats", last_turn_output_tokens = 7,
+})
+reasoning_only = transcript.close_lead_unit(reasoning_only)
+eq(reasoning_only.in_flight, nil, "abnormal close clears reasoning-only in-flight ownership")
+eq(reasoning_only.entries[1].text, "", "abnormal close does not synthesize provider text")
+eq(reasoning_only.entries[1].reasoning.text, "partial reasoning")
+eq(reasoning_only.entries[1].reasoning.streaming, false, "reasoning no longer renders as active")
+eq(reasoning_only.entries[1].streaming, false, "reasoning-only assistant no longer streams")
+eq(reasoning_only.entries[1].model, "reasoning-model")
+eq(reasoning_only.entries[1].output_tokens, 7)
+local reasoning_again = transcript.close_lead_unit(reasoning_only)
+eq(reasoning_again.entries[1].v, reasoning_only.entries[1].v,
+  "duplicate abnormal close does not rewrite a settled reasoning entry")
+
+local partial_text = transcript.append_reasoning_delta({
+  entries = {}, pending = true, turn_started_at = 900,
+}, "why")
+partial_text = transcript.append_assistant_delta(partial_text, "partial answer")
+partial_text = transcript.reduce_assistant_event(partial_text, {
+  kind = "chat.session.stats", last_turn_output_tokens = 3, last_turn_duration_ms = 12,
+})
+partial_text = transcript.reduce_assistant_event(partial_text, {
+  kind = "chat.stream.end", model = "partial-model",
+})
+partial_text = transcript.close_lead_unit(partial_text)
+eq(partial_text.entries[1].text, "partial answer", "partial provider text is preserved")
+eq(partial_text.entries[1].reasoning.text, "why", "partial reasoning is preserved")
+eq(partial_text.entries[1].reasoning.streaming, false)
+eq(partial_text.entries[1].streaming, false)
+eq(partial_text.entries[1].model, "partial-model")
+eq(partial_text.entries[1].duration_ms, 12)
+eq(partial_text.entries[1].output_tokens, 3)
+
 print("transcript_test: all assertions passed")

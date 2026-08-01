@@ -3577,6 +3577,94 @@ fn lead_terminal_result_reconciles_pending_thinking_after_streamed_answer() {
 }
 
 #[test]
+fn abnormal_lead_close_settles_partial_reasoning_and_text() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "reasoning turn");
+    let _ = engine.take_emit_queue();
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "lead-run",
+            "run_name": "lead", "principal": "lead"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.reasoning_delta", "chat_id": "r1/lead.llm@round-1",
+            "text": "partial reasoning"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.delta", "chat_id": "r1/lead.llm@round-1",
+            "text": "partial answer"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats", "chat_id": "r1/lead.llm@round-1",
+            "last_turn_output_tokens": 3, "last_turn_duration_ms": 12
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.end", "chat_id": "r1/lead.llm@round-1",
+            "model": "review-model"
+        }),
+    );
+    assert!(render_snapshot(&mut engine).contains("partial answer"));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "failed" }),
+    );
+    let settled = render_snapshot(&mut engine);
+    assert!(
+        settled.contains("partial answer"),
+        "partial text is preserved: {settled}"
+    );
+    assert!(
+        settled.contains("reasoning"),
+        "reasoning remains available: {settled}"
+    );
+    assert!(
+        settled.contains("review-model"),
+        "request-owned model survives closure: {settled}"
+    );
+    assert!(
+        settled.contains("250 tok/s"),
+        "projected turn stats survive closure: {settled}"
+    );
+    assert!(
+        !settled.contains("thinking"),
+        "reasoning is no longer active: {settled}"
+    );
+    assert!(
+        !settled.contains("[thinking"),
+        "placeholder is cleared: {settled}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "failed" }),
+    );
+    let duplicate = render_snapshot(&mut engine);
+    assert!(duplicate.contains("partial answer"));
+    assert!(!duplicate.contains("thinking"));
+}
+
+#[test]
 fn foreign_terminal_result_does_not_close_the_lead_placeholder() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

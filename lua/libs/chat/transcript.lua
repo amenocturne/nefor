@@ -210,14 +210,30 @@ end
 function M.close_lead_unit(state)
   local entries = state.entries or {}
   local closed_entries = entries
+  local function close_entry(i, entry)
+    if closed_entries == entries then
+      closed_entries = {}
+      for j = 1, #entries do closed_entries[j] = entries[j] end
+    end
+    closed_entries[i] = entry
+  end
+
+  local in_flight = state.in_flight
+  if in_flight ~= nil and entries[in_flight] ~= nil then
+    local assistant = entries[in_flight]
+    if assistant.reasoning ~= nil and assistant.reasoning.streaming == true then
+      assistant = Entry.finalize_reasoning(assistant)
+    end
+    if assistant.streaming == true then
+      assistant = Entry.finalize(assistant)
+    end
+    if assistant ~= entries[in_flight] then close_entry(in_flight, assistant) end
+  end
+
   for i = 1, #entries do
     local entry = entries[i]
     if entry.kind == "tool_call" and entry.output == nil then
-      if closed_entries == entries then
-        closed_entries = {}
-        for j = 1, #entries do closed_entries[j] = entries[j] end
-      end
-      closed_entries[i] = Entry.set_output(entry, "interrupted", true)
+      close_entry(i, Entry.set_output(entry, "interrupted", true))
     end
   end
   return shallow_merge(state, {
@@ -274,7 +290,7 @@ end
 function M.attach_latest_assistant_stats(state, output_tokens, duration_ms)
   for i = #state.entries, 1, -1 do
     local entry = state.entries[i]
-    if entry.role == "assistant" and entry.streaming ~= true then
+    if entry.role == "assistant" then
       local updated = Entry.set_turn_stats(entry, output_tokens, duration_ms)
       return shallow_merge(state, { entries = replace_entry(state.entries, i, updated) })
     end
