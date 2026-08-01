@@ -1773,7 +1773,12 @@ end
 
 local function handle_mag_run_result(msg, state)
   if type(msg.run_id) ~= "string" then return state, {} end
-  return retract_mag_approvals(state, msg.run_id), {}
+  local next = retract_mag_approvals(state, msg.run_id)
+  local run = (state.runs or {})[msg.run_id]
+  if run ~= nil and run.principal == "lead" then
+    next = transcript.close_lead_unit(next)
+  end
+  return next, {}
 end
 
 -- The tool gate broadcasts `tool-gate.tool.invoke { id, from, name, args }`

@@ -130,4 +130,19 @@ eq(cancelled.entries[1].output, "interrupted", "cancellation closes an open tool
 eq(cancelled.entries[1].error, true, "cancelled tool is visibly interrupted")
 eq(cancelled.entries[2].run_id, "cancelled", "cancellation preserves buffered results")
 
+local terminal = transcript.finalize_assistant({
+  entries = {}, pending = true, turn_started_at = 900,
+}, "provider answer", "structured-model", 10)
+terminal = transcript.push_entry(terminal, {
+  role = "assistant", kind = "text", text = "durable answer", v = 999,
+})
+terminal = transcript.close_lead_unit(terminal)
+eq(terminal.pending, false, "terminal close clears the thinking placeholder")
+eq(terminal.entries[1].text, "provider answer", "terminal close retains streamed content")
+eq(terminal.entries[2].text, "durable answer", "terminal close retains durable content")
+local terminal_again = transcript.close_lead_unit(terminal)
+eq(#terminal_again.entries, 2, "terminal close is idempotent")
+eq(terminal_again.entries[1].text, "provider answer")
+eq(terminal_again.entries[2].text, "durable answer")
+
 print("transcript_test: all assertions passed")

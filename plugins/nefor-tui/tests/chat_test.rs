@@ -3515,6 +3515,98 @@ fn mag_approval_cancel_only_retracts_its_correlated_popup() {
 }
 
 #[test]
+fn lead_terminal_result_reconciles_pending_thinking_after_streamed_answer() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first turn");
+    let _ = engine.take_emit_queue();
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "lead-run",
+            "run_name": "lead", "principal": "lead"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.end", "chat_id": "r1/cap-1",
+            "text": "provider answer", "model": "mock-model", "duration_ms": 1
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "provider answer" }),
+    );
+    let streamed = render_str(&mut engine);
+    assert!(
+        streamed.contains("provider answer"),
+        "answer missing: {streamed}"
+    );
+    assert!(
+        streamed.contains("[thinking"),
+        "the reproduced ordering must retain pending before terminal close: {streamed}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_complete", "run_id": "lead-run" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "completed" }),
+    );
+    let settled = render_str(&mut engine);
+    assert!(
+        !settled.contains("[thinking"),
+        "lead terminal result must reconcile the pending placeholder: {settled}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "completed" }),
+    );
+    let duplicate = render_str(&mut engine);
+    assert!(!duplicate.contains("[thinking"));
+}
+
+#[test]
+fn foreign_terminal_result_does_not_close_the_lead_placeholder() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "lead turn");
+    let _ = engine.take_emit_queue();
+    for (run_id, principal) in [("lead-run", "lead"), ("sub-run", "subagent")] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.run_started", "run_id": run_id,
+                "run_name": run_id, "principal": principal
+            }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "sub-run", "status": "completed" }),
+    );
+    assert!(render_str(&mut engine).contains("[thinking"));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "killed" }),
+    );
+    assert!(!render_str(&mut engine).contains("[thinking"));
+}
+
+#[test]
 fn terminal_run_and_session_cleanup_retract_mag_approvals() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
