@@ -500,7 +500,10 @@ async fn handle_event(
     // Canonical provider events correlate themselves by request_id. Terminal
     // events settle the kernel capability; streaming and other telemetry remain
     // observational and keep the request open. Unknown and late ids are ignored.
-    if let Some(request_id) = bridge.provider_request_id(kind, body) {
+    if let Some(request_id) = bridge.provider_request_id(kind, body).map(str::to_owned) {
+        if let Some(projected) = bridge.project_event(kind, body) {
+            send_event(out_tx, projected).await?;
+        }
         if let Some(text) = body.get("text").and_then(Value::as_str) {
             let event_kind = if body.get("event").and_then(Value::as_str) == Some("reasoning_delta")
             {
@@ -509,7 +512,7 @@ async fn handle_event(
                 "assistant"
             };
             let value = serde_json::json!({ "kind": event_kind, "text": text });
-            let _ = host.bus_observation(request_id, "append", "transcript", &value)?;
+            let _ = host.bus_observation(&request_id, "append", "transcript", &value)?;
             flush_emits(out_tx, host, bridge).await?;
         }
         if let Some(reply) = bridge.take_reply(kind, body) {
