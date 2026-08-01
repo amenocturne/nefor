@@ -254,8 +254,9 @@ function M:on_emit(id, message, generation)
     and kind ~= CAP_INVOKE and kind ~= COMPLETE and kind ~= FAILED
     and kind ~= RUN_COMPLETE and kind ~= APPROVAL_REQUEST
     and kind ~= APPROVAL_CANCEL
+  local terminal_control_signal = kind == RUN_COMPLETE and dead
   if generation ~= nil and (generation ~= current_generation
-      or (dead and not signal_bus_envelope)) then
+      or (dead and not terminal_control_signal and not signal_bus_envelope)) then
     self.events({
       kind = EVT_EMISSION_IGNORED,
       from = id,

@@ -1176,7 +1176,7 @@ mod tests {
             .expect("ordinary graph completes");
         let result = completion.result.expect("typed output result");
         assert_eq!(result["kind"], "nefor.graph.Value");
-        assert_eq!(result["payload"]["value"]["content"], "ordinary");
+        assert_eq!(result["value"]["content"], "ordinary");
         assert!(host
             .take_run_failed("ordinary-source-node-output")
             .expect("read failure")

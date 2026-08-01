@@ -199,7 +199,9 @@ function M.construct(id, params, emit, deps)
   local function handle_input(one)
     local stdin = nil
     if one.tag == "mag.Text" then
-      stdin = (one.message or {}).text or ""
+      local message = one.message or {}
+      local value = message.value
+      stdin = type(value) == "table" and value.content or message.text or ""
       if preview_emit and stdin ~= "" then
         preview_emit("append", "terminal_events", { kind = "stdin", text = stdin })
       end
