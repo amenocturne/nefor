@@ -1,17 +1,13 @@
-//! MVP acceptance test for the mag actor-kernel runtime — the definition of
-//! done, in code, deterministic and rerunnable.
+//! MVP acceptance test for the mag actor-kernel runtime — deterministic and
+//! rerunnable against the real plugin process.
 //!
-//! It spawns the real `mag-plugin`, drives its stdio, and acts as the
-//! deterministic provider/tool capability itself. Crucially it speaks the REAL
-//! protocols on both capability legs: the mag plugin's capability bridge drives
-//! each provider turn as `chat.create` → `chat.append` → `chat.complete` (NOT a
-//! bare `tool.invoke`), answered here with a `chat.complete.result`; and it
-//! rewrites each tool invocation onto the gate's `<gate>.tool.invoke` contract
-//! (unwrapped `{ id, name, args }` — NOT the kernel's bare double-wrapped
-//! `tool.invoke`, which nothing on the bus subscribes to), answered here with
-//! the gate's broadcast `tool.result { id, output }`. Scripted bare-`tool.invoke`
-//! responders are exactly how both bridge gaps survived earlier tests. No
-//! wall-clock synchronization — every step is driven off an observed event.
+//! The fixture speaks both canonical capability protocols. Provider turns are
+//! single `<provider>.completion.request` messages answered by correlated
+//! `<provider>.completion.event` observations and terminal events. Tool calls
+//! are rewritten onto `<gate>.tool.invoke` and answered with `tool.result`.
+//! Every response is driven by observed request content and correlated only by
+//! the request's opaque `request_id`; no provider-owned conversation state is
+//! reconstructed or parsed.
 //!
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
 //! full provider loop (`llm → run-tool → tool-result → llm`),
@@ -29,8 +25,8 @@
 //!      provider; every surviving-agent node output persists to its per-node
 //!      file, typed per the declared contracts.
 //!   4. One agent (`a2`) is killed mid-flight: its in-flight provider request
-//!      aborts (the `<provider>.chat.cancel` envelope observably reaches the
-//!      wire), its late provider reply is voided (no output file), and the
+//!      aborts (the `<provider>.completion.cancel` envelope observably reaches
+//!      the wire), its late terminal event is voided (no output file), and the
 //!      other agent is unaffected.
 //!   5. The structural result boundary receives the surviving agent's typed
 //!      result (asserted inline and on the persisted actor output).
@@ -62,8 +58,7 @@ fn kernel_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
 }
 
-/// The provider capability name the `llm` actors target — the shipped fixture's
-/// provider, so the abort envelope is the real `chatgpt-provider.chat.cancel`.
+/// The provider capability name targeted by the `llm` actors.
 const PROVIDER: &str = "chatgpt-provider";
 /// The gate bus name threaded via `--tool-gate`, mirroring the starter
 /// composition (starter/init.lua). Tool invocations must reach the wire as
@@ -194,8 +189,8 @@ fn two_agent_modification() -> Value {
     json!({
         "actors": actors,
         "messages": [
-            { "to": "a1.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go" }] } },
-            { "to": "a2.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go" }] } }
+            { "to": "a1.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a1" }] } },
+            { "to": "a2.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a2" }] } }
         ],
         "kills": [],
         "rules": [],
@@ -207,21 +202,6 @@ fn two_agent_modification() -> Value {
             }
         }
     })
-}
-
-/// `("r1/a1.llm@r2")` → `("a1", 2)`. Wire chat handles are run-scoped by the
-/// kernel (`r<K>/<actor>@r<seq>` — plugins/mag/lua/mag-kernel/init.lua bus_emit); the
-/// test peels the scope prefix off the node segment only to script per-agent
-/// behavior — real consumers never parse a chat_id.
-fn parse_chat_id(chat_id: &str) -> (String, u32) {
-    let idx = chat_id.find("@r").expect("chat_id carries @r turn suffix");
-    let node = &chat_id[..idx];
-    let node = node.split('/').next_back().unwrap_or(node);
-    let turn: u32 = chat_id[idx + 2..]
-        .parse()
-        .expect("chat_id turn is a number");
-    let agent = node.split('.').next().unwrap_or(node).to_owned();
-    (agent, turn)
 }
 
 /// A `tool.result` reply carrying `output` — the gate's reply shape
@@ -236,20 +216,30 @@ fn tool_result(id: &str, output: Value) -> Map<String, Value> {
     m
 }
 
-/// A provider `chat.complete.result` reply — the REAL provider protocol shape
-/// (starter/mock-provider: `<name>.chat.complete.result { chat_id, output }`),
-/// correlated back to the driving `llm` actor by chat_id through the mag plugin's
-/// provider bridge. Provider turns are answered with this, NOT a bare
-/// `tool.result` — the exact protocol a scripted `tool.invoke` responder skipped.
-fn chat_result(chat_id: &str, output: Value) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert(
+fn completion_event(
+    request_id: &str,
+    event: &str,
+    fields: Map<String, Value>,
+) -> Map<String, Value> {
+    let mut body = fields;
+    body.insert(
         "kind".into(),
-        Value::String(format!("{PROVIDER}.chat.complete.result")),
+        Value::String(format!("{PROVIDER}.completion.event")),
     );
-    m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
-    m.insert("output".into(), output);
-    m
+    body.insert("request_id".into(), Value::String(request_id.to_owned()));
+    body.insert("event".into(), Value::String(event.to_owned()));
+    body
+}
+
+fn completed(request_id: &str, fields: Value) -> Map<String, Value> {
+    completion_event(
+        request_id,
+        "completed",
+        fields
+            .as_object()
+            .expect("completion fields are an object")
+            .clone(),
+    )
 }
 
 #[tokio::test]
@@ -323,11 +313,11 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     let mut ready_ids: Vec<String> = Vec::new();
     let mut provider_agents: std::collections::BTreeSet<String> = Default::default();
     let mut killed_ids: Vec<String> = Vec::new();
-    let mut cancel_chat_id: Option<String> = None;
-    let mut a2_pending_chat: Option<String> = None;
+    let mut cancelled_request_id: Option<String> = None;
+    let mut a2_pending_request: Option<String> = None;
     let mut a2_kill_sent = false;
     let mut a2_void_sent = false;
-    let complete_kind = format!("{PROVIDER}.chat.complete");
+    let request_kind = format!("{PROVIDER}.completion.request");
     let run_result;
 
     loop {
@@ -360,14 +350,12 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     killed_ids.push(id.to_owned());
                 }
             }
-            // Nothing on the bus subscribes to a bare `tool.invoke`: a provider
-            // request must be bridged to chat.*, a tool invocation onto the
-            // gate's `<GATE>.tool.invoke`. Any bare invoke is a bridge regression
-            // (a run would hang at its first capability call).
+            // Nothing subscribes to a bare `tool.invoke`: provider calls must
+            // be bridged to completion.request, and tool calls to the gate.
             "tool.invoke" => {
                 panic!(
                     "bare tool.invoke reached the wire (name {:?}) — every capability \
-                     invoke must be bridged (provider → chat.*, tool → {GATE}.tool.invoke)",
+                     invoke must be bridged (provider → completion.request, tool → {GATE}.tool.invoke)",
                     body.get("name")
                 );
             }
@@ -404,42 +392,77 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                 );
                 send_event(&mut stdin, tool_result(&req_id, json!("echo-ran"))).await;
             }
-            // A driven provider turn: the bridge finished `chat.create`/`.append`
-            // and asks the provider to complete. Answer with a `chat.complete.result`
-            // keyed by the same chat_id (the REAL protocol).
-            k if k == complete_kind => {
-                let chat_id = body
-                    .get("chat_id")
+            // Provider requests carry their complete history. The fixture derives
+            // the logical turn from that observed history, while treating the
+            // request_id as an opaque correlation token.
+            k if k == request_kind => {
+                let request_id = body
+                    .get("request_id")
                     .and_then(Value::as_str)
-                    .expect("chat.complete carries chat_id")
+                    .expect("completion.request carries request_id")
                     .to_owned();
-                let (agent, turn) = parse_chat_id(&chat_id);
-                provider_agents.insert(agent.clone());
-                match (agent.as_str(), turn) {
-                    // a1 turn 1 → tool calls; drives the loop one turn.
-                    ("a1", 1) => {
+                let messages = body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .expect("completion.request carries messages");
+                let initial_prompt = messages
+                    .first()
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_str)
+                    .expect("initial prompt is textual");
+                let has_tool_result = messages
+                    .iter()
+                    .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+
+                match (initial_prompt, has_tool_result) {
+                    ("go-a1", false) => {
+                        provider_agents.insert("a1".to_owned());
                         send_event(
                             &mut stdin,
-                            chat_result(
-                                &chat_id,
-                                json!({ "tool_calls": [{ "id": "c1", "name": "echo", "args": { "text": "hi" } }] }),
+                            completion_event(
+                                &request_id,
+                                "tool_call",
+                                json!({ "id": "c1", "name": "echo", "arguments": { "text": "hi" } })
+                                    .as_object()
+                                    .expect("tool call fields")
+                                    .clone(),
+                            ),
+                        )
+                        .await;
+                        send_event(
+                            &mut stdin,
+                            completed(
+                                &request_id,
+                                json!({ "text": "", "finish_reason": "tool_calls" }),
                             ),
                         )
                         .await;
                     }
-                    // a1 turn 2 → final answer; reaches the structural result boundary.
-                    ("a1", 2) => {
+                    ("go-a1", true) => {
                         send_event(
                             &mut stdin,
-                            chat_result(&chat_id, json!({ "text": "final-a1" })),
+                            completion_event(
+                                &request_id,
+                                "text_delta",
+                                json!({ "text": "final-" })
+                                    .as_object()
+                                    .expect("delta fields")
+                                    .clone(),
+                            ),
+                        )
+                        .await;
+                        send_event(
+                            &mut stdin,
+                            completed(
+                                &request_id,
+                                json!({ "text": "final-a1", "finish_reason": "stop" }),
+                            ),
                         )
                         .await;
                     }
-                    // a2 turn 1 → the doomed request. Withhold the reply and kill
-                    // a2 mid-completion (SIX STEPS #4). Record the chat_id so its
-                    // late reply can be delivered and asserted voided.
-                    ("a2", 1) => {
-                        a2_pending_chat = Some(chat_id.clone());
+                    ("go-a2", false) => {
+                        provider_agents.insert("a2".to_owned());
+                        a2_pending_request = Some(request_id);
                         if !a2_kill_sent {
                             a2_kill_sent = true;
                             let mut apply = Map::new();
@@ -457,27 +480,38 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                             send_event(&mut stdin, apply).await;
                         }
                     }
-                    other => panic!("unexpected provider turn {other:?} (chat_id {chat_id})"),
+                    other => panic!("unexpected provider request history {other:?}: {body:?}"),
                 }
             }
             k if k == format!("{PROVIDER}.chat.cancel") => {
-                // SIX STEPS #4: the in-flight provider request aborts — the
-                // cancel envelope reaches the wire, keyed by a2's chat_id.
-                let chat_id = body
-                    .get("chat_id")
+                panic!(
+                    "legacy provider cancellation reached the wire; expected {PROVIDER}.completion.cancel correlated by request_id: {body:?}"
+                );
+            }
+            k if k == format!("{PROVIDER}.completion.cancel") => {
+                let request_id = body
+                    .get("request_id")
                     .and_then(Value::as_str)
-                    .expect("cancel envelope carries chat_id")
+                    .expect("completion.cancel carries request_id")
                     .to_owned();
-                cancel_chat_id = Some(chat_id);
-                // Now deliver a2's withheld provider reply on the same chat: it
-                // must be voided (the requester is dead, its correlation dropped),
-                // so the bridge's bus_response lands on no open correlation.
+                assert_eq!(
+                    a2_pending_request.as_deref(),
+                    Some(request_id.as_str()),
+                    "cancel correlates exactly to a2's observed request_id"
+                );
+                cancelled_request_id = Some(request_id.clone());
                 if !a2_void_sent {
                     a2_void_sent = true;
-                    let chat = a2_pending_chat.clone().expect("a2 chat recorded");
                     send_event(
                         &mut stdin,
-                        chat_result(&chat, json!({ "text": "late-a2-should-be-voided" })),
+                        completion_event(
+                            &request_id,
+                            "error",
+                            json!({ "message": "interrupted" })
+                                .as_object()
+                                .expect("error fields")
+                                .clone(),
+                        ),
                     )
                     .await;
                 }
@@ -524,15 +558,15 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         );
     }
 
-    // ── SIX STEPS #4: a2 killed mid-flight; abort envelope on the wire; late
-    //    reply voided (no a2 node output). The wire handle is the kernel's
-    //    run-scoped form (`r<K>/a2.llm@r1`). ──────────────────────────────────
-    let cancel = cancel_chat_id
-        .as_deref()
-        .expect("the in-flight provider request's cancel envelope reached the wire");
-    assert!(
-        cancel.ends_with("/a2.llm@r1"),
-        "the cancel names a2's run-scoped chat handle; got {cancel:?}"
+    // ── SIX STEPS #4: a2 killed mid-flight; cancellation correlated by the
+    //    exact request_id; late terminal error voided (no a2 node output). ───
+    let cancelled = cancelled_request_id.as_deref().unwrap_or_else(|| {
+        panic!("the in-flight provider request's cancellation reached the wire; saw {seen:?}")
+    });
+    assert_eq!(
+        Some(cancelled),
+        a2_pending_request.as_deref(),
+        "completion.cancel preserves the observed provider request_id"
     );
     assert!(
         killed_ids.iter().any(|id| id == "a2.llm"),

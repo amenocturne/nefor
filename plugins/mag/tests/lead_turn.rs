@@ -19,7 +19,7 @@
 //!
 //! Test 2 (interrupt = kill): `mag.kill_run` mid-provider-round reaps the
 //! constellation through the fold — the dying llm's
-//! `<provider>.chat.cancel` reaches the wire (provider cancel observed) —
+//! `<provider>.completion.cancel` reaches the wire (provider cancel observed) —
 //! and settles the pending execute as `mag.run_result status:"killed"`.
 
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The turn spawner appends a `## MAG workspace` block to the system
 /// overlay (starter/agentic-loop): the session workspace dir plus the
 /// inlined canonical patterns document. Here we build a representative overlay the
-/// same way and assert it reaches the provider intact on chat.create.
+/// same way and assert it reaches the provider intact on completion.request.
 const LEAD_SYSTEM: &str = "you are the lead\n\n\
 ## MAG workspace\n\n\
 workspace dir: /tmp/nefor/sessions/lead-turn-session/mag\n\n\
@@ -268,12 +268,15 @@ fn execute_body(
     }))
 }
 
-fn chat_result(chat_id: &str, output: Value) -> Map<String, Value> {
-    obj(json!({
-        "kind": format!("{PROVIDER}.chat.complete.result"),
-        "chat_id": chat_id,
-        "output": output,
-    }))
+fn completed(provider: &str, request_id: &str, fields: Value) -> Map<String, Value> {
+    let mut body = fields.as_object().expect("completion fields").clone();
+    body.insert(
+        "kind".into(),
+        Value::String(format!("{provider}.completion.event")),
+    );
+    body.insert("request_id".into(), Value::String(request_id.to_owned()));
+    body.insert("event".into(), Value::String("completed".into()));
+    body
 }
 
 async fn load_typed_task_program<R: AsyncBufReadExt + Unpin>(
@@ -378,67 +381,34 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     )
     .await;
 
-    let create_kind = format!("{MOCK}.chat.create");
-    let append_kind = format!("{MOCK}.chat.append");
-    let complete_kind = format!("{MOCK}.chat.complete");
+    let create_kind = format!("{MOCK}.completion.request");
     let create = next_event_of_kind(&mut reader, &create_kind).await;
-    let first_chat = create
-        .get("chat_id")
-        .and_then(Value::as_str)
-        .unwrap()
-        .to_owned();
-    let saw_provider_schema = loop {
-        let event = next_event(&mut reader, "first typed provider round").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some(kind) if kind == complete_kind => {
-                break event.pointer_str("/output_schema/properties/task/type") == Some("string");
-            }
-            Some("mag.error") => panic!("typed program failed: {event:?}"),
-            _ => {}
-        }
-    };
-    assert!(saw_provider_schema);
+    let first_chat = create["request_id"].as_str().unwrap().to_owned();
+    assert!(create
+        .get("output_schema")
+        .and_then(|schema| schema.pointer("/root/body/fields"))
+        .and_then(Value::as_array)
+        .is_some_and(|fields| fields.iter().any(|field| {
+            field.get("name").and_then(Value::as_str) == Some("task")
+                && field.pointer("/schema/kind").and_then(Value::as_str) == Some("string")
+        })));
     send_event(
         &mut stdin,
-        obj(json!({
-            "kind": format!("{MOCK}.chat.complete.result"),
-            "chat_id": first_chat,
-            "output": { "text": "```json\n{}\n```" }
-        })),
+        completed(MOCK, &first_chat, json!({ "text": "```json\n{}\n```" })),
     )
     .await;
 
     let create2 = next_event_of_kind(&mut reader, &create_kind).await;
     let second_chat = create2
-        .get("chat_id")
+        .get("request_id")
         .and_then(Value::as_str)
         .unwrap()
         .to_owned();
-    let mut saw_correction = false;
-    loop {
-        let event = next_event(&mut reader, "corrected typed provider round").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some(kind)
-                if kind == append_kind
-                    && event
-                        .pointer_str("/message/content")
-                        .is_some_and(|text| text.contains("malformed_json")) =>
-            {
-                saw_correction = true;
-            }
-            Some(kind) if kind == complete_kind => break,
-            Some("mag.error") => panic!("typed correction failed: {event:?}"),
-            _ => {}
-        }
-    }
-    assert!(saw_correction);
+    let correction_history = serde_json::to_string(&create2["messages"]).unwrap();
+    assert!(correction_history.contains("malformed_json"));
     send_event(
         &mut stdin,
-        obj(json!({
-            "kind": format!("{MOCK}.chat.complete.result"),
-            "chat_id": second_chat,
-            "output": { "text": "{\"task\":\"build\",\"description\":\"Implement it\",\"dependent-tasks\":[]}" }
-        })),
+        completed(MOCK, &second_chat, json!({ "text": "{\"task\":\"build\",\"description\":\"Implement it\",\"dependent-tasks\":[]}" })),
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -488,46 +458,30 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     )
     .await;
 
-    let builder_create = next_event_of_kind(&mut reader, &format!("{MOCK}.chat.create")).await;
-    let builder_id = builder_create["chat_id"].as_str().unwrap().to_owned();
-    next_event_of_kind(&mut reader, &format!("{MOCK}.chat.complete")).await;
+    let builder_create =
+        next_event_of_kind(&mut reader, &format!("{MOCK}.completion.request")).await;
+    let builder_id = builder_create["request_id"].as_str().unwrap().to_owned();
     send_event(
         &mut stdin,
-        obj(json!({
-            "kind": format!("{MOCK}.chat.complete.result"),
-            "chat_id": builder_id,
-            "output": {"text": "partial builder notes"},
-        })),
+        completed(MOCK, &builder_id, json!({"text": "partial builder notes"})),
     )
     .await;
 
-    let reviewer_create = next_event_of_kind(&mut reader, &format!("{MOCK}.chat.create")).await;
-    let reviewer_id = reviewer_create["chat_id"].as_str().unwrap().to_owned();
-    let mut retained_partial = false;
-    loop {
-        let event = next_event(&mut reader, "reviewer request").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some(kind) if kind == format!("{MOCK}.chat.append") => {
-                retained_partial |= event
-                    .pointer_str("/message/content/value/value/last_output/text")
-                    == Some("partial builder notes");
-            }
-            Some(kind) if kind == format!("{MOCK}.chat.complete") => break,
-            Some("mag.error") => panic!("recovery chain failed: {event:?}"),
-            _ => {}
-        }
-    }
+    let reviewer_create =
+        next_event_of_kind(&mut reader, &format!("{MOCK}.completion.request")).await;
+    let reviewer_id = reviewer_create["request_id"].as_str().unwrap().to_owned();
+    let reviewer_history = serde_json::to_string(&reviewer_create["messages"]).unwrap();
     assert!(
-        retained_partial,
+        reviewer_history.contains("partial builder notes"),
         "reviewer did not receive builder last_output"
     );
     send_event(
         &mut stdin,
-        obj(json!({
-            "kind": format!("{MOCK}.chat.complete.result"),
-            "chat_id": reviewer_id,
-            "output": {"text": "{\"assessment\":\"continue from partial work\"}"},
-        })),
+        completed(
+            MOCK,
+            &reviewer_id,
+            json!({"text": "{\"assessment\":\"continue from partial work\"}"}),
+        ),
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -540,24 +494,14 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
 }
 
 async fn complete_chat<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+    _reader: &mut R,
     stdin: &mut ChildStdin,
-    chat_id: &str,
+    request_id: &str,
     text: &str,
 ) {
-    let complete = "mock-provider.chat.complete";
-    loop {
-        let event = next_event(reader, "provider request").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some(kind) if kind == complete => break,
-            Some("mag.error") => panic!("dynamic program failed: {event:?}"),
-            _ => {}
-        }
-    }
     send_event(
         stdin,
-        obj(json!({"kind":"mock-provider.chat.complete.result",
-        "chat_id":chat_id,"output":{"text":text}})),
+        completed("mock-provider", request_id, json!({"text": text})),
     )
     .await;
 }
@@ -609,21 +553,21 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     .await;
 
     let planner = loop {
-        let event = next_event(&mut reader, "planner chat.create").await;
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.create") {
+        let event = next_event(&mut reader, "planner completion.request").await;
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.completion.request") {
             break event;
         }
         if event.get("kind").and_then(Value::as_str) == Some("mag.error") {
             panic!("dynamic execute: {event:?}");
         }
     };
-    let planner_id = planner["chat_id"].as_str().unwrap().to_owned();
+    let planner_id = planner["request_id"].as_str().unwrap().to_owned();
     complete_chat(&mut reader, &mut stdin, &planner_id,
       r#"[{"task":"a","description":"first","dependent_tasks":[]},{"task":"a.collect","description":"second","dependent_tasks":["a"]}]"#).await;
 
     let first = loop {
-        let event = next_event(&mut reader, "first worker chat.create").await;
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.create") {
+        let event = next_event(&mut reader, "first worker completion.request").await;
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.completion.request") {
             break event;
         }
         if matches!(
@@ -633,55 +577,52 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
             panic!("planner expansion failed: {event:?}");
         }
     };
-    next_event_of_kind(&mut reader, "mock-provider.chat.complete").await;
-    let second = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
-    next_event_of_kind(&mut reader, "mock-provider.chat.complete").await;
-    let first_id = first["chat_id"].as_str().unwrap().to_owned();
-    let second_id = second["chat_id"].as_str().unwrap().to_owned();
-    assert!(first_id.contains("expand.worker.1.llm"));
-    assert!(second_id.contains("expand.worker.0.llm"));
+    let second = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let first_id = first["request_id"].as_str().unwrap().to_owned();
+    let second_id = second["request_id"].as_str().unwrap().to_owned();
+    assert_ne!(
+        first_id, second_id,
+        "parallel workers have distinct request ids"
+    );
     // Planner order is one,two; completion order is two,one.
     send_event(
         &mut stdin,
-        obj(json!({"kind":"mock-provider.chat.complete.result",
-      "chat_id":first_id,"output":{"text":r#"{"task":"a.collect","description":"done second"}"#}})),
+        completed(
+            "mock-provider",
+            &first_id,
+            json!({"text":r#"{"task":"a.collect","description":"done second"}"#}),
+        ),
     )
     .await;
     send_event(
         &mut stdin,
-        obj(json!({"kind":"mock-provider.chat.complete.result",
-      "chat_id":second_id,"output":{"text":r#"{"task":"a","description":"done first"}"#}})),
+        completed(
+            "mock-provider",
+            &second_id,
+            json!({"text":r#"{"task":"a","description":"done first"}"#}),
+        ),
     )
     .await;
 
-    let summary_create = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
-    let summary_id = summary_create["chat_id"].as_str().unwrap().to_owned();
-    let mut ordered_input = None;
-    loop {
-        let event = next_event(&mut reader, "summarizer request").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some("mock-provider.chat.append") => {
-                if let Some(value) = event
-                    .get("message")
-                    .and_then(|message| message.get("content"))
-                {
-                    if value.is_array() {
-                        ordered_input = Some(value.clone());
-                    }
-                }
-            }
-            Some("mock-provider.chat.complete") => break,
-            Some("mag.error") => panic!("summarizer failed: {event:?}"),
-            _ => {}
-        }
-    }
-    let ordered = ordered_input.expect("typed worker list reached summarizer");
+    let summary_create = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let summary_id = summary_create["request_id"].as_str().unwrap().to_owned();
+    let ordered = summary_create["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find_map(|message| message.get("content")?.as_array())
+        })
+        .expect("typed worker list reached summarizer");
     assert_eq!(ordered[0]["task"], "a");
     assert_eq!(ordered[1]["task"], "a.collect");
     send_event(
         &mut stdin,
-        obj(json!({"kind":"mock-provider.chat.complete.result",
-      "chat_id":summary_id,"output":{"text":"{\"content\":\"done\"}"}})),
+        completed(
+            "mock-provider",
+            &summary_id,
+            json!({"text":"{\"content\":\"done\"}"}),
+        ),
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -712,11 +653,11 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
         ),
     )
     .await;
-    let planner = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    let planner = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
     complete_chat(
         &mut reader,
         &mut stdin,
-        planner["chat_id"].as_str().unwrap(),
+        planner["request_id"].as_str().unwrap(),
         "[]",
     )
     .await;
@@ -728,27 +669,17 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
                 "zero branch spawned dynamic actor {id}"
             );
         }
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.create") {
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.completion.request") {
             break event;
         }
     };
-    let summary_id = summary["chat_id"].as_str().unwrap().to_owned();
-    loop {
-        let event = next_event(&mut reader, "zero summarizer").await;
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.complete") {
-            break;
-        }
-        assert_ne!(
-            event.get("kind").and_then(Value::as_str),
-            Some("mag.actor_spawned"),
-            "zero branch must not spawn dynamic workers or collector"
-        );
-    }
+    let summary_id = summary["request_id"].as_str().unwrap().to_owned();
     send_event(
         &mut stdin,
-        obj(
-            json!({"kind":"mock-provider.chat.complete.result","chat_id":summary_id,
-      "output":{"text":"{\"content\":\"empty\"}"}}),
+        completed(
+            "mock-provider",
+            &summary_id,
+            json!({"text":"{\"content\":\"empty\"}"}),
         ),
     )
     .await;
@@ -790,31 +721,28 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         ),
     )
     .await;
-    let planner = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    let planner = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
     complete_chat(
         &mut reader,
         &mut stdin,
-        planner["chat_id"].as_str().unwrap(),
+        planner["request_id"].as_str().unwrap(),
         r#"[{"task":"duplicate","description":"only","dependent_tasks":[]}]"#,
     )
     .await;
-    let worker = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
-    assert!(worker["chat_id"]
-        .as_str()
-        .unwrap()
-        .contains("expand.worker.0.llm"));
+    let worker = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    assert!(worker["request_id"].as_str().is_some());
     complete_chat(
         &mut reader,
         &mut stdin,
-        worker["chat_id"].as_str().unwrap(),
+        worker["request_id"].as_str().unwrap(),
         r#"{"task":"duplicate","description":"done"}"#,
     )
     .await;
-    let summary = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    let summary = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
     complete_chat(
         &mut reader,
         &mut stdin,
-        summary["chat_id"].as_str().unwrap(),
+        summary["request_id"].as_str().unwrap(),
         r#"{"content":"one done"}"#,
     )
     .await;
@@ -846,11 +774,11 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
     )
     .await;
     for _ in 0..3 {
-        let request = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+        let request = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
         complete_chat(
             &mut reader,
             &mut stdin,
-            request["chat_id"].as_str().unwrap(),
+            request["request_id"].as_str().unwrap(),
             "not json",
         )
         .await;
@@ -927,19 +855,19 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         .expect("mag.run_started carries the run's wire-id scope token")
         .to_owned();
 
-    // The bridge drives the provider round: chat.create carries the
+    // The bridge drives the provider round: completion.request carries the
     // overlaid system + the program-authored tool surface, keyed by a
     // scope-prefixed chat handle.
-    let create_kind = format!("{PROVIDER}.chat.create");
+    let create_kind = format!("{PROVIDER}.completion.request");
     let create = next_event_of_kind(&mut reader, &create_kind).await;
-    let chat_id = create
-        .get("chat_id")
+    let request_id = create
+        .get("request_id")
         .and_then(Value::as_str)
-        .expect("chat.create carries chat_id")
+        .expect("completion.request carries request_id")
         .to_owned();
     assert!(
-        chat_id.starts_with(&format!("{scope}/lead.llm@")),
-        "chat handle {chat_id:?} carries the run scope {scope:?} + the llm actor id"
+        request_id.starts_with(&format!("{scope}/")),
+        "request id {request_id:?} carries run scope {scope:?}"
     );
     let routing_session_id = format!("{SESSION_ID}/{scope}/lead.llm");
     assert_eq!(
@@ -950,7 +878,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let system = create
         .get("system")
         .and_then(Value::as_str)
-        .expect("chat.create carries the spawner's system overlay");
+        .expect("completion.request carries the spawner's system overlay");
     assert!(
         system.contains("## MAG workspace"),
         "the ambient MAG workspace block reaches the provider; got {system:?}"
@@ -970,7 +898,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let tools = create
         .get("tools")
         .and_then(Value::as_array)
-        .expect("chat.create advertises the program-authored tool surface");
+        .expect("completion.request advertises the program-authored tool surface");
     let tool_names: Vec<&str> = tools.iter().filter_map(Value::as_str).collect();
     for expected in ["read_file", "write-review", "mag", "mag-eval"] {
         assert!(
@@ -988,31 +916,19 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         );
     }
 
-    // Turn 1, round 1: the only appended message is the task (empty seed).
-    let append_kind = format!("{PROVIDER}.chat.append");
-    let append = loop {
-        let event = next_event(&mut reader, "initial provider input").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some(kind) if kind == append_kind => break event,
-            Some(kind) if kind == format!("{PROVIDER}.chat.complete") => {
-                panic!("provider turn completed before receiving its initial input: {event:?}")
-            }
-            _ => {}
-        }
-    };
+    // Turn 1, round 1: the request carries the task as its only message.
     assert_eq!(
-        append.pointer_str("/message/content/value/prompt"),
+        create.pointer_str("/messages/0/content/value/prompt"),
         Some("what is in the repo?"),
     );
-    let complete_kind = format!("{PROVIDER}.chat.complete");
-    next_event_of_kind(&mut reader, &complete_kind).await;
 
     // The model calls a tool → the gate invoke rides a scope-prefixed
     // correlation id (the seam the spawner's transcript tool events key on).
     send_event(
         &mut stdin,
-        chat_result(
-            &chat_id,
+        completed(
+            PROVIDER,
+            &request_id,
             json!({ "tool_calls": [
                 { "id": "call-1", "name": "read_file", "args": { "path": "README.md" } }
             ] }),
@@ -1070,33 +986,24 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
 
     // Round 2: the tool result feeds exactly one fresh provider round; answer final.
     let create2 = next_event_of_kind(&mut reader, &create_kind).await;
-    let chat_id2 = create2
-        .get("chat_id")
+    let request_id2 = create2
+        .get("request_id")
         .and_then(Value::as_str)
-        .expect("round 2 chat_id")
+        .expect("round 2 request_id")
         .to_owned();
-    assert_ne!(chat_id2, chat_id, "provider request handles stay per-round");
+    assert_ne!(
+        request_id2, request_id,
+        "provider request handles stay per-round"
+    );
     assert_eq!(
         create2.get("routing_session_id").and_then(Value::as_str),
         Some(routing_session_id.as_str()),
         "round 2 reuses the actor routing identity"
     );
-    let mut continuation_appends = Vec::new();
-    loop {
-        let event = next_event(&mut reader, "correlated MAG continuation").await;
-        match event.get("kind").and_then(Value::as_str) {
-            Some(kind) if kind == append_kind => continuation_appends.push(event),
-            Some(kind) if kind == complete_kind => break,
-            Some(kind) if kind == create_kind => {
-                panic!("tool result created a duplicate model continuation: {event:?}")
-            }
-            Some("mag.error") => panic!("lead continuation failed: {event:?}"),
-            _ => {}
-        }
-    }
-    let tool_results: Vec<&Map<String, Value>> = continuation_appends
+    let continuation_messages = create2["messages"].as_array().expect("round 2 messages");
+    let tool_results: Vec<&Value> = continuation_messages
         .iter()
-        .filter(|event| event.pointer_str("/message/role") == Some("tool"))
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
         .collect();
     assert_eq!(
         tool_results.len(),
@@ -1104,18 +1011,19 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         "the original gate result reaches provider history exactly once"
     );
     assert_eq!(
-        tool_results[0].pointer_str("/message/content"),
+        tool_results[0].pointer("/content").and_then(Value::as_str),
         Some("# nefor")
     );
-    let provider_history = serde_json::to_string(&continuation_appends).unwrap();
+    let provider_history = serde_json::to_string(continuation_messages).unwrap();
     assert!(
         !provider_history.contains(notice_text),
         "instruction notices are absent from provider history"
     );
     send_event(
         &mut stdin,
-        chat_result(
-            &chat_id2,
+        completed(
+            PROVIDER,
+            &request_id2,
             json!({ "text": "{\"content\":\"the repo holds nefor\"}" }),
         ),
     )
@@ -1166,25 +1074,17 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     )
     .await;
 
-    next_event_of_kind(&mut reader, &create_kind).await;
-    // The llm replays the seeded history ahead of the new task: three
-    // appends, in order.
-    let a1 = next_event_of_kind(&mut reader, &append_kind).await;
-    assert_eq!(a1.pointer_str("/message/role"), Some("user"));
+    let turn2 = next_event_of_kind(&mut reader, &create_kind).await;
+    let messages = turn2["messages"].as_array().expect("turn 2 messages");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "what is in the repo?");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "the repo holds nefor");
+    assert_eq!(messages[2]["role"], "user");
     assert_eq!(
-        a1.pointer_str("/message/content"),
-        Some("what is in the repo?")
-    );
-    let a2 = next_event_of_kind(&mut reader, &append_kind).await;
-    assert_eq!(a2.pointer_str("/message/role"), Some("assistant"));
-    assert_eq!(
-        a2.pointer_str("/message/content"),
-        Some("the repo holds nefor")
-    );
-    let a3 = next_event_of_kind(&mut reader, &append_kind).await;
-    assert_eq!(a3.pointer_str("/message/role"), Some("user"));
-    assert_eq!(
-        a3.pointer_str("/message/content/value/prompt"),
+        messages[2]
+            .pointer("/content/value/prompt")
+            .and_then(Value::as_str),
         Some("and what else?")
     );
 
@@ -1224,14 +1124,13 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
     )
     .await;
 
-    // Wait until the provider round is in flight (chat.complete on the
+    // Wait until the provider round is in flight (completion.request on the
     // wire, no reply sent) — the llm actor now holds live external work.
-    let complete_kind = format!("{PROVIDER}.chat.complete");
-    let complete = next_event_of_kind(&mut reader, &complete_kind).await;
-    let chat_id = complete
-        .get("chat_id")
+    let request = next_event_of_kind(&mut reader, &format!("{PROVIDER}.completion.request")).await;
+    let request_id = request
+        .get("request_id")
         .and_then(Value::as_str)
-        .expect("chat.complete carries chat_id")
+        .expect("completion.request carries request_id")
         .to_owned();
 
     // Esc: the control plane kills the run.
@@ -1243,15 +1142,15 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
 
     // The reap runs kill handlers through the fold: the dying llm's
     // provider-cancel envelope reaches the wire BEFORE the terminal reply.
-    let cancel_kind = format!("{PROVIDER}.chat.cancel");
+    let cancel_kind = format!("{PROVIDER}.completion.cancel");
     let mut saw_cancel = false;
     let result = loop {
         let body = next_event(&mut reader, "kill aftermath").await;
         match body.get("kind").and_then(Value::as_str) {
             Some(k) if k == cancel_kind => {
                 assert_eq!(
-                    body.get("chat_id").and_then(Value::as_str),
-                    Some(chat_id.as_str()),
+                    body.get("request_id").and_then(Value::as_str),
+                    Some(request_id.as_str()),
                     "the cancel targets the in-flight provider chat"
                 );
                 saw_cancel = true;
@@ -1335,19 +1234,18 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
     .await;
 
     // Round 1: drive the provider round to a tool call.
-    let create_kind = format!("{PROVIDER}.chat.create");
-    let complete_kind = format!("{PROVIDER}.chat.complete");
+    let create_kind = format!("{PROVIDER}.completion.request");
     let create = next_event_of_kind(&mut reader, &create_kind).await;
-    let chat_id = create
-        .get("chat_id")
+    let request_id = create
+        .get("request_id")
         .and_then(Value::as_str)
-        .expect("chat.create carries chat_id")
+        .expect("completion.request carries request_id")
         .to_owned();
-    next_event_of_kind(&mut reader, &complete_kind).await;
     send_event(
         &mut stdin,
-        chat_result(
-            &chat_id,
+        completed(
+            PROVIDER,
+            &request_id,
             json!({ "tool_calls": [
                 { "id": "call-1", "name": "read_file", "args": { "path": "HUGE" } }
             ] }),
@@ -1374,14 +1272,11 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
 
     // Real termination: a tool.cancel for the open correlation reaches the wire
     // (→ the gate would forward it to the owning source and kill the child).
-    // The lead llm re-fires: a fresh chat.create whose transcript carries the
+    // The lead llm re-fires: a fresh completion.request whose transcript carries the
     // interrupted tool result as a readable `[tool error] interrupted by user`.
     let cancel_kind = format!("{GATE}.tool.cancel");
-    let append_kind = format!("{PROVIDER}.chat.append");
     let mut saw_cancel = false;
-    let mut saw_interrupted_tool_turn = false;
-    let mut chat_id2: Option<String> = None;
-    loop {
+    let request_id2 = loop {
         let body = next_event(&mut reader, "interrupt aftermath").await;
         match body.get("kind").and_then(Value::as_str) {
             Some(k) if k == cancel_kind => {
@@ -1392,48 +1287,38 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
                 );
                 saw_cancel = true;
             }
-            Some(k) if k == create_kind && chat_id2.is_none() => {
-                // Round 2 chat (the re-fire) — a fresh handle, not round 1's.
+            Some(k) if k == create_kind => {
                 let c2 = body
-                    .get("chat_id")
+                    .get("request_id")
                     .and_then(Value::as_str)
-                    .expect("round 2 chat_id")
+                    .expect("round 2 request_id")
                     .to_owned();
-                assert_ne!(c2, chat_id, "the re-fire runs on a fresh provider chat");
-                chat_id2 = Some(c2);
-            }
-            Some(k)
-                if k == append_kind
-                    && body.pointer_str("/message/content")
-                        == Some("[tool error] interrupted by user") =>
-            {
-                assert_eq!(
-                    body.pointer_str("/message/role"),
-                    Some("tool"),
-                    "the interrupted result replays as a tool-role turn"
+                assert_ne!(
+                    c2, request_id,
+                    "the re-fire runs on a fresh provider request"
                 );
-                saw_interrupted_tool_turn = true;
+                let history = serde_json::to_string(&body["messages"]).unwrap();
+                assert!(
+                    history.contains("[tool error] interrupted by user"),
+                    "the lead re-fired with the interrupted result as a readable tool turn"
+                );
+                break c2;
             }
-            Some(k) if k == complete_kind && chat_id2.is_some() => break,
             _ => {}
         }
-    }
+    };
     assert!(
         saw_cancel,
         "a tool.cancel for the in-flight call reached the wire"
     );
-    assert!(
-        saw_interrupted_tool_turn,
-        "the lead re-fired with the interrupted result as a readable tool turn"
-    );
-    let chat_id2 = chat_id2.expect("round 2 chat established");
 
     // The re-fired round produces the real final answer; the run completes
     // (NOT killed) so the terminal reply settles the ORIGINAL execute.
     send_event(
         &mut stdin,
-        chat_result(
-            &chat_id2,
+        completed(
+            PROVIDER,
+            &request_id2,
             json!({ "text": "{\"content\":\"I stopped the read as you asked.\"}" }),
         ),
     )
@@ -1465,7 +1350,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
 /// let its llm re-fire to a phantom "Completed". Here the interrupt cancels the
 /// in-flight tool (a `tool-gate.tool.cancel` reaches the wire → the bash dies)
 /// AND ends the run FAILED — `mag.run_result status:"failed" error:"interrupted
-/// by user"`, and the llm NEVER re-fires (no round-2 `chat.create`). This pins
+/// by user"`, and the llm NEVER re-fires (no round-2 `completion.request`). This pins
 /// the incident's fix through the real plugin + bridge + kernel.
 #[tokio::test]
 async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_refire() {
@@ -1500,19 +1385,18 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
     .await;
 
     // Round 1: drive the provider round to a tool call.
-    let create_kind = format!("{PROVIDER}.chat.create");
-    let complete_kind = format!("{PROVIDER}.chat.complete");
+    let create_kind = format!("{PROVIDER}.completion.request");
     let create = next_event_of_kind(&mut reader, &create_kind).await;
-    let chat_id = create
-        .get("chat_id")
+    let request_id = create
+        .get("request_id")
         .and_then(Value::as_str)
-        .expect("chat.create carries chat_id")
+        .expect("completion.request carries request_id")
         .to_owned();
-    next_event_of_kind(&mut reader, &complete_kind).await;
     send_event(
         &mut stdin,
-        chat_result(
-            &chat_id,
+        completed(
+            PROVIDER,
+            &request_id,
             json!({ "tool_calls": [
                 { "id": "call-1", "name": "read_file", "args": { "path": "HUGE" } }
             ] }),
@@ -1543,7 +1427,7 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
 
     // The run ends failed with NO re-fire: a tool.cancel for the in-flight call
     // reaches the wire, and the terminal reply is `status:"failed"`. Crucially,
-    // NO round-2 chat.create appears — the llm never gets to answer "Completed".
+    // NO round-2 completion.request appears — the llm never gets to answer "Completed".
     let cancel_kind = format!("{GATE}.tool.cancel");
     let mut saw_cancel = false;
     let result = loop {
@@ -1558,7 +1442,9 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
                 saw_cancel = true;
             }
             Some(k) if k == create_kind => {
-                panic!("the terminated run's llm must NOT re-fire — saw a round-2 chat.create");
+                panic!(
+                    "the terminated run's llm must NOT re-fire — saw a round-2 completion.request"
+                );
             }
             Some("mag.run_result") => break body,
             _ => {}

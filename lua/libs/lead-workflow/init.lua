@@ -1002,6 +1002,13 @@ end
 -- reading the persisted output file.
 local function mag_result_text(result)
   if type(result) ~= "table" then return nil end
+  local semantic = result.semantic_type
+  if type(semantic) == "table"
+      and semantic.name == "nefor.contracts.FinalAnswer"
+      and type(result.value) == "table"
+      and type(result.value.content) == "string" then
+    return result.value.content
+  end
   if type(result.text) == "string" and #result.text > 0 then
     return result.text
   end

@@ -146,7 +146,15 @@ function M.new(opts)
     events = opts.events or noop,
     persist_output = opts.persist_output or noop,
     observe_output = opts.observe_output or noop,
-    settle_result = opts.settle_result or function() return true end,
+    settle_result = opts.settle_result or function(id, result, persist_result, persisted)
+      (opts.events or noop)({
+        kind = EVT_RUN_COMPLETE,
+        from = id,
+        result = result,
+        persisted = persisted == true or persist_result ~= nil,
+      })
+      return true
+    end,
     -- Injected clock for the busy-window stamps (mag.actor_idle's busy_ms).
     -- init.lua wires the host's nefor.now_ms; pure unit tests pass a fake or
     -- take the zero default.
@@ -254,9 +262,10 @@ function M:on_emit(id, message, generation)
     and kind ~= CAP_INVOKE and kind ~= COMPLETE and kind ~= FAILED
     and kind ~= RUN_COMPLETE and kind ~= APPROVAL_REQUEST
     and kind ~= APPROVAL_CANCEL
-  local terminal_control_signal = kind == RUN_COMPLETE and dead
-  if generation ~= nil and (generation ~= current_generation
-      or (dead and not terminal_control_signal and not signal_bus_envelope)) then
+  local terminal_control_signal = kind == RUN_COMPLETE
+    or (self.signaling[id] and kind == APPROVAL_CANCEL)
+  if generation ~= nil and not terminal_control_signal
+      and (generation ~= current_generation or (dead and not signal_bus_envelope)) then
     self.events({
       kind = EVT_EMISSION_IGNORED,
       from = id,
@@ -299,14 +308,9 @@ function M:on_emit(id, message, generation)
       correlation = message.correlation,
     })
   elseif self.signaling[id] then
-    -- A non-reserved emit from an actor whose signal handler (kill/drain) is
-    -- running: these are final abort/cancel envelopes bound for a capability
-    -- plugin (llm's `<provider>.chat.cancel`), not declared outputs. They must
-    -- bypass route_output's declared-tag routing
-    -- — which would drop them (a killed actor is already unrouted; a cancel is
-    -- not on any route) — and land straight on the bus. This is the raw-emit
-    -- seam; on kill it runs strictly before forget (dispatch_kill), so the
-    -- envelope reaches bus_emit while the instance is still bound.
+    -- Final non-reserved envelopes from a signal handler are capability-bus
+    -- traffic, not declared graph outputs. Bypass route_output while the
+    -- instance remains bound; dispatch_kill removes it only afterward.
     self.bus_emit(message)
   else
     -- A declared output: persist it to the sender's per-node file (the control
@@ -482,7 +486,7 @@ end
 -- control plane as a `mag.run_complete` lifecycle event. The sink declares no
 -- outputs, so there is nothing to route.
 function M:on_run_complete(id, message)
-  self.settle_result(id, message.result, message.persist_result)
+  self.settle_result(id, message.result, message.persist_result, message.persisted)
 end
 
 -- Route one id-signed output along the sender's routes[tag]. A tag with no
@@ -995,15 +999,10 @@ function M:bus_response(response)
   return true
 end
 
--- Cancel this run's in-flight work WITHOUT settling any correlation: emit a
--- `tool.cancel { id = request_id }` for every OPEN capability correlation so the
--- real work stops burning — the bridge routes each to the gate (a tool leg →
--- the owning source kills the child / cancels a nested sub-run) or to
--- `<provider>.chat.cancel` (a provider round). No reply is delivered, so no
--- actor re-fires from this call. Returns the number of correlations cancelled.
--- Shared by both interrupt paths: the graceful interrupt adds a settle on top;
--- the terminating interrupt (a dispatched sub-run) cancels only, then the host
--- ends the run failed — the run's llm never gets a reply to re-fire on.
+-- Cancel this run's in-flight work WITHOUT settling correlations. The bridge
+-- translates each generic cancellation to its owned provider or tool wire.
+-- This primitive is retained for direct kernel callers; terminating host paths
+-- reap actors instead so kill-time cancellation cannot be duplicated.
 function M:cancel_inflight()
   local ids = self.correlation:pending_ids()
   for _, request_id in ipairs(ids) do
@@ -1070,20 +1069,18 @@ function M:is_constructed(id)
   return self.instances[id] ~= nil
 end
 
--- Hand a dying instance its one final kill message (actor-model.md, Signals:
--- kill). Removal is unconditional; the handler is a courtesy so an actor holding
--- live external work (an open provider request) can abort it. A kill before
--- construction finds no instance and returns false — the spec just drops, no
--- courtesy delivery (nothing exists to receive it). Runs the handler with
--- `signaling[id]` set, so any non-reserved envelope it emits takes the
--- raw-emit path to the bus (on_emit) instead of route_output — which would drop
--- it, the id being already unrouted. Called from the inventory's on_kill seam
--- BEFORE forget (init.lua), so the abort envelope reaches bus_emit while the
--- instance is still bound: emit-before-forget.
+-- Cancel every open capability owned by a dying actor, then let its instance
+-- clear local state. Correlation owns generated request ids; factories retain
+-- only opaque refs and never emit provider/tool cancellation wires.
 function M:dispatch_kill(id)
+  local request_ids = self.correlation:take_requester(id)
+  for _, request_id in ipairs(request_ids) do
+    self.bus_emit({ kind = "tool.cancel", id = request_id })
+  end
+
   local instance = self.instances[id]
   if not instance or type(instance.handle_kill) ~= "function" then
-    return false
+    return #request_ids > 0
   end
   self.signaling[id] = true
   instance.handle_kill()
@@ -1091,14 +1088,9 @@ function M:dispatch_kill(id)
   return true
 end
 
--- Graceful drain (actor-model.md, Signals: drain / SIGTERM). The kernel exposes
--- this as a distinct op (init.lua `drain(id)`) — it is NEVER auto-called from
--- kill. Calls the instance's drain handler where declared, with `signaling[id]`
--- set so a bus-bound cancel envelope it emits (an llm's `<provider>.chat.cancel`)
--- reaches the bus by the same raw path; intercepted kinds (mag.complete, the
--- human gate's `mag.ApprovalCancel`) still take their reserved paths — the
--- interception branches in on_emit run before the signaling check. Returns true
--- when a handler ran.
+-- Graceful drain calls the instance's local handler where declared. Reserved
+-- completion and approval-cancel signals keep their control-plane paths;
+-- non-reserved signal traffic reaches the bus directly.
 function M:drain(id)
   local instance = self.instances[id]
   if not instance or type(instance.handle_drain) ~= "function" then
@@ -1121,17 +1113,14 @@ function M:steer(id, message)
   return instance.handle_steer(message) == true
 end
 
--- Drop all routing state for a killed id — the instance, the firing slots
--- (buffered partial inputs included), and outstanding capability correlations
--- (actor-model.md, Signals: kill). Wired from the inventory's on_kill seam in
--- init.lua, strictly after dispatch_kill.
+-- Drop all local routing state for a killed id. Capability ownership is
+-- consumed and cancelled by dispatch_kill before this removal step.
 function M:forget(id)
   self.machines[id] = nil
   self.ready[id] = nil
   self.busy[id] = nil
   self.instances[id] = nil
   self.signaling[id] = nil
-  self.correlation:drop_requester(id)
 end
 
 return M

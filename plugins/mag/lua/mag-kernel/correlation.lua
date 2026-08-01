@@ -58,15 +58,30 @@ function M:pending_ids()
   return ids
 end
 
--- Drop every outstanding request owned by a killed actor. Kill unroutes and
--- drops the mailbox; it drops pending correlations too, so a late reply to a
--- dead requester finds nothing and is discarded.
-function M:drop_requester(id)
-  for rid, entry in pairs(self.pending) do
-    if entry.requester == id then
-      self.pending[rid] = nil
+-- Consume every outstanding request owned by one actor, returning the wire ids
+-- in deterministic order. Teardown emits cancellation for this snapshot after
+-- ownership is removed, so late replies cannot settle the dying requester.
+function M:take_requester(requester)
+  local ids = {}
+  for request_id, entry in pairs(self.pending) do
+    if entry.requester == requester then
+      ids[#ids + 1] = request_id
+      self.pending[request_id] = nil
     end
   end
+  table.sort(ids)
+  return ids
+end
+
+-- Resolve one actor-owned opaque ref to its generated request id without
+-- exposing correlation representation to factories.
+function M:request_id(requester, ref)
+  for request_id, entry in pairs(self.pending) do
+    if entry.requester == requester and entry.ref == ref then
+      return request_id
+    end
+  end
+  return nil
 end
 
 return M

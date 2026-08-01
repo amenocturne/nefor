@@ -324,8 +324,9 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         local killed, killed_out = new_actor("killed")
         killed.deliver({ kind = "reply", result = { text = "1" } })
         assert(killed_out[#killed_out].kind == "capability.invoke")
+        local before_kill = #killed_out
         killed.handle_kill()
-        assert(killed_out[#killed_out].kind == "mock-provider.chat.cancel")
+        assert(#killed_out == before_kill)
 
         local retained, retained_out = new_actor("retained")
         retained.deliver({ kind = "reply", result = { text = "1", marker = "first" } })

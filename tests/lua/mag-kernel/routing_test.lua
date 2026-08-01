@@ -414,64 +414,56 @@ do
 end
 
 -- ==================================================================
--- kill drops firing slots + correlations (forget wired via on_kill)
+-- kill consumes and cancels only the dying requester's correlations before
+-- local actor removal; late replies cannot settle or re-fire it.
 -- ==================================================================
 
 do
   local h = harness({
     worker = { name = "worker", inputs = { input = "job.Start" }, outputs = { "job.Done" } },
   })
-  local w = spawn_actor(h, "w", "worker", {}, function(self)
-    self.emit({ kind = "capability.invoke", from = self.id, capability = "compute", request = {}, ref = "r" })
+  local replies = 0
+  local w = spawn_actor(h, "w", "worker", {}, function(self, activation)
+    if activation.kind == "reply" then replies = replies + 1; return "ok" end
+    self.emit({ kind = "capability.invoke", capability = "provider", request = {}, ref = "actor@r1" })
+    self.emit({ kind = "capability.invoke", capability = "tool", request = {}, ref = "actor@r2" })
     return nil
   end)
-  w.emit({ kind = "mag.ready", from = "w" })
+  local other = spawn_actor(h, "other", "worker", {}, function() return nil end)
+  w.emit({ kind = "mag.ready" })
+  other.emit({ kind = "mag.ready" })
   h.router:fire("w", "seed", "job.Start", {})
-  assert_eq(count(h.router.correlation.pending), 1, "one correlation outstanding before kill")
+  other.emit({ kind = "capability.invoke", capability = "unrelated", request = {}, ref = "other@r1" })
 
-  h.inv.apply({ kills = { "w" } })
-  assert_eq(count(h.router.correlation.pending), 0, "kill dropped the outstanding correlation")
-  assert_eq(h.router.machines["w"], nil, "kill dropped the firing machine (slots)")
-  assert_eq(h.router.ready["w"], nil, "kill dropped the ready flag")
-end
-
--- ==================================================================
--- kill dispatch: handle_kill runs and its cancel envelope reaches bus_emit
--- BEFORE forget drops the instance (emit-before-forget, raw-emit path)
--- ==================================================================
-
-do
-  local h = harness({
-    canceller = { name = "canceller", inputs = { input = "job.Start" }, outputs = { "job.Done" } },
-  })
-
-  -- Register + bind an instance whose kill handler emits a bus-bound cancel
-  -- envelope (a non-reserved, non-declared kind — exactly llm's
-  -- `<provider>.chat.cancel` / human's `mag.ApprovalCancel` case).
-  local res = h.inv.apply({ actors = { { id = "k", factory = "canceller", params = {}, routes = {} } } })
-  assert_true(res.ok, "spawn canceller: " .. tostring(res.error))
+  assert_eq(h.router.correlation:request_id("w", "actor@r1"), "req-1",
+    "requester plus opaque ref resolves the generated id")
+  assert_eq(h.router.correlation:request_id("other", "actor@r1"), nil,
+    "opaque refs are requester-scoped")
 
   local observed = {}
-  local inst = { id = "k", emit = h.router:emitter("k") }
-  inst.deliver = function() return "ok" end
-  function inst.handle_kill()
-    inst.emit({ kind = "prov.chat.cancel", from = "k", chat_id = "c1" })
-    -- Still bound at emit time? (forget has not run yet — emit-before-forget.)
-    observed.bound_at_emit = h.router.instances["k"] ~= nil
+  function w.handle_kill()
+    observed.bound = h.router.instances.w ~= nil
+    observed.owned = h.router.correlation:request_id("w", "actor@r1")
   end
-  h.router:bind("k", inst)
-  inst.emit({ kind = "mag.ready", from = "k" })
+  h.inv.apply({ kills = { "w" } })
 
-  h.inv.apply({ kills = { "k" } })
+  assert_eq(#h.bus, 5, "three invokes plus exactly two cancels reached the bus")
+  assert_eq(h.bus[4].kind, "tool.cancel", "first owned request uses generic cancellation")
+  assert_eq(h.bus[4].id, "req-1", "first generated request id is cancelled")
+  assert_eq(h.bus[5].kind, "tool.cancel", "second owned request uses generic cancellation")
+  assert_eq(h.bus[5].id, "req-2", "second generated request id is cancelled")
+  assert_true(observed.bound, "cancellation precedes local actor removal")
+  assert_eq(observed.owned, nil, "ownership is consumed before local kill cleanup")
+  assert_eq(count(h.router.correlation.pending), 1, "unrelated requester correlation remains open")
+  assert_eq(h.router.instances.w, nil, "the dying instance is removed after cancellation")
+  assert_eq(h.router.machines.w, nil, "kill drops firing slots")
+  assert_eq(h.router.ready.w, nil, "kill drops readiness")
 
-  local cancel
-  for _, env in ipairs(h.bus) do
-    if env.kind == "prov.chat.cancel" then cancel = env end
-  end
-  assert_true(cancel ~= nil, "the kill handler's cancel envelope reached bus_emit via the raw path")
-  assert_eq(cancel.chat_id, "c1", "the cancel carries its provider handle")
-  assert_true(observed.bound_at_emit, "the cancel was emitted before forget (instance still bound)")
-  assert_eq(h.router.instances["k"], nil, "forget ran after dispatch — the instance is dropped")
+  assert_eq(h.router:bus_response({ id = "req-1", result = { value = "late" } }), false,
+    "a late response cannot claim consumed ownership")
+  assert_eq(replies, 0, "a late response cannot re-fire the dead requester")
+  h.inv.apply({ kills = { "w" } })
+  assert_eq(#h.bus, 5, "duplicate kill emits no duplicate cancellation")
 end
 
 -- ==================================================================

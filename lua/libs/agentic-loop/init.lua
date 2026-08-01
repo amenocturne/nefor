@@ -1280,7 +1280,7 @@ local function handle_mag_run_result(body)
       run_id = run_id, streamed = turn.streamed,
       answer_len = #answer, history_len = #state.history,
     })
-    fire_observers(state.complete_observers, run_id, "success")
+    fire_observers(state.complete_observers, run_id, "success", answer)
     flush_deferred()
     flush_pending_user_inputs()
     emit_idle_if_idle(run_id)

@@ -216,10 +216,10 @@ assert_eq(#a_killed, 1, "one actor killed")
 assert_eq(a_killed[1].run_id, "run-A", "the kill event is run-A's")
 assert_eq(a_killed[1].reason, "modification",
   "a kill entry in an applied modification carries reason modification")
--- The dying llm's provider-cancel reached the bus with run-A's scoped handle.
-local cancels = filter(a_kill_wire, function(b) return b.kind == "prov.chat.cancel" end)
+-- Routing consumes the dying actor's correlation and emits one generic cancel.
+local cancels = filter(a_kill_wire, function(b) return b.kind == "tool.cancel" end)
 assert_eq(#cancels, 1, "the dying llm aborts its provider request")
-assert_eq(cancels[1].chat_id, "r1/agent@r1", "the cancel names run-A's scoped chat")
+assert_eq(cancels[1].id, a_invoke.id, "the cancel names run-A's generated request")
 
 -- Same id in run-C: untouched.
 assert_eq(kernel.state_of("run-C", "agent"), "alive", "run-C's agent survives run-A's kill")
@@ -259,11 +259,10 @@ assert_eq(begun.reaped[1], "run-E", "the previous session's run is the one reape
 assert_true(kernel.context("run-E") == nil, "run-E context dropped")
 assert_true(kernel.context("run-F") ~= nil, "run-F context live")
 local reap_wire = drain_emitted()
--- The reap ran kill handlers: run-E's in-flight llm cancelled its provider
--- request, scoped to run-E's context.
-local reap_cancels = filter(reap_wire, function(b) return b.kind == "prov.chat.cancel" end)
+-- Reaping uses the same correlation-owned generic cancellation path.
+local reap_cancels = filter(reap_wire, function(b) return b.kind == "tool.cancel" end)
 assert_eq(#reap_cancels, 1, "the reaped run's llm aborts its provider request")
-assert_eq(reap_cancels[1].chat_id, "r4/agent@r1", "the cancel names run-E's scoped chat")
+assert_true(type(reap_cancels[1].id) == "string", "the cancel carries the generated request id")
 for _, e in ipairs(by_kind(reap_wire, "mag.actor_killed")) do
   assert_eq(e.run_id, "run-E", "reap kills are stamped with the stale run's id")
   assert_eq(e.reason, "reaped", "session-boundary reap kills carry reason reaped")

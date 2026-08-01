@@ -220,13 +220,11 @@ local function now_ms()
   return (((tonumber(h) * 60) + tonumber(m)) * 60 + tonumber(s)) * 1000 + tonumber(ms)
 end
 
-local function install_text_format(gate)
-  agentic_workflow.on_stream(function(text)
-    if gate and gate.suppress_stream then return end
-    if type(text) == "string" and #text > 0 then
-      write_stdout(text)
-    end
-  end)
+local function install_text_format(_gate)
+  -- The CLI prints the normalized terminal result on completion. Provider
+  -- stream deltas remain presentation/observability events and are not a
+  -- second result channel.
+  agentic_workflow.on_stream(function(_text) end)
   agentic_workflow.on_tool_start(function(_id, name, input)
     -- One-liner to stderr keeps stdout pipe-clean.
     local input_preview
@@ -249,15 +247,10 @@ local function install_text_format(gate)
 end
 
 local function install_json_format(state)
-  -- JSON mode: suppress streaming, accumulate tool calls + final text,
-  -- print on completion.
+  -- JSON mode prints the normalized terminal result supplied by the
+  -- agentic-loop boundary. Streams are presentation events only; using them
+  -- as the result would make non-streaming and suppressed relay turns empty.
   state.tool_calls = {}
-  state.answer_acc = {}
-  agentic_workflow.on_stream(function(text)
-    if type(text) == "string" and #text > 0 then
-      state.answer_acc[#state.answer_acc + 1] = text
-    end
-  end)
   agentic_workflow.on_tool_start(function(id, name, input)
     state.tool_calls[#state.tool_calls + 1] = {
       id = id, name = name, input = input,
@@ -340,14 +333,13 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
     end
   end)
 
-  local function emit_completion(status)
+  local function emit_completion(status, answer)
     if already_exited then return end
     already_exited = true
     if format == "json" then
-      local answer = table.concat(json_state.answer_acc or {})
       local duration_ms = now_ms() - turn_start_ms
       local payload = {
-        answer = answer,
+        answer = type(answer) == "string" and answer or "",
         tool_calls = json_state.tool_calls or {},
         duration_ms = duration_ms,
         status = status,
@@ -355,6 +347,7 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
       local ok, encoded = pcall(json.encode, payload)
       if ok then write_stdout(encoded .. "\n") end
     elseif format == "text" then
+      if type(answer) == "string" and #answer > 0 then write_stdout(answer) end
       write_stdout("\n")
     end
     -- stream-json: nothing extra; the run-close tool.result already
@@ -362,7 +355,7 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
     nefor.engine.exit(0)
   end
 
-  agentic_workflow.on_complete(function(_run_id, status)
+  agentic_workflow.on_complete(function(_run_id, status, answer)
     if async_dispatch_inflight then
       -- Suppress the first complete; reset the flag so the next turn
       -- (relay of the deferred run result) is the one we exit on.
@@ -370,17 +363,11 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
       -- Re-open the stream gate so the relay turn's content reaches
       -- stdout.
       if gate then gate.suppress_stream = false end
-      -- Reset accumulated answer text so the JSON payload only carries
-      -- the relay turn's content (matches user expectation: "the answer"
-      -- is the final user-facing text). Tool calls accumulate across
-      -- both turns — the dispatch call from the first turn belongs in
-      -- the report alongside any tool calls in the relay turn.
-      if format == "json" then
-        json_state.answer_acc = {}
-      end
+      -- Tool calls accumulate across both turns — the dispatch call from the
+      -- first turn belongs in the report alongside any relay-turn calls.
       return
     end
-    emit_completion(status)
+    emit_completion(status, answer)
   end)
 
   wait_until_ready(function()
@@ -403,20 +390,19 @@ local function run_repl(format, json_state, gate)
   local function reset_json_state()
     if format == "json" then
       json_state.tool_calls = {}
-      json_state.answer_acc = {}
     end
   end
 
-  local function emit_completion_output()
+  local function emit_completion_output(answer)
     if format == "json" then
-      local answer = table.concat(json_state.answer_acc or {})
       local payload = {
-        answer = answer,
+        answer = type(answer) == "string" and answer or "",
         tool_calls = json_state.tool_calls or {},
       }
       local ok, encoded = pcall(json.encode, payload)
       if ok then write_stdout(encoded .. "\n") end
     elseif format == "text" then
+      if type(answer) == "string" and #answer > 0 then write_stdout(answer) end
       write_stdout("\n")
     end
   end
@@ -447,20 +433,14 @@ local function run_repl(format, json_state, gate)
     agentic_workflow.submit(line)
   end
 
-  agentic_workflow.on_complete(function(_run_id, _status)
+  agentic_workflow.on_complete(function(_run_id, _status, answer)
     if async_dispatch_inflight then
       async_dispatch_inflight = false
       if gate then gate.suppress_stream = false end
       -- Don't print or prompt yet — wait for the deferred relay turn.
-      -- Reset answer_acc so the JSON payload only carries the relay
-      -- turn's text; keep tool_calls so the dispatch call stays in the
-      -- final report.
-      if format == "json" then
-        json_state.answer_acc = {}
-      end
       return
     end
-    emit_completion_output()
+    emit_completion_output(answer)
     read_and_submit()
   end)
 

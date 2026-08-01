@@ -580,26 +580,22 @@ do
 end
 
 -- ==================================================================
--- kill mid-flight → provider cancel envelope keyed by the chat_id handle
+-- kill clears local pending state; routing owns external cancellation
 -- ==================================================================
 
 do
   local instance, msgs = make("docs-explorer.llm", { provider = "chatgpt-provider" })
   instance.deliver(turn({}))
   local invoke = find_kind(msgs, "capability.invoke")
-  local handle = invoke.request.chat_id
 
   instance.handle_kill()
 
-  local cancel = find_kind(msgs, "chatgpt-provider.chat.cancel")
-  assert_true(cancel ~= nil, "kill mid-flight emits the provider cancel envelope")
-  assert_eq(cancel.chat_id, handle, "cancel is keyed by the in-flight chat_id handle")
-  assert_eq(cancel.from, "docs-explorer.llm", "the cancel is id-signed")
+  assert_true(find_kind(msgs, "tool.cancel") == nil,
+    "the provider boundary never emits generated-id cancellation")
 
-  -- Idempotent: no in-flight request → kill emits no cancel.
   local i2, m2 = make("idle.llm", { provider = "p" })
   i2.handle_kill()
-  assert_true(find_kind(m2, "p.chat.cancel") == nil, "kill while idle emits no cancel")
+  assert_true(find_kind(m2, "tool.cancel") == nil, "kill while idle emits no cancel")
 
   -- A late reply after kill is ignored (pending was cleared).
   instance.deliver({ kind = "reply", ref = invoke.ref, result = { text = "late" } })

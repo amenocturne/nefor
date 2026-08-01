@@ -313,8 +313,12 @@ const MAG_DISPATCH_PROMPT: &str =
 /// Two short non-dispatching prompts. The mock has no canned trigger
 /// for either, so each turn falls through to the help-banner path —
 /// fine for REPL multi-turn since we only need two recognisable turns.
-const SIMPLE_PROMPT_1: &str = "hello";
-const SIMPLE_PROMPT_2: &str = "world";
+const SIMPLE_PROMPT_1: &str = "Summarise octopuses in one sentence.";
+const SIMPLE_PROMPT_2: &str = "Summarise lighthouses in one sentence.";
+const EXPECTED_MAG_FINAL: &str = "Octopuses, with their remarkable intelligence and adaptive camouflage, share an unlikely kinship with the steadfast lighthouse — both serve as vigilant sentinels of their respective worlds, the cephalopod beneath the waves and the beacon above them, each watchful in its solitary post.";
+const EXPECTED_OCTOPUS_FINAL: &str = "Octopuses are highly intelligent invertebrate cephalopods known for problem-solving, dynamic camouflage, and eight prehensile arms lined with chemosensitive suckers.";
+const EXPECTED_LIGHTHOUSE_FINAL: &str = "Lighthouses are tall coastal towers crowned with bright rotating beams that guide ships safely past hazards and into harbours, dating back to the Pharos of Alexandria.";
+const EXPECTED_SLOW_FINAL: &str = "slow regression payload acknowledged";
 
 // --------------------------------------------------------------------
 // scenario 1 — single-shot text format
@@ -326,25 +330,7 @@ fn scenario_1_single_shot_text_canonical() {
     let out = run_scenario(&[MAG_DISPATCH_PROMPT], None);
     assert_success(&out);
 
-    // The mock's combine-step canned text contains "octopus", "lighthouse",
-    // and "sentinels". Loose substring match on those three keeps the
-    // assertion robust against minor mock_provider tweaks while still
-    // catching regressions in the kernel-dispatch round-trip.
-    let lc = out.stdout.to_lowercase();
-    for needle in ["octopus", "lighthouse", "sentinel"] {
-        assert!(
-            lc.contains(needle),
-            "expected stdout to contain {needle:?}; got: {:?}",
-            truncate(&out.stdout, 2048)
-        );
-    }
-
-    // text mode prints a trailing newline on completion; the answer is
-    // the only payload on stdout (tool one-liners go to stderr).
-    assert!(
-        out.stdout.ends_with('\n'),
-        "expected trailing newline on text-format stdout"
-    );
+    assert_eq!(out.stdout, format!("{EXPECTED_MAG_FINAL}\n"));
 
     // Sanity: the mag tool one-liners (write + execute) appeared on
     // stderr — the kernel-dispatch pipeline actually ran.
@@ -387,17 +373,7 @@ fn scenario_2_single_shot_json() {
         .get("answer")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("missing `answer` field: {v:?}"));
-    assert!(
-        !answer.is_empty(),
-        "expected non-empty `answer` field; got: {v:?}"
-    );
-    let answer_lc = answer.to_lowercase();
-    for needle in ["octopus", "lighthouse"] {
-        assert!(
-            answer_lc.contains(needle),
-            "expected answer to contain {needle:?}; got: {answer:?}"
-        );
-    }
+    assert_eq!(answer, EXPECTED_MAG_FINAL);
 
     let status = v
         .get("status")
@@ -551,18 +527,9 @@ fn scenario_4_repl_multi_turn() {
     let out = run_scenario(&[], Some(payload.as_bytes()));
     assert_success(&out);
 
-    // Unrecognised prompts now route through the mock's help-fallback
-    // path, which prepends the `**MOCK PROVIDER**` banner. Two turns
-    // means the banner shows up at least twice on stdout — one
-    // recognisable marker per turn, without locking to the help body
-    // which gets reformatted whenever triggers are added.
-    let stdout = &out.stdout;
-    let banner_count = stdout.matches("**MOCK PROVIDER**").count();
-    assert!(
-        banner_count >= 2,
-        "expected the MOCK PROVIDER banner on each of two REPL turns; \
-         saw {banner_count}; stdout: {:?}",
-        truncate(stdout, 2048)
+    assert_eq!(
+        out.stdout,
+        format!("{EXPECTED_OCTOPUS_FINAL}\n{EXPECTED_LIGHTHOUSE_FINAL}\n")
     );
 
     // Sanity: the REPL emitted at least two prompts on stderr.
@@ -610,19 +577,7 @@ fn scenario_6_yolo_flag_accepted() {
     let out = run_scenario(&["--yolo", MAG_DISPATCH_PROMPT], None);
     assert_success(&out);
 
-    // --yolo is a placeholder per agentic_workflow.set_yolo. Behaviour
-    // should be identical to the non-yolo run — assert the canonical
-    // answer still flows. We don't assert on tool-gate behaviour: the
-    // gate hookup is explicitly deferred (Phase 1B).
-    let lc = out.stdout.to_lowercase();
-    for needle in ["octopus", "lighthouse"] {
-        assert!(
-            lc.contains(needle),
-            "expected --yolo run to still produce canonical answer; \
-             missing {needle:?}; stdout: {:?}",
-            truncate(&out.stdout, 2048)
-        );
-    }
+    assert_eq!(out.stdout, format!("{EXPECTED_MAG_FINAL}\n"));
 }
 
 // --------------------------------------------------------------------
@@ -649,11 +604,7 @@ fn long_stream_completes_without_timeout() {
     // The slow-path canned text — distinguishes a real completion from
     // an early-exit / "no canned match" fallback that might otherwise
     // satisfy `assert_success` while skipping the slow handler.
-    assert!(
-        out.stdout.contains("slow regression payload acknowledged"),
-        "slow path must complete with its canned answer; got: {:?}",
-        truncate(&out.stdout, 2048)
-    );
+    assert_eq!(out.stdout, format!("{EXPECTED_SLOW_FINAL}\n"));
     // No deadline-shaped error envelope should leak onto stderr —
     // historical AckTimeout payloads carried this exact substring.
     assert!(

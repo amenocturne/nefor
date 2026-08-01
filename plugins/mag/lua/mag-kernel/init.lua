@@ -252,15 +252,9 @@ local function new_run_context(meta)
     return true
   end
 
-  -- Injected host bus seam. Routing hands this tool.invoke-shaped envelopes
-  -- ({ kind = "tool.invoke", id, name, args }) and raw signal-time envelopes
-  -- (a dying llm's `<provider>.chat.cancel`). Before an envelope reaches the
-  -- shared bus, any provider chat handle it carries — `chat_id` top-level
-  -- (cancel envelopes) or under `args` (provider-class invokes,
-  -- factories/llm.lua build_request) — is prefixed with this run's scope, so
-  -- two runs of the same program hold disjoint provider-side chats and the
-  -- bridge's chat-keyed correlation never crosses runs. The rewrite copies
-  -- rather than mutates: the emitting actor's own tables stay untouched.
+  -- Injected host bus seam. Routing emits generic capability invokes/cancels.
+  -- Legacy chat_id fields remain run-scoped here for non-MAG compatibility;
+  -- generated correlation ids already carry authoritative run scope.
   local function scope_chat_id(chat_id)
     return scope .. "/" .. chat_id
   end

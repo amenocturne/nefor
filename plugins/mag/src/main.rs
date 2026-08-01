@@ -1141,11 +1141,9 @@ async fn handle_interrupt_run(
         .unwrap_or(false);
 
     if terminate {
-        // A dispatched sub-run: cancel the in-flight work then reap the run so
-        // no actor re-fires, and settle the pending execute FAILED. The cancels
-        // (our explicit `tool.cancel` + the reap's kill-time aborts) flush
-        // BEFORE the terminal reply — a consumer that treats the reply as "run
-        // closed" observes the aborts first.
+        // A dispatched sub-run is reaped immediately. Actor teardown consumes
+        // each open correlation and emits its one generic cancellation before
+        // removal, so there is no separate pre-cancel path here.
         let a = match active.remove(&run_id) {
             Some(a) => a,
             None => {
@@ -1153,9 +1151,8 @@ async fn handle_interrupt_run(
                 return Ok(());
             }
         };
-        let (cancelled, _) = host.interrupt_run(&run_id, INTERRUPT_FAILURE, true)?;
         host.end_run(&run_id, TeardownReason::RunFailed)?;
-        tracing::info!(run_id = %run_id, cancelled, "mag.interrupt_run(terminate): in-flight cancelled, run ended failed");
+        tracing::info!(run_id = %run_id, "mag.interrupt_run(terminate): run ended failed");
         flush_emits(out_tx, host, bridge).await?;
         return send_event(
             out_tx,

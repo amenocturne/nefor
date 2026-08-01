@@ -240,11 +240,9 @@ function M.construct(id, params, emit, options)
   end
 
   function instance.handle_kill()
-    if pending ~= nil then
-      state:emit({ kind = provider .. ".chat.cancel", chat_id = pending.chat_id })
-      pending = nil
-    end
+    pending = nil
     turn_active = false
+    awaiting_continuation = false
   end
 
   function instance.handle_drain()
