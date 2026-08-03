@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 mlua = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

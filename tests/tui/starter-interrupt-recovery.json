@@ -10,10 +10,11 @@
     {"kind": "wait_text", "text": "mock-model", "timeout_ms": 30000},
     {"kind": "type", "text": "show me help"},
     {"kind": "key", "key": "Enter"},
-    {"kind": "wait_text", "text": "MOCK PROVIDER", "timeout_ms": 30000},
+    {"kind": "wait_text", "text": "Error path", "timeout_ms": 30000},
     {"kind": "key", "key": "Escape"},
     {"kind": "key", "key": "Escape"},
     {"kind": "key", "key": "Escape"},
+    {"kind": "wait_not_text", "text": "[thinking", "timeout_ms": 10000},
     {"kind": "type", "text": "the secret key is recovery-ok"},
     {"kind": "key", "key": "Enter"},
     {"kind": "wait_text", "text": "secret key is now", "timeout_ms": 30000},
@@ -21,6 +22,7 @@
     {"kind": "key", "key": "CtrlC"},
     {"kind": "key", "key": "CtrlC"},
     {"kind": "wait_text", "text": "NEFOR_EXIT_CODE=0", "timeout_ms": 10000},
-    {"kind": "wait_exit", "timeout_ms": 10000}
+    {"kind": "wait_exit", "timeout_ms": 10000},
+    {"kind": "assert_exit_code", "expected": 0}
   ]
 }

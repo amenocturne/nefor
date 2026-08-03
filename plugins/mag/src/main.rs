@@ -504,16 +504,19 @@ async fn handle_event(
         if let Some(projected) = bridge.project_event(kind, body) {
             send_event(out_tx, projected).await?;
         }
-        if let Some(text) = body.get("text").and_then(Value::as_str) {
-            let event_kind = if body.get("event").and_then(Value::as_str) == Some("reasoning_delta")
-            {
-                "reasoning"
-            } else {
-                "assistant"
-            };
-            let value = serde_json::json!({ "kind": event_kind, "text": text });
-            let _ = host.bus_observation(&request_id, "append", "transcript", &value)?;
-            flush_emits(out_tx, host, bridge).await?;
+        if let Some(event @ ("text_delta" | "reasoning_delta")) =
+            body.get("event").and_then(Value::as_str)
+        {
+            if let Some(text) = body.get("text").and_then(Value::as_str) {
+                let event_kind = if event == "reasoning_delta" {
+                    "reasoning"
+                } else {
+                    "assistant"
+                };
+                let value = serde_json::json!({ "kind": event_kind, "text": text });
+                let _ = host.bus_observation(&request_id, "append", "transcript", &value)?;
+                flush_emits(out_tx, host, bridge).await?;
+            }
         }
         if let Some(reply) = bridge.take_reply(kind, body) {
             return handle_provider_reply(out_tx, reply, program.as_deref(), host, active, bridge)
@@ -1819,6 +1822,177 @@ mod tests {
             .expect("quiescent")
             .is_none());
         fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn provider_events_append_only_deltas_and_preserve_terminal_semantic_result() {
+        fn named(name: &str) -> Value {
+            serde_json::json!({"kind":"named","name":name,"arguments":[]})
+        }
+        fn evidence(identity: &str, input: Value, output: Value) -> Value {
+            serde_json::json!({
+                "version": 2,
+                "identity": identity,
+                "arguments": [],
+                "input": input,
+                "output": output
+            })
+        }
+        fn event(request_id: &str, event: &str, fields: Value) -> Map<String, Value> {
+            let mut body = fields.as_object().expect("event fields").clone();
+            body.insert(
+                "kind".into(),
+                Value::String("provider-a.completion.event".into()),
+            );
+            body.insert("request_id".into(), Value::String(request_id.into()));
+            body.insert("event".into(), Value::String(event.into()));
+            body
+        }
+
+        let provider_input = named("nefor.contracts.ProviderInput");
+        let tool_calls = named("nefor.contracts.ToolCalls");
+        let final_answer = named("nefor.contracts.FinalAnswer");
+        let modification = serde_json::json!({
+            "actors": [{
+                "id": "answer",
+                "factory": "llm",
+                "evidence": evidence(
+                    "nefor.factory.llm",
+                    provider_input.clone(),
+                    serde_json::json!({"kind":"union","items":[tool_calls.clone(),final_answer.clone()]})
+                ),
+                "input": {"wire":"generic-provider.ProviderOut","type":provider_input},
+                "outputs": [
+                    {"wire":"generic-tool.ToolCalls","type":tool_calls},
+                    {"wire":"generic-provider.FinalAnswer","type":final_answer}
+                ],
+                "params": {"provider":"provider-a"},
+                "routes": {"generic-tool.ToolCalls":[],"generic-provider.FinalAnswer":[]}
+            }],
+            "messages": [{
+                "to": "answer",
+                "content": {"kind":"generic-provider.ProviderOut","messages":[{"role":"user","content":"go"}]}
+            }],
+            "kills": [],
+            "rules": [],
+            "result": {"from": {
+                "actor":"answer",
+                "type":"generic-provider.FinalAnswer",
+                "wire":"generic-provider.FinalAnswer"
+            }}
+        });
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let host = LuaHost::load_kernel(
+            &manifest.join("lua/mag-kernel/init.lua"),
+            Some(&manifest.join("../../lua")),
+        )
+        .expect("kernel");
+        assert!(
+            host.begin_run("provider-events", "provider-events", None)
+                .expect("begin")
+                .ok
+        );
+        assert!(
+            host.start("provider-events", &modification)
+                .expect("start")
+                .ok
+        );
+
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        let request = host
+            .drain_emits()
+            .expect("initial emits")
+            .into_iter()
+            .flat_map(|body| bridge.translate_emit(body))
+            .find(|body| {
+                body.get("kind").and_then(Value::as_str) == Some("provider-a.completion.request")
+            })
+            .expect("provider request");
+        let request_id = request["request_id"]
+            .as_str()
+            .expect("request id")
+            .to_owned();
+        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
+        let mut program = None;
+        let mut active = HashMap::from([(
+            "provider-events".to_owned(),
+            ActiveExecute {
+                in_reply_to: None,
+                program: None,
+            },
+        )]);
+
+        for body in [
+            event(
+                &request_id,
+                "text_delta",
+                serde_json::json!({"text":"visible"}),
+            ),
+            event(
+                &request_id,
+                "reasoning_delta",
+                serde_json::json!({"text":"thinking"}),
+            ),
+            event(
+                &request_id,
+                "reasoning_end",
+                serde_json::json!({"text":"must-not-append"}),
+            ),
+            event(
+                &request_id,
+                "completed",
+                serde_json::json!({
+                    "text":"terminal-aggregate-must-not-append",
+                    "result": {
+                        "final_answer":"semantic-only",
+                        "text":"terminal-result-must-not-append"
+                    }
+                }),
+            ),
+        ] {
+            handle_event(
+                &out_tx,
+                "provider-a",
+                &body,
+                &mut program,
+                &host,
+                &mut active,
+                &mut bridge,
+            )
+            .await
+            .expect("provider event");
+        }
+        drop(out_tx);
+
+        let mut transcript_appends = Vec::new();
+        let mut terminal_result = None;
+        while let Some(outgoing) = out_rx.recv().await {
+            let Body::Event(body) = outgoing.body else {
+                continue;
+            };
+            if body.get("kind").and_then(Value::as_str) == Some("mag.node_preview")
+                && body.get("binding").and_then(Value::as_str) == Some("transcript")
+                && body.get("operation").and_then(Value::as_str) == Some("append")
+            {
+                transcript_appends.push(body["value"].clone());
+            }
+            if body.get("kind").and_then(Value::as_str) == Some(RUN_RESULT_KIND) {
+                terminal_result = body.get("result").cloned();
+            }
+        }
+
+        assert_eq!(
+            transcript_appends,
+            vec![
+                serde_json::json!({"kind":"assistant","text":"visible"}),
+                serde_json::json!({"kind":"reasoning","text":"thinking"}),
+            ],
+            "only provider deltas append preview transcript content, in wire order"
+        );
+        let result = terminal_result.expect("durable terminal result");
+        assert_eq!(result["value"]["content"], "semantic-only");
+        assert_eq!(result["final_answer"], "semantic-only");
     }
 
     #[test]

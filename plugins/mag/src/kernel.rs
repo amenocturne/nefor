@@ -543,6 +543,9 @@ fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
     })?;
     nefor.set("now_ms", now_ms)?;
 
+    let opaque_id = lua.create_function(|_, _: ()| Ok(uuid::Uuid::new_v4().to_string()))?;
+    nefor.set("opaque_id", opaque_id)?;
+
     // Bus-emit queue. `nefor.emit(body)` appends onto a global array the host
     // drains after each kernel call; the kernel's injected `bus_emit`/
     // `emit_event` seams call it synchronously from inside the fold.

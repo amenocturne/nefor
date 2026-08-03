@@ -869,11 +869,17 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         request_id.starts_with(&format!("{scope}/")),
         "request id {request_id:?} carries run scope {scope:?}"
     );
-    let routing_session_id = format!("{SESSION_ID}/{scope}/lead.llm");
-    assert_eq!(
-        create.get("routing_session_id").and_then(Value::as_str),
-        Some(routing_session_id.as_str()),
-        "provider routing identity is stable for the logical actor"
+    let routing_session_id = create
+        .get("routing_session_id")
+        .and_then(Value::as_str)
+        .expect("completion.request carries opaque routing identity")
+        .to_owned();
+    assert!(!routing_session_id.is_empty());
+    assert!(
+        !routing_session_id.contains(SESSION_ID)
+            && !routing_session_id.contains(&scope)
+            && !routing_session_id.contains("lead.llm"),
+        "provider routing identity must not expose session, run scope, or actor identity: {routing_session_id:?}"
     );
     let system = create
         .get("system")

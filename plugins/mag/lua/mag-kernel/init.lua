@@ -144,6 +144,7 @@ local function new_run_context(meta)
     run_name = meta.run_name,
     session_id = meta.session_id,
     principal = meta.principal,
+    routing_session_ids = {},
     last_output_path = nil,
     run_complete = nil,
     run_complete_taken = false,
@@ -278,13 +279,18 @@ local function new_run_context(meta)
           args[k] = v
         end
         args.chat_id = scope_chat_id(args.chat_id)
-        -- Provider chat handles are request-scoped (`@r<N>` changes on
+        -- Provider chat handles remain request-scoped (`@r<N>` changes on
         -- every activation), while backend routing and prompt caching need
-        -- one stable identity for the logical actor conversation. Include
-        -- the Nefor session so identical graph scopes in concurrent
-        -- sessions never collide, then drop only the per-activation suffix.
+        -- one stable identity for the logical actor conversation. Keep that
+        -- identity host-opaque: raw graph scope and actor ids must never cross
+        -- the provider boundary.
         local actor_chat_id = args.chat_id:gsub("@r%d+$", "")
-        args.routing_session_id = ctx.session_id .. "/" .. actor_chat_id
+        local routing_session_id = ctx.routing_session_ids[actor_chat_id]
+        if routing_session_id == nil then
+          routing_session_id = nefor.opaque_id()
+          ctx.routing_session_ids[actor_chat_id] = routing_session_id
+        end
+        args.routing_session_id = routing_session_id
         out.args = args
       end
     end

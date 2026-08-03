@@ -1113,6 +1113,7 @@ async fn dispatch_completion_request(
                                     .map(Value::String)
                                     .unwrap_or(Value::Null),
                             ),
+                            ("model", Value::String(model.clone())),
                         ],
                     )))
                     .await;

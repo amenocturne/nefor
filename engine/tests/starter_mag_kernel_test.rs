@@ -119,8 +119,9 @@ fn run_lua_test(rel_path: &str) {
 /// `install_json`), which the llm factory uses to serialize tool-call
 /// arguments for its transcript — plus `nefor.emit`, the host's bus-emit
 /// queue seam, appended to a global `__emitted` array so tests loading the
-/// full kernel entry (multi_run_test) can assert on the wire traffic. Kernel
-/// modules take their logger by injection, so nothing else is required.
+/// full kernel entry (multi_run_test) can assert on the wire traffic, plus a
+/// deterministic `nefor.opaque_id` matching the host binding used for provider
+/// routing correlation. Kernel modules take their logger by injection.
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     let log: Function = lua.create_function(|_, _: Variadic<Value>| Ok(()))?;
@@ -134,6 +135,9 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         Ok(())
     })?;
     nefor.set("emit", emit)?;
+
+    let opaque_id = lua.create_function(|_, _: ()| Ok("opaque-test-id"))?;
+    nefor.set("opaque_id", opaque_id)?;
 
     let json = lua.create_table()?;
     let encode = lua.create_function(|lua, value: Value| {

@@ -17,7 +17,6 @@ const PROVIDER_EVENT: &str = "completion.event";
 struct PendingProvider {
     provider: String,
     stream_id: String,
-    model: Option<Value>,
     observed_stream: bool,
     tool_calls: Vec<Value>,
 }
@@ -75,8 +74,6 @@ impl CapabilityBridge {
             return vec![body];
         };
 
-        let model = request.get("model").cloned();
-
         // The kernel's ProviderInput wrapper is an internal activation shape;
         // the provider protocol owns one canonical top-level message history.
         if let Some(input) = request.remove("input") {
@@ -100,7 +97,6 @@ impl CapabilityBridge {
             PendingProvider {
                 provider,
                 stream_id,
-                model,
                 observed_stream: false,
                 tool_calls: Vec::new(),
             },
@@ -202,7 +198,7 @@ impl CapabilityBridge {
                 .get("result")
                 .and_then(Value::as_object)
                 .and_then(|result| result.get("model"))
-                .or(pending.model.as_ref())
+                .or_else(|| body.get("model"))
             {
                 projected.insert("model".into(), model.clone());
             }
@@ -371,6 +367,7 @@ mod tests {
             "name": provider,
             "args": {
                 "chat_id": stream_id,
+                "routing_session_id": "opaque-routing-token",
                 "model": "opus",
                 "system": "be helpful",
                 "tools": [{"name": "read_file"}],
@@ -412,6 +409,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["kind"], "provider-a.completion.request");
         assert_eq!(out[0]["request_id"], "req-1");
+        assert_eq!(out[0]["routing_session_id"], "opaque-routing-token");
         assert_eq!(out[0]["messages"], messages);
         assert!(out[0].get("input").is_none());
         assert!(out[0].get("chat_id").is_none());
@@ -781,14 +779,14 @@ mod tests {
             "req-interrupted",
             "provider-a",
             "interrupted",
-            json!({"message": "stopped by user"}),
+            json!({"message": "stopped by user", "model": "provider-active"}),
         );
         let projected = bridge
             .project_event(interrupted["kind"].as_str().unwrap(), &interrupted)
             .expect("abnormal terminal closes visible stream");
         assert_eq!(projected["kind"], "chat.stream.end");
         assert_eq!(projected["chat_id"], "run/lead.llm@round-1");
-        assert_eq!(projected["model"], "opus");
+        assert_eq!(projected["model"], "provider-active");
         assert!(projected.get("request_id").is_none());
         assert!(projected.get("text").is_none());
         assert!(bridge
@@ -823,13 +821,17 @@ mod tests {
             "req-interrupted",
             "provider-a",
             "interrupted",
-            json!({"message": "stopped by user", "text": "provider terminal text"}),
+            json!({
+                "message": "stopped by user",
+                "text": "provider terminal text",
+                "model": "retargeted"
+            }),
         );
         let projected_end = bridge
             .project_event(interrupted["kind"].as_str().unwrap(), &interrupted)
             .expect("interrupted closes the visible stream");
         assert_eq!(projected_end["kind"], "chat.stream.end");
-        assert_eq!(projected_end["model"], "opus");
+        assert_eq!(projected_end["model"], "retargeted");
         let reply = bridge
             .take_reply(interrupted["kind"].as_str().unwrap(), &interrupted)
             .expect("interrupted is terminal");
