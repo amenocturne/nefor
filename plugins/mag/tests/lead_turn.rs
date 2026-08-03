@@ -384,14 +384,17 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     let create_kind = format!("{MOCK}.completion.request");
     let create = next_event_of_kind(&mut reader, &create_kind).await;
     let first_chat = create["request_id"].as_str().unwrap().to_owned();
-    assert!(create
-        .get("output_schema")
-        .and_then(|schema| schema.pointer("/root/body/fields"))
-        .and_then(Value::as_array)
-        .is_some_and(|fields| fields.iter().any(|field| {
-            field.get("name").and_then(Value::as_str) == Some("task")
-                && field.pointer("/schema/kind").and_then(Value::as_str) == Some("string")
-        })));
+    assert_eq!(create.pointer_str("/output_schema/type"), Some("object"));
+    assert_eq!(
+        create.pointer_str("/output_schema/properties/task/type"),
+        Some("string")
+    );
+    assert_eq!(
+        create
+            .get("output_schema")
+            .and_then(|schema| schema.get("additionalProperties")),
+        Some(&Value::Bool(false))
+    );
     send_event(
         &mut stdin,
         completed(MOCK, &first_chat, json!({ "text": "```json\n{}\n```" })),
@@ -563,7 +566,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     };
     let planner_id = planner["request_id"].as_str().unwrap().to_owned();
     complete_chat(&mut reader, &mut stdin, &planner_id,
-      r#"[{"task":"a","description":"first","dependent_tasks":[]},{"task":"a.collect","description":"second","dependent_tasks":["a"]}]"#).await;
+      r#"{"value":[{"task":"a","description":"first","dependent_tasks":[]},{"task":"a.collect","description":"second","dependent_tasks":["a"]}]}"#).await;
 
     let first = loop {
         let event = next_event(&mut reader, "first worker completion.request").await;
@@ -605,6 +608,23 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     .await;
 
     let summary_create = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    assert_eq!(
+        summary_create.pointer_str("/output_schema/type"),
+        Some("object")
+    );
+    assert_eq!(
+        summary_create.pointer_str("/output_schema/title"),
+        Some("main.Summary")
+    );
+    assert_eq!(
+        summary_create.pointer_str("/output_schema/properties/content/type"),
+        Some("string")
+    );
+    let output_schema = summary_create["output_schema"]
+        .as_object()
+        .expect("provider JSON Schema object");
+    assert!(!output_schema.contains_key("version"));
+    assert!(!output_schema.contains_key("root"));
     let summary_id = summary_create["request_id"].as_str().unwrap().to_owned();
     let ordered = summary_create["messages"]
         .as_array()
@@ -658,7 +678,7 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
         &mut reader,
         &mut stdin,
         planner["request_id"].as_str().unwrap(),
-        "[]",
+        r#"{"value":[]}"#,
     )
     .await;
     let summary = loop {
@@ -726,7 +746,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         &mut reader,
         &mut stdin,
         planner["request_id"].as_str().unwrap(),
-        r#"[{"task":"duplicate","description":"only","dependent_tasks":[]}]"#,
+        r#"{"value":[{"task":"duplicate","description":"only","dependent_tasks":[]}]}"#,
     )
     .await;
     let worker = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;

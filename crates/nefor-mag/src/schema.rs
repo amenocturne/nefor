@@ -17,6 +17,12 @@ pub struct TypeSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSchema {
+    pub schema: Value,
+    pub wrapped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SchemaType {
     JsonValue,
@@ -140,11 +146,344 @@ impl TypeSchema {
         }
     }
 
-    /// Convert the compiler-owned MAG descriptor into provider-neutral JSON
-    /// Schema. Providers decide whether to use this as a native response
-    /// format, a terminal tool schema, constrained decoding, or a prompt aid.
+    /// Convert the compiler-owned descriptor into provider-neutral JSON Schema.
     pub fn to_json_schema(&self) -> Value {
         schema_type_to_json_schema(&self.root)
+    }
+
+    /// Lower the semantic type into OpenAI's strict Structured Outputs subset.
+    /// Representations which differ from MAG JSON are decoded again by
+    /// `validate_provider_json`; types without a faithful representation fail
+    /// before a provider request is made.
+    pub fn to_provider_schema(&self) -> Result<ProviderSchema, MagError> {
+        let schema = provider_schema_at(&self.root)?;
+        if schema_root_is_record(&self.root) {
+            Ok(ProviderSchema {
+                schema,
+                wrapped: false,
+            })
+        } else {
+            Ok(ProviderSchema {
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "value": schema },
+                    "required": ["value"],
+                    "additionalProperties": false,
+                }),
+                wrapped: true,
+            })
+        }
+    }
+
+    pub fn validate_provider_json(&self, source: &str) -> JsonValidation {
+        let value: Value = match serde_json::from_str(source) {
+            Ok(value) => value,
+            Err(error) => return validation_error("malformed_json", error.to_string()),
+        };
+        let provider = match self.to_provider_schema() {
+            Ok(provider) => provider,
+            Err(error) => {
+                return validation_error("unsupported_provider_schema", error.to_string())
+            }
+        };
+        let encoded = if provider.wrapped {
+            match value {
+                Value::Object(mut fields) if fields.len() == 1 && fields.contains_key("value") => {
+                    fields.remove("value").unwrap_or(Value::Null)
+                }
+                value => {
+                    return JsonValidation {
+                        ok: false,
+                        value: None,
+                        error: None,
+                        violations: vec![Violation {
+                            path: "$".into(),
+                            code: "invalid_provider_envelope".into(),
+                            expected: "object containing only required field 'value'".into(),
+                            actual: json_kind(&value).into(),
+                            message: "provider response did not match the structured-output root envelope".into(),
+                        }],
+                    };
+                }
+            }
+        } else {
+            value
+        };
+        match decode_provider_value(&self.root, encoded, "$") {
+            Ok(value) => self.validate_value(value),
+            Err(violation) => JsonValidation {
+                ok: false,
+                value: None,
+                error: None,
+                violations: vec![violation],
+            },
+        }
+    }
+}
+
+fn validation_error(kind: &str, message: String) -> JsonValidation {
+    JsonValidation {
+        ok: false,
+        value: None,
+        error: Some(JsonValidationError {
+            kind: kind.into(),
+            message,
+        }),
+        violations: vec![],
+    }
+}
+
+fn schema_root_is_record(schema: &SchemaType) -> bool {
+    match schema {
+        SchemaType::Record { .. } => true,
+        SchemaType::Named { body, .. } => schema_root_is_record(body),
+        _ => false,
+    }
+}
+
+fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
+    Ok(match schema {
+        SchemaType::JsonValue => {
+            return Err(MagError::Type(
+                "JsonValue has no faithful OpenAI strict structured-output representation".into(),
+            ));
+        }
+        SchemaType::Unit => serde_json::json!({"type": "null"}),
+        SchemaType::Bool => serde_json::json!({"type": "boolean"}),
+        SchemaType::Int => serde_json::json!({
+            "type": "integer",
+            "minimum": i64::MIN,
+            "maximum": i64::MAX,
+        }),
+        SchemaType::Float => serde_json::json!({"type": "number"}),
+        SchemaType::String => serde_json::json!({"type": "string"}),
+        SchemaType::List { item } => serde_json::json!({
+            "type": "array",
+            "items": provider_schema_at(item)?,
+        }),
+        SchemaType::Map { value } => serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": provider_schema_at(value)?,
+                },
+                "required": ["key", "value"],
+                "additionalProperties": false,
+            },
+        }),
+        SchemaType::Record { fields } => {
+            let properties = fields
+                .iter()
+                .map(|field| Ok((field.name.clone(), provider_schema_at(&field.schema)?)))
+                .collect::<Result<serde_json::Map<_, _>, MagError>>()?;
+            let required = fields
+                .iter()
+                .map(|field| Value::String(field.name.clone()))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            })
+        }
+        SchemaType::Union { variants } => serde_json::json!({
+            "anyOf": variants.iter().map(|variant| Ok(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "type": { "type": "string", "enum": [variant.tag.clone()] },
+                    "value": provider_schema_at(&variant.schema)?,
+                },
+                "required": ["type", "value"],
+                "additionalProperties": false,
+            }))).collect::<Result<Vec<_>, MagError>>()?,
+        }),
+        SchemaType::Product { components } => {
+            let properties = components
+                .iter()
+                .enumerate()
+                .map(|(index, component)| Ok((index.to_string(), provider_schema_at(component)?)))
+                .collect::<Result<serde_json::Map<_, _>, MagError>>()?;
+            let required = (0..components.len())
+                .map(|index| Value::String(index.to_string()))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            })
+        }
+        SchemaType::Named { name, body } => {
+            let mut value = provider_schema_at(body)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("title".into(), Value::String(name.clone()));
+            }
+            value
+        }
+    })
+}
+
+fn decode_provider_value(
+    schema: &SchemaType,
+    value: Value,
+    path: &str,
+) -> Result<Value, Violation> {
+    match schema {
+        SchemaType::Named { body, .. } => decode_provider_value(body, value, path),
+        SchemaType::Map { value: item } => {
+            let Value::Array(entries) = value else {
+                return Err(provider_decode_violation(
+                    path,
+                    "array of map entries",
+                    &value,
+                ));
+            };
+            let mut decoded = serde_json::Map::new();
+            for (index, entry) in entries.into_iter().enumerate() {
+                let entry_path = format!("{path}[{index}]");
+                let Value::Object(mut fields) = entry else {
+                    return Err(provider_decode_violation(
+                        &entry_path,
+                        "map entry object",
+                        &entry,
+                    ));
+                };
+                if fields.len() != 2 || !fields.contains_key("key") || !fields.contains_key("value")
+                {
+                    return Err(provider_decode_violation(
+                        &entry_path,
+                        "object containing only key and value",
+                        &Value::Object(fields),
+                    ));
+                }
+                let key_value = fields.remove("key").unwrap_or(Value::Null);
+                let Some(key) = key_value.as_str() else {
+                    return Err(provider_decode_violation(
+                        &format!("{entry_path}.key"),
+                        "string",
+                        &key_value,
+                    ));
+                };
+                if decoded.contains_key(key) {
+                    return Err(Violation {
+                        path: format!("{entry_path}.key"),
+                        code: "duplicate_map_key".into(),
+                        expected: "unique map key".into(),
+                        actual: key.into(),
+                        message: format!("map key '{key}' appears more than once"),
+                    });
+                }
+                let item_value = fields.remove("value").unwrap_or(Value::Null);
+                decoded.insert(
+                    key.into(),
+                    decode_provider_value(item, item_value, &field_path(path, key))?,
+                );
+            }
+            Ok(Value::Object(decoded))
+        }
+        SchemaType::Product { components } => {
+            let Value::Object(mut fields) = value else {
+                return Err(provider_decode_violation(path, "positional object", &value));
+            };
+            let mut decoded = Vec::with_capacity(components.len());
+            for (index, component) in components.iter().enumerate() {
+                let key = index.to_string();
+                let position = fields.remove(&key).ok_or_else(|| {
+                    provider_decode_violation(
+                        path,
+                        "complete positional object",
+                        &Value::Object(fields.clone()),
+                    )
+                })?;
+                decoded.push(decode_provider_value(
+                    component,
+                    position,
+                    &format!("{path}.{key}"),
+                )?);
+            }
+            if !fields.is_empty() {
+                return Err(provider_decode_violation(
+                    path,
+                    "exact positional object",
+                    &Value::Object(fields),
+                ));
+            }
+            Ok(Value::Array(decoded))
+        }
+        SchemaType::Record { fields } => {
+            let Value::Object(mut values) = value else {
+                return Err(provider_decode_violation(path, "object", &value));
+            };
+            for field in fields {
+                if let Some(field_value) = values.remove(&field.name) {
+                    values.insert(
+                        field.name.clone(),
+                        decode_provider_value(
+                            &field.schema,
+                            field_value,
+                            &field_path(path, &field.name),
+                        )?,
+                    );
+                }
+            }
+            Ok(Value::Object(values))
+        }
+        SchemaType::List { item } => {
+            let Value::Array(values) = value else {
+                return Err(provider_decode_violation(path, "array", &value));
+            };
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    decode_provider_value(item, value, &format!("{path}[{index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array)
+        }
+        SchemaType::Union { variants } => {
+            let Value::Object(mut fields) = value else {
+                return Err(provider_decode_violation(path, "tagged sum object", &value));
+            };
+            let tag = fields
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    provider_decode_violation(
+                        path,
+                        "tagged sum object",
+                        &Value::Object(fields.clone()),
+                    )
+                })?
+                .to_owned();
+            if let Some(variant) = variants.iter().find(|variant| variant.tag == tag) {
+                if let Some(payload) = fields.remove("value") {
+                    fields.insert(
+                        "value".into(),
+                        decode_provider_value(
+                            &variant.schema,
+                            payload,
+                            &field_path(path, "value"),
+                        )?,
+                    );
+                }
+            }
+            Ok(Value::Object(fields))
+        }
+        _ => Ok(value),
+    }
+}
+
+fn provider_decode_violation(path: &str, expected: &str, actual: &Value) -> Violation {
+    Violation {
+        path: path.into(),
+        code: "invalid_provider_encoding".into(),
+        expected: expected.into(),
+        actual: json_kind(actual).into(),
+        message: format!("provider response did not use the required {expected} encoding"),
     }
 }
 
@@ -292,13 +631,7 @@ fn validate_at(schema: &SchemaType, value: &Value, path: &str, out: &mut Vec<Vio
         SchemaType::Unit => expect(value.is_null(), path, "Unit", value, out),
         SchemaType::Bool => expect(value.is_boolean(), path, "Bool", value, out),
         SchemaType::Int => expect(value.as_i64().is_some(), path, "Int", value, out),
-        SchemaType::Float => expect(
-            matches!(value, Value::Number(number) if number.is_f64()),
-            path,
-            "Float",
-            value,
-            out,
-        ),
+        SchemaType::Float => expect(value.as_f64().is_some(), path, "Float", value, out),
         SchemaType::String => expect(value.is_string(), path, "String", value, out),
         SchemaType::List { item } => match value {
             Value::Array(items) => {
@@ -652,7 +985,7 @@ mod tests {
             root: SchemaType::Float,
         };
         assert!(float.validate_json("1.5").ok);
-        assert!(!float.validate_json("1").ok);
+        assert!(float.validate_json("1").ok);
     }
 
     #[test]
@@ -703,6 +1036,195 @@ mod tests {
             "sha256:y"
         );
         assert_eq!(provider["oneOf"][1]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn provider_schema_wraps_non_object_roots_and_decodes_without_semantic_loss() {
+        let union = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Union {
+                variants: vec![SchemaVariant {
+                    tag: "sha256:answer".into(),
+                    schema: SchemaType::Named {
+                        name: "FinalAnswer".into(),
+                        body: Box::new(SchemaType::Record {
+                            fields: vec![SchemaField {
+                                name: "content".into(),
+                                schema: SchemaType::String,
+                            }],
+                        }),
+                    },
+                }],
+            },
+        };
+        let provider = union.to_provider_schema().unwrap();
+        assert!(provider.wrapped);
+        assert_eq!(provider.schema["type"], "object");
+        assert_eq!(provider.schema["required"], serde_json::json!(["value"]));
+        assert_eq!(provider.schema["additionalProperties"], false);
+        assert_eq!(
+            provider.schema["properties"]["value"]["anyOf"][0]["properties"]["type"]["enum"],
+            serde_json::json!(["sha256:answer"])
+        );
+        let decoded = union.validate_provider_json(
+            r#"{"value":{"type":"sha256:answer","value":{"content":"done"}}}"#,
+        );
+        assert!(decoded.ok, "{:?}", decoded.violations);
+        assert_eq!(decoded.value.unwrap()["value"]["content"], "done");
+    }
+
+    #[test]
+    fn provider_schema_covers_nested_records_products_lists_and_option_sums() {
+        let schema = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Named {
+                name: "Envelope".into(),
+                body: Box::new(SchemaType::Record {
+                    fields: vec![
+                        SchemaField {
+                            name: "items".into(),
+                            schema: SchemaType::List {
+                                item: Box::new(SchemaType::Product {
+                                    components: vec![SchemaType::String, SchemaType::Int],
+                                }),
+                            },
+                        },
+                        SchemaField {
+                            name: "optional".into(),
+                            schema: SchemaType::Union {
+                                variants: vec![
+                                    SchemaVariant {
+                                        tag: "Some".into(),
+                                        schema: SchemaType::Named {
+                                            name: "Some".into(),
+                                            body: Box::new(SchemaType::String),
+                                        },
+                                    },
+                                    SchemaVariant {
+                                        tag: "None".into(),
+                                        schema: SchemaType::Named {
+                                            name: "None".into(),
+                                            body: Box::new(SchemaType::Unit),
+                                        },
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                }),
+            },
+        };
+        let provider = schema.to_provider_schema().unwrap();
+        assert!(!provider.wrapped);
+        assert_eq!(provider.schema["type"], "object");
+        assert_eq!(provider.schema["additionalProperties"], false);
+        assert_eq!(
+            provider.schema["required"],
+            serde_json::json!(["items", "optional"])
+        );
+        assert_eq!(
+            provider.schema["properties"]["items"]["items"]["properties"]["1"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            provider.schema["properties"]["optional"]["anyOf"][1]["properties"]["value"]["type"],
+            "null"
+        );
+    }
+
+    #[test]
+    fn provider_schema_lowers_maps_products_and_rejects_unconstrained_json() {
+        let map = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Map {
+                value: Box::new(SchemaType::Int),
+            },
+        };
+        let provider = map.to_provider_schema().unwrap();
+        assert!(provider.wrapped);
+        assert_eq!(provider.schema["properties"]["value"]["type"], "array");
+        assert_eq!(
+            provider.schema["properties"]["value"]["items"]["additionalProperties"],
+            false
+        );
+        let decoded = map.validate_provider_json(
+            r#"{"value":[{"key":"one","value":1},{"key":"two","value":2}]}"#,
+        );
+        assert!(decoded.ok, "{:?}", decoded.violations);
+        assert_eq!(
+            decoded.value.unwrap(),
+            serde_json::json!({"one": 1, "two": 2})
+        );
+        assert!(
+            !map.validate_provider_json(
+                r#"{"value":[{"key":"same","value":1},{"key":"same","value":2}]}"#,
+            )
+            .ok
+        );
+
+        let product = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Product {
+                components: vec![SchemaType::String, SchemaType::Bool],
+            },
+        };
+        let provider = product.to_provider_schema().unwrap();
+        assert_eq!(provider.schema["properties"]["value"]["type"], "object");
+        assert_eq!(
+            provider.schema["properties"]["value"]["required"],
+            serde_json::json!(["0", "1"])
+        );
+        let decoded = product.validate_provider_json(r#"{"value":{"0":"x","1":true}}"#);
+        assert_eq!(decoded.value.unwrap(), serde_json::json!(["x", true]));
+
+        let json = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::JsonValue,
+        };
+        assert!(json
+            .to_provider_schema()
+            .unwrap_err()
+            .to_string()
+            .contains("no faithful"));
+    }
+
+    #[test]
+    fn provider_schema_int_bounds_and_float_validation_match_decoder() {
+        let int = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Int,
+        };
+        let provider = int.to_provider_schema().unwrap();
+        assert_eq!(provider.schema["properties"]["value"]["minimum"], i64::MIN);
+        assert_eq!(provider.schema["properties"]["value"]["maximum"], i64::MAX);
+        assert!(int
+            .validate_provider_json(r#"{"value":9223372036854775808}"#)
+            .violations
+            .iter()
+            .any(|v| v.code == "wrong_type"));
+
+        let float = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Float,
+        };
+        assert!(float.validate_provider_json(r#"{"value":1}"#).ok);
+    }
+
+    #[test]
+    fn recursive_types_are_rejected_before_schema_reification() {
+        let mut env = Env::new();
+        env.define(
+            "main.Node",
+            crate::ast::Value::TypeDecl(crate::ast::TypeDecl {
+                name: "main.Node".into(),
+                params: vec![],
+                body: MagType::Named("main.Node".into(), vec![]),
+            }),
+        );
+        let error = TypeSchema::reify(&env, &MagType::Named("main.Node".into(), vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recursive semantic type main.Node is unsupported"));
     }
 
     #[test]

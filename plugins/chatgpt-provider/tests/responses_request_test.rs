@@ -4,9 +4,15 @@
 //! assertion here corresponds to a way the wire shape could regress
 //! and silently break the streaming endpoint.
 
+use nefor_mag::schema::{SchemaField, SchemaType, TypeSchema, SCHEMA_VERSION};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use chatgpt_provider::auth::store::{AccessToken, RefreshToken, TokenData};
+use chatgpt_provider::auth::{AuthSnapshot, AuthState, TokenSource};
 use chatgpt_provider::responses::{
     MessageContent, Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem,
-    ResponsesApiRequest, TextControls, Verbosity,
+    ResponsesApiRequest, ResponsesClient, ResponsesTurnContext, TextControls, Verbosity,
 };
 use serde_json::json;
 
@@ -115,6 +121,115 @@ fn text_controls_serializes_verbosity_and_format() {
     let v = serde_json::to_value(&req).expect("serialize");
     assert_eq!(v["text"]["verbosity"], json!("low"));
     assert_eq!(v["text"]["format"]["type"], json!("json_schema"));
+}
+
+#[tokio::test]
+async fn structured_request_reaches_local_responses_server_with_explicit_object_root() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.expect("read request");
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|length| length.parse::<usize>().ok())
+                })
+                .expect("content length");
+            if bytes.len() >= header_end + 4 + content_length {
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end + 4..header_end + 4 + content_length])
+                        .expect("request JSON");
+                let schema = &request["text"]["format"]["schema"];
+                assert_eq!(
+                    schema["type"], "object",
+                    "backend rejects a missing root type"
+                );
+                assert_eq!(schema["required"], json!(["content"]));
+                assert_eq!(schema["additionalProperties"], false);
+                break;
+            }
+        }
+        let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"content\\\":\\\"done\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n";
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let mag_schema = TypeSchema {
+        version: SCHEMA_VERSION,
+        root: SchemaType::Named {
+            name: "nefor.contracts.FinalAnswer".into(),
+            body: Box::new(SchemaType::Record {
+                fields: vec![SchemaField {
+                    name: "content".into(),
+                    schema: SchemaType::String,
+                }],
+            }),
+        },
+    };
+    let provider_schema = mag_schema
+        .to_provider_schema()
+        .expect("supported MAG schema");
+    let mut request = minimal_request();
+    request.text = Some(TextControls {
+        verbosity: None,
+        format: Some(json!({
+            "type": "json_schema",
+            "name": "mag_output",
+            "strict": true,
+            "schema": provider_schema.schema
+        })),
+    });
+    let auth = AuthSnapshot {
+        tokens: Some(TokenData {
+            id_token: "test-id".into(),
+            access_token: AccessToken("test-access".into()),
+            refresh_token: RefreshToken("test-refresh".into()),
+            account_id: None,
+        }),
+        state: AuthState::Connected,
+        source: Some(TokenSource::AuthSet),
+    };
+    let client = ResponsesClient::new(
+        format!("http://{addr}"),
+        "test-installation".into(),
+        "nefor_test".into(),
+    );
+    let mut turn = ResponsesTurnContext::new("session", "thread");
+    let mut response = client
+        .stream(&request, &auth, &mut turn)
+        .await
+        .expect("stream");
+    use futures::StreamExt;
+    let mut delta = String::new();
+    while let Some(event) = response.next().await {
+        if let chatgpt_provider::responses::ResponseEvent::OutputTextDelta { delta: part, .. } =
+            event.expect("event")
+        {
+            delta.push_str(&part);
+        }
+    }
+    server.await.expect("server");
+    assert_eq!(delta, r#"{"content":"done"}"#);
+    let decoded = mag_schema.validate_provider_json(&delta);
+    assert!(decoded.ok, "{:?}", decoded.violations);
+    assert_eq!(decoded.value, Some(json!({"content": "done"})));
 }
 
 #[test]

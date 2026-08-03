@@ -648,6 +648,23 @@ fn install_typed_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
         lua.to_value(&schema.validate_json(&source))
     })?;
     typed_json.set("validate", validate)?;
+    let provider_schema = lua.create_function(|lua, schema: Value| {
+        let encoded: JsonValue = lua.from_value(schema)?;
+        let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(encoded)
+            .map_err(|error| mlua::Error::runtime(format!("invalid MAG type schema: {error}")))?;
+        let provider = schema
+            .to_provider_schema()
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        lua.to_value(&provider)
+    })?;
+    typed_json.set("provider_schema", provider_schema)?;
+    let validate_provider = lua.create_function(|lua, (schema, source): (Value, String)| {
+        let encoded: JsonValue = lua.from_value(schema)?;
+        let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(encoded)
+            .map_err(|error| mlua::Error::runtime(format!("invalid MAG type schema: {error}")))?;
+        lua.to_value(&schema.validate_provider_json(&source))
+    })?;
+    typed_json.set("validate_provider", validate_provider)?;
     nefor_tbl.set("typed_json", typed_json)?;
     Ok(())
 }

@@ -44,6 +44,31 @@ fn harness() -> Lua {
             .unwrap(),
         )
         .unwrap();
+    typed
+        .set(
+            "provider_schema",
+            lua.create_function(|lua, schema: Value| {
+                let value: serde_json::Value = lua.from_value(schema)?;
+                let schema: TypeSchema =
+                    serde_json::from_value(value).map_err(mlua::Error::external)?;
+                let provider = schema.to_provider_schema().map_err(mlua::Error::external)?;
+                lua.to_value(&provider)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    typed
+        .set(
+            "validate_provider",
+            lua.create_function(|lua, (schema, source): (Value, String)| {
+                let value: serde_json::Value = lua.from_value(schema)?;
+                let schema: TypeSchema =
+                    serde_json::from_value(value).map_err(mlua::Error::external)?;
+                lua.to_value(&schema.validate_provider_json(&source))
+            })
+            .unwrap(),
+        )
+        .unwrap();
     nefor.set("typed_json", typed).unwrap();
     lua.globals().set("nefor", nefor).unwrap();
 
@@ -92,7 +117,10 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }}}})
         assert(emitted[#emitted].kind == "capability.invoke")
         local first_request = emitted[#emitted].request
-        assert(first_request.output_schema.version == 1)
+        assert(first_request.output_schema.type == "object")
+        assert(first_request.output_schema.properties.task.type == "string")
+        assert(first_request.output_schema.required[1] == "task")
+        assert(first_request.output_schema.additionalProperties == false)
         assert(first_request.max_corrections == 2)
 
         actor.deliver({ kind = "reply", result = { tool_calls = {{
@@ -183,10 +211,50 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
         assert(terminal.kind == "nefor.agent.Result")
         assert(terminal.semantic_type_id == "agent-error-tag")
         assert(terminal.value.last_output.raw == "candidate")
-        assert(terminal.value.reason.value.violations[1].code == "wrong_type")
+        assert(terminal.value.reason.value.violations[1].code == "invalid_provider_envelope")
         for _, message in ipairs(emitted) do
           assert(not (message.kind == "capability.invoke" and message.ref == "no-retry@r2"))
         end
+      "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn wrapped_retry_requests_provider_envelope_and_named_union_routes_constructor() {
+    let lua = harness();
+    lua.load(
+        r#"
+        local factory = require("factories.structured-output")
+        local emitted = {}
+        local actor = assert(factory.construct("named-union", {
+          provider = "mock-provider",
+          schema = { version = 1, root = { kind = "named", name = "Choice", body = {
+            kind = "union", variants = {
+              { tag = "left-tag", schema = { kind = "named", name = "Left",
+                body = { kind = "record", fields = {{ name = "answer", schema = { kind = "int" } }} }
+              }},
+              { tag = "right-tag", schema = { kind = "named", name = "Right", body = { kind = "string" } } }
+            }
+          }}},
+          max_corrections = 1,
+          output_type = "declared-union-tag",
+          error_type = "agent-error-tag",
+          provider_error_type = "provider-error-tag",
+          validation_error_type = "validation-error-tag"
+        }, function(message) emitted[#emitted + 1] = message end))
+        actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
+          messages = {{ role = "user", content = "answer" }}
+        }}}})
+        actor.deliver({ kind = "reply", result = { text = [[{"type":"left-tag","value":{"answer":42}}]] } })
+        local request = emitted[#emitted].request
+        local prompt = request.input.messages[#request.input.messages].content
+        assert(prompt:find([[{"value": <corrected value>}]], 1, true), prompt)
+        actor.deliver({ kind = "reply", result = { text = [[{"value":{"type":"left-tag","value":{"answer":42}}}]] } })
+        local terminal = emitted[#emitted - 1]
+        assert(terminal.semantic_type_id == "left-tag")
+        assert(terminal.value.answer == 42)
       "#,
     )
     .exec()
@@ -221,7 +289,7 @@ fn tagged_result_preserves_the_selected_constructor_without_a_selector() {
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut",
           message = { messages = {{ role = "user", content = "answer" }} } }}})
         actor.deliver({ kind = "reply",
-          result = { text = [[{"type":"left-tag","value":{"answer":42}}]] } })
+          result = { text = [[{"value":{"type":"left-tag","value":{"answer":42}}}]] } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.agent.Result")
         assert(terminal.semantic_type_id == "left-tag")
@@ -252,7 +320,7 @@ fn ordinary_string_output_accepts_the_empty_string() {
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
-        actor.deliver({ kind = "reply", result = { text = [[""]] } })
+        actor.deliver({ kind = "reply", result = { text = [[{"value":""}]] } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.agent.Result")
         assert(terminal.semantic_type_id == "output-type-tag")
@@ -380,7 +448,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         end
 
         activate("first")
-        actor.deliver({ kind = "reply", result = { text = [["ok"]] } })
+        actor.deliver({ kind = "reply", result = { text = [[{"value":"ok"}]] } })
         assert(emitted[#emitted - 1].semantic_type_id == "output-type-tag")
 
         activate("second")

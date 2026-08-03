@@ -46,15 +46,24 @@ local function json_encode(value)
   return ok and encoded or "<unencodable>"
 end
 
-local function correction(validation)
+local function correction(validation, wrapped)
   local detail
   if type(validation.error) == "table" then
     detail = validation.error.kind .. ": " .. validation.error.message
   else
     detail = json_encode(validation.violations or {})
   end
+  local shape = wrapped
+    and 'Return only a JSON object of the form {"value": <corrected value>}.'
+    or "Return the corrected JSON object only."
   return "Your previous response was not valid for the required MAG type. "
-    .. "Return a corrected bare JSON value only. Diagnostics: " .. detail
+    .. shape .. " Diagnostics: " .. detail
+end
+
+local function root_union(schema)
+  local root = schema and schema.root
+  while type(root) == "table" and root.kind == "named" do root = root.body end
+  return type(root) == "table" and root.kind == "union"
 end
 
 local function output_violations(validation, message)
@@ -89,8 +98,10 @@ function M.construct(id, params, emit, deps)
   if type(params.schema) ~= "table" then
     return nil, string.format("structured-output '%s': params.schema is required", tostring(id))
   end
-  if type(nefor.typed_json) ~= "table" or type(nefor.typed_json.validate) ~= "function" then
-    return nil, "structured-output requires nefor.typed_json.validate"
+  if type(nefor.typed_json) ~= "table"
+      or type(nefor.typed_json.validate_provider) ~= "function"
+      or type(nefor.typed_json.provider_schema) ~= "function" then
+    return nil, "structured-output requires the MAG typed JSON provider bridge"
   end
   if type(params.max_corrections) ~= "number" or params.max_corrections < 0
       or params.max_corrections % 1 ~= 0 then
@@ -105,6 +116,10 @@ function M.construct(id, params, emit, deps)
   end
   local corrections = 0
   local last_output = nefor.json.decode("null")
+  local provider_schema = nefor.typed_json.provider_schema(params.schema)
+  local provider_params = {}
+  for key, value in pairs(params) do provider_params[key] = value end
+  provider_params.schema = provider_schema.schema
   local function finish_result(state, type_id, value)
     local message = { kind=RESULT, semantic_type_id=type_id, value=value }
     local delta = state:transcript_delta()
@@ -116,7 +131,7 @@ function M.construct(id, params, emit, deps)
       last_output=last_output, reason={type=reason_type,value=reason},
     })
   end
-  return boundary.construct(id, params, emit, {
+  return boundary.construct(id, provider_params, emit, {
     name = "structured-output",
     preview = deps.preview,
     on_turn_start = function(_)
@@ -132,13 +147,13 @@ function M.construct(id, params, emit, deps)
           kind = "missing_text", message = "provider final answer had no textual content",
         }}
       else
-        validation = nefor.typed_json.validate(params.schema, text)
+        validation = nefor.typed_json.validate_provider(params.schema, text)
         state:append({ role = "assistant", content = text })
       end
       if validation.ok then
         local value = validation.value
         local selected = params.output_type
-        if type(params.schema.root) == "table" and params.schema.root.kind == "union" then
+        if root_union(params.schema) then
           selected = value.type
           value = value.value
         end
@@ -158,7 +173,7 @@ function M.construct(id, params, emit, deps)
         return
       end
       corrections = corrections + 1
-      state:append({ role = "user", content = correction(validation) })
+      state:append({ role = "user", content = correction(validation, provider_schema.wrapped) })
       state:retry()
     end,
     on_tool_calls = function(_, result)

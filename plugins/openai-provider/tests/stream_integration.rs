@@ -4,10 +4,12 @@
 //! enough HTTP/1.1 to satisfy reqwest's streaming reader. Avoids
 //! pulling in axum/hyper-server for one test file.
 
+use nefor_mag::schema::{SchemaField, SchemaType, TypeSchema, SCHEMA_VERSION};
 use openai_provider::openai::Message;
 use openai_provider::state::{ChatId, Chats};
 use openai_provider::stream::{
-    list_models, run_chat_stream, run_chat_stream_with_retry_progress, RetryProgress, StreamError,
+    list_models, run_chat_stream, run_chat_stream_with_retry_progress,
+    run_chat_stream_with_retry_progress_and_format, RetryProgress, StreamError,
 };
 use std::net::SocketAddr;
 use std::sync::{
@@ -40,6 +42,83 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         acc.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
     acc
+}
+
+#[tokio::test]
+async fn structured_request_has_object_root_and_decodes_successful_response() {
+    let (listener, addr) = bind_local().await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let request = read_request(&mut stream).await;
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let request: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+        let schema = &request["response_format"]["json_schema"]["schema"];
+        assert_eq!(
+            schema["type"], "object",
+            "provider rejects absent root type"
+        );
+        assert_eq!(schema["required"], serde_json::json!(["content"]));
+        assert_eq!(schema["additionalProperties"], false);
+
+        let events = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"content\\\":\\\"done\\\"}\"}}]}\n\n\
+                      data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                      data: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            events.len(), events
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let mag_schema = TypeSchema {
+        version: SCHEMA_VERSION,
+        root: SchemaType::Named {
+            name: "nefor.contracts.FinalAnswer".into(),
+            body: Box::new(SchemaType::Record {
+                fields: vec![SchemaField {
+                    name: "content".into(),
+                    schema: SchemaType::String,
+                }],
+            }),
+        },
+    };
+    let provider_schema = mag_schema
+        .to_provider_schema()
+        .expect("supported MAG schema");
+    let response_format = serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "mag_output",
+            "strict": true,
+            "schema": provider_schema.schema
+        }
+    });
+    let client = reqwest::Client::new();
+    let outcome = run_chat_stream_with_retry_progress_and_format(
+        &client,
+        &format!("http://{addr}/v1/chat/completions"),
+        None,
+        "Authorization",
+        "fake-model",
+        &[Message::user("answer")],
+        None,
+        None,
+        Some(&response_format),
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect("structured response");
+    server.await.expect("server");
+    assert_eq!(outcome.full_text, r#"{"content":"done"}"#);
+    let decoded = mag_schema.validate_provider_json(&outcome.full_text);
+    assert!(decoded.ok, "{:?}", decoded.violations);
+    assert_eq!(decoded.value, Some(serde_json::json!({"content": "done"})));
 }
 
 #[tokio::test]

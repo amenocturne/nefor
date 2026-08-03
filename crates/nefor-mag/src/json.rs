@@ -413,9 +413,12 @@ pub fn json_to_typed_value(
             ))
         }
         MagType::JsonValue => Value::JsonValue(value.clone()),
-        MagType::Unit | MagType::Bool | MagType::Int | MagType::Float | MagType::String => {
-            json_to_value(value)
-        }
+        MagType::Float => Value::Float(
+            value
+                .as_f64()
+                .ok_or_else(|| MagError::Type(format!("expected {ty}")))?,
+        ),
+        MagType::Unit | MagType::Bool | MagType::Int | MagType::String => json_to_value(value),
         unsupported => {
             return Err(MagError::Type(format!(
                 "{unsupported} is not representable as rule input JSON"
