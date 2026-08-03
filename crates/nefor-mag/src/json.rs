@@ -23,7 +23,10 @@ pub fn value_to_json(env: &Env, value: &Value) -> Result<serde_json::Value, MagE
         Value::Unit => Ok(serde_json::Value::Null),
         Value::Str(v) => Ok(v.clone().into()),
         Value::Int(v) => Ok((*v).into()),
-        Value::Float(v) => Ok(serde_json::json!(v)),
+        Value::Float(v) if v.is_finite() => Ok(serde_json::json!(v)),
+        Value::Float(v) => Err(MagError::Eval(format!(
+            "cannot serialize non-finite Float {v} to JSON"
+        ))),
         Value::Bool(v) => Ok((*v).into()),
         Value::Keyword(v) => Ok(format!(":{v}").into()),
         Value::Symbol(v) => Ok(v.clone().into()),
@@ -464,6 +467,37 @@ mod tests {
         ] {
             assert!(json_to_typed_value(&env, &value, &MagType::Int).is_err());
         }
+    }
+
+    #[test]
+    fn typed_int_canonicalizes_provider_integer_notation_recursively() {
+        let env = Env::new();
+        let ty = MagType::List(Box::new(MagType::Record(BTreeMap::from([(
+            "value".into(),
+            MagType::Int,
+        )]))));
+        let value = serde_json::json!([{"value": 1.0}]);
+        let decoded = json_to_typed_value(&env, &value, &ty).unwrap();
+        let Value::Vector(items) = decoded else {
+            panic!("expected typed list");
+        };
+        let Value::Map(fields) = &items[0] else {
+            panic!("expected typed record");
+        };
+        assert!(matches!(fields.get("value"), Some(Value::Int(1))));
+    }
+
+    #[test]
+    fn non_finite_floats_are_rejected_before_json_serialization() {
+        let env = Env::new();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = value_to_json(&env, &Value::Float(value)).unwrap_err();
+            assert!(error.to_string().contains("non-finite Float"));
+        }
+        assert_eq!(
+            value_to_json(&env, &Value::Float(f64::MAX)).unwrap(),
+            serde_json::json!(f64::MAX)
+        );
     }
 
     #[test]

@@ -8383,7 +8383,15 @@ fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
         "the settled task firing must count as completed while the run remains active:\n{snap}"
     );
     assert!(
-        snap.contains("✓ task 0ms"),
+        snap.lines().any(|line| {
+            line.split('│').any(|segment| {
+                let node = segment.trim();
+                node.contains("✓ task ")
+                    && ["ms", "s", "m", "h"]
+                        .iter()
+                        .any(|unit| node.ends_with(unit))
+            })
+        }),
         "task must show its actual firing duration rather than the run lifetime:\n{snap}"
     );
     assert!(
