@@ -135,6 +135,33 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     acc
 }
 
+async fn read_request_json(stream: &mut tokio::net::TcpStream) -> Value {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = stream.read(&mut buffer).await.expect("read request");
+        assert!(count > 0, "request closed before body");
+        bytes.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        if bytes.len() >= body_start + length {
+            return serde_json::from_slice(&bytes[body_start..body_start + length])
+                .expect("request JSON");
+        }
+    }
+}
+
 async fn spin_until(counter: &AtomicUsize, at_least: usize, dur: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + dur;
     while counter.load(Ordering::SeqCst) < at_least {
@@ -369,6 +396,227 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     drop(in_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn invalid_direct_completion_tools_fail_once_before_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server_hits = hits.clone();
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((_stream, _))) =
+            tokio::time::timeout(Duration::from_millis(750), listener.accept()).await
+        {
+            server_hits.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let args = Arc::new(ServeArgs {
+        provider_name: PROVIDER.into(),
+        base_url: format!("http://{addr}"),
+    });
+    let chats = Arc::new(Chats::with_default_model(None));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Arc::new(
+        AuthStore::load_from_disk(&dir.path().join("auth.json"))
+            .await
+            .expect("auth store"),
+    );
+    let _ = auth.apply_auth_set("test-token".into()).await;
+    let catalog = Arc::new(ToolCatalog::new());
+    catalog
+        .register_from(
+            "tool-gate",
+            ToolCatalog::parse_tools(&serde_json::json!([{
+                "name": "alpha", "description": "Alpha", "input_schema": {"type": "object"}
+            }])),
+        )
+        .await;
+    let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(256);
+    let ctx = DispatcherContext::new(
+        args,
+        chats,
+        auth,
+        catalog,
+        Arc::new(ToolBroker::new()),
+        Arc::new(ResponsesClient::new(
+            format!("http://{addr}"),
+            "test-installation".into(),
+            "nefor_test".into(),
+        )),
+        out_tx,
+    );
+    let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
+    let loop_handle = tokio::spawn(run_dispatch_loop(ctx, in_rx));
+
+    let invalid = [
+        ("true", serde_json::json!(true)),
+        ("null", serde_json::json!(null)),
+        ("number", serde_json::json!(7)),
+        ("string", serde_json::json!("alpha")),
+        ("object", serde_json::json!({"name": "alpha"})),
+        ("mixed", serde_json::json!(["alpha", 7])),
+        ("inline", serde_json::json!([{"name": "alpha"}])),
+        ("mixed-spec", serde_json::json!(["alpha", {"name": "beta"}])),
+        ("empty-name", serde_json::json!([" "])),
+        ("duplicate", serde_json::json!(["alpha", "alpha"])),
+        ("unknown", serde_json::json!(["missing"])),
+    ];
+    for (request_id, tools) in invalid {
+        in_tx
+            .send(Ok(event_env(
+                &kind("completion.request"),
+                &[
+                    ("request_id", Value::String(request_id.into())),
+                    ("model", Value::String("test-model".into())),
+                    ("tools", tools),
+                    (
+                        "messages",
+                        serde_json::json!([{"role":"user","content":"hello"}]),
+                    ),
+                ],
+            )))
+            .await
+            .expect("submit invalid completion");
+        wait_for_completion_event(&mut out_rx, request_id, "failed", Duration::from_secs(2))
+            .await
+            .expect("one correlated failure");
+    }
+
+    let extra = drain_for(&mut out_rx, Duration::from_millis(100)).await;
+    assert!(
+        extra.iter().all(|event| {
+            event.get("kind").and_then(Value::as_str) != Some(&kind("completion.event"))
+        }),
+        "invalid requests emitted extra completion events: {extra:?}"
+    );
+    server.await.expect("server");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "rejection reached HTTP");
+
+    drop(in_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+}
+
+#[tokio::test]
+async fn concurrent_direct_completions_keep_request_local_tool_allowlists() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (request_tx, mut request_rx) = mpsc::channel::<Value>(2);
+    let server = tokio::spawn(async move {
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request_tx = request_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let request = read_request_json(&mut stream).await;
+                request_tx.send(request).await.expect("capture request");
+                let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                stream.write_all(response.as_bytes()).await.expect("response");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("connection task");
+        }
+    });
+
+    let args = Arc::new(ServeArgs {
+        provider_name: PROVIDER.into(),
+        base_url: format!("http://{addr}"),
+    });
+    let chats = Arc::new(Chats::with_default_model(None));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Arc::new(
+        AuthStore::load_from_disk(&dir.path().join("auth.json"))
+            .await
+            .expect("auth store"),
+    );
+    let _ = auth.apply_auth_set("test-token".into()).await;
+    let catalog = Arc::new(ToolCatalog::new());
+    catalog
+        .register_from(
+            "tool-gate",
+            ToolCatalog::parse_tools(&serde_json::json!([
+                {"name":"alpha","description":"Alpha","input_schema":{"type":"object","properties":{"a":{"type":"string"}}}},
+                {"name":"beta","description":"Beta","input_schema":{"type":"object","properties":{"b":{"type":"integer"}}}}
+            ])),
+        )
+        .await;
+    let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(256);
+    let ctx = DispatcherContext::new(
+        args,
+        chats,
+        auth,
+        catalog,
+        Arc::new(ToolBroker::new()),
+        Arc::new(ResponsesClient::new(
+            format!("http://{addr}"),
+            "test-installation".into(),
+            "nefor_test".into(),
+        )),
+        out_tx,
+    );
+    let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
+    let loop_handle = tokio::spawn(run_dispatch_loop(ctx, in_rx));
+
+    for (request_id, tool) in [("request-alpha", "alpha"), ("request-beta", "beta")] {
+        in_tx
+            .send(Ok(event_env(
+                &kind("completion.request"),
+                &[
+                    ("request_id", Value::String(request_id.into())),
+                    ("model", Value::String("test-model".into())),
+                    ("tools", serde_json::json!([tool])),
+                    (
+                        "messages",
+                        serde_json::json!([{"role":"user","content":request_id}]),
+                    ),
+                ],
+            )))
+            .await
+            .expect("submit completion");
+    }
+
+    let first = request_rx.recv().await.expect("first HTTP request");
+    let second = request_rx.recv().await.expect("second HTTP request");
+    let mut observed = [first, second]
+        .into_iter()
+        .map(|request| {
+            let prompt = request["input"][0]["content"][0]["text"]
+                .as_str()
+                .expect("prompt")
+                .to_owned();
+            let tools = request["tools"].as_array().expect("tools");
+            assert_eq!(tools.len(), 1, "each request keeps exactly its allowlist");
+            let tool = tools[0]["name"].as_str().expect("tool name").to_owned();
+            assert_eq!(tools[0]["parameters"]["type"], "object");
+            (prompt, tool)
+        })
+        .collect::<Vec<_>>();
+    observed.sort();
+    assert_eq!(
+        observed,
+        vec![
+            ("request-alpha".into(), "alpha".into()),
+            ("request-beta".into(), "beta".into())
+        ]
+    );
+
+    for request_id in ["request-alpha", "request-beta"] {
+        let completed =
+            wait_for_completion_event(&mut out_rx, request_id, "completed", Duration::from_secs(5))
+                .await
+                .expect("completion settles");
+        assert_eq!(completed["text"], "done");
+    }
+
+    drop(in_tx);
+    server.await.expect("server");
+    let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
 }
 
 #[tokio::test]

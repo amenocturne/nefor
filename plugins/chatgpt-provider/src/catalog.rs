@@ -68,6 +68,23 @@ impl ToolCatalog {
         g.values().flat_map(|v| v.iter().cloned()).collect()
     }
 
+    /// Resolve every requested name against one catalog snapshot.
+    /// Unknown names fail the request instead of silently narrowing its capability surface.
+    pub async fn resolve_names(&self, names: &[String]) -> Result<Vec<ToolSpec>, String> {
+        let g = self.inner.lock().await;
+        let mut resolved = Vec::with_capacity(names.len());
+        for name in names {
+            let spec = g
+                .values()
+                .flat_map(|tools| tools.iter())
+                .find(|tool| &tool.name == name)
+                .cloned()
+                .ok_or_else(|| format!("completion.request names unknown tool `{name}`"))?;
+            resolved.push(spec);
+        }
+        Ok(resolved)
+    }
+
     /// Reverse-map: tool `name` → owning plugin's `from` identity.
     /// Returns `None` if the name isn't in the catalog. With "last
     /// register wins" semantics across plugins — if two plugins

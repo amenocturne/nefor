@@ -304,6 +304,7 @@ async fn fake_server(kind: ProviderKind, listener: TcpListener) {
             }
             ProviderKind::ChatGpt => {
                 assert!(request_line.contains(" /responses "));
+                assert_eq!(request["tools"], json!([]));
                 assert_eq!(request["text"]["format"]["type"], "json_schema");
                 assert_eq!(request["text"]["format"]["name"], "mag_output");
                 assert_eq!(request["text"]["format"]["strict"], true);

@@ -1451,6 +1451,50 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectCompletionTools {
+    Disabled,
+    Allowlist(Vec<String>),
+}
+
+fn parse_direct_completion_tools(value: Option<&Value>) -> Result<DirectCompletionTools, String> {
+    let Some(value) = value else {
+        // Direct completions are an untyped, single-shot boundary. Absence must not
+        // implicitly expose the provider's process-wide catalog.
+        return Ok(DirectCompletionTools::Disabled);
+    };
+    match value {
+        Value::Bool(false) => Ok(DirectCompletionTools::Disabled),
+        Value::Array(values) if values.is_empty() => Ok(DirectCompletionTools::Disabled),
+        Value::Array(values) => {
+            let mut names = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let name = value.as_str().ok_or_else(|| {
+                    format!(
+                        "completion.request `tools[{index}]` must be a non-empty tool-name string"
+                    )
+                })?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(format!(
+                        "completion.request `tools[{index}]` must be a non-empty tool-name string"
+                    ));
+                }
+                if names.iter().any(|known| known == name) {
+                    return Err(format!(
+                        "completion.request `tools` contains duplicate tool name `{name}`"
+                    ));
+                }
+                names.push(name.to_owned());
+            }
+            Ok(DirectCompletionTools::Allowlist(names))
+        }
+        _ => {
+            Err("completion.request `tools` must be false or an array of tool-name strings".into())
+        }
+    }
+}
+
 async fn handle_completion_request(
     ctx: &DispatcherContext,
     body: &Map<String, Value>,
@@ -1515,7 +1559,28 @@ async fn handle_completion_request(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let tool_overrides = body.get("tools").map(ToolCatalog::parse_tools);
+    let (tool_overrides, tool_allowlist) = match parse_direct_completion_tools(body.get("tools")) {
+        Ok(DirectCompletionTools::Disabled) => (Some(Vec::new()), Some(Vec::new())),
+        Ok(DirectCompletionTools::Allowlist(names)) => {
+            match ctx.catalog.resolve_names(&names).await {
+                Ok(specs) => (Some(specs), Some(names)),
+                Err(error) => {
+                    send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                        event.insert("error".into(), Value::String(error));
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(error) => {
+            send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                event.insert("error".into(), Value::String(error));
+            })
+            .await?;
+            return Ok(());
+        }
+    };
     let reasoning_effort = match parse_reasoning_effort(body.get("reasoning_effort")) {
         Ok(value) => value,
         Err(error) => {
@@ -1539,7 +1604,7 @@ async fn handle_completion_request(
             routing_session_id,
             system,
             tool_overrides,
-            tool_allowlist: None,
+            tool_allowlist,
             reasoning_effort,
             history,
         })
@@ -3363,6 +3428,47 @@ mod tests {
         ServeArgs {
             provider_name: "chatgpt".into(),
             base_url: "https://example.invalid".into(),
+        }
+    }
+
+    #[test]
+    fn direct_completion_tools_are_a_closed_validated_sum() {
+        assert_eq!(
+            parse_direct_completion_tools(None),
+            Ok(DirectCompletionTools::Disabled)
+        );
+        assert_eq!(
+            parse_direct_completion_tools(Some(&Value::Bool(false))),
+            Ok(DirectCompletionTools::Disabled)
+        );
+        assert_eq!(
+            parse_direct_completion_tools(Some(&serde_json::json!([]))),
+            Ok(DirectCompletionTools::Disabled)
+        );
+        assert_eq!(
+            parse_direct_completion_tools(Some(&serde_json::json!(["alpha", "beta"]))),
+            Ok(DirectCompletionTools::Allowlist(vec![
+                "alpha".into(),
+                "beta".into()
+            ]))
+        );
+
+        for invalid in [
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!("alpha"),
+            serde_json::json!({"name": "alpha"}),
+            serde_json::json!(["alpha", 1]),
+            serde_json::json!([{"name": "alpha"}]),
+            serde_json::json!(["alpha", {"name": "beta"}]),
+            serde_json::json!([""]),
+            serde_json::json!(["alpha", "alpha"]),
+        ] {
+            assert!(
+                parse_direct_completion_tools(Some(&invalid)).is_err(),
+                "accepted invalid tools value {invalid}"
+            );
         }
     }
 
