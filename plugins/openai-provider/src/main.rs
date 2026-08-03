@@ -1006,6 +1006,7 @@ async fn dispatch_completion_request(
         let token = auth.token().await;
         let id_for_text = request_id.clone();
         let tx_for_text = out_tx.clone();
+        let suppress_text_deltas = response_format.is_some();
         let id_for_reasoning = request_id.clone();
         let tx_for_reasoning = out_tx.clone();
         let id_for_retry = request_id.clone();
@@ -1022,11 +1023,13 @@ async fn dispatch_completion_request(
             response_format.as_ref(),
             cancel.clone(),
             move |text| {
-                let _ = tx_for_text.try_send(PluginOutgoing::event(completion_event_body(
-                    &id_for_text,
-                    "text_delta",
-                    [("text", Value::String(text.to_owned()))],
-                )));
+                if !suppress_text_deltas {
+                    let _ = tx_for_text.try_send(PluginOutgoing::event(completion_event_body(
+                        &id_for_text,
+                        "text_delta",
+                        [("text", Value::String(text.to_owned()))],
+                    )));
+                }
             },
             move |event| {
                 let (event, text) = match event {
