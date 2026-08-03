@@ -5,8 +5,10 @@
 //! request controls. The local servers only inspect the resulting wire request and return a
 //! deterministic structured response.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody, Timestamp};
@@ -45,15 +47,45 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn workspace_binary(name: &str) -> PathBuf {
-    let suffix = std::env::consts::EXE_SUFFIX;
-    repo_root()
-        .join("target/debug")
-        .join(format!("{name}{suffix}"))
-}
-
 fn mag_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mag-plugin"))
+}
+
+fn provider_binaries() -> &'static HashMap<&'static str, PathBuf> {
+    static BINARIES: OnceLock<HashMap<&'static str, PathBuf>> = OnceLock::new();
+    BINARIES.get_or_init(|| {
+        let root = repo_root();
+        let target_dir = root.join("target/structured-provider-e2e");
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                "openai-provider",
+                "-p",
+                "chatgpt-provider",
+            ])
+            .status()
+            .expect("run isolated Cargo provider build");
+        assert!(status.success(), "Cargo provider build failed: {status}");
+
+        ["openai-provider", "chatgpt-provider"]
+            .into_iter()
+            .map(|name| {
+                let binary = target_dir
+                    .join("debug")
+                    .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+                assert!(
+                    binary.is_file(),
+                    "Cargo did not produce expected provider binary {}",
+                    binary.display()
+                );
+                (name, binary)
+            })
+            .collect()
+    })
 }
 
 fn kernel_path() -> PathBuf {
@@ -80,13 +112,9 @@ async fn spawn_mag(data_dir: &Path) -> Child {
 }
 
 async fn spawn_provider(kind: ProviderKind, base_url: &str, data_dir: &Path) -> Child {
-    let binary = workspace_binary(kind.binary());
-    assert!(
-        binary.exists(),
-        "{} must be built before this cross-plugin test; run `cargo build -p {}`",
-        binary.display(),
-        kind.binary()
-    );
+    let binary = provider_binaries()
+        .get(kind.binary())
+        .expect("Cargo-built provider binary");
     let mut command = tokio::process::Command::new(binary);
     command
         .arg("--name")
@@ -224,6 +252,13 @@ fn assert_strict_final_answer_schema(schema: &Value) {
     assert_eq!(schema["properties"]["content"]["type"], "string");
     assert_eq!(schema["required"], json!(["content"]));
     assert_eq!(schema["additionalProperties"], false);
+    let object = schema.as_object().expect("provider schema object");
+    for descriptor in ["version", "root", "kind"] {
+        assert!(
+            !object.contains_key(descriptor),
+            "provider schema must omit MAG descriptor field `{descriptor}`: {schema}"
+        );
+    }
 }
 
 async fn fake_server(kind: ProviderKind, listener: TcpListener) {
@@ -253,6 +288,10 @@ async fn fake_server(kind: ProviderKind, listener: TcpListener) {
             ProviderKind::OpenAi => {
                 assert!(request_line.contains(" /v1/chat/completions "));
                 assert_eq!(request["response_format"]["type"], "json_schema");
+                assert_eq!(
+                    request["response_format"]["json_schema"]["name"],
+                    "mag_output"
+                );
                 assert_eq!(request["response_format"]["json_schema"]["strict"], true);
                 assert_strict_final_answer_schema(
                     &request["response_format"]["json_schema"]["schema"],
@@ -266,6 +305,7 @@ async fn fake_server(kind: ProviderKind, listener: TcpListener) {
             ProviderKind::ChatGpt => {
                 assert!(request_line.contains(" /responses "));
                 assert_eq!(request["text"]["format"]["type"], "json_schema");
+                assert_eq!(request["text"]["format"]["name"], "mag_output");
                 assert_eq!(request["text"]["format"]["strict"], true);
                 assert_strict_final_answer_schema(&request["text"]["format"]["schema"]);
                 write_sse(
@@ -394,12 +434,14 @@ async fn run_case(kind: ProviderKind) {
     let completion_kind = format!("{}.completion.event", kind.name());
     let completed = loop {
         let outgoing = read_outgoing(&mut provider_out, "structured provider completion").await;
-        let Body::Event(mut body) = outgoing.body else {
+        let Body::Event(body) = outgoing.body else {
             continue;
         };
-        if body.get("kind").and_then(Value::as_str) == Some("completion.event") {
-            body.insert("kind".into(), Value::String(completion_kind.clone()));
-        }
+        assert_ne!(
+            body.get("kind").and_then(Value::as_str),
+            Some("completion.event"),
+            "provider process must publish its configured canonical kind"
+        );
         if body.get("kind").and_then(Value::as_str) != Some(&completion_kind) {
             continue;
         }

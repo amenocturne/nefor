@@ -899,7 +899,7 @@ async fn dispatch_completion_request(
     else {
         send_event(
             out_tx,
-            completion_error_body("", "completion.request missing `request_id`"),
+            completion_error_body(config, "", "completion.request missing `request_id`"),
         )
         .await?;
         return Ok(());
@@ -917,6 +917,7 @@ async fn dispatch_completion_request(
                         send_event(
                             out_tx,
                             completion_error_body(
+                                config,
                                 &request_id,
                                 "invalid tool call in completion history",
                             ),
@@ -925,7 +926,8 @@ async fn dispatch_completion_request(
                         return Ok(());
                     }
                     Err(message) => {
-                        send_event(out_tx, completion_error_body(&request_id, &message)).await?;
+                        send_event(out_tx, completion_error_body(config, &request_id, &message))
+                            .await?;
                         return Ok(());
                     }
                 }
@@ -935,7 +937,7 @@ async fn dispatch_completion_request(
         None => {
             send_event(
                 out_tx,
-                completion_error_body(&request_id, "completion.request missing `messages`"),
+                completion_error_body(config, &request_id, "completion.request missing `messages`"),
             )
             .await?;
             return Ok(());
@@ -945,6 +947,7 @@ async fn dispatch_completion_request(
         send_event(
             out_tx,
             completion_error_body(
+                config,
                 &request_id,
                 "completion request needs at least one non-empty user or tool message",
             ),
@@ -957,7 +960,7 @@ async fn dispatch_completion_request(
     let run = match completions.begin(request_id.clone()).await {
         Ok(run) => run,
         Err(message) => {
-            send_event(out_tx, completion_error_body(&request_id, &message)).await?;
+            send_event(out_tx, completion_error_body(config, &request_id, &message)).await?;
             return Ok(());
         }
     };
@@ -972,7 +975,7 @@ async fn dispatch_completion_request(
         completions.finish(&request_id, &run).await;
         send_event(
             out_tx,
-            completion_error_body(&request_id, "no model configured"),
+            completion_error_body(config, &request_id, "no model configured"),
         )
         .await?;
         return Ok(());
@@ -1003,6 +1006,10 @@ async fn dispatch_completion_request(
     let client = client.clone();
     let out_tx = out_tx.clone();
     tokio::spawn(async move {
+        let event_prefix = config.event_prefix();
+        let text_event_prefix = event_prefix.clone();
+        let reasoning_event_prefix = event_prefix.clone();
+        let retry_event_prefix = event_prefix.clone();
         let token = auth.token().await;
         let id_for_text = request_id.clone();
         let tx_for_text = out_tx.clone();
@@ -1025,6 +1032,7 @@ async fn dispatch_completion_request(
             move |text| {
                 if !suppress_text_deltas {
                     let _ = tx_for_text.try_send(PluginOutgoing::event(completion_event_body(
+                        &text_event_prefix,
                         &id_for_text,
                         "text_delta",
                         [("text", Value::String(text.to_owned()))],
@@ -1037,6 +1045,7 @@ async fn dispatch_completion_request(
                     ReasoningEvent::End { text } => ("reasoning_end", text),
                 };
                 let _ = tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
+                    &reasoning_event_prefix,
                     &id_for_reasoning,
                     event,
                     [("text", Value::String(text.to_owned()))],
@@ -1044,6 +1053,7 @@ async fn dispatch_completion_request(
             },
             move |progress| {
                 let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body(
+                    &retry_event_prefix,
                     &id_for_retry,
                     "retry",
                     [
@@ -1074,6 +1084,7 @@ async fn dispatch_completion_request(
                 if let Some(usage) = outcome.usage {
                     let _ = out_tx
                         .send(PluginOutgoing::event(completion_event_body(
+                            &event_prefix,
                             &request_id,
                             "usage",
                             [
@@ -1092,6 +1103,7 @@ async fn dispatch_completion_request(
                         .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
                     let _ = out_tx
                         .send(PluginOutgoing::event(completion_event_body(
+                            &event_prefix,
                             &request_id,
                             "tool_call",
                             [
@@ -1104,6 +1116,7 @@ async fn dispatch_completion_request(
                 }
                 let _ = out_tx
                     .send(PluginOutgoing::event(completion_event_body(
+                        &event_prefix,
                         &request_id,
                         "completed",
                         [
@@ -1124,6 +1137,7 @@ async fn dispatch_completion_request(
             Err(error) => {
                 let _ = out_tx
                     .send(PluginOutgoing::event(completion_error_body(
+                        &config,
                         &request_id,
                         &error.to_string(),
                     )))
@@ -1135,12 +1149,16 @@ async fn dispatch_completion_request(
 }
 
 fn completion_event_body<const N: usize>(
+    prefix: &str,
     request_id: &str,
     event: &str,
     fields: [(&str, Value); N],
 ) -> Map<String, Value> {
     let mut body = Map::new();
-    body.insert("kind".into(), Value::String("completion.event".into()));
+    body.insert(
+        "kind".into(),
+        Value::String(format!("{prefix}completion.event")),
+    );
     body.insert("request_id".into(), Value::String(request_id.to_owned()));
     body.insert("event".into(), Value::String(event.to_owned()));
     for (name, value) in fields {
@@ -1149,8 +1167,9 @@ fn completion_event_body<const N: usize>(
     body
 }
 
-fn completion_error_body(request_id: &str, message: &str) -> Map<String, Value> {
+fn completion_error_body(config: &Config, request_id: &str, message: &str) -> Map<String, Value> {
     completion_event_body(
+        &config.event_prefix(),
         request_id,
         "error",
         [("message", Value::String(message.to_owned()))],
@@ -2694,8 +2713,9 @@ mod tests {
     }
 
     #[test]
-    fn completion_events_are_provider_neutral_and_request_correlated() {
+    fn completion_events_are_namespaced_and_request_correlated() {
         let event = completion_event_body(
+            "ollama.",
             "req-42",
             "tool_call",
             [
@@ -2706,7 +2726,7 @@ mod tests {
         );
         assert_eq!(
             event.get("kind").and_then(Value::as_str),
-            Some("completion.event")
+            Some("ollama.completion.event")
         );
         assert_eq!(
             event.get("request_id").and_then(Value::as_str),
@@ -2721,10 +2741,11 @@ mod tests {
 
     #[test]
     fn completion_errors_are_terminal_and_request_correlated() {
-        let event = completion_error_body("req-err", "upstream failed");
+        let config = cfg("ollama");
+        let event = completion_error_body(&config, "req-err", "upstream failed");
         assert_eq!(
             event.get("kind").and_then(Value::as_str),
-            Some("completion.event")
+            Some("ollama.completion.event")
         );
         assert_eq!(
             event.get("request_id").and_then(Value::as_str),
