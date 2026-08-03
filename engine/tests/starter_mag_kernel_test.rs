@@ -65,6 +65,11 @@ fn starter_mag_kernel_llm_factory() {
 }
 
 #[test]
+fn starter_mag_kernel_structured_output_factory() {
+    run_lua_test("tests/lua/mag-kernel/structured_output_test.lua");
+}
+
+#[test]
 fn starter_mag_kernel_tool_primitives() {
     run_lua_test("tests/lua/mag-kernel/tools_test.lua");
 }

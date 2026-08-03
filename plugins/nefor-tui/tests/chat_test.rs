@@ -9963,6 +9963,58 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
 }
 
 #[test]
+fn structured_validation_preview_never_renders_rejected_candidate_json() {
+    let mut engine = Engine::new(110, 32).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    advertise_preview(
+        &mut engine,
+        "structured-output",
+        json!({
+            "kind": "stream",
+            "source": { "binding": "stream", "name": "transcript", "schema": "table" },
+            "item": { "kind": "cases", "values": {
+                "validation": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "validation", "style": "error", "wrap": "word" }
+            } }
+        }),
+        json!({ "transcript": { "kind": "stream", "schema": "table" } }),
+    );
+    open_single_node(&mut engine, "structured-output", "typed.node");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.node_preview", "run_id": "preview-run", "id": "typed.node",
+            "operation": "append", "binding": "transcript", "observation_seq": 1,
+            "value": { "kind": "validation", "value": {
+                "attempt": 1,
+                "output": { "raw_machine_secret": "REJECTED-CANDIDATE-MUST-NEVER-RENDER" },
+                "violations": [{ "path": "$.content", "message": "required" }]
+            } }
+        }),
+    );
+
+    let concise = render_snapshot(&mut engine);
+    assert!(
+        concise.contains("validation attempt 1 · details hidden"),
+        "{concise}"
+    );
+    assert!(
+        !concise.contains("REJECTED-CANDIDATE-MUST-NEVER-RENDER"),
+        "normal preview leaked rejected JSON:\n{concise}"
+    );
+
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("expand validation details");
+    let expanded = render_snapshot(&mut engine);
+    assert!(expanded.contains("violations:"), "{expanded}");
+    assert!(expanded.contains("required"), "{expanded}");
+    assert!(
+        !expanded.contains("REJECTED-CANDIDATE-MUST-NEVER-RENDER"),
+        "expanded preview leaked rejected JSON:\n{expanded}"
+    );
+}
+
+#[test]
 fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_widths() {
     let declaration = json!({
         "kind": "column", "gap": 1, "children": [

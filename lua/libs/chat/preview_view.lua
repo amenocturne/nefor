@@ -120,8 +120,8 @@ local function format_value(value, format, ctx)
     if ctx.state.expanded_details ~= true then
       return "validation attempt " .. tostring(value.attempt or "?") .. " · details hidden"
     end
-    return "validation attempt " .. tostring(value.attempt or "?") .. "\noutput:\n"
-      .. encode(value.output) .. "\nviolations:\n" .. encode(value.violations)
+    return "validation attempt " .. tostring(value.attempt or "?")
+      .. "\nviolations:\n" .. encode(value.violations)
   end
   return encode(value)
 end

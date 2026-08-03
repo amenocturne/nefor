@@ -507,15 +507,17 @@ async fn handle_event(
         if let Some(event @ ("text_delta" | "reasoning_delta")) =
             body.get("event").and_then(Value::as_str)
         {
-            if let Some(text) = body.get("text").and_then(Value::as_str) {
-                let event_kind = if event == "reasoning_delta" {
-                    "reasoning"
-                } else {
-                    "assistant"
-                };
-                let value = serde_json::json!({ "kind": event_kind, "text": text });
-                let _ = host.bus_observation(&request_id, "append", "transcript", &value)?;
-                flush_emits(out_tx, host, bridge).await?;
+            if event != "text_delta" || !bridge.is_structured_request(&request_id) {
+                if let Some(text) = body.get("text").and_then(Value::as_str) {
+                    let event_kind = if event == "reasoning_delta" {
+                        "reasoning"
+                    } else {
+                        "assistant"
+                    };
+                    let value = serde_json::json!({ "kind": event_kind, "text": text });
+                    let _ = host.bus_observation(&request_id, "append", "transcript", &value)?;
+                    flush_emits(out_tx, host, bridge).await?;
+                }
             }
         }
         if let Some(reply) = bridge.take_reply(kind, body) {

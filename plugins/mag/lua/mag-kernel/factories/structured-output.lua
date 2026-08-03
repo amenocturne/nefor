@@ -166,7 +166,7 @@ function M.construct(id, params, emit, deps)
       end
       local violations = output_violations(validation)
       state:observe("append", "transcript", { kind = "validation", value = {
-        attempt = corrections + 1, output = last_output, violations = violations,
+        attempt = corrections + 1, violations = violations,
       } })
       if corrections >= params.max_corrections then
         finish_error(state, params.validation_error_type, { violations=violations })

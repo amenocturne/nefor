@@ -17,6 +17,7 @@ const PROVIDER_EVENT: &str = "completion.event";
 struct PendingProvider {
     provider: String,
     stream_id: String,
+    structured_output: bool,
     observed_stream: bool,
     tool_calls: Vec<Value>,
 }
@@ -92,11 +93,15 @@ impl CapabilityBridge {
         );
         request.insert("request_id".into(), Value::String(request_id.clone()));
 
+        let structured_output = request
+            .get("output_schema")
+            .is_some_and(|value| !value.is_null());
         self.pending_providers.insert(
             request_id,
             PendingProvider {
                 provider,
                 stream_id,
+                structured_output,
                 observed_stream: false,
                 tool_calls: Vec::new(),
             },
@@ -143,6 +148,9 @@ impl CapabilityBridge {
         let request_id = self.provider_request_id(kind, body)?.to_owned();
         let event = body.get("event").and_then(Value::as_str)?;
         let pending = self.pending_providers.get_mut(&request_id)?;
+        if pending.structured_output && event == "text_delta" {
+            return None;
+        }
         let projected_kind = match event {
             "text_delta" => {
                 pending.observed_stream = true;
@@ -209,6 +217,12 @@ impl CapabilityBridge {
             }
         }
         Some(projected)
+    }
+
+    pub fn is_structured_request(&self, request_id: &str) -> bool {
+        self.pending_providers
+            .get(request_id)
+            .is_some_and(|pending| pending.structured_output)
     }
 
     /// Record non-terminal provider data or consume a terminal event. Unknown,
@@ -418,6 +432,42 @@ mod tests {
         assert_eq!(wire.matches("first").count(), 1);
         assert!(!wire.contains(".chat."));
         assert!(!wire.contains("history"));
+    }
+
+    #[test]
+    fn structured_requests_suppress_raw_text_projection_but_keep_reasoning() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        let mut invoke = provider_invoke("structured-1", "provider-a", json!([]));
+        invoke
+            .get_mut("args")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("output_schema".into(), json!({"type": "object"}));
+        bridge.translate_emit(invoke);
+
+        let text = event(
+            "structured-1",
+            "provider-a",
+            "text_delta",
+            json!({"text": "{\"raw_machine_secret\":true}"}),
+        );
+        assert!(bridge
+            .project_event(text["kind"].as_str().unwrap(), &text)
+            .is_none());
+        assert!(bridge.is_structured_request("structured-1"));
+
+        let reasoning = event(
+            "structured-1",
+            "provider-a",
+            "reasoning_delta",
+            json!({"text": "checking the schema"}),
+        );
+        assert_eq!(
+            bridge
+                .project_event(reasoning["kind"].as_str().unwrap(), &reasoning)
+                .unwrap()["kind"],
+            "chat.stream.reasoning_delta"
+        );
     }
 
     #[test]
