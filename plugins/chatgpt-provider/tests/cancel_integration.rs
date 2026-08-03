@@ -96,6 +96,30 @@ async fn wait_for_kind(
     }
 }
 
+async fn wait_for_completion_event(
+    rx: &mut mpsc::Receiver<PluginOutgoing>,
+    request_id: &str,
+    terminal_event: &str,
+    dur: Duration,
+) -> Option<Map<String, Value>> {
+    let deadline = tokio::time::Instant::now() + dur;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(msg)) => {
+                if let Some(body) = event_body(&msg) {
+                    if body.get("kind").and_then(Value::as_str) == Some(&kind("completion.event"))
+                        && body.get("request_id").and_then(Value::as_str) == Some(request_id)
+                        && body.get("event").and_then(Value::as_str) == Some(terminal_event)
+                    {
+                        return Some(body.clone());
+                    }
+                }
+            }
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
 /// Read a request off the socket until the header terminator. Enough to
 /// confirm the POST arrived before we script the response.
 async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
@@ -267,14 +291,26 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
         .await
         .expect("send cancel ghost");
 
-    // No terminal result for the cancelled request within a settle window.
+    // No terminal event for the cancelled request within a settle window.
     let drained = drain_for(&mut out_rx, Duration::from_millis(600)).await;
-    let leaked_result = drained
-        .iter()
-        .any(|m| m.get("kind").and_then(Value::as_str) == Some(&kind("chat.complete.result")));
+    let leaked_terminal = drained.iter().any(|m| {
+        m.get("kind").and_then(Value::as_str) == Some(&kind("completion.event"))
+            && m.get("request_id").and_then(Value::as_str) == Some("shared-id")
+            && matches!(
+                m.get("event").and_then(Value::as_str),
+                Some("completed" | "error")
+            )
+    });
     assert!(
-        !leaked_result,
-        "cancelled completion must not deliver a chat.complete.result: {drained:?}"
+        !leaked_terminal,
+        "cancelled completion must not deliver a terminal completion.event: {drained:?}"
+    );
+    assert!(
+        drained.iter().all(|m| {
+            m.get("kind").and_then(Value::as_str) != Some(&kind("chat.complete.result"))
+                || m.get("chat_id").and_then(Value::as_str) != Some("shared-id")
+        }),
+        "direct completion must never use the persistent chat result API: {drained:?}"
     );
 
     // --- 3. the provider serves the next completion normally ---
@@ -415,28 +451,31 @@ async fn clean_eof_requires_terminal_event_and_next_submissions_settle() {
     }
 
     submit(&in_tx, "before-output").await;
-    let retried = wait_for_kind(
+    let retried = wait_for_completion_event(
         &mut out_rx,
-        &kind("chat.complete.result"),
+        "before-output",
+        "completed",
         Duration::from_secs(5),
     )
     .await
     .expect("pre-output EOF retries and settles");
-    assert_eq!(retried["chat_id"], "before-output");
-    assert_eq!(retried["output"]["text"], "retried");
+    assert_eq!(retried["request_id"], "before-output");
+    assert_eq!(retried["event"], "completed");
+    assert_eq!(retried["text"], "retried");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 
     submit(&in_tx, "after-partial").await;
-    let failed = wait_for_kind(
+    let failed = wait_for_completion_event(
         &mut out_rx,
-        &kind("chat.complete.result"),
+        "after-partial",
+        "error",
         Duration::from_secs(3),
     )
     .await
     .expect("partial EOF settles as an error");
-    assert_eq!(failed["chat_id"], "after-partial");
-    assert_eq!(failed["output"]["finish_reason"], "error");
-    assert!(failed["output"]["error"]
+    assert_eq!(failed["request_id"], "after-partial");
+    assert_eq!(failed["event"], "error");
+    assert!(failed["message"]
         .as_str()
         .is_some_and(|error| error.contains("before a terminal event")));
     assert_eq!(
@@ -446,16 +485,17 @@ async fn clean_eof_requires_terminal_event_and_next_submissions_settle() {
     );
 
     submit(&in_tx, "after-terminal").await;
-    let completed = wait_for_kind(
+    let completed = wait_for_completion_event(
         &mut out_rx,
-        &kind("chat.complete.result"),
+        "after-terminal",
+        "completed",
         Duration::from_secs(3),
     )
     .await
     .expect("provider remains usable after scoped EOF error");
-    assert_eq!(completed["chat_id"], "after-terminal");
-    assert_eq!(completed["output"]["text"], "after-error");
-    assert_ne!(completed["output"]["finish_reason"], "error");
+    assert_eq!(completed["request_id"], "after-terminal");
+    assert_eq!(completed["event"], "completed");
+    assert_eq!(completed["text"], "after-error");
     assert_eq!(hits.load(Ordering::SeqCst), 4);
 
     drop(in_tx);

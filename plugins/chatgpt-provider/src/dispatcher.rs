@@ -859,8 +859,13 @@ impl DirectCompletions {
         Ok(run)
     }
 
+    #[cfg(test)]
     async fn get(&self, request_id: &str) -> Option<DirectCompletion> {
         self.runs.lock().await.get(request_id).cloned()
+    }
+
+    async fn cancel(&self, request_id: &str) -> Option<DirectCompletion> {
+        self.runs.lock().await.remove(request_id)
     }
 
     async fn finish(&self, request_id: &str, owner: u64) -> bool {
@@ -1036,8 +1041,7 @@ async fn dispatch_event(
         "completion.request" => handle_completion_request(ctx, body).await,
         "completion.cancel" => {
             if let Some(request_id) = read_request_id(body) {
-                let owned = ctx.direct_completions.get(&request_id).await;
-                if let Some(owned) = owned {
+                if let Some(owned) = ctx.direct_completions.cancel(&request_id).await {
                     if !owned.chats.cancel_turn(&owned.chat_id).await {
                         tracing::debug!(%request_id, "completion.cancel for finished request; no-op");
                     }
@@ -1582,6 +1586,21 @@ async fn handle_completion_request(
         Some((request_id, completion)),
     );
     Ok(())
+}
+
+fn completion_event_body<const N: usize>(
+    args: &ServeArgs,
+    request_id: &str,
+    event: &str,
+    fields: [(&str, Value); N],
+) -> Map<String, Value> {
+    let mut body = Map::new();
+    body.insert("request_id".into(), Value::String(request_id.to_owned()));
+    body.insert("event".into(), Value::String(event.to_owned()));
+    for (name, value) in fields {
+        body.insert(name.to_owned(), value);
+    }
+    make_event(format!("{}completion.event", args.event_prefix()), body)
 }
 
 async fn send_completion_event(
@@ -2439,6 +2458,7 @@ fn spawn_turn(
         let started = Instant::now();
         let mut iterations: u32 = 0;
         let mut final_text = String::new();
+        let mut final_reasoning = String::new();
         // Every loop path assigns this before break; the initial value
         // is unused but the linter can't see that across the loop,
         // so suppress the false positive.
@@ -2784,12 +2804,21 @@ fn spawn_turn(
                                 ResponseEvent::OutputTextDelta { delta, .. } => {
                                     output_text.push_str(&delta);
                                     if output_schema.is_none() {
-                                        let body = stream_delta_body(
-                                            &ctx.args.event_prefix(),
-                                            &turn_id,
-                                            &chat_id,
-                                            &delta,
-                                        );
+                                        let body = if let Some((request_id, _)) = &direct_request {
+                                            completion_event_body(
+                                                &ctx.args,
+                                                request_id,
+                                                "text_delta",
+                                                [("text", Value::String(delta.clone()))],
+                                            )
+                                        } else {
+                                            stream_delta_body(
+                                                &ctx.args.event_prefix(),
+                                                &turn_id,
+                                                &chat_id,
+                                                &delta,
+                                            )
+                                        };
                                         let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                     }
                                 }
@@ -2802,12 +2831,21 @@ fn spawn_turn(
                                             continue;
                                         }
                                         reasoning_text.push_str(&formatted);
-                                        let body = stream_reasoning_delta_body(
-                                            &ctx.args.event_prefix(),
-                                            &turn_id,
-                                            &chat_id,
-                                            &formatted,
-                                        );
+                                        let body = if let Some((request_id, _)) = &direct_request {
+                                            completion_event_body(
+                                                &ctx.args,
+                                                request_id,
+                                                "reasoning_delta",
+                                                [("text", Value::String(formatted.clone()))],
+                                            )
+                                        } else {
+                                            stream_reasoning_delta_body(
+                                                &ctx.args.event_prefix(),
+                                                &turn_id,
+                                                &chat_id,
+                                                &formatted,
+                                            )
+                                        };
                                         let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                     }
                                 }
@@ -2820,21 +2858,39 @@ fn spawn_turn(
                                             continue;
                                         }
                                         reasoning_text.push_str(&formatted);
-                                        let body = stream_reasoning_delta_body(
-                                            &ctx.args.event_prefix(),
-                                            &turn_id,
-                                            &chat_id,
-                                            &formatted,
-                                        );
+                                        let body = if let Some((request_id, _)) = &direct_request {
+                                            completion_event_body(
+                                                &ctx.args,
+                                                request_id,
+                                                "reasoning_delta",
+                                                [("text", Value::String(formatted.clone()))],
+                                            )
+                                        } else {
+                                            stream_reasoning_delta_body(
+                                                &ctx.args.event_prefix(),
+                                                &turn_id,
+                                                &chat_id,
+                                                &formatted,
+                                            )
+                                        };
                                         let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                     }
                                     reasoning_text.push_str(&delta);
-                                    let body = stream_reasoning_delta_body(
-                                        &ctx.args.event_prefix(),
-                                        &turn_id,
-                                        &chat_id,
-                                        &delta,
-                                    );
+                                    let body = if let Some((request_id, _)) = &direct_request {
+                                        completion_event_body(
+                                            &ctx.args,
+                                            request_id,
+                                            "reasoning_delta",
+                                            [("text", Value::String(delta.clone()))],
+                                        )
+                                    } else {
+                                        stream_reasoning_delta_body(
+                                            &ctx.args.event_prefix(),
+                                            &turn_id,
+                                            &chat_id,
+                                            &delta,
+                                        )
+                                    };
                                     let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                 }
                                 ResponseEvent::FunctionCallArgumentsDelta { delta, item_id } => {
@@ -2989,27 +3045,46 @@ fn spawn_turn(
                     continue;
                 }
                 reasoning_text.push_str(&formatted);
-                let body = stream_reasoning_delta_body(
-                    &ctx.args.event_prefix(),
-                    &turn_id,
-                    &chat_id,
-                    &formatted,
-                );
+                let body = if let Some((request_id, _)) = &direct_request {
+                    completion_event_body(
+                        &ctx.args,
+                        request_id,
+                        "reasoning_delta",
+                        [("text", Value::String(formatted.clone()))],
+                    )
+                } else {
+                    stream_reasoning_delta_body(
+                        &ctx.args.event_prefix(),
+                        &turn_id,
+                        &chat_id,
+                        &formatted,
+                    )
+                };
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
             // Emit per-turn reasoning_end if we accumulated any.
             if !reasoning_text.is_empty() {
+                final_reasoning.push_str(&reasoning_text);
                 let duration_ms = reasoning_started_at
                     .map(|s| s.elapsed().as_millis() as u64)
                     .unwrap_or(0);
-                let body = stream_reasoning_end_body(
-                    &ctx.args.event_prefix(),
-                    &turn_id,
-                    &chat_id,
-                    &reasoning_text,
-                    duration_ms,
-                );
+                let body = if let Some((request_id, _)) = &direct_request {
+                    completion_event_body(
+                        &ctx.args,
+                        request_id,
+                        "reasoning_end",
+                        [("text", Value::String(reasoning_text.clone()))],
+                    )
+                } else {
+                    stream_reasoning_end_body(
+                        &ctx.args.event_prefix(),
+                        &turn_id,
+                        &chat_id,
+                        &reasoning_text,
+                        duration_ms,
+                    )
+                };
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
@@ -3031,14 +3106,27 @@ fn spawn_turn(
                         error = %err_msg,
                         "Responses stream failed before output; retrying turn iteration",
                     );
-                    let retry_body =
-                        stream_retry_body(&ctx.args, &chat_id, pre_output_stream_retries, &err_msg);
+                    let retry_delay =
+                        crate::responses::retry_delay(pre_output_stream_retries - 1, None);
+                    let retry_body = if let Some((request_id, _)) = &direct_request {
+                        completion_event_body(
+                            &ctx.args,
+                            request_id,
+                            "retry",
+                            [
+                                ("attempt", Value::Number(pre_output_stream_retries.into())),
+                                (
+                                    "delay_ms",
+                                    Value::Number((retry_delay.as_millis() as u64).into()),
+                                ),
+                                ("error", Value::String(err_msg.clone())),
+                            ],
+                        )
+                    } else {
+                        stream_retry_body(&ctx.args, &chat_id, pre_output_stream_retries, &err_msg)
+                    };
                     let _ = ctx.out_tx.send(PluginOutgoing::event(retry_body)).await;
-                    tokio::time::sleep(crate::responses::retry_delay(
-                        pre_output_stream_retries - 1,
-                        None,
-                    ))
-                    .await;
+                    tokio::time::sleep(retry_delay).await;
                     continue;
                 }
                 let _ = ctx
@@ -3104,6 +3192,73 @@ fn spawn_turn(
             if let Some((request_id, owner)) = &direct_request {
                 ctx.direct_completions.finish(request_id, owner.owner).await;
             }
+            return;
+        }
+
+        if let Some((request_id, owner)) = &direct_request {
+            if !ctx.direct_completions.finish(request_id, owner.owner).await {
+                ctx.chats.end_turn(&chat_id).await;
+                return;
+            }
+
+            if let Some((prompt_tokens, completion_tokens)) = total_usage {
+                let body = completion_event_body(
+                    &ctx.args,
+                    request_id,
+                    "usage",
+                    [
+                        ("prompt_tokens", Value::Number(prompt_tokens.into())),
+                        ("completion_tokens", Value::Number(completion_tokens.into())),
+                        ("model", Value::String(active_model.clone())),
+                    ],
+                );
+                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+            }
+            for call in &final_tool_calls {
+                let arguments = serde_json::from_str(&call.function.arguments)
+                    .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+                let body = completion_event_body(
+                    &ctx.args,
+                    request_id,
+                    "tool_call",
+                    [
+                        ("id", Value::String(call.id.clone())),
+                        ("name", Value::String(call.function.name.clone())),
+                        ("arguments", arguments),
+                    ],
+                );
+                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+            }
+            let body = if errored {
+                completion_event_body(
+                    &ctx.args,
+                    request_id,
+                    "error",
+                    [(
+                        "message",
+                        Value::String(final_error.unwrap_or_else(|| "completion failed".into())),
+                    )],
+                )
+            } else {
+                completion_event_body(
+                    &ctx.args,
+                    request_id,
+                    "completed",
+                    [
+                        ("text", Value::String(final_text)),
+                        ("reasoning", Value::String(final_reasoning)),
+                        (
+                            "finish_reason",
+                            final_finish_reason
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        ),
+                        ("model", Value::String(active_model)),
+                    ],
+                )
+            };
+            let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+            ctx.chats.end_turn(&chat_id).await;
             return;
         }
 

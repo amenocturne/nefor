@@ -397,28 +397,8 @@ async fn run_case(kind: ProviderKind) {
         let Body::Event(mut body) = outgoing.body else {
             continue;
         };
-        match kind {
-            ProviderKind::OpenAi
-                if body.get("kind").and_then(Value::as_str) == Some("completion.event") =>
-            {
-                body.insert("kind".into(), Value::String(completion_kind.clone()));
-            }
-            ProviderKind::ChatGpt
-                if body.get("kind").and_then(Value::as_str)
-                    == Some(&format!("{}.chat.complete.result", kind.name())) =>
-            {
-                let output = body
-                    .get("output")
-                    .cloned()
-                    .expect("provider terminal output");
-                body = object(json!({
-                    "kind": completion_kind,
-                    "request_id": body["chat_id"],
-                    "event": "completed",
-                    "result": output
-                }));
-            }
-            _ => {}
+        if body.get("kind").and_then(Value::as_str) == Some("completion.event") {
+            body.insert("kind".into(), Value::String(completion_kind.clone()));
         }
         if body.get("kind").and_then(Value::as_str) != Some(&completion_kind) {
             continue;
