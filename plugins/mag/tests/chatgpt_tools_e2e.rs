@@ -55,8 +55,13 @@ fn basic_tools_binary() -> &'static PathBuf {
     BINARY.get_or_init(|| built_binary("basic-tools-plugin", "basic-tools"))
 }
 
+fn mag_binary() -> &'static PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| built_binary("mag-plugin", "mag-plugin"))
+}
+
 async fn spawn_mag(data_dir: &Path) -> Child {
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_mag-plugin"))
+    tokio::process::Command::new(mag_binary())
         .arg("--kernel")
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua"))
         .arg("--tool-gate")
