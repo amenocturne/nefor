@@ -5,6 +5,19 @@ use crate::error::MagError;
 use crate::types::MagType;
 use std::collections::{BTreeMap, HashMap};
 
+pub(crate) fn json_number_to_i64(number: &serde_json::Number) -> Option<i64> {
+    number.as_i64().or_else(|| {
+        number
+            .as_f64()
+            .filter(|value| {
+                value.fract() == 0.0
+                    && *value >= i64::MIN as f64
+                    && *value < 9_223_372_036_854_775_808.0
+            })
+            .map(|value| value as i64)
+    })
+}
+
 pub fn value_to_json(env: &Env, value: &Value) -> Result<serde_json::Value, MagError> {
     match value {
         Value::Unit => Ok(serde_json::Value::Null),
@@ -418,7 +431,13 @@ pub fn json_to_typed_value(
                 .as_f64()
                 .ok_or_else(|| MagError::Type(format!("expected {ty}")))?,
         ),
-        MagType::Unit | MagType::Bool | MagType::Int | MagType::String => json_to_value(value),
+        MagType::Int => Value::Int(
+            value
+                .as_number()
+                .and_then(json_number_to_i64)
+                .ok_or_else(|| MagError::Type(format!("expected {ty}")))?,
+        ),
+        MagType::Unit | MagType::Bool | MagType::String => json_to_value(value),
         unsupported => {
             return Err(MagError::Type(format!(
                 "{unsupported} is not representable as rule input JSON"
@@ -431,6 +450,21 @@ pub fn json_to_typed_value(
 mod tests {
     use super::*;
     use crate::types::ConcreteType;
+
+    #[test]
+    fn typed_int_accepts_provider_integer_notation_and_rejects_non_ints() {
+        let env = Env::new();
+        assert!(matches!(
+            json_to_typed_value(&env, &serde_json::json!(1.0), &MagType::Int).unwrap(),
+            Value::Int(1)
+        ));
+        for value in [
+            serde_json::json!(1.5),
+            serde_json::from_str::<serde_json::Value>("9223372036854775808.0").unwrap(),
+        ] {
+            assert!(json_to_typed_value(&env, &value, &MagType::Int).is_err());
+        }
+    }
 
     #[test]
     fn canonical_semantic_descriptors_round_trip_and_reject_forged_shape() {

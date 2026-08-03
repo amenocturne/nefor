@@ -255,7 +255,11 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
             "minimum": i64::MIN,
             "maximum": i64::MAX,
         }),
-        SchemaType::Float => serde_json::json!({"type": "number"}),
+        SchemaType::Float => serde_json::json!({
+            "type": "number",
+            "minimum": f64::MIN,
+            "maximum": f64::MAX,
+        }),
         SchemaType::String => serde_json::json!({"type": "string"}),
         SchemaType::List { item } => serde_json::json!({
             "type": "array",
@@ -444,6 +448,13 @@ fn decode_provider_value(
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array)
         }
+        SchemaType::Int => match value {
+            Value::Number(number) if number.as_i64().is_some() => Ok(Value::Number(number)),
+            Value::Number(number) => crate::json::json_number_to_i64(&number)
+                .map(|number| Value::Number(serde_json::Number::from(number)))
+                .ok_or_else(|| provider_decode_violation(path, "Int", &Value::Number(number))),
+            value => Err(provider_decode_violation(path, "Int", &value)),
+        },
         SchemaType::Union { variants } => {
             let Value::Object(mut fields) = value else {
                 return Err(provider_decode_violation(path, "tagged sum object", &value));
@@ -1197,17 +1208,37 @@ mod tests {
         let provider = int.to_provider_schema().unwrap();
         assert_eq!(provider.schema["properties"]["value"]["minimum"], i64::MIN);
         assert_eq!(provider.schema["properties"]["value"]["maximum"], i64::MAX);
-        assert!(int
-            .validate_provider_json(r#"{"value":9223372036854775808}"#)
-            .violations
-            .iter()
-            .any(|v| v.code == "wrong_type"));
+        for (source, expected) in [
+            (r#"{"value":1.0}"#, Some(serde_json::json!(1))),
+            (
+                r#"{"value":-9223372036854775808}"#,
+                Some(serde_json::json!(i64::MIN)),
+            ),
+            (
+                r#"{"value":9223372036854775807}"#,
+                Some(serde_json::json!(i64::MAX)),
+            ),
+            (r#"{"value":1.5}"#, None),
+            (r#"{"value":9223372036854775808}"#, None),
+        ] {
+            let validation = int.validate_provider_json(source);
+            assert_eq!(validation.value, expected, "{source}: {validation:?}");
+        }
 
         let float = TypeSchema {
             version: SCHEMA_VERSION,
             root: SchemaType::Float,
         };
-        assert!(float.validate_provider_json(r#"{"value":1}"#).ok);
+        let provider = float.to_provider_schema().unwrap();
+        assert_eq!(provider.schema["properties"]["value"]["minimum"], f64::MIN);
+        assert_eq!(provider.schema["properties"]["value"]["maximum"], f64::MAX);
+        for value in [0.0, 1.0, f64::MIN, f64::MAX] {
+            let source = serde_json::json!({"value": value}).to_string();
+            assert!(
+                float.validate_provider_json(&source).ok,
+                "provider-valid boundary must decode: {source}"
+            );
+        }
     }
 
     #[test]

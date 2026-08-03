@@ -786,6 +786,9 @@ async fn handle_execute(
             return send_event(out_tx, error_body(in_reply_to, &error)).await;
         }
     }
+    if let Err(error) = preflight_provider_schemas(&modification) {
+        return send_event(out_tx, error_body(in_reply_to, &error)).await;
+    }
 
     let run_id = body
         .get("run_id")
@@ -868,6 +871,40 @@ async fn handle_execute(
             program: program.clone(),
         },
     );
+    Ok(())
+}
+
+fn preflight_provider_schemas(modification: &Value) -> Result<(), String> {
+    let Some(actors) = modification.get("actors").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for actor in actors {
+        let Some(actor) = actor.as_object() else {
+            continue;
+        };
+        if !matches!(
+            actor.get("factory").and_then(Value::as_str),
+            Some("structured-output" | "nefor.factory.structured-output")
+        ) {
+            continue;
+        }
+        let id = actor
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let schema = actor
+            .get("params")
+            .and_then(Value::as_object)
+            .and_then(|params| params.get("schema"))
+            .ok_or_else(|| format!("structured-output {id:?}: params.schema is required"))?;
+        let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(schema.clone())
+            .map_err(|error| {
+                format!("structured-output {id:?}: invalid MAG type schema: {error}")
+            })?;
+        schema
+            .to_provider_schema()
+            .map_err(|error| format!("structured-output {id:?}: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1534,6 +1571,100 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), MagErro
 mod tests {
     use super::*;
     use std::fs;
+
+    #[tokio::test]
+    async fn unsupported_provider_schema_rejects_before_run_start_or_provider_dispatch() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let host = LuaHost::load_kernel(
+            &manifest.join("lua/mag-kernel/init.lua"),
+            Some(&manifest.join("../../lua")),
+        )
+        .expect("kernel");
+        let body = serde_json::json!({
+            "run_id": "unsupported-schema",
+            "session_id": "session-1",
+            "artifact": {
+                "format": GRAPH_MODIFICATION_FORMAT,
+                "data": {
+                    "actors": [{
+                        "id": "answer",
+                        "factory": "structured-output",
+                        "params": {
+                            "schema": {"version": 1, "root": {"kind": "json_value"}}
+                        }
+                    }],
+                    "messages": [], "kills": [], "rules": []
+                }
+            }
+        });
+        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
+        let mut active = ActiveExecutes::new();
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        handle_execute(
+            &out_tx,
+            "direct",
+            body.as_object().expect("execute body"),
+            Some("execute-1"),
+            &None,
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .expect("rejection is a protocol response");
+
+        let outgoing = out_rx.try_recv().expect("one rejection response");
+        let Body::Event(body) = outgoing.body else {
+            panic!("expected event response")
+        };
+        assert_eq!(body["kind"], ERROR_KIND);
+        assert!(body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no faithful")));
+        assert!(
+            out_rx.try_recv().is_err(),
+            "no provider dispatch follows rejection"
+        );
+        assert!(active.is_empty(), "rejected execute never becomes active");
+        assert!(
+            host.drain_emits().expect("kernel emits").is_empty(),
+            "begin_run was never called, so mag.run_started was not emitted"
+        );
+    }
+
+    #[test]
+    fn provider_schema_preflight_rejects_unsupported_types_before_activation() {
+        let modification = serde_json::json!({
+            "actors": [{
+                "id": "answer",
+                "factory": "structured-output",
+                "params": {
+                    "schema": {"version": 1, "root": {"kind": "json_value"}}
+                }
+            }]
+        });
+        let error = preflight_provider_schemas(&modification).expect_err("JsonValue rejected");
+        assert!(error.contains("structured-output \"answer\""), "{error}");
+        assert!(error.contains("no faithful"), "{error}");
+    }
+
+    #[test]
+    fn provider_schema_preflight_preserves_supported_lowering() {
+        let modification = serde_json::json!({
+            "actors": [{
+                "id": "answer",
+                "factory": "nefor.factory.structured-output",
+                "params": {
+                    "schema": {"version": 1, "root": {"kind": "record", "fields": [{
+                        "name": "answer", "schema": {"kind": "int"}
+                    }]}}
+                }
+            }, {
+                "id": "prose",
+                "factory": "llm",
+                "params": {}
+            }]
+        });
+        preflight_provider_schemas(&modification).expect("supported schema lowers");
+    }
 
     #[test]
     fn execute_principal_validates_shipped_routes_and_defaults_custom_routes_untrusted() {
