@@ -80,14 +80,25 @@ boundaries; there is still no separate node registry or add-node operation.
 
 ## Structural type descriptors
 
-`(type-schema (type-tag T))` reifies a JSON-representable MAG type into an
-opaque compiler-owned `TypeSchema`. Named types remain named for diagnostics while
+`(type-schema (type-tag T))` reifies a MAG data type into an opaque,
+compiler-owned `TypeSchema`. Named types remain named for diagnostics while
 their substituted bodies describe the runtime structure. Records are strict:
-all fields are required and additional fields are rejected. The supported
-shapes are `JsonValue`, `Unit`, `Bool`, `Int`, `Float`, `String`, lists,
-string-keyed maps, records, unions, and products. Functions, foreign
-capabilities, artifacts, type tags, unresolved variables, and maps with
-non-string keys fail while loading the MAG program.
+all fields are required and additional fields are rejected. The descriptor can
+represent `JsonValue`, `Unit`, `Bool`, `Int`, `Float`, `String`, lists,
+string-keyed maps, records, unions, and products for MAG-side validation.
+Functions, foreign capabilities, artifacts, type tags, unresolved variables,
+and maps with non-string keys fail while loading the MAG program.
+
+The structured-agent provider boundary deliberately supports a narrower,
+faithful projection into OpenAI's strict JSON Schema dialect. Closed records,
+nested lists, primitives, and nominal sums are supported; non-record roots use
+a closed `value` envelope, and sums use mutually exclusive single-tag `anyOf`
+branches. Maps and products use reversible entry-list and positional-object
+encodings. `JsonValue` is rejected before provider execution because
+unrestricted JSON cannot be expressed faithfully. `Int` requests carry signed
+64-bit bounds, while `Float` accepts all finite JSON numbers, including integral
+syntax. After inverse projection, the original `TypeSchema` remains
+authoritative.
 
 The schema and `(type-evidence ...)` descriptors are transport-neutral opaque
 values. They serialize only when the compiler constructs an artifact; named
