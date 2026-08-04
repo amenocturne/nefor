@@ -461,7 +461,6 @@ async fn invalid_direct_completion_tools_fail_once_before_http() {
         ("mixed-spec", serde_json::json!(["alpha", {"name": "beta"}])),
         ("empty-name", serde_json::json!([" "])),
         ("duplicate", serde_json::json!(["alpha", "alpha"])),
-        ("unknown", serde_json::json!(["missing"])),
     ];
     for (request_id, tools) in invalid {
         in_tx

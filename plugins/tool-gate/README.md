@@ -6,7 +6,11 @@ providers and tool-providing plugins (basic-tools, etc.).
 Tool sources advertise privately to the gate via
 `tool-gate.tools.advertise`. The gate aggregates and re-emits a single
 public `tool.register` so providers see one canonical registry with
-`tool-gate.tool.invoke` as the entry point.
+`tool-gate.tool.invoke` as the entry point. Each public descriptor retains its
+advertising `owner`; MAG snapshots this owner-qualified registry and projects
+authored agent allowlists through it for every provider request. A profile can
+therefore contain a stale name without advertising a nonexistent tool or
+aborting the provider turn.
 Advertisement `source` and every tool `name` must be non-empty strings;
 whitespace-only identifiers are rejected. Any invalid advertisement emits a
 deterministic `tool-gate.advertise_error` and leaves the prior valid registry

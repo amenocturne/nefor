@@ -861,12 +861,17 @@ fn hello_body() -> Map<String, Value> {
 }
 
 fn tool_register_body(state: &GateState) -> Map<String, Value> {
-    let mut specs = state.advertised.values().flatten().collect::<Vec<_>>();
-    specs.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    let mut specs = state
+        .advertised
+        .iter()
+        .flat_map(|(owner, tools)| tools.iter().map(move |tool| (owner, tool)))
+        .collect::<Vec<_>>();
+    specs.sort_unstable_by(|(_, left), (_, right)| left.name.cmp(&right.name));
     let mut tools: Vec<Value> = Vec::new();
-    for ts in specs {
+    for (owner, ts) in specs {
         let mut m = Map::new();
         m.insert("name".into(), Value::String(ts.name.clone()));
+        m.insert("owner".into(), Value::String(owner.clone()));
         m.insert("description".into(), Value::String(ts.description.clone()));
         m.insert("parameters".into(), ts.parameters.clone());
         m.insert("display".into(), ts.display.clone());
@@ -1191,6 +1196,7 @@ mod tests {
         );
         let arr = body.get("tools").and_then(Value::as_array).unwrap();
         assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["owner"], "basic-tools");
     }
 
     #[tokio::test]

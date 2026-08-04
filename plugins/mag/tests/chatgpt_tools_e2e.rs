@@ -292,7 +292,7 @@ async fn fake_responses(listener: TcpListener) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_gate() {
+async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate() {
     let temp = tempfile::tempdir().expect("tempdir");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let base_url = format!("http://{}", listener.local_addr().expect("address"));
@@ -327,6 +327,7 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
     let advertisement = next_kind(&mut basic_tools_out, "tool-gate.tools.advertise").await;
     send(&mut gate_in, "basic-tools", advertisement).await;
     let register = next_kind(&mut gate_out, "tool.register").await;
+    send(&mut mag_in, "tool-gate", register.clone()).await;
     send(&mut provider_in, "tool-gate", register).await;
 
     // A disallowed call is rejected by the real gate before policy or source dispatch.
@@ -360,7 +361,7 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
       answer (nefor.actors.agent
                (as nefor.actors.AgentConfig {:id "answer" :model (nefor.contracts.identifier "test-model")
                 :profile (nefor.contracts.no-identifier) :provider "provider" :system "Read fixture.txt, then answer."
-                :tools ["read_file"] :da-policy (nefor.contracts.no-da-policy) :max-corrections 0})
+                :tools ["read_file" "python-read"] :da-policy (nefor.contracts.no-da-policy) :max-corrections 0})
                (type-tag nefor.contracts.Task) "task" (type-tag nefor.contracts.FinalAnswer))
       output (nefor.graph.output "result" (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
       topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
@@ -412,7 +413,7 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
             assert_eq!(invoke["name"], "read_file");
             assert_eq!(invoke["args"]["path"], "fixture.txt");
             assert_eq!(invoke["invocation"]["run_id"], "tool-run");
-            assert_eq!(invoke["allowlist"], json!(["read_file"]));
+            assert_eq!(invoke["allowlist"], json!(["read_file", "python-read"]));
             let upstream_invoke_id = invoke
                 .get("id")
                 .and_then(Value::as_str)
@@ -422,7 +423,7 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
 
             let permission = next_kind(&mut gate_out, "chat.tool.permission_request").await;
             assert_eq!(permission["tool"], "read_file");
-            assert_eq!(permission["allowlist"], json!(["read_file"]));
+            assert_eq!(permission["allowlist"], json!(["read_file", "python-read"]));
             send(
                 &mut gate_in,
                 "tool-validator",
@@ -438,7 +439,10 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
             assert_eq!(source_invoke["name"], "read_file");
             assert_eq!(source_invoke["args"]["path"], "fixture.txt");
             assert_eq!(source_invoke["from"], "answer.run-tool");
-            assert_eq!(source_invoke["allowlist"], json!(["read_file"]));
+            assert_eq!(
+                source_invoke["allowlist"],
+                json!(["read_file", "python-read"])
+            );
             assert_eq!(source_invoke["invocation"]["session_id"], "tool-session");
             assert_eq!(source_invoke["invocation"]["run_id"], "tool-run");
             assert_eq!(source_invoke["invocation"]["actor_id"], "answer.run-tool");

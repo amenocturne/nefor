@@ -6,6 +6,16 @@ actors, folding graph modifications over an initially empty graph. The lead
 writes tiny MAG programs ad-hoc during sessions; this plugin turns them into
 running workflows.
 
+## Tool projection
+
+Agent `tools` lists are requested capability profiles, not schema registries.
+MAG snapshots the configured tool gate's owner-qualified `tool.register`
+advertisement and attaches the matching descriptors to each provider request.
+Providers consume that request-local snapshot, while the original names remain
+the immutable allowlist enforced when a model invokes a tool. Names absent from
+the runtime advertisement are omitted from the model surface instead of
+failing the delegated run.
+
 ## Kernel
 
 The plugin ships its own kernel Lua tree at `lua/mag-kernel/` (entry

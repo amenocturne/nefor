@@ -62,20 +62,43 @@ impl ToolCatalog {
     /// Empty when no tool plugins are attached.
     pub async fn to_openai_tools(&self) -> Vec<Value> {
         let g = self.inner.lock().await;
-        let mut out = Vec::new();
-        for tools in g.values() {
-            for t in tools {
+        Self::format_openai_tools(g.values().flatten())
+    }
+
+    /// Project requested names through one runtime advertisement snapshot.
+    pub async fn project_names(&self, names: &[String]) -> Vec<ToolSpec> {
+        let g = self.inner.lock().await;
+        let mut resolved = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(spec) = g
+                .values()
+                .flat_map(|tools| tools.iter())
+                .find(|tool| &tool.name == name)
+                .cloned()
+            {
+                resolved.push(spec);
+            }
+        }
+        resolved
+    }
+
+    pub fn format_openai_tools<'a>(tools: impl IntoIterator<Item = &'a ToolSpec>) -> Vec<Value> {
+        tools
+            .into_iter()
+            .map(|tool| {
                 let mut function = serde_json::Map::new();
-                function.insert("name".into(), Value::String(t.name.clone()));
-                function.insert("description".into(), Value::String(t.description.clone()));
-                function.insert("parameters".into(), t.parameters.clone());
+                function.insert("name".into(), Value::String(tool.name.clone()));
+                function.insert(
+                    "description".into(),
+                    Value::String(tool.description.clone()),
+                );
+                function.insert("parameters".into(), tool.parameters.clone());
                 let mut wrapper = serde_json::Map::new();
                 wrapper.insert("type".into(), Value::String("function".into()));
                 wrapper.insert("function".into(), Value::Object(function));
-                out.push(Value::Object(wrapper));
-            }
-        }
-        out
+                Value::Object(wrapper)
+            })
+            .collect()
     }
 
     /// Reverse-map: tool `name` → owning plugin's `from` identity.
@@ -208,6 +231,16 @@ mod tests {
         assert_eq!(tools.len(), 1);
         let f = tools[0].get("function").expect("fn");
         assert_eq!(f.get("name").and_then(Value::as_str), Some("read_file"));
+    }
+
+    #[tokio::test]
+    async fn project_names_omits_stale_profile_entries() {
+        let cat = ToolCatalog::new();
+        cat.register_from("tool-gate", vec![read_file_spec()]).await;
+        let projected = cat
+            .project_names(&["read_file".into(), "python-read".into()])
+            .await;
+        assert_eq!(projected, vec![read_file_spec()]);
     }
 
     #[tokio::test]

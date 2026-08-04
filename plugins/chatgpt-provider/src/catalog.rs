@@ -68,21 +68,26 @@ impl ToolCatalog {
         g.values().flat_map(|v| v.iter().cloned()).collect()
     }
 
-    /// Resolve every requested name against one catalog snapshot.
-    /// Unknown names fail the request instead of silently narrowing its capability surface.
-    pub async fn resolve_names(&self, names: &[String]) -> Result<Vec<ToolSpec>, String> {
+    /// Project requested names through one catalog snapshot.
+    ///
+    /// The catalog came from runtime `tool.register` advertisements and is the
+    /// capability authority. An authored profile may outlive one of those
+    /// advertisements; missing names are therefore omitted rather than turned
+    /// into a provider failure.
+    pub async fn project_names(&self, names: &[String]) -> Vec<ToolSpec> {
         let g = self.inner.lock().await;
         let mut resolved = Vec::with_capacity(names.len());
         for name in names {
-            let spec = g
+            if let Some(spec) = g
                 .values()
                 .flat_map(|tools| tools.iter())
                 .find(|tool| &tool.name == name)
                 .cloned()
-                .ok_or_else(|| format!("completion.request names unknown tool `{name}`"))?;
-            resolved.push(spec);
+            {
+                resolved.push(spec);
+            }
         }
-        Ok(resolved)
+        resolved
     }
 
     /// Reverse-map: tool `name` → owning plugin's `from` identity.
@@ -224,6 +229,16 @@ mod tests {
         cat.register_from("basic-tools", vec![]).await;
         assert!(cat.all().await.is_empty());
         assert!(cat.owner_of("read_file").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn project_names_omits_stale_profile_entries() {
+        let cat = ToolCatalog::new();
+        cat.register_from("tool-gate", vec![read_file_spec()]).await;
+        let projected = cat
+            .project_names(&["read_file".into(), "python-read".into()])
+            .await;
+        assert_eq!(projected, vec![read_file_spec()]);
     }
 
     #[test]

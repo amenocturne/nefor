@@ -1562,16 +1562,41 @@ async fn handle_completion_request(
     let (tool_overrides, tool_allowlist) = match parse_direct_completion_tools(body.get("tools")) {
         Ok(DirectCompletionTools::Disabled) => (Some(Vec::new()), Some(Vec::new())),
         Ok(DirectCompletionTools::Allowlist(names)) => {
-            match ctx.catalog.resolve_names(&names).await {
-                Ok(specs) => (Some(specs), Some(names)),
-                Err(error) => {
+            let specs = match body.get("tool_specs") {
+                Some(value @ Value::Array(_)) => ToolCatalog::parse_tools(value)
+                    .into_iter()
+                    .filter(|spec| names.iter().any(|name| name == &spec.name))
+                    .collect(),
+                Some(_) => {
                     send_completion_event(ctx, Some(&request_id), "failed", |event| {
-                        event.insert("error".into(), Value::String(error));
+                        event.insert(
+                            "error".into(),
+                            Value::String(
+                                "completion.request `tool_specs` must be an array".into(),
+                            ),
+                        );
                     })
                     .await?;
                     return Ok(());
                 }
+                None => ctx.catalog.project_names(&names).await,
+            };
+            let projected_names = specs
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect::<Vec<_>>();
+            let missing = names
+                .iter()
+                .filter(|name| !projected_names.contains(name))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    request_id,
+                    missing = ?missing,
+                    "projected stale tool names out of completion request"
+                );
             }
+            (Some(specs), Some(projected_names))
         }
         Err(error) => {
             send_completion_event(ctx, Some(&request_id), "failed", |event| {

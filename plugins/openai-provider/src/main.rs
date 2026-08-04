@@ -248,7 +248,8 @@ async fn dispatch_event_with_completions(
 
     let prefix = config.event_prefix();
     if kind == format!("{prefix}completion.request") {
-        dispatch_completion_request(completions, auth, config, client, out_tx, body).await?;
+        dispatch_completion_request(completions, auth, catalog, config, client, out_tx, body)
+            .await?;
         return Ok(());
     }
     if kind == format!("{prefix}completion.cancel") {
@@ -886,6 +887,7 @@ async fn dispatch_event(
 async fn dispatch_completion_request(
     completions: &Arc<CompletionRuns>,
     auth: &Arc<AuthStore>,
+    catalog: &Arc<ToolCatalog>,
     config: &Config,
     client: &reqwest::Client,
     out_tx: &mpsc::Sender<PluginOutgoing>,
@@ -990,11 +992,58 @@ async fn dispatch_completion_request(
             "json_schema": {"name": "mag_output", "strict": true, "schema": schema},
         })
     });
-    let mut tools = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
+    let authored_tools = body.get("tools").and_then(Value::as_array);
+    let authored_names = authored_tools
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
+    let projected_specs = if authored_names.is_empty() {
+        authored_tools
+            .map(|tools| ToolCatalog::parse_tools(&Value::Array(tools.clone())))
+            .unwrap_or_default()
+    } else {
+        match body.get("tool_specs") {
+            Some(value @ Value::Array(_)) => ToolCatalog::parse_tools(value)
+                .into_iter()
+                .filter(|spec| authored_names.iter().any(|name| name == &spec.name))
+                .collect(),
+            Some(_) => {
+                completions.finish(&request_id, &run).await;
+                send_event(
+                    out_tx,
+                    completion_error_body(
+                        config,
+                        &request_id,
+                        "completion.request `tool_specs` must be an array",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            None => catalog.project_names(&authored_names).await,
+        }
+    };
+    let projected_names = projected_specs
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect::<Vec<_>>();
+    let missing = authored_names
+        .iter()
+        .filter(|name| !projected_names.contains(name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        tracing::warn!(
+            request_id,
+            missing = ?missing,
+            "projected stale tool names out of completion request"
+        );
+    }
+    let mut tools = ToolCatalog::format_openai_tools(projected_specs.iter());
     if let Some(extra) = body.get("extra_tools").and_then(Value::as_array) {
         tools.extend(extra.iter().cloned());
     }

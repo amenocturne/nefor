@@ -22,6 +22,12 @@ struct PendingProvider {
     tool_calls: Vec<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct AdvertisedTool {
+    owner: String,
+    spec: Value,
+}
+
 /// A terminal provider response ready for `kernel.bus_response`.
 pub struct ProviderReply {
     pub request_id: String,
@@ -33,6 +39,7 @@ pub struct ProviderReply {
 /// composition-owned tool-gate target.
 pub struct CapabilityBridge {
     pending_providers: HashMap<String, PendingProvider>,
+    advertised_tools: Option<HashMap<String, AdvertisedTool>>,
     gate: String,
 }
 
@@ -40,8 +47,47 @@ impl CapabilityBridge {
     pub fn new(gate: impl Into<String>) -> Self {
         Self {
             pending_providers: HashMap::new(),
+            advertised_tools: None,
             gate: gate.into(),
         }
+    }
+
+    /// Replace the runtime tool snapshot from the composition's canonical gate.
+    ///
+    /// The gate has already rejected malformed schemas and owner collisions.
+    /// MAG therefore treats its flattened `tool.register` event as immutable
+    /// descriptor data for subsequent provider requests, rather than asking
+    /// each provider to independently resolve an authored name list later.
+    pub fn observe_tool_register(&mut self, source: &str, body: &Map<String, Value>) -> bool {
+        if source != self.gate || body.get("kind").and_then(Value::as_str) != Some("tool.register")
+        {
+            return false;
+        }
+
+        let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+            return false;
+        };
+        let mut snapshot = HashMap::with_capacity(tools.len());
+        for spec in tools {
+            let Some(name) = spec.get("name").and_then(Value::as_str) else {
+                return false;
+            };
+            let Some(owner) = spec.get("owner").and_then(Value::as_str) else {
+                return false;
+            };
+            if name.is_empty() || owner.is_empty() || snapshot.contains_key(name) {
+                return false;
+            }
+            snapshot.insert(
+                name.to_owned(),
+                AdvertisedTool {
+                    owner: owner.to_owned(),
+                    spec: spec.clone(),
+                },
+            );
+        }
+        self.advertised_tools = Some(snapshot);
+        true
     }
 
     pub fn translate_emit(&mut self, body: Map<String, Value>) -> Vec<Map<String, Value>> {
@@ -87,6 +133,22 @@ impl CapabilityBridge {
             }
         }
         request.remove("chat_id");
+        if let (Some(catalog), Some(names)) = (
+            self.advertised_tools.as_ref(),
+            request.get("tools").and_then(Value::as_array),
+        ) {
+            let requested = names.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            if requested.len() == names.len() {
+                let mut specs = Vec::with_capacity(requested.len());
+                for name in requested {
+                    if let Some(tool) = catalog.get(name) {
+                        debug_assert!(!tool.owner.is_empty());
+                        specs.push(tool.spec.clone());
+                    }
+                }
+                request.insert("tool_specs".into(), Value::Array(specs));
+            }
+        }
         request.insert(
             "kind".into(),
             Value::String(format!("{provider}.completion.request")),
@@ -408,6 +470,93 @@ mod tests {
         body.insert("request_id".into(), Value::String(request_id.into()));
         body.insert("event".into(), Value::String(name.into()));
         body
+    }
+
+    fn register(tools: Value) -> Map<String, Value> {
+        obj(json!({"kind": "tool.register", "tools": tools}))
+    }
+
+    #[test]
+    fn provider_requests_project_authored_names_through_the_gate_snapshot() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        let snapshot = register(json!([
+            {
+                "name": "read_file",
+                "owner": "basic-tools",
+                "description": "Read a file.",
+                "parameters": {"type": "object"},
+                "display": {"label": "Read", "result": {"kind": "content"}}
+            },
+            {
+                "name": "instructions",
+                "owner": "read-only-tools",
+                "description": "Load instructions.",
+                "parameters": {"type": "object"},
+                "display": {"label": "Instructions", "result": {"kind": "content"}}
+            }
+        ]));
+        assert!(bridge.observe_tool_register("tool-gate", &snapshot));
+
+        let mut invoke = provider_invoke("req-projected", "provider-a", json!([]));
+        invoke
+            .get_mut("args")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "tools".into(),
+                json!(["read_file", "python-read", "instructions"]),
+            );
+        let out = bridge.translate_emit(invoke);
+
+        assert_eq!(
+            out[0]["tools"],
+            json!(["read_file", "python-read", "instructions"]),
+            "the authored list remains the immutable invocation allowlist"
+        );
+        assert_eq!(out[0]["tool_specs"].as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["tool_specs"][0]["name"], "read_file");
+        assert_eq!(out[0]["tool_specs"][0]["owner"], "basic-tools");
+        assert_eq!(out[0]["tool_specs"][1]["name"], "instructions");
+    }
+
+    #[test]
+    fn only_the_named_gate_can_replace_the_tool_snapshot() {
+        let mut bridge = CapabilityBridge::new("custom-gate");
+        let foreign = register(json!([{
+            "name": "stale", "owner": "foreign", "description": "",
+            "parameters": {}, "display": {"label": "Stale", "result": {"kind": "content"}}
+        }]));
+        assert!(!bridge.observe_tool_register("tool-gate", &foreign));
+
+        let canonical = register(json!([{
+            "name": "read_file", "owner": "basic-tools", "description": "",
+            "parameters": {}, "display": {"label": "Read", "result": {"kind": "content"}}
+        }]));
+        assert!(bridge.observe_tool_register("custom-gate", &canonical));
+        let replacement = register(json!([]));
+        assert!(bridge.observe_tool_register("custom-gate", &replacement));
+
+        let mut invoke = provider_invoke("req-empty", "provider-a", json!([]));
+        invoke
+            .get_mut("args")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("tools".into(), json!(["read_file"]));
+        let out = bridge.translate_emit(invoke);
+        assert_eq!(out[0]["tool_specs"], json!([]));
+    }
+
+    #[test]
+    fn provider_fallback_remains_available_before_the_first_gate_snapshot() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        let mut invoke = provider_invoke("req-legacy", "provider-a", json!([]));
+        invoke
+            .get_mut("args")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("tools".into(), json!(["read_file"]));
+        let out = bridge.translate_emit(invoke);
+        assert!(out[0].get("tool_specs").is_none());
     }
 
     #[test]

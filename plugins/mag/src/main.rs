@@ -497,6 +497,9 @@ async fn handle_event(
         Some(k) => k,
         None => return Ok(()),
     };
+    if bridge.observe_tool_register(source, body) {
+        return Ok(());
+    }
     // Canonical provider events correlate themselves by request_id. Terminal
     // events settle the kernel capability; streaming and other telemetry remain
     // observational and keep the request open. Unknown and late ids are ignored.
