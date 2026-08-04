@@ -333,6 +333,10 @@ do
       preview.value { value = preview.state("status", "string") },
       preview.stream { source = preview.stream_ref("items", { kind = "record", fields = { text = "string" } }),
         item = preview.value { value = preview.item("text") } },
+      preview.stream { source = preview.stream_ref("data_items", { kind = "record", fields = { value = "data" } }),
+        item = preview.value { value = preview.item("value") } },
+      preview.stream { source = preview.stream_ref("list_items", { kind = "record", fields = { value = "data" } }),
+        item = preview.value { value = preview.item("value") } },
     } },
   }
   local _, err = reg:register({ declaration = declaration, construct = function(id) return { id = id } end })
@@ -345,11 +349,17 @@ do
   local observe = router:preview_emitter("O")
   assert_true(observe("set", "status", "working"), "valid state set accepted")
   assert_true(observe("append", "items", { text = "complete" }), "valid stream append accepted")
+  assert_true(observe("append", "data_items", { value = nefor.json.decode("null") }),
+    "JSON null sentinel is accepted as serializable data")
+  assert_true(observe("append", "list_items", { value = nefor.json.decode("[]") }),
+    "host-decoded JSON arrays retain serializable array identity")
   assert_true(not observe("append", "items", { text = 7 }), "invalid stream item rejected")
+  assert_true(not observe("append", "items", { text = function() end }),
+    "non-serializable stream item rejected")
   assert_true(not observe("set", "items", {}), "wrong operation rejected")
   assert_true(not observe("update", "status", {}), "update rejected for non-record state")
-  assert_eq(#events, 2, "only valid observations reached the event sink")
-  assert_eq(#warnings, 3, "every malformed observation was isolated and logged")
+  assert_eq(#events, 4, "only valid observations reached the event sink")
+  assert_eq(#warnings, 4, "every malformed observation was isolated and logged")
 end
 
 -- ==================================================================

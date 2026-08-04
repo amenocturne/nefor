@@ -688,12 +688,19 @@ fn install_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
     })?;
     json.set("decode", decode)?;
 
-    // serde_json null crosses into Lua as mlua's dedicated NULL sentinel, not
-    // nil. Expose an exact predicate so field-specific optional-value
-    // boundaries can normalize it without treating arbitrary userdata as
-    // absence or erasing meaningful nulls elsewhere in actor data.
+    // serde_json null and arrays cross into Lua with mlua-owned identities:
+    // null is a dedicated userdata sentinel and arrays carry a private
+    // metatable (including empty arrays). Expose exact predicates so preview
+    // validation can admit JSON-native values without admitting arbitrary
+    // userdata or metatable-bearing tables.
     let is_null = lua.create_function(|_, value: Value| Ok(value.is_null()))?;
     json.set("is_null", is_null)?;
+    let array_metatable = lua.array_metatable();
+    let is_array = lua.create_function(move |_, value: Value| {
+        Ok(matches!(value, Value::Table(ref table)
+            if table.metatable().is_some_and(|mt| mt.to_pointer() == array_metatable.to_pointer())))
+    })?;
+    json.set("is_array", is_array)?;
 
     nefor_tbl.set("json", json)?;
     Ok(())

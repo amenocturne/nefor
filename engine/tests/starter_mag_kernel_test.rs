@@ -156,6 +156,14 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         lua.to_value(&v)
     })?;
     json.set("decode", decode)?;
+    let is_null = lua.create_function(|_, value: Value| Ok(value.is_null()))?;
+    json.set("is_null", is_null)?;
+    let array_metatable = lua.array_metatable();
+    let is_array = lua.create_function(move |_, value: Value| {
+        Ok(matches!(value, Value::Table(ref table)
+            if table.metatable().is_some_and(|mt| mt.to_pointer() == array_metatable.to_pointer())))
+    })?;
+    json.set("is_array", is_array)?;
     nefor.set("json", json)?;
 
     lua.globals().set("nefor", nefor)?;

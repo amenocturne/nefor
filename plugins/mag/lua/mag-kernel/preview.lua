@@ -58,8 +58,24 @@ local function is_dense_array(value)
   return count == maximum
 end
 
+local function is_json_null(value)
+  if type(value) ~= "userdata" then return false end
+  local json = type(nefor) == "table" and type(nefor.json) == "table" and nefor.json or nil
+  if not json or type(json.is_null) ~= "function" then return false end
+  local ok, result = pcall(json.is_null, value)
+  return ok and result == true
+end
+
+local function has_json_array_identity(value)
+  local json = type(nefor) == "table" and type(nefor.json) == "table" and nefor.json or nil
+  if not json or type(json.is_array) ~= "function" then return false end
+  local ok, result = pcall(json.is_array, value)
+  return ok and result == true
+end
+
 local function validate_serializable(value, path, visiting)
   local kind = type(value)
+  if kind == "userdata" and is_json_null(value) then return true end
   if kind == "function" or kind == "thread" or kind == "userdata" then
     return fail(path, kind .. " values are not serializable")
   end
@@ -67,7 +83,9 @@ local function validate_serializable(value, path, visiting)
     return fail(path, "non-finite numbers are not serializable")
   end
   if kind ~= "table" then return true end
-  if getmetatable(value) ~= nil then return fail(path, "metatables are not serializable declaration data") end
+  if getmetatable(value) ~= nil and not has_json_array_identity(value) then
+    return fail(path, "metatables are not serializable declaration data")
+  end
   visiting = visiting or {}
   if visiting[value] then return fail(path, "cycle in declaration data") end
   visiting[value] = true
