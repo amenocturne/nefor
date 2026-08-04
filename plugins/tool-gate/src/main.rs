@@ -205,6 +205,7 @@ struct PendingApproval {
     args: Value,
     invoking_from: Option<String>,
     invocation: Option<Value>,
+    allowlist: Option<Value>,
 }
 
 struct GateState {
@@ -647,6 +648,7 @@ async fn handle_tool_invoke(
                     args,
                     invoking_from,
                     invocation,
+                    allowlist: allowlist.map(|values| Value::Array(values.clone())),
                 },
             )
             .await?;
@@ -661,6 +663,7 @@ async fn handle_tool_invoke(
                     args: args.clone(),
                     invoking_from,
                     invocation,
+                    allowlist: allowlist.map(|values| Value::Array(values.clone())),
                 },
             );
             send_event(
@@ -692,6 +695,7 @@ async fn forward_to_source(
         args,
         invoking_from,
         invocation,
+        allowlist,
     } = invocation;
     let inner_id = state.next_inner_id();
     state.pending.insert(
@@ -710,8 +714,11 @@ async fn forward_to_source(
             &outer_id,
             &name,
             args,
-            invoking_from.as_deref(),
-            invocation.as_ref(),
+            ForwardMetadata {
+                invoking_from: invoking_from.as_deref(),
+                invocation: invocation.as_ref(),
+                allowlist: allowlist.as_ref(),
+            },
         ),
     )
     .await?;
@@ -871,14 +878,19 @@ fn tool_register_body(state: &GateState) -> Map<String, Value> {
     m
 }
 
+struct ForwardMetadata<'a> {
+    invoking_from: Option<&'a str>,
+    invocation: Option<&'a Value>,
+    allowlist: Option<&'a Value>,
+}
+
 fn forward_invoke_body(
     source: &str,
     inner_id: &str,
     caller_id: &str,
     name: &str,
     args: Value,
-    invoking_from: Option<&str>,
-    invocation: Option<&Value>,
+    metadata: ForwardMetadata<'_>,
 ) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
@@ -887,11 +899,14 @@ fn forward_invoke_body(
     );
     m.insert("id".into(), Value::String(inner_id.to_owned()));
     m.insert("caller_id".into(), Value::String(caller_id.to_owned()));
-    if let Some(from) = invoking_from {
+    if let Some(from) = metadata.invoking_from {
         m.insert("from".into(), Value::String(from.to_owned()));
     }
-    if let Some(invocation) = invocation {
+    if let Some(invocation) = metadata.invocation {
         m.insert("invocation".into(), invocation.clone());
+    }
+    if let Some(allowlist) = metadata.allowlist {
+        m.insert("allowlist".into(), allowlist.clone());
     }
     m.insert("name".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args);
@@ -1477,6 +1492,7 @@ mod tests {
                 "capability_id": "r-old/cap-1",
                 "principal": "lead"
             },
+            "allowlist": ["mag"],
             "name": "mag",
             "args": {"action": "execute", "file": "build.mag"}
         })
@@ -1506,6 +1522,7 @@ mod tests {
             "session-before-switch"
         );
         assert_eq!(forwarded["body"]["invocation"]["principal"], "lead");
+        assert_eq!(forwarded["body"]["allowlist"], json!(["mag"]));
         assert_eq!(forwarded["body"]["caller_id"], "r-old/cap-1");
     }
 

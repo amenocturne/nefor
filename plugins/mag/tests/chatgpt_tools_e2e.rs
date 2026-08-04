@@ -128,13 +128,22 @@ async fn outgoing(reader: &mut BufReader<ChildStdout>, expecting: &str) -> Plugi
     }
 }
 
-async fn assert_no_output(reader: &mut BufReader<ChildStdout>, context: &str) {
-    let mut line = String::new();
-    match timeout(Duration::from_millis(200), reader.read_line(&mut line)).await {
-        Err(_) => {}
-        Ok(Ok(0)) => panic!("plugin closed while checking {context}"),
-        Ok(Ok(_)) => panic!("unexpected output while checking {context}: {line}"),
-        Ok(Err(error)) => panic!("read while checking {context}: {error}"),
+async fn expect_denial_without_source_invocation(
+    reader: &mut BufReader<ChildStdout>,
+    blocked_id: &str,
+) -> Map<String, Value> {
+    loop {
+        let Body::Event(body) = outgoing(reader, "correlated gate denial").await.body else {
+            continue;
+        };
+        let kind = body.get("kind").and_then(Value::as_str);
+        if kind.is_some_and(|kind| kind.ends_with(".tool.invoke")) {
+            panic!("blocked invocation reached a source: {body:?}");
+        }
+        if kind == Some("tool.result") && body.get("id").and_then(Value::as_str) == Some(blocked_id)
+        {
+            return body;
+        }
     }
 }
 
@@ -332,16 +341,11 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
         })),
     )
     .await;
-    let denied = next_kind(&mut gate_out, "tool.result").await;
+    let denied = expect_denial_without_source_invocation(&mut gate_out, "blocked-probe").await;
     assert_eq!(denied["id"], "blocked-probe");
     assert!(denied["error"]
         .as_str()
         .is_some_and(|error| error.contains("not in this invocation's allowlist")));
-    assert_no_output(
-        &mut basic_tools_out,
-        "disallowed invocation must not reach basic-tools",
-    )
-    .await;
 
     tokio::fs::write(temp.path().join("fixture.txt"), FIXTURE_CONTENT)
         .await
@@ -429,7 +433,18 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
             assert_eq!(source_invoke["name"], "read_file");
             assert_eq!(source_invoke["args"]["path"], "fixture.txt");
             assert_eq!(source_invoke["from"], "answer.run-tool");
+            assert_eq!(source_invoke["allowlist"], json!(["read_file"]));
+            assert_eq!(source_invoke["invocation"]["session_id"], "tool-session");
             assert_eq!(source_invoke["invocation"]["run_id"], "tool-run");
+            assert_eq!(source_invoke["invocation"]["actor_id"], "answer.run-tool");
+            assert_eq!(
+                source_invoke["invocation"]["capability_id"],
+                source_invoke["caller_id"]
+            );
+            assert_eq!(source_invoke["invocation"]["principal"], "lead");
+            assert!(source_invoke["invocation"]["run_scope"]
+                .as_str()
+                .is_some_and(|scope| scope.starts_with('r')));
             send(&mut basic_tools_in, "tool-gate", source_invoke).await;
             let source_result = next_kind(&mut basic_tools_out, "tool.result").await;
             assert_eq!(source_result["output"], FIXTURE_CONTENT);
