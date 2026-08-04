@@ -16,6 +16,11 @@ the immutable allowlist enforced when a model invokes a tool. Names absent from
 the runtime advertisement are omitted from the model surface instead of
 failing the delegated run.
 
+Direct providers attach `model` and `duration_ms` to terminal observations and
+to usage observations when token usage exists. MAG projects those fields
+unchanged, so the chat surface can render per-turn model, elapsed time, and
+throughput without knowing which provider produced the response.
+
 ## Kernel
 
 The plugin ships its own kernel Lua tree at `lua/mag-kernel/` (entry

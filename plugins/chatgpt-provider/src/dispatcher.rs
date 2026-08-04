@@ -3164,7 +3164,10 @@ fn spawn_turn(
                         &ctx.args,
                         request_id,
                         "reasoning_end",
-                        [("text", Value::String(reasoning_text.clone()))],
+                        [
+                            ("text", Value::String(reasoning_text.clone())),
+                            ("duration_ms", Value::Number(duration_ms.into())),
+                        ],
                     )
                 } else {
                     stream_reasoning_end_body(
@@ -3290,6 +3293,7 @@ fn spawn_turn(
                 ctx.chats.end_turn(&chat_id).await;
                 return;
             }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
 
             if let Some((prompt_tokens, completion_tokens)) = total_usage {
                 let body = completion_event_body(
@@ -3300,6 +3304,7 @@ fn spawn_turn(
                         ("prompt_tokens", Value::Number(prompt_tokens.into())),
                         ("completion_tokens", Value::Number(completion_tokens.into())),
                         ("model", Value::String(active_model.clone())),
+                        ("duration_ms", Value::Number(elapsed_ms.into())),
                     ],
                 );
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
@@ -3324,10 +3329,16 @@ fn spawn_turn(
                     &ctx.args,
                     request_id,
                     "error",
-                    [(
-                        "message",
-                        Value::String(final_error.unwrap_or_else(|| "completion failed".into())),
-                    )],
+                    [
+                        (
+                            "message",
+                            Value::String(
+                                final_error.unwrap_or_else(|| "completion failed".into()),
+                            ),
+                        ),
+                        ("model", Value::String(active_model)),
+                        ("duration_ms", Value::Number(elapsed_ms.into())),
+                    ],
                 )
             } else {
                 completion_event_body(
@@ -3344,6 +3355,7 @@ fn spawn_turn(
                                 .unwrap_or(Value::Null),
                         ),
                         ("model", Value::String(active_model)),
+                        ("duration_ms", Value::Number(elapsed_ms.into())),
                     ],
                 )
             };

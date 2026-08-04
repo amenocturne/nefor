@@ -5,15 +5,12 @@
 -- alongside the openai-provider/ollama instance unconditionally; both
 -- register on the bus and show up in the /model picker.
 --
--- Speaks the same wire shape as openai-provider:
---   <name>.chat.create  { chat_id, model?, system? }
---   <name>.chat.append  { chat_id, message: { role, content, ... } }
---   <name>.chat.complete { chat_id }
+-- Speaks the same direct-completion wire shape as openai-provider:
+--   <name>.completion.request { request_id, messages, model?, ... }
 -- responds with:
---   <name>.stream.delta { id, chat_id, text }   (one or more)
---   <name>.stream.end   { id, chat_id, text, model, duration_ms, finish_reason? }
---   <name>.chat.complete.result { chat_id, output: ProviderInput }
---   <name>.chat.error   { chat_id, message }    (error-shaped close)
+--   <name>.completion.event { request_id, event="text_delta", text }
+--   <name>.completion.event { request_id, event="usage", model, duration_ms, ... }
+--   <name>.completion.event { request_id, event="completed", result, model, duration_ms }
 --
 -- ProviderInput shape (matching openai-provider's chat_complete_result_body):
 --   { text, tool_calls?: [{id, name, arguments: object}], finish_reason?, usage }
@@ -695,6 +692,7 @@ local CANNED_REASONING_CHUNKS = {
 -- the dominant cost of an interactive turn.
 local STREAM_CHUNK_CODEPOINTS = 16
 local STREAM_PACE_MS          = 20
+local DIRECT_TURN_DURATION_MS = 250
 
 -- Skip pacing under tests — agentic_cli_mock_e2e fires several
 -- scenarios with a 10s wall-clock cap and the long-stream regression
@@ -731,27 +729,27 @@ local function is_cancelled(cancellation, request_id)
   return cancellation.cancelled or cancellation[request_id]
 end
 
-local function emit_reasoning(chat_id, id, cancellation)
+local function emit_reasoning(request_id, cancellation)
   -- Emit reasoning chunks ahead of the content stream, then a
   -- reasoning_end carrying the full accumulated text. Mirrors what
   -- openai-provider does on a real Qwen 3 turn.
   local full = ""
   for i, chunk in ipairs(CANNED_REASONING_CHUNKS) do
-    if is_cancelled(cancellation, chat_id) then return false end
+    if is_cancelled(cancellation, request_id) then return false end
     full = full .. chunk
-    nefor.emit("stream.reasoning_delta", {
-      id      = id,
-      chat_id = chat_id,
-      text    = chunk,
+    nefor.emit("completion.event", {
+      request_id = request_id,
+      event      = "reasoning_delta",
+      text       = chunk,
     })
     if i < #CANNED_REASONING_CHUNKS then pace() end
   end
-  if is_cancelled(cancellation, chat_id) then return false end
-  nefor.emit("stream.reasoning_end", {
-    id          = id,
-    chat_id     = chat_id,
+  if is_cancelled(cancellation, request_id) then return false end
+  nefor.emit("completion.event", {
+    request_id  = request_id,
+    event       = "reasoning_end",
     text        = full,
-    duration_ms = 250,
+    duration_ms = DIRECT_TURN_DURATION_MS,
   })
   return true
 end
@@ -760,14 +758,12 @@ end
 -- `completed` is true if the stream ran to completion and `partial` is
 -- the substring emitted before cancellation. Direct requests discard that
 -- request-local partial value when the handler returns.
-local function emit_stream(chat_id, text, opts, cancellation)
+local function emit_stream(request_id, text, opts, cancellation)
   if type(text) ~= "string" or #text == 0 then return true, "" end
   opts = opts or {}
   cancellation = cancellation or interrupted
-  local id = "resp-" .. chat_id
-
   if opts.with_reasoning then
-    if not emit_reasoning(chat_id, id, cancellation) then return false, "" end
+    if not emit_reasoning(request_id, cancellation) then return false, "" end
   end
 
   -- Stream the response in small fixed-size chunks paced to ~200 tok/s
@@ -780,29 +776,22 @@ local function emit_stream(chat_id, text, opts, cancellation)
   local cp_i = 1
   local emitted = ""
   while cp_i <= cp_count do
-    if is_cancelled(cancellation, chat_id) then return false, emitted end
+    if is_cancelled(cancellation, request_id) then return false, emitted end
     local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
     local byte_start = utf8.offset(text, cp_i)
     local byte_after_stop = utf8.offset(text, cp_stop + 1)
     local byte_stop = byte_after_stop and (byte_after_stop - 1) or #text
     local chunk = string.sub(text, byte_start, byte_stop)
-    nefor.emit("stream.delta", {
-      id      = id,
-      chat_id = chat_id,
-      text    = chunk,
+    nefor.emit("completion.event", {
+      request_id = request_id,
+      event      = "text_delta",
+      text       = chunk,
     })
     emitted = emitted .. chunk
     cp_i = cp_stop + 1
     if cp_i <= cp_count then pace() end
   end
-  if is_cancelled(cancellation, chat_id) then return false, emitted end
-  nefor.emit("stream.end", {
-    id            = id,
-    chat_id       = chat_id,
-    text          = text,
-    model         = "mock-model",
-    duration_ms   = 0,
-  })
+  if is_cancelled(cancellation, request_id) then return false, emitted end
   return true, text
 end
 
@@ -939,9 +928,19 @@ local function complete_request(body)
     output.reasoning = full
   end
   nefor.emit("completion.event", {
+    request_id        = chat_id,
+    event             = "usage",
+    prompt_tokens     = 0,
+    completion_tokens = type(resp.text) == "string" and #resp.text or 0,
+    model             = "mock-model",
+    duration_ms       = DIRECT_TURN_DURATION_MS,
+  })
+  nefor.emit("completion.event", {
     request_id = chat_id,
     event      = "completed",
     result     = output,
+    model      = "mock-model",
+    duration_ms = DIRECT_TURN_DURATION_MS,
   })
 
   if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end

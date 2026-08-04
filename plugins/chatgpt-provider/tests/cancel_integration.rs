@@ -611,6 +611,8 @@ async fn concurrent_direct_completions_keep_request_local_tool_allowlists() {
                 .await
                 .expect("completion settles");
         assert_eq!(completed["text"], "done");
+        assert_eq!(completed["model"], "test-model");
+        assert!(completed["duration_ms"].as_u64().is_some());
     }
 
     drop(in_tx);

@@ -46,7 +46,7 @@
 mod error;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
@@ -1055,6 +1055,7 @@ async fn dispatch_completion_request(
     let client = client.clone();
     let out_tx = out_tx.clone();
     tokio::spawn(async move {
+        let started = Instant::now();
         let event_prefix = config.event_prefix();
         let text_event_prefix = event_prefix.clone();
         let reasoning_event_prefix = event_prefix.clone();
@@ -1067,6 +1068,7 @@ async fn dispatch_completion_request(
         let tx_for_reasoning = out_tx.clone();
         let id_for_retry = request_id.clone();
         let tx_for_retry = out_tx.clone();
+        let mut reasoning_started_at: Option<Instant> = None;
         let result = run_chat_stream_with_retry_progress_and_format(
             &client,
             &config.chat_endpoint(),
@@ -1088,17 +1090,34 @@ async fn dispatch_completion_request(
                     )));
                 }
             },
-            move |event| {
-                let (event, text) = match event {
-                    ReasoningEvent::Delta(text) => ("reasoning_delta", text),
-                    ReasoningEvent::End { text } => ("reasoning_end", text),
-                };
-                let _ = tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
-                    &reasoning_event_prefix,
-                    &id_for_reasoning,
-                    event,
-                    [("text", Value::String(text.to_owned()))],
-                )));
+            move |event| match event {
+                ReasoningEvent::Delta(text) => {
+                    if reasoning_started_at.is_none() {
+                        reasoning_started_at = Some(Instant::now());
+                    }
+                    let _ =
+                        tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
+                            &reasoning_event_prefix,
+                            &id_for_reasoning,
+                            "reasoning_delta",
+                            [("text", Value::String(text.to_owned()))],
+                        )));
+                }
+                ReasoningEvent::End { text } => {
+                    let duration_ms = reasoning_started_at
+                        .map(|started| started.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let _ =
+                        tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
+                            &reasoning_event_prefix,
+                            &id_for_reasoning,
+                            "reasoning_end",
+                            [
+                                ("text", Value::String(text.to_owned())),
+                                ("duration_ms", Value::Number(duration_ms.into())),
+                            ],
+                        )));
+                }
             },
             move |progress| {
                 let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body(
@@ -1128,6 +1147,7 @@ async fn dispatch_completion_request(
         if cancel.is_cancelled() {
             return;
         }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(outcome) => {
                 if let Some(usage) = outcome.usage {
@@ -1143,6 +1163,7 @@ async fn dispatch_completion_request(
                                     Value::Number(usage.completion_tokens.into()),
                                 ),
                                 ("model", Value::String(model.clone())),
+                                ("duration_ms", Value::Number(elapsed_ms.into())),
                             ],
                         )))
                         .await;
@@ -1179,16 +1200,22 @@ async fn dispatch_completion_request(
                                     .unwrap_or(Value::Null),
                             ),
                             ("model", Value::String(model.clone())),
+                            ("duration_ms", Value::Number(elapsed_ms.into())),
                         ],
                     )))
                     .await;
             }
             Err(error) => {
                 let _ = out_tx
-                    .send(PluginOutgoing::event(completion_error_body(
-                        &config,
+                    .send(PluginOutgoing::event(completion_event_body(
+                        &event_prefix,
                         &request_id,
-                        &error.to_string(),
+                        "error",
+                        [
+                            ("message", Value::String(error.to_string())),
+                            ("model", Value::String(model)),
+                            ("duration_ms", Value::Number(elapsed_ms.into())),
+                        ],
                     )))
                     .await;
             }
@@ -2963,6 +2990,19 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.get("event").and_then(Value::as_str) == Some("usage")));
+        let usage = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("usage"))
+            .expect("usage event");
+        assert!(usage.get("duration_ms").and_then(Value::as_u64).is_some());
+        let reasoning_end = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("reasoning_end"))
+            .expect("reasoning end event");
+        assert!(reasoning_end
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .is_some());
         let terminal = events.last().expect("terminal event");
         assert_eq!(
             terminal.get("event").and_then(Value::as_str),
@@ -2972,6 +3012,14 @@ mod tests {
             terminal.get("text").and_then(Value::as_str),
             Some(r#"{"content":"ok"}"#)
         );
+        assert_eq!(
+            terminal.get("model").and_then(Value::as_str),
+            Some("qwen2.5-coder:7b")
+        );
+        assert!(terminal
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .is_some());
         assert_eq!(
             events
                 .iter()

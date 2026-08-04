@@ -12,6 +12,7 @@
     {"kind": "key", "key": "Enter"},
     {"kind": "wait_text", "text": "secret key is now", "timeout_ms": 30000},
     {"kind": "wait_not_text", "text": "[thinking", "timeout_ms": 10000},
+    {"kind": "wait_text", "text": "▣ mock-model · 250ms", "timeout_ms": 10000},
     {"kind": "wait_idle", "idle_ms": 500, "timeout_ms": 10000},
     {"kind": "key", "key": "CtrlC"},
     {"kind": "key", "key": "CtrlC"},

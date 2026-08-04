@@ -225,11 +225,10 @@ impl CapabilityBridge {
             "reasoning_end" | "reasoning_completed" => "chat.stream.reasoning_end",
             "usage" => "chat.session.stats",
             "retry" => "chat.toast",
-            "completed" | "result" | "failed" | "error" | "interrupted"
-                if pending.observed_stream =>
-            {
+            "completed" | "result" if pending.observed_stream || pending.structured_output => {
                 "chat.stream.end"
             }
+            "failed" | "error" | "interrupted" if pending.observed_stream => "chat.stream.end",
             _ => return None,
         };
         let stream_id = pending.stream_id.clone();
@@ -839,6 +838,113 @@ mod tests {
             .take_reply(done["kind"].as_str().unwrap(), &done)
             .unwrap();
         assert_eq!(reply.result.unwrap()["tool_calls"][0]["name"], "read_file");
+    }
+
+    #[test]
+    fn provider_timing_metadata_projects_onto_visible_chat_events() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        bridge.translate_emit(provider_invoke_with_stream(
+            "req-1",
+            "run/lead.llm@round-1",
+            "provider-a",
+            json!([]),
+        ));
+        let delta = event(
+            "req-1",
+            "provider-a",
+            "text_delta",
+            json!({"text": "answer"}),
+        );
+        assert!(bridge
+            .project_event(delta["kind"].as_str().unwrap(), &delta)
+            .is_some());
+
+        let reasoning = event(
+            "req-1",
+            "provider-a",
+            "reasoning_end",
+            json!({"text": "thought", "duration_ms": 420}),
+        );
+        let projected_reasoning = bridge
+            .project_event(reasoning["kind"].as_str().unwrap(), &reasoning)
+            .expect("reasoning completion projects");
+        assert_eq!(projected_reasoning["kind"], "chat.stream.reasoning_end");
+        assert_eq!(projected_reasoning["duration_ms"], 420);
+
+        let usage = event(
+            "req-1",
+            "provider-a",
+            "usage",
+            json!({
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "model": "gpt-test",
+                "duration_ms": 1_500
+            }),
+        );
+        let projected_usage = bridge
+            .project_event(usage["kind"].as_str().unwrap(), &usage)
+            .expect("usage projects");
+        assert_eq!(projected_usage["kind"], "chat.session.stats");
+        assert_eq!(projected_usage["completion_tokens"], 30);
+        assert_eq!(projected_usage["duration_ms"], 1_500);
+
+        let completed = event(
+            "req-1",
+            "provider-a",
+            "completed",
+            json!({"text": "answer", "model": "gpt-test", "duration_ms": 1_500}),
+        );
+        let projected_completed = bridge
+            .project_event(completed["kind"].as_str().unwrap(), &completed)
+            .expect("terminal projects");
+        assert_eq!(projected_completed["kind"], "chat.stream.end");
+        assert_eq!(projected_completed["model"], "gpt-test");
+        assert_eq!(projected_completed["duration_ms"], 1_500);
+    }
+
+    #[test]
+    fn structured_terminal_projects_metadata_when_text_deltas_are_hidden() {
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        let mut invoke = provider_invoke_with_stream(
+            "req-structured",
+            "run/lead.llm@round-1",
+            "provider-a",
+            json!([]),
+        );
+        invoke
+            .get_mut("args")
+            .and_then(Value::as_object_mut)
+            .expect("provider args")
+            .insert(
+                "output_schema".into(),
+                json!({"type": "object", "properties": {"content": {"type": "string"}}}),
+            );
+        bridge.translate_emit(invoke);
+
+        let hidden_delta = event(
+            "req-structured",
+            "provider-a",
+            "text_delta",
+            json!({"text": "{\"content\":"}),
+        );
+        assert!(bridge
+            .project_event(hidden_delta["kind"].as_str().unwrap(), &hidden_delta)
+            .is_none());
+
+        let completed = event(
+            "req-structured",
+            "provider-a",
+            "completed",
+            json!({"model": "gpt-test", "duration_ms": 750, "text": "{\"content\":\"ok\"}"}),
+        );
+        let projected = bridge
+            .project_event(completed["kind"].as_str().unwrap(), &completed)
+            .expect("structured terminal reserves the metadata-bearing entry");
+        assert_eq!(projected["kind"], "chat.stream.end");
+        assert_eq!(projected["model"], "gpt-test");
+        assert_eq!(projected["duration_ms"], 750);
+        assert!(projected.get("text").is_none());
     }
 
     #[test]
