@@ -413,6 +413,11 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
             assert_eq!(invoke["args"]["path"], "fixture.txt");
             assert_eq!(invoke["invocation"]["run_id"], "tool-run");
             assert_eq!(invoke["allowlist"], json!(["read_file"]));
+            let upstream_invoke_id = invoke
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("tool-gate.tool.invoke.id must be a string")
+                .to_owned();
             send(&mut gate_in, "mag", invoke).await;
 
             let permission = next_kind(&mut gate_out, "chat.tool.permission_request").await;
@@ -438,8 +443,16 @@ async fn chatgpt_direct_allowlist_reaches_http_and_tool_result_returns_through_g
             assert_eq!(source_invoke["invocation"]["run_id"], "tool-run");
             assert_eq!(source_invoke["invocation"]["actor_id"], "answer.run-tool");
             assert_eq!(
-                source_invoke["invocation"]["capability_id"],
-                source_invoke["caller_id"]
+                source_invoke.get("caller_id").and_then(Value::as_str),
+                Some(upstream_invoke_id.as_str()),
+                "source caller_id must preserve the upstream tool invocation ID"
+            );
+            assert_eq!(
+                source_invoke["invocation"]
+                    .get("capability_id")
+                    .and_then(Value::as_str),
+                Some(upstream_invoke_id.as_str()),
+                "source invocation.capability_id must preserve the upstream tool invocation ID"
             );
             assert_eq!(source_invoke["invocation"]["principal"], "lead");
             assert!(source_invoke["invocation"]["run_scope"]
