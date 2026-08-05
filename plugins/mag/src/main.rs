@@ -286,9 +286,8 @@ async fn run_dispatch_loop(
     // Concurrent `mag.execute` requests each hold one entry; each settles
     // independently against its own run-scoped kernel context.
     let mut active: ActiveExecutes = HashMap::new();
-    // Capability bridge: drives each provider-class `tool.invoke` as a
-    // `chat.*` conversation (correlating the streamed result back; state keyed
-    // by chat_id) and rewrites each tool-class `tool.invoke` onto the
+    // Capability bridge: correlates provider-class `tool.invoke` requests with
+    // provider completions and rewrites tool-class invocations onto the
     // composition-named gate's `<gate>.tool.invoke` contract (bridge.rs).
     let mut bridge = CapabilityBridge::new(resolve_gate_target());
     loop {
@@ -336,7 +335,7 @@ async fn run_dispatch_loop(
 /// Forward everything the kernel emitted since the last drain (capability
 /// requests + lifecycle events) onto the NCP wire, in order. Each drained body
 /// passes through the capability bridge first: a provider-class `tool.invoke`
-/// is rewritten into its `chat.*` conversation, a tool-class `tool.invoke` onto
+/// becomes a single-shot completion request, a tool-class `tool.invoke` goes to
 /// the gate's `<gate>.tool.invoke` contract (bridge.rs); everything else
 /// forwards unchanged.
 async fn flush_emits(
@@ -504,9 +503,6 @@ async fn handle_event(
     // events settle the kernel capability; streaming and other telemetry remain
     // observational and keep the request open. Unknown and late ids are ignored.
     if let Some(request_id) = bridge.provider_request_id(kind, body).map(str::to_owned) {
-        if let Some(projected) = bridge.project_event(kind, body) {
-            send_event(out_tx, projected).await?;
-        }
         if let Some(event @ ("text_delta" | "reasoning_delta")) =
             body.get("event").and_then(Value::as_str)
         {

@@ -70,14 +70,6 @@ function M.construct(id, params, emit, options)
   for key, value in pairs(conversation.provenance or {}) do provenance[key] = value end
   provenance.provider = provider
   provenance.model = params.model
-  local facts = conversation_facts.new({
-    conversation_id = conversation.id,
-    turn_id = conversation.turn_id,
-    provenance = provenance,
-    emit = conversation.emit,
-  })
-  if not conversation.is_root then facts:create(provenance) end
-  facts:start_turn()
 
   local function sign(message)
     message.from = id
@@ -95,6 +87,30 @@ function M.construct(id, params, emit, options)
   local steered_messages = {}
   local streamed_message_id = nil
   local terminal_metadata = {}
+  local facts = nil
+  local firing_sequence = 0
+  local conversation_created = conversation.is_root
+
+  local function start_firing()
+    firing_sequence = firing_sequence + 1
+    local turn_id = conversation.turn_id
+    if firing_sequence > 1 then
+      turn_id = turn_id .. ":firing:" .. tostring(firing_sequence)
+    end
+    facts = conversation_facts.new({
+      conversation_id = conversation.id,
+      turn_id = turn_id,
+      provenance = provenance,
+      emit = conversation.emit,
+    })
+    if not conversation_created then
+      facts:create(provenance)
+      conversation_created = true
+    end
+    facts:start_turn()
+    streamed_message_id = nil
+    terminal_metadata = {}
+  end
 
   local function merge_terminal(detail)
     local merged = {}
@@ -176,7 +192,6 @@ function M.construct(id, params, emit, options)
       system = params.system,
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,
-      context_artifact = params.context_artifact,
       conversation_context = params.conversation_context,
       output_schema = params.schema,
       max_corrections = params.max_corrections,
@@ -283,6 +298,7 @@ function M.construct(id, params, emit, options)
     if draining then return nil end
     local continuation = awaiting_continuation
     awaiting_continuation = false
+    if not continuation then start_firing() end
     if not turn_active then turn_active = true end
     extend_history(((activation.messages or {})[1] or {}).message)
     append_steered_messages()
@@ -296,7 +312,7 @@ function M.construct(id, params, emit, options)
     turn_active = false
     awaiting_continuation = false
     interrupt_stream("actor_killed")
-    facts:interrupt_turn({ reason = "actor_killed" })
+    if facts then facts:interrupt_turn({ reason = "actor_killed" }) end
   end
 
   function instance.handle_drain()
@@ -304,7 +320,7 @@ function M.construct(id, params, emit, options)
       state:emit({ kind = kinds.complete })
       turn_active = false
       interrupt_stream("actor_drained")
-      facts:interrupt_turn({ reason = "actor_drained" })
+      if facts then facts:interrupt_turn({ reason = "actor_drained" }) end
     else
       draining = true
     end

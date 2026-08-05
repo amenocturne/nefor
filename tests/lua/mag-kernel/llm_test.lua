@@ -491,14 +491,74 @@ do
     role = "tool", tool_call_id = "call-1", name = "inspect",
     content = { files = { "a.lua", "b.lua" }, count = 2 },
   } } }))
-  local structured
+  local structured, exchange, completed_call, tool_message, recorded_result
   for _, fact in ipairs(facts) do
     if fact.kind == "content_chunk_appended" and fact.chunk.kind == "structured" then
       structured = fact.chunk.data
+    elseif fact.kind == "tool_exchange_started" then
+      exchange = fact
+    elseif fact.kind == "tool_call_completed" then
+      completed_call = fact.call
+    elseif fact.kind == "message_started" and fact.role == "tool" then
+      tool_message = fact
+    elseif fact.kind == "tool_result_recorded" then
+      recorded_result = fact.result
     end
   end
+  assert_eq(exchange.tool_call_id, "call-1", "the provider call id remains external correlation data")
+  assert_true(exchange.exchange_id ~= exchange.tool_call_id,
+    "the manager-owned exchange id is distinct from the provider call id")
+  assert_eq(completed_call.tool_call_id, "call-1", "the completed call keeps raw correlation")
+  assert_eq(tool_message.tool_call_id, "call-1", "the tool message names the call it answers")
+  assert_eq(tool_message.name, "inspect", "the tool message keeps its universal tool name")
   assert_eq(structured.count, 2, "structured universal content is preserved losslessly")
   assert_eq(structured.files[2], "b.lua", "structured content keeps nested values")
+  assert_eq(recorded_result.count, 2, "the exchange result stays structured")
+end
+
+do
+  local instance, msgs, facts = make("reused.llm", {
+    provider = "provider-with-an-internal-id",
+    conversation_context = {
+      messages = { { role = "user", content = "manager history" } },
+      history_length = 1,
+      watermark = "manager-watermark",
+      compaction = { opaque = true },
+    },
+    context_artifact = { legacy = true },
+  })
+
+  instance.deliver(turn({ messages = { { role = "user", content = "first firing" } } }))
+  local first_request = find_last_kind(msgs, "capability.invoke")
+  assert_eq(first_request.request.conversation_context.watermark, "manager-watermark",
+    "MAG forwards manager context without interpreting it")
+  assert_true(first_request.request.context_artifact == nil,
+    "the removed provider artifact compatibility field is never forwarded")
+  instance.deliver({ kind = "reply", ref = first_request.ref, result = { text = "first answer" } })
+
+  instance.deliver(turn({ messages = { { role = "user", content = "second firing" } } }))
+  local second_request = find_last_kind(msgs, "capability.invoke")
+  instance.deliver({ kind = "reply", ref = second_request.ref, result = { text = "second answer" } })
+
+  local turns, turn_ids, event_ids, message_ids = 0, {}, {}, {}
+  for _, fact in ipairs(facts) do
+    assert_true(not fact.event_id:find("provider%-with%-an%-internal%-id"),
+      "provider identity never enters canonical event identity")
+    assert_true(not event_ids[fact.event_id], "event ids remain unique across firings")
+    event_ids[fact.event_id] = true
+    if fact.kind == "turn_started" then
+      turns = turns + 1
+      turn_ids[fact.turn_id] = true
+    elseif fact.kind == "message_started" then
+      assert_true(not message_ids[fact.message_id], "message ids remain unique across firings")
+      message_ids[fact.message_id] = true
+    end
+  end
+  local distinct_turns = 0
+  for _ in pairs(turn_ids) do distinct_turns = distinct_turns + 1 end
+  assert_eq(turns, 2, "a long-lived actor records every independent firing")
+  assert_eq(distinct_turns, 2, "each firing receives a distinct stable turn identity")
+  assert_eq(facts[#facts].kind, "turn_completed", "the second firing is not dropped after the first terminal")
 end
 
 do

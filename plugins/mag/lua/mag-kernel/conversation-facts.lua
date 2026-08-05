@@ -67,15 +67,16 @@ function M.new(options)
       emit("tool_exchange_started", {
         exchange_id = exchange_id,
         message_id = message_id,
+        tool_call_id = call_id,
         tool_name = tool_name,
       })
       emit("tool_call_fragment_appended", {
         exchange_id = exchange_id,
-        fragment = { id = call_id, name = tool_name, arguments = copy(arguments) },
+        fragment = { arguments = copy(arguments) },
       })
       emit("tool_call_completed", {
         exchange_id = exchange_id,
-        call = { id = call_id, name = tool_name, arguments = copy(arguments) },
+        call = { tool_call_id = call_id, name = tool_name, arguments = copy(arguments) },
       })
     end
   end
@@ -90,9 +91,11 @@ function M.new(options)
     return emit("turn_started", { provenance = provenance })
   end
 
-  function recorder:start_message(role)
+  function recorder:start_message(role, fields)
     local message_id = next_message_id()
-    emit("message_started", { message_id = message_id, role = role })
+    local started = { message_id = message_id, role = role }
+    for key, value in pairs(fields or {}) do started[key] = copy(value) end
+    emit("message_started", started)
     return message_id
   end
 
@@ -127,7 +130,10 @@ function M.new(options)
 
   function recorder:message(message, completion)
     if type(message) ~= "table" or type(message.role) ~= "string" then return nil end
-    local message_id = self:start_message(message.role)
+    local message_id = self:start_message(message.role, {
+      tool_call_id = message.tool_call_id,
+      name = message.name,
+    })
     local chunk = content_chunk(message.content)
     if chunk then self:content(message_id, chunk.kind, chunk.data) end
     self:finish_message(message_id, message, completion)
