@@ -88,7 +88,7 @@ actor.install()
 
 -- The CLI config lives beside starter rather than containing its own MAG
 -- library tree. Seed session workspaces from the shared starter library.
-require("mag").configure { library_dir = STARTER_ROOT .. "/mag/lib" }
+require("libs.mag-workspace").configure { library_dir = STARTER_ROOT .. "/mag/lib" }
 
 actor.spawn(sessions)
 actor.spawn(require("libs.conversation-manager.runtime").build())

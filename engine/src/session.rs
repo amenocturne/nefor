@@ -4,7 +4,7 @@
 //! disk. The broker stamps every inbound and outbound envelope into a
 //! [`LogEntry`] and hands it to the Lua dispatch hook (and to bus
 //! subscribers); persistence to a per-session jsonl file lives entirely in
-//! `starter/sessions.lua`. The module name `session` is a historical
+//! `lua/libs/sessions`. The module name `session` is a historical
 //! artefact — the types here aren't session-scoped, they're just the
 //! engine's log-line shape.
 //!

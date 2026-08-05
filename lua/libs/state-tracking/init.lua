@@ -6,7 +6,7 @@
 
 local json = nefor.json
 
-local sessions = require("sessions")
+local sessions = require("libs.sessions")
 
 local CLAMOR_AGENT_ID = os.getenv("CLAMOR_AGENT_ID")
 local NOTIFICATION_TITLE = "Nefor"

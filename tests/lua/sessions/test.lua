@@ -1,9 +1,10 @@
--- starter/sessions/test.lua — test escape hatches for the sessions actor.
+-- tests/lua/sessions/test.lua — test escape hatches for the sessions actor.
 --
--- Loaded ONLY from tests via `require("sessions.test")`. Production
--- code requires `require("sessions")` and never reaches this surface.
+-- Loaded only by the session test harness via the explicit test-only module
+-- `require("sessions.test")`. Production
+-- code requires `require("libs.sessions")` and never reaches this surface.
 
-local sessions = require("sessions")
+local sessions = require("libs.sessions")
 local i        = sessions._internals
 local json     = nefor.json
 

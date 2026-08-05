@@ -22,8 +22,8 @@
 -- site. A canceled pending load is removed before a late compiler response can
 -- launch work.
 
-local mag = require("mag")
-local sessions = require("sessions")
+local mag = require("libs.mag-workspace")
+local sessions = require("libs.sessions")
 local envelope = require("core.envelope")
 
 local emit_as = envelope.emit_as

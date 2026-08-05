@@ -73,11 +73,11 @@
 
 local json = nefor.json
 
-local mag            = require("mag")
+local mag            = require("libs.mag-workspace")
 local mag_eval       = require("libs.lead-workflow.mag-eval")
 local RunRegistry    = require("libs.lead-workflow.run-registry")
 local chat_emitter   = require("libs.chat-emitter")
-local sessions       = require("sessions")
+local sessions       = require("libs.sessions")
 local envelope       = require("core.envelope")
 local replay_window  = require("core.replay_window")
 

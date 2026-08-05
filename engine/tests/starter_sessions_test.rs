@@ -1,4 +1,4 @@
-//! Unit tests for `starter/sessions.lua`'s persistence + control-event
+//! Unit tests for `libs.sessions` persistence + control-event
 //! filtering, driven from Rust. Mirrors the `starter_ncp_test.rs`
 //! harness pattern: install a stub `nefor.*` surface, point
 //! NEFOR_DATA_DIR at a tempdir, then exercise the module directly.
@@ -45,7 +45,7 @@ fn jsonl_excludes_session_control_events() {
     // Initialise the sessions module (mints a session id, opens jsonl).
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -148,7 +148,7 @@ fn jsonl_excludes_session_control_events() {
 
 #[test]
 fn inbound_outbound_cycle_lands_in_jsonl() {
-    // Engine-side persistence is gone: starter/sessions.lua is the sole
+    // Engine-side persistence is gone: libs.sessions is the sole
     // writer. Drive a realistic inbound→broadcast cycle through the
     // persistence hook and assert the jsonl mirrors what the broker
     // would feed it. The shape is the same `{ts, origin, target?,
@@ -165,7 +165,7 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
 
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -295,7 +295,7 @@ fn resume_emits_lifecycle_markers_in_order() {
 
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
 
@@ -357,7 +357,7 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
         set_package_path(&lua).expect("set package.path");
         lua.load(
             r#"
-            sessions = require("sessions")
+            sessions = require("libs.sessions")
             sessions_test = require("sessions.test")
             sessions.init()
             "#,
@@ -388,7 +388,7 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
         set_package_path(&lua).expect("set package.path");
         lua.load(
             r#"
-            sessions = require("sessions")
+            sessions = require("libs.sessions")
             sessions_test = require("sessions.test")
             sessions.init()
             local json = nefor.json
@@ -443,7 +443,7 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
 
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -528,7 +528,7 @@ fn resume_to_existing_session_appends_in_order() {
 
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -626,7 +626,7 @@ fn resume_to_self_replays_log_so_chat_repaints() {
                 _trace[#_trace + 1] = "emit:" .. decoded.body.kind
             end
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
 
@@ -716,7 +716,7 @@ fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
             end
             return original_send(payload, target)
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         sessions.resume("{target_id}")
@@ -779,7 +779,7 @@ fn init_with_resume_id_cold_starts_without_session_end() {
             end
             return original_send(payload, target)
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions.init("{target_id}")
         "#
     );
@@ -835,7 +835,7 @@ fn new_then_new_prunes_each_empty_predecessor() {
 
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         sessions_test._on_new_request(nil)  -- /new #1
@@ -889,7 +889,7 @@ fn new_after_submit_preserves_prior_session() {
 
     lua.load(
         r#"
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         local json = nefor.json
@@ -975,7 +975,7 @@ fn replay_window_frames_resume_and_skips_persistence_inside() {
                 _emits[#_emits + 1] = decoded.body.kind
             end
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions_test = require("sessions.test")
         sessions.init()
         _emits = {}
@@ -1124,7 +1124,7 @@ fn resume_sets_global_replay_window_during_replay_burst() {
                 _active_trace[#_active_trace + 1] = decoded.body.kind .. ":" .. tostring(replay.active())
             end
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions.init()
         _active_trace = {{}}
         sessions.resume("{target_id}")
@@ -1210,7 +1210,7 @@ fn large_resume_replays_complete_burst_without_progress_workaround() {
                 _resume_done_replayed = decoded.body.replayed
             end
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions.init()
         sessions.resume("{target_id}")
         "#
@@ -1281,7 +1281,7 @@ fn resume_skips_malformed_and_non_object_jsonl_rows() {
                 end
             end
         end
-        sessions = require("sessions")
+        sessions = require("libs.sessions")
         sessions.init()
         _seen = {{}}
         sessions.resume("{target_id}")
@@ -1351,7 +1351,7 @@ fn session_switch_cancels_stale_replay_before_new_window() {
             _trace[#_trace + 1] = kind .. ":" .. tostring(decoded.body.session_id)
           end
         end
-        local sessions = require("sessions")
+        local sessions = require("libs.sessions")
         sessions.init()
         sessions.resume("66666666-2222-4333-8444-555555555555")
         sessions.resume("55555555-2222-4333-8444-555555555555")
@@ -1422,7 +1422,7 @@ fn cooperative_resume_exposes_numeric_byte_progress_before_completion() {
             _done = true
           end
         end
-        local sessions = require("sessions")
+        local sessions = require("libs.sessions")
         sessions.init()
         sessions.resume("77777777-2222-4333-8444-555555555555")
         assert(_progress == nil and not _done)
@@ -1487,7 +1487,7 @@ fn resume_progress_is_monotonic_and_bounded() {
             _progress[#_progress + 1] = decoded.body.replayed
           end
         end
-        local sessions = require("sessions")
+        local sessions = require("libs.sessions")
         sessions.init()
         _trace = {}
         sessions.resume("11111111-2222-4333-8444-555555555555")
@@ -1580,9 +1580,9 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter_str = starter.display().to_string();
     let lua_root = lua_dir();
     let lua_root_str = lua_root.display().to_string();
-    // `tests/lua/?.lua` so `require("sessions.test")` resolves to the
-    // test-only escape hatch at `tests/lua/sessions/test.lua` — the file
-    // is not shipped under starter/ to keep the installed config pure.
+    // `tests/lua/?.lua` makes the explicit test-only module
+    // `require("sessions.test")` resolve to `tests/lua/sessions/test.lua`.
+    // The file is not shipped with the runtime configuration.
     let tests_lua = repo_root().join("tests").join("lua");
     let tests_lua_str = tests_lua.display().to_string();
     let script = format!(

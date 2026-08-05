@@ -20,7 +20,7 @@ local json = nefor.json
 -- Seed an active session so the ambient MAG-workspace block can anchor a
 -- workspace dir (mirrors a booted session in the live runtime). Set once —
 -- the sessions module is separate state the loop's reset() doesn't touch.
-require("sessions")._internals.state.current_session_id = "wf-mag-session"
+require("libs.sessions")._internals.state.current_session_id = "wf-mag-session"
 
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then

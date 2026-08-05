@@ -30,7 +30,7 @@
 --       -- + whatever helpers / public methods the module exposes
 --     }
 --
--- `init.lua` then calls `actor.spawn(require("sessions"))` to register
+-- `init.lua` then calls `actor.spawn(require("libs.sessions"))` to register
 -- it. The runtime never inspects fields beyond `name` and `receive_msg`;
 -- everything else is plugin-internal.
 --

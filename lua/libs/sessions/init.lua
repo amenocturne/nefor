@@ -5,8 +5,8 @@
 -- plugin's concern; sessions broadcasts every recorded step-origin
 -- entry to its original target on resume.
 --
--- The test escape-hatch surface (`require("sessions.test")`) lives
--- under `tests/lua/sessions/test.lua` and is on the package.path only
+-- The explicit test-only escape-hatch module (`require("sessions.test")`)
+-- lives under `tests/lua/sessions/test.lua` and is on package.path only
 -- in the Rust test harness.
 --
 -- ## Public bus protocol

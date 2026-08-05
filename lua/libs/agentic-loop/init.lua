@@ -229,8 +229,8 @@ end
 -- and the prompt roster.
 --
 -- Seam: the MAG workspace is lead-workflow's domain, but its path
--- resolution and seeding live in the shared `mag` workspace module
--- (starter/mag) — required here as a composition-layer helper, not a reach
+-- resolution and seeding live in the shared `libs.mag-workspace` module
+-- (libs.mag-workspace) — required here as a composition-layer helper, not a reach
 -- into lead-workflow's internals.
 
 -- The config dir that holds the turn-program and the mag/lib library. Same
@@ -328,7 +328,7 @@ local function mag_workspace_dir(session_id, config_dir)
   if mc.workspace_session == session_id and type(mc.workspace) == "string" then
     return mc.workspace
   end
-  local mag = require("mag")
+  local mag = require("libs.mag-workspace")
   local ws
   local ok, res = pcall(mag.init_workspace, session_id, config_dir)
   if ok and type(res) == "string" and #res > 0 then
@@ -344,7 +344,7 @@ end
 -- The full `## MAG workspace` block, or nil when there is no active session
 -- to anchor the workspace dir.
 local function mag_workspace_block()
-  local sessions = require("sessions")
+  local sessions = require("libs.sessions")
   local session_id = sessions.current_id()
   if type(session_id) ~= "string" or session_id == "" then return nil end
   local config_dir = mag_config_dir()
@@ -589,7 +589,7 @@ local function submit_orchestrator_run(user_text)
   }
   emit_runtime_state("agentic_loop.run_start", { run_id = run_id })
 
-  local sessions = require("sessions")
+  local sessions = require("libs.sessions")
   envelope.emit_as("agentic-loop", "mag", {
     kind           = "mag.execute",
     id             = run_id,

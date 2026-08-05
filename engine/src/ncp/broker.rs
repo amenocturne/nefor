@@ -26,7 +26,7 @@
 //! line — raw bytes in, raw bytes out. The broker is session-blind: it
 //! does not own any session id, does not write any jsonl file, and does
 //! not know what a "session" is. Cross-run resumption / log persistence
-//! / replay are owned by `starter/sessions.lua`.
+//! / replay are owned by `lua/libs/sessions`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

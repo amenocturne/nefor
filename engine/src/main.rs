@@ -23,7 +23,7 @@
 //! and exit cleanly. No UI, no bundled harness. The engine is fully
 //! session-blind: it owns no session id, writes no on-disk log, and does
 //! not parse envelope bodies. Cross-session persistence / resumption /
-//! impersonation are the responsibility of `starter/sessions.lua`.
+//! impersonation are the responsibility of `lua/libs/sessions`.
 
 mod cli;
 mod config;
@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // The engine owns no session id and writes no jsonl — those concerns
-    // live in `starter/sessions.lua`. The broker's shared state is purely
+    // live in `lua/libs/sessions`. The broker's shared state is purely
     // an in-memory event log + connection map.
     let shared = Arc::new(Mutex::new(BrokerShared::new()));
     let engine_ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
