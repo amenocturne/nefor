@@ -14,6 +14,7 @@ function M.new()
   local conversation_id = nil
   local sequence = 0
   local context = { messages = {}, tail_messages = {}, compaction = nil }
+  local provenance = {}
 
   local projection = {}
 
@@ -27,6 +28,7 @@ function M.new()
       conversation_id = delta.conversation_id
       sequence = delta.sequence or 0
       context = { messages = {}, tail_messages = {}, compaction = nil }
+      provenance = copy((change.conversation or {}).provenance or {})
       return true
     end
     if conversation_id ~= nil and delta.conversation_id ~= conversation_id then
@@ -37,6 +39,9 @@ function M.new()
       return false
     end
     sequence = delta.sequence or sequence
+    if change.kind == "turn_started" or change.kind == "provenance_updated" then
+      for key, value in pairs(change.provenance or {}) do provenance[key] = copy(value) end
+    end
     if change.kind == "message_completed" or change.kind == "message_interrupted" then
       for _, message in ipairs(change.context_messages or {}) do
         local item = copy(message)
@@ -69,11 +74,13 @@ function M.new()
   function projection:context() return copy(context) end
   function projection:history() return copy(context.messages) end
   function projection:compaction() return copy(context.compaction) end
+  function projection:provenance() return copy(provenance) end
 
   function projection:reset()
     conversation_id = nil
     sequence = 0
     context = { messages = {}, tail_messages = {}, compaction = nil }
+    provenance = {}
   end
 
   return projection

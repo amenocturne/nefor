@@ -164,6 +164,9 @@ function M.change(after, event)
     change.exchange = projected_exchange(after.exchange_by_id[event.exchange_id])
   elseif kind == "retry_started" then
     change.retry = domain.copy(after.retries[#after.retries])
+  elseif kind == "turn_started" then
+    local turn = after.turn_by_id[event.turn_id]
+    change.provenance = domain.copy(turn and turn.provenance or {})
   elseif kind:sub(1, 5) == "turn_" then
     local turn = after.turn_by_id[event.turn_id]
     change.kind = kind

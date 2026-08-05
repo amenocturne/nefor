@@ -53,7 +53,6 @@ local envelope        = require("core.envelope")
 local ids             = require("core.ids")
 local results_lib     = require("libs.agentic-loop.results")
 local history_replay  = require("core.history_replay")
-local session_config  = require("libs.agentic-loop.session_config")
 local conversation_projection = require("libs.agentic-loop.conversation_projection")
 
 local state = {
@@ -89,11 +88,10 @@ local state = {
   pending_context_request = nil,
 
   current_run_id = nil,         ---@type string|nil
-  -- The in-flight turn: { run_id, user_text, scope, chat_prefix, streamed }.
+  -- The in-flight turn: { run_id, user_text, scope }.
   current_turn   = nil,         ---@type table|nil
   deferred_queue       = {},    ---@type table  queued relay texts { text }
   pending_user_inputs  = {},    ---@type table  queued submits while busy
-  pending_inputs_projected = 0, ---@type integer cold-queue prefix already projected
   pending_steer        = nil,   ---@type table|nil queued inputs awaiting MAG steer ack
 
   -- Observer registries. Public on_* setters append; producers fire via
@@ -138,6 +136,15 @@ local function append_conversation_fact(fact)
   })
 end
 
+local function configuration_provenance()
+  return {
+    surface = "lead",
+    provider = state.config.provider,
+    model = state.config.model,
+    reasoning_effort = state.config.reasoning_effort,
+  }
+end
+
 local function ensure_conversation_id()
   local conversation_id = state.conversation_id
   if conversation_id ~= nil then return conversation_id end
@@ -149,7 +156,7 @@ local function ensure_conversation_id()
     kind = "created",
     event_id = event_id,
     conversation_id = conversation_id,
-    provenance = { surface = "lead" },
+    provenance = configuration_provenance(),
   })
   return conversation_id
 end
@@ -158,6 +165,16 @@ local function conversation_ready()
   return state.conversation_id ~= nil
       and state.conversation:id() == state.conversation_id
       and state.pending_conversation_create == nil
+end
+
+local function record_configuration()
+  if not conversation_ready() then return end
+  append_conversation_fact({
+    kind = "provenance_updated",
+    event_id = "conversation-event-" .. envelope.uuid_lite(),
+    conversation_id = state.conversation_id,
+    provenance = configuration_provenance(),
+  })
 end
 
 local function request_context(reason)
@@ -463,16 +480,20 @@ local function handle_lead_program_loaded(body)
   local modification = type(artifact) == "table" and artifact.data or nil
   if type(modification) ~= "table" then
     emit("nefor-tui", {
-      kind = "chat.message.append", role = "system",
-      text = "[lead turn-program load carried no artifact data]",
+      kind = "chat.error.append",
+      title = "Lead program unavailable",
+      message = "The lead turn program loaded without executable data.",
+      retryable = true,
     })
     return
   end
   local seams, err = derive_program_seams(modification)
   if not seams then
     emit("nefor-tui", {
-      kind = "chat.message.append", role = "system",
-      text = "[lead turn-program invalid] " .. tostring(err),
+      kind = "chat.error.append",
+      title = "Lead program invalid",
+      message = tostring(err),
+      retryable = false,
     })
     return
   end
@@ -492,8 +513,10 @@ local function handle_lead_program_error(body)
   if body.in_reply_to ~= p.load_id then return end
   p.load_id = nil
   emit("nefor-tui", {
-    kind = "chat.message.append", role = "system",
-    text = "[lead turn-program failed to compile]\n" .. tostring(body.message),
+    kind = "chat.error.append",
+    title = "Lead program failed to compile",
+    message = tostring(body.message),
+    retryable = true,
   })
   -- Queued submits stay queued; the next submit retries the load.
   emit_idle_state("lead-program-load-failed")
@@ -561,8 +584,6 @@ local function submit_orchestrator_run(user_text)
     turn_id   = run_id,
     user_text = user_text or "",
     scope     = nil,
-    chat_prefix = nil,
-    streamed  = false,
     manager_terminal = false,
     result_body = nil,
   }
@@ -632,19 +653,8 @@ flush_pending_user_inputs = function()
     count = #inputs,
     text_preview = string.sub(combined, 1, 80),
   })
-  local projected_count = state.pending_inputs_projected
   state.pending_user_inputs = {}
-  state.pending_inputs_projected = 0
-  -- The first cold submit is projected immediately. Later cold submits are
-  -- optimistic queued text, so promotion replaces only that unprojected suffix.
   emit("nefor-tui", { kind = "chat.queue.steered" })
-  if projected_count < #inputs then
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "user",
-      text = table.concat(inputs, "\n", projected_count + 1),
-    })
-  end
   submit_orchestrator_run(combined)
 end
 
@@ -700,7 +710,6 @@ end
 local function cancel(drop_queued)
   if drop_queued then
     state.pending_user_inputs = {}
-    state.pending_inputs_projected = 0
     state.pending_steer = nil
   end
   kill_active_lead_run()
@@ -711,7 +720,6 @@ local function steer_pending_inputs()
   if #state.pending_user_inputs == 0 then return false end
   local texts = state.pending_user_inputs
   state.pending_user_inputs = {}
-  state.pending_inputs_projected = 0
   local text = table.concat(texts, "\n")
   local id = "lead-steer-" .. envelope.uuid_lite()
   state.pending_steer = {
@@ -735,13 +743,8 @@ local function handle_run_steered(body)
   state.pending_steer = nil
   if body.accepted == true and body.run_id == pending.run_id then
     -- Acceptance is the ownership boundary: the queued text is now part of
-    -- model-visible history, so emit its durable transcript projection once.
+    -- model-visible history. Conversation-manager owns its durable projection.
     emit("nefor-tui", { kind = "chat.queue.steered" })
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "user",
-      text = table.concat(pending.texts, "\n"),
-    })
     return
   end
   local restored = {}
@@ -762,15 +765,7 @@ local function cancel_all()
   local interrupted = interrupt_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
   state.pending_user_inputs = {}
-  state.pending_inputs_projected = 0
   state.pending_steer = nil
-  if interrupted then
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "system",
-      text = "[interrupted by user — cancelling in-flight work]",
-    })
-  end
   nefor.log.info("agentic-loop: cancel_all (graceful interrupt)", {
     interrupted_lead_run = interrupted,
     deferred_queued = #state.deferred_queue,
@@ -791,7 +786,6 @@ local function new_chat()
   state.current_turn = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
-  state.pending_inputs_projected = 0
   state.pending_steer = nil
   state.conversation:reset()
   state.conversation_id = nil
@@ -852,6 +846,7 @@ local function set_model(provider, model)
   if type(model) == "string" and #model > 0 then
     state.config.model = model
   end
+  record_configuration()
 end
 
 local function set_reasoning_effort(provider, effort)
@@ -860,6 +855,7 @@ local function set_reasoning_effort(provider, effort)
   end
   if type(effort) ~= "string" or #effort == 0 then return end
   state.config.reasoning_effort = effort
+  record_configuration()
   emit(nil, {
     kind     = "chat.reasoning.set_ack",
     provider = state.config.provider,
@@ -896,44 +892,16 @@ local function handle_chat_input_submit(body)
   ensure_conversation_id()
   if state.current_run_id ~= nil or conversation_commit_pending()
       or not conversation_ready() then
-    local projects_immediately = state.current_run_id == nil
-        and #state.pending_user_inputs == 0
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
-    if projects_immediately then
-      state.pending_inputs_projected = 1
-      emit("nefor-tui", {
-        kind = "chat.message.append",
-        role = "user",
-        text = text,
-      })
-    end
     ensure_lead_program_loaded()
     return
   end
 
   if state.lead_program.artifact == nil then
-    local first_cold_input = #state.pending_user_inputs == 0
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
-    if first_cold_input then
-      state.pending_inputs_projected = 1
-      emit("nefor-tui", {
-        kind = "chat.message.append",
-        role = "user",
-        text = text,
-      })
-    end
     ensure_lead_program_loaded()
     return
   end
-
-  -- Echo the user message to the TUI as a transcript-bound event so
-  -- replay can repaint user turns (chat.lua dedupes against the local
-  -- push, so live view sees the user line exactly once).
-  emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "user",
-    text = text,
-  })
 
   local deferred = drain_deferred_text()
   if type(deferred) == "string" then
@@ -991,7 +959,6 @@ local function handle_mag_run_started(body)
     return
   end
   turn.scope = body.scope
-  turn.chat_prefix = body.scope .. "/" .. state.lead_program.llm_actor .. "@"
 end
 
 local function typed_semantic_name(result)
@@ -1125,14 +1092,6 @@ local function finish_mag_run_result(body)
   if body.status == "completed" then
     local agent_error = agent_error_display(body.result)
     if agent_error ~= nil then
-      if not turn.streamed and type(agent_error.partial) == "string"
-          and #agent_error.partial > 0 then
-        emit("nefor-tui", {
-          kind = "chat.message.append",
-          role = "assistant",
-          text = agent_error.partial,
-        })
-      end
       emit("nefor-tui", {
         kind = "chat.error.append",
         title = agent_error.title,
@@ -1151,15 +1110,8 @@ local function finish_mag_run_result(body)
       return
     end
     local answer = mag_result_text(body.result) or ""
-    if not turn.streamed and #answer > 0 then
-      emit("nefor-tui", {
-        kind = "chat.message.append",
-        role = "assistant",
-        text = answer,
-      })
-    end
     nefor.log.info("agentic-loop: lead turn completed", {
-      run_id = run_id, streamed = turn.streamed,
+      run_id = run_id,
       answer_len = #answer, history_len = #conversation_history(),
     })
     fire_observers(state.complete_observers, run_id, "success", answer)
@@ -1232,9 +1184,24 @@ local function handle_conversation_projection_delta(body)
   end
   if not state.conversation:apply_delta(body) then return end
 
+  if body.replay ~= true and not history_replay.active()
+      and change.kind == "content_chunk_appended" then
+    local turn = state.current_turn
+    local chunk = change.chunk
+    if turn ~= nil and change.turn_id == turn.turn_id and type(chunk) == "table"
+        and type(chunk.data) == "string" and chunk.data ~= "" then
+      if chunk.kind == "text" then
+        fire_observers(state.stream_observers, chunk.data)
+      elseif chunk.kind == "reasoning" then
+        fire_observers(state.reasoning_observers, chunk.data)
+      end
+    end
+  end
+
   if change.kind == "conversation_created" then
     state.conversation_id = body.conversation_id
     state.pending_conversation_create = nil
+    if body.replay == true or history_replay.active() then return end
     emit("conversation-manager", {
       kind = "conversation.active.set",
       request_id = "conversation-active-" .. envelope.uuid_lite(),
@@ -1351,12 +1318,6 @@ end
 local function handle_gate_invoke(body)
   if not lead_scoped_id(body.id) then return end
   fire_observers(state.tool_start_observers, body.id, body.name, body.args)
-  emit("nefor-tui", {
-    kind  = "chat.tool.start",
-    id    = body.id,
-    name  = body.name,
-    input = body.args,
-  })
 end
 
 local function handle_gate_result(body)
@@ -1369,25 +1330,6 @@ local function handle_gate_result(body)
   local err = body.error ~= nil
   if err then output = tostring(body.error) end
   fire_observers(state.tool_end_observers, body.id, output, err)
-  emit("nefor-tui", {
-    kind   = "chat.tool.end",
-    id     = body.id,
-    output = output,
-    error  = err,
-  })
-end
-
--- Track whether the lead's answer painted via the stream this turn (the
--- chat surface finalizes the assistant entry off `chat.stream.end`); when
--- it did, the run-result close must not append the text a second time.
-local function handle_stream_marker(body)
-  local turn = state.current_turn
-  if turn == nil or type(turn.chat_prefix) ~= "string" then return end
-  if not starts_with(body.chat_id, turn.chat_prefix) then return end
-  local text = body.text or body.delta
-  if type(text) == "string" and #text > 0 then
-    turn.streamed = true
-  end
 end
 
 local function teardown_for_session_end()
@@ -1396,7 +1338,6 @@ local function teardown_for_session_end()
   state.current_turn   = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
-  state.pending_inputs_projected = 0
   state.pending_steer       = nil
   state.conversation:reset()
   state.conversation_id = nil
@@ -1405,29 +1346,6 @@ local function teardown_for_session_end()
   state.pending_context_request = nil
   emit_idle_state("session-ended")
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
-end
-
--- Stream-visible check by chat_id: true for the active lead turn's
--- prefix-scoped kernel chats (so the provider compositor fires the
--- public stream observers for the lead's own deltas — the CLI surface
--- reads those).
-local function stream_visible(chat_id)
-  local turn = state.current_turn
-  if turn ~= nil and type(turn.chat_prefix) == "string"
-      and starts_with(chat_id, turn.chat_prefix) then
-    return true
-  end
-  return false
-end
-
--- Fire stream / reasoning observers (used by per-provider wrapper to
--- forward visible deltas to public observer registries).
-local function fire_stream_observers(text)
-  fire_observers(state.stream_observers, text)
-end
-
-local function fire_reasoning_observers(text)
-  fire_observers(state.reasoning_observers, text)
 end
 
 local function fire_tool_start_observers(id, name, input)
@@ -1539,7 +1457,6 @@ function M.relay_run_completion(completion)
   state.deferred_queue[#state.deferred_queue + 1] = { text = format_deferred(completion) }
   flush_deferred()
 end
-function M.stream_visible(chat_id) return stream_visible(chat_id) end
 
 -- Whether a gate correlation id belongs to the lead's ACTIVE turn (ids are
 -- `<scope>/cap-N`; the lead's own tool firings carry its turn scope, a
@@ -1549,8 +1466,6 @@ function M.stream_visible(chat_id) return stream_visible(chat_id) end
 -- relay channel.
 function M.lead_scoped_id(id) return lead_scoped_id(id) end
 
-function M.fire_stream_observers(text) fire_stream_observers(text) end
-function M.fire_reasoning_observers(text) fire_reasoning_observers(text) end
 function M.fire_tool_start_observers(id, name, input) fire_tool_start_observers(id, name, input) end
 function M.fire_tool_end_observers(id, output, err) fire_tool_end_observers(id, output, err) end
 function M.set_reasoning_effort(provider, effort) set_reasoning_effort(provider, effort) end
@@ -1636,67 +1551,39 @@ local function receive_msg(entry)
   if type(kind) == "string" then
     if kind:match("%.tool%.invoke$") then handle_gate_invoke(body); return end
     if kind == "tool.result" then handle_gate_result(body); return end
-    if kind == "chat.stream.delta" or kind == "chat.stream.end" then
-      handle_stream_marker(body)
-      return
-    end
   end
 end
 
--- Restore `state.config.{provider,model}` from the resumed session's
--- on-disk log. Without this, /resume of a chat that was originally
--- under provider A leaves state.config.provider pointing at whatever
--- the LIVE session had switched to. The helper picks the latest
--- `chat.model.set` if the session ever saw /model, otherwise falls back
--- to the prefix + model on the latest `<prefix>.chat.create`.
-local function restore_active_model_from_session_log()
-  local sessions_mod = require("sessions")
-  local path = sessions_mod.current_path()
-  if type(path) ~= "string" or path == "" then return end
-  local active = session_config.read_active_model(path)
-  local provider = active.provider
-  local model    = active.model
-  local reasoning_effort = active.reasoning_effort
-
+local function restore_configuration_from_projection()
+  local provenance = state.conversation:provenance()
   local changed = false
-  if type(provider) == "string" and #provider > 0
-      and state.config.provider ~= provider then
-    state.config.provider = provider
-    changed = true
+  for _, key in ipairs({ "provider", "model", "reasoning_effort" }) do
+    local value = provenance[key]
+    if type(value) == "string" and value ~= "" and state.config[key] ~= value then
+      state.config[key] = value
+      changed = true
+    end
   end
-  if type(model) == "string" and #model > 0
-      and state.config.model ~= model then
-    state.config.model = model
-    changed = true
-  end
-  if type(reasoning_effort) == "string" and #reasoning_effort > 0
-      and state.config.reasoning_effort ~= reasoning_effort then
-    state.config.reasoning_effort = reasoning_effort
-    changed = true
-  end
-
-  if changed then
-    nefor.log.info("agentic-loop: /resume restored active provider/model from session log", {
+  if not changed then return end
+  nefor.log.info("agentic-loop: /resume restored canonical conversation configuration", {
+    provider = state.config.provider,
+    model = state.config.model,
+    reasoning_effort = state.config.reasoning_effort,
+  })
+  if type(state.config.model) == "string" and state.config.model ~= "" then
+    emit(nil, {
+      kind = "chat.model.set_ack",
       provider = state.config.provider,
       model = state.config.model,
-      reasoning_effort = state.config.reasoning_effort,
     })
-    if type(state.config.provider) == "string" and #state.config.provider > 0
-        and type(state.config.model) == "string" and #state.config.model > 0 then
-      emit(nil, {
-        kind     = "chat.model.set_ack",
-        provider = state.config.provider,
-        model    = state.config.model,
-      })
-    end
-    if type(state.config.reasoning_effort) == "string"
-        and #state.config.reasoning_effort > 0 then
-      emit(nil, {
-        kind     = "chat.reasoning.set_ack",
-        provider = state.config.provider,
-        effort   = state.config.reasoning_effort,
-      })
-    end
+  end
+  if type(state.config.reasoning_effort) == "string"
+      and state.config.reasoning_effort ~= "" then
+    emit(nil, {
+      kind = "chat.reasoning.set_ack",
+      provider = state.config.provider,
+      effort = state.config.reasoning_effort,
+    })
   end
 end
 
@@ -1707,22 +1594,11 @@ if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     teardown_for_session_end()
   end)
-  -- Restore active provider+model while conversation-manager rebuilds and
-  -- publishes the universal projection from the replayed canonical facts.
-  nefor.bus.on_event("sessions.replay.start", function(_entry)
-    state.conversation:reset()
-    state.conversation_id = nil
-    state.pending_conversation_create = nil
-    state.pending_compaction = nil
-    state.pending_context_request = nil
-    restore_active_model_from_session_log()
-  end)
-  nefor.bus.on_event("sessions.replay.end", function(_entry)
+  -- Replay is chunked; settle the restored conversation only after the whole
+  -- resume, never at each chunk boundary.
+  nefor.bus.on_event("sessions.resume_done", function(_entry)
     if conversation_ready() then
-      emit("conversation-manager", {
-        kind = "conversation.active.set",
-        conversation_id = state.conversation_id,
-      })
+      restore_configuration_from_projection()
       request_context("resume")
     end
   end)
@@ -1760,7 +1636,6 @@ M._internals  = {
     state.current_turn = nil
     state.deferred_queue = {}
     state.pending_user_inputs = {}
-    state.pending_inputs_projected = 0
     state.pending_steer = nil
     state.stream_observers = {}
     state.reasoning_observers = {}

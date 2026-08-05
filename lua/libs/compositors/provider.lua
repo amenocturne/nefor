@@ -36,13 +36,6 @@
 --   chat.model.set                 → <prefix>.model.set
 --   chat.reasoning.set             → <prefix>.reasoning.set
 --
--- ## Orchestrator coupling (lives in this file)
---
--- Stream deltas on the lead's prefix-bound kernel chats fire the
--- agentic-loop's public stream/reasoning observers (the CLI surface
--- reads those). The lib returns these envelopes' bodies unchanged; this file
--- pattern-matches on the prefixed kind.
---
 -- Replay is inert at this boundary: provider requests carry complete
 -- conversation-manager context and never rebuild process-local chats.
 
@@ -120,40 +113,6 @@ function M.spawn_spec(name, command, opts)
     return out
   end
 
-  local function handle_orchestrator_outbound(body)
-    local k = body.kind
-    if type(k) ~= "string" then return body end
-
-    if k == "chat.stream.delta"
-        or k == "chat.stream.end"
-        or k == "chat.stream.reasoning_delta"
-        or k == "chat.stream.reasoning_end"
-        or k == "chat.session.stats" then
-      local chat_id = body.chat_id
-      if type(chat_id) == "string" and al.stream_visible(chat_id) then
-        if k == "chat.stream.delta" then
-          local txt = body.text or body.delta or ""
-          if type(txt) == "string" then al.fire_stream_observers(txt) end
-        elseif k == "chat.stream.reasoning_delta" then
-          local txt = body.text or body.delta or ""
-          if type(txt) == "string" then al.fire_reasoning_observers(txt) end
-        end
-      end
-      return body
-    end
-
-    -- chat.error / chat.complete.result keep their prefixed kinds on
-    -- the bus: the mag plugin's provider bridge correlates them back to
-    -- the kernel request by chat_id.
-    if k == kinds.chat_complete_result then
-      local chat_id = body.chat_id
-      if type(chat_id) ~= "string" then return body end
-      return body
-    end
-
-    return body
-  end
-
   local function publish_compaction_failed(change, message)
     emit_synthetic(name, {
       kind = "conversation.context.compact.failed",
@@ -229,9 +188,7 @@ function M.spawn_spec(name, command, opts)
   --   1. translator.maybe_inject_static_token: bus-quiet auth.set
   --      injection on first ready (no-op otherwise).
   --   2. translator.outbound: kind rename, or nil for ready/goodbye.
-  --   3. handle_orchestrator_outbound: agentic-loop coupling for
-  --      stream / chat.error / chat.complete.result.
-  --   4. publish via translator.publish (preserves env.from).
+  --   3. publish via translator.publish (preserves env.from).
   local function from_plugin(envs)
     for _, env in ipairs(envs) do
       -- Static-token injection runs even when outbound drops the body
@@ -265,10 +222,7 @@ function M.spawn_spec(name, command, opts)
 
       local body = translator.outbound(env)
       if body ~= nil then
-        body = handle_orchestrator_outbound(body)
-        if body ~= nil then
-          translator.publish(env.from or name, body)
-        end
+        translator.publish(env.from or name, body)
       end
       ::continue::
     end

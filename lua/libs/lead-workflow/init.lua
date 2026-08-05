@@ -1011,13 +1011,7 @@ local function mag_result_text(result)
   if type(result.text) == "string" and #result.text > 0 then
     return result.text
   end
-  -- The encode fallback excludes transcript_delta (factories/llm.lua): the
-  -- conversation record is not part of the relayed answer.
-  local bare = {}
-  for k, v in pairs(result) do
-    if k ~= "transcript_delta" then bare[k] = v end
-  end
-  local ok, encoded = pcall(json.encode, bare)
+  local ok, encoded = pcall(json.encode, result)
   if ok and type(encoded) == "string" then return encoded end
   return nil
 end

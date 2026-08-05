@@ -285,7 +285,7 @@ local function project_pending_conversation(calls)
   manager_conversation_id = append.body.fact.conversation_id
   manager_delta({
     kind = "conversation_created",
-    conversation = { provenance = { surface = "lead" } },
+    conversation = { provenance = append.body.fact.provenance },
   })
   local active = find_kind(decode_calls(), "conversation.active.set")
   assert(active ~= nil, "canonical root creation publishes the active binding")
@@ -387,8 +387,8 @@ local function begin_bound_turn(text, scope)
   return exec
 end
 
--- (echo) once the turn program is warm, chat.input.submit emits the durable
--- chat.message.append role=user immediately.
+-- Conversation-manager is the only durable transcript projection. The TUI
+-- owns its optimistic local echo; agentic-loop emits no parallel chat message.
 do
   fresh_loop()
   local warmup = begin_turn("warmup")
@@ -399,16 +399,12 @@ do
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first prompt" })
   local calls = decode_calls()
-  local user_echo = find_call(calls, "chat.message.append", "user", "first prompt")
-  assert(user_echo ~= nil,
-    "warm chat.input.submit must emit chat.message.append role=user")
-  assert_eq(user_echo.target, "nefor-tui",
-    "user echo must target nefor-tui specifically")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "warm submit emits no legacy transcript projection")
 end
 
--- (cold load ownership) the initial ordinary submit is durable immediately;
--- later cold submits stay optimistic until mag.loaded promotes their coalesced
--- suffix. The model still receives the whole cold batch exactly once.
+-- Cold inputs remain an optimistic TUI queue until the program loads. The
+-- model receives the whole batch once and the manager records it canonically.
 do
   fresh_loop()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "cold one" })
@@ -416,8 +412,8 @@ do
   local load = find_kind(calls, "mag.load")
   project_pending_conversation(calls)
   assert(load ~= nil, "cold submit loads the turn program")
-  assert(find_call(calls, "chat.message.append", "user", "cold one") ~= nil,
-    "initial cold submit emits its durable projection immediately")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "cold submit emits no legacy transcript projection")
 
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "cold two" })
@@ -439,10 +435,35 @@ do
     "cold submits coalesce into one model delivery")
   assert(find_kind(calls, "chat.queue.steered") ~= nil,
     "promotion reconciles the optimistic queue")
-  assert(find_call(calls, "chat.message.append", "user", "cold two") ~= nil,
-    "promotion durably projects only the unprojected cold suffix")
-  assert_eq(find_call(calls, "chat.message.append", "user", "cold one"), nil,
-    "promotion does not duplicate the initial cold projection")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "promotion emits no legacy transcript projection")
+end
+
+-- Runtime provider/model/reasoning selection is persisted as canonical
+-- conversation provenance, never inferred later from provider chat wires.
+do
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "configure me" })
+  project_pending_conversation(decode_calls())
+
+  _test.calls_clear()
+  send_to_loop("nefor-tui", {
+    kind = "chat.model.set", provider = "other-provider", model = "other-model",
+  })
+  local model_fact = find_kind(decode_calls(), "conversation.fact.append")
+  assert(model_fact ~= nil, "model selection appends a canonical fact")
+  assert_eq(model_fact.body.fact.kind, "provenance_updated",
+    "model selection uses conversation provenance")
+  assert_eq(model_fact.body.fact.provenance.provider, "other-provider")
+  assert_eq(model_fact.body.fact.provenance.model, "other-model")
+
+  _test.calls_clear()
+  send_to_loop("nefor-tui", {
+    kind = "chat.reasoning.set", provider = "other-provider", effort = "low",
+  })
+  local reasoning_fact = find_kind(decode_calls(), "conversation.fact.append")
+  assert(reasoning_fact ~= nil, "reasoning selection appends a canonical fact")
+  assert_eq(reasoning_fact.body.fact.provenance.reasoning_effort, "low")
 end
 
 -- (turn) a submit clones the program with the user text as the task,
@@ -519,26 +540,31 @@ do
   assert(find_kind(calls, "chat.lead.bound") == nil,
     "run-scoped provider handles are not exposed as a transcript contract")
 
-  -- A lead-scoped gated tool invocation surfaces as transcript tool
-  -- events (the gate keeps the kernel's scope-prefixed correlation id).
+  -- Lead-scoped gate traffic drives public observers without creating a
+  -- parallel TUI transcript; canonical tool facts own presentation.
+  local observed_start, observed_end
+  agentic_loop.on_tool_start(function(id, name) observed_start = { id = id, name = name } end)
+  agentic_loop.on_tool_end(function(id, output, err)
+    observed_end = { id = id, output = output, error = err }
+  end)
   _test.calls_clear()
   send_to_loop("tool-gate", {
     kind = "tool-gate.tool.invoke", id = "r7/cap-1",
     name = "read_file", args = { path = "README.md" },
   })
   calls = decode_calls()
-  local tool_start = find_kind(calls, "chat.tool.start")
-  assert(tool_start ~= nil, "lead-scoped gate invoke emits chat.tool.start")
-  assert_eq(tool_start.body.id, "r7/cap-1", "tool start keyed by the correlation id")
-  assert_eq(tool_start.body.name, "read_file", "tool start names the tool")
+  assert_eq(find_kind(calls, "chat.tool.start"), nil,
+    "lead-scoped invoke emits no legacy tool projection")
+  assert_eq(observed_start.id, "r7/cap-1", "tool observer is keyed by correlation id")
+  assert_eq(observed_start.name, "read_file", "tool observer names the tool")
 
   _test.calls_clear()
   send_to_loop("tool-gate", { kind = "tool.result", id = "r7/cap-1", output = "# nefor" })
   calls = decode_calls()
-  local tool_end = find_kind(calls, "chat.tool.end")
-  assert(tool_end ~= nil, "lead-scoped tool.result emits chat.tool.end")
-  assert_eq(tool_end.body.id, "r7/cap-1", "tool end keyed by the correlation id")
-  assert_eq(tool_end.body.error, false, "successful tool result is not an error")
+  assert_eq(find_kind(calls, "chat.tool.end"), nil,
+    "lead-scoped result emits no legacy tool projection")
+  assert_eq(observed_end.id, "r7/cap-1", "tool-end observer is keyed by correlation id")
+  assert_eq(observed_end.error, false, "successful tool result is not an error")
 
   -- A foreign-scoped invoke (a dispatched sub-run) stays out of the
   -- lead transcript.
@@ -549,12 +575,7 @@ do
   assert_eq(find_kind(decode_calls(), "chat.tool.start"), nil,
     "foreign-scope gate invoke must not emit lead tool events")
 
-  -- The answer streams under the bound prefix…
-  send_to_loop("mock", { kind = "chat.stream.delta", chat_id = "r7/lead.llm@r2", text = "the answer" })
-  send_to_loop("mock", { kind = "chat.stream.end",   chat_id = "r7/lead.llm@r2", text = "the answer" })
-
-  -- …so the terminal close records history but does NOT re-append the
-  -- already-streamed answer.
+  -- Terminal close records history without any direct transcript append.
   _test.calls_clear()
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec.body.run_id,
@@ -754,8 +775,8 @@ do
     "the static MAG section is read from disk once and cached across turns")
 end
 
--- (no-stream fallback) a completed turn whose answer never streamed
--- appends the text so the transcript is never silently empty.
+-- A non-streaming provider still reaches the TUI through the canonical
+-- completed-message projection; agentic-loop emits no fallback append.
 do
   fresh_loop()
   local exec = begin_bound_turn("quiet one", "r3")
@@ -764,10 +785,8 @@ do
     status = "completed", result = { text = "quiet answer" },
   })
   local calls = decode_calls()
-  local appended = find_call(calls, "chat.message.append", "assistant", "quiet answer")
-  assert(appended ~= nil,
-    "non-streamed answer must append to the transcript on run close")
-  assert_eq(appended.target, "nefor-tui", "answer append targets the TUI")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "non-streamed completion emits no legacy transcript fallback")
 end
 
 -- (failure surfaces + preserves context) a failed run puts the error in chat
@@ -843,8 +862,8 @@ do
       value = { content = "clean answer" },
     },
   })
-  assert(find_call(decode_calls(), "chat.message.append", "assistant", "clean answer") ~= nil,
-    "typed success renders the semantic FinalAnswer content")
+  assert_eq(find_call(decode_calls(), "chat.message.append"), nil,
+    "typed success emits no legacy assistant projection")
 
   fresh_loop()
   exec = begin_bound_turn("typed failure", "r-typed-error")
@@ -860,8 +879,8 @@ do
     },
   })
   local calls = decode_calls()
-  assert(find_call(calls, "chat.message.append", "assistant", "partial builder report") ~= nil,
-    "typed AgentError preserves and renders the last completed provider output")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "typed AgentError emits no legacy partial-output projection")
   local generic_error = find_kind(calls, "chat.error.append")
   assert(generic_error ~= nil, "typed AgentError emits a structured chat error")
   assert_eq(generic_error.body.title, "Agent run failed",
@@ -979,9 +998,8 @@ do
     status = "completed", result = { text = "first answer" },
   })
   calls = decode_calls()
-  local projected = find_call(calls, "chat.message.append", "user", "second")
-  assert(projected ~= nil,
-    "queued promotion emits its durable user projection exactly when it becomes model-visible")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "queued promotion relies on canonical manager projection")
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "queued input promotes into a fresh turn on close")
   assert_eq(task_prompt(exec2.body.artifact.data), "second",
@@ -1017,9 +1035,8 @@ do
   calls = decode_calls()
   assert(find_kind(calls, "chat.queue.steered") ~= nil,
     "accepted steer tells the TUI its queued entry is now live transcript")
-  local projected = find_call(calls, "chat.message.append", "user", "queued")
-  assert(projected ~= nil,
-    "accepted steer emits the durable user projection exactly once")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "accepted steer relies on canonical manager projection")
   assert_eq(agentic_loop._internals.state.pending_steer, nil,
     "accepted steer clears the acknowledgement latch")
 end
@@ -1081,9 +1098,8 @@ do
   assert_eq(find_kind(calls, "mag.kill_run"), nil,
     "double-Esc no longer kills the run")
 
-  -- a transcript notice is rendered
-  local notice = find_call(calls, "chat.message.append", "system", "interrupted by user")
-  assert(notice ~= nil, "double-Esc renders an interrupt notice in the transcript")
+  assert_eq(find_call(calls, "chat.message.append"), nil,
+    "double-Esc relies on the canonical interrupted-turn projection")
 
   -- the run is still active — a new submit queues rather than dispatching.
   _test.calls_clear()
@@ -1182,10 +1198,13 @@ do
     "a replayed chat.input.submit must not trigger a program load")
 
   manager_conversation_id = "resumed-conversation"
-  manager_delta({
-    kind = "conversation_created",
-    conversation = { provenance = { surface = "lead" } },
-  })
+  manager_delta({ kind = "conversation_created", conversation = {
+    provenance = { surface = "lead", provider = "restored", model = "restored-model",
+      reasoning_effort = "medium" },
+  } })
+  manager_delta({ kind = "turn_started", turn_id = "old-turn", run_id = "old-turn",
+    provenance = { provider = "restored", model = "restored-model",
+      reasoning_effort = "medium" } })
   local resumed_messages = {
     { role = "user", content = "old question" },
     { role = "assistant", content = "old answer" },
@@ -1198,8 +1217,15 @@ do
   manager_delta({ kind = "message_completed", context_messages = resumed_messages })
   _test.calls_clear()
   _test.fire_bus("sessions.replay.end", { session_id = "resume-1" })
+  assert_eq(find_kind(decode_calls(), "conversation.context.request"), nil,
+    "chunk completion does not query context")
+  _test.fire_bus("sessions.resume_done", { session_id = "resume-1" })
   local query = find_kind(decode_calls(), "conversation.context.request")
-  assert(query ~= nil, "replay completion requests the manager context snapshot")
+  assert(query ~= nil, "overall resume completion requests one manager context snapshot")
+  assert_eq(agentic_loop.config().provider, "restored", "resume restores canonical provider")
+  assert_eq(agentic_loop.config().model, "restored-model", "resume restores canonical model")
+  assert_eq(agentic_loop.config().reasoning_effort, "medium",
+    "resume restores canonical reasoning effort")
   send_to_loop("conversation-manager", {
     kind = "conversation.context.snapshot",
     request_id = query.body.request_id,
@@ -1247,16 +1273,27 @@ do
   assert(next(seeded) == nil, "post-/new turn seeds empty history")
 end
 
--- (stream visibility) the active turn's prefix-scoped chats are
--- stream-visible (the provider compositor fires the public observers off
--- this), everything else keeps the tracked-table semantics.
+-- Public CLI observers consume canonical conversation chunks and ignore
+-- replayed chunks; no provider chat-id/stream protocol is involved.
 do
   fresh_loop()
-  begin_bound_turn("streamy", "r12")
-  assert_eq(agentic_loop.stream_visible("r12/lead.llm@r1"), true,
-    "the bound turn's scoped chats are stream-visible")
-  assert_eq(agentic_loop.stream_visible("r99/other.llm@r1"), false,
-    "foreign-scope chats are not stream-visible")
+  local exec = begin_bound_turn("streamy", "r12")
+  local text, reasoning = "", ""
+  agentic_loop.on_stream(function(chunk) text = text .. chunk end)
+  agentic_loop.on_reasoning(function(chunk) reasoning = reasoning .. chunk end)
+  manager_delta({ kind = "content_chunk_appended", turn_id = exec.body.run_id,
+    chunk = { kind = "reasoning", data = "think" } })
+  manager_delta({ kind = "content_chunk_appended", turn_id = exec.body.run_id,
+    chunk = { kind = "text", data = "answer" } })
+  assert_eq(reasoning, "think", "canonical reasoning chunk reaches observer")
+  assert_eq(text, "answer", "canonical text chunk reaches observer")
+  raw_send_to_loop("conversation-manager", {
+    kind = "conversation.projection.delta", conversation_id = manager_conversation_id,
+    sequence = manager_sequence + 1, replay = true,
+    change = { kind = "content_chunk_appended", turn_id = exec.body.run_id,
+      chunk = { kind = "text", data = "old" } },
+  })
+  assert_eq(text, "answer", "replayed canonical chunks do not re-stream")
 end
 
 -- (lead-scoped firing ids) the public caller-routing seam: the active turn's
@@ -1315,8 +1352,10 @@ do
     kind = "mag.error", in_reply_to = load.body.id, message = "parse error at line 3",
   })
   local calls = decode_calls()
-  assert(find_call(calls, "chat.message.append", "system", "parse error") ~= nil,
-    "a turn-program compile failure surfaces in chat")
+  local compile_error = find_kind(calls, "chat.error.append")
+  assert(compile_error ~= nil, "a turn-program compile failure surfaces in chat")
+  assert_eq(compile_error.body.message, "parse error at line 3",
+    "compile failure retains its diagnostic")
   -- Retry path: the next submit re-kicks the load.
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "again" })
