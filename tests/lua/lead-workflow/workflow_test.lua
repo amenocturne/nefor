@@ -5,7 +5,7 @@
 
 local lw   = require("libs.lead-workflow")
 local json = nefor.json
-local agentic_loop = require("agentic-loop")
+local agentic_loop = require("libs.agentic-loop")
 local sessions = require("sessions")
 
 local function assert_eq(actual, expected, msg)

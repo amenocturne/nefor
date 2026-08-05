@@ -572,7 +572,7 @@ end
 -- transform. We exercise it by calling the callback directly with a
 -- pre-decoded envelope; assertion is on what `_test.calls()` recorded.
 
-local agentic_loop_mod = require("agentic-loop")
+local agentic_loop_mod = require("libs.agentic-loop")
 local openai_provider  = require("libs.compositors.provider")
 
 local function build_provider_chain(name, opts)

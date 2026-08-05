@@ -256,7 +256,7 @@ function M.handle(firing_id, args, metadata)
     local caller_id = type(metadata) == "table" and metadata.caller_id or nil
     if type(caller_id) ~= "string" then caller_id = firing_id end
     routing = "attached"
-    local al_ok, al = pcall(require, "agentic-loop")
+    local al_ok, al = pcall(require, "libs.agentic-loop")
     if al_ok and type(al.lead_scoped_id) == "function"
         and al.lead_scoped_id(caller_id) == true then
       routing = "lead"

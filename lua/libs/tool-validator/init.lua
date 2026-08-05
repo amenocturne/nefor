@@ -85,7 +85,7 @@ local DA_ARGS_STRICT_READONLY = {
 }
 
 local function has_approved_plan()
-  local ok, lw = pcall(require, "lead-workflow")
+  local ok, lw = pcall(require, "libs.lead-workflow")
   if not ok or type(lw) ~= "table" then return false end
   local internals = lw._internals
   local st = type(internals) == "table" and internals.state or nil

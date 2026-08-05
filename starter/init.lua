@@ -221,7 +221,7 @@ local actor          = require("core.actor")
 local history_replay = require("core.history_replay")
 local sessions       = require("libs.sessions")
 local cfg            = require("config").active
-local lead_role      = require("lead-workflow.role")
+local lead_role      = require("libs.lead-workflow.role")
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
@@ -392,7 +392,7 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 -- its bus subscription is live when tool-gate.hello arrives —
 -- otherwise the advertise is missed and the lead model gets "no such
 -- tool" at runtime.
-actor.spawn(require("lead-workflow"))
+actor.spawn(require("libs.lead-workflow"))
 
 -- read-only-tools advertises the composition-selected Lua read tools.
 -- basic-tools is the canonical shipped search_text owner. Same ordering

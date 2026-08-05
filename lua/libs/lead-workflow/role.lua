@@ -27,7 +27,7 @@
 -- runs unchanged from the shared lua tree while every config keeps its own
 -- persona prompt. Downstream configs `require("libs.lead-workflow.role")`;
 -- the starter keeps a re-export shim only because starter/init.lua still
--- says `require("lead-workflow.role")`.
+-- loads `libs.lead-workflow.role` directly.
 
 local M = {}
 
@@ -35,7 +35,7 @@ local M = {}
 -- `NEFOR_CONFIG_DIR` is the canonical global the engine sets to the
 -- directory containing `init.lua`. For tests that load the module
 -- directly without booting the full engine, `package.path` is set so
--- `require("lead-workflow.role")` resolves, and the test rig sets
+-- `require("libs.lead-workflow.role")` resolves, and the test rig sets
 -- `NEFOR_CONFIG_DIR` to the starter dir.
 local STARTER_ROOT = (rawget(_G, "NEFOR_CONFIG_DIR") or ".")
 local PROMPTS_DIR = STARTER_ROOT .. "/prompts"

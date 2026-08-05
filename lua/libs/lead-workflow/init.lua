@@ -3,9 +3,8 @@
 -- Config-agnostic: derives every path from env/globals the engine sets
 -- (NEFOR_CONFIG_DIR, NEFOR_DATA_DIR, NEFOR_REVIEW_HOOK), never from its
 -- own file location, so it runs identically from the shared lua tree.
--- Downstream configs `require("libs.lead-workflow")`; the starter keeps a
--- one-line re-export shim at starter/lead-workflow/init.lua only because
--- starter/init.lua's spawn site still says `require("lead-workflow")`.
+-- Config compositions load this mechanism directly through
+-- `libs.lead-workflow`.
 --
 -- Owns two pieces of state on top of the lead's chat-side agentic-loop
 -- (see `agentic-loop/init.lua`):
@@ -1028,7 +1027,7 @@ end
 -- `format_deferred` frames the sink content. The output path stays on the
 -- visible graph-result block instead of being duplicated in the model input.
 local function relay_kernel_completion(run_id, run_name, ok, content, err)
-  local al = require("agentic-loop")
+  local al = require("libs.agentic-loop")
   if type(al.relay_run_completion) ~= "function" then return end
   if ok then
     local content_available = type(content) == "string" and content:find("%S") ~= nil
@@ -1237,7 +1236,7 @@ local function resolve_invocation(metadata, direct_default_principal)
     end
     local caller_id = type(metadata) == "table" and metadata.caller_id or nil
     local principal = direct_default_principal or "subagent"
-    local al_ok, al = pcall(require, "agentic-loop")
+    local al_ok, al = pcall(require, "libs.agentic-loop")
     if type(caller_id) == "string" and al_ok and type(al.lead_scoped_id) == "function"
         and al.lead_scoped_id(caller_id) == true then
       principal = "lead"

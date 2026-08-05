@@ -193,7 +193,7 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 -- Mirrors starter/init.lua: registered BEFORE tool-gate's spawn so its
 -- bus subscription is live when tool-gate.hello arrives — otherwise
 -- the advertise is missed and the lead gets "no such tool" at runtime.
-actor.spawn(require("lead-workflow"))
+actor.spawn(require("libs.lead-workflow"))
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
