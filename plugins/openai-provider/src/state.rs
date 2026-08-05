@@ -46,6 +46,7 @@ impl CompletionRun {
 pub struct CompletionRuns {
     inner: Mutex<HashMap<String, CompletionRun>>,
     next_owner: AtomicU64,
+    tools_unsupported_models: Mutex<HashSet<String>>,
 }
 
 impl CompletionRuns {
@@ -89,6 +90,17 @@ impl CompletionRuns {
         } else {
             false
         }
+    }
+
+    pub async fn model_supports_tools(&self, model: &str) -> bool {
+        !self.tools_unsupported_models.lock().await.contains(model)
+    }
+
+    pub async fn mark_model_tools_unsupported(&self, model: &str) {
+        self.tools_unsupported_models
+            .lock()
+            .await
+            .insert(model.to_owned());
     }
 }
 

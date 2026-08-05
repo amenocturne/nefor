@@ -62,10 +62,11 @@ use openai_provider::state::{
 };
 use openai_provider::stream::{
     list_models, run_chat_stream_with_retry_progress_and_format, ReasoningEvent, RetryProgress,
-    StreamError,
+    StreamError, StreamOutcome,
 };
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::LlmError;
 
@@ -1057,91 +1058,48 @@ async fn dispatch_completion_request(
     tokio::spawn(async move {
         let started = Instant::now();
         let event_prefix = config.event_prefix();
-        let text_event_prefix = event_prefix.clone();
-        let reasoning_event_prefix = event_prefix.clone();
-        let retry_event_prefix = event_prefix.clone();
         let token = auth.token().await;
-        let id_for_text = request_id.clone();
-        let tx_for_text = out_tx.clone();
-        let suppress_text_deltas = response_format.is_some();
-        let id_for_reasoning = request_id.clone();
-        let tx_for_reasoning = out_tx.clone();
-        let id_for_retry = request_id.clone();
-        let tx_for_retry = out_tx.clone();
-        let mut reasoning_started_at: Option<Instant> = None;
-        let result = run_chat_stream_with_retry_progress_and_format(
+        let tools_supported = completions.model_supports_tools(&model).await;
+        let attempted_tools = tools_supported && tools.is_some();
+        let mut result = run_completion_attempt(
             &client,
-            &config.chat_endpoint(),
+            &config,
             token.as_deref(),
-            &config.auth_header,
             &model,
             &messages,
-            tools.as_deref(),
+            if tools_supported {
+                tools.as_deref()
+            } else {
+                None
+            },
             reasoning_effort.as_deref(),
             response_format.as_ref(),
             cancel.clone(),
-            move |text| {
-                if !suppress_text_deltas {
-                    let _ = tx_for_text.try_send(PluginOutgoing::event(completion_event_body(
-                        &text_event_prefix,
-                        &id_for_text,
-                        "text_delta",
-                        [("text", Value::String(text.to_owned()))],
-                    )));
-                }
-            },
-            move |event| match event {
-                ReasoningEvent::Delta(text) => {
-                    if reasoning_started_at.is_none() {
-                        reasoning_started_at = Some(Instant::now());
-                    }
-                    let _ =
-                        tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
-                            &reasoning_event_prefix,
-                            &id_for_reasoning,
-                            "reasoning_delta",
-                            [("text", Value::String(text.to_owned()))],
-                        )));
-                }
-                ReasoningEvent::End { text } => {
-                    let duration_ms = reasoning_started_at
-                        .map(|started| started.elapsed().as_millis() as u64)
-                        .unwrap_or(0);
-                    let _ =
-                        tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
-                            &reasoning_event_prefix,
-                            &id_for_reasoning,
-                            "reasoning_end",
-                            [
-                                ("text", Value::String(text.to_owned())),
-                                ("duration_ms", Value::Number(duration_ms.into())),
-                            ],
-                        )));
-                }
-            },
-            move |progress| {
-                let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body(
-                    &retry_event_prefix,
-                    &id_for_retry,
-                    "retry",
-                    [
-                        ("attempt", Value::Number(progress.retry_index().into())),
-                        (
-                            "delay_ms",
-                            Value::Number((progress.next_delay.as_millis() as u64).into()),
-                        ),
-                        (
-                            "error",
-                            progress
-                                .status
-                                .map(|status| Value::String(format!("HTTP {status}")))
-                                .unwrap_or(Value::String("transient provider error".into())),
-                        ),
-                    ],
-                )));
-            },
+            &out_tx,
+            &request_id,
         )
         .await;
+
+        if attempted_tools
+            && matches!(result, Err(StreamError::ToolsUnsupported { .. }))
+            && !cancel.is_cancelled()
+        {
+            completions.mark_model_tools_unsupported(&model).await;
+            result = run_completion_attempt(
+                &client,
+                &config,
+                token.as_deref(),
+                &model,
+                &messages,
+                None,
+                reasoning_effort.as_deref(),
+                response_format.as_ref(),
+                cancel.clone(),
+                &out_tx,
+                &request_id,
+            )
+            .await;
+        }
 
         completions.finish(&request_id, &run).await;
         if cancel.is_cancelled() {
@@ -1222,6 +1180,106 @@ async fn dispatch_completion_request(
         }
     });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_completion_attempt(
+    client: &reqwest::Client,
+    config: &Config,
+    token: Option<&str>,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[Value]>,
+    reasoning_effort: Option<&str>,
+    response_format: Option<&Value>,
+    cancel: CancellationToken,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    request_id: &str,
+) -> Result<StreamOutcome, StreamError> {
+    let event_prefix = config.event_prefix();
+    let text_event_prefix = event_prefix.clone();
+    let reasoning_event_prefix = event_prefix.clone();
+    let retry_event_prefix = event_prefix;
+    let id_for_text = request_id.to_owned();
+    let tx_for_text = out_tx.clone();
+    let suppress_text_deltas = response_format.is_some();
+    let id_for_reasoning = request_id.to_owned();
+    let tx_for_reasoning = out_tx.clone();
+    let id_for_retry = request_id.to_owned();
+    let tx_for_retry = out_tx.clone();
+    let mut reasoning_started_at: Option<Instant> = None;
+
+    run_chat_stream_with_retry_progress_and_format(
+        client,
+        &config.chat_endpoint(),
+        token,
+        &config.auth_header,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        response_format,
+        cancel,
+        move |text| {
+            if !suppress_text_deltas {
+                let _ = tx_for_text.try_send(PluginOutgoing::event(completion_event_body(
+                    &text_event_prefix,
+                    &id_for_text,
+                    "text_delta",
+                    [("text", Value::String(text.to_owned()))],
+                )));
+            }
+        },
+        move |event| match event {
+            ReasoningEvent::Delta(text) => {
+                if reasoning_started_at.is_none() {
+                    reasoning_started_at = Some(Instant::now());
+                }
+                let _ = tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
+                    &reasoning_event_prefix,
+                    &id_for_reasoning,
+                    "reasoning_delta",
+                    [("text", Value::String(text.to_owned()))],
+                )));
+            }
+            ReasoningEvent::End { text } => {
+                let duration_ms = reasoning_started_at
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = tx_for_reasoning.try_send(PluginOutgoing::event(completion_event_body(
+                    &reasoning_event_prefix,
+                    &id_for_reasoning,
+                    "reasoning_end",
+                    [
+                        ("text", Value::String(text.to_owned())),
+                        ("duration_ms", Value::Number(duration_ms.into())),
+                    ],
+                )));
+            }
+        },
+        move |progress| {
+            let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body(
+                &retry_event_prefix,
+                &id_for_retry,
+                "retry",
+                [
+                    ("attempt", Value::Number(progress.retry_index().into())),
+                    (
+                        "delay_ms",
+                        Value::Number((progress.next_delay.as_millis() as u64).into()),
+                    ),
+                    (
+                        "error",
+                        progress
+                            .status
+                            .map(|status| Value::String(format!("HTTP {status}")))
+                            .unwrap_or(Value::String("transient provider error".into())),
+                    ),
+                ],
+            )));
+        },
+    )
+    .await
 }
 
 fn completion_event_body<const N: usize>(
@@ -3049,6 +3107,175 @@ mod tests {
                 .and_then(Value::as_str),
             Some(r#"{"content":"ok"}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn direct_completion_caches_tools_unsupported_per_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Clone, Copy)]
+        struct DirectTestDeps<'a> {
+            chats: &'a Arc<Chats>,
+            completions: &'a Arc<CompletionRuns>,
+            auth: &'a Arc<AuthStore>,
+            catalog: &'a Arc<ToolCatalog>,
+            broker: &'a Arc<ToolBroker>,
+        }
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Value {
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("read request");
+                assert!(read > 0, "request closed before its complete body");
+                bytes.extend_from_slice(&buffer[..read]);
+                let Some(headers_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .expect("content length");
+                let body_start = headers_end + 4;
+                if bytes.len() >= body_start + content_length {
+                    return serde_json::from_slice(&bytes[body_start..body_start + content_length])
+                        .expect("request json");
+                }
+            }
+        }
+
+        async fn dispatch_and_wait(
+            request_id: &str,
+            model: &str,
+            deps: DirectTestDeps<'_>,
+            config: &Config,
+            client: &reqwest::Client,
+            tx: &mpsc::Sender<PluginOutgoing>,
+            rx: &mut mpsc::Receiver<PluginOutgoing>,
+        ) {
+            let body = make_event_body(
+                "ollama.completion.request",
+                &[
+                    ("request_id", Value::String(request_id.into())),
+                    ("model", Value::String(model.into())),
+                    (
+                        "messages",
+                        serde_json::json!([{"role": "user", "content": "answer"}]),
+                    ),
+                    ("tools", serde_json::json!(["read_file"])),
+                    (
+                        "tool_specs",
+                        serde_json::json!([{
+                            "name": "read_file", "description": "Read a file",
+                            "parameters": {"type": "object"}
+                        }]),
+                    ),
+                    (
+                        "routing_session_id",
+                        Value::String("stable-provider-context".into()),
+                    ),
+                ],
+            );
+            dispatch_event_with_completions(
+                deps.chats,
+                deps.completions,
+                deps.auth,
+                deps.catalog,
+                deps.broker,
+                config,
+                client,
+                tx,
+                &from_plugin("mag"),
+                &body,
+            )
+            .await
+            .expect("dispatch completion");
+
+            loop {
+                let outgoing = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("completion timeout")
+                    .expect("completion channel");
+                let envelope: Value =
+                    serde_json::from_str(&outgoing.to_line()).expect("outgoing json");
+                let event = envelope["body"]["event"].as_str();
+                if matches!(event, Some("completed" | "error")) {
+                    assert_eq!(event, Some("completed"));
+                    break;
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let server = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                request_tx
+                    .send(read_request(&mut stream).await)
+                    .await
+                    .expect("capture request");
+                if index == 0 {
+                    let body = r#"{"error":"model does not support tools"}"#;
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write 400");
+                } else {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                                data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                                data: [DONE]\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write 200");
+                }
+            }
+        });
+
+        let auth = Arc::new(AuthStore::from_env_key(Some("test-key".into())));
+        let chats = fresh_chats("test-model");
+        let completions = Arc::new(CompletionRuns::new());
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let deps = DirectTestDeps {
+            chats: &chats,
+            completions: &completions,
+            auth: &auth,
+            catalog: &catalog,
+            broker: &broker,
+        };
+        let mut config = cfg("ollama");
+        config.base_url = format!("http://{addr}");
+        let client = reqwest::Client::builder().build().expect("client");
+        let (tx, mut rx) = mpsc::channel(32);
+
+        dispatch_and_wait("first-a", "model-a", deps, &config, &client, &tx, &mut rx).await;
+        dispatch_and_wait("second-a", "model-a", deps, &config, &client, &tx, &mut rx).await;
+        dispatch_and_wait("first-b", "model-b", deps, &config, &client, &tx, &mut rx).await;
+
+        server.await.expect("server");
+        let mut tool_presence = Vec::new();
+        while let Some(request) = request_rx.recv().await {
+            tool_presence.push(request.get("tools").is_some());
+        }
+        assert_eq!(tool_presence, vec![true, false, false, true]);
     }
 
     #[test]
