@@ -179,7 +179,7 @@ end
 -- ------------------------------------------------------------------
 
 do
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.install()
   _test.set_plugins({ "ollama", "mag", "nefor-tui" })
   _test.calls_clear()
@@ -195,7 +195,7 @@ end
 
 -- Replay-window gating flips on the framing markers.
 do
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   _test.fire_bus("sessions.replay.start", { session_id = "new-id", count = 0 })
   assert_eq(replay_window.active(), true,
     "after replay.start, replay_window is active")
@@ -1187,7 +1187,7 @@ end
 -- re-orchestrate; manager projection/context rebuilds the next live seed.
 do
   fresh_loop()
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   _test.fire_bus("sessions.replay.start", { session_id = "resume-1", count = 2 })
   assert_eq(replay_window.active(), true, "replay window open")
 

@@ -1547,7 +1547,7 @@ end
 
 do
   fresh()
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.set(true)
   feed("step", {
     kind         = "lead-workflow.plan.submitted",
@@ -1569,7 +1569,7 @@ end
 -- per-session — flushing on session boundary is the contract.
 do
   fresh()
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.set(true)
   feed("step", {
     kind         = "lead-workflow.plan.submitted",

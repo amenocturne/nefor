@@ -18,6 +18,6 @@ M.envelope       = require("core.envelope")
 M.ncp            = require("core.ncp")
 M.actor          = require("core.actor")
 M.ids            = require("core.ids")
-M.history_replay = require("core.history_replay")
+M.replay_window = require("core.replay_window")
 M.event          = require("core.event")
 return M

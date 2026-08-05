@@ -253,7 +253,7 @@ end
 local function test_late_attacher_preserves_replay_flags_from_prior_log()
   reset()
   _test.set_plugins({})
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.set(false)
 
   local function send_step(from, body)
@@ -967,7 +967,7 @@ local function test_tool_permission_response_dropped_during_replay()
   spawn_tool_gate_wrapper()
 
   -- Open the replay window on the bus the way sessions does.
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.set(true)
   _test.calls_clear()
 
@@ -1006,7 +1006,7 @@ local function test_replay_window_suppresses_replayed_tool_invoke_in_same_batch(
   spawn_tool_gate_wrapper()
   -- Force the flag to a known starting state in case a prior test
   -- left it set.
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.set(false)
 
   -- Bypass invoke_from_plugin's "must be a ready peer" check by
@@ -1050,7 +1050,7 @@ local function test_replay_window_does_not_starve_nefor_tui()
   _test.set_plugins({ "tool-gate", "nefor-tui", "ollama" })
   ready_each({ "tool-gate", "nefor-tui", "ollama" })
   spawn_tool_gate_wrapper()
-  local replay_window = require("core.history_replay")
+  local replay_window = require("core.replay_window")
   replay_window.set(false)
 
   local function send_step(from, body)

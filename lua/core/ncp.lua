@@ -84,7 +84,7 @@
 -- `sessions.replay.start` / `sessions.replay.end` framing markers), so
 -- every envelope inside a replay window carries `env.replay = true` and
 -- every live envelope carries `env.replay = false`. The global
--- `core.history_replay.active()` flag stays in sync for
+-- `core.replay_window.active()` flag stays in sync for
 -- `nefor.bus.on_event` subscribers; wrappers should prefer `env.replay`
 -- because batched dispatch removes the per-envelope temporal coupling
 -- that the global flag implicitly relied on.
@@ -97,7 +97,7 @@
 -- "decide whether to publish" and obscure the replay/persistence path.
 
 local json = nefor.json
-local replay_window = require("core.history_replay")
+local replay_window = require("core.replay_window")
 
 local M = {}
 

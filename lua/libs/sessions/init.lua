@@ -42,7 +42,7 @@
 -- Path: `<root>/sessions/<id>.jsonl`. Parent dir is created on init.
 
 local json = nefor.json
-local replay_window = require("core.history_replay")
+local replay_window = require("core.replay_window")
 
 local state = {
   ---@type string|nil

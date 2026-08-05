@@ -218,7 +218,7 @@ pm.install({
 
 local ncp            = require("core.ncp")
 local actor          = require("core.actor")
-local history_replay = require("core.history_replay")
+local replay_window = require("core.replay_window")
 local sessions       = require("libs.sessions")
 local cfg            = require("config").active
 local lead_role      = require("libs.lead-workflow.role")
@@ -232,10 +232,10 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
--- Defense-in-depth fallback for the synchronous `history_replay.set`
+-- Defense-in-depth fallback for the synchronous `replay_window.set`
 -- path that sessions drives around its replay burst. Wired explicitly
 -- here so module load stays free of bus dependencies.
-history_replay.install()
+replay_window.install()
 actor.spawn(sessions)
 actor.spawn(require("libs.conversation-manager.runtime").build())
 actor.spawn(require("libs.state-tracking"))

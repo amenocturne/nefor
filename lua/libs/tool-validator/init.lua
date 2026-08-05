@@ -59,7 +59,7 @@
 
 local envelope     = require("core.envelope")
 local event        = require("core.event")
-local replay_window = require("core.history_replay")
+local replay_window = require("core.replay_window")
 
 local emit = envelope.emit
 

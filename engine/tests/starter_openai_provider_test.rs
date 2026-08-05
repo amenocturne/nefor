@@ -184,9 +184,9 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     nefor.set("log", log_tbl)?;
 
     // bus.on_event — accept handler registrations as a no-op. The
-    // history_replay module no longer self-subscribes at require-time
+    // replay_window module no longer self-subscribes at require-time
     // (now wired explicitly by starter/init.lua via
-    // history_replay.install()); these tests drive the replay-window
+    // replay_window.install()); these tests drive the replay-window
     // flag via the module's public set() helper instead.
     let bus_tbl = lua.create_table()?;
     let on_event = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;

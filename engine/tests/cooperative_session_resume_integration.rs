@@ -145,7 +145,7 @@ fn engine_init_source(root: &Path) -> String {
 
         local ncp = require("core.ncp")
         local actor = require("core.actor")
-        local history_replay = require("core.history_replay")
+        local replay_window = require("core.replay_window")
         local sessions = require("libs.sessions")
 
         function dispatch(current_log) ncp.dispatch(current_log) end
@@ -157,7 +157,7 @@ fn engine_init_source(root: &Path) -> String {
         end
 
         actor.install()
-        history_replay.install()
+        replay_window.install()
         actor.spawn(sessions)
         actor.spawn(require("libs.conversation-manager.runtime").build())
         actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({{ "nefor-tui" }}))

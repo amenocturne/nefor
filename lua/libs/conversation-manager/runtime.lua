@@ -1,7 +1,7 @@
 local manager = require("libs.conversation-manager")
 local domain = manager.domain
 local projection = require("libs.conversation-manager.projection")
-local replay_window = require("core.history_replay")
+local replay_window = require("core.replay_window")
 
 local M = {}
 

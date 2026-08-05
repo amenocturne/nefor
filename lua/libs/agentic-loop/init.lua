@@ -52,7 +52,7 @@ local json = nefor.json
 local envelope        = require("core.envelope")
 local ids             = require("core.ids")
 local results_lib     = require("libs.agentic-loop.results")
-local history_replay  = require("core.history_replay")
+local replay_window   = require("core.replay_window")
 local conversation_projection = require("libs.agentic-loop.conversation_projection")
 
 local state = {
@@ -1184,7 +1184,7 @@ local function handle_conversation_projection_delta(body)
   end
   if not state.conversation:apply_delta(body) then return end
 
-  if body.replay ~= true and not history_replay.active()
+  if body.replay ~= true and not replay_window.active()
       and change.kind == "content_chunk_appended" then
     local turn = state.current_turn
     local chunk = change.chunk
@@ -1201,7 +1201,7 @@ local function handle_conversation_projection_delta(body)
   if change.kind == "conversation_created" then
     state.conversation_id = body.conversation_id
     state.pending_conversation_create = nil
-    if body.replay == true or history_replay.active() then return end
+    if body.replay == true or replay_window.active() then return end
     emit("conversation-manager", {
       kind = "conversation.active.set",
       request_id = "conversation-active-" .. envelope.uuid_lite(),
@@ -1509,7 +1509,7 @@ local function receive_msg(entry)
     return
   end
 
-  if history_replay.active() then
+  if replay_window.active() then
     -- conversation-manager rebuilds and publishes the universal projection;
     -- input handlers must not
     -- re-fire (a replayed chat.input.submit would spawn a fresh turn
@@ -1588,7 +1588,7 @@ local function restore_configuration_from_projection()
 end
 
 -- Drive `teardown_for_session_end` from the bus marker. Replay-mode
--- gating is owned by `core.history_replay`, which subscribes to
+-- gating is owned by `core.replay_window`, which subscribes to
 -- `sessions.replay.start` / `sessions.replay.end` independently.
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)

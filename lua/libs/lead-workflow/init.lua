@@ -79,7 +79,7 @@ local RunRegistry    = require("libs.lead-workflow.run-registry")
 local chat_emitter   = require("libs.chat-emitter")
 local sessions       = require("sessions")
 local envelope       = require("core.envelope")
-local replay_window  = require("core.history_replay")
+local replay_window  = require("core.replay_window")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit

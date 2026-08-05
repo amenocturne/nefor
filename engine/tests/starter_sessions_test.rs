@@ -1082,8 +1082,8 @@ fn replay_window_frames_resume_and_skips_persistence_inside() {
 }
 
 #[test]
-fn resume_sets_global_history_replay_flag_during_replay_burst() {
-    // `core.history_replay.active()` is the synchronous replay gate read by
+fn resume_sets_global_replay_window_during_replay_burst() {
+    // `core.replay_window.active()` is the synchronous replay gate read by
     // pure-Lua actors such as agentic-loop. The sessions actor must hold it
     // true while it emits replay.start, replayed envelopes, and replay.end,
     // then release it before returning.
@@ -1114,7 +1114,7 @@ fn resume_sets_global_history_replay_flag_during_replay_burst() {
     let script = format!(
         r#"
         local json = nefor.json
-        local replay = require("core.history_replay")
+        local replay = require("core.replay_window")
         _active_trace = {{}}
         nefor.engine.send = function(payload, _target)
             local ok, decoded = pcall(json.decode, payload)
@@ -1141,15 +1141,15 @@ fn resume_sets_global_history_replay_flag_during_replay_burst() {
 
     assert!(
         ordered.iter().any(|v| v == "sessions.replay.start:true"),
-        "replay.start must be emitted with history_replay.active=true: {ordered:?}"
+        "replay.start must be emitted with replay_window.active=true: {ordered:?}"
     );
     assert!(
         ordered.iter().any(|v| v == "chat.input.submit:true"),
-        "replayed envelope must be emitted with history_replay.active=true: {ordered:?}"
+        "replayed envelope must be emitted with replay_window.active=true: {ordered:?}"
     );
     assert!(
         ordered.iter().any(|v| v == "sessions.replay.end:true"),
-        "replay.end must be emitted before releasing history_replay: {ordered:?}"
+        "replay.end must be emitted before releasing replay_window: {ordered:?}"
     );
     let active_after: bool = lua
         .load(r#"return _active_after"#)
@@ -1157,7 +1157,7 @@ fn resume_sets_global_history_replay_flag_during_replay_burst() {
         .expect("active after");
     assert!(
         !active_after,
-        "history_replay.active() must be false after resume"
+        "replay_window.active() must be false after resume"
     );
 
     match prev.as_deref() {
