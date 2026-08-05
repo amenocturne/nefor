@@ -27,6 +27,21 @@ local function translator(name)
     assert(type(request.messages) == "table",
       "chatgpt-provider.complete: complete messages/history required")
     local body = copy(request)
+    local context = body.conversation_context
+    if type(context) == "table" then
+      local lowered_context = copy(context)
+      local messages = type(context.messages) == "table" and context.messages or {}
+      body.messages = {}
+      for index, message in ipairs(messages) do
+        body.messages[index] = t.context_message(message)
+      end
+      lowered_context.messages = body.messages
+      lowered_context.tail_messages = {}
+      for index, message in ipairs(context.tail_messages or {}) do
+        lowered_context.tail_messages[index] = t.context_message(message)
+      end
+      body.conversation_context = lowered_context
+    end
     body.kind = t.kinds.completion_request
     return body
   end
@@ -35,6 +50,55 @@ local function translator(name)
     assert(type(request_id) == "string" and #request_id > 0,
       "chatgpt-provider.cancel: request_id required")
     return { kind = t.kinds.completion_cancel, request_id = request_id }
+  end
+
+
+  -- Interpret provider-owned checkpoints here, at the provider boundary.
+  -- Conversation-manager and callers only carry the envelope; they never
+  -- need to know that ChatGPT compaction is represented by Responses items.
+  t.compact_context = function(change)
+    local context = type(change) == "table" and change.context or nil
+    if type(context) ~= "table" or type(context.messages) ~= "table" then
+      return nil, "conversation context is missing complete messages"
+    end
+
+    local request_id = change.compaction and change.compaction.request_id
+    if type(request_id) ~= "string" or request_id == "" then
+      return nil, "conversation compaction request_id is missing"
+    end
+
+    local chat_id = "conversation-compact:" .. request_id
+    local plan = {
+      chat_id = chat_id,
+      create = { kind = prefix .. "chat.create", chat_id = chat_id },
+      messages = context.messages,
+      compact = {
+        kind = prefix .. "chat.compact",
+        chat_id = chat_id,
+        trigger = "conversation-manager",
+      },
+      delete = { kind = prefix .. "chat.delete", chat_id = chat_id },
+    }
+
+    local selected = context.compaction
+    local checkpoint = type(selected) == "table" and selected.checkpoint or nil
+    if type(checkpoint) == "table"
+        and checkpoint.provider == name
+        and checkpoint.format == "chatgpt.responses.compaction.v1"
+        and type(checkpoint.artifact) == "table"
+        and type(checkpoint.artifact.items) == "table" then
+      plan.restore = {
+        kind = prefix .. "chat.compaction.restore",
+        chat_id = chat_id,
+        model_context_artifact = checkpoint.artifact,
+      }
+      plan.messages = type(context.tail_messages) == "table"
+        and context.tail_messages or {}
+    end
+    for index, message in ipairs(plan.messages) do
+      plan.messages[index] = t.context_message(message)
+    end
+    return plan
   end
 
   t.inbound = function(env)

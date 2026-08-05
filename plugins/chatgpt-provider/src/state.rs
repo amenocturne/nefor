@@ -695,6 +695,27 @@ impl Chats {
         Ok(())
     }
 
+    /// Install a provider-native checkpoint before the neutral tail already
+    /// restored into the chat. The checkpoint stays opaque outside this
+    /// provider; only the Responses translator ever observes these entries.
+    pub async fn prepend_native_history(
+        &self,
+        id: &ChatId,
+        items: Vec<ResponseItem>,
+    ) -> Result<(), ChatsError> {
+        let mut g = self.inner.lock().await;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        let mut history = items
+            .into_iter()
+            .map(|item| HistoryEntry::Native { item })
+            .collect::<Vec<_>>();
+        history.append(&mut chat.history);
+        chat.history = history;
+        Ok(())
+    }
+
     pub async fn push_user(&self, id: &ChatId, text: String) -> Result<(), ChatsError> {
         self.append(id, Message::user(text)).await
     }
@@ -1442,6 +1463,28 @@ mod tests {
         let h = c.snapshot(&id).await.expect("h").history;
         assert_eq!(h.len(), 1);
         assert!(matches!(h[0], HistoryEntry::Native { .. }));
+    }
+
+    #[tokio::test]
+    async fn prepend_native_history_keeps_neutral_tail_after_checkpoint() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        c.push_user(&id, "tail".into()).await.expect("push");
+        c.prepend_native_history(
+            &id,
+            vec![ResponseItem::Compaction {
+                encrypted_content: "sealed".into(),
+            }],
+        )
+        .await
+        .expect("prepend");
+
+        let history = c.snapshot(&id).await.expect("snapshot").history;
+        assert!(matches!(history[0], HistoryEntry::Native { .. }));
+        assert!(matches!(history[1], HistoryEntry::Message { .. }));
     }
 
     #[tokio::test]

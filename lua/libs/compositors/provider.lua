@@ -1,7 +1,7 @@
 -- lua/libs/compositors/provider.lua — engine-side actor for
 -- OpenAI-compatible providers. Threads the openai-provider plugin
--- lib's translation primitives with starter-owned `agentic-loop`
--- orchestrator state.
+-- lib's translation primitives with conversation-manager projections and
+-- starter-owned control-plane state.
 --
 -- The mock-plugin Rust binary speaks the same provider wire-protocol
 -- (`<prefix>.chat.create`, `<prefix>.stream.delta`, …), so it uses the
@@ -40,16 +40,11 @@
 --
 -- Stream deltas on the lead's prefix-bound kernel chats fire the
 -- agentic-loop's public stream/reasoning observers (the CLI surface
--- reads those); `<prefix>.chat.complete.result` feeds the history
--- mirror. The lib returns these envelopes' bodies unchanged; this file
+-- reads those). The lib returns these envelopes' bodies unchanged; this file
 -- pattern-matches on the prefixed kind.
 --
--- ## Replay window
---
--- When `env.replay` is set, the lib's `replay_rebuild(env, name)`
--- handles the entire rebuild path (chat.create re-feed, chat.append
--- re-feed with ownership, tool.result → assistant chat.append
--- synthesis). This file just delegates.
+-- Replay is inert at this boundary: provider requests carry complete
+-- conversation-manager context and never rebuild process-local chats.
 
 local M = {}
 
@@ -99,6 +94,7 @@ function M.spawn_spec(name, command, opts)
   local provider_lib = require(opts.translator_lib or "openai-provider")
   local translator = provider_lib.translator(name)
   local kinds = translator.kinds
+  local pending_compactions = {}
 
   local function emit_synthetic(from, body)
     nefor.engine.send(nefor.json.encode({
@@ -122,69 +118,6 @@ function M.spawn_spec(name, command, opts)
       out[k] = type(v) == "table" and clone_table(v) or v
     end
     return out
-  end
-
-  local function publish_history_create(body)
-    if type(body.chat_id) ~= "string" then return end
-    emit_synthetic(name, {
-      kind             = "chat.history.create",
-      provider         = name,
-      chat_id          = body.chat_id,
-      model            = body.model,
-      system           = body.system,
-      tools            = clone_table(body.tools),
-      reasoning_effort = body.reasoning_effort,
-    })
-  end
-
-  local function publish_history_message(chat_id, message)
-    if type(chat_id) ~= "string" or type(message) ~= "table" then return end
-    emit_synthetic(name, {
-      kind     = "chat.history.message",
-      provider = name,
-      chat_id  = chat_id,
-      message  = clone_table(message),
-    })
-  end
-
-  local function normalize_tool_calls(tcs)
-    if type(tcs) ~= "table" then return nil end
-    local out = {}
-    for _, tc in ipairs(tcs) do
-      if type(tc) == "table" then
-        if type(tc["function"]) == "table" then
-          table.insert(out, clone_table(tc))
-        elseif type(tc.id) == "string" and type(tc.name) == "string" then
-          local arguments = tc.arguments
-          if type(arguments) ~= "string" then
-            local ok, encoded = pcall(nefor.json.encode, arguments == nil and {} or arguments)
-            arguments = ok and encoded or "{}"
-          end
-          table.insert(out, {
-            id = tc.id,
-            type = "function",
-            ["function"] = {
-              name = tc.name,
-              arguments = arguments,
-            },
-          })
-        end
-      end
-    end
-    if #out == 0 then return nil end
-    return out
-  end
-
-  local function assistant_message_from_output(output)
-    if type(output) ~= "table" then return nil end
-    local text = type(output.text) == "string" and output.text or ""
-    local tcs = normalize_tool_calls(output.tool_calls)
-    local has_text = #text > 0
-    local has_tcs = type(tcs) == "table" and #tcs > 0
-    if not has_text and not has_tcs then return nil end
-    local message = { role = "assistant", content = text }
-    if has_tcs then message.tool_calls = tcs end
-    return message
   end
 
   local function handle_orchestrator_outbound(body)
@@ -212,16 +145,84 @@ function M.spawn_spec(name, command, opts)
     -- chat.error / chat.complete.result keep their prefixed kinds on
     -- the bus: the mag plugin's provider bridge correlates them back to
     -- the kernel request by chat_id.
-    -- chat.complete.result additionally mirrors the assistant message
-    -- into the history stream before passing through.
     if k == kinds.chat_complete_result then
       local chat_id = body.chat_id
       if type(chat_id) ~= "string" then return body end
-      publish_history_message(chat_id, assistant_message_from_output(body.output))
       return body
     end
 
     return body
+  end
+
+  local function publish_compaction_failed(change, message)
+    emit_synthetic(name, {
+      kind = "conversation.context.compact.failed",
+      request_id = change.compaction and change.compaction.request_id,
+      conversation_id = change.conversation_id,
+      error = { code = "provider_compaction_failed", message = tostring(message) },
+    })
+  end
+
+  local function begin_compaction(change)
+    if change.provider ~= name then return true end
+    local plan, message = translator.compact_context(change)
+    if not plan then
+      publish_compaction_failed(change, message or "context compaction is unsupported")
+      return true
+    end
+    pending_compactions[plan.chat_id] = {
+      request_id = change.compaction.request_id,
+      conversation_id = change.conversation_id,
+      delete = plan.delete,
+    }
+    translator.deliver(plan.create)
+    if plan.restore then translator.deliver(plan.restore) end
+    for _, message_body in ipairs(plan.messages or {}) do
+      translator.deliver({
+        kind = kinds.chat_append,
+        chat_id = plan.chat_id,
+        message = clone_table(message_body),
+      })
+    end
+    translator.deliver(plan.compact)
+    return true
+  end
+
+  local function finish_compaction(body)
+    local pending = type(body.chat_id) == "string" and pending_compactions[body.chat_id] or nil
+    if not pending then return false end
+    pending_compactions[body.chat_id] = nil
+    if pending.delete then translator.deliver(pending.delete) end
+    if body.kind == kinds.chat_compaction_commit then
+      local checkpoint = {
+        provider = name,
+        format = "chatgpt.responses.compaction.v1",
+        model = body.model,
+        artifact = clone_table(body.model_context_artifact),
+      }
+      emit_synthetic(name, {
+        kind = "conversation.context.compact.complete",
+        request_id = pending.request_id,
+        conversation_id = pending.conversation_id,
+        checkpoint = checkpoint,
+        compatibility = {
+          provider = name,
+          format = checkpoint.format,
+          model = checkpoint.model,
+        },
+      })
+    else
+      emit_synthetic(name, {
+        kind = "conversation.context.compact.failed",
+        request_id = pending.request_id,
+        conversation_id = pending.conversation_id,
+        error = {
+          code = "provider_compaction_failed",
+          message = tostring(body.message or body.error or "context compaction failed"),
+        },
+      })
+    end
+    return true
   end
 
   -- from_plugin (binary → bus) — four steps per envelope:
@@ -236,6 +237,18 @@ function M.spawn_spec(name, command, opts)
       -- Static-token injection runs even when outbound drops the body
       -- (ready/goodbye both return nil from outbound).
       translator.maybe_inject_static_token(env, opts)
+
+      if type(env.body) == "table" then
+        local body = env.body
+        if pending_compactions[body.chat_id]
+            and (body.kind == kinds.chat_compaction_commit
+              or body.kind == kinds.chat_error
+              or body.kind == kinds.turn_error) then
+          finish_compaction(body)
+          goto continue
+        end
+        if pending_compactions[body.chat_id] then goto continue end
+      end
 
       if hooks.intercept_inbound then
         if hooks.intercept_inbound(env, hook_helpers) == false then
@@ -262,7 +275,7 @@ function M.spawn_spec(name, command, opts)
   end
 
   -- to_plugin (bus → binary) — per-envelope:
-  --   1. env.replay: hand off to lib.replay_rebuild (full rebuild path).
+  --   1. env.replay: drop; conversation-manager reconstructs durable context.
   --   2. translator.inbound: kind rename, drop UI-shaped prompts,
   --      target-filter provider-scoped envelopes.
   --   3. translator.deliver to the peer's stdin.
@@ -270,7 +283,9 @@ function M.spawn_spec(name, command, opts)
     for _, env in ipairs(envs) do
       local kind = type(env.body) == "table" and env.body.kind or nil
       if env.replay or kind == "sessions.replay.end" then
-        provider_lib.replay_rebuild(env, name)
+        -- Provider processes are request-scoped. Conversation-manager
+        -- reconstructs universal context, so replay never rebuilds provider
+        -- chat tables or reissues completed requests.
       else
         if hooks.intercept_to_plugin then
           if hooks.intercept_to_plugin(env) == false then
@@ -286,13 +301,18 @@ function M.spawn_spec(name, command, opts)
           end
         end
 
+        if type(env.body) == "table"
+            and env.body.kind == "conversation.projection.delta"
+            and type(env.body.change) == "table"
+            and env.body.change.kind == "context_compaction_pending" then
+          local change = clone_table(env.body.change)
+          change.conversation_id = env.body.conversation_id
+          begin_compaction(change)
+          goto continue
+        end
+
         local body = translator.inbound(env)
         if body ~= nil then
-          if body.kind == kinds.chat_create then
-            publish_history_create(body)
-          elseif body.kind == kinds.chat_append then
-            publish_history_message(body.chat_id, body.message)
-          end
           translator.deliver(body)
         end
       end

@@ -1495,6 +1495,28 @@ fn parse_direct_completion_tools(value: Option<&Value>) -> Result<DirectCompleti
     }
 }
 
+fn completion_checkpoint(
+    context: Option<&Value>,
+    provider: &str,
+    model: Option<&str>,
+) -> Option<Vec<ResponseItem>> {
+    let checkpoint = context?.get("compaction")?.get("checkpoint")?.as_object()?;
+    if checkpoint.get("provider").and_then(Value::as_str) != Some(provider)
+        || checkpoint.get("format").and_then(Value::as_str)
+            != Some("chatgpt.responses.compaction.v1")
+    {
+        return None;
+    }
+    let checkpoint_model = checkpoint.get("model").and_then(Value::as_str);
+    if checkpoint_model.is_some() && checkpoint_model != model {
+        return None;
+    }
+    let items = checkpoint.get("artifact")?.get("items")?.clone();
+    serde_json::from_value(items)
+        .ok()
+        .filter(|items: &Vec<ResponseItem>| !items.is_empty())
+}
+
 async fn handle_completion_request(
     ctx: &DispatcherContext,
     body: &Map<String, Value>,
@@ -1513,7 +1535,33 @@ async fn handle_completion_request(
         }
     };
     let chat_id = ChatId::new(request_id.clone());
-    let messages = match body.get("messages").and_then(Value::as_array) {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let effective_model = match model.clone() {
+        Some(model) => Some(model),
+        None => ctx.chats.default_model().await,
+    };
+    let checkpoint = completion_checkpoint(
+        body.get("conversation_context"),
+        &ctx.args.provider_name,
+        effective_model.as_deref(),
+    );
+    let message_values = body
+        .get("conversation_context")
+        .and_then(Value::as_object)
+        .and_then(|context| {
+            let field = if checkpoint.is_some() {
+                "tail_messages"
+            } else {
+                "messages"
+            };
+            context.get(field).and_then(Value::as_array)
+        })
+        .or_else(|| body.get("messages").and_then(Value::as_array));
+    let messages = match message_values {
         Some(messages) => messages,
         None => {
             send_completion_event(ctx, Some(&request_id), "failed", |event| {
@@ -1549,11 +1597,6 @@ async fn handle_completion_request(
             }
         }
     }
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
     let routing_session_id = body
         .get("routing_session_id")
         .and_then(Value::as_str)
@@ -1640,6 +1683,15 @@ async fn handle_completion_request(
         })
         .await?;
         return Ok(());
+    }
+    if let Some(items) = checkpoint {
+        if let Err(error) = direct_chats.prepend_native_history(&chat_id, items).await {
+            send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                event.insert("error".into(), Value::String(error.to_string()));
+            })
+            .await?;
+            return Ok(());
+        }
     }
     let cancel = match direct_chats.begin_turn(&chat_id).await {
         Ok(cancel) => cancel,
@@ -3914,6 +3966,29 @@ mod tests {
         assert_eq!(parsed.message.content(), Some("hello"));
         assert!(parsed.message.tool_calls().is_empty());
         assert!(parsed.tool_call_failures.is_empty());
+    }
+
+    #[test]
+    fn completion_checkpoint_is_provider_and_model_owned() {
+        let context = serde_json::json!({
+            "compaction": { "checkpoint": {
+                "provider": "chatgpt",
+                "format": "chatgpt.responses.compaction.v1",
+                "model": "gpt-5.6-sol",
+                "artifact": { "items": [{
+                    "type": "compaction",
+                    "encrypted_content": "sealed"
+                }] }
+            }}
+        });
+        assert_eq!(
+            completion_checkpoint(Some(&context), "chatgpt", Some("gpt-5.6-sol"))
+                .expect("compatible checkpoint")
+                .len(),
+            1
+        );
+        assert!(completion_checkpoint(Some(&context), "other", Some("gpt-5.6-sol")).is_none());
+        assert!(completion_checkpoint(Some(&context), "chatgpt", Some("other-model")).is_none());
     }
 
     #[test]

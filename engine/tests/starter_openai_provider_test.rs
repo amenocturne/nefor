@@ -1,27 +1,4 @@
-//! Unit tests for `starter/openai-provider/init.lua` driven from Rust.
-//!
-//! These tests exercise the `to_plugin` callback during a synthetic
-//! session-replay window — the path that rebuilds the provider binary's
-//! per-chat_id history table on cross-process /resume after a nefor
-//! restart. The harness installs a stub `nefor.*` surface that records
-//! every `nefor.engine.deliver(name, payload)` call so the test can
-//! assert the binary saw the right re-fed `<prefix>.chat.create` /
-//! `<prefix>.chat.append` envelopes.
-//!
-//! Post batch-protocol refactor `to_plugin` takes a LIST of envelopes
-//! per invocation (`function to_plugin(envs) for _, env in ipairs(envs)
-//! do ... end end`). The Lua-side helpers below feed the wrapper a
-//! one-element list per "live" call to keep the per-envelope semantics
-//! these tests pin, and per-envelope the test sets `env.replay` to
-//! match what the framework would stamp inline as it walks
-//! `sessions.replay.*` framing.
-//!
-//! Why not e2e: the cross-process flow (kill nefor, start fresh, /resume)
-//! requires driving the engine binary across two process lifetimes plus
-//! a real provider binary. Pinning the contract at the wrapper boundary
-//! is sharper for regression: any change that breaks the rebuild path
-//! shows up here even if the e2e harness can't easily express the
-//! cross-process scenario.
+//! Provider compositor contracts driven through the production Lua callbacks.
 
 use std::path::PathBuf;
 
@@ -43,22 +20,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Drive the wrapper's `to_plugin` callback for a sequence of replayed
-/// envelopes inside a `sessions.replay.start` / `sessions.replay.end`
-/// window, then assert every `nefor.engine.deliver(name, ...)` payload
-/// the wrapper produced.
-///
-/// Scenario covered:
-///   1. `<prefix>.chat.create` → delivered to binary verbatim.
-///   2. `<prefix>.chat.append { user }` → delivered to binary verbatim.
-///   3. `tool.result` carrying `result.text` + `result.next_state.chat_id`
-///      that we own → synthesises an assistant `<prefix>.chat.append`.
-///   4. `<prefix>.chat.append { tool }` → delivered to binary verbatim.
-///
-/// Net effect: the binary observes the full
-/// system → user → assistant → tool history exactly as the live path
-/// would have produced it, so the next live turn (a fresh
-/// `<prefix>.chat.complete`) sees full prior context.
 #[test]
 fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events() {
     let lua = Lua::new();
@@ -122,483 +83,91 @@ fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events(
 }
 
 #[test]
-fn replay_window_re_feeds_chat_history_into_provider_binary() {
+fn provider_adapter_owns_universal_compaction_lifecycle() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local op = require("libs.compositors.provider")
+        local spec = op.spawn_spec("chatgpt", { "/bin/true" }, {
+          agentic_loop = {}, translator_lib = "chatgpt-provider",
+        })
+        spec.to_plugin({{
+          type = "event", from = "conversation-manager",
+          body = {
+            kind = "conversation.projection.delta",
+            conversation_id = "lead",
+            change = {
+              kind = "context_compaction_pending",
+              provider = "chatgpt",
+              compaction = { request_id = "compact-1" },
+              context = {
+                messages = {{ role = "user", content = "full context" }},
+                tail_messages = {},
+              },
+            },
+          },
+        }})
+        local delivered = _test.delivered()
+        assert(#delivered == 3)
+        assert(delivered[1].kind == "chatgpt.chat.create")
+        assert(delivered[2].kind == "chatgpt.chat.append")
+        assert(delivered[3].kind == "chatgpt.chat.compact")
 
-    // Spawn the wrapper. `nefor.plugins.spawn` is a no-op stub, so this
-    // just returns the spec table; we drive `to_plugin` directly.
+        spec.from_plugin({{
+          type = "event", from = "chatgpt",
+          body = {
+            kind = "chatgpt.chat.compaction.commit",
+            chat_id = "conversation-compact:compact-1",
+            model = "gpt-5.6-sol",
+            model_context_artifact = {
+              kind = "responses.compaction",
+              items = {{ type = "compaction", encrypted_content = "sealed" }},
+            },
+          },
+        }})
+        local sent = _test.sent()
+        local cleanup = _test.delivered()
+        assert(#sent == 1)
+        assert(sent[1].kind == "conversation.context.compact.complete")
+        assert(#cleanup == 1 and cleanup[1].kind == "chatgpt.chat.delete")
+        "#,
+    )
+    .exec()
+    .expect("drive universal compaction lifecycle");
+}
+
+#[test]
+fn unsupported_provider_returns_universal_compaction_failure() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
     lua.load(
         r#"
         local op = require("libs.compositors.provider")
         local spec = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} })
-        _to_plugin = spec.to_plugin
-        _replay = require("core.history_replay")
-        "#,
-    )
-    .exec()
-    .expect("spawn wrapper");
-
-    // Replay window open. Drive the recorded envelope sequence — these
-    // are the shapes the bus log carries on disk after a normal turn.
-    // Batched signature: every call hands the wrapper a one-element list
-    // with `env.replay = true` (what the framework stamps when iterating
-    // a tail framed by sessions.replay.start/end).
-    lua.load(
-        r#"
-        _replay.set(true)
-        local function deliver_env(from, body)
-            _to_plugin({ { type = "event", from = from, body = body, replay = true } })
-        end
-
-        -- 1. Engine→provider chat.create (recorded with target=ollama).
-        deliver_env("engine", { kind = "ollama.chat.create", chat_id = "chat-1", model = "qwen3" })
-        -- 2. Engine→provider chat.append { system }.
-        deliver_env("engine", {
-            kind    = "ollama.chat.append",
-            chat_id = "chat-1",
-            message = { role = "system", content = "you are a helpful assistant" },
-        })
-        -- 3. Engine→provider chat.append { user }.
-        deliver_env("engine", {
-            kind    = "ollama.chat.append",
-            chat_id = "chat-1",
-            message = { role = "user", content = "hi" },
-        })
-        -- 4. Wrapper-emitted tool.result close. Carries the assistant
-        --    text + next_state.chat_id; the live binary push_assistant
-        --    happened inside the provider process, so we synthesize the
-        --    chat.append here.
-        deliver_env("provider-wrapper", {
-            kind   = "tool.result",
-            id     = "firing-1",
-            result = {
-                text          = "Hello! How can I help?",
-                finish_reason = "stop",
-                next_state    = { chat_id = "chat-1" },
+        spec.to_plugin({{
+          type = "event", from = "conversation-manager",
+          body = {
+            kind = "conversation.projection.delta",
+            conversation_id = "lead",
+            change = {
+              kind = "context_compaction_pending",
+              provider = "ollama",
+              compaction = { request_id = "compact-2" },
+              context = { messages = {{ role = "user", content = "context" }} },
             },
-        })
-
-        _replay.set(false)
-        _delivered = _test.delivered()
+          },
+        }})
+        local sent = _test.sent()
+        assert(#sent == 1)
+        assert(sent[1].kind == "conversation.context.compact.failed")
+        assert(#_test.delivered() == 0)
         "#,
     )
     .exec()
-    .expect("drive replay");
-
-    let delivered = collect_delivered(&lua, "_delivered");
-
-    // Assertion shape: every payload delivered to "ollama" carries a
-    // `<prefix>.chat.{create,append}` body. The synthesized assistant
-    // append is at index 4 (after create + 2 appends + the synthesis
-    // input was a tool.result that we don't deliver verbatim).
-    assert_eq!(
-        delivered.len(),
-        4,
-        "expected 4 delivered envelopes (create + system + user + synthesized assistant), got {}: {:#?}",
-        delivered.len(),
-        delivered
-    );
-
-    let kinds: Vec<&str> = delivered.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            "ollama.chat.create",
-            "ollama.chat.append",
-            "ollama.chat.append",
-            "ollama.chat.append",
-        ],
-        "kinds re-fed in order: create → system append → user append → synthesized assistant append; got {:?}",
-        delivered
-    );
-
-    let roles: Vec<Option<&str>> = delivered.iter().map(|e| e.role.as_deref()).collect();
-    assert_eq!(
-        roles,
-        vec![None, Some("system"), Some("user"), Some("assistant")],
-        "roles in order; got {:#?}",
-        delivered
-    );
-
-    // The synthesized assistant message must carry the assistant text.
-    let assistant = &delivered[3];
-    assert_eq!(
-        assistant.content.as_deref(),
-        Some("Hello! How can I help?"),
-        "assistant chat.append must carry the model's text from result.text"
-    );
-
-    // Ownership: the chat_id reaches every delivered envelope.
-    for entry in &delivered {
-        assert_eq!(
-            entry.chat_id.as_deref(),
-            Some("chat-1"),
-            "every re-fed envelope carries the original chat_id; got {:#?}",
-            entry
-        );
-    }
-}
-
-/// Cross-wrapper isolation: when two providers (mock-plugin + ollama)
-/// coexist, only the wrapper that originally created a chat_id should
-/// re-feed envelopes for it on replay. Without ownership filtering the
-/// "wrong" wrapper would deliver chat.append envelopes to its binary
-/// for chat_ids it never created — and the binary would emit a
-/// chat.error because that chat_id doesn't exist in its table.
-#[test]
-fn cross_wrapper_isolation_unowned_chat_ids_drop() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    lua.load(
-        r#"
-        local op = require("libs.compositors.provider")
-        local al_stub = {}
-        -- mock_provider chats and ollama chats use independent spawn_spec
-        -- instances; the two actor instances don't share state.
-        _mock_to_plugin   = op.spawn_spec("mock-plugin", { "/bin/true" }, { agentic_loop = al_stub }).to_plugin
-        _ollama_to_plugin = op.spawn_spec("ollama",      { "/bin/true" }, { agentic_loop = al_stub }).to_plugin
-        _replay = require("core.history_replay")
-        "#,
-    )
-    .exec()
-    .expect("spawn both provider instances");
-
-    lua.load(
-        r#"
-        _replay.set(true)
-        local function fire(body, from)
-            local envs = { { type = "event", from = from, body = body, replay = true } }
-            _mock_to_plugin(envs)
-            _ollama_to_plugin(envs)
-        end
-
-        -- Mock chat is created via mock-plugin.chat.create.
-        fire({ kind = "mock-plugin.chat.create", chat_id = "chat-mock-1" }, "engine")
-        fire({
-            kind    = "mock-plugin.chat.append",
-            chat_id = "chat-mock-1",
-            message = { role = "user", content = "hi mock" },
-        }, "engine")
-        -- Ollama chat is created via ollama.chat.create.
-        fire({ kind = "ollama.chat.create", chat_id = "chat-ollama-1" }, "engine")
-        fire({
-            kind    = "ollama.chat.append",
-            chat_id = "chat-ollama-1",
-            message = { role = "user", content = "hi ollama" },
-        }, "engine")
-        -- tool.result for the ollama chat. Only the ollama wrapper owns
-        -- it; mock-plugin must drop.
-        fire({
-            kind = "tool.result", id = "f1",
-            result = { text = "ollama reply", next_state = { chat_id = "chat-ollama-1" } },
-        }, "provider-wrapper")
-
-        _replay.set(false)
-        _delivered = _test.delivered()
-        "#,
-    )
-    .exec()
-    .expect("drive replay");
-
-    let delivered = collect_delivered(&lua, "_delivered");
-
-    // Filter per binary.
-    let mock_payloads: Vec<&DeliveredEntry> = delivered
-        .iter()
-        .filter(|e| e.peer == "mock-plugin")
-        .collect();
-    let ollama_payloads: Vec<&DeliveredEntry> =
-        delivered.iter().filter(|e| e.peer == "ollama").collect();
-
-    // mock-plugin: create + user append only. No ollama-prefixed
-    // envelopes leaked through, no synthesized assistant for the
-    // ollama chat.
-    assert_eq!(
-        mock_payloads.len(),
-        2,
-        "mock-plugin must see only its own chat.create + chat.append; got {:#?}",
-        mock_payloads
-    );
-    assert!(
-        mock_payloads
-            .iter()
-            .all(|e| e.kind.starts_with("mock-plugin.")),
-        "mock-plugin must not see ollama-prefixed envelopes during replay; got {:#?}",
-        mock_payloads
-    );
-    assert!(
-        mock_payloads
-            .iter()
-            .all(|e| e.chat_id.as_deref() == Some("chat-mock-1")),
-        "mock-plugin must only re-feed its owned chat_id; got {:#?}",
-        mock_payloads
-    );
-
-    // ollama: create + user append + synthesized assistant. No mock-prefixed
-    // envelopes leaked through.
-    assert_eq!(
-        ollama_payloads.len(),
-        3,
-        "ollama must see its own create + user + synthesized assistant; got {:#?}",
-        ollama_payloads
-    );
-    let ollama_kinds: Vec<&str> = ollama_payloads.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(
-        ollama_kinds,
-        vec![
-            "ollama.chat.create",
-            "ollama.chat.append",
-            "ollama.chat.append"
-        ],
-        "ollama re-feed shape; got {:#?}",
-        ollama_payloads
-    );
-    let ollama_roles: Vec<Option<&str>> =
-        ollama_payloads.iter().map(|e| e.role.as_deref()).collect();
-    assert_eq!(
-        ollama_roles,
-        vec![None, Some("user"), Some("assistant")],
-        "ollama roles in order; got {:#?}",
-        ollama_payloads
-    );
-}
-
-/// In-process /resume of a chat already created in the same process must
-/// not re-deliver `<prefix>.chat.create` or any provider-history re-feed
-/// to the binary. The binary already has that chat's in-memory history;
-/// mutating it during replay can trip the per-chat busy guard or produce
-/// orphaned tool outputs on the next live turn. The wrapper tracks
-/// `owned_chat_ids` on the live path too, so the replay handler can
-/// recognise an in-process duplicate and skip the replay rebuild for
-/// that chat.
-///
-/// Cross-process resume (the bug we fixed) is the OPPOSITE of this:
-/// fresh process, owned set is empty, first-seen chat.create gets
-/// through.
-#[test]
-fn in_process_resume_skips_live_owned_provider_refeed() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    lua.load(
-        r#"
-        local op = require("libs.compositors.provider")
-        _to_plugin = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} }).to_plugin
-        _replay = require("core.history_replay")
-        "#,
-    )
-    .exec()
-    .expect("spawn wrapper");
-
-    // Live turn — wrapper sees chat.create through the live path.
-    // Batched signature: hand the wrapper a one-element envs list with
-    // `replay = false` (the framework's per-envelope stamp under live
-    // dispatch).
-    lua.load(
-        r#"
-        _replay.set(false)
-        _to_plugin({ {
-            type = "event", from = "engine", replay = false,
-            body = { kind = "ollama.chat.create", chat_id = "chat-1" },
-        } })
-        _live_delivered_count = #_test.delivered()
-        "#,
-    )
-    .exec()
-    .expect("drive live");
-
-    let live_count: i64 = lua
-        .load(r#"return _live_delivered_count"#)
-        .eval()
-        .expect("live count");
-    assert_eq!(live_count, 1, "live path delivers chat.create to binary");
-
-    // /resume of the same chat_id while still in-process — replay path
-    // sees chat.create again plus historical turns. All must skip.
-    lua.load(
-        r#"
-        _replay.set(true)
-        _to_plugin({
-            {
-                type = "event", from = "engine", replay = true,
-                body = { kind = "ollama.chat.create", chat_id = "chat-1" },
-            },
-            {
-                type = "event", from = "engine", replay = true,
-                body = {
-                    kind    = "ollama.chat.append",
-                    chat_id = "chat-1",
-                    message = { role = "user", content = "historical user" },
-                },
-            },
-            {
-                type = "event", from = "ollama", replay = true,
-                body = {
-                    kind    = "ollama.chat.complete.result",
-                    chat_id = "chat-1",
-                    output  = { text = "historical assistant", finish_reason = "stop" },
-                },
-            },
-        })
-        _replay.set(false)
-        _replay_delivered = _test.delivered()
-        "#,
-    )
-    .exec()
-    .expect("drive replay");
-
-    let after = collect_delivered(&lua, "_replay_delivered");
-    assert_eq!(
-        after.len(),
-        0,
-        "in-process /resume must NOT re-deliver an already-created provider \
-         chat or mutate its existing history; live path already delivered \
-         chat.create once and `_test.delivered()` drains the log between \
-         snapshots, so the replay-window snapshot must be empty. \
-         Got {:#?}",
-        after
-    );
-}
-
-#[test]
-fn live_provider_writes_emit_history_facts() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    lua.load(
-        r#"
-        local op = require("libs.compositors.provider")
-        local spec = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} })
-        _to_plugin = spec.to_plugin
-        "#,
-    )
-    .exec()
-    .expect("spawn wrapper");
-
-    lua.load(
-        r#"
-        _to_plugin({ {
-            type = "event", from = "engine", replay = false,
-            body = { kind = "ollama.chat.create", chat_id = "chat-1", model = "qwen3" },
-        } })
-        _to_plugin({ {
-            type = "event", from = "engine", replay = false,
-            body = {
-                kind = "ollama.chat.append",
-                chat_id = "chat-1",
-                message = { role = "user", content = "hi" },
-            },
-        } })
-        _delivered = _test.delivered()
-        _sent = _test.sent()
-        "#,
-    )
-    .exec()
-    .expect("drive live provider writes");
-
-    let delivered = collect_delivered(&lua, "_delivered");
-    let sent = collect_sent(&lua, "_sent");
-
-    let delivered_kinds: Vec<&str> = delivered.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(
-        delivered_kinds,
-        vec!["ollama.chat.create", "ollama.chat.append"],
-        "live provider wire events must still reach the binary"
-    );
-
-    let sent_kinds: Vec<&str> = sent.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(
-        sent_kinds,
-        vec!["chat.history.create", "chat.history.message"],
-        "live provider writes must also emit canonical history facts"
-    );
-    assert_eq!(sent[0].from, "ollama");
-    assert_eq!(sent[0].chat_id.as_deref(), Some("chat-1"));
-    assert_eq!(sent[1].role.as_deref(), Some("user"));
-}
-
-// --------------------------------------------------------------------
-// harness
-// --------------------------------------------------------------------
-
-#[derive(Debug)]
-struct DeliveredEntry {
-    peer: String,
-    kind: String,
-    chat_id: Option<String>,
-    role: Option<String>,
-    content: Option<String>,
-}
-
-#[derive(Debug)]
-struct SentEntry {
-    from: String,
-    kind: String,
-    chat_id: Option<String>,
-    role: Option<String>,
-}
-
-fn collect_delivered(lua: &Lua, global: &str) -> Vec<DeliveredEntry> {
-    let tbl: Table = lua.globals().get(global).expect("delivered table");
-    let len = tbl.len().expect("len") as usize;
-    let mut out = Vec::with_capacity(len);
-    for i in 1..=len {
-        let row: Table = tbl.get(i).expect("row");
-        let peer: String = row.get("peer").expect("peer");
-        let kind: String = row.get("kind").expect("kind");
-        let chat_id: Option<String> = match row.get::<Value>("chat_id").ok() {
-            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
-            _ => None,
-        };
-        let role: Option<String> = match row.get::<Value>("role").ok() {
-            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
-            _ => None,
-        };
-        let content: Option<String> = match row.get::<Value>("content").ok() {
-            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
-            _ => None,
-        };
-        out.push(DeliveredEntry {
-            peer,
-            kind,
-            chat_id,
-            role,
-            content,
-        });
-    }
-    out
-}
-
-fn collect_sent(lua: &Lua, global: &str) -> Vec<SentEntry> {
-    let tbl: Table = lua.globals().get(global).expect("sent table");
-    let len = tbl.len().expect("len") as usize;
-    let mut out = Vec::with_capacity(len);
-    for i in 1..=len {
-        let row: Table = tbl.get(i).expect("row");
-        let from: String = row.get("from").expect("from");
-        let kind: String = row.get("kind").expect("kind");
-        let chat_id: Option<String> = match row.get::<Value>("chat_id").ok() {
-            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
-            _ => None,
-        };
-        let role: Option<String> = match row.get::<Value>("role").ok() {
-            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
-            _ => None,
-        };
-        out.push(SentEntry {
-            from,
-            kind,
-            chat_id,
-            role,
-        });
-    }
-    out
+    .expect("unsupported compaction failure");
 }
 
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
@@ -775,6 +344,11 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         .join("openai-provider")
         .join("lua");
     let plugin_lua_str = plugin_lua.display().to_string();
+    let chatgpt_lua = repo_root()
+        .join("plugins")
+        .join("chatgpt-provider")
+        .join("lua");
+    let chatgpt_lua_str = chatgpt_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
@@ -782,6 +356,8 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
           "{starter}/?/init.lua",
           "{plugin_lua}/?.lua",
           "{plugin_lua}/?/init.lua",
+          "{chatgpt_lua}/?.lua",
+          "{chatgpt_lua}/?/init.lua",
           "{lua_root}/?.lua",
           "{lua_root}/?/init.lua",
           package.path,
@@ -795,6 +371,7 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         starter = starter_str,
         lua_root = lua_root_str,
         plugin_lua = plugin_lua_str,
+        chatgpt_lua = chatgpt_lua_str,
     );
     lua.load(&script).exec()
 }
