@@ -19,6 +19,13 @@ fn run(script: &str) {
           log = function() end,
           now_ms = function() return 0 end,
           emit = function(event) events[#events + 1] = event end,
+          opaque_id = (function()
+            local sequence = 0
+            return function()
+              sequence = sequence + 1
+              return "opaque-test-id-" .. sequence
+            end
+          end)(),
         }
         "#,
     )

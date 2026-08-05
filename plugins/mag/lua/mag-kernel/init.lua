@@ -255,48 +255,9 @@ local function new_run_context(meta)
     return true
   end
 
-  -- Injected host bus seam. Routing emits generic capability invokes/cancels.
-  -- Legacy chat_id fields remain run-scoped here for non-MAG compatibility;
-  -- generated correlation ids already carry authoritative run scope.
-  local function scope_chat_id(chat_id)
-    return scope .. "/" .. chat_id
-  end
+  -- Injected host bus seam. Routing already mints run-scoped capability ids.
   local function bus_emit(envelope)
-    if type(envelope) ~= "table" then
-      return
-    end
-    local out = envelope
-    if type(envelope.chat_id) == "string" or
-        (type(envelope.args) == "table" and type(envelope.args.chat_id) == "string") then
-      out = {}
-      for k, v in pairs(envelope) do
-        out[k] = v
-      end
-      if type(out.chat_id) == "string" then
-        out.chat_id = scope_chat_id(out.chat_id)
-      end
-      if type(out.args) == "table" and type(out.args.chat_id) == "string" then
-        local args = {}
-        for k, v in pairs(out.args) do
-          args[k] = v
-        end
-        args.chat_id = scope_chat_id(args.chat_id)
-        -- Provider chat handles remain request-scoped (`@r<N>` changes on
-        -- every activation), while backend routing and prompt caching need
-        -- one stable identity for the logical actor conversation. Keep that
-        -- identity host-opaque: raw graph scope and actor ids must never cross
-        -- the provider boundary.
-        local actor_chat_id = args.chat_id:gsub("@r%d+$", "")
-        local routing_session_id = ctx.routing_session_ids[actor_chat_id]
-        if routing_session_id == nil then
-          routing_session_id = nefor.opaque_id()
-          ctx.routing_session_ids[actor_chat_id] = routing_session_id
-        end
-        args.routing_session_id = routing_session_id
-        out.args = args
-      end
-    end
-    nefor.emit(out)
+    if type(envelope) == "table" then nefor.emit(envelope) end
   end
 
   -- The registry is injected so the fold validates every modification's
@@ -412,6 +373,11 @@ local function new_run_context(meta)
         and actor_params.turn_id ~= "" and actor_params.turn_id or nil
     local actor_turn_id = explicit_turn_id
       or (is_root_conversation and ctx.run_id or (ctx.run_id .. "/" .. tostring(record.id)))
+    local routing_session_id = ctx.routing_session_ids[actor_conversation_id]
+    if routing_session_id == nil then
+      routing_session_id = nefor.opaque_id()
+      ctx.routing_session_ids[actor_conversation_id] = routing_session_id
+    end
     local deps = {
       persistence_owned_by_kernel = true,
       writer = function(output)
@@ -423,6 +389,7 @@ local function new_run_context(meta)
         root_id = ctx.conversation_id,
         is_root = is_root_conversation,
         turn_id = actor_turn_id,
+        routing_session_id = routing_session_id,
         provenance = {
           session_id = ctx.session_id,
           run_id = ctx.run_id,

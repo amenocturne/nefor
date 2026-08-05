@@ -122,7 +122,6 @@ impl CapabilityBridge {
                 request.insert("messages".into(), messages);
             }
         }
-        request.remove("chat_id");
         if let (Some(catalog), Some(names)) = (
             self.advertised_tools.as_ref(),
             request.get("tools").and_then(Value::as_array),
@@ -338,18 +337,12 @@ mod tests {
         value.as_object().expect("object").clone()
     }
 
-    fn provider_invoke_with_stream(
-        request_id: &str,
-        stream_id: &str,
-        provider: &str,
-        messages: Value,
-    ) -> Map<String, Value> {
+    fn provider_invoke(request_id: &str, provider: &str, messages: Value) -> Map<String, Value> {
         obj(json!({
             "kind": "tool.invoke",
             "id": request_id,
             "name": provider,
             "args": {
-                "chat_id": stream_id,
                 "routing_session_id": "opaque-routing-token",
                 "model": "opus",
                 "system": "be helpful",
@@ -357,15 +350,6 @@ mod tests {
                 "input": {"messages": messages}
             }
         }))
-    }
-
-    fn provider_invoke(request_id: &str, provider: &str, messages: Value) -> Map<String, Value> {
-        provider_invoke_with_stream(
-            request_id,
-            &format!("run/lead.llm@{request_id}"),
-            provider,
-            messages,
-        )
     }
 
     fn event(request_id: &str, provider: &str, name: &str, fields: Value) -> Map<String, Value> {
@@ -483,7 +467,6 @@ mod tests {
         assert_eq!(out[0]["messages"], messages);
         assert!(out[0].get("input").is_none());
         assert!(out[0].get("chat_id").is_none());
-        assert!(!out[0].values().any(|value| value == "run/lead.llm@req-1"));
         let wire = serde_json::to_string(&out).expect("serialize");
         assert_eq!(wire.matches("first").count(), 1);
         assert!(!wire.contains(".chat."));

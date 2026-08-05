@@ -17,7 +17,7 @@
 --
 -- ### Response selection (state machine, applied in order)
 --
--- For each chat.complete, look at the chat's history and pattern-match
+-- For each completion request, inspect its supplied history and pattern-match
 -- the latest user message against this priority list:
 --
 --   1. Deferred result / failure / submitted-ack from a prior kernel
@@ -43,9 +43,6 @@
 -- file instead of a fresh crate.
 
 local NAME = nefor.name -- "mock-plugin"
-
--- per-chat history: chat_id -> array of {role, content, tool_call_id?, tool_calls?}
-local chats = {}
 
 -- The MAG program the orchestrator turn writes + executes via the
 -- lead's `mag` tool. A chain — sx feeds sy feeds
@@ -307,10 +304,8 @@ local function pick_response_for(history)
   -- should respond to it. If the user has spoken since (next-turn
   -- after a prior dispatch completed), last_tool is stale chat
   -- history; pattern-match the new user input instead. Without this
-  -- gate, every turn in a chat that ever dispatched a run falls into
-  -- the SUBMITTED_ACK_MARKER branch because chat_id (and therefore
-  -- mock-side history) persists across orchestrator runs for
-  -- conversation continuity.
+  -- gate, a later user message in the supplied request history would
+  -- incorrectly fall into the SUBMITTED_ACK_MARKER branch.
   local tool_is_pending_relay
   if last_tool_idx == nil then
     tool_is_pending_relay = false
@@ -705,12 +700,11 @@ local function pacing_enabled()
 end
 
 -- Yield-style pace: `nefor.sleep` is a tokio timer awaited from inside
--- the host's async task, so the runtime can poll *other* dispatch tasks
--- (notably the in-flight `<NAME>.interrupt` handler that sets the
--- per-chat cancel flag) while we're paused between chunks. Earlier shape
+-- the host's async task, so the runtime can poll other dispatch tasks
+-- (notably `<NAME>.completion.cancel`) while paused between chunks. Earlier shape
 -- used `os.execute("sleep …")`, which spawns a blocking subprocess and
 -- holds the Lua coroutine; the dispatch loop still couldn't deliver an
--- interrupt mid-stream, so /cancel only landed after the canned text
+-- cancel mid-stream, so /cancel only landed after the canned text
 -- finished — visible bug.
 local function pace()
   if pacing_enabled() then
@@ -718,11 +712,6 @@ local function pace()
   end
 end
 
--- Per-chat interrupt flag. Set by the `<NAME>.interrupt` handler when an
--- envelope lands during a stream; the streaming loops check it on every
--- chunk boundary and break early. Keyed by chat_id so concurrent chats
--- (one per active kernel actor) don't mistakenly cancel each other.
-local interrupted = {}
 local completion_runs = {}
 
 local function is_cancelled(cancellation, request_id)
@@ -761,7 +750,7 @@ end
 local function emit_stream(request_id, text, opts, cancellation)
   if type(text) ~= "string" or #text == 0 then return true, "" end
   opts = opts or {}
-  cancellation = cancellation or interrupted
+  cancellation = cancellation or {}
   if opts.with_reasoning then
     if not emit_reasoning(request_id, cancellation) then return false, "" end
   end
@@ -807,8 +796,8 @@ nefor.on_ready_ok(function()
 end)
 
 local function complete_request(body)
-  local chat_id = body.request_id
-  if type(chat_id) ~= "string" or chat_id == "" then return end
+  local request_id = body.request_id
+  if type(request_id) ~= "string" or request_id == "" then return end
   local request = type(body.request) == "table" and body.request or body
   local input = type(request.input) == "table" and request.input or {}
   local messages = type(input.messages) == "table" and input.messages or request.messages
@@ -825,16 +814,16 @@ local function complete_request(body)
     })
   end
 
-  if completion_runs[chat_id] then
+  if completion_runs[request_id] then
     nefor.emit("completion.event", {
-      request_id = chat_id,
+      request_id = request_id,
       event = "error",
-      message = "completion request `" .. chat_id .. "` is already in flight",
+      message = "completion request `" .. request_id .. "` is already in flight",
     })
     return
   end
   local run = { cancelled = false }
-  completion_runs[chat_id] = run
+  completion_runs[request_id] = run
 
   local resp = pick_response_for(history)
   -- The starter's agent boundary is typed: successful terminal text must be
@@ -848,8 +837,8 @@ local function complete_request(body)
     result_text = nefor.json.encode({ content = resp.text })
   end
   nefor.log(string.format(
-    "chat.complete chat_id=%s finish=%s text_len=%d tool_calls=%s",
-    chat_id,
+    "completion.request request_id=%s finish=%s text_len=%d tool_calls=%s",
+    request_id,
     tostring(resp.finish_reason),
     type(resp.text) == "string" and #resp.text or 0,
     resp.tool_calls and #resp.tool_calls or 0))
@@ -858,12 +847,12 @@ local function complete_request(body)
   -- under NEFOR_TEST_FAST_MOCK so harness runs stay fast. Sliced into
   -- 100ms chunks so a /cancel during the wait actually lands — the
   -- yielding `nefor.sleep` lets the dispatch loop deliver the
-  -- `<NAME>.interrupt` envelope between slices.
+  -- `<NAME>.completion.cancel` envelope between slices.
   if pacing_enabled() and type(resp.pre_delay_ms) == "number" and resp.pre_delay_ms > 0 then
     local remaining = resp.pre_delay_ms
     while remaining > 0 do
       if run.cancelled then
-        if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
+        if completion_runs[request_id] == run then completion_runs[request_id] = nil end
         return
       end
       local slice = remaining > 100 and 100 or remaining
@@ -872,17 +861,15 @@ local function complete_request(body)
     end
   end
 
-  -- Error branch: emit `<name>.chat.error` and skip the result wire.
-  -- The wrapper actor (starter/wrappers/openai-provider.lua) translates
-  -- chat.error into `tool.result { error }` for the agentic-loop's
-  -- run-error path, which is the rendering target the brief asks for.
+  -- Error branch: emit a canonical terminal completion event and skip the
+  -- successful result wire.
   if resp.finish_reason == "error" then
     nefor.emit("completion.event", {
-      request_id = chat_id,
+      request_id = request_id,
       event = "error",
       message = resp.error_message or "mock provider error",
     })
-    if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
+    if completion_runs[request_id] == run then completion_runs[request_id] = nil end
     return
   end
 
@@ -892,21 +879,20 @@ local function complete_request(body)
   -- the orchestrator's wrap node demonstrates the live thinking →
   -- collapse rendering path. `partial` is the prefix actually emitted
   -- before the loop ran out (full text on completion, cancel-boundary
-  -- prefix on interrupt — used to seed history below).
+  -- prefix on cancellation).
   local completed = true
   if type(resp.text) == "string" and #resp.text > 0 then
-    completed = emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning }, run)
+    completed = emit_stream(request_id, resp.text, { with_reasoning = resp.with_reasoning }, run)
   end
 
-  -- Cancelled mid-stream: emit an interrupted completion event and skip
-  -- the result wire. Direct completion history is request-local and is not
-  -- persisted after this handler returns.
+  -- Cancelled mid-stream: skip the result wire. Direct completion history is
+  -- request-local and is not persisted after this handler returns.
   if not completed then
-    if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
+    if completion_runs[request_id] == run then completion_runs[request_id] = nil end
     return
   end
 
-  -- chat.complete.result with ProviderInput shape.
+  -- Canonical completion result with ProviderInput shape.
   local output = {
     text          = result_text or "",
     finish_reason = resp.finish_reason,
@@ -920,7 +906,7 @@ local function complete_request(body)
     output.tool_calls = resp.tool_calls
   end
   if resp.with_reasoning then
-    -- Mirrors openai-provider's chat.complete.result.output.reasoning
+    -- Mirrors openai-provider's completion result reasoning
     -- field — non-streaming consumers (kernel node outputs, audit
     -- listeners) get the full trace alongside the content.
     local full = ""
@@ -928,7 +914,7 @@ local function complete_request(body)
     output.reasoning = full
   end
   nefor.emit("completion.event", {
-    request_id        = chat_id,
+    request_id        = request_id,
     event             = "usage",
     prompt_tokens     = 0,
     completion_tokens = type(resp.text) == "string" and #resp.text or 0,
@@ -936,14 +922,14 @@ local function complete_request(body)
     duration_ms       = DIRECT_TURN_DURATION_MS,
   })
   nefor.emit("completion.event", {
-    request_id = chat_id,
+    request_id = request_id,
     event      = "completed",
     result     = output,
     model      = "mock-model",
     duration_ms = DIRECT_TURN_DURATION_MS,
   })
 
-  if completion_runs[chat_id] == run then completion_runs[chat_id] = nil end
+  if completion_runs[request_id] == run then completion_runs[request_id] = nil end
 end
 
 nefor.on(NAME .. ".completion.request", complete_request)
@@ -956,44 +942,8 @@ nefor.on(NAME .. ".completion.cancel", function(body)
   end
 end)
 
--- Cancellation hook. The chat-side `chat.interrupt` envelope is
--- translated by the openai-provider wrapper to `<NAME>.interrupt`
--- (carrying the chat_id, so concurrent chats don't clobber each other);
--- when it lands during a stream we flip the per-chat flag and the
--- emit_stream / emit_reasoning loops break at the next chunk boundary.
--- Without this hook /cancel had to wait for the canned text to finish
--- before taking effect.
-nefor.on(NAME .. ".interrupt", function(body)
-  local chat_id = body and body.chat_id
-  if type(chat_id) == "string" then
-    interrupted[chat_id] = true
-    nefor.log("interrupt chat_id=" .. chat_id)
-  else
-    -- Bare interrupt without chat_id: cancel every active chat. Rare
-    -- (the wrapper always carries the chat_id) but defensive.
-    for k, _ in pairs(chats) do interrupted[k] = true end
-    nefor.log("interrupt fanned out (no chat_id)")
-  end
-end)
-
-nefor.on(NAME .. ".chat.delete", function(body)
-  local chat_id = body.chat_id
-  if type(chat_id) ~= "string" then return end
-  chats[chat_id] = nil
-  interrupted[chat_id] = nil
-end)
-
-nefor.on(NAME .. ".reset", function()
-  chats = {}
-  interrupted = {}
-  completion_runs = {}
-end)
-
--- Tool-result accumulation is handled kernel-side (the tool-result
--- factory turns tool outputs into `{role="tool", content, tool_call_id}`
--- messages appended via chat.append), so mock receives the tool message
--- through the normal chat.append path and doesn't need to subscribe to
--- broadcast `tool.result` directly.
+-- Tool-result accumulation is handled kernel-side; the next direct request
+-- carries the resulting tool message in its complete history.
 
 -- The auth dance — chat_orchestrator's openai_provider_adapter expects
 -- to inject a static_token via `<name>.auth.set` after seeing
@@ -1013,29 +963,6 @@ nefor.on(NAME .. ".models.list_requested", function(_body)
   nefor.emit("models.listed", { models = { "mock-model" } })
 end)
 
--- Debug-only history snapshot. Used by integration tests (and ad-hoc
--- diagnostics) to peek at the per-chat messages table without
--- re-driving a full chat.complete cycle. The production chat path
--- doesn't depend on it; nothing on the bus emits or subscribes to
--- `<NAME>.debug.history.*` outside of test harnesses.
-nefor.on(NAME .. ".debug.history.dump", function(body)
-  local chat_id = body and body.chat_id
-  if type(chat_id) ~= "string" then return end
-  local history = chats[chat_id] or {}
-  local snapshot = {}
-  for i, m in ipairs(history) do
-    snapshot[i] = {
-      role         = m.role,
-      content      = m.content,
-      tool_call_id = m.tool_call_id,
-      tool_calls   = m.tool_calls,
-    }
-  end
-  nefor.emit("debug.history.result", {
-    chat_id  = chat_id,
-    messages = snapshot,
-  })
-end)
 
 -- /model <name> selection. Mock has only one model; whatever model the
 -- user picks we ack back unchanged so chat.lua's reducer records the

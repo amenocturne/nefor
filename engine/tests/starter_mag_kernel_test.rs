@@ -141,7 +141,11 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     })?;
     nefor.set("emit", emit)?;
 
-    let opaque_id = lua.create_function(|_, _: ()| Ok("opaque-test-id"))?;
+    let mut opaque_sequence = 0_u64;
+    let opaque_id = lua.create_function_mut(move |_, _: ()| {
+        opaque_sequence += 1;
+        Ok(format!("opaque-test-id-{opaque_sequence}"))
+    })?;
     nefor.set("opaque_id", opaque_id)?;
 
     let json = lua.create_table()?;

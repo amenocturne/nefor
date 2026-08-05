@@ -200,7 +200,7 @@ function M.construct(id, params, emit, options)
       model = model.present and model.value or nil
     end
     return {
-      chat_id = pending.chat_id,
+      routing_session_id = conversation.routing_session_id,
       model = model,
       system = params.system,
       tools = params.tools,
@@ -215,12 +215,12 @@ function M.construct(id, params, emit, options)
   local function invoke_provider()
     if draining then return false end
     seq = seq + 1
-    pending = { chat_id = id .. "@r" .. tostring(seq) }
+    pending = { request_id = id .. "@r" .. tostring(seq) }
     state:emit({
       kind = "capability.invoke",
       capability = provider,
       request = build_request(),
-      ref = pending.chat_id,
+      ref = pending.request_id,
     })
     return true
   end

@@ -175,9 +175,9 @@ do
   assert_eq(inv.request.tools[1], "fs/read", "request carries params.tools")
   assert_eq(inv.request.reasoning_effort, "high", "request carries the resolved reasoning effort")
   assert_eq(inv.request.input.messages[1], "prior turn", "request carries the incoming turn message")
-  assert_true(type(inv.request.chat_id) == "string" and #inv.request.chat_id > 0,
-    "factory mints a chat_id request handle")
-  assert_eq(inv.ref, inv.request.chat_id, "the capability ref traces the chat_id handle")
+  assert_true(type(inv.ref) == "string" and inv.ref:find("@r1", 1, true) ~= nil,
+    "factory mints a request-scoped correlation handle")
+  assert_eq(inv.request.chat_id, nil, "provider requests carry no legacy chat_id")
 end
 
 -- ==================================================================
@@ -248,7 +248,7 @@ do
   local instance, msgs = make("agent.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "list the repo" } } }))
   local r1 = find_kind(msgs, "capability.invoke")
-  assert_true(r1.request.chat_id:find("@r1", 1, true) ~= nil,
+  assert_true(r1.ref:find("@r1", 1, true) ~= nil,
     "the first activation mints @r1, not a continued counter")
   assert_eq(#r1.request.input.messages, 1, "round 1 carries the seed turn alone")
 
@@ -271,7 +271,7 @@ do
     if m.kind == "capability.invoke" and m ~= r1 then r2 = m end
   end
   assert_true(r2 ~= nil, "round 2 emits a second capability.invoke")
-  assert_true(r2.request.chat_id:find("@r2", 1, true) ~= nil,
+  assert_true(r2.ref:find("@r2", 1, true) ~= nil,
     "round 2 mints @r2 — one increment per activation")
 
   -- Each round runs on a fresh provider chat, so the request must replay the
@@ -626,7 +626,7 @@ do
   local pi = find_kind(pm, "capability.invoke")
   assert_eq(#pi.request.input.messages, 1, "no seed: round 1 carries the activation turn alone")
   assert_eq(pi.request.input.messages[1].content, "go", "the activation turn is verbatim")
-  assert_true(pi.request.chat_id:find("@r1", 1, true) ~= nil, "no seed: the round counter starts at @r1")
+  assert_true(pi.ref:find("@r1", 1, true) ~= nil, "no seed: the round counter starts at @r1")
 
   local empty, em = make("empty.llm", { provider = "p", model = "opus", history = {} })
   empty.deliver(turn({ messages = { { role = "user", content = "go" } } }))

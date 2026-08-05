@@ -125,8 +125,9 @@ local a_wire = launch("run-A", "s1")
 local a_invoke = the_invoke(a_wire, "run-A")
 assert_true(starts_with(a_invoke.id, "r1/cap-"),
   "run-A correlation id is scope-prefixed; got " .. tostring(a_invoke.id))
-assert_eq(a_invoke.args.chat_id, "r1/agent@r1",
-  "run-A chat handle is scope-prefixed")
+assert_eq(a_invoke.args.chat_id, nil, "run-A carries no legacy chat handle")
+assert_true(type(a_invoke.args.routing_session_id) == "string",
+  "run-A carries an opaque routing identity")
 assert_eq(#by_kind(a_wire, "mag.run_started"), 1, "run-A run_started emitted")
 assert_eq(by_kind(a_wire, "mag.run_started")[1].run_id, "run-A",
   "run_started carries run_id")
@@ -155,8 +156,11 @@ local b_wire = launch("run-B", "s1")
 local b_invoke = the_invoke(b_wire, "run-B")
 assert_true(starts_with(b_invoke.id, "r2/cap-"),
   "run-B correlation id carries its own scope; got " .. tostring(b_invoke.id))
-assert_eq(b_invoke.args.chat_id, "r2/agent@r1",
-  "run-B chat handle carries its own scope (same actor id, same round)")
+assert_eq(b_invoke.args.chat_id, nil, "run-B carries no legacy chat handle")
+assert_true(type(b_invoke.args.routing_session_id) == "string",
+  "run-B carries an opaque routing identity")
+assert_true(a_invoke.args.routing_session_id ~= b_invoke.args.routing_session_id,
+  "concurrent actor conversations have distinct routing identities")
 
 -- run-B starting did NOT reset run-A: its actors are still alive, fresh
 -- spawn/ready events fired for run-B (no duplicate-alive degradation), and
