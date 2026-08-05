@@ -14,6 +14,7 @@ local INPUT_MESSAGE = "Waiting for your input"
 
 local state = {
   session_token = nil,
+  active_conversation_id = nil,
   running = false,
   active_tool = nil,
   mode = nil,
@@ -116,19 +117,32 @@ local function compute_runtime_state(body)
     return nil
   end
 
+  if kind == "conversation.active.changed" then
+    state.active_conversation_id = body.conversation_id
+    return nil
+  end
+
   if kind == "chat.input.submit" or kind == "agentic_loop.run_start" then
     return { mode = "working", tool = state.active_tool }
   end
 
-  if kind == "chat.tool.start" then
-    local tool = body.name or body.tool
+  if kind == "conversation.projection.delta"
+      and body.conversation_id == state.active_conversation_id
+      and type(body.change) == "table"
+      and body.change.kind == "tool_call_completed" then
+    local exchange = body.change.exchange or {}
+    local tool = exchange.name
     if type(tool) == "string" and #tool > 0 then
       state.active_tool = tool
     end
     return { mode = "working", tool = state.active_tool }
   end
 
-  if kind == "chat.tool.end" then
+  if kind == "conversation.projection.delta"
+      and body.conversation_id == state.active_conversation_id
+      and type(body.change) == "table"
+      and (body.change.kind == "tool_result_recorded"
+        or body.change.kind == "tool_error_recorded") then
     state.active_tool = nil
     if state.running then
       return { mode = "working", tool = nil }
@@ -186,6 +200,7 @@ return {
     handle_body = handle_body,
     reset = function()
       state.session_token = nil
+      state.active_conversation_id = nil
       state.running = false
       state.active_tool = nil
       state.mode = nil
