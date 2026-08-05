@@ -237,6 +237,7 @@ actor.install()
 -- here so module load stays free of bus dependencies.
 history_replay.install()
 actor.spawn(sessions)
+actor.spawn(require("libs.conversation-manager.runtime").build())
 actor.spawn(require("libs.state-tracking"))
 
 local startup_args = require("startup")

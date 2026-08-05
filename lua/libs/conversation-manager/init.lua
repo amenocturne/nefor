@@ -20,7 +20,9 @@ local function append_to(conversations, event_index, fact)
 
   local prior = event_index[fact.event_id]
   if prior then
-    if domain.equal(prior.fact, fact) then return readonly(conversations[prior.conversation_id]), nil, true end
+    if domain.equal(prior.fact, fact) then
+      return readonly(conversations[prior.conversation_id]), nil, true, domain.copy(prior.event)
+    end
     return domain.error("event_id_conflict", {
       event_id = fact.event_id,
       existing_conversation_id = prior.conversation_id,
@@ -35,7 +37,55 @@ local function append_to(conversations, event_index, fact)
   if not folded then return nil, e end
 
   conversations[fact.conversation_id] = folded
-  event_index[fact.event_id] = { conversation_id = fact.conversation_id, fact = domain.copy(fact) }
+  event_index[fact.event_id] = {
+    conversation_id = fact.conversation_id,
+    fact = domain.copy(fact),
+    event = domain.copy(event),
+  }
+  return readonly(folded), nil, false, domain.copy(event)
+end
+
+local function apply_recorded_to(conversations, event_index, event)
+  if type(event) ~= "table" then return domain.error("invalid_event", { value_type = type(event) }) end
+  if type(event.event_id) ~= "string" or event.event_id == "" then
+    return domain.error("invalid_event_id", { kind = event.kind })
+  end
+  if type(event.conversation_id) ~= "string" or event.conversation_id == "" then
+    return domain.error("invalid_conversation_id", { kind = event.kind })
+  end
+
+  local prior = event_index[event.event_id]
+  if prior then
+    if domain.equal(prior.event, event) then
+      return readonly(conversations[prior.conversation_id]), nil, true
+    end
+    return domain.error("event_id_conflict", {
+      event_id = event.event_id,
+      existing_conversation_id = prior.conversation_id,
+      conversation_id = event.conversation_id,
+    })
+  end
+
+  local current = conversations[event.conversation_id]
+  local expected = current and current.last_sequence + 1 or 1
+  if event.sequence ~= expected then
+    return domain.error("noncontiguous_sequence", {
+      conversation_id = event.conversation_id,
+      expected = expected,
+      actual = event.sequence,
+    })
+  end
+
+  local folded, e = domain.fold(current, event)
+  if not folded then return nil, e end
+  local fact = domain.copy(event)
+  fact.sequence = nil
+  conversations[event.conversation_id] = folded
+  event_index[event.event_id] = {
+    conversation_id = event.conversation_id,
+    fact = fact,
+    event = domain.copy(event),
+  }
   return readonly(folded), nil, false
 end
 
@@ -58,6 +108,10 @@ function M.new()
     return append_to(conversations, event_index, fact)
   end
 
+  function store:apply_recorded(event)
+    return apply_recorded_to(conversations, event_index, event)
+  end
+
   function store:get(conversation_id)
     return readonly(conversations[conversation_id])
   end
@@ -72,16 +126,7 @@ function M.new()
     local next_event_index = domain.copy(event_index)
     for index, event in ipairs(events or {}) do
       if type(event) ~= "table" then return domain.error("invalid_event", { value_type = type(event), replay_index = index }) end
-      local current = next_conversations[event.conversation_id]
-      local expected = current and current.last_sequence + 1 or 1
-      if event.sequence ~= expected then
-        return domain.error("noncontiguous_sequence", {
-          conversation_id = event.conversation_id, expected = expected,
-          actual = event.sequence, replay_index = index,
-        })
-      end
-      local fact = domain.copy(event); fact.sequence = nil
-      local result, e = append_to(next_conversations, next_event_index, fact)
+      local result, e = apply_recorded_to(next_conversations, next_event_index, event)
       if not result then
         e.context = e.context or {}
         e.context.replay_index = index

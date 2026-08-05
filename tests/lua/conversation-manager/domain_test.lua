@@ -51,6 +51,32 @@ do
   rejects(store, fact("late", "lead", "provenance_updated", { provenance = { model = "late" } }), "conversation_terminal")
 end
 
+-- Canonical recorded facts are the replay boundary: exact repeats are
+-- idempotent, while sequence gaps and contradictory ids are rejected.
+do
+  local store = manager.new()
+  local created = {
+    event_id = "created", conversation_id = "recorded", kind = "created",
+    sequence = 1, provenance = { session = "s" },
+  }
+  local value, e, duplicate = store:apply_recorded(created)
+  ok(value, e); eq(duplicate, false)
+  value, e, duplicate = store:apply_recorded(domain.copy(created))
+  ok(value, e); eq(duplicate, true, "exact recorded replay is idempotent")
+
+  local gap = {
+    event_id = "message", conversation_id = "recorded", kind = "message_started",
+    sequence = 3, message_id = "m", role = "user",
+  }
+  value, e = store:apply_recorded(gap)
+  eq(value, nil); eq(e.code, "noncontiguous_sequence")
+  eq(store:get("recorded").last_sequence, 1, "rejected recorded fact does not mutate")
+
+  local conflict = domain.copy(created); conflict.provenance = { session = "other" }
+  value, e = store:apply_recorded(conflict)
+  eq(value, nil); eq(e.code, "event_id_conflict")
+end
+
 -- Tool errors are the other exactly-once terminal exchange outcome.
 do
   local store = manager.new(); create(store, "error-chat", "agent")
