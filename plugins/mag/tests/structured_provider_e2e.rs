@@ -417,6 +417,7 @@ async fn run_case(kind: ProviderKind) {
             "run_id": "structured-run",
             "session_id": SESSION_ID,
             "principal": "lead",
+            "conversation_id": "structured-provider-conversation",
             "artifact": artifact,
             "params_overlay": {"answer.llm": {"provider": kind.name()}}
         })),

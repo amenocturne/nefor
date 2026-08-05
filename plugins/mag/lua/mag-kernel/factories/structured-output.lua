@@ -35,6 +35,8 @@ M.declaration = {
     output_type = "string", error_type = "string",
     provider_error_type = "string", validation_error_type = "string",
     max_corrections = "number",
+    conversation_id = "string?",
+    turn_id = "string?",
   },
   inputs = { provider_input = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", RESULT },
@@ -122,9 +124,11 @@ function M.construct(id, params, emit, deps)
   provider_params.schema = provider_schema.schema
   local function finish_result(state, type_id, value)
     local message = { kind=RESULT, semantic_type_id=type_id, value=value }
-    local delta = state:transcript_delta()
-    if #delta > 0 then message.transcript_delta = delta end
-    state:finish(message)
+    state:finish(message, {
+      result = last_output,
+      value = value,
+      semantic_type_id = type_id,
+    })
   end
   local function finish_error(state, reason_type, reason)
     finish_result(state, params.error_type, {
@@ -132,6 +136,7 @@ function M.construct(id, params, emit, deps)
     })
   end
   return boundary.construct(id, provider_params, emit, {
+    conversation = deps.conversation,
     name = "structured-output",
     preview = deps.preview,
     on_turn_start = function(_)
@@ -174,7 +179,7 @@ function M.construct(id, params, emit, deps)
       end
       corrections = corrections + 1
       state:append({ role = "user", content = correction(validation, provider_schema.wrapped) })
-      state:retry()
+      state:retry("structured_output_correction")
     end,
     on_tool_calls = function(_, result)
       last_output = result

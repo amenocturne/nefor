@@ -184,7 +184,7 @@ impl LuaHost {
         run_name: &str,
         session_id: Option<&str>,
     ) -> Result<BeginRunOutcome, MagError> {
-        self.begin_run_with_principal(run_id, run_name, session_id, None)
+        self.begin_run_with_principal(run_id, run_name, session_id, None, None)
     }
 
     pub fn begin_run_with_principal(
@@ -193,6 +193,7 @@ impl LuaHost {
         run_name: &str,
         session_id: Option<&str>,
         principal: Option<&str>,
+        conversation_id: Option<&str>,
     ) -> Result<BeginRunOutcome, MagError> {
         let meta = self.lua.create_table()?;
         meta.set("run_id", run_id)?;
@@ -202,6 +203,9 @@ impl LuaHost {
         }
         if let Some(p) = principal {
             meta.set("principal", p)?;
+        }
+        if let Some(id) = conversation_id {
+            meta.set("conversation_id", id)?;
         }
         let f: Function = self.kernel.get("begin_run")?;
         let res: Table = f.call::<Table>(meta)?;
@@ -1029,7 +1033,13 @@ mod tests {
             r#"(nefor.shell.command "command" "printf provenance")"#,
         );
         let begun = host
-            .begin_run_with_principal(run_id, "scout", Some("session-1"), Some("subagent"))
+            .begin_run_with_principal(
+                run_id,
+                "scout",
+                Some("session-1"),
+                Some("subagent"),
+                Some("conversation-1"),
+            )
             .expect("begin provenance run");
         assert!(begun.ok, "begin failed: {:?}", begun.error);
         host.drain_emits().expect("drain begin event");

@@ -39,6 +39,7 @@ local function make(schema)
     output_type = "direct-id", error_type = "error-id",
     provider_error_type = "provider-error-id", validation_error_type = "validation-error-id",
   }, function(message) messages[#messages + 1] = message end, {
+    conversation = { id = "typed:conversation", turn_id = "typed:turn", emit = function(_) end },
     preview = function(operation, binding, value)
       previews[#previews + 1] = { operation = operation, binding = binding, value = value }
       return true

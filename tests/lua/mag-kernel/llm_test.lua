@@ -52,11 +52,22 @@ local function find_last_kind(msgs, kind)
   return nil
 end
 
+local function conversation(id, facts)
+  facts = facts or {}
+  return {
+    id = id .. ":conversation",
+    turn_id = id .. ":turn",
+    provenance = { actor_id = id, run_id = id .. ":run" },
+    emit = function(fact) facts[#facts + 1] = fact end,
+  }, facts
+end
+
 -- Construct an llm instance with a fresh capture. Consumes the ready confirm.
 local function make(id, params)
   local msgs, emit = capture()
-  local instance = llm.construct(id, params or {}, emit)
-  return instance, msgs
+  local dependency, facts = conversation(id)
+  local instance = llm.construct(id, params or {}, emit, { conversation = dependency })
+  return instance, msgs, facts
 end
 
 -- A graph activation carrying one ProviderInput message.
@@ -381,12 +392,11 @@ do
 end
 
 -- ==================================================================
--- transcript delta: the FinalAnswer carries everything accumulated beyond the
--- seed — the seed itself is never echoed back
+-- canonical conversation facts replace transcript reconstruction metadata.
 -- ==================================================================
 
 do
-  local instance, msgs = make("turn.llm", {
+  local instance, msgs, facts = make("turn.llm", {
     provider = "p",
     history = {
       { role = "user", content = "earlier question" },
@@ -415,26 +425,104 @@ do
 
   local final = find_kind(msgs, "generic-provider.FinalAnswer")
   assert_true(final ~= nil, "the run ends in a FinalAnswer")
-  local delta = final.transcript_delta
-  assert_true(type(delta) == "table", "the FinalAnswer carries a transcript_delta")
-  assert_eq(#delta, 4, "the delta is the live turns alone: user, tool call, tool result, answer")
-  assert_eq(delta[1].role, "user", "the delta opens with the activation's user turn")
-  assert_eq(delta[1].content, "new question", "the seed is not echoed back")
-  assert_eq(delta[2].role, "assistant", "the assistant tool-call turn is recorded")
-  assert_eq(delta[2].tool_calls[1].id, "call-1", "the recorded call keeps the model's id")
-  assert_eq(delta[3].role, "tool", "the tool result follows the call")
-  assert_eq(delta[3].content, "dir-listing", "the tool result is verbatim")
-  assert_eq(delta[4].role, "assistant", "the final answer closes the delta")
-  assert_eq(delta[4].content, "the answer", "the final answer text is verbatim")
+  assert_eq(final.transcript_delta, nil, "FinalAnswer carries no transcript reconstruction data")
+  assert_eq(facts[1].kind, "created", "the logical actor conversation is explicit")
+  assert_eq(facts[#facts].kind, "turn_completed", "the turn closes at final output")
+  local started, exchanges, results = 0, 0, 0
+  for _, fact in ipairs(facts) do
+    if fact.kind == "message_started" then started = started + 1 end
+    if fact.kind == "tool_exchange_started" then exchanges = exchanges + 1 end
+    if fact.kind == "tool_result_recorded" then results = results + 1 end
+  end
+  assert_eq(started, 4, "only live user, assistant-call, tool, and answer messages become facts")
+  assert_eq(exchanges, 1, "the provider tool call becomes one canonical exchange")
+  assert_eq(results, 1, "the matching tool result settles that exchange")
 
-  -- Without a seed the delta covers the whole owned transcript.
-  local i2, m2 = make("plain.llm", { provider = "p" })
+  local i2, m2, f2facts = make("plain.llm", { provider = "p" })
   i2.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   i2.deliver({ kind = "reply", ref = find_kind(m2, "capability.invoke").ref, result = { text = "done" } })
   local f2 = find_kind(m2, "generic-provider.FinalAnswer")
-  assert_eq(#f2.transcript_delta, 2, "no seed: the delta is the whole transcript")
-  assert_eq(f2.transcript_delta[1].content, "go", "the user turn leads")
-  assert_eq(f2.transcript_delta[2].content, "done", "the answer closes")
+  assert_eq(f2.transcript_delta, nil, "unseeded turns also rely on canonical facts")
+  assert_eq(f2facts[#f2facts].kind, "turn_completed", "unseeded turn closes")
+end
+
+-- ==================================================================
+-- live provider observations become canonical chunks before terminal settle.
+-- ==================================================================
+
+do
+  local instance, msgs, facts = make("stream.llm", { provider = "p", model = "opus" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  instance.handle_observation({ binding = "transcript", value = {
+    kind = "reasoning", text = "thinking",
+  } })
+  instance.handle_observation({ binding = "transcript", value = {
+    kind = "assistant", text = "answer",
+  } })
+  instance.deliver({
+    kind = "reply",
+    ref = find_kind(msgs, "capability.invoke").ref,
+    result = { text = "answer", model = "opus", duration_ms = 42, usage = { output_tokens = 2 } },
+  })
+
+  local chunks, assistant_starts = {}, 0
+  for _, fact in ipairs(facts) do
+    if fact.kind == "message_started" and fact.role == "assistant" then
+      assistant_starts = assistant_starts + 1
+    elseif fact.kind == "content_chunk_appended" then
+      chunks[#chunks + 1] = fact.chunk
+    end
+  end
+  assert_eq(assistant_starts, 1, "stream and terminal result share one assistant message")
+  assert_eq(chunks[#chunks - 1].kind, "reasoning", "reasoning is canonical before terminal")
+  assert_eq(chunks[#chunks].kind, "text", "visible text is canonical before terminal")
+  local terminal = facts[#facts]
+  assert_eq(terminal.kind, "turn_completed", "streaming turn has one terminal fact")
+  assert_eq(terminal.detail.result.duration_ms, 42, "terminal timing metadata is preserved")
+  assert_eq(terminal.detail.result.model, "opus", "terminal model metadata is preserved")
+end
+
+do
+  local instance, msgs, facts = make("structured-tool.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
+  instance.deliver({ kind = "reply", ref = find_kind(msgs, "capability.invoke").ref,
+    result = { tool_calls = { { id = "call-1", name = "inspect", args = {} } } } })
+  instance.deliver(turn({ messages = { {
+    role = "tool", tool_call_id = "call-1", name = "inspect",
+    content = { files = { "a.lua", "b.lua" }, count = 2 },
+  } } }))
+  local structured
+  for _, fact in ipairs(facts) do
+    if fact.kind == "content_chunk_appended" and fact.chunk.kind == "structured" then
+      structured = fact.chunk.data
+    end
+  end
+  assert_eq(structured.count, 2, "structured universal content is preserved losslessly")
+  assert_eq(structured.files[2], "b.lua", "structured content keeps nested values")
+end
+
+do
+  local msgs, emit = capture()
+  local facts = {}
+  local instance = assert(llm.construct("lead.llm", { provider = "p" }, emit, {
+    conversation = {
+      id = "root-conversation",
+      root_id = "root-conversation",
+      is_root = true,
+      turn_id = "lead-run-1",
+      provenance = { run_id = "lead-run-1", actor_id = "lead.llm" },
+      emit = function(fact) facts[#facts + 1] = fact end,
+    },
+  }))
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  instance.deliver({ kind = "reply", ref = find_kind(msgs, "capability.invoke").ref,
+    result = { text = "done" } })
+  assert_eq(facts[1].kind, "turn_started", "manager-created root starts directly with its turn")
+  for _, fact in ipairs(facts) do
+    assert_eq(fact.conversation_id, "root-conversation", "root identity is explicit")
+    assert_eq(fact.turn_id, "lead-run-1", "root turn is run-correlated")
+    assert_eq(fact.run_id, "lead-run-1", "every root fact carries run correlation")
+  end
 end
 
 -- ==================================================================

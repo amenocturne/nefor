@@ -144,6 +144,8 @@ local function new_run_context(meta)
     run_name = meta.run_name,
     session_id = meta.session_id,
     principal = meta.principal,
+    conversation_id = meta.conversation_id
+      or (tostring(meta.session_id or "sessionless") .. "/" .. tostring(meta.run_id)),
     routing_session_ids = {},
     last_output_path = nil,
     run_complete = nil,
@@ -399,12 +401,39 @@ local function new_run_context(meta)
   -- failure return escalates inside routing (mag.run_failed).
   router:set_construct(function(record)
     local emit = router:emitter(record.id)
+    local actor_params = record.params or {}
+    local explicit_conversation_id = type(actor_params.conversation_id) == "string"
+        and actor_params.conversation_id ~= "" and actor_params.conversation_id or nil
+    local actor_conversation_id = explicit_conversation_id
+      or tostring(ctx.conversation_id) .. "/turns/" .. tostring(ctx.run_id)
+        .. "/actors/" .. tostring(record.id)
+    local is_root_conversation = actor_conversation_id == ctx.conversation_id
+    local explicit_turn_id = type(actor_params.turn_id) == "string"
+        and actor_params.turn_id ~= "" and actor_params.turn_id or nil
+    local actor_turn_id = explicit_turn_id
+      or (is_root_conversation and ctx.run_id or (ctx.run_id .. "/" .. tostring(record.id)))
     local deps = {
       persistence_owned_by_kernel = true,
       writer = function(output)
         return persist_output(record.id, output)
       end,
       preview = router:preview_emitter(record.id),
+      conversation = {
+        id = actor_conversation_id,
+        root_id = ctx.conversation_id,
+        is_root = is_root_conversation,
+        turn_id = actor_turn_id,
+        provenance = {
+          session_id = ctx.session_id,
+          run_id = ctx.run_id,
+          root_conversation_id = ctx.conversation_id,
+          actor_id = record.id,
+          factory = record.factory,
+        },
+        emit = function(fact)
+          nefor.emit({ kind = "conversation.fact.append", fact = fact })
+        end,
+      },
       diagnostic = function(diagnostic)
         diagnostic = diagnostic or {}
         emit_event({

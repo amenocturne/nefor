@@ -321,7 +321,9 @@ end
 do
   -- Drive an llm to a tool-calls reply so it emits a real ToolCalls message.
   local lm, lemit = capture()
-  local linst = llm.construct("dx.llm", { provider = "p" }, lemit)
+  local linst = llm.construct("dx.llm", { provider = "p" }, lemit, {
+    conversation = { id = "dx:conversation", turn_id = "dx:turn", emit = function(_) end },
+  })
   linst.deliver({
     shape = "single",
     messages = { { from = "up", tag = "generic-provider.ProviderOut", message = { messages = {} } } },

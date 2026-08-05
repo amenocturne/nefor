@@ -225,7 +225,9 @@ do
     } },
   } } }
   local provider_messages, provider_emit = capture()
-  local provider = assert(llm.construct("fan-in.llm", { provider = "fake-provider" }, provider_emit))
+  local provider = assert(llm.construct("fan-in.llm", { provider = "fake-provider" }, provider_emit, {
+    conversation = { id = "fan-in:conversation", turn_id = "fan-in:turn", emit = function(_) end },
+  }))
   local adapter_messages, adapter_emit = capture()
   local entry = adapter.construct("fan-in.entry", { schema = product_schema }, function(message)
     adapter_emit(message)

@@ -1,4 +1,4 @@
--- Prose provider boundary. Shared transcript/correlation/tool lifecycle lives
+-- Prose provider boundary. Shared request/correlation/tool lifecycle lives
 -- in provider-boundary.lua; this module only declares and classifies its final
 -- output.
 local boundary = require("factories.provider-boundary")
@@ -24,6 +24,9 @@ M.declaration = {
     model = "string?", system = "string?", tools = "table?",
     profile = "string?", reasoning_effort = "string?",
     provider = "string?", history = "table?", context_artifact = "table?",
+    conversation_context = "table?",
+    conversation_id = "string?",
+    turn_id = "string?",
   },
   inputs = { provider_input = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" },
@@ -33,6 +36,7 @@ M.declaration = {
 function M.construct(id, params, emit, deps)
   deps = deps or {}
   return boundary.construct(id, params, emit, {
+    conversation = deps.conversation,
     preview = deps.preview,
     name = "llm",
     steerable = true,
@@ -48,12 +52,8 @@ function M.construct(id, params, emit, deps)
       if type(result) == "table" then
         final.text = result.text
         final.final_answer = result.final_answer
-        if type(result.text) == "string" and result.text ~= "" then
-          state:append({ role = "assistant", content = result.text })
-        end
       end
-      local delta = state:transcript_delta()
-      if #delta > 0 then final.transcript_delta = delta end
+      if content ~= "" then state:append({ role = "assistant", content = content }) end
       state:finish(final)
     end,
   })

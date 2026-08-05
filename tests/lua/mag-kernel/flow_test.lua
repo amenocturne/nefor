@@ -112,8 +112,7 @@ do
 end
 
 -- ==================================================================
--- sink: the llm's transcript_delta stays off the persisted output but rides
--- the run-complete result (the conversation record is not the final answer)
+-- sink: terminal results carry no parallel conversation reconstruction data.
 -- ==================================================================
 
 do
@@ -125,20 +124,14 @@ do
   inst.deliver(single("up", "generic-provider.FinalAnswer", {
     kind = "generic-provider.FinalAnswer",
     text = "the answer",
-    transcript_delta = {
-      { role = "user", content = "the task" },
-      { role = "assistant", content = "the answer" },
-    },
   }))
 
   assert_eq(persisted[1].text, "the answer", "writer received the final output")
-  assert_eq(persisted[1].transcript_delta, nil,
-    "the persisted output carries no transcript_delta")
+  assert_eq(persisted[1].transcript_delta, nil, "the result has no transcript metadata")
   local done = find_kind(msgs, "mag.RunComplete")
   assert_eq(done.result.text, "the answer", "run-complete carries the result")
-  assert_true(type(done.result.transcript_delta) == "table"
-      and #done.result.transcript_delta == 2,
-    "run-complete's result keeps the transcript_delta for the run's spawner")
+  assert_eq(done.result.transcript_delta, nil,
+    "run-complete does not reconstruct conversation history")
 end
 
 -- ==================================================================

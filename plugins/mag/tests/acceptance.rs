@@ -737,6 +737,7 @@ async fn execute_worktree_program<R: AsyncBufReadExt + Unpin>(
             "id": id,
             "session_id": "worktree-acceptance",
             "principal": "lead",
+            "conversation_id": "acceptance-conversation",
             "run_id": id,
             "run_name": id,
             "artifact": artifact,

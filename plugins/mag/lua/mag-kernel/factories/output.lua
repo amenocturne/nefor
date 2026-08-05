@@ -27,15 +27,10 @@ function M.construct(id, _, emit)
   function instance.deliver(activation)
     if activation and activation.shape == "product" and not activation.whole then
       local values, semantic_values = {}, {}
-      local transcript_delta
       for index, position in ipairs(activation.messages or {}) do
         local message = position.message or {}
         local value = message.value
         if value == nil then value = message end
-        local metadata = position.arrival and position.arrival.control_metadata
-        if metadata and metadata.transcript_delta ~= nil then
-          transcript_delta = metadata.transcript_delta
-        end
         values[index] = value
         semantic_values[index] = value
         local arrival = position.arrival
@@ -53,7 +48,6 @@ function M.construct(id, _, emit)
         from = id,
         value = values,
         semantic_value = semantic_values,
-        transcript_delta = transcript_delta,
       })
       return { status = "ok" }
     end
@@ -68,10 +62,6 @@ function M.construct(id, _, emit)
       forwarded.semantic_type = arrival.type
       forwarded.constructor_id = arrival.constructor_id
       forwarded.arrival_id = arrival.arrival_id
-      local metadata = arrival.control_metadata
-      if metadata and metadata.transcript_delta ~= nil then
-        forwarded.transcript_delta = metadata.transcript_delta
-      end
     end
     forwarded.kind = VALUE
     forwarded.from = id

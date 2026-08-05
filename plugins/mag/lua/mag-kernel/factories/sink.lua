@@ -6,7 +6,7 @@
 -- two jobs a terminal owes the control plane:
 --
 --   1. Select the persisted final output. The sink strips transcript metadata
---      from the persisted form while retaining it in the control-plane result.
+--      as the final result without carrying conversation reconstruction data.
 --      The kernel's terminal settlement boundary performs the actual write, so
 --      persistence and completion share one first-write-wins decision.
 --
@@ -80,17 +80,7 @@ function M.construct(id, params, emit, deps)
   function instance.deliver(activation)
     activation = activation or {}
     local final = ((activation.messages or {})[1] or {}).message
-    -- The llm's transcript_delta (factories/llm.lua, "Transcript delta") is
-    -- the conversation record, not the final output: keep it OFF the persisted
-    -- file (sink.output stays the answer alone) but ON the run-complete signal,
-    -- where it rides the terminal mag.run_result back to the run's spawner.
     local to_persist = final
-    if type(final) == "table" and final.transcript_delta ~= nil then
-      to_persist = {}
-      for k, v in pairs(final) do
-        if k ~= "transcript_delta" then to_persist[k] = v end
-      end
-    end
     if type(deps.writer) == "function" and not deps.persistence_owned_by_kernel then
       deps.writer(to_persist)
     end

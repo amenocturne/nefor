@@ -523,6 +523,21 @@ async fn handle_event(
                 }
             }
         }
+        if let Some(event @ ("retry" | "usage" | "failed" | "error" | "interrupted")) =
+            body.get("event").and_then(Value::as_str)
+        {
+            let mut observation = body.clone();
+            observation.insert("kind".into(), Value::String(event.into()));
+            observation.remove("request_id");
+            observation.remove("event");
+            let _ = host.bus_observation(
+                &request_id,
+                "append",
+                "conversation",
+                &Value::Object(observation),
+            )?;
+            flush_emits(out_tx, host, bridge).await?;
+        }
         if let Some(reply) = bridge.take_reply(kind, body) {
             return handle_provider_reply(out_tx, reply, program.as_deref(), host, active, bridge)
                 .await;
@@ -818,12 +833,27 @@ async fn handle_execute(
         Ok(principal) => principal,
         Err(error) => return send_event(out_tx, error_body(in_reply_to, &error)).await,
     };
+    let conversation_id = match body.get("conversation_id").and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ if principal == RunPrincipal::Lead => {
+            return send_event(
+                out_tx,
+                error_body(
+                    in_reply_to,
+                    "lead mag.execute requires a non-empty conversation_id",
+                ),
+            )
+            .await
+        }
+        _ => format!("{session_id}/{run_id}"),
+    };
 
     let begun = host.begin_run_with_principal(
         &run_id,
         run_name,
         Some(session_id),
         Some(principal.as_str()),
+        Some(&conversation_id),
     )?;
     // The kernel reaps stale contexts from a previous session at the boundary
     // (begin_run); fail their pending replies before driving the new run.

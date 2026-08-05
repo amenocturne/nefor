@@ -1,9 +1,11 @@
--- Shared provider round/transcript lifecycle for provider-boundary factories.
+-- Shared provider round/request lifecycle for provider-boundary factories.
 -- Classification policy stays in the thin consumer (`llm` or
 -- `structured-output`); correlation, history, tool calls, cancellation and
--- drain behavior live here once.
+-- drain behavior live here once. Canonical conversation history is emitted as
+-- facts and projected outside this request-local boundary.
 
 local kinds = require("kinds")
+local conversation_facts = require("conversation-facts")
 local M = {}
 
 local function copy_history(id, factory_name, seed)
@@ -56,8 +58,26 @@ function M.construct(id, params, emit, options)
   if type(provider) ~= "string" or provider == "" then
     return nil, string.format("%s '%s': params.provider is required", factory_name, tostring(id))
   end
-  local history, history_error = copy_history(id, factory_name, params.history)
-  if not history then return nil, history_error end
+  local request_messages, history_error = copy_history(id, factory_name, params.history)
+  if not request_messages then return nil, history_error end
+
+  local conversation = options.conversation
+  if type(conversation) ~= "table" or type(conversation.id) ~= "string"
+      or type(conversation.emit) ~= "function" then
+    return nil, string.format("%s '%s': conversation dependency is required", factory_name, tostring(id))
+  end
+  local provenance = {}
+  for key, value in pairs(conversation.provenance or {}) do provenance[key] = value end
+  provenance.provider = provider
+  provenance.model = params.model
+  local facts = conversation_facts.new({
+    conversation_id = conversation.id,
+    turn_id = conversation.turn_id,
+    provenance = provenance,
+    emit = conversation.emit,
+  })
+  if not conversation.is_root then facts:create(provenance) end
+  facts:start_turn()
 
   local function sign(message)
     message.from = id
@@ -67,16 +87,42 @@ function M.construct(id, params, emit, options)
   local instance = { id = id }
   local state = {}
   local observe = type(options.preview) == "function" and options.preview or function() return false end
-  local seed_len = #history
   local seq = 0
   local pending = nil
   local draining = false
   local turn_active = false
   local awaiting_continuation = false
   local steered_messages = {}
+  local streamed_message_id = nil
+  local terminal_metadata = {}
 
-  function state:append(message)
-    history[#history + 1] = message
+  local function merge_terminal(detail)
+    local merged = {}
+    for key, value in pairs(terminal_metadata) do merged[key] = value end
+    for key, value in pairs(detail or {}) do merged[key] = value end
+    local result = merged.result
+    if type(result) == "table" then
+      for _, key in ipairs({ "model", "duration_ms", "usage", "finish_reason" }) do
+        if merged[key] == nil then merged[key] = result[key] end
+      end
+    end
+    return merged
+  end
+
+  local function interrupt_stream(reason)
+    if streamed_message_id == nil then return end
+    facts:interrupt_message(streamed_message_id, { reason = reason })
+    streamed_message_id = nil
+  end
+
+  function state:append(message, completion)
+    request_messages[#request_messages + 1] = message
+    if message.role == "assistant" and streamed_message_id then
+      facts:finish_message(streamed_message_id, message, completion)
+      streamed_message_id = nil
+    else
+      facts:message(message, completion)
+    end
     if type(message.tool_calls) == "table" then
       for _, call in ipairs(message.tool_calls) do
         observe("append", "transcript", { kind = "tool_call", value = call })
@@ -86,21 +132,23 @@ function M.construct(id, params, emit, options)
   function state:emit(message) emit(sign(message)) end
   function state:observe(operation, binding, value) return observe(operation, binding, value) end
   function state:is_draining() return draining end
-  function state:transcript_delta()
-    local delta = {}
-    for i = seed_len + 1, #history do delta[#delta + 1] = history[i] end
-    return delta
-  end
-  function state:finish(message)
+  function state:finish(message, terminal_detail)
     self:emit(message)
     self:emit({ kind = kinds.complete })
     turn_active = false
     awaiting_continuation = false
+    facts:complete_turn(merge_terminal(terminal_detail or {
+      result = message.result,
+      value = message.value,
+      semantic_type_id = message.semantic_type_id,
+    }))
   end
   function state:fail(detail)
+    interrupt_stream("provider_failed")
     self:emit({ kind = kinds.failed, failure = kinds.Failed, value = { error = detail } })
     turn_active = false
     awaiting_continuation = false
+    facts:fail_turn(merge_terminal({ error = detail }))
   end
 
   local function extend_history(input)
@@ -117,7 +165,7 @@ function M.construct(id, params, emit, options)
 
   local function build_request()
     local messages = {}
-    for i, message in ipairs(history) do messages[i] = message end
+    for i, message in ipairs(request_messages) do messages[i] = message end
     local model = params.model
     if type(model) == "table" then
       model = model.present and model.value or nil
@@ -129,6 +177,7 @@ function M.construct(id, params, emit, options)
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,
       context_artifact = params.context_artifact,
+      conversation_context = params.conversation_context,
       output_schema = params.schema,
       max_corrections = params.max_corrections,
       input = { messages = messages },
@@ -147,7 +196,10 @@ function M.construct(id, params, emit, options)
     })
     return true
   end
-  function state:retry() return invoke_provider() end
+  function state:retry(reason)
+    facts:retry(reason or "provider_retry")
+    return invoke_provider()
+  end
 
   local function append_steered_messages()
     if #steered_messages == 0 then return false end
@@ -243,12 +295,16 @@ function M.construct(id, params, emit, options)
     pending = nil
     turn_active = false
     awaiting_continuation = false
+    interrupt_stream("actor_killed")
+    facts:interrupt_turn({ reason = "actor_killed" })
   end
 
   function instance.handle_drain()
     if pending == nil then
       state:emit({ kind = kinds.complete })
       turn_active = false
+      interrupt_stream("actor_drained")
+      facts:interrupt_turn({ reason = "actor_drained" })
     else
       draining = true
     end
@@ -258,6 +314,36 @@ function M.construct(id, params, emit, options)
     if not options.steerable or type(message) ~= "table" then return false end
     if type(message.role) ~= "string" or message.role == "" then return false end
     steered_messages[#steered_messages + 1] = message
+    return true
+  end
+
+  function instance.handle_observation(observation)
+    local value = observation and observation.value
+    if observation.binding == "conversation" and type(value) == "table" then
+      if value.kind == "retry" then
+        facts:retry(value.error or value.message or "provider_retry", value)
+      elseif value.kind == "usage" then
+        terminal_metadata.usage = value.usage or value.result
+        terminal_metadata.model = value.model or terminal_metadata.model
+        terminal_metadata.duration_ms = value.duration_ms or terminal_metadata.duration_ms
+      elseif value.kind == "interrupted" then
+        interrupt_stream("provider_interrupted")
+        facts:interrupt_turn(merge_terminal(value))
+      elseif value.kind == "failed" or value.kind == "error" then
+        interrupt_stream("provider_failed")
+        facts:fail_turn(merge_terminal(value))
+      end
+      return true
+    end
+    if observation.binding ~= "transcript" or type(value) ~= "table"
+        or type(value.text) ~= "string" or value.text == "" then
+      return false
+    end
+    local chunk_kind = value.kind == "reasoning" and "reasoning" or "text"
+    if streamed_message_id == nil then
+      streamed_message_id = facts:start_message("assistant")
+    end
+    facts:content(streamed_message_id, chunk_kind, value.text)
     return true
   end
 

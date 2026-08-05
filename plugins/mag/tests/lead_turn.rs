@@ -35,6 +35,7 @@ use tokio::time::timeout;
 const PROVIDER: &str = "test-provider";
 const GATE: &str = "tool-gate";
 const SESSION_ID: &str = "lead-turn-session";
+const CONVERSATION_ID: &str = "lead-conversation";
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The turn spawner appends a `## MAG workspace` block to the system
@@ -255,6 +256,7 @@ fn execute_body(
         "run_name": "lead",
         "session_id": SESSION_ID,
         "principal": "lead",
+        "conversation_id": CONVERSATION_ID,
         "artifact": artifact,
         "params_overlay": {
             "lead.llm": {
@@ -263,6 +265,7 @@ fn execute_body(
                 "model": "test-model",
                 "reasoning_effort": "high",
                 "history": history,
+                "conversation_id": CONVERSATION_ID,
             }
         }
     }))
@@ -345,6 +348,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             "run_id": "typed-schema-tamper-run",
             "session_id": SESSION_ID,
             "principal": "lead",
+            "conversation_id": CONVERSATION_ID,
             "artifact": artifact.clone(),
             "params_overlay": {
                 "typed-task.llm": {
@@ -373,6 +377,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             "run_name": "typed-task",
             "session_id": SESSION_ID,
             "principal": "lead",
+            "conversation_id": CONVERSATION_ID,
             "artifact": artifact,
             "params_overlay": {
                 "typed-task.llm": { "provider": MOCK, "model": "mock-model" }
@@ -456,6 +461,7 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
             "run_id": "recovery-chain-run",
             "session_id": SESSION_ID,
             "principal": "lead",
+            "conversation_id": CONVERSATION_ID,
             "artifact": artifact,
         })),
     )
@@ -551,7 +557,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         &mut stdin,
         obj(json!({"kind":"mag.execute","id":"dynamic-exec",
       "run_id":"dynamic-run","run_name":"dynamic-tasks","session_id":SESSION_ID,
-      "principal":"lead"})),
+      "principal":"lead","conversation_id":CONVERSATION_ID})),
     )
     .await;
 
@@ -669,7 +675,7 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
         &mut stdin,
         obj(
             json!({"kind":"mag.execute","id":"zero-exec","run_id":"zero-run",
-      "run_name":"zero","session_id":SESSION_ID,"principal":"lead"}),
+      "run_name":"zero","session_id":SESSION_ID,"principal":"lead","conversation_id":CONVERSATION_ID}),
         ),
     )
     .await;
@@ -737,7 +743,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         &mut stdin,
         obj(
             json!({"kind":"mag.execute","id":"one-exec","run_id":"one-run",
-      "run_name":"one","session_id":SESSION_ID,"principal":"lead"}),
+      "run_name":"one","session_id":SESSION_ID,"principal":"lead","conversation_id":CONVERSATION_ID}),
         ),
     )
     .await;
@@ -789,7 +795,7 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
         &mut stdin,
         obj(
             json!({"kind":"mag.execute","id":"invalid-exec","run_id":"invalid-run",
-      "run_name":"invalid","session_id":SESSION_ID,"principal":"lead"}),
+      "run_name":"invalid","session_id":SESSION_ID,"principal":"lead","conversation_id":CONVERSATION_ID}),
         ),
     )
     .await;
@@ -1069,20 +1075,12 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         Some("the repo holds nefor"),
         "the sink's final answer rides the terminal reply inline"
     );
-    let delta = result
-        .get("result")
-        .and_then(|value| value.get("transcript_delta"))
-        .and_then(Value::as_array)
-        .expect("lead result carries the model transcript delta");
-    let delta_text = serde_json::to_string(delta).unwrap();
-    assert!(!delta_text.contains(notice_text));
-    assert_eq!(
-        delta
-            .iter()
-            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
-            .count(),
-        1,
-        "transcript delta records the original tool result once"
+    assert!(
+        result
+            .get("result")
+            .and_then(|value| value.get("transcript_delta"))
+            .is_none(),
+        "terminal graph data does not carry a parallel conversation history"
     );
 
     // ── turn 2: the spawner seeds {user, answer} from turn 1 ───────────

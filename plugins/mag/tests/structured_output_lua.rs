@@ -109,7 +109,7 @@ fn structured_output_retries_and_preserves_tool_rounds() {
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, emit)
+        }, emit, { conversation = { id = "typed:conversation", turn_id = "typed:turn", emit = function(_) end } })
         assert(actor, err)
 
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
@@ -167,7 +167,8 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, function(message) emitted[#emitted + 1] = message end))
+        }, function(message) emitted[#emitted + 1] = message end,
+          { conversation = { id = "typed:conversation", turn_id = "typed:turn", emit = function(_) end } }))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
@@ -202,7 +203,8 @@ fn zero_corrections_rejects_the_initial_invalid_candidate() {
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, function(message) emitted[#emitted + 1] = message end))
+        }, function(message) emitted[#emitted + 1] = message end,
+          { conversation = { id = "no-retry:conversation", turn_id = "no-retry:turn", emit = function(_) end } }))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
@@ -243,7 +245,8 @@ fn wrapped_retry_requests_provider_envelope_and_named_union_routes_constructor()
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, function(message) emitted[#emitted + 1] = message end))
+        }, function(message) emitted[#emitted + 1] = message end,
+          { conversation = { id = "named-union:conversation", turn_id = "named-union:turn", emit = function(_) end } }))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
@@ -285,7 +288,8 @@ fn tagged_result_preserves_the_selected_constructor_without_a_selector() {
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, function(message) emitted[#emitted + 1] = message end))
+        }, function(message) emitted[#emitted + 1] = message end,
+          { conversation = { id = "tagged:conversation", turn_id = "tagged:turn", emit = function(_) end } }))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut",
           message = { messages = {{ role = "user", content = "answer" }} } }}})
         actor.deliver({ kind = "reply",
@@ -316,7 +320,8 @@ fn ordinary_string_output_accepts_the_empty_string() {
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, function(message) emitted[#emitted + 1] = message end))
+        }, function(message) emitted[#emitted + 1] = message end,
+          { conversation = { id = "empty-string:conversation", turn_id = "empty-string:turn", emit = function(_) end } }))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
@@ -347,7 +352,8 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
             error_type = "agent-error-tag",
             provider_error_type = "provider-error-tag",
             validation_error_type = "validation-error-tag"
-          }, function(message) emitted[#emitted + 1] = message end))
+          }, function(message) emitted[#emitted + 1] = message end,
+            { conversation = { id = id .. ":conversation", turn_id = id .. ":turn", emit = function(_) end } }))
           actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
             messages = {{ role = "user", content = "answer" }}
           }}}})
@@ -440,7 +446,8 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, function(message) emitted[#emitted + 1] = message end))
+        }, function(message) emitted[#emitted + 1] = message end,
+          { conversation = { id = "repeat:conversation", turn_id = "repeat:turn", emit = function(_) end } }))
         local function activate(content)
           actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
             messages = {{ role = "user", content = content }}
