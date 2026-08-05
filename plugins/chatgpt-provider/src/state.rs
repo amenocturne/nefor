@@ -252,11 +252,11 @@ enum TurnState {
 
 struct ChatState {
     model: String,
-    /// Stable logical conversation identity supplied by the caller.
-    /// Unlike `ChatId`, this does not carry the per-activation `@r<N>`
-    /// suffix, so Responses routing and prompt caching can remain sticky
-    /// while the provider chat itself stays request-scoped.
-    routing_session_id: Option<String>,
+    /// Durable conversation-manager identity supplied by the caller. Unlike
+    /// `ChatId`, this stays stable across provider requests, so Responses
+    /// routing and prompt caching remain sticky while mutable provider state
+    /// stays request-scoped.
+    conversation_id: Option<String>,
     /// Optional system prompt (set on chat.create). Translator pulls
     /// this out into the Responses-API `instructions` field; never goes
     /// into the `input` array.
@@ -280,7 +280,7 @@ impl ChatState {
     fn new(model: String) -> Self {
         Self {
             model,
-            routing_session_id: None,
+            conversation_id: None,
             system: None,
             history: Vec::new(),
             turn: TurnState::Idle,
@@ -293,14 +293,14 @@ impl ChatState {
 
     fn from_create(
         model: String,
-        routing_session_id: Option<String>,
+        conversation_id: Option<String>,
         system: Option<String>,
         tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
         tool_allowlist: Option<Vec<String>>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
         let mut chat = Self::new(model);
-        chat.routing_session_id = routing_session_id;
+        chat.conversation_id = conversation_id;
         chat.system = system;
         chat.tool_overrides = tool_overrides;
         chat.tool_allowlist = tool_allowlist;
@@ -331,7 +331,7 @@ pub enum ChatsError {
 #[derive(Debug, Clone)]
 pub struct ChatSnapshot {
     pub model: String,
-    pub routing_session_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub system: Option<String>,
     pub history: Vec<HistoryEntry>,
     pub tool_allowlist: Option<Vec<String>>,
@@ -342,7 +342,7 @@ pub struct ChatSnapshot {
 pub struct MessageRestore {
     pub id: ChatId,
     pub model: Option<String>,
-    pub routing_session_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub system: Option<String>,
     pub tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
     pub tool_allowlist: Option<Vec<String>>,
@@ -482,7 +482,7 @@ impl Chats {
     async fn build_chat(
         &self,
         model: Option<String>,
-        routing_session_id: Option<String>,
+        conversation_id: Option<String>,
         system: Option<String>,
         tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
         tool_allowlist: Option<Vec<String>>,
@@ -491,7 +491,7 @@ impl Chats {
         let resolved_model = self.resolve_model(model).await?;
         Ok(ChatState::from_create(
             resolved_model,
-            routing_session_id,
+            conversation_id,
             system,
             tool_overrides,
             tool_allowlist,
@@ -565,7 +565,7 @@ impl Chats {
         let mut chat = self
             .build_chat(
                 restore.model,
-                restore.routing_session_id,
+                restore.conversation_id,
                 restore.system,
                 restore.tool_overrides,
                 restore.tool_allowlist,
@@ -600,23 +600,23 @@ impl Chats {
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
-    pub async fn routing_session_id(&self, id: &ChatId) -> Result<Option<String>, ChatsError> {
+    pub async fn conversation_id(&self, id: &ChatId) -> Result<Option<String>, ChatsError> {
         let g = self.inner.lock().await;
         g.get(id)
-            .map(|c| c.routing_session_id.clone())
+            .map(|c| c.conversation_id.clone())
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
-    pub async fn set_routing_session_id(
+    pub async fn set_conversation_id(
         &self,
         id: &ChatId,
-        routing_session_id: String,
+        conversation_id: String,
     ) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
-        chat.routing_session_id = Some(routing_session_id);
+        chat.conversation_id = Some(conversation_id);
         Ok(())
     }
 
@@ -650,7 +650,7 @@ impl Chats {
         g.get(id)
             .map(|c| ChatSnapshot {
                 model: c.model.clone(),
-                routing_session_id: c.routing_session_id.clone(),
+                conversation_id: c.conversation_id.clone(),
                 system: c.system.clone(),
                 history: c.history.clone(),
                 tool_allowlist: c.tool_allowlist.clone(),
@@ -1008,17 +1008,14 @@ mod tests {
         )
         .await
         .expect("recreate");
-        c.set_routing_session_id(&id, "session-1/r7/worker.llm".into())
+        c.set_conversation_id(&id, "conversation-1".into())
             .await
-            .expect("routing session");
+            .expect("conversation identity");
 
         let snap = c.snapshot(&id).await.expect("snapshot");
         assert!(snap.history.is_empty());
         assert_eq!(snap.model, "new-model");
-        assert_eq!(
-            snap.routing_session_id.as_deref(),
-            Some("session-1/r7/worker.llm")
-        );
+        assert_eq!(snap.conversation_id.as_deref(), Some("conversation-1"));
         assert_eq!(snap.system.as_deref(), Some("new"));
     }
 
@@ -1366,7 +1363,7 @@ mod tests {
         c.restore_messages(MessageRestore {
             id: id.clone(),
             model: None,
-            routing_session_id: None,
+            conversation_id: None,
             system: None,
             tool_overrides: None,
             tool_allowlist: None,

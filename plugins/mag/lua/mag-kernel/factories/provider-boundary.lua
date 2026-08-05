@@ -200,7 +200,7 @@ function M.construct(id, params, emit, options)
       model = model.present and model.value or nil
     end
     return {
-      routing_session_id = conversation.routing_session_id,
+      conversation_id = conversation.id,
       model = model,
       system = params.system,
       tools = params.tools,

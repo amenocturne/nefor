@@ -1286,16 +1286,16 @@ fn read_chat_id(body: &Map<String, Value>) -> Option<ChatId> {
         .map(ChatId::new)
 }
 
-fn read_routing_session_id(body: &Map<String, Value>) -> Option<String> {
-    body.get("routing_session_id")
+fn read_conversation_id(body: &Map<String, Value>) -> Option<String> {
+    body.get("conversation_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
 }
 
-fn logical_routing_id(routing_session_id: Option<&str>, chat_id: &ChatId) -> String {
-    routing_session_id
+fn logical_routing_id(conversation_id: Option<&str>, chat_id: &ChatId) -> String {
+    conversation_id
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| chat_id.to_string())
@@ -1597,8 +1597,8 @@ async fn handle_completion_request(
             }
         }
     }
-    let routing_session_id = body
-        .get("routing_session_id")
+    let conversation_id = body
+        .get("conversation_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
@@ -1669,7 +1669,7 @@ async fn handle_completion_request(
         .restore_messages(MessageRestore {
             id: chat_id.clone(),
             model,
-            routing_session_id,
+            conversation_id,
             system,
             tool_overrides,
             tool_allowlist,
@@ -1786,7 +1786,7 @@ async fn handle_chat_create(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let routing_session_id = read_routing_session_id(body);
+    let conversation_id = read_conversation_id(body);
     let system = body
         .get("system")
         .and_then(Value::as_str)
@@ -1832,11 +1832,8 @@ async fn handle_chat_create(
         .await
     {
         Ok(()) => {
-            if let Some(routing_session_id) = routing_session_id {
-                if let Err(error) = chats
-                    .set_routing_session_id(&chat_id, routing_session_id)
-                    .await
-                {
+            if let Some(conversation_id) = conversation_id {
+                if let Err(error) = chats.set_conversation_id(&chat_id, conversation_id).await {
                     send_event(out_tx, chat_error_body(args, &chat_id, error.to_string())).await?;
                     return Ok(());
                 }
@@ -1920,7 +1917,7 @@ async fn handle_chat_restore(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let routing_session_id = read_routing_session_id(body);
+    let conversation_id = read_conversation_id(body);
     let system = body
         .get("system")
         .and_then(Value::as_str)
@@ -1981,7 +1978,7 @@ async fn handle_chat_restore(
         .restore_messages(MessageRestore {
             id: chat_id.clone(),
             model,
-            routing_session_id,
+            conversation_id,
             system,
             tool_overrides,
             tool_allowlist,
@@ -2175,8 +2172,8 @@ async fn compact_chat(
         effort: snapshot.reasoning_effort,
         summary: Some(ReasoningSummary::Concise),
     });
-    let routing_session_id = logical_routing_id(snapshot.routing_session_id.as_deref(), chat_id);
-    let provider_routing = provider_routing_identity(&routing_session_id);
+    let conversation_id = logical_routing_id(snapshot.conversation_id.as_deref(), chat_id);
+    let provider_routing = provider_routing_identity(&conversation_id);
     let response_turn = ResponsesTurnContext::new(
         provider_routing.session_id,
         provider_routing.thread_id.clone(),
@@ -2618,16 +2615,16 @@ fn spawn_turn(
         let mut pre_output_stream_retries: u32 = 0;
         let mut pre_output_retry_started: Option<Instant> = None;
         let mut auth_401_recovery_stage: u8 = 0;
-        let routing_session_id = logical_routing_id(
+        let conversation_id = logical_routing_id(
             ctx.chats
-                .routing_session_id(&chat_id)
+                .conversation_id(&chat_id)
                 .await
                 .ok()
                 .flatten()
                 .as_deref(),
             &chat_id,
         );
-        let provider_routing = provider_routing_identity(&routing_session_id);
+        let provider_routing = provider_routing_identity(&conversation_id);
         let cache_key = provider_routing.thread_id.clone();
         let mut response_turn =
             ResponsesTurnContext::new(provider_routing.session_id, provider_routing.thread_id);
@@ -3599,20 +3596,76 @@ mod tests {
         assert_eq!(runs.get("other").await.expect("other").owner, other.owner);
     }
 
+    #[tokio::test]
+    async fn concurrent_requests_for_one_conversation_cancel_independently() {
+        let runs = DirectCompletions::default();
+        let conversation_id = "conversation-shared";
+        let chats_a = Arc::new(Chats::with_default_model(Some("model".into())));
+        let chats_b = Arc::new(Chats::with_default_model(Some("model".into())));
+        let chat_a = ChatId::new("request-a");
+        let chat_b = ChatId::new("request-b");
+        for (chats, chat) in [(&chats_a, &chat_a), (&chats_b, &chat_b)] {
+            chats
+                .create(chat.clone(), None, None, None, None, None)
+                .await
+                .expect("request chat");
+            chats
+                .set_conversation_id(chat, conversation_id.into())
+                .await
+                .expect("shared conversation identity");
+        }
+        let token_a = chats_a.begin_turn(&chat_a).await.expect("turn a");
+        let token_b = chats_b.begin_turn(&chat_b).await.expect("turn b");
+        runs.begin("request-a".into(), chats_a, chat_a)
+            .await
+            .expect("request a");
+        runs.begin("request-b".into(), chats_b, chat_b)
+            .await
+            .expect("request b");
+
+        let cancelled = runs.cancel("request-a").await.expect("owned request a");
+        assert!(cancelled.chats.cancel_turn(&cancelled.chat_id).await);
+        assert!(token_a.is_cancelled());
+        assert!(!token_b.is_cancelled());
+        assert!(runs.get("request-a").await.is_none());
+        assert!(runs.get("request-b").await.is_some());
+    }
+
     #[test]
-    fn logical_routing_and_cache_keys_are_stable_across_provider_rounds() {
+    fn conversation_identity_keeps_routing_and_cache_stable_across_requests() {
         let round_1 = ChatId::new("r7/worker.llm@r1");
         let round_2 = ChatId::new("r7/worker.llm@r2");
-        let logical = "session-42/r7/worker.llm";
+        let conversation_id = "conversation-stable";
 
-        let route_1 = logical_routing_id(Some(logical), &round_1);
-        let route_2 = logical_routing_id(Some(logical), &round_2);
-        assert_eq!(route_1, logical);
-        assert_eq!(route_2, logical);
+        let route_1 = logical_routing_id(Some(conversation_id), &round_1);
+        let route_2 = logical_routing_id(Some(conversation_id), &round_2);
+        assert_eq!(route_1, conversation_id);
+        assert_eq!(route_2, conversation_id);
 
         let provider_1 = provider_routing_identity(&route_1);
         let provider_2 = provider_routing_identity(&route_2);
         assert_eq!(provider_1, provider_2);
+        let mut headers_1 = reqwest::header::HeaderMap::new();
+        let mut headers_2 = reqwest::header::HeaderMap::new();
+        crate::responses::headers::add_turn_headers(
+            &mut headers_1,
+            &provider_1.session_id,
+            &provider_1.thread_id,
+            None,
+        )
+        .expect("round 1 headers");
+        crate::responses::headers::add_turn_headers(
+            &mut headers_2,
+            &provider_2.session_id,
+            &provider_2.thread_id,
+            None,
+        )
+        .expect("round 2 headers");
+        assert_eq!(headers_1, headers_2);
+        assert_eq!(
+            provider_1.thread_id, provider_2.thread_id,
+            "thread-id is also the stable prompt_cache_key"
+        );
         assert_eq!(provider_1.session_id.len(), 36);
         assert_eq!(provider_1.thread_id.len(), 36);
         assert_ne!(provider_1.session_id, provider_1.thread_id);
@@ -3628,11 +3681,9 @@ mod tests {
                 .get_version_num(),
             8
         );
-        assert_ne!(
-            provider_1,
-            provider_routing_identity("session-42/r7/sibling.llm"),
-            "sibling agents must not share cache routing"
-        );
+        let sibling = provider_routing_identity("conversation-sibling");
+        assert_ne!(provider_1.session_id, sibling.session_id);
+        assert_ne!(provider_1.thread_id, sibling.thread_id);
     }
 
     #[test]
@@ -3652,12 +3703,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_create_preserves_the_logical_routing_identity() {
+    async fn chat_create_preserves_the_conversation_identity() {
         let chats = Arc::new(Chats::with_default_model(Some("test-model".into())));
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let body = serde_json::json!({
             "chat_id": "r7/worker.llm@r2",
-            "routing_session_id": "session-42/r7/worker.llm"
+            "conversation_id": "conversation-stable"
         })
         .as_object()
         .expect("object")
@@ -3674,8 +3725,8 @@ mod tests {
             .await
             .expect("snapshot");
         assert_eq!(
-            snapshot.routing_session_id.as_deref(),
-            Some("session-42/r7/worker.llm")
+            snapshot.conversation_id.as_deref(),
+            Some("conversation-stable")
         );
     }
 

@@ -70,7 +70,11 @@ local function translator(name)
     local chat_id = "conversation-compact:" .. request_id
     local plan = {
       chat_id = chat_id,
-      create = { kind = prefix .. "chat.create", chat_id = chat_id },
+      create = {
+        kind = prefix .. "chat.create",
+        chat_id = chat_id,
+        conversation_id = change.conversation_id,
+      },
       messages = context.messages,
       compact = {
         kind = prefix .. "chat.compact",

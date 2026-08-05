@@ -146,7 +146,6 @@ local function new_run_context(meta)
     principal = meta.principal,
     conversation_id = meta.conversation_id
       or (tostring(meta.session_id or "sessionless") .. "/" .. tostring(meta.run_id)),
-    routing_session_ids = {},
     last_output_path = nil,
     run_complete = nil,
     run_complete_taken = false,
@@ -373,11 +372,6 @@ local function new_run_context(meta)
         and actor_params.turn_id ~= "" and actor_params.turn_id or nil
     local actor_turn_id = explicit_turn_id
       or (is_root_conversation and ctx.run_id or (ctx.run_id .. "/" .. tostring(record.id)))
-    local routing_session_id = ctx.routing_session_ids[actor_conversation_id]
-    if routing_session_id == nil then
-      routing_session_id = nefor.opaque_id()
-      ctx.routing_session_ids[actor_conversation_id] = routing_session_id
-    end
     local deps = {
       persistence_owned_by_kernel = true,
       writer = function(output)
@@ -389,7 +383,6 @@ local function new_run_context(meta)
         root_id = ctx.conversation_id,
         is_root = is_root_conversation,
         turn_id = actor_turn_id,
-        routing_session_id = routing_session_id,
         provenance = {
           session_id = ctx.session_id,
           run_id = ctx.run_id,

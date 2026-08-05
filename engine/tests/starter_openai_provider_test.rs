@@ -112,6 +112,7 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
         local delivered = _test.delivered()
         assert(#delivered == 3)
         assert(delivered[1].kind == "chatgpt.chat.create")
+        assert(delivered[1].conversation_id == "lead")
         assert(delivered[2].kind == "chatgpt.chat.append")
         assert(delivered[3].kind == "chatgpt.chat.compact")
 
@@ -264,6 +265,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_default();
         let chat_id: Value = body.get("chat_id").unwrap_or(Value::Nil);
+        let conversation_id: Value = body.get("conversation_id").unwrap_or(Value::Nil);
         let message_role: Value = match body.get::<Value>("message").ok() {
             Some(Value::Table(m)) => m.get::<Value>("role").unwrap_or(Value::Nil),
             _ => Value::Nil,
@@ -277,6 +279,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         row.set("peer", lua.create_string(&peer)?)?;
         row.set("kind", lua.create_string(&kind)?)?;
         row.set("chat_id", chat_id)?;
+        row.set("conversation_id", conversation_id)?;
         row.set("role", message_role)?;
         row.set("content", message_content)?;
         let n = log.len()?;

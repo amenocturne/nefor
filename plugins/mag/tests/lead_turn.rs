@@ -895,17 +895,14 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         request_id.starts_with(&format!("{scope}/")),
         "request id {request_id:?} carries run scope {scope:?}"
     );
-    let routing_session_id = create
-        .get("routing_session_id")
+    let conversation_id = create
+        .get("conversation_id")
         .and_then(Value::as_str)
-        .expect("completion.request carries opaque routing identity")
+        .expect("completion.request carries conversation identity")
         .to_owned();
-    assert!(!routing_session_id.is_empty());
-    assert!(
-        !routing_session_id.contains(SESSION_ID)
-            && !routing_session_id.contains(&scope)
-            && !routing_session_id.contains("lead.llm"),
-        "provider routing identity must not expose session, run scope, or actor identity: {routing_session_id:?}"
+    assert_eq!(
+        conversation_id, CONVERSATION_ID,
+        "provider routing is owned by the durable conversation"
     );
     let system = create
         .get("system")
@@ -1028,9 +1025,9 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         "provider request handles stay per-round"
     );
     assert_eq!(
-        create2.get("routing_session_id").and_then(Value::as_str),
-        Some(routing_session_id.as_str()),
-        "round 2 reuses the actor routing identity"
+        create2.get("conversation_id").and_then(Value::as_str),
+        Some(conversation_id.as_str()),
+        "round 2 reuses the durable conversation identity"
     );
     let continuation_messages = create2["messages"].as_array().expect("round 2 messages");
     let tool_results: Vec<&Value> = continuation_messages
@@ -1099,6 +1096,11 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     .await;
 
     let turn2 = next_event_of_kind(&mut reader, &create_kind).await;
+    assert_eq!(
+        turn2.get("conversation_id").and_then(Value::as_str),
+        Some(conversation_id.as_str()),
+        "a later MAG run for the same conversation keeps provider cache affinity"
+    );
     let messages = turn2["messages"].as_array().expect("turn 2 messages");
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[0]["content"], "what is in the repo?");

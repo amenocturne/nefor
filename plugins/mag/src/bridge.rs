@@ -343,7 +343,7 @@ mod tests {
             "id": request_id,
             "name": provider,
             "args": {
-                "routing_session_id": "opaque-routing-token",
+                "conversation_id": "conversation-stable",
                 "model": "opus",
                 "system": "be helpful",
                 "tools": [{"name": "read_file"}],
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["kind"], "provider-a.completion.request");
         assert_eq!(out[0]["request_id"], "req-1");
-        assert_eq!(out[0]["routing_session_id"], "opaque-routing-token");
+        assert_eq!(out[0]["conversation_id"], "conversation-stable");
         assert_eq!(out[0]["messages"], messages);
         assert!(out[0].get("input").is_none());
         assert!(out[0].get("chat_id").is_none());
