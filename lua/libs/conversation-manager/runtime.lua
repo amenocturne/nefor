@@ -17,6 +17,7 @@ function M.build(options)
   local replay_active = options.replay_active or replay_window.active
   local store = manager.new()
   local session_id = nil
+  local active_conversation_id = nil
 
   local function send(body)
     emit(json.encode({
@@ -51,9 +52,10 @@ function M.build(options)
   local function reset(next_session_id)
     store = manager.new()
     session_id = next_session_id
+    active_conversation_id = nil
   end
 
-  local function publish_recorded(event, duplicate, conversation, before)
+  local function publish_recorded(event, duplicate, conversation)
     send({
       kind = "conversation.fact.recorded",
       event = event,
@@ -65,17 +67,16 @@ function M.build(options)
         kind = "conversation.projection.delta",
         conversation_id = event.conversation_id,
         sequence = event.sequence,
-        change = projection.change(before, conversation, event),
+        change = projection.change(conversation, event),
       })
     end
   end
 
   local function append_fact(fact)
-    local before = type(fact) == "table" and store:get(fact.conversation_id) or nil
     local conversation, e, duplicate, event = store:append(fact)
     if not conversation then reject(fact, e); return nil end
-    publish_recorded(event, duplicate, conversation, before)
-    return conversation
+    publish_recorded(event, duplicate, conversation)
+    return conversation, duplicate, event
   end
 
   local function handle_append(body)
@@ -85,7 +86,6 @@ function M.build(options)
 
   local function handle_recorded(body)
     local event = body.event
-    local before = type(event) == "table" and store:get(event.conversation_id) or nil
     local conversation, e, duplicate = store:apply_recorded(event)
     if e then diagnose(body.event, e) end
     if conversation and not duplicate and replay_active() then
@@ -94,7 +94,16 @@ function M.build(options)
         conversation_id = event.conversation_id,
         sequence = event.sequence,
         replay = true,
-        change = projection.change(before, conversation, event),
+        change = projection.change(conversation, event),
+      })
+    end
+    if conversation and not duplicate and event.kind == "active_selected" then
+      active_conversation_id = event.conversation_id
+      send({
+        kind = "conversation.active.changed",
+        conversation_id = active_conversation_id,
+        sequence = event.sequence,
+        replay = replay_active() or nil,
       })
     end
   end
@@ -110,7 +119,7 @@ function M.build(options)
       })
       return
     end
-    local conversation = projection.conversation(store:get(body.conversation_id))
+    local conversation = projection.conversation(store:peek(body.conversation_id))
     send({
       kind = "conversation.snapshot",
       request_id = body.request_id,
@@ -135,7 +144,7 @@ function M.build(options)
       request_id = body.request_id,
       conversations = (function()
         local out = {}
-        for _, conversation in ipairs(store:list()) do out[#out + 1] = projection.conversation(conversation) end
+        for _, conversation in ipairs(store:list_owned()) do out[#out + 1] = projection.conversation(conversation) end
         return out
       end)(),
     })
@@ -143,12 +152,11 @@ function M.build(options)
 
   local function handle_context(body)
     if replay_active() then return end
-    if not nonempty(body.request_id) or not nonempty(body.conversation_id)
-        or (body.compatibility ~= nil and type(body.compatibility) ~= "table") then
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id) then
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_context_request" })
       return
     end
-    local context = projection.context(store:get(body.conversation_id), body.compatibility)
+    local context = projection.context(store:peek(body.conversation_id))
     send({
       kind = "conversation.context.snapshot",
       request_id = body.request_id,
@@ -160,11 +168,11 @@ function M.build(options)
 
   local function handle_compaction_request(body)
     if replay_active() then return end
-    if not nonempty(body.request_id) or not nonempty(body.conversation_id) then
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id) or not nonempty(body.provider) then
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_compaction_request" })
       return
     end
-    local conversation = store:get(body.conversation_id)
+    local conversation = store:peek(body.conversation_id)
     if not conversation then
       reject({ event_id = "compaction:" .. body.request_id .. ":requested", conversation_id = body.conversation_id },
         { code = "conversation_not_found", context = { request_id = body.request_id } })
@@ -175,7 +183,8 @@ function M.build(options)
       conversation_id = body.conversation_id,
       kind = "context_compaction_requested",
       request_id = body.request_id,
-      history_cutoff = projection.context(conversation, nil).history_length,
+      history_cutoff = projection.context(conversation).history_length,
+      provider = body.provider,
     })
   end
 
@@ -191,9 +200,34 @@ function M.build(options)
       kind = kind,
       request_id = body.request_id,
       checkpoint = domain.copy(body.checkpoint),
-      compatibility = domain.copy(body.compatibility),
       error = domain.copy(body.error),
     })
+  end
+
+  local function handle_active_set(body)
+    if replay_active() then return end
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id) then
+      send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_active_request" })
+      return
+    end
+    if not store:peek(body.conversation_id) then
+      send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "conversation_not_found" })
+      return
+    end
+    local _, duplicate, event = append_fact({
+      event_id = body.event_id or ("active:" .. body.request_id),
+      conversation_id = body.conversation_id,
+      kind = "active_selected",
+    })
+    if event and not duplicate then
+      active_conversation_id = body.conversation_id
+      send({
+        kind = "conversation.active.changed",
+        request_id = body.request_id,
+        conversation_id = active_conversation_id,
+        sequence = event.sequence,
+      })
+    end
   end
 
   local function receive_msg(entry)
@@ -220,6 +254,7 @@ function M.build(options)
     if body.kind == "conversation.get.request" then handle_get(body); return end
     if body.kind == "conversation.list.request" then handle_list(body); return end
     if body.kind == "conversation.context.request" then handle_context(body); return end
+    if body.kind == "conversation.active.set" then handle_active_set(body); return end
     if body.kind == "conversation.context.compact.request" then handle_compaction_request(body); return end
     if body.kind == "conversation.context.compact.complete" then
       handle_compaction_terminal(body, "context_compaction_completed"); return
@@ -236,6 +271,8 @@ function M.build(options)
     _internals = {
       get = function(id) return store:get(id) end,
       list = function() return store:list() end,
+      active_conversation_id = function() return active_conversation_id end,
+      stats = function() return store:stats() end,
       session_id = function() return session_id end,
       reset = reset,
     },

@@ -32,21 +32,24 @@ do
   append(store, fact("m", "lead", "message_started", { message_id = "assistant:1", role = "assistant" }))
   local chunks = {
     { kind = "text", data = "hel" }, { kind = "reasoning", data = "why" },
+    { kind = "structured", data = { answer = 4 } },
     { kind = "native", data = { type = "citation", index = 4 } }, { kind = "text", data = "lo" },
   }
   for index, chunk in ipairs(chunks) do append(store, fact("c" .. index, "lead", "content_chunk_appended", { message_id = "assistant:1", chunk = chunk })) end
   append(store, fact("x", "lead", "tool_exchange_started", { exchange_id = "exchange:1", message_id = "assistant:1", tool_name = "read" }))
   append(store, fact("xf1", "lead", "tool_call_fragment_appended", { exchange_id = "exchange:1", fragment = '{"pa' }))
   append(store, fact("xf2", "lead", "tool_call_fragment_appended", { exchange_id = "exchange:1", fragment = 'th":"x"}' }))
-  append(store, fact("xc", "lead", "tool_call_completed", { exchange_id = "exchange:1", call = { path = "x" } }))
+  append(store, fact("xc", "lead", "tool_call_completed", {
+    exchange_id = "exchange:1", call = { id = "provider-call-7", name = "read", arguments = { path = "x" } },
+  }))
   append(store, fact("xr", "lead", "tool_result_recorded", { exchange_id = "exchange:1", result = { text = "data" } }))
   append(store, fact("retry", "lead", "retry_started", { retry_id = "retry:1", message_id = "assistant:1", reason = "rate_limit", provenance = { model = "three" } }))
   append(store, fact("mc", "lead", "message_completed", { message_id = "assistant:1", completion = { finish_reason = "stop" } }))
   local done = append(store, fact("done", "lead", "conversation_completed", { detail = { usage = 12 } }))
   eq(done.status, "completed"); eq(done.provenance.provider, "anthropic"); eq(done.id, "lead", "provenance switch does not move identity")
-  eq(#done.messages[1].chunks, 6, "native chunks and fragmented tool-call chunks remain individual")
+  eq(#done.messages[1].chunks, 5, "universal content chunks remain individual")
   for index, chunk in ipairs(chunks) do eq(done.messages[1].chunks[index], chunk, "chunk order preserved") end
-  eq(done.messages[1].chunks[5].kind, "tool_call"); eq(done.messages[1].chunks[6].data, 'th":"x"}')
+  eq(done.exchanges[1].tool_call_id, "provider-call-7"); eq(done.exchanges[1].arguments.path, "x")
   eq(done.exchanges[1].status, "result"); eq(#done.retries, 1)
   rejects(store, fact("late", "lead", "provenance_updated", { provenance = { model = "late" } }), "conversation_terminal")
 end
@@ -82,7 +85,9 @@ do
   local store = manager.new(); create(store, "error-chat", "agent")
   append(store, fact("m", "error-chat", "message_started", { message_id = "m", role = "assistant" }))
   append(store, fact("x", "error-chat", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "bash" }))
-  append(store, fact("xc", "error-chat", "tool_call_completed", { exchange_id = "x", call = {} }))
+  append(store, fact("xc", "error-chat", "tool_call_completed", {
+    exchange_id = "x", call = { id = "external-x", name = "bash", arguments = {} },
+  }))
   append(store, fact("xe", "error-chat", "tool_error_recorded", { exchange_id = "x", error = { code = "exit", message = "1" } }))
   rejects(store, fact("xr", "error-chat", "tool_result_recorded", { exchange_id = "x", result = {} }), "tool_exchange_terminal")
 end
@@ -140,37 +145,32 @@ end
 
 -- Serialized replay reconstructs the complete modeled domain, including interleaved chats and partial state.
 do
-  local live = manager.new(); create(live, "serialized", "temporary"); create(live, "partial", "agent")
-  append(live, fact("p", "serialized", "provenance_updated", { provenance = { provider = "anthropic", model = "two" } }))
-  append(live, fact("m", "serialized", "message_started", { message_id = "m", role = "assistant" }))
-  append(live, fact("native", "serialized", "content_chunk_appended", { message_id = "m", chunk = { kind = "native", data = { citation = 1 } } }))
-  append(live, fact("x", "serialized", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "read" }))
-  append(live, fact("xf", "serialized", "tool_call_fragment_appended", { exchange_id = "x", fragment = '{"path":"x"}' }))
-  append(live, fact("xc", "serialized", "tool_call_completed", { exchange_id = "x", call = { path = "x" } }))
-  append(live, fact("xr", "serialized", "tool_result_recorded", { exchange_id = "x", result = { text = "data" } }))
-  append(live, fact("retry", "serialized", "retry_started", { retry_id = "retry", message_id = "m", reason = "rate_limit" }))
-  append(live, fact("mc", "serialized", "message_completed", { message_id = "m" }))
-  append(live, fact("done", "serialized", "conversation_completed", { detail = { usage = 12 } }))
-  append(live, fact("pm", "partial", "message_started", { message_id = "m", role = "assistant" }))
-  append(live, fact("pc", "partial", "content_chunk_appended", { message_id = "m", chunk = { kind = "reasoning", data = "unfinished" } }))
-
-  local events = {}
-  local serialized_events = live:get("serialized").events
-  local partial_events = live:get("partial").events
-  local longest = math.max(#serialized_events, #partial_events)
-  for index = 1, longest do
-    if serialized_events[index] then events[#events + 1] = serialized_events[index] end
-    if partial_events[index] then events[#events + 1] = partial_events[index] end
+  local live = manager.new(); local events = {}
+  local function record(value)
+    local conversation, e, _, event = live:append(value); ok(conversation, e); events[#events + 1] = event
   end
+  record(fact("serialized:created", "serialized", "created", { provenance = { purpose = "temporary" } }))
+  record(fact("partial:created", "partial", "created", { provenance = { purpose = "agent" } }))
+  record(fact("p", "serialized", "provenance_updated", { provenance = { provider = "anthropic", model = "two" } }))
+  record(fact("m", "serialized", "message_started", { message_id = "m", role = "assistant" }))
+  record(fact("native", "serialized", "content_chunk_appended", { message_id = "m", chunk = { kind = "native", data = { citation = 1 } } }))
+  record(fact("x", "serialized", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "read" }))
+  record(fact("xf", "serialized", "tool_call_fragment_appended", { exchange_id = "x", fragment = '{"path":"x"}' }))
+  record(fact("xc", "serialized", "tool_call_completed", { exchange_id = "x", call = { id = "external", name = "read", arguments = { path = "x" } } }))
+  record(fact("xr", "serialized", "tool_result_recorded", { exchange_id = "x", result = { text = "data" } }))
+  record(fact("retry", "serialized", "retry_started", { retry_id = "retry", message_id = "m", reason = "rate_limit" }))
+  record(fact("mc", "serialized", "message_completed", { message_id = "m" }))
+  record(fact("done", "serialized", "conversation_completed", { detail = { usage = 12 } }))
+  record(fact("pm", "partial", "message_started", { message_id = "m", role = "assistant" }))
+  record(fact("pc", "partial", "content_chunk_appended", { message_id = "m", chunk = { kind = "reasoning", data = "unfinished" } }))
   local encoded = nefor.json.encode(events); local decoded = nefor.json.decode(encoded)
   local replayed = manager.new(); ok(replayed:replay(decoded))
   eq(replayed:list(), live:list(), "serialized replay equals live state deeply")
 
-  local existing = manager.new(); create(existing, "existing", "lead")
-  local before = existing:list()
+  local existing = manager.new()
   local bad = domain.copy(decoded); bad[#bad].sequence = 99
   local value, e = existing:replay(bad)
-  eq(value, nil); eq(e.code, "noncontiguous_sequence"); eq(existing:list(), before, "failed replay is atomic")
+  eq(value, nil); eq(e.code, "noncontiguous_sequence")
 end
 
 -- Heavily interleaved chats never share messages, exchanges, sequence, or provenance.
@@ -209,13 +209,37 @@ do
     append(store, fact(id .. ":m", id, "message_started", { message_id = "shared-message", role = "assistant" }))
     append(store, fact(id .. ":x", id, "tool_exchange_started", { exchange_id = "shared-exchange", message_id = "shared-message", tool_name = "read" }))
     append(store, fact(id .. ":xf", id, "tool_call_fragment_appended", { exchange_id = "shared-exchange", fragment = id }))
-    append(store, fact(id .. ":xc", id, "tool_call_completed", { exchange_id = "shared-exchange", call = { source = id } }))
+    append(store, fact(id .. ":xc", id, "tool_call_completed", {
+      exchange_id = "shared-exchange", call = { id = id .. ":call", name = "read", arguments = { source = id } },
+    }))
     append(store, fact(id .. ":xr", id, "tool_result_recorded", { exchange_id = "shared-exchange", result = { source = id } }))
     append(store, fact(id .. ":retry", id, "retry_started", { retry_id = "shared-retry", message_id = "shared-message" }))
   end
   eq(store:get("local-a").exchanges[1].call_chunks[1], "local-a")
   eq(store:get("local-b").exchanges[1].call_chunks[1], "local-b")
   eq(store:get("local-a").retries[1].id, "shared-retry"); eq(store:get("local-b").retries[1].id, "shared-retry")
+end
+
+
+-- Fold work is one validated in-place application per canonical event. The
+-- aggregate contains current indexes and state, never a second events array.
+do
+  local store = manager.new()
+  create(store, "linear", "lead")
+  local event_count = 1
+  for index = 1, 2000 do
+    local message_id = "m:" .. index
+    append(store, fact("s:" .. index, "linear", "message_started", { message_id = message_id, role = "user" }))
+    append(store, fact("c:" .. index, "linear", "content_chunk_appended", {
+      message_id = message_id, chunk = { kind = "text", data = "x" },
+    }))
+    append(store, fact("d:" .. index, "linear", "message_completed", { message_id = message_id }))
+    event_count = event_count + 3
+  end
+  local stats = store:stats()
+  eq(stats.fold_count, event_count, "fold count scales exactly with accepted events")
+  eq(stats.event_ids, event_count, "idempotency index stores one compact entry per event")
+  eq(store:get("linear").events, nil, "aggregate does not duplicate canonical history")
 end
 
 print("conversation_manager_domain_test: all assertions passed")

@@ -203,7 +203,8 @@ append_fact("tool-start", "tool_exchange_started", {
   exchange_id = "call-1", message_id = "assistant", tool_name = "read_file",
 })
 append_fact("tool-call", "tool_call_completed", {
-  exchange_id = "call-1", call = { path = "x" },
+  exchange_id = "call-1",
+  call = { id = "provider-call-42", name = "read_file", arguments = { path = "x" } },
 })
 append_fact("tool-result", "tool_result_recorded", {
   exchange_id = "call-1", result = { text = "data" },
@@ -214,9 +215,22 @@ delta = append_fact("assistant-done", "message_completed", {
 })
 eq(delta.change.message.text, "answer")
 eq(delta.change.message.reasoning, "think")
-eq(delta.change.message.tool_calls[1].id, "call-1")
+eq(delta.change.message.tool_calls[1].id, "provider-call-42")
+eq(delta.change.message.tool_calls[1].arguments.path, "x")
 eq(delta.change.message.terminal.duration_ms, 42)
-eq(#delta.change.context_messages, 2, "assistant plus linked tool result enter context")
+eq(#delta.change.context_messages, 1, "completed assistant enters context once")
+
+append_fact("tool-message", "message_started", {
+  turn_id = "turn-1", message_id = "tool-message", role = "tool",
+  tool_call_id = "provider-call-42", tool_name = "read_file",
+})
+append_fact("tool-content", "content_chunk_appended", {
+  message_id = "tool-message", chunk = { kind = "structured", data = { text = "data" } },
+})
+delta = append_fact("tool-message-done", "message_completed", { message_id = "tool-message" })
+eq(delta.change.message.tool_call_id, "provider-call-42")
+eq(delta.change.message.content.text, "data", "structured tool content stays structured")
+eq(#delta.change.context_messages, 1, "actual tool message enters context once")
 
 delta = append_fact("turn-done", "turn_completed", {
   turn_id = "turn-1", run_id = "run-1", terminal = { output = "answer" },
@@ -225,7 +239,7 @@ eq(delta.change.kind, "turn_completed")
 eq(delta.change.turn_id, "turn-1")
 eq(delta.change.run_id, "run-1")
 eq(delta.change.message_start, 1)
-eq(delta.change.message_end, 2)
+eq(delta.change.message_end, 3)
 eq(delta.change.watermark, body_at(#emitted - 1).event.sequence)
 
 receive({ kind = "conversation.context.request", request_id = "context-1", conversation_id = "replayed" })
@@ -233,17 +247,24 @@ local context = last_body()
 eq(context.kind, "conversation.context.snapshot")
 eq(context.context.history_length, 3, "user, assistant, and tool result are universal context")
 eq(context.context.messages[2].tool_calls[1].name, "read_file")
+eq(context.context.messages[2].tool_calls[1].id, "provider-call-42")
+eq(context.context.messages[3].tool_call_id, "provider-call-42")
+eq(context.context.messages[3].content.text, "data")
+eq(context.context.watermark, actor._internals.get("replayed").last_sequence)
 
-receive({ kind = "conversation.context.compact.request", request_id = "compact-1", conversation_id = "replayed" })
+receive({
+  kind = "conversation.context.compact.request", request_id = "compact-1",
+  conversation_id = "replayed", provider = "chatgpt",
+})
 delta = last_body()
 eq(delta.change.kind, "context_compaction_pending")
 eq(delta.change.compaction.history_cutoff, 3)
+eq(delta.change.compaction.provider, "chatgpt", "pending compaction preserves routing provider")
 receive({
   kind = "conversation.context.compact.complete",
   request_id = "compact-1",
   conversation_id = "replayed",
   checkpoint = { opaque = "provider-owned" },
-  compatibility = { family = "universal-v1" },
 })
 delta = last_body()
 eq(delta.change.kind, "context_compaction_completed")
@@ -253,9 +274,17 @@ receive({
   kind = "conversation.context.request",
   request_id = "context-2",
   conversation_id = "replayed",
-  compatibility = { family = "universal-v1" },
 })
 context = last_body().context
-eq(#context.messages, 3, "full neutral history remains available for incompatible providers")
-eq(#context.tail_messages, 0, "compatible checkpoint tail begins after its cutoff")
+eq(#context.messages, 3, "full neutral history remains universally available")
+eq(#context.tail_messages, 0, "checkpoint tail begins after its cutoff")
 eq(context.compaction.checkpoint.opaque, "provider-owned")
+eq(context.compaction.provider, "chatgpt")
+
+receive({ kind = "conversation.active.set", request_id = "active-1", conversation_id = "replayed" })
+local active_changed = last_body()
+eq(active_changed.kind, "conversation.active.changed")
+eq(active_changed.conversation_id, "replayed")
+eq(actor._internals.active_conversation_id(), "replayed")
+eq(body_at(#emitted - 1).kind, "conversation.projection.delta")
+eq(body_at(#emitted - 2).kind, "conversation.fact.recorded", "active selection is replay-safe canonical state")
