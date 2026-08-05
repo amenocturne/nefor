@@ -4,6 +4,7 @@ local M = {}
 
 local function projected_exchange(exchange)
   return {
+    id = exchange.id,
     tool_call_id = exchange.tool_call_id,
     message_id = exchange.message_id,
     name = exchange.tool_name,

@@ -473,13 +473,10 @@ fn scenario_3_single_shot_stream_json() {
          {total_lines} lines"
     );
 
-    // Run completion surfaces two ways: a `chat.graph_result.append`
-    // block (status + node summary + the sink's output PATH — content
-    // deliberately omitted) and the deferred relay turn that streams
-    // the actual combined text. Assert both: a successful result block,
-    // and the mock's combine keyword ("sentinels") reaching the wire in
-    // some chat.* envelope from the relay turn.
-    let mut result_block_count = 0usize;
+    // The surface consumes the universal conversation projection, not the
+    // old TUI-specific `chat.graph_result.append` presentation event. Assert
+    // both a canonical terminal turn and the deferred relay content.
+    let mut terminal_turn_count = 0usize;
     let mut relay_content_count = 0usize;
     for line in out.stdout.lines() {
         if line.is_empty() {
@@ -494,24 +491,28 @@ fn scenario_3_single_shot_stream_json() {
             None => continue,
         };
         let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
-        if kind == "chat.graph_result.append"
-            && body.get("status").and_then(Value::as_str) == Some("success")
+        if kind == "conversation.projection.delta"
+            && body
+                .get("change")
+                .and_then(|change| change.get("kind"))
+                .and_then(Value::as_str)
+                == Some("turn_completed")
         {
-            result_block_count += 1;
+            terminal_turn_count += 1;
         }
-        if kind.starts_with("chat.") && line.contains("sentinels") {
+        if kind.starts_with("conversation.") && line.contains("sentinels") {
             relay_content_count += 1;
         }
     }
     assert!(
-        result_block_count >= 1,
-        "expected a successful chat.graph_result.append run-result block \
-         on the bus; saw {result_block_count} across {total_lines} lines"
+        terminal_turn_count >= 1,
+        "expected a canonical terminal conversation turn on the bus; saw \
+         {terminal_turn_count} across {total_lines} lines"
     );
     assert!(
         relay_content_count >= 1,
         "expected the combine step's text (\"sentinels\") to reach the \
-         wire in a chat.* envelope from the deferred relay turn; saw \
+         wire in a conversation.* envelope from the deferred relay turn; saw \
          {relay_content_count} across {total_lines} lines"
     );
 }

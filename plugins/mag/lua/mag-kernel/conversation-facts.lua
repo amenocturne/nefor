@@ -16,6 +16,16 @@ local function content_chunk(content)
   return { kind = "structured", data = copy(content) }
 end
 
+local function universal_arguments(arguments)
+  if type(arguments) ~= "string" then return copy(arguments) end
+  if type(nefor) == "table" and type(nefor.json) == "table"
+      and type(nefor.json.decode) == "function" then
+    local ok, decoded = pcall(nefor.json.decode, arguments)
+    if ok then return copy(decoded) end
+  end
+  return arguments
+end
+
 function M.new(options)
   options = options or {}
   assert(type(options.conversation_id) == "string" and options.conversation_id ~= "",
@@ -61,7 +71,7 @@ function M.new(options)
       local fn = type(raw_call["function"]) == "table" and raw_call["function"] or {}
       local call_id = raw_call.id or (message_id .. ":tool:" .. tostring(index))
       local tool_name = raw_call.name or fn.name
-      local arguments = raw_call.args or raw_call.arguments or fn.arguments
+      local arguments = universal_arguments(raw_call.args or raw_call.arguments or fn.arguments)
       local exchange_id = message_id .. ":exchange:" .. tostring(index)
       exchanges[call_id] = exchange_id
       emit("tool_exchange_started", {

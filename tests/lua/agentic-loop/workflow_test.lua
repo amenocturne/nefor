@@ -509,17 +509,15 @@ do
   assert(find_kind(calls, "agentic_loop.run_start") ~= nil,
     "run_start runtime state emitted")
 
-  -- The run began: the spawner binds the transcript to the run's scoped
-  -- chat prefix (scope token + llm actor id).
+  -- The run began: the spawner retains the scoped prefix privately for
+  -- provider/tool correlation. Conversation-manager owns surface selection.
   send_to_loop("mag", {
     kind = "mag.run_started", run_id = exec.body.run_id,
     run_name = "lead", scope = "r7",
   })
   calls = decode_calls()
-  local bound = find_kind(calls, "chat.lead.bound")
-  assert(bound ~= nil, "run start binds the lead transcript")
-  assert_eq(bound.body.chat_prefix, "r7/lead.llm@",
-    "the binding is prefix-form: scope + llm actor id")
+  assert(find_kind(calls, "chat.lead.bound") == nil,
+    "run-scoped provider handles are not exposed as a transcript contract")
 
   -- A lead-scoped gated tool invocation surfaces as transcript tool
   -- events (the gate keeps the kernel's scope-prefixed correlation id).

@@ -80,4 +80,20 @@ fn conversation_manager_runtime_contract() {
         sessions_spawn < manager_spawn && manager_spawn < sessions_init,
         "manager must subscribe before the initial session lifecycle event"
     );
+
+    let cli_init =
+        std::fs::read_to_string(root.join("cli-config/init.lua")).expect("read cli config init");
+    let cli_sessions_spawn = cli_init
+        .find("actor.spawn(sessions)")
+        .expect("CLI sessions actor spawn");
+    let cli_manager_spawn = cli_init
+        .find("actor.spawn(require(\"libs.conversation-manager.runtime\").build())")
+        .expect("CLI conversation manager actor spawn");
+    let cli_sessions_init = cli_init
+        .find("sessions.init()")
+        .expect("CLI session initialization");
+    assert!(
+        cli_sessions_spawn < cli_manager_spawn && cli_manager_spawn < cli_sessions_init,
+        "CLI manager must subscribe before the initial session lifecycle event"
+    );
 }

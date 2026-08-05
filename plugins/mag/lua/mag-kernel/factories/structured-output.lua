@@ -154,7 +154,6 @@ function M.construct(id, params, emit, deps)
         }}
       else
         validation = nefor.typed_json.validate_provider(params.schema, text)
-        state:append({ role = "assistant", content = text })
       end
       if validation.ok then
         local value = validation.value
@@ -163,9 +162,15 @@ function M.construct(id, params, emit, deps)
           selected = value.type
           value = value.value
         end
+        local content = type(value) == "table" and value.content or nil
+        state:append({
+          role = "assistant",
+          content = type(content) == "string" and content or text,
+        })
         finish_result(state, selected, value)
         return
       end
+      if text ~= nil then state:append({ role = "assistant", content = text }) end
       if state:is_draining() then
         state:fail("structured output was draining and could not start a correction round")
         return

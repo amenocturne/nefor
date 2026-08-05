@@ -109,10 +109,15 @@ receive({ kind = "conversation.list.request", request_id = "list-1" })
 eq(last_body().kind, "conversation.list")
 eq(#last_body().conversations, 1)
 
--- Fan-out copies are not a second logical delivery.
-local before_fanout = #emitted
-actor.receive_msg(envelope({ kind = "conversation.list.request", request_id = "ignored" }, "step", "peer"))
-eq(#emitted, before_fanout)
+-- A targeted engine send is itself the sole logical Step entry. The actor
+-- runtime exposes it to every Lua actor; the addressed actor must not mistake
+-- it for a duplicate fan-out delivery and drop the command.
+actor.receive_msg(envelope({
+  kind = "conversation.list.request",
+  request_id = "targeted-list",
+}, "step", "conversation-manager"))
+eq(last_body().kind, "conversation.list")
+eq(last_body().request_id, "targeted-list")
 
 -- Session transition clears the projection before incoming replay rebuilds it.
 receive({ kind = "sessions.session_end", session_id = "session-1" })
@@ -202,10 +207,11 @@ append_fact("answer", "content_chunk_appended", {
 append_fact("tool-start", "tool_exchange_started", {
   exchange_id = "call-1", message_id = "assistant", tool_name = "read_file",
 })
-append_fact("tool-call", "tool_call_completed", {
+delta = append_fact("tool-call", "tool_call_completed", {
   exchange_id = "call-1",
   call = { id = "provider-call-42", name = "read_file", arguments = { path = "x" } },
 })
+eq(delta.change.exchange.id, "call-1", "universal projections preserve the exchange identity")
 append_fact("tool-result", "tool_result_recorded", {
   exchange_id = "call-1", result = { text = "data" },
 })

@@ -5,6 +5,19 @@ local boundary = require("factories.provider-boundary")
 local M = {}
 local preview_components = require("preview-components")
 
+local function final_answer_text(result)
+  local content = boundary.answer_text(result)
+  if type(content) ~= "string" or content == "" then return content end
+  if type(nefor) == "table" and type(nefor.json) == "table"
+      and type(nefor.json.decode) == "function" then
+    local ok, decoded = pcall(nefor.json.decode, content)
+    if ok and type(decoded) == "table" and type(decoded.content) == "string" then
+      return decoded.content
+    end
+  end
+  return content
+end
+
 M.declaration = {
   preview = preview_components.transcript(),
   name = "llm",
@@ -41,12 +54,13 @@ function M.construct(id, params, emit, deps)
     name = "llm",
     steerable = true,
     on_steered_final = function(state, result)
-      if type(result) == "table" and type(result.text) == "string" and result.text ~= "" then
-        state:append({ role = "assistant", content = result.text })
+      local content = final_answer_text(result)
+      if type(content) == "string" and content ~= "" then
+        state:append({ role = "assistant", content = content })
       end
     end,
     on_final = function(state, result)
-      local content = boundary.answer_text(result) or ""
+      local content = final_answer_text(result) or ""
       local final = { kind = "generic-provider.FinalAnswer",
         value = { content = content }, result = result }
       if type(result) == "table" then

@@ -101,8 +101,8 @@ end
 -- token (`r<K>` — init.lua, run contexts): everything this run puts on the
 -- shared bus that must resolve back to it is `<scope>/`-prefixed (capability
 -- correlation ids, provider chat handles), so surfacing the token here lets
--- the run's spawner do prefix-form correlation (e.g. the lead turn's
--- `chat.lead.bound { chat_prefix }`) without ever parsing an opaque id.
+-- the run's spawner correlate its private wire traffic without parsing an
+-- opaque id.
 function M:run_started(meta)
   meta = meta or {}
   self.emit_event({

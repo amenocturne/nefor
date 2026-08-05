@@ -16,6 +16,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const SESSION_ID: &str = "cooperative-resume";
 const REPLAY_ENTRIES: usize = 130;
+const REPLAY_MESSAGES: usize = 42;
+const CONVERSATION_ID: &str = "cooperative-conversation";
 
 fn format_replay_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -50,15 +52,67 @@ fn write_session_fixture(data_dir: &Path) {
     }))
     .expect("serialize header")];
 
-    for index in 0..REPLAY_ENTRIES {
+    let mut facts = vec![
+        json!({
+            "kind": "created",
+            "event_id": "fixture-created",
+            "conversation_id": CONVERSATION_ID,
+            "provenance": { "surface": "lead" },
+        }),
+        json!({
+            "kind": "active_selected",
+            "event_id": "fixture-active",
+            "conversation_id": CONVERSATION_ID,
+        }),
+        json!({
+            "kind": "provenance_updated",
+            "event_id": "fixture-provider",
+            "conversation_id": CONVERSATION_ID,
+            "provenance": { "provider": "mock-plugin" },
+        }),
+        json!({
+            "kind": "provenance_updated",
+            "event_id": "fixture-model",
+            "conversation_id": CONVERSATION_ID,
+            "provenance": { "model": "mock-model" },
+        }),
+    ];
+    for index in 0..REPLAY_MESSAGES {
+        let message_id = format!("fixture-message-{index}");
+        facts.push(json!({
+            "kind": "message_started",
+            "event_id": format!("{message_id}-started"),
+            "conversation_id": CONVERSATION_ID,
+            "message_id": message_id,
+            "role": "user",
+        }));
+        facts.push(json!({
+            "kind": "content_chunk_appended",
+            "event_id": format!("{message_id}-content"),
+            "conversation_id": CONVERSATION_ID,
+            "message_id": message_id,
+            "chunk": { "kind": "text", "data": format!("replayed message {index}") },
+        }));
+        facts.push(json!({
+            "kind": "message_completed",
+            "event_id": format!("{message_id}-completed"),
+            "conversation_id": CONVERSATION_ID,
+            "message_id": message_id,
+        }));
+    }
+    assert_eq!(facts.len(), REPLAY_ENTRIES);
+
+    for (index, mut event) in facts.into_iter().enumerate() {
+        event["sequence"] = json!(index + 1);
         let payload = serde_json::to_string(&json!({
             "type": "event",
-            "from": "agentic-loop",
+            "from": "conversation-manager",
             "ts": "2026-07-15T00:00:00.000Z",
             "body": {
-                "kind": "chat.message.append",
-                "role": "user",
-                "text": format!("replayed message {index}")
+                "kind": "conversation.fact.recorded",
+                "duplicate": false,
+                "session_id": SESSION_ID,
+                "event": event,
             }
         }))
         .expect("serialize replay envelope");
@@ -66,7 +120,6 @@ fn write_session_fixture(data_dir: &Path) {
             serde_json::to_string(&json!({
                 "ts": "2026-07-15T00:00:00.000Z",
                 "origin": "step",
-                "target": "nefor-tui",
                 "payload": payload
             }))
             .expect("serialize session row"),
@@ -106,6 +159,7 @@ fn engine_init_source(root: &Path) -> String {
         actor.install()
         history_replay.install()
         actor.spawn(sessions)
+        actor.spawn(require("libs.conversation-manager.runtime").build())
         actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({{ "nefor-tui" }}))
         sessions.init()
         "#
@@ -260,11 +314,12 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
     )
     .await;
 
-    let expected_messages: Vec<String> = (0..REPLAY_ENTRIES)
+    let expected_messages: Vec<String> = (0..REPLAY_MESSAGES)
         .map(|index| format!("replayed message {index}"))
         .collect();
     let mut lifecycle = Vec::new();
     let mut replayed_messages = Vec::new();
+    let mut projected_messages_completed = 0usize;
     let mut progress_values = Vec::new();
     let mut replay_frame_sizes = Vec::new();
     let mut current_replay_frame = None;
@@ -283,15 +338,23 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
                     "replay frames must not overlap"
                 );
             }
-            "chat.message.append" => {
-                let text = envelope["body"]["text"]
-                    .as_str()
-                    .expect("replayed message text")
-                    .to_owned();
-                replayed_messages.push(text);
+            "conversation.fact.recorded" => {
                 *current_replay_frame
                     .as_mut()
-                    .expect("replayed messages must be framed") += 1;
+                    .expect("replayed facts must be framed") += 1;
+            }
+            "conversation.projection.delta"
+                if envelope["body"]["change"]["kind"] == "content_chunk_appended" =>
+            {
+                if let Some(text) = envelope["body"]["change"]["chunk"]["data"].as_str() {
+                    replayed_messages.push(text.to_owned());
+                }
+            }
+            "conversation.projection.delta"
+                if envelope["body"]["change"]["kind"] == "message_completed"
+                    && envelope["body"]["change"]["message"]["role"] == "user" =>
+            {
+                projected_messages_completed += 1;
             }
             "sessions.replay.end" => replay_frame_sizes.push(
                 current_replay_frame
@@ -326,8 +389,8 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
             let &(replayed, total) = progress_values.last().expect("recorded progress");
             assert!(replayed > 0 && replayed < total, "progress must be partial");
             assert!(
-                !replayed_messages.is_empty() && replayed_messages.len() < REPLAY_ENTRIES,
-                "partial render must occur after a strict ordered replay prefix"
+                replayed_messages.len() < REPLAY_MESSAGES,
+                "partial render must precede the complete replay projection"
             );
             assert_eq!(
                 replayed_messages,
@@ -368,7 +431,10 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
             rendered_partial_progress = true;
         }
 
-        if kind == "sessions.resume_done" {
+        if resume_done_replayed.is_some()
+            && replayed_messages.len() == REPLAY_MESSAGES
+            && projected_messages_completed == REPLAY_MESSAGES
+        {
             break;
         }
     }
@@ -505,7 +571,7 @@ fn switching_sessions_between_chunks_cancels_the_stale_replay() {
         nefor.engine.send = function(payload, target)
           local decoded = nefor.json.decode(payload)
           local body = decoded.body or {}
-          if body.kind == "chat.message.append"
+          if body.kind == "conversation.fact.recorded"
               or body.kind == "sessions.replay.start"
               or body.kind == "sessions.replay.end"
               or body.kind == "sessions.resume_done" then
@@ -545,7 +611,7 @@ fn switching_sessions_between_chunks_cancels_the_stale_replay() {
         local first_ends = 0
         local replacement_done = false
         for _, event in ipairs(_cancel_trace) do
-          if event.kind == "chat.message.append" then
+          if event.kind == "conversation.fact.recorded" then
             first_messages = first_messages + 1
           elseif event.session_id == "cooperative-resume" and event.kind == "sessions.replay.start" then
             first_starts = first_starts + 1

@@ -18,12 +18,9 @@
 --     (lead-workflow → relay_run_completion), model/profile switching, the
 --     statusline runtime states.
 --
--- Transcript binding: kernel wire ids are run-scoped (`r<K>/…`), so per
--- run this actor broadcasts `chat.lead.bound { chat_prefix }` — the scope
--- token off `mag.run_started` plus the lead llm's actor id — and the chat
--- surface renders exactly the chats under that prefix. The same prefix
--- keys the lead's gated tool invocations (`<scope>/cap-N`) into
--- `chat.tool.start` / `chat.tool.end` transcript events.
+-- Kernel wire ids remain run-scoped (`r<K>/…`). Their prefix is private
+-- correlation state for this orchestrator; transcript selection belongs to
+-- conversation-manager and its active-conversation projection.
 --
 -- Live-turn controls:
 --   * `chat.steer` claims queued input and injects it at the lead LLM's next
@@ -982,10 +979,8 @@ end
 
 -- ── turn lifecycle (kernel events) ────────────────────────────────────
 
--- The lead run began: bind the transcript to its scoped wire ids. The
--- kernel's chat handles are `<scope>/<actor>@r<seq>` and change every
--- round, so the binding is prefix-form — `<scope>/<llm actor>@` — and the
--- chat surface's foreign-chat guard honors it for exactly this run.
+-- The lead run began: retain its scoped wire-id prefix for provider stream
+-- and gated-tool correlation. It is deliberately not a surface contract.
 local function handle_mag_run_started(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
@@ -997,7 +992,6 @@ local function handle_mag_run_started(body)
   end
   turn.scope = body.scope
   turn.chat_prefix = body.scope .. "/" .. state.lead_program.llm_actor .. "@"
-  emit(nil, { kind = "chat.lead.bound", chat_prefix = turn.chat_prefix })
 end
 
 local function typed_semantic_name(result)
@@ -1243,6 +1237,7 @@ local function handle_conversation_projection_delta(body)
     state.pending_conversation_create = nil
     emit("conversation-manager", {
       kind = "conversation.active.set",
+      request_id = "conversation-active-" .. envelope.uuid_lite(),
       conversation_id = body.conversation_id,
     })
     flush_pending_user_inputs()

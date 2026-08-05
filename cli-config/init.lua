@@ -91,6 +91,7 @@ actor.install()
 require("mag").configure { library_dir = STARTER_ROOT .. "/mag/lib" }
 
 actor.spawn(sessions)
+actor.spawn(require("libs.conversation-manager.runtime").build())
 sessions.init()
 
 local agentic_cli = require("libs.cli")

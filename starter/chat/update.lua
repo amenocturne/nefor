@@ -1650,8 +1650,13 @@ local function replace_pending_compaction(state, compaction, status)
         request_id = compaction.request_id,
         conversation_id = state.conversation_id,
         status = status,
+        provider = compaction.provider,
+        model = compaction.model,
+        strategy = compaction.strategy,
+        trigger = compaction.trigger,
+        metadata = compaction.metadata,
         display_summary = status == "complete"
-            and "Context compacted."
+            and (compaction.display_summary or "Context compacted.")
           or display_value(compaction.error or "Context compaction failed."),
       })
       replaced = true
@@ -1664,8 +1669,13 @@ local function replace_pending_compaction(state, compaction, status)
     request_id = compaction.request_id,
     conversation_id = state.conversation_id,
     status = status,
+    provider = compaction.provider,
+    model = compaction.model,
+    strategy = compaction.strategy,
+    trigger = compaction.trigger,
+    metadata = compaction.metadata,
     display_summary = status == "complete"
-        and "Context compacted."
+        and (compaction.display_summary or "Context compacted.")
       or display_value(compaction.error or "Context compaction failed."),
   }))
 end
@@ -1725,7 +1735,7 @@ local function apply_conversation_action(state, item)
   end
   if item.kind == "tool_completed" then
     return transcript.attach_tool_end(
-      state, item.exchange_id, display_value(item.output), item.error == true)
+      state, item.exchange_id, item.output, item.error == true)
   end
   if item.kind == "retry_started" then
     local retry = item.retry or {}

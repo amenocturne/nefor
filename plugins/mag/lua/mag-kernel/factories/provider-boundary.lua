@@ -86,6 +86,7 @@ function M.construct(id, params, emit, options)
   local awaiting_continuation = false
   local steered_messages = {}
   local streamed_message_id = nil
+  local streamed_text = ""
   local terminal_metadata = {}
   local facts = nil
   local firing_sequence = 0
@@ -109,6 +110,7 @@ function M.construct(id, params, emit, options)
     end
     facts:start_turn()
     streamed_message_id = nil
+    streamed_text = ""
     terminal_metadata = {}
   end
 
@@ -129,13 +131,24 @@ function M.construct(id, params, emit, options)
     if streamed_message_id == nil then return end
     facts:interrupt_message(streamed_message_id, { reason = reason })
     streamed_message_id = nil
+    streamed_text = ""
   end
 
   function state:append(message, completion)
     request_messages[#request_messages + 1] = message
     if message.role == "assistant" and streamed_message_id then
+      local content = message.content
+      if type(content) == "string" and content ~= "" then
+        if streamed_text == "" then
+          facts:content(streamed_message_id, "text", content)
+        elseif content:sub(1, #streamed_text) == streamed_text
+            and #content > #streamed_text then
+          facts:content(streamed_message_id, "text", content:sub(#streamed_text + 1))
+        end
+      end
       facts:finish_message(streamed_message_id, message, completion)
       streamed_message_id = nil
+      streamed_text = ""
     else
       facts:message(message, completion)
     end
@@ -360,6 +373,7 @@ function M.construct(id, params, emit, options)
       streamed_message_id = facts:start_message("assistant")
     end
     facts:content(streamed_message_id, chunk_kind, value.text)
+    if chunk_kind == "text" then streamed_text = streamed_text .. value.text end
     return true
   end
 

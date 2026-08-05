@@ -231,7 +231,6 @@ function M.build(options)
   end
 
   local function receive_msg(entry)
-    if entry.origin == "step" and entry.target ~= nil then return end
     if type(entry.payload) ~= "string" or entry.payload == "" then return end
     local ok, decoded = pcall(json.decode, entry.payload)
     if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end

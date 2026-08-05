@@ -94,7 +94,20 @@ fn chat_lua_source() -> String {
         std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
     }
     let chat_path = repo_root.join("starter").join("chat").join("init.lua");
-    std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
+    let source =
+        std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path));
+    with_legacy_fixture_adapter(source, &repo_root)
+}
+
+fn with_legacy_fixture_adapter(source: String, repo_root: &std::path::Path) -> String {
+    let test_lua = repo_root.join("tests/lua").display().to_string();
+    let source = source.replace(
+        "update        = update.update,",
+        "update        = require('chat.legacy_fixture_adapter').wrap(update.update),",
+    );
+    format!(
+        "package.path = {test_lua:?} .. '/?.lua;' .. {test_lua:?} .. '/?/init.lua;' .. package.path\n{source}"
+    )
 }
 
 fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
@@ -110,6 +123,7 @@ fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
     let init_path = chat_dir.join("init.lua");
     let source =
         std::fs::read_to_string(&init_path).unwrap_or_else(|e| panic!("read {:?}: {e}", init_path));
+    let source = with_legacy_fixture_adapter(source, &repo_root);
     format!(
         r#"
         local real_getenv = os.getenv
@@ -159,6 +173,98 @@ fn dispatch_event(engine: &mut Engine, body: JsonValue) {
         _ => "test",
     };
     dispatch_event_from(engine, source, body);
+}
+
+fn activate_conversation(engine: &mut Engine, conversation_id: &str) {
+    dispatch_event(
+        engine,
+        json!({ "kind": "conversation.active.changed", "conversation_id": conversation_id }),
+    );
+}
+
+fn append_canonical_message(
+    engine: &mut Engine,
+    conversation_id: &str,
+    message_id: &str,
+    role: &str,
+    text: &str,
+) {
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "message_started",
+                "message": { "id": message_id, "role": role } }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "content_chunk_appended", "message_id": message_id,
+                "chunk": { "kind": "text", "data": text } }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "message_completed",
+                "message": { "id": message_id, "role": role, "text": text } }
+        }),
+    );
+}
+
+fn append_canonical_assistant_turn(
+    engine: &mut Engine,
+    conversation_id: &str,
+    turn_id: &str,
+    text: &str,
+    terminal: JsonValue,
+) {
+    let message_id = format!("{turn_id}-assistant");
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "turn_started", "turn_id": turn_id, "run_id": turn_id }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "message_started", "turn_id": turn_id,
+                "message": { "id": message_id, "turn_id": turn_id, "role": "assistant" } }
+        }),
+    );
+    if !text.is_empty() {
+        dispatch_event(
+            engine,
+            json!({
+                "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+                "change": { "kind": "content_chunk_appended", "message_id": message_id,
+                    "chunk": { "kind": "text", "data": text } }
+            }),
+        );
+    }
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "message_completed", "turn_id": turn_id,
+                "message": { "id": message_id, "turn_id": turn_id, "role": "assistant",
+                    "text": text, "terminal": terminal.clone() } }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "turn_completed", "turn_id": turn_id,
+                "run_id": turn_id, "terminal": terminal }
+        }),
+    );
 }
 
 fn key(name: &str) -> KeyMessage {
@@ -702,7 +808,7 @@ fn chat_reset_closes_the_lead_unit_and_preserves_buffered_graph_results() {
 }
 
 #[test]
-fn replayed_reset_and_session_end_preserve_buffered_results() {
+fn replayed_reset_preserves_results_but_new_session_selects_a_fresh_conversation() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -758,8 +864,8 @@ fn replayed_reset_and_session_end_preserve_buffered_results() {
 
     let new_session = render_str(&mut engine);
     assert!(
-        new_session.contains("must-not-leak"),
-        "session end must flush an old session's buffered result before switching:\n{new_session}"
+        !new_session.contains("must-not-leak"),
+        "selecting the new session's conversation must hide the old projection:\n{new_session}"
     );
 }
 
@@ -769,26 +875,16 @@ fn structured_answer_keeps_footer_across_interleaved_steered_user_append() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    activate_conversation(&mut engine, "root");
+    append_canonical_assistant_turn(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+        "root",
+        "turn-1",
+        "structured answer",
+        json!({ "model": "gpt-test", "duration_ms": 2_000,
+            "usage": { "output_tokens": 40 } }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.session.stats",
-            "last_turn_duration_ms": 2_000,
-            "last_turn_output_tokens": 40,
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "steered follow-up" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "structured answer" }),
-    );
+    append_canonical_message(&mut engine, "root", "steered", "user", "steered follow-up");
 
     let out = render_str(&mut engine);
     let answer = out.find("structured answer").expect("structured answer");
@@ -809,29 +905,21 @@ fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    activate_conversation(&mut engine, "root");
+    append_canonical_assistant_turn(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+        "root",
+        "turn-1",
+        "structured answer",
+        json!({ "model": "gpt-test", "duration_ms": 2_000,
+            "usage": { "output_tokens": 40 } }),
     );
-    dispatch_event(
+    append_canonical_message(
         &mut engine,
-        json!({
-            "kind": "chat.session.stats",
-            "last_turn_duration_ms": 2_000,
-            "last_turn_output_tokens": 40,
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.message.append",
-            "role": "system",
-            "text": "[interrupted by user — cancelling in-flight work]",
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "structured answer" }),
+        "root",
+        "interrupt",
+        "system",
+        "[interrupted by user — cancelling in-flight work]",
     );
 
     let out = render_str(&mut engine);
@@ -855,34 +943,24 @@ fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() 
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    activate_conversation(&mut engine, "root");
+    append_canonical_assistant_turn(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
+        "root",
+        "failed-turn",
+        "",
+        json!({ "model": "gpt-test", "duration_ms": 2_000,
+            "usage": { "output_tokens": 40 } }),
     );
-    dispatch_event(
+    append_canonical_message(
         &mut engine,
-        json!({
-            "kind": "chat.session.stats",
-            "last_turn_duration_ms": 2_000,
-            "last_turn_output_tokens": 40,
-        }),
+        "root",
+        "failure",
+        "system",
+        "[lead turn failed] terminal MAG failure",
     );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.message.append",
-            "role": "system",
-            "text": "[lead turn failed] terminal MAG failure",
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "next turn" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "later answer" }),
-    );
+    append_canonical_message(&mut engine, "root", "next-user", "user", "next turn");
+    append_canonical_assistant_turn(&mut engine, "root", "next-turn", "later answer", json!({}));
 
     let out = render_str(&mut engine);
     let failure = out.find("[lead turn failed]").expect("lead failure notice");
@@ -897,7 +975,7 @@ fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() 
         "failed provider round must retain its own footer before the notice:\n{out}"
     );
     assert!(
-        !out[answer..].contains("gpt-test") && !out[answer..].contains("tok/s"),
+        !out[answer..].contains("▣ gpt-test") && !out[answer..].contains("tok/s"),
         "later assistant inherited stale failed-turn metadata:\n{out}"
     );
 }
@@ -908,10 +986,7 @@ fn structured_chat_error_is_readable_and_closes_the_provider_round() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2_000 }),
-    );
+    activate_conversation(&mut engine, "root");
     dispatch_event(
         &mut engine,
         json!({
@@ -921,10 +996,7 @@ fn structured_chat_error_is_readable_and_closes_the_provider_round() {
             "retryable": true,
         }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "later answer" }),
-    );
+    append_canonical_assistant_turn(&mut engine, "root", "next-turn", "later answer", json!({}));
 
     let out = render_str(&mut engine);
     assert!(
@@ -976,55 +1048,33 @@ fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
     );
 }
 
-// Kernel-run actor chats (mag `<actor>@rN`) stream on the same bus as
-// the lead's chat — deliberately, so the session log and run-panel
-// consumers capture the deltas — but the transcript renders only the
-// lead conversation. `chat.lead.bound` tells the surface which chat_id
-// that is; stream events carrying any other chat_id must not append.
 #[test]
 fn foreign_chat_stream_delta_stays_out_of_transcript() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_id": "chat-1" }),
-    );
+    activate_conversation(&mut engine, "root");
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.stream.delta",
-            "chat_id": "explorer.llm@r2",
-            "text": "kernel-internal-bytes",
+            "kind": "conversation.projection.delta", "conversation_id": "worker",
+            "change": { "kind": "content_chunk_appended", "message_id": "worker-answer",
+                "chunk": { "kind": "text", "data": "kernel-internal-bytes" } }
         }),
     );
-    dispatch_event(
+    append_canonical_assistant_turn(
         &mut engine,
-        json!({
-            "kind": "chat.stream.reasoning_delta",
-            "chat_id": "explorer.llm@r2",
-            "text": "kernel-internal-thoughts",
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "chat-1", "text": "lead-visible-reply" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.end",
-            "chat_id": "chat-1",
-            "model": "qwen-test",
-            "duration_ms": 42,
-        }),
+        "root",
+        "root-turn",
+        "lead-visible-reply",
+        json!({ "model": "qwen-test", "duration_ms": 42 }),
     );
 
     let out = render_str(&mut engine);
     assert!(
         !out.contains("kernel-internal"),
-        "foreign chat's stream must not render in the transcript: {out:?}"
+        "a non-active conversation must not render in the transcript: {out:?}"
     );
     assert!(
         out.contains("lead-visible-reply"),
@@ -2157,81 +2207,64 @@ fn mag_concurrent_runs_key_panel_state_by_run_id() {
     );
 }
 
-// The lead's kernel turn-program mints a scoped provider chat handle per
-// round (`r<K>/<actor>@r<seq>`), so exact-match binding can't follow it.
-// `chat.lead.bound { chat_prefix }` binds the run's prefix instead: every
-// round's chat renders, foreign scopes stay out, and a later exact-form
-// binding supersedes the prefix.
 #[test]
-fn lead_prefix_binding_renders_scoped_rounds_and_filters_foreign_scopes() {
+fn active_conversation_switch_filters_old_and_foreign_projections() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    activate_conversation(&mut engine, "root");
+    append_canonical_assistant_turn(
         &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r3/lead.llm@" }),
-    );
-    // Round 1 and round 2 mint different chat ids under the same prefix.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r3/lead.llm@r1", "text": "round-one " }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r3/lead.llm@r2", "text": "round-two" }),
-    );
-    // A dispatched sub-run's actor chat (different scope) is foreign.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r4/worker.llm@r1", "text": "sub-internal-bytes" }),
+        "root",
+        "root-turn",
+        "root-visible",
+        json!({ "model": "qwen-test", "duration_ms": 7 }),
     );
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.stream.end",
-            "chat_id": "r3/lead.llm@r2",
-            "model": "qwen-test",
-            "duration_ms": 7,
+            "kind": "conversation.projection.delta", "conversation_id": "worker",
+            "change": { "kind": "message_completed",
+                "message": { "id": "worker-message", "role": "assistant",
+                    "text": "worker-internal" } }
         }),
     );
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("round-one") && out.contains("round-two"),
-        "every round under the bound prefix renders: {out:?}"
+        out.contains("root-visible"),
+        "active projection missing: {out:?}"
     );
     assert!(
-        !out.contains("sub-internal-bytes"),
-        "foreign-scope chats must stay out of the transcript: {out:?}"
+        !out.contains("worker-internal"),
+        "foreign projection leaked: {out:?}"
     );
 
-    // An exact-form binding supersedes the prefix (replayed logs may
-    // carry the exact-match form).
+    activate_conversation(&mut engine, "next");
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_id": "chat-9" }),
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "message_completed",
+                "message": { "id": "stale", "role": "assistant", "text": "stale-root" } }
+        }),
     );
-    dispatch_event(
+    append_canonical_assistant_turn(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "r3/lead.llm@r3", "text": "stale-prefix-bytes" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "chat_id": "chat-9", "text": "exact-bound-reply" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "chat_id": "chat-9", "model": "m", "duration_ms": 1 }),
+        "next",
+        "next-turn",
+        "next-visible",
+        json!({ "model": "m", "duration_ms": 1 }),
     );
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("stale-prefix-bytes"),
-        "a later exact binding supersedes the prefix: {out:?}"
+        !out.contains("stale-root"),
+        "old active projection leaked: {out:?}"
     );
     assert!(
-        out.contains("exact-bound-reply"),
-        "the exact-bound chat renders after the switch: {out:?}"
+        out.contains("next-visible"),
+        "new active projection missing: {out:?}"
     );
 }
 
@@ -3576,7 +3609,7 @@ fn mag_approval_cancel_only_retracts_its_correlated_popup() {
 }
 
 #[test]
-fn lead_terminal_result_reconciles_pending_thinking_after_streamed_answer() {
+fn canonical_turn_completion_reconciles_pending_before_mag_result() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -3592,18 +3625,10 @@ fn lead_terminal_result_reconciles_pending_thinking_after_streamed_answer() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
-    );
-    dispatch_event(
-        &mut engine,
         json!({
-            "kind": "chat.stream.end", "chat_id": "r1/cap-1",
+            "kind": "chat.stream.end",
             "text": "provider answer", "model": "mock-model", "duration_ms": 1
         }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "provider answer" }),
     );
     let streamed = render_str(&mut engine);
     assert!(
@@ -3611,8 +3636,8 @@ fn lead_terminal_result_reconciles_pending_thinking_after_streamed_answer() {
         "answer missing: {streamed}"
     );
     assert!(
-        streamed.contains("[thinking"),
-        "the reproduced ordering must retain pending before terminal close: {streamed}"
+        !streamed.contains("[thinking"),
+        "canonical turn completion must settle transcript pending state: {streamed}"
     );
 
     dispatch_event(
@@ -3651,10 +3676,6 @@ fn abnormal_lead_close_settles_partial_reasoning_and_text() {
             "kind": "mag.run_started", "run_id": "lead-run",
             "run_name": "lead", "principal": "lead"
         }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
     );
     dispatch_event(
         &mut engine,
@@ -8067,16 +8088,11 @@ fn cursor_styled_text(out: &str) -> String {
 
 /// Boot a chat surface with one scoped MAG run (`scope: r2`) carrying a
 /// single WORKING actor `worker.llm` (spawned → ready → busy, the kernel's
-/// activation-delivery order), plus a lead prefix binding so the
-/// foreign-chat guard is active. Shared setup for the capture/view tests.
+/// activation-delivery order). Shared setup for the capture/view tests.
 fn engine_with_scoped_worker() -> Engine {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
-    );
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),

@@ -64,6 +64,15 @@ local function fresh()
   agentic_loop._internals.reset()
   sessions._internals.reset_state()
   sessions.init()
+  agentic_loop.receive_msg(make_entry("conversation-manager", {
+    kind = "conversation.projection.delta",
+    conversation_id = "lead-workflow-test-conversation",
+    sequence = 1,
+    change = {
+      kind = "conversation_created",
+      conversation = { provenance = { surface = "lead" } },
+    },
+  }))
   _test.set_plugins({ "mag", "tool-gate", "nefor-tui" })
   _test.calls_clear()
 end
