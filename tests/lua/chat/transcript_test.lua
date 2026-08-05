@@ -31,11 +31,10 @@ local initial = {
   pending = true,
   turn_started_at = 900,
 }
-local ended = transcript.finalize_assistant(initial, "", "structured-model", 75)
+local ended = transcript.finalize_assistant(initial, "validated answer", "structured-model", 75)
 eq(#ended.entries, 1)
-eq(ended.entries[1].text, "")
+eq(ended.entries[1].text, "validated answer")
 eq(ended.entries[1].model, "structured-model")
-eq(ended.pending_assistant_projection, 1)
 
 local with_stats = transcript.attach_latest_assistant_terminal(ended, {
   model = "late-model",
@@ -46,14 +45,6 @@ eq(with_stats.entries[1].output_tokens, 42)
 eq(with_stats.entries[1].duration_ms, 80)
 eq(with_stats.entries[1].model, "late-model",
   "late turn metadata updates the completed assistant footer")
-
-local projected = select(1, transcript.project_assistant_message(with_stats, "validated answer"))
-eq(#projected.entries, 1, "durable answer reuses the provider-owned entry")
-eq(projected.entries[1].text, "validated answer")
-eq(projected.entries[1].model, "late-model")
-eq(projected.entries[1].output_tokens, 42)
-eq(projected.entries[1].duration_ms, 80)
-eq(projected.pending_assistant_projection, nil)
 
 local ordinary = transcript.push_entry({ entries = {} }, {
   role = "assistant", kind = "text", text = "ordinary answer",
@@ -90,23 +81,13 @@ local idle = transcript.append_graph_result({ entries = {}, pending = false }, g
 eq(idle.entries[1].run_id, "idle", "idle results append immediately")
 eq(idle.pending_graph_results, nil)
 
-local projected_round = transcript.finalize_assistant({
+local completed_round = transcript.finalize_assistant({
   entries = {}, pending = true, turn_started_at = 900,
-}, "", "structured-model", 10)
-projected_round = transcript.append_graph_result(projected_round, graph("projected"))
-eq(#projected_round.entries, 1, "empty structured answer keeps result buffered")
-projected_round = select(1, transcript.project_assistant_message(projected_round, "final answer"))
-projected_round = transcript.flush_graph_results_if_stable(projected_round)
-eq(projected_round.entries[1].text, "final answer")
-eq(projected_round.entries[2].run_id, "projected",
-  "final-answer projection stays ahead of its graph result")
-
-local failed = transcript.append_graph_result({
-  entries = {}, pending = false, pending_assistant_projection = 1,
-}, graph("failed"))
-failed = transcript.close_assistant_projection(failed)
-failed = transcript.flush_graph_results_if_stable(failed)
-eq(failed.entries[1].run_id, "failed", "failure closure flushes buffered results")
+}, "final answer", "structured-model", 10)
+completed_round = transcript.append_graph_result(completed_round, graph("completed"))
+eq(completed_round.entries[1].text, "final answer")
+eq(completed_round.entries[2].run_id, "completed",
+  "completed canonical answer is stable before later graph results")
 
 local cancelled = transcript.push_entry({ entries = {}, pending = true }, {
   role = "tool", kind = "tool_call", id = "cancelled-tool", name = "mag", v = 1,

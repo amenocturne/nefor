@@ -8,6 +8,8 @@
 //! In-process per the same pattern as `engine_test.rs` — no spawned
 //! subprocess, no /dev/tty — so the test stays fast and CI-portable.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -94,20 +96,7 @@ fn chat_lua_source() -> String {
         std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
     }
     let chat_path = repo_root.join("starter").join("chat").join("init.lua");
-    let source =
-        std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path));
-    with_legacy_fixture_adapter(source, &repo_root)
-}
-
-fn with_legacy_fixture_adapter(source: String, repo_root: &std::path::Path) -> String {
-    let test_lua = repo_root.join("tests/lua").display().to_string();
-    let source = source.replace(
-        "update        = update.update,",
-        "update        = require('chat.legacy_fixture_adapter').wrap(update.update),",
-    );
-    format!(
-        "package.path = {test_lua:?} .. '/?.lua;' .. {test_lua:?} .. '/?/init.lua;' .. package.path\n{source}"
-    )
+    std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
 fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
@@ -123,7 +112,6 @@ fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
     let init_path = chat_dir.join("init.lua");
     let source =
         std::fs::read_to_string(&init_path).unwrap_or_else(|e| panic!("read {:?}: {e}", init_path));
-    let source = with_legacy_fixture_adapter(source, &repo_root);
     format!(
         r#"
         local real_getenv = os.getenv
@@ -179,6 +167,200 @@ fn activate_conversation(engine: &mut Engine, conversation_id: &str) {
     dispatch_event(
         engine,
         json!({ "kind": "conversation.active.changed", "conversation_id": conversation_id }),
+    );
+}
+
+#[derive(Clone)]
+struct FixtureTurn {
+    conversation_id: String,
+    turn_id: String,
+    message_id: String,
+}
+
+#[derive(Default)]
+struct FixtureConversation {
+    sequence: u64,
+    current: Option<FixtureTurn>,
+}
+
+thread_local! {
+    static FIXTURE_CONVERSATIONS: RefCell<HashMap<usize, FixtureConversation>> =
+        RefCell::new(HashMap::new());
+}
+
+fn fixture_key(engine: &mut Engine) -> usize {
+    engine as *mut Engine as usize
+}
+
+fn fixture_turn(engine: &mut Engine) -> FixtureTurn {
+    let key = fixture_key(engine);
+    let turn = FIXTURE_CONVERSATIONS.with(|fixtures| {
+        let mut fixtures = fixtures.borrow_mut();
+        let fixture = fixtures.entry(key).or_default();
+        if fixture.current.is_none() {
+            fixture.sequence += 1;
+            let suffix = fixture.sequence;
+            fixture.current = Some(FixtureTurn {
+                conversation_id: format!("fixture-conversation-{key}"),
+                turn_id: format!("fixture-turn-{key}-{suffix}"),
+                message_id: format!("fixture-assistant-{key}-{suffix}"),
+            });
+        }
+        fixture.current.clone().expect("fixture turn")
+    });
+    activate_conversation(engine, &turn.conversation_id);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "turn_started", "turn_id": turn.turn_id, "run_id": turn.turn_id }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "message_started", "turn_id": turn.turn_id,
+                "message": { "id": turn.message_id, "turn_id": turn.turn_id, "role": "assistant" } }
+        }),
+    );
+    turn
+}
+
+fn fixture_assistant_delta(engine: &mut Engine, text: impl Into<String>) {
+    let text = text.into();
+    let turn = fixture_turn(engine);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "content_chunk_appended", "turn_id": turn.turn_id,
+                "message_id": turn.message_id, "chunk": { "kind": "text", "data": text } }
+        }),
+    );
+}
+
+fn fixture_reasoning_delta(engine: &mut Engine, text: impl Into<String>) {
+    let text = text.into();
+    let turn = fixture_turn(engine);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "content_chunk_appended", "turn_id": turn.turn_id,
+                "message_id": turn.message_id, "chunk": { "kind": "reasoning", "data": text } }
+        }),
+    );
+}
+
+fn fixture_assistant_completed(engine: &mut Engine, text: Option<String>, terminal: JsonValue) {
+    let turn = fixture_turn(engine);
+    let text = text.unwrap_or_default();
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "message_completed", "turn_id": turn.turn_id,
+                "message": { "id": turn.message_id, "turn_id": turn.turn_id, "role": "assistant",
+                    "text": text, "terminal": terminal.clone() } }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "turn_completed", "turn_id": turn.turn_id,
+                "run_id": turn.turn_id, "terminal": terminal }
+        }),
+    );
+    let key = fixture_key(engine);
+    FIXTURE_CONVERSATIONS.with(|fixtures| {
+        let mut fixtures = fixtures.borrow_mut();
+        let fixture = fixtures.entry(key).or_default();
+        fixture.current = None;
+    });
+}
+
+fn fixture_message(engine: &mut Engine, role: &str, text: impl Into<String>) {
+    let text = text.into();
+    let key = fixture_key(engine);
+    let (conversation_id, message_id) = FIXTURE_CONVERSATIONS.with(|fixtures| {
+        let mut fixtures = fixtures.borrow_mut();
+        let fixture = fixtures.entry(key).or_default();
+        fixture.sequence += 1;
+        (
+            format!("fixture-conversation-{key}"),
+            format!("fixture-message-{key}-{}", fixture.sequence),
+        )
+    });
+    activate_conversation(engine, &conversation_id);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "message_started",
+                "message": { "id": message_id, "role": role } }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "content_chunk_appended", "message_id": message_id,
+                "chunk": { "kind": "text", "data": text } }
+        }),
+    );
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "message_completed",
+                "message": { "id": message_id, "role": role, "text": text } }
+        }),
+    );
+}
+
+fn fixture_tool_started(engine: &mut Engine, id: &str, name: &str, input: JsonValue) {
+    let turn = fixture_turn(engine);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": "tool_call_completed", "turn_id": turn.turn_id,
+                "exchange": { "id": id, "name": name, "status": "call_completed",
+                    "arguments": input } }
+        }),
+    );
+}
+
+fn fixture_tool_completed(engine: &mut Engine, id: &str, output: JsonValue, error: bool) {
+    let turn = fixture_turn(engine);
+    let kind = if error {
+        "tool_error_recorded"
+    } else {
+        "tool_result_recorded"
+    };
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": turn.conversation_id,
+            "change": { "kind": kind, "turn_id": turn.turn_id,
+                "exchange": { "id": id, "status": if error { "error" } else { "result" },
+                    "result": output, "error": if error { output } else { JsonValue::Null } } }
+        }),
+    );
+}
+
+fn fixture_compaction(engine: &mut Engine, status: &str, fields: JsonValue) {
+    let key = fixture_key(engine);
+    let conversation_id = format!("fixture-conversation-{key}");
+    activate_conversation(engine, &conversation_id);
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": format!("context_compaction_{status}"), "compaction": fields }
+        }),
     );
 }
 
@@ -289,7 +471,7 @@ fn chat_lua_loads_and_renders_initial_frame() {
     );
     // The input field should NOT carry a default hint — the bordered
     // box below the transcript is self-explanatory. Substrings from the
-    // legacy hint must be absent.
+    // removed hint must be absent.
     for needle in ["type a message", "ype a message", "/help for keys"] {
         assert!(
             !out.contains(needle),
@@ -354,7 +536,7 @@ fn input_field_has_no_default_placeholder() {
 }
 
 // Batch-protocol Phase B regression — N replayed envelopes coalesce
-// into ONE render pass. Pre-refactor each chat.stream.delta envelope
+// into ONE render pass. Before batching, every projected content chunk
 // rode the dispatch loop independently and triggered its own render
 // (visible re-streaming on /resume of a long chat). Post batch-protocol
 // refactor + main.rs drain-before-paint: a burst of envelopes lands as
@@ -375,14 +557,12 @@ fn batched_stream_deltas_render_in_a_single_pass() {
     // Push 200 deltas back-to-back without rendering between them.
     let n: usize = 200;
     for i in 0..n {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.stream.delta", "text": format!("d{i:03} ") }),
-        );
+        fixture_assistant_delta(&mut engine, format!("d{i:03} "));
     }
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "qwen-test", "duration_ms": 42 }),
+        None,
+        json!({ "model": "qwen-test", "duration_ms": 42 }),
     );
 
     // Single render — the final transcript must carry the latest
@@ -435,10 +615,7 @@ fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
         &mut engine,
         json!({ "kind": "sessions.replay.start", "session_id": "resume-1", "count": 200 }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "concealed replay fixture" }),
-    );
+    fixture_message(&mut engine, "user", "concealed replay fixture");
     dispatch_event(
         &mut engine,
         json!({ "kind": "sessions.replay.progress", "session_id": "resume-1", "replayed": 64, "total": 200 }),
@@ -622,7 +799,7 @@ fn conversation_projection_appends_to_transcript_with_terminal_metadata() {
         1,
         "message and turn completion must not append the answer twice: {out:?}"
     );
-    // Per legacy spec, assistant entries have NO role label — the visual
+    // Assistant entries have NO role label — the visual
     // cue is the absence of the user block's left bar. The per-turn
     // footer marker `▣` + model name is the assistant signature.
     assert!(
@@ -641,25 +818,13 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
         ("answer before status", 2_000, 40),
         ("answer after status", 3_000, 60),
     ] {
-        dispatch_event(
+        fixture_reasoning_delta(&mut engine, "provider reasoning");
+        fixture_assistant_completed(
             &mut engine,
-            json!({ "kind": "chat.reasoning.delta", "text": "provider reasoning" }),
-        );
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.reasoning.end", "duration_ms": 100 }),
-        );
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": duration_ms }),
-        );
-        dispatch_event(
-            &mut engine,
+            Some(answer.into()),
             json!({
-                "kind": "chat.session.stats",
-                "model": "gpt-test",
-                "last_turn_duration_ms": duration_ms,
-                "last_turn_output_tokens": output_tokens,
+                "model": "gpt-test", "duration_ms": duration_ms,
+                "usage": { "output_tokens": output_tokens }
             }),
         );
         if answer == "answer before status" {
@@ -675,10 +840,6 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
                 }),
             );
         }
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "assistant", "text": answer }),
-        );
     }
 
     let out = render_str(&mut engine);
@@ -712,10 +873,7 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "lead answer" }),
-    );
+    fixture_assistant_delta(&mut engine, "lead answer");
     for (run_id, run_name) in [("run-first", "first"), ("run-second", "second")] {
         dispatch_event(
             &mut engine,
@@ -733,9 +891,10 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
         "results must remain hidden while the lead stream is open:\n{open}"
     );
 
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 10 }),
+        None,
+        json!({ "model": "gpt-test", "duration_ms": 10 }),
     );
     let streamed = render_str(&mut engine);
     let first = streamed.find("first").expect("first result");
@@ -745,10 +904,7 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
         "stream completion must flush graph results in FIFO order:\n{streamed}"
     );
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "tool-1", "name": "mag", "input": {} }),
-    );
+    fixture_tool_started(&mut engine, "tool-1", "mag", json!({}));
     dispatch_event(
         &mut engine,
         json!({
@@ -764,10 +920,8 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
         "result must remain hidden while the lead tool is open:\n{tool_open}"
     );
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "tool-1", "output": "done" }),
-    );
+    fixture_tool_completed(&mut engine, "tool-1", json!("done"), false);
+    fixture_assistant_completed(&mut engine, None, json!({}));
     let out = render_str(&mut engine);
     assert!(
         out.contains("tool-result"),
@@ -781,10 +935,7 @@ fn chat_reset_closes_the_lead_unit_and_preserves_buffered_graph_results() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "unfinished" }),
-    );
+    fixture_assistant_delta(&mut engine, "unfinished");
     dispatch_event(
         &mut engine,
         json!({
@@ -810,9 +961,10 @@ fn replayed_reset_preserves_results_but_new_session_selects_a_fresh_conversation
     let _ = render_str(&mut engine);
 
     dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
     dispatch_event(
         &mut engine,
@@ -832,10 +984,7 @@ fn replayed_reset_preserves_results_but_new_session_selects_a_fresh_conversation
         "replaying a reset must deterministically retain the preceding result:\n{replayed}"
     );
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "old session lead" }),
-    );
+    fixture_assistant_delta(&mut engine, "old session lead");
     dispatch_event(
         &mut engine,
         json!({
@@ -853,9 +1002,10 @@ fn replayed_reset_preserves_results_but_new_session_selects_a_fresh_conversation
         &mut engine,
         json!({ "kind": "sessions.session_start", "session_id": "new" }),
     );
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
 
     let new_session = render_str(&mut engine);
@@ -1018,22 +1168,18 @@ fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "gpt-test", "duration_ms": 1 }),
     );
-    dispatch_event(
+    fixture_tool_started(&mut engine, "t1", "mag-eval", json!({}));
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "t1", "name": "mag-eval", "input": {} }),
+        None,
+        json!({ "model": "gpt-test", "duration_ms": 2 }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 2 }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "final answer" }),
-    );
+    fixture_message(&mut engine, "assistant", "final answer");
 
     let out = render_str(&mut engine);
     let tool = out.find("mag-eval").expect("tool entry");
@@ -1154,9 +1300,10 @@ fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
     );
 
     // No local buffer means stream end has nothing left to promote.
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
     let emits = engine.take_emit_queue();
     assert!(
@@ -1236,10 +1383,7 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
 
     let _ = render_str(&mut engine);
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "queued" }),
-    );
+    fixture_message(&mut engine, "user", "queued");
     let out = render_snapshot(&mut engine);
     assert_eq!(
         out.matches("queued").count(),
@@ -1260,15 +1404,9 @@ fn accepted_steering_reconciles_indexed_entry_after_non_tail_interleaving() {
     submit_text(&mut engine, "queued-owned");
     let _ = engine.take_emit_queue();
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "system", "text": "interleaved-result" }),
-    );
+    fixture_message(&mut engine, "system", "interleaved-result");
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "queued-owned" }),
-    );
+    fixture_message(&mut engine, "user", "queued-owned");
 
     let out = render_snapshot(&mut engine);
     assert!(
@@ -1295,63 +1433,14 @@ fn accepted_steering_preserves_repeated_equal_user_text() {
     let _ = engine.take_emit_queue();
 
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "same-text" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "same-text" }),
-    );
+    fixture_message(&mut engine, "user", "same-text");
+    fixture_message(&mut engine, "user", "same-text");
 
     let out = render_snapshot(&mut engine);
     assert_eq!(
         out.matches("same-text").count(),
         2,
         "accepted steering must not globally dedup repeated equal user text: {out:?}"
-    );
-}
-
-#[test]
-fn stream_end_then_double_escape_restores_and_drops_unaccepted_queue() {
-    let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    submit_text(&mut engine, "first");
-    let _ = engine.take_emit_queue();
-    let _ = render_str(&mut engine);
-    submit_text(&mut engine, "queued-before-end");
-    let _ = engine.take_emit_queue();
-    let _ = render_str(&mut engine);
-    type_text(&mut engine, "draft");
-
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "text": "answer", "model": "test", "duration_ms": 1 }),
-    );
-    engine.handle_key(key("escape")).expect("first escape");
-    engine.handle_key(key("escape")).expect("second escape");
-
-    let emits = engine.take_emit_queue();
-    let interrupt = emits
-        .iter()
-        .find(|(_, body)| body.get("kind").and_then(|v| v.as_str()) == Some("chat.interrupt"))
-        .expect("hard stop interrupt");
-    assert_eq!(
-        interrupt.1.get("drop_queued").and_then(|v| v.as_bool()),
-        Some(true)
-    );
-
-    let out = render_snapshot(&mut engine);
-    assert!(
-        out.contains("queued-before-end draft"),
-        "queue must return before draft: {out:?}"
-    );
-    assert_eq!(
-        out.matches("queued-before-end").count(),
-        1,
-        "unaccepted queue must leave no transcript copy after stream end + hard stop: {out:?}"
     );
 }
 
@@ -1398,7 +1487,7 @@ fn absolute_path_submit_is_plain_chat_not_slash_command() {
 
 #[test]
 fn input_field_renders_full_width_rounded_border() {
-    // Per legacy spec section 7: input box has `╭─╮ │ ╰─╯` chrome in
+    // The input box has `╭─╮ │ ╰─╯` chrome in
     // HL_USER. The bordered_box helper composes corners + tui.fill for
     // the rules + side bars around the text_input.
     let mut engine = Engine::new(80, 24).expect("engine");
@@ -1418,10 +1507,7 @@ fn user_message_renders_full_width_rounded_border() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "hello" }),
-    );
+    fixture_message(&mut engine, "user", "hello");
     let out = render_str(&mut engine);
     // The body text must land between the rules.
     assert!(out.contains("hello"), "user body missing: {out:?}");
@@ -1570,10 +1656,7 @@ fn slash_new_clears_transcript_and_mints_new_session() {
     let _ = render_str(&mut engine);
 
     // Seed a couple of entries first.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "previous" }),
-    );
+    fixture_message(&mut engine, "user", "previous");
     let _ = render_str(&mut engine);
 
     // Type "/new" + Enter.
@@ -1933,10 +2016,7 @@ fn mag_killed_run_prunes_after_linger() {
     );
 
     engine.advance_time(Duration::from_millis(3000));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.session.stats", "turns": 1 }),
-    );
+    dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
     let out = render_str(&mut engine);
     assert!(
         !out.contains("MAG victim"),
@@ -1977,10 +2057,7 @@ fn mag_modification_kill_keeps_run_live() {
     // Well past any linger window, with a dispatch to run the prune: the run
     // is still live (never stamped terminal), so it must stay on screen.
     engine.advance_time(Duration::from_millis(5000));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.session.stats", "turns": 1 }),
-    );
+    dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
     let out = render_str(&mut engine);
     assert!(
         out.contains("MAG living"),
@@ -2361,13 +2438,9 @@ fn graph_run_complete_removes_run_after_linger_window() {
 
     // Advance past the 2s linger and dispatch a no-op event so update
     // runs and prunes the stale entry. (The pure-update prune fires on
-    // every dispatch — we use any event with a kind chat.lua handles
-    // and that doesn't touch panel runs; chat.session.stats fits.)
+    // every dispatch — use a harmless input refresh that does not touch runs.)
     engine.advance_time(Duration::from_millis(3000));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.session.stats", "turns": 1 }),
-    );
+    dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
     let out = render_str(&mut engine);
     assert!(
         !out.contains("MAG run-cccc"),
@@ -2381,21 +2454,17 @@ fn graph_run_complete_removes_run_after_linger_window() {
 }
 
 #[test]
-fn chat_session_stats_updates_statusline() {
+fn canonical_turn_stats_update_statusline_and_turn_footer() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
+        Some("answer".into()),
         json!({
-            "kind": "chat.session.stats",
-            "model": "qwen-test",
-            "prompt_tokens": 11,
-            "completion_tokens": 7,
-            "cost_usd": 0.0042,
-            "turns": 1,
-            "duration_ms": 1500,
+            "model": "qwen-test", "duration_ms": 1500,
+            "usage": { "input_tokens": 11, "output_tokens": 7 }
         }),
     );
 
@@ -2406,14 +2475,13 @@ fn chat_session_stats_updates_statusline() {
         out.contains("qwen-test"),
         "statusline missing model: {out:?}"
     );
-    assert!(out.contains("$0.00"), "cost segment missing: {out:?}");
     assert!(
         !out.contains("1 turns"),
         "turn count should stay out of the footer: {out:?}"
     );
     assert!(
-        !out.contains("1s"),
-        "turn duration should stay out of the footer: {out:?}"
+        out.contains("▣ qwen-test · 1s · 5 tok/s"),
+        "turn metadata should stay on the completed turn footer: {out:?}"
     );
 }
 
@@ -2560,23 +2628,13 @@ fn ctrl_o_toggles_expanded_details() {
             }
         }] }),
     );
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({
-            "kind": "chat.tool.start",
-            "id": "t1",
-            "name": "bash",
-            "input": { "command": "ls -la /tmp" },
-        }),
+        "t1",
+        "bash",
+        json!({ "command": "ls -la /tmp" }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.tool.end",
-            "id": "t1",
-            "output": "SECRET RAW OUTPUT",
-        }),
-    );
+    fixture_tool_completed(&mut engine, "t1", json!("SECRET RAW OUTPUT"), false);
 
     let out = render_str(&mut engine);
     assert!(
@@ -2660,14 +2718,8 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
             json!({ "action": "execute", "file": "ship.mag" }),
         ),
     ] {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.tool.start", "id": id, "name": "mag", "input": input }),
-        );
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.tool.end", "id": id, "output": "done" }),
-        );
+        fixture_tool_started(&mut engine, id, "mag", json!(input));
+        fixture_tool_completed(&mut engine, id, json!("done"), false);
     }
 
     let collapsed = render_str(&mut engine);
@@ -2692,37 +2744,25 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
     );
 }
 
-/// Bug-B regression: a denied tool call (`chat.tool.end` with
-/// `error = true`) flips the expanded tool block to a clearly denied
-/// state — `error:` label in red, then the error message — instead
-/// of leaving an empty `output:` line that reads as "running...
-/// finished but produced nothing". The error message comes through in
-/// the `output` field on the chat-side wire (mirroring openai-
-/// provider's `chat_tool_end_body` contract); the tool-gate Lua
-/// wrapper now preserves it instead of zeroing it on the way through.
+/// A denied canonical tool result flips the expanded block to a clearly denied
+/// state instead of leaving an empty output line that reads as successful.
 #[test]
 fn denied_tool_call_renders_error_state_not_empty_output() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({
-            "kind": "chat.tool.start",
-            "id": "call_mock_ls",
-            "name": "bash",
-            "input": { "command": "ls -la" },
-        }),
+        "call_mock_ls",
+        "bash",
+        json!({ "command": "ls -la" }),
     );
-    dispatch_event(
+    fixture_tool_completed(
         &mut engine,
-        json!({
-            "kind": "chat.tool.end",
-            "id": "call_mock_ls",
-            "output": "tool `bash` denied by user",
-            "error": true,
-        }),
+        "call_mock_ls",
+        json!("tool `bash` denied by user"),
+        true,
     );
 
     // Failure diagnostics are visible even while the entry is collapsed.
@@ -2791,7 +2831,7 @@ fn ctrl_b_uppercase_letter_still_toggles() {
 
 #[test]
 fn ctrl_b_single_press_toggles_sidebar() {
-    // The chat surface boots with `show_sidebar = true` (legacy parity:
+    // The chat surface boots with `show_sidebar = true` (default:
     // sidebar visible by default in wide terminals). One Ctrl+B should
     // hide it; a second should bring it back. A regression where the
     // first press is consumed silently and only the second flips state
@@ -3025,14 +3065,11 @@ fn tool_expanded_pretty_prints_input_object() {
     // for any non-Bash tool: Read, Edit, Write, etc). Legacy spec
     // section 5 says expanded view shows pretty-printed JSON, not the
     // `(object)` placeholder the previous build emitted.
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({
-            "kind": "chat.tool.start",
-            "id": "t1",
-            "name": "Read",
-            "input": { "file_path": "/tmp/example.txt" },
-        }),
+        "t1",
+        "Read",
+        json!({ "file_path": "/tmp/example.txt" }),
     );
     engine.handle_key(key("ctrl_o")).expect("ctrl_o expand");
     engine.handle_key(key("ctrl_r")).expect("ctrl_r reveal");
@@ -3065,13 +3102,11 @@ fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
     );
 
     // Stream end clears pending, records last_turn_duration_ms.
-    dispatch_event(
+    fixture_assistant_delta(&mut engine, "hello");
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "hello" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 100 }),
+        None,
+        json!({ "model": "test", "duration_ms": 100 }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -3080,14 +3115,14 @@ fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
     );
     // Legacy spec section 4 shows the turn duration as a bare segment
     // (`100ms`, `2s`, etc.) — no `[done in ...]` brackets. The previous
-    // behavior added an extra status_ok segment that wasn't in legacy.
+    // behavior added an extra status_ok segment that duplicated the duration.
     assert!(
         out.contains("100ms"),
         "turn duration missing on statusline: {out:?}"
     );
     assert!(
         !out.contains("[done in"),
-        "legacy spec: no [done in ...] segment, just bare duration: {out:?}"
+        "no [done in ...] segment, just bare duration: {out:?}"
     );
 }
 
@@ -3115,7 +3150,7 @@ fn thinking_indicator_has_no_braille_spinner() {
     for braille in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
         assert!(
             !out.contains(braille),
-            "braille spinner glyph '{braille}' present (legacy spec: no spinner): {out:?}"
+            "braille spinner glyph '{braille}' present (no spinner): {out:?}"
         );
     }
 }
@@ -3619,12 +3654,10 @@ fn canonical_turn_completion_reconciles_pending_before_mag_result() {
             "run_name": "lead", "principal": "lead"
         }),
     );
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({
-            "kind": "chat.stream.end",
-            "text": "provider answer", "model": "mock-model", "duration_ms": 1
-        }),
+        Some("provider answer".into()),
+        json!({ "model": "mock-model", "duration_ms": 1 }),
     );
     let streamed = render_str(&mut engine);
     assert!(
@@ -3673,32 +3706,14 @@ fn abnormal_lead_close_settles_partial_reasoning_and_text() {
             "run_name": "lead", "principal": "lead"
         }),
     );
-    dispatch_event(
+    fixture_reasoning_delta(&mut engine, "partial reasoning");
+    fixture_assistant_delta(&mut engine, "partial answer");
+    fixture_assistant_completed(
         &mut engine,
+        None,
         json!({
-            "kind": "chat.stream.reasoning_delta", "chat_id": "r1/lead.llm@round-1",
-            "text": "partial reasoning"
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.delta", "chat_id": "r1/lead.llm@round-1",
-            "text": "partial answer"
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.session.stats", "chat_id": "r1/lead.llm@round-1",
-            "last_turn_output_tokens": 3, "last_turn_duration_ms": 12
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.end", "chat_id": "r1/lead.llm@round-1",
-            "model": "review-model"
+            "model": "review-model", "duration_ms": 12,
+            "usage": { "output_tokens": 3 }
         }),
     );
     assert!(render_snapshot(&mut engine).contains("partial answer"));
@@ -4010,7 +4025,7 @@ fn autocomplete_open_enter_runs_highlighted_command() {
     // the partial fragment they actually typed. Type `/mo`, the dropdown
     // shows `/model` (the only command starting with "mo") highlighted;
     // Enter must dispatch the `/model` action, which fans out one
-    // `chat.model.list_requested` per connected provider (legacy spec
+    // `chat.model.list_requested` per connected provider (
     // section 8/12) — not bottom-fall-through to a generic `chat.command`
     // named "mo".
     let mut engine = Engine::new(80, 24).expect("engine");
@@ -4057,7 +4072,7 @@ fn autocomplete_open_enter_runs_highlighted_command() {
         );
         assert!(
             e.1.get("provider").and_then(|v| v.as_str()).is_some(),
-            "fan-out must include `provider` field per legacy spec: {:?}",
+            "fan-out must include `provider` field per provider contract: {:?}",
             e.1
         );
     }
@@ -4164,10 +4179,15 @@ fn slash_compact_renders_pending_entry_until_commit() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.session.stats",
-            "model": "mock-model",
-            "last_turn_context_tokens": 80_000,
-            "max_context_tokens": 128_000,
+            "kind": "chat.models.listed", "provider": "mock-plugin",
+            "models": ["mock-model"], "context_windows": { "mock-model": 128_000 }
+        }),
+    );
+    fixture_assistant_completed(
+        &mut engine,
+        Some("prior answer".into()),
+        json!({
+            "model": "mock-model", "usage": { "input_tokens": 80_000 }
         }),
     );
     let before = render_str(&mut engine);
@@ -4191,16 +4211,17 @@ fn slash_compact_renders_pending_entry_until_commit() {
         Some("chat.compaction.request")
     );
 
-    dispatch_event(
+    fixture_compaction(
         &mut engine,
+        "completed",
         json!({
-            "kind": "chat.compaction.commit",
-            "provider": "mock-plugin",
-            "model": "mock-model",
-            "trigger": "manual",
-            "display_summary": "Kept the important bits.",
-            "model_context_artifact": { "kind": "responses.compaction" },
-            "metadata": { "before_items": 7, "after_items": 2 },
+                "request_id": "fixture-compaction",
+                "status": "completed",
+                "provider": "mock-plugin",
+                "model": "mock-model",
+                "trigger": "manual",
+                "display_summary": "Kept the important bits.",
+                "metadata": { "before_items": 7, "after_items": 2 },
         }),
     );
 
@@ -4233,54 +4254,22 @@ fn slash_compact_renders_pending_entry_until_commit() {
 }
 
 #[test]
-fn invalid_compaction_commit_keeps_pending_entry_and_context_tokens() {
-    let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.session.stats",
-            "model": "mock-model",
-            "last_turn_context_tokens": 80_000,
-            "max_context_tokens": 128_000,
-        }),
-    );
-    submit_text(&mut engine, "/compact");
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.compaction.commit",
-            "provider": "mock-plugin",
-            "model": "mock-model",
-        }),
-    );
-
-    let out = render_str(&mut engine);
-    assert!(out.contains("context compacting..."), "{out:?}");
-    assert!(!out.contains("context compacted"), "{out:?}");
-    assert!(
-        out.contains("ctx 80k/128k"),
-        "rejected commit must not clear the current-context count: {out:?}"
-    );
-}
-
-#[test]
 fn slash_compact_replaces_pending_entry_with_failure() {
     let mut engine = Engine::new(100, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "/compact");
-    dispatch_event(
+    fixture_compaction(
         &mut engine,
+        "failed",
         json!({
-            "kind": "chat.compaction.failed",
-            "provider": "chatgpt",
-            "model": "gpt-5.6-sol",
-            "trigger": "manual",
-            "message": "nothing to compact",
+                "request_id": "fixture-compaction",
+                "status": "failed",
+                "provider": "chatgpt",
+                "model": "gpt-5.6-sol",
+                "trigger": "manual",
+                "error": "nothing to compact",
         }),
     );
 
@@ -4699,10 +4688,7 @@ fn popup_open_routes_pgdn_to_popup_not_transcript() {
     // Pump enough transcript content that PgDn would have something to
     // scroll if it were routed to the transcript.
     for _ in 0..40 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
-        );
+        fixture_message(&mut engine, "user", "x");
     }
     let _ = render_str(&mut engine);
 
@@ -4775,10 +4761,7 @@ fn arrow_up_scrolls_transcript_when_input_focused_at_top_line() {
     // through. Auto-scroll keeps the transcript pinned to the bottom, so
     // the offset is positive after the deltas land.
     for _ in 0..40 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
-        );
+        fixture_message(&mut engine, "user", "x");
     }
     let _ = render_str(&mut engine);
 
@@ -4838,10 +4821,7 @@ fn arrow_up_scrolls_transcript_when_input_empty() {
     let _ = render_str(&mut engine);
 
     for _ in 0..40 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
-        );
+        fixture_message(&mut engine, "user", "x");
     }
     let _ = render_str(&mut engine);
 
@@ -4890,10 +4870,7 @@ fn mouse_wheel_up_scrolls_transcript() {
     let _ = render_str(&mut engine);
 
     for _ in 0..40 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
-        );
+        fixture_message(&mut engine, "user", "x");
     }
     let _ = render_str(&mut engine);
 
@@ -5006,15 +4983,15 @@ fn arrow_up_scrolls_popup_when_popup_open() {
 
 #[test]
 fn statusline_renders_below_input_row() {
-    // Per legacy spec, the statusline sits BELOW the input box. Verify
+    // The statusline sits BELOW the input box. Verify
     // by rendering and walking rows: the input box's bottom-right
     // corner `╯` lies above the statusline, not below it.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    // Send a stats event so the statusline has identifiable text.
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.session.stats", "model": "claude-test" }),
+        Some("answer".into()),
+        json!({ "model": "claude-test" }),
     );
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
@@ -5039,7 +5016,7 @@ fn statusline_renders_below_input_row() {
 #[test]
 fn statusline_omits_scroll_segment_when_transcript_fits_viewport() {
     // Empty / tiny transcript → no scrollback. The scroll segment is
-    // hidden entirely (legacy spec section 4: "Only rendered when total
+    // hidden entirely ( section 4: "Only rendered when total
     // > transcript_rows").
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -5063,14 +5040,7 @@ fn statusline_omits_scroll_marker_when_transcript_overflows() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
     for i in 0..30 {
-        dispatch_event(
-            &mut engine,
-            json!({
-                "kind": "chat.message.append",
-                "role": "user",
-                "text": format!("line-{i}"),
-            }),
-        );
+        fixture_message(&mut engine, "user", format!("line-{i}"));
     }
     let _ = render_snapshot(&mut engine);
     let snap = render_snapshot(&mut engine);
@@ -5159,24 +5129,17 @@ fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
 }
 
 #[test]
-fn completed_turn_footer_absorbs_token_speed_from_session_stats() {
+fn completed_turn_footer_absorbs_canonical_token_speed() {
     let mut engine = Engine::new(100, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    dispatch_event(
+    fixture_assistant_delta(&mut engine, "done");
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "done" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 1000 }),
-    );
-    dispatch_event(
-        &mut engine,
+        None,
         json!({
-            "kind": "chat.session.stats",
-            "last_turn_output_tokens": 35,
-            "last_turn_duration_ms": 1000
+            "model": "gpt-test", "duration_ms": 1000,
+            "usage": { "output_tokens": 35 }
         }),
     );
     let out = render_snapshot(&mut engine);
@@ -5192,10 +5155,10 @@ fn statusline_omits_loaded_providers_list() {
     // — the model picker (and `/model` slash command) shows providers
     // alongside their models, so duplicating that information beside
     // the active model just adds visual noise. The active model itself
-    // (from `chat.session.stats`) stays visible.
+    // from the canonical turn terminal stays visible.
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    // Seed three auth statuses so the legacy `auth_segment` would have
+    // Seed three auth statuses so the redundant `auth_segment` would have
     // emitted `ollama:✓ anthropic:? openai:!` into the statusline.
     for (provider, status) in [
         ("ollama", "connected"),
@@ -5207,12 +5170,13 @@ fn statusline_omits_loaded_providers_list() {
             json!({ "kind": "chat.auth.status", "provider": provider, "status": status }),
         );
     }
-    // Stats event so the statusline carries the active model name —
+    // Canonical completion so the statusline carries the active model name —
     // anchors the assertion to a frame where the statusline is fully
     // populated rather than the pre-stats placeholder branch.
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.session.stats", "model": "claude-test" }),
+        Some("answer".into()),
+        json!({ "model": "claude-test" }),
     );
     let _ = render_snapshot(&mut engine);
     let snap = render_snapshot(&mut engine);
@@ -5823,13 +5787,11 @@ fn mouse_drag_copies_selection_and_shows_toast() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     // Stream a known message into the transcript so the drag covers
     // identifiable text.
-    dispatch_event(
+    fixture_assistant_delta(&mut engine, "selectable-token");
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "selectable-token" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
     let frame = render_str(&mut engine);
     assert!(
@@ -5915,13 +5877,11 @@ fn mouse_drag_toast_overlays_input_and_statusline() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     // Stream a known message into the transcript so the drag covers
     // identifiable text.
-    dispatch_event(
+    fixture_assistant_delta(&mut engine, "selectable-token");
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "selectable-token" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
     let _ = render_str(&mut engine);
 
@@ -6077,7 +6037,7 @@ fn chat_toast_slides_horizontally_during_enter() {
 // These tests pin the chat-side handling of the four control envelopes the
 // starter `sessions` module emits — `sessions.session_end`,
 // `sessions.session_start`, `sessions.resume_done` (broadcast events) — and
-// the orchestrator's `chat.message.append` round-trip echo. The earlier
+// the canonical user-message round trip. The earlier
 // tests in this file cover the egress side (`/resume <id>` → emits
 // `sessions.resume_request`); these cover the ingress side (the bus
 // envelopes flow back into chat.lua).
@@ -6090,7 +6050,7 @@ fn chat_toast_slides_horizontally_during_enter() {
 // emits — the assertions reflect that.
 
 /// `/new` immediately followed by a submit must show the user's text. The
-/// orchestrator echoes the submitted text back as `chat.message.append
+/// conversation manager projects the submitted text back as a canonical message
 /// role=user` so it persists + replays; the chat side has a `pending_user_echo`
 /// dedup marker so the echo doesn't double-render the live message. The
 /// regression: the lifecycle events from `/new` (chat.reset, session_end,
@@ -6140,10 +6100,7 @@ fn slash_new_then_submit_shows_user_message_after_lifecycle_round_trip() {
         &mut engine,
         json!({ "kind": "sessions.resume_done", "session_id": "new-id", "replayed": 0 }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "hello" }),
-    );
+    fixture_message(&mut engine, "user", "hello");
 
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
@@ -6170,10 +6127,7 @@ fn live_submit_dedups_orchestrator_echo() {
     let _ = engine.take_emit_queue();
     let _ = render_str(&mut engine);
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "abc" }),
-    );
+    fixture_message(&mut engine, "user", "abc");
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
 
@@ -6187,7 +6141,7 @@ fn live_submit_dedups_orchestrator_echo() {
     );
 }
 
-/// Replay path: between session_start and resume_done, `chat.message.append`
+/// Replay path: between session_start and resume_done, canonical message deltas
 /// envelopes must paint the transcript. This is what makes a `/resume` show
 /// the prior conversation. The dedup marker is irrelevant on replay (the
 /// chat surface didn't emit anything live), so push_entry fires for every
@@ -6209,18 +6163,9 @@ fn replay_paints_transcript_between_session_start_and_resume_done() {
     );
 
     // Replay envelopes — what the engine's replay loop sends to nefor-tui.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "first prompt" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "first reply" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "second prompt" }),
-    );
+    fixture_message(&mut engine, "user", "first prompt");
+    fixture_message(&mut engine, "assistant", "first reply");
+    fixture_message(&mut engine, "user", "second prompt");
 
     // Close the cycle.
     dispatch_event(
@@ -6252,7 +6197,7 @@ fn height_cache_tolerates_unversioned_replay_entries() {
             return height_cache.get({
               role = "assistant",
               kind = "text",
-              text = "legacy replay entry without cache version",
+              text = "replay entry without cache version",
             }, function(e)
               return tui.text { content = e.text, wrap = "word" }
             end)
@@ -6276,10 +6221,7 @@ fn session_end_does_not_wipe_entries() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "user-typed-quickly" }),
-    );
+    fixture_message(&mut engine, "user", "user-typed-quickly");
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -6312,10 +6254,7 @@ fn picker_enter_locally_clears_transcript_before_resume() {
     let _ = render_str(&mut engine);
 
     // Old content from the current session.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "old-content" }),
-    );
+    fixture_message(&mut engine, "user", "old-content");
     let _ = render_str(&mut engine);
 
     // Open the picker and press Enter on the (only) row.
@@ -6387,10 +6326,7 @@ fn slash_new_clears_pending_user_echo_so_repeated_text_is_not_swallowed() {
         &mut engine,
         json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "abc" }),
-    );
+    fixture_message(&mut engine, "user", "abc");
 
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
@@ -6445,14 +6381,8 @@ fn realistic_new_flow_with_prior_content_displays_first_message() {
     let _ = render_str(&mut engine);
 
     // Prior session content.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "old-prompt" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "assistant", "text": "old-reply" }),
-    );
+    fixture_message(&mut engine, "user", "old-prompt");
+    fixture_message(&mut engine, "assistant", "old-reply");
     let _ = render_str(&mut engine);
 
     // `/new` → emits chat.interrupt_all + sessions.new_request.
@@ -6496,10 +6426,7 @@ fn realistic_new_flow_with_prior_content_displays_first_message() {
     let _ = render_str(&mut engine);
 
     // Orchestrator's echo for the fresh submit.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "fresh-prompt" }),
-    );
+    fixture_message(&mut engine, "user", "fresh-prompt");
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
     assert!(
@@ -6516,7 +6443,7 @@ fn realistic_new_flow_with_prior_content_displays_first_message() {
 /// `entries = {}` "for cleanliness" — but at boot the transcript is
 /// already empty, so the clear only ever destroyed the user's locally-
 /// pushed message. The user then saw only the assistant's reply because
-/// the orchestrator's chat.message.append echo got deduped against
+/// the canonical user-message projection got deduped against
 /// pending_user_echo, so nothing repaints the user line.
 #[test]
 fn boot_session_start_after_local_submit_keeps_user_message_visible() {
@@ -6540,19 +6467,14 @@ fn boot_session_start_after_local_submit_keeps_user_message_visible() {
 
     // Then the orchestrator's echo arrives — it's deduped against the
     // pending_user_echo marker the local submit set.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "first-prompt" }),
-    );
+    fixture_message(&mut engine, "user", "first-prompt");
 
     // Assistant streams a reply.
-    dispatch_event(
+    fixture_assistant_delta(&mut engine, "response-token");
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "response-token" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
 
     let _ = render_str(&mut engine);
@@ -6576,7 +6498,7 @@ fn boot_session_start_after_local_submit_keeps_user_message_visible() {
 /// `sessions.session_end` does — broadcast by `teardown_for_session_end`
 /// at the start of `/new` or `/resume`, but also reachable via other
 /// races). When the orchestrator's echo arrives, the dedup matches the
-/// stranded marker and silently swallows it. Then `chat.tool.start`
+/// stranded marker and silently swallows it. Then a canonical tool projection
 /// pushes the tool block. The transcript ends up showing only the tool
 /// call.
 ///
@@ -6609,20 +6531,9 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
 
     // Orchestrator's echo arrives with the SAME text the marker
     // tracks — naive dedup would swallow it.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-thing" }),
-    );
+    fixture_message(&mut engine, "user", "summarize-thing");
     // Then the tool call paints (the visible artefact of the bug).
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.tool.start",
-            "id": "t1",
-            "name": "mag",
-            "input": "{}",
-        }),
-    );
+    fixture_tool_started(&mut engine, "t1", "mag", json!({}));
     let _ = render_str(&mut engine);
 
     let out = engine.snapshot();
@@ -6659,17 +6570,12 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     }
     engine.handle_key(key("enter")).expect("enter");
     let _ = engine.take_emit_queue();
-    dispatch_event(
+    fixture_message(&mut engine, "user", "old-prompt");
+    fixture_assistant_delta(&mut engine, "old-reply");
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "old-prompt" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "old-reply" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
     let _ = render_str(&mut engine);
     let first = engine.snapshot();
@@ -6715,19 +6621,8 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     // Step 4: orchestrator's echo + immediate tool_call (no preceding
     // text/reasoning — the orchestrator went straight to the kernel
     // dispatch).
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-things" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.tool.start",
-            "id": "t1",
-            "name": "mag",
-            "input": "{}",
-        }),
-    );
+    fixture_message(&mut engine, "user", "summarize-things");
+    fixture_tool_started(&mut engine, "t1", "mag", json!({}));
 
     // Step 5: kernel-run events + final answer.
     dispatch_event(
@@ -6738,22 +6633,12 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
         &mut engine,
         json!({ "kind": "mag.run_complete", "run_id": "r1" }),
     );
-    dispatch_event(
+    fixture_tool_completed(&mut engine, "t1", json!("ok"), false);
+    fixture_assistant_delta(&mut engine, "final-answer");
+    fixture_assistant_completed(
         &mut engine,
-        json!({
-            "kind": "chat.tool.end",
-            "id": "t1",
-            "output": "ok",
-            "error": false,
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "final-answer" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
     );
     let _ = render_str(&mut engine);
 
@@ -6786,14 +6671,7 @@ fn popup_paints_opaque_background_over_transcript() {
     // Seed transcript with a known marker that sits in the area the
     // popup will eventually overlay (centred, 60% × 50%).
     for i in 0..20 {
-        dispatch_event(
-            &mut engine,
-            json!({
-                "kind": "chat.message.append",
-                "role": "user",
-                "text": format!("MARKER-LEAK-LINE-{i}"),
-            }),
-        );
+        fixture_message(&mut engine, "user", format!("MARKER-LEAK-LINE-{i}"));
     }
     let _ = render_str(&mut engine);
 
@@ -6890,10 +6768,7 @@ fn submit_re_pins_transcript_to_bottom_after_user_scrolled_up() {
     // away from. Auto-scroll keeps it pinned to the bottom while
     // entries arrive.
     for _ in 0..40 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
-        );
+        fixture_message(&mut engine, "user", "x");
     }
     let _ = render_str(&mut engine);
 
@@ -6994,10 +6869,7 @@ fn streaming_deltas_do_not_yank_user_back_to_bottom_when_scrolled_up() {
 
     // Pre-fill enough content that there's somewhere to scroll up.
     for _ in 0..40 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
-        );
+        fixture_message(&mut engine, "user", "x");
     }
     let _ = render_str(&mut engine);
 
@@ -7069,10 +6941,7 @@ fn streaming_deltas_do_not_yank_user_back_to_bottom_when_scrolled_up() {
     // user back to the bottom on every delta and they'd never get to
     // read the older context they scrolled up to see (issue #37).
     for _ in 0..20 {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "chat.stream.delta", "text": "lorem ipsum dolor sit amet " }),
-        );
+        fixture_assistant_delta(&mut engine, "lorem ipsum dolor sit amet ");
     }
     let _ = render_str(&mut engine);
 
@@ -8058,7 +7927,7 @@ fn chat_plan_append_dedup_preserves_approved_status() {
 // DEFAULT COLLAPSED — Enter on a group row toggles it (fold state
 // survives re-renders and focus changes, resets with run prune / new
 // session); Enter on an actor leaf opens a read-only popup fed by
-// per-actor capture buffers that tap the scoped `chat.stream.*`
+// per-actor capture buffers that consume scoped provider observations
 // broadcasts BEFORE the transcript's foreign-chat guard. Member rows are
 // activity-honest (kernel busy/idle events): working members tick their
 // current activation, idle members render quietly, and only a
@@ -8291,16 +8160,8 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
 }
 
 #[test]
-fn node_inspector_legacy_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt() {
+fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt() {
     let mut engine = engine_with_scoped_worker();
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.stream.delta",
-            "chat_id": "r2/worker.llm@r1",
-            "text": "WORKER_OUTPUT",
-        }),
-    );
 
     // Tab, unfold the worker group, land on the leaf (the helper renders
     // between the focus flip and the keys: the Rust router reads the
@@ -8963,14 +8824,8 @@ fn tool_result_long_single_line_wraps_fully() {
     let _ = render_str(&mut engine);
 
     let long = format!("https://example.com/api/v1/resource/{}", "x".repeat(160));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "t1", "name": "Bash", "input": "curl url" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "t1", "output": long.clone() }),
-    );
+    fixture_tool_started(&mut engine, "t1", "Bash", json!("curl url"));
+    fixture_tool_completed(&mut engine, "t1", json!(long.clone()), false);
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
     engine.handle_key(key("ctrl_r")).expect("ctrl_r");
     let _ = render_str(&mut engine);
@@ -9005,14 +8860,11 @@ fn tool_input_long_single_line_wraps_fully() {
     let _ = render_str(&mut engine);
 
     let expr = format!("(pipeline{})", "-step".repeat(40));
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({
-            "kind": "chat.tool.start",
-            "id": "t1",
-            "name": "mag-eval",
-            "input": { "expression": expr.clone() },
-        }),
+        "t1",
+        "mag-eval",
+        json!({ "expression": expr.clone() }),
     );
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
     engine.handle_key(key("ctrl_r")).expect("ctrl_r");
@@ -9049,20 +8901,14 @@ fn slash_new_collapses_stale_scroll_region() {
 
     // Overflow the viewport so the virtual-scroll cache has real extent.
     for i in 0..25 {
-        dispatch_event(
+        fixture_message(
             &mut engine,
-            json!({
-                "kind": "chat.message.append",
-                "role": "user",
-                "text": format!("message number {i} filling the transcript"),
-            }),
+            "user",
+            format!("message number {i} filling the transcript"),
         );
     }
     let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "one more line" }),
-    );
+    fixture_message(&mut engine, "user", "one more line");
     let _ = render_str(&mut engine);
     let before = engine.snapshot();
     assert!(
@@ -9132,61 +8978,12 @@ fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
         &mut engine,
         json!({ "kind": "sessions.replay.end", "session_id": "s" }),
     );
-    // Legacy discovery and loaded signatures are suppressed regardless of
-    // absent, malformed, or contradictory path metadata.
-    let private_paths = [
-        "/legacy-absent-discovery",
-        "/legacy-malformed-discovery",
-        "/legacy-contradictory-discovery",
-        "/legacy-absent-loaded/CLAUDE.md",
-        "/legacy-malformed-loaded/AGENTS.md",
-        "/legacy-contradictory-loaded/CLAUDE.md",
-    ];
-    for body in [
-        json!({
-            "kind": "chat.message.append", "role": "system",
-            "text": "Local instruction files available for /legacy-absent-discovery"
-        }),
-        json!({
-            "kind": "chat.message.append", "role": "system", "path": 42, "dir": false,
-            "text": "Local instruction files available for /legacy-malformed-discovery"
-        }),
-        json!({
-            "kind": "chat.message.append", "role": "system", "path": "/public", "dir": "/elsewhere",
-            "text": "Local instruction files available for /legacy-contradictory-discovery"
-        }),
-        json!({
-            "kind": "chat.message.append", "role": "system",
-            "text": "[Loaded /legacy-absent-loaded/CLAUDE.md because tool call touched a file in /private. This is project guidance for that directory, not a user request.]\n\nsecret"
-        }),
-        json!({
-            "kind": "chat.message.append", "role": "system", "path": {}, "dir": 7,
-            "text": "[Loaded /legacy-malformed-loaded/AGENTS.md because tool call touched a file in /private. This is project guidance for that directory, not a user request.]\n\nsecret"
-        }),
-        json!({
-            "kind": "chat.message.append", "role": "system", "path": "/public", "dir": "/public",
-            "text": "[Loaded /legacy-contradictory-loaded/CLAUDE.md because tool call touched a file in /private. This is project guidance for that directory, not a user request.]\n\nsecret"
-        }),
-    ] {
-        dispatch_event(&mut engine, body);
-    }
-
     let state = engine.state_table().expect("state");
     let entries: mlua::Table = state.get("entries").expect("entries");
     assert_eq!(entries.raw_len(), 0);
-    for index in 1..=entries.raw_len() {
-        let entry: mlua::Table = entries.get(index).expect("entry");
-        let text: Option<String> = entry.get("text").ok();
-        for private in private_paths {
-            assert!(!text.as_deref().unwrap_or_default().contains(private));
-        }
-    }
     let snapshot = render_str(&mut engine);
     assert!(!snapshot.contains("/private"), "{snapshot}");
     assert!(!snapshot.contains("/historical"), "{snapshot}");
-    for private in private_paths {
-        assert!(!snapshot.contains(private), "{snapshot}");
-    }
 }
 
 #[test]
@@ -9205,17 +9002,21 @@ fn tool_display_projection_preserves_entry_payload_identity() {
             }
         }] }),
     );
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "identity-id", "name": "loader", "input": {
+        "identity-id",
+        "loader",
+        json!({
             "path": "secret.txt", "cwd": "/exact/root", "token": "EXACT INPUT TOKEN"
-        } }),
+        }),
     );
-    dispatch_event(
+    fixture_tool_completed(
         &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "identity-id", "output": {
+        "identity-id",
+        json!({
             "body": "EXACT MODEL RESULT", "count": 2
-        } }),
+        }),
+        false,
     );
 
     engine.handle_key(key("ctrl_o")).expect("expand");
@@ -9309,13 +9110,17 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
     // Personal config must preserve the shared per-entry raw receipt path.
     // The command is exercised against a real entry so both state and body
     // visibility are meaningful when this optional integration is enabled.
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "personal-raw-id", "name": "personal_unknown", "input": { "token": "PERSONAL SECRET INPUT" } }),
+        "personal-raw-id",
+        "personal_unknown",
+        json!({ "token": "PERSONAL SECRET INPUT" }),
     );
-    dispatch_event(
+    fixture_tool_completed(
         &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "personal-raw-id", "output": "PERSONAL SECRET OUTPUT" }),
+        "personal-raw-id",
+        json!("PERSONAL SECRET OUTPUT"),
+        false,
     );
     dispatch_event(
         &mut engine,
@@ -9459,38 +9264,34 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
         { "name": "content", "display": { "label": "Show content", "result": { "kind": "content" } } }
     ] }),
     );
-    dispatch_event(
+    fixture_tool_started(&mut engine, "removed-id", "removed", json!({}));
+    fixture_tool_completed(&mut engine, "removed-id", json!("removed-output"), false);
+    fixture_tool_started(
         &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "removed-id", "name": "removed", "input": {} }),
+        "load-id",
+        "loader",
+        json!({ "path": "secret.txt" }),
     );
-    dispatch_event(
+    fixture_tool_completed(
         &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "removed-id", "output": "removed-output" }),
+        "load-id",
+        json!("SECRET SUCCESS PAYLOAD"),
+        false,
     );
-    dispatch_event(
+    fixture_tool_started(&mut engine, "content-id", "content", json!({}));
+    fixture_tool_completed(
         &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "load-id", "name": "loader", "input": { "path": "secret.txt" } }),
+        "content-id",
+        json!("VISIBLE CONTENT RESULT"),
+        false,
     );
-    dispatch_event(
+    fixture_tool_started(
         &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "load-id", "output": "SECRET SUCCESS PAYLOAD" }),
+        "error-id",
+        "loader",
+        json!({ "path": "bad.txt" }),
     );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "content-id", "name": "content", "input": {} }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "content-id", "output": "VISIBLE CONTENT RESULT" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.start", "id": "error-id", "name": "loader", "input": { "path": "bad.txt" } }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "chat.tool.end", "id": "error-id", "output": "VISIBLE ERROR RESULT", "error": true }),
-    );
+    fixture_tool_completed(&mut engine, "error-id", json!("VISIBLE ERROR RESULT"), true);
     engine
         .handle_key(key("ctrl_o"))
         .expect("expand semantic tools");
@@ -9526,14 +9327,8 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
         json!({ "kind": "tool.register", "tools": [{ "name": "late", "display": { "label": "Late catalog", "result": { "kind": "receipt", "text": "late accepted" } } }] }),
     );
     dispatch_event(&mut cold, json!({ "kind": "sessions.replay.end" }));
-    dispatch_event(
-        &mut cold,
-        json!({ "kind": "chat.tool.start", "id": "late-id", "name": "late", "input": {} }),
-    );
-    dispatch_event(
-        &mut cold,
-        json!({ "kind": "chat.tool.end", "id": "late-id", "output": "hidden late payload" }),
-    );
+    fixture_tool_started(&mut cold, "late-id", "late", json!({}));
+    fixture_tool_completed(&mut cold, "late-id", json!("hidden late payload"), false);
     cold.handle_key(key("ctrl_o")).unwrap();
     let cold_render = render_snapshot(&mut cold);
     assert!(
@@ -10354,9 +10149,10 @@ fn assistant_and_workflow_result_footers_share_compact_durations() {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    dispatch_event(
+    fixture_assistant_completed(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "text": "long answer", "model": "test", "duration_ms": 18_615_000 }),
+        Some(("long answer").into()),
+        json!({ "model": "test", "duration_ms": 18_615_000 }),
     );
     dispatch_event(
         &mut engine,

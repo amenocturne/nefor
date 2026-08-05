@@ -40,7 +40,6 @@ end
 function M.lead_unit_open(state)
   return state.pending == true
     or state.in_flight ~= nil
-    or state.pending_assistant_projection ~= nil
     or has_open_tool(state.entries or {})
 end
 
@@ -85,7 +84,6 @@ function M.append_assistant_delta(state, delta)
   return shallow_merge(state, {
     entries   = new_entries,
     in_flight = #new_entries,
-    pending_assistant_projection = NIL_SENTINEL,
     pending   = false,
   })
 end
@@ -100,7 +98,6 @@ function M.append_reasoning_delta(state, delta)
       new_entry.v, #new_entries)
     return shallow_merge(state, {
       entries = new_entries, in_flight = #new_entries,
-      pending_assistant_projection = NIL_SENTINEL,
       pending = false,
     })
   end
@@ -110,17 +107,6 @@ function M.append_reasoning_delta(state, delta)
   log.log("transcript", "reasoning_delta in_flight=%d new_v=%d",
     idx, new_entry.v)
   return shallow_merge(state, { entries = new_entries, pending = false })
-end
-
-function M.finalize_reasoning(state, duration_ms)
-  if state.in_flight == nil then return state end
-  local e = state.entries[state.in_flight]
-  if not e then return state end
-  local new_entry = Entry.finalize_reasoning(e, duration_ms)
-  local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
-  log.log("transcript", "finalize_reasoning in_flight=%d new_v=%d",
-    state.in_flight, new_entry.v)
-  return shallow_merge(state, { entries = new_entries })
 end
 
 function M.finalize_assistant(state, final_text, model, duration_ms)
@@ -143,15 +129,12 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
         pending              = false,
         turn_started_at      = NIL_SENTINEL,
         last_turn_duration_ms = turn_dur,
-        pending_assistant_projection = (new_entry.text or "") == ""
-          and #new_entries or NIL_SENTINEL,
       })
     end
     return shallow_merge(state, {
       pending              = false,
       turn_started_at      = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
-      pending_assistant_projection = NIL_SENTINEL,
     })
   end
 
@@ -172,8 +155,6 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
       pending              = false,
       turn_started_at      = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
-      pending_assistant_projection = (new_entry.text or "") == ""
-        and state.in_flight or NIL_SENTINEL,
     })
   end
 
@@ -182,29 +163,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     pending              = false,
     turn_started_at      = NIL_SENTINEL,
     last_turn_duration_ms = turn_dur,
-    pending_assistant_projection = NIL_SENTINEL,
   })
-end
-
--- A completed canonical message may fill an empty streamed entry. Keep both
--- halves in one chronological position when a graph result lands between them.
-function M.project_assistant_message(state, text)
-  local idx = state.pending_assistant_projection
-  if idx == nil then return state, false end
-  local entry = idx and state.entries[idx] or nil
-  if entry == nil or entry.role ~= "assistant" or (entry.text or "") ~= "" then
-    return M.close_assistant_projection(state), false
-  end
-  local updated = Entry.set_text(entry, text)
-  return shallow_merge(state, {
-    entries = replace_entry(state.entries, idx, updated),
-    pending_assistant_projection = NIL_SENTINEL,
-  }), true
-end
-
-function M.close_assistant_projection(state)
-  if state.pending_assistant_projection == nil then return state end
-  return shallow_merge(state, { pending_assistant_projection = NIL_SENTINEL })
 end
 
 function M.close_lead_unit(state)
@@ -239,7 +198,6 @@ function M.close_lead_unit(state)
   return shallow_merge(state, {
     entries = closed_entries,
     in_flight = NIL_SENTINEL,
-    pending_assistant_projection = NIL_SENTINEL,
     pending = false,
     turn_started_at = NIL_SENTINEL,
   })

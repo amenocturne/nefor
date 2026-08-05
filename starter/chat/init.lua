@@ -252,7 +252,6 @@ local function initial_state()
   return {
     entries          = {},
     in_flight        = nil,
-    pending_assistant_projection = nil,
     pending_graph_results = nil,
     -- The selected conversation is a manager-owned identity. Provider request
     -- and chat handles never cross into presentation state.

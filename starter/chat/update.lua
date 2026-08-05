@@ -261,7 +261,6 @@ local function handle_input_submit(msg, state)
     reset_transcript_scroll()
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL,
-      pending_assistant_projection = NIL_SENTINEL,
       pending_graph_results = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
       runs = {}, sidebar_folds = {},
@@ -460,7 +459,6 @@ local function handle_input_submit(msg, state)
       reset_transcript_scroll()
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL,
-        pending_assistant_projection = NIL_SENTINEL,
         pending_graph_results = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
         runs = {}, sidebar_folds = {},
@@ -549,7 +547,6 @@ local function handle_input_submit(msg, state)
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
-        pending_assistant_projection = NIL_SENTINEL,
         pending_graph_results = NIL_SENTINEL,
         pending = false, runs = {}, sidebar_folds = {},
         node_previews = {}, preview_registry = {}, scope_to_run = {},
@@ -868,7 +865,6 @@ local function handle_session_end(_msg, state)
   state = close_and_flush_lead_unit(state)
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
-    pending_assistant_projection = NIL_SENTINEL,
     pending          = false,
     turn_started_at  = NIL_SENTINEL,
     last_turn_duration_ms = NIL_SENTINEL,
@@ -1015,17 +1011,10 @@ local function handle_instruction_notice(msg, state)
     Entry.agents_md(msg.path, msg.dir or msg.path, msg.text, notice_id)), {}
 end
 
-local function handle_message_append(msg, state)
+local function handle_message(msg, state)
   local text = msg.text or ""
   if #text == 0 then return state, {} end
   local role = msg.role or "system"
-  -- The pending structured answer owns the provider round's chronological
-  -- position. Same-turn transcript appends can arrive before its durable
-  -- assistant projection; only an explicit terminal failure closes that ownership.
-  if role == "system" and (text:match("^Error:")
-      or text:match("^%[lead turn failed%]")) then
-    state = transcript.close_assistant_projection(state)
-  end
   if role == "user" then
     local reconciled, matched = queued_input.reconcile_echo(state, text)
     if matched then return reconciled, {} end
@@ -1033,15 +1022,6 @@ local function handle_message_append(msg, state)
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
     or  {}
-
-  -- Legacy instruction-shaped chat messages fail closed. Dedicated
-  -- chat.instruction.notice events are the only accepted projection path;
-  -- metadata is irrelevant because old sessions contain absent, malformed,
-  -- and contradictory path/dir combinations.
-  if role == "system" and (text:match("^Local instruction files available")
-        or text:match("^%[Loaded .- because tool call touched a file")) then
-    return shallow_merge(state, turn_state), {}
-  end
 
   if role == "system" then
     return transcript.push_entry(shallow_merge(state, turn_state),
@@ -1056,8 +1036,7 @@ end
 local function handle_error_append(msg, state)
   local title = type(msg.title) == "string" and msg.title or "Something went wrong"
   local message = type(msg.message) == "string" and msg.message or "The operation failed."
-  local next_state = transcript.close_assistant_projection(state)
-  next_state = shallow_merge(next_state, {
+  local next_state = shallow_merge(state, {
     pending = false,
     turn_started_at = NIL_SENTINEL,
   })
@@ -1120,7 +1099,6 @@ local function handle_tool_start(msg, state)
   else input_str = "" end
   local raw_input = msg.input
   local contract = (state.tool_displays or {})[msg.name]
-  state = transcript.close_assistant_projection(state)
   return transcript.push_entry(state, Entry.tool_call(
     msg.id or "", msg.name or "?", input_str,
     type(msg.input) == "table" and msg.input or nil,
@@ -1686,7 +1664,6 @@ local function apply_conversation_action(state, item)
       conversation_id = item.conversation_id,
       entries = {},
       in_flight = NIL_SENTINEL,
-      pending_assistant_projection = NIL_SENTINEL,
     })
   end
   if item.kind == "active_cleared" then
@@ -1703,7 +1680,7 @@ local function apply_conversation_action(state, item)
     })
   end
   if item.kind == "message" then
-    return select(1, handle_message_append(item, state))
+    return select(1, handle_message(item, state))
   end
   if item.kind == "text_delta" then
     return transcript.append_assistant_delta(state, item.text)
@@ -2027,7 +2004,6 @@ local function route_keys_and_popups(msg, state)
         return shallow_merge(state, {
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
-          pending_assistant_projection = NIL_SENTINEL,
           pending = false, runs = {}, sidebar_folds = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
