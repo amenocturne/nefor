@@ -3176,7 +3176,7 @@ mod tests {
                         }]),
                     ),
                     (
-                        "routing_session_id",
+                        "conversation_id",
                         Value::String("stable-provider-context".into()),
                     ),
                 ],

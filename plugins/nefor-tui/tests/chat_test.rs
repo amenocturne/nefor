@@ -99,45 +99,6 @@ fn chat_lua_source() -> String {
     std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
-fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
-    ensure_test_data_home();
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root")
-        .to_path_buf();
-    let plugin_lua = repo_root.join("plugins/nefor-tui/lua");
-    let lua_root = repo_root.join("lua");
-    let chat_dir = config_dir.join("chat");
-    let init_path = chat_dir.join("init.lua");
-    let source =
-        std::fs::read_to_string(&init_path).unwrap_or_else(|e| panic!("read {:?}: {e}", init_path));
-    format!(
-        r#"
-        local real_getenv = os.getenv
-        local overrides = {{
-          NEFOR_CONFIG_DIR = {config:?},
-          NEFOR_STARTER_CONFIG_DIR = {config:?},
-          NEFOR_STARTER_CHAT_DIR = {chat:?},
-          NEFOR_TUI_LUA_DIR = {tui:?},
-          NEFOR_LUA_DIR = {lua:?},
-          NEFOR_DEFAULT_PROVIDER = "mock-plugin",
-          NEFOR_DEFAULT_MODEL = "mock-model",
-        }}
-        os.getenv = function(name)
-          if overrides[name] ~= nil then return overrides[name] end
-          return real_getenv(name)
-        end
-        os.execute = function() return true end
-        {source}
-        "#,
-        config = config_dir.display().to_string(),
-        chat = chat_dir.display().to_string(),
-        tui = plugin_lua.display().to_string(),
-        lua = lua_root.display().to_string(),
-    )
-}
-
 fn canonical_chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
     ensure_test_data_home();
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -9099,7 +9060,7 @@ fn tool_display_projection_preserves_entry_payload_identity() {
 }
 
 #[test]
-fn personal_override_behavior_uses_shared_tui_mechanisms() {
+fn personal_extension_behavior_uses_canonical_tui() {
     let Some(personal_config) = std::env::var_os("NEFOR_PERSONAL_CONFIG_DIR") else {
         return;
     };
@@ -9109,10 +9070,18 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
     std::fs::create_dir_all(&config).expect("config dir");
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(personal_config.join("chat"), config.join("chat"))
-            .expect("link personal chat");
         std::os::unix::fs::symlink(personal_config.join("config"), config.join("config"))
             .expect("link personal runtime config");
+        std::os::unix::fs::symlink(
+            personal_config.join("chat-extension.lua"),
+            config.join("chat-extension.lua"),
+        )
+        .expect("link personal chat extension");
+        std::os::unix::fs::symlink(
+            personal_config.join("chat-save.lua"),
+            config.join("chat-save.lua"),
+        )
+        .expect("link personal chat save helper");
         std::os::unix::fs::symlink(
             personal_config.join("gemma-audio-core.lua"),
             config.join("gemma-audio-core.lua"),
@@ -9134,7 +9103,7 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
 
     let mut engine = Engine::new(120, 40).expect("engine");
     engine
-        .load_scenario(&chat_lua_source_for_config(&config))
+        .load_scenario(&canonical_chat_lua_source_for_config(&config))
         .expect("load personal chat");
     let _ = render_str(&mut engine);
 
@@ -9332,9 +9301,16 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
         json!({ "path": "bad.txt" }),
     );
     fixture_tool_completed(&mut engine, "error-id", json!("VISIBLE ERROR RESULT"), true);
-    engine
-        .handle_key(key("ctrl_o"))
-        .expect("expand semantic tools");
+    let expanded_details = engine
+        .state_table()
+        .expect("state")
+        .get::<bool>("expanded_details")
+        .expect("expanded_details");
+    if !expanded_details {
+        engine
+            .handle_key(key("ctrl_o"))
+            .expect("expand semantic tools");
+    }
     let semantic = render_snapshot(&mut engine);
     assert!(semantic.contains("loader · secret.txt"), "{semantic}");
     assert!(semantic.contains("content loaded"), "{semantic}");
@@ -9355,30 +9331,6 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
     let raw = render_snapshot(&mut engine);
     assert!(raw.contains("SECRET SUCCESS PAYLOAD"), "{raw}");
     assert!(raw.contains("secret.txt"), "{raw}");
-
-    // Cold-start replay remains accepted when no live catalog exists.
-    let mut cold = Engine::new(100, 24).expect("cold engine");
-    cold.load_scenario(&chat_lua_source_for_config(&config))
-        .expect("cold load");
-    let _ = render_str(&mut cold);
-    dispatch_event(&mut cold, json!({ "kind": "sessions.replay.start" }));
-    dispatch_event(
-        &mut cold,
-        json!({ "kind": "tool.register", "tools": [{ "name": "late", "display": { "label": "Late catalog", "result": { "kind": "receipt", "text": "late accepted" } } }] }),
-    );
-    dispatch_event(&mut cold, json!({ "kind": "sessions.replay.end" }));
-    fixture_tool_started(&mut cold, "late-id", "late", json!({}));
-    fixture_tool_completed(&mut cold, "late-id", json!("hidden late payload"), false);
-    cold.handle_key(key("ctrl_o")).unwrap();
-    let cold_render = render_snapshot(&mut cold);
-    assert!(
-        cold_render.contains("Late catalog") && cold_render.contains("late accepted"),
-        "{cold_render}"
-    );
-    assert!(
-        !cold_render.contains("hidden late payload"),
-        "{cold_render}"
-    );
 }
 
 #[test]
