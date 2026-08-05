@@ -2345,6 +2345,81 @@ fn active_conversation_switch_filters_old_and_foreign_projections() {
 }
 
 #[test]
+fn first_canonical_activation_preserves_optimistic_user_message() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "visible prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    activate_conversation(&mut engine, "root");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "turn_started", "turn_id": "turn", "run_id": "run" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "message_started", "turn_id": "turn",
+                "message": { "id": "user", "turn_id": "turn", "role": "user" } }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "content_chunk_appended", "turn_id": "turn",
+                "message_id": "user",
+                "chunk": { "kind": "structured", "data": {
+                    "value": { "prompt": "visible prompt" },
+                    "mag_type": { "version": 1 }
+                } } }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "message_completed", "turn_id": "turn",
+                "message": { "id": "user", "turn_id": "turn", "role": "user",
+                    "text": "", "content": {
+                        "value": { "prompt": "visible prompt" },
+                        "mag_type": { "version": 1 }
+                    } } }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "tool_call_completed", "turn_id": "turn",
+                "exchange": { "id": "tool", "name": "mag", "status": "call_completed",
+                    "arguments": { "id": "provider-call", "arguments": {} } } }
+        }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("visible prompt"),
+        "first activation must not erase the locally-owned user row when the canonical input is structured:\n{out}"
+    );
+    assert!(
+        out.contains("mag"),
+        "agent activity must remain visible:\n{out}"
+    );
+}
+
+#[test]
 fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     // Regression for the "fully green sidebar until I interact" bug:
     // the wallclock_tick in plugins/nefor-tui/src/main.rs paints
