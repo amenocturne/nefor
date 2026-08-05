@@ -1227,11 +1227,24 @@ local terminal_turn_changes = {
 local function handle_conversation_projection_delta(body)
   local change = body.change
   if type(change) ~= "table" then return end
+  if change.kind == "conversation_created" then
+    local provenance = type(change.conversation) == "table"
+      and change.conversation.provenance or nil
+    local is_pending_root = state.pending_conversation_create ~= nil
+        and body.conversation_id == state.conversation_id
+    local is_replayed_root = type(provenance) == "table"
+        and provenance.surface == "lead"
+    if not is_pending_root and not is_replayed_root then return end
+  end
   if not state.conversation:apply_delta(body) then return end
 
   if change.kind == "conversation_created" then
     state.conversation_id = body.conversation_id
     state.pending_conversation_create = nil
+    emit("conversation-manager", {
+      kind = "conversation.active.set",
+      conversation_id = body.conversation_id,
+    })
     flush_pending_user_inputs()
     flush_deferred()
     return
@@ -1710,7 +1723,13 @@ if nefor.bus and nefor.bus.on_event then
     restore_active_model_from_session_log()
   end)
   nefor.bus.on_event("sessions.replay.end", function(_entry)
-    if conversation_ready() then request_context("resume") end
+    if conversation_ready() then
+      emit("conversation-manager", {
+        kind = "conversation.active.set",
+        conversation_id = state.conversation_id,
+      })
+      request_context("resume")
+    end
   end)
 end
 

@@ -283,7 +283,15 @@ local function project_pending_conversation(calls)
     return false
   end
   manager_conversation_id = append.body.fact.conversation_id
-  manager_delta({ kind = "conversation_created", conversation = { context_messages = {} } })
+  manager_delta({
+    kind = "conversation_created",
+    conversation = { provenance = { surface = "lead" } },
+  })
+  local active = find_kind(decode_calls(), "conversation.active.set")
+  assert(active ~= nil, "canonical root creation publishes the active binding")
+  assert_eq(active.target, "conversation-manager", "active binding targets the manager")
+  assert_eq(active.body.conversation_id, manager_conversation_id,
+    "active binding names the canonical root")
   return true
 end
 
@@ -446,6 +454,19 @@ do
     "execute carries a minted run_id")
   assert_eq(exec.body.run_name, "lead", "the lead's run is named")
   assert_eq(exec.body.principal, "lead", "lead turn execute declares the lead domain principal")
+  assert_eq(exec.body.conversation_id, manager_conversation_id,
+    "lead execution carries the active root conversation")
+  raw_send_to_loop("conversation-manager", {
+    kind = "conversation.projection.delta",
+    conversation_id = "derived-child",
+    sequence = 1,
+    change = {
+      kind = "conversation_created",
+      conversation = { provenance = { surface = "actor" } },
+    },
+  })
+  assert_eq(agentic_loop._internals.state.conversation_id, manager_conversation_id,
+    "derived child creation cannot replace the active root")
   local mod = exec.body.artifact and exec.body.artifact.data
   assert(type(mod) == "table", "the artifact rides inline on the execute")
   assert_eq(mod.messages[1].to, "lead.source", "Unit activation targets the source actor")
@@ -626,6 +647,7 @@ do
   local compact = find_kind(calls, "conversation.context.compact.request")
   assert(compact ~= nil, "compaction delegates to conversation-manager")
   assert_eq(compact.target, "conversation-manager")
+  assert_eq(compact.body.provider, "mock", "compaction carries provider routing only")
   assert_eq(find_kind(calls, "mock.chat.create"), nil,
     "agentic-loop does not orchestrate provider chats")
 
@@ -1162,7 +1184,10 @@ do
     "a replayed chat.input.submit must not trigger a program load")
 
   manager_conversation_id = "resumed-conversation"
-  manager_delta({ kind = "conversation_created", conversation = {} })
+  manager_delta({
+    kind = "conversation_created",
+    conversation = { provenance = { surface = "lead" } },
+  })
   local resumed_messages = {
     { role = "user", content = "old question" },
     { role = "assistant", content = "old answer" },
