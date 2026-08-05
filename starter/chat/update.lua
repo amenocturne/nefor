@@ -14,6 +14,7 @@ local at_path      = require("libs.chat.at_path")
 local history      = require("libs.chat.history")
 local run_panel    = require("libs.chat.run_panel")
 local transcript   = require("libs.chat.transcript")
+local conversation_projection = require("libs.chat.conversation_projection")
 local popups       = require("libs.chat.popups")
 local usage_view   = require("libs.chat.usage")
 local Entry        = require("libs.chat.entry")
@@ -528,13 +529,10 @@ local function handle_input_submit(msg, state)
     local body = {
       kind     = "chat.compaction.request",
       trigger  = "manual",
-      provider = state.provider,
     }
     local next_state = transcript.push_entry(
       shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }),
       Entry.compaction({
-        provider = state.provider,
-        model = state.model,
         trigger = "manual",
         status = "pending",
       })
@@ -885,8 +883,8 @@ local function handle_session_end(_msg, state)
     node_previews    = {}, preview_registry = {},
     scope_to_run     = {},
     sidebar_folds    = {},
-    lead_chat_id     = NIL_SENTINEL,
-    lead_chat_prefix = NIL_SENTINEL,
+    conversation_id = NIL_SENTINEL,
+    conversation_projection = conversation_projection.new(),
     instruction_notice_ids = {},
   }), {}
 end
@@ -916,7 +914,8 @@ local function handle_session_start(msg, state)
     session_id = msg.session_id,
     runs = runs,
     node_previews = {}, preview_registry = {}, scope_to_run = {},
-    lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
+    conversation_id = NIL_SENTINEL,
+    conversation_projection = conversation_projection.new(),
     instruction_notice_ids = {},
   }), {}
 end
@@ -1031,12 +1030,6 @@ local function handle_message_append(msg, state)
     local reconciled, matched = queued_input.reconcile_echo(state, text)
     if matched then return reconciled, {} end
   end
-  if role == "assistant" then
-    local next_state, handled = transcript.reduce_assistant_event(state, msg)
-    if handled then
-      return transcript.flush_graph_results_if_stable(next_state), {}
-    end
-  end
   local turn_state = role == "system"
     and { pending = false, turn_started_at = NIL_SENTINEL }
     or  {}
@@ -1071,108 +1064,6 @@ local function handle_error_append(msg, state)
   next_state = transcript.push_entry(next_state,
     Entry.error(title, message, msg.retryable))
   return transcript.flush_graph_results(next_state), {}
-end
-
--- The transcript renders exactly one conversation: the lead's. Its
--- binding arrives via `chat.lead.bound` (broadcast by the agentic-loop,
--- and replayed from the session log on /resume) in one of two forms:
---
---   * `{ chat_prefix }` — prefix-match; the lead's kernel turn-program.
---     Kernel chat handles are run-scoped and per-round
---     (`r<K>/<actor>@r<seq>` — a new id every round), so the spawner
---     binds the `r<K>/<actor>@` prefix once per run.
---   * `{ chat_id }` — exact-match; a single long-lived provider chat
---     (retained for replayed logs of older sessions).
---
--- Foreign chats (dispatched kernel runs' actor chats, other scopes)
--- stream on the same bus deliberately — the session log and run-panel
--- consumers want the deltas — but stay out of the transcript. Events
--- without a chat_id, or arriving before any binding is known, stay
--- renderable (mock providers and pre-binding turns).
-local function is_foreign_chat(msg, state)
-  local cid = msg.chat_id
-  if type(cid) ~= "string" or #cid == 0 then return false end
-  local prefix = state.lead_chat_prefix
-  if type(prefix) == "string" and #prefix > 0 then
-    return cid:sub(1, #prefix) ~= prefix
-  end
-  local lead = state.lead_chat_id
-  if type(lead) ~= "string" or #lead == 0 then return false end
-  return cid ~= lead
-end
-
--- Not gated on replay_mode: replay must rebuild the binding so
--- replayed foreign deltas stay out of the transcript too. A binding in
--- either form supersedes the other (the newest broadcast wins — one
--- lead conversation at a time).
-local function handle_lead_chat_bound(msg, state)
-  local prefix = msg.chat_prefix
-  if type(prefix) == "string" and #prefix > 0 then
-    if state.lead_chat_prefix == prefix then return state, {} end
-    return shallow_merge(state, {
-      lead_chat_prefix = prefix,
-      lead_chat_id     = NIL_SENTINEL,
-    }), {}
-  end
-  local cid = msg.chat_id
-  if type(cid) ~= "string" or #cid == 0 then return state, {} end
-  if state.lead_chat_id == cid and state.lead_chat_prefix == nil then
-    return state, {}
-  end
-  return shallow_merge(state, {
-    lead_chat_id     = cid,
-    lead_chat_prefix = NIL_SENTINEL,
-  }), {}
-end
-
-local function handle_stream_delta(msg, state)
-  if is_foreign_chat(msg, state) then return state, {} end
-  local t = msg.text or msg.delta or ""
-  if #t == 0 then return state, {} end
-  return transcript.append_assistant_delta(state, t), {}
-end
-
-local function handle_stream_end(msg, state)
-  if is_foreign_chat(msg, state) then return state, {} end
-  local next_state = transcript.reduce_assistant_event(state, msg)
-  return transcript.flush_graph_results_if_stable(next_state), {}
-end
-
-local function handle_reasoning_delta(msg, state)
-  if is_foreign_chat(msg, state) then return state, {} end
-  local t = msg.text or msg.delta or ""
-  if #t == 0 then return state, {} end
-  return transcript.append_reasoning_delta(state, t), {}
-end
-
-local function handle_reasoning_end(msg, state)
-  if is_foreign_chat(msg, state) then return state, {} end
-  return transcript.finalize_reasoning(state, msg.duration_ms), {}
-end
-
-local function handle_session_stats(msg, state)
-  if is_foreign_chat(msg, state) then return state, {} end
-  local next_state = transcript.reduce_assistant_event(state, msg)
-  local stats = shallow_merge(next_state.stats or {}, {})
-  for k, v in pairs(msg) do
-    if k ~= "kind" then stats[k] = v end
-  end
-  local current_context_tokens = msg.last_turn_context_tokens
-    or msg.last_turn_input_tokens
-    or msg.context_tokens
-    or msg.prompt_tokens
-  local patch = { stats = stats }
-  if current_context_tokens ~= nil then
-    patch.current_context_tokens = current_context_tokens
-  end
-  local s = shallow_merge(next_state, patch)
-  if msg.model then
-    local mt = msg.max_context_tokens
-      or model_context_windows[msg.model]
-      or state.max_tokens
-    s = shallow_merge(s, { model = msg.model, max_tokens = mt })
-  end
-  return s, {}
 end
 
 local function handle_usage_updated(msg, state)
@@ -1298,66 +1189,6 @@ local function handle_plan_append(msg, state)
     Entry.plan(text, submitted_at, msg.plan_id, status)
   )
   return without_pending_plan_status(next_state, key), {}
-end
-
-local function handle_compaction_commit(msg, state)
-  local pending_idx
-  for i = #state.entries, 1, -1 do
-    local e = state.entries[i]
-    if type(e) == "table" and e.kind == "compaction" and e.status == "pending" then
-      pending_idx = i
-      if (e.provider ~= nil and msg.provider ~= e.provider)
-          or (e.model ~= nil and msg.model ~= e.model) then
-        return state, {}
-      end
-      break
-    end
-  end
-
-  local committed = Entry.compaction({
-    chat_id = msg.chat_id,
-    provider = msg.provider,
-    model = msg.model,
-    strategy = msg.strategy,
-    trigger = msg.trigger,
-    display_summary = msg.display_summary,
-    metadata = msg.metadata,
-  })
-  local entries = {}
-  for i = 1, #state.entries do entries[i] = state.entries[i] end
-  if pending_idx ~= nil then entries[pending_idx] = committed end
-  local next_state
-  if pending_idx ~= nil then
-    next_state = shallow_merge(state, { entries = entries })
-  else
-    next_state = transcript.push_entry(state, committed)
-  end
-  return shallow_merge(next_state, { current_context_tokens = NIL_SENTINEL }), {}
-end
-
-local function handle_compaction_failed(msg, state)
-  local failed = Entry.compaction({
-    provider = msg.provider,
-    model = msg.model,
-    trigger = msg.trigger,
-    status = "failed",
-    display_summary = msg.message or "Context compaction failed.",
-  })
-  local entries = {}
-  local replaced = false
-  for i = 1, #state.entries do entries[i] = state.entries[i] end
-  for i = #entries, 1, -1 do
-    local e = entries[i]
-    if type(e) == "table" and e.kind == "compaction" and e.status == "pending" then
-      entries[i] = failed
-      replaced = true
-      break
-    end
-  end
-  if replaced then
-    return shallow_merge(state, { entries = entries }), {}
-  end
-  return transcript.push_entry(state, failed), {}
 end
 
 local function handle_plan_approved(msg, state)
@@ -1800,6 +1631,198 @@ local function handle_mouse_selection(msg, state)
   return state, {}
 end
 
+local function display_value(value)
+  if type(value) == "string" then return value end
+  if value == nil then return "" end
+  local ok, encoded = pcall(nefor.json.encode, value)
+  return ok and encoded or tostring(value)
+end
+
+local function replace_pending_compaction(state, compaction, status)
+  compaction = compaction or {}
+  local entries = {}
+  local replaced = false
+  for i, entry in ipairs(state.entries or {}) do
+    if not replaced and type(entry) == "table" and entry.kind == "compaction"
+        and entry.status == "pending"
+        and (entry.request_id == nil or entry.request_id == compaction.request_id) then
+      entries[i] = Entry.compaction({
+        request_id = compaction.request_id,
+        conversation_id = state.conversation_id,
+        status = status,
+        display_summary = status == "complete"
+            and "Context compacted."
+          or display_value(compaction.error or "Context compaction failed."),
+      })
+      replaced = true
+    else
+      entries[i] = entry
+    end
+  end
+  if replaced then return shallow_merge(state, { entries = entries }) end
+  return transcript.push_entry(state, Entry.compaction({
+    request_id = compaction.request_id,
+    conversation_id = state.conversation_id,
+    status = status,
+    display_summary = status == "complete"
+        and "Context compacted."
+      or display_value(compaction.error or "Context compaction failed."),
+  }))
+end
+
+local function apply_conversation_action(state, item)
+  if item.kind == "active_changed" then
+    return shallow_merge(state, {
+      conversation_id = item.conversation_id,
+      entries = {},
+      in_flight = NIL_SENTINEL,
+      pending_assistant_projection = NIL_SENTINEL,
+    })
+  end
+  if item.kind == "active_cleared" then
+    return shallow_merge(state, { conversation_id = NIL_SENTINEL })
+  end
+  if item.kind == "snapshot_reset" then
+    state = close_and_flush_lead_unit(state)
+    return shallow_merge(state, { entries = {} })
+  end
+  if item.kind == "turn_started" then
+    return shallow_merge(state, {
+      active_turn_id = item.turn_id,
+      pending = true,
+    })
+  end
+  if item.kind == "message" then
+    return select(1, handle_message_append(item, state))
+  end
+  if item.kind == "text_delta" then
+    return transcript.append_assistant_delta(state, item.text)
+  end
+  if item.kind == "reasoning_delta" then
+    return transcript.append_reasoning_delta(state, item.text)
+  end
+  if item.kind == "assistant_completed" then
+    local terminal = item.terminal or {}
+    local next_state = transcript.finalize_assistant(
+      state, item.text, terminal.model, terminal.duration_ms)
+    if type(terminal.usage) == "table" then
+      next_state = transcript.attach_latest_assistant_stats(
+        next_state,
+        terminal.usage.output_tokens or terminal.usage.completion_tokens,
+        terminal.duration_ms)
+    end
+    return next_state
+  end
+  if item.kind == "message_interrupted" then
+    return transcript.close_lead_unit(state)
+  end
+  if item.kind == "tool_started" then
+    return select(1, handle_tool_start({
+      id = item.exchange_id,
+      name = item.name,
+      input = item.arguments,
+    }, state))
+  end
+  if item.kind == "tool_completed" then
+    return transcript.attach_tool_end(
+      state, item.exchange_id, display_value(item.output), item.error == true)
+  end
+  if item.kind == "retry_started" then
+    local retry = item.retry or {}
+    return select(1, handle_toast({
+      id = retry.id,
+      level = "warning",
+      text = "Retrying: " .. display_value(retry.reason or "provider retry"),
+      ttl_ms = 3500,
+    }, state))
+  end
+  if item.kind == "turn_completed" then
+    local terminal = item.terminal or {}
+    local next_state = state
+    local usage = type(terminal.usage) == "table" and terminal.usage or {}
+    next_state = transcript.attach_latest_assistant_stats(
+      next_state,
+      usage.output_tokens or usage.completion_tokens,
+      terminal.duration_ms)
+    local stats = shallow_merge(next_state.stats or {}, {
+      model = terminal.model,
+      last_turn_duration_ms = terminal.duration_ms,
+      last_turn_input_tokens = usage.input_tokens or usage.prompt_tokens,
+      last_turn_output_tokens = usage.output_tokens or usage.completion_tokens,
+    })
+    local patch = {
+      stats = stats,
+      active_turn_id = NIL_SENTINEL,
+      current_context_tokens = usage.input_tokens or usage.prompt_tokens,
+    }
+    if terminal.model ~= nil then
+      patch.model = terminal.model
+      patch.max_tokens = model_context_windows[terminal.model] or state.max_tokens
+    end
+    return transcript.flush_graph_results_if_stable(shallow_merge(next_state, patch))
+  end
+  if item.kind == "turn_interrupted" then
+    local next_state = transcript.close_lead_unit(state)
+    return transcript.push_entry(shallow_merge(next_state, {
+      active_turn_id = NIL_SENTINEL,
+    }), Entry.system(display_value((item.terminal or {}).reason or "interrupted")))
+  end
+  if item.kind == "turn_failed" or item.kind == "conversation_failed" then
+    local terminal = item.terminal or {}
+    local message = item.message or terminal.error or terminal.message or "The conversation failed."
+    local next_state = transcript.close_lead_unit(state)
+    return transcript.push_entry(shallow_merge(next_state, {
+      active_turn_id = NIL_SENTINEL,
+    }), Entry.error("Conversation failed", display_value(message), true))
+  end
+  if item.kind == "conversation_interrupted" then
+    return transcript.close_lead_unit(state)
+  end
+  if item.kind == "compaction_pending" then
+    local compaction = item.compaction or {}
+    local entries = {}
+    for i, entry in ipairs(state.entries or {}) do
+      if entry.kind == "compaction" and entry.status == "pending" then
+        if entry.request_id == compaction.request_id then return state end
+        if entry.request_id == nil then
+          entries[i] = Entry.compaction({
+            request_id = compaction.request_id,
+            conversation_id = state.conversation_id,
+            status = "pending",
+          })
+          for j = i + 1, #(state.entries or {}) do entries[j] = state.entries[j] end
+          return shallow_merge(state, { entries = entries })
+        end
+      end
+      entries[i] = entry
+    end
+    return transcript.push_entry(state, Entry.compaction({
+      request_id = compaction.request_id,
+      conversation_id = state.conversation_id,
+      status = "pending",
+    }))
+  end
+  if item.kind == "compaction_completed" then
+    return shallow_merge(replace_pending_compaction(state, item.compaction, "complete"), {
+      current_context_tokens = NIL_SENTINEL,
+    })
+  end
+  if item.kind == "compaction_failed" then
+    return replace_pending_compaction(state, item.compaction, "failed")
+  end
+  return state
+end
+
+local function handle_conversation_event(msg, state)
+  local projection_state, actions = conversation_projection.reduce(
+    state.conversation_projection, msg)
+  local next_state = shallow_merge(state, { conversation_projection = projection_state })
+  for _, item in ipairs(actions) do
+    next_state = apply_conversation_action(next_state, item)
+  end
+  return next_state, {}
+end
+
 -- ── dispatch table ────────────────────────────────────────────────────
 
 local handlers = {
@@ -1825,25 +1848,17 @@ local handlers = {
   ["sessions.replay.end"]         = handle_replay_end,
   ["sessions.resume_done"]        = handle_resume_done,
   ["chat.reset"]                  = handle_chat_reset,
-  ["chat.message.append"]         = handle_message_append,
   ["chat.error.append"]           = handle_error_append,
   ["chat.queue.steered"]          = handle_queue_steered,
   ["chat.instruction.notice"]     = handle_instruction_notice,
-  ["chat.lead.bound"]             = handle_lead_chat_bound,
-  ["chat.stream.delta"]           = handle_stream_delta,
-  ["chat.stream.end"]             = handle_stream_end,
-  ["chat.stream.reasoning_delta"] = handle_reasoning_delta,
-  ["chat.stream.reasoning_end"]   = handle_reasoning_end,
-  ["chat.session.stats"]          = handle_session_stats,
+  ["conversation.active.changed"] = handle_conversation_event,
+  ["conversation.projection.delta"] = handle_conversation_event,
+  ["conversation.snapshot"]       = handle_conversation_event,
   ["chat.usage.updated"]          = handle_usage_updated,
   ["chat.usage.error"]            = handle_usage_error,
   ["tool.register"]               = handle_tool_register,
-  ["chat.tool.start"]             = handle_tool_start,
-  ["chat.tool.end"]               = handle_tool_end,
   ["chat.graph_result.append"]    = handle_graph_result_append,
   ["chat.plan.append"]            = handle_plan_append,
-  ["chat.compaction.commit"]      = handle_compaction_commit,
-  ["chat.compaction.failed"]      = handle_compaction_failed,
   ["lead-workflow.plan.approved"] = handle_plan_approved,
   ["chat.popup"]                  = handle_popup,
   ["chat.toast"]                  = handle_toast,

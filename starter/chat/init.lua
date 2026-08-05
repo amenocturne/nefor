@@ -8,11 +8,8 @@
 -- `tui.start`.
 --
 -- Inbound chat-contract events handled here:
---   chat.lead.bound (which chat_id the transcript renders),
---   chat.message.append, chat.instruction.notice, chat.stream.delta,
---   chat.stream.end,
---   chat.stream.reasoning_delta, chat.stream.reasoning_end,
---   chat.session.stats, chat.tool.start, chat.tool.end,
+--   conversation.active.changed, conversation.projection.delta,
+--   conversation.snapshot, chat.instruction.notice,
 --   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,
 --   chat.tool.popup_request, tool-gate.mode_changed,
 --   mag.run_started and the rest of the mag.* kernel lifecycle stream.
@@ -257,12 +254,10 @@ local function initial_state()
     in_flight        = nil,
     pending_assistant_projection = nil,
     pending_graph_results = nil,
-    -- The lead conversation's binding, set by `chat.lead.bound`: either
-    -- an exact chat_id or a chat_prefix (the lead's kernel turn-programs
-    -- mint a scoped chat handle per round; the run-scoped prefix is the
-    -- stable identity). Stream events for other chats never render here.
-    lead_chat_id     = nil,
-    lead_chat_prefix = nil,
+    -- The selected conversation is a manager-owned identity. Provider request
+    -- and chat handles never cross into presentation state.
+    conversation_id = nil,
+    conversation_projection = require("libs.chat.conversation_projection").new(),
     input_value      = "",
     show_sidebar     = true,
     -- Pane key focus: "prompt" | "sidebar" (Tab/Shift-Tab cycles). The

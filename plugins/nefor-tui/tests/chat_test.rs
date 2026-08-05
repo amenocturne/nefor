@@ -1,7 +1,7 @@
 //! Phase-6 integration test for the chat surface as a Lua composition.
 //!
 //! Loads `starter/chat.lua` into the in-process engine and verifies the
-//! must-have wire path: a `chat.stream.delta` from a peer lands in the
+//! must-have wire path: a conversation-manager projection from a peer lands in the
 //! transcript, an `input.submit` produces a `chat.input.submit` egress
 //! envelope, and `/quit` exits.
 //!
@@ -436,22 +436,74 @@ fn resume_loading_formats_byte_boundaries_and_clamps_progress() {
 }
 
 #[test]
-fn streaming_delta_appends_to_transcript() {
+fn conversation_projection_appends_to_transcript_with_terminal_metadata() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "hello " }),
+        json!({ "kind": "conversation.active.changed", "conversation_id": "root" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.stream.delta", "text": "world" }),
+        json!({
+            "kind": "conversation.projection.delta",
+            "conversation_id": "root",
+            "change": { "kind": "turn_started", "turn_id": "turn-1", "run_id": "run-1" },
+        }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.stream.end", "model": "qwen-test", "duration_ms": 42 }),
+        json!({
+            "kind": "conversation.projection.delta",
+            "conversation_id": "root",
+            "change": {
+                "kind": "message_started", "turn_id": "turn-1",
+                "message": { "id": "assistant", "turn_id": "turn-1", "role": "assistant" },
+            },
+        }),
+    );
+    for text in ["hello ", "world"] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "conversation.projection.delta",
+                "conversation_id": "root",
+                "change": {
+                    "kind": "content_chunk_appended", "message_id": "assistant",
+                    "chunk": { "kind": "text", "data": text },
+                },
+            }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta",
+            "conversation_id": "root",
+            "change": {
+                "kind": "message_completed", "turn_id": "turn-1",
+                "message": {
+                    "id": "assistant", "turn_id": "turn-1", "role": "assistant",
+                    "text": "hello world", "terminal": {},
+                },
+            },
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta",
+            "conversation_id": "root",
+            "change": {
+                "kind": "turn_completed", "turn_id": "turn-1", "run_id": "run-1",
+                "terminal": {
+                    "model": "qwen-test", "duration_ms": 42,
+                    "usage": { "input_tokens": 5, "output_tokens": 2 },
+                },
+            },
+        }),
     );
 
     let out = render_str(&mut engine);
@@ -459,12 +511,21 @@ fn streaming_delta_appends_to_transcript() {
         out.contains("hello world"),
         "concatenated deltas missing from transcript: {out:?}"
     );
+    assert_eq!(
+        out.matches("hello world").count(),
+        1,
+        "message and turn completion must not append the answer twice: {out:?}"
+    );
     // Per legacy spec, assistant entries have NO role label — the visual
     // cue is the absence of the user block's left bar. The per-turn
     // footer marker `▣` + model name is the assistant signature.
     assert!(
         out.contains('▣') && out.contains("qwen-test"),
         "per-turn footer (▣ <model>) missing after stream end: {out:?}"
+    );
+    assert!(
+        out.contains("42ms") && out.contains("48 tok/s"),
+        "manager terminal duration and usage should reach the turn footer: {out:?}"
     );
 }
 

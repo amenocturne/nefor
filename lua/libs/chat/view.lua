@@ -82,7 +82,7 @@ local function transcript(state)
   -- `empty_view` slot accepts a fn returning the banner tree, which
   -- it stacks over an empty scrollable so scroll_position keeps
   -- resolving. Replay-mode opt-out: between sessions.replay.start
-  -- and the first replayed chat.message.append, the transcript is
+  -- and the first replayed conversation projection, the transcript is
   -- briefly empty AND we're rebuilding. Painting the banner here
   -- would flash the welcome copy in the middle of a resume.
   local empty_view

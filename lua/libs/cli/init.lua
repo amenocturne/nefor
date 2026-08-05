@@ -1,9 +1,7 @@
 -- lua/libs/cli/init.lua — agentic-cli plugin (pure-Lua, virtual).
 --
--- Surfaces `agentic-loop` as a stdin/stdout CLI: single-shot prompt or
--- interactive REPL. Behaviour parity with the TUI is by construction —
--- `agentic-loop` is the single source of truth and this module only
--- changes the surface (stdin/stdout vs. chat-contract → nefor-tui).
+-- Submits through agentic-loop and renders conversation-manager's universal
+-- projection as either a single-shot command or interactive REPL.
 --
 -- ### Lifecycle
 --
@@ -12,17 +10,17 @@
 -- Lua VM mutex. While this runs, plugin lines queue in the broker but
 -- step is NOT being driven — so the cli function must register its
 -- callbacks and RETURN to let the broker enter its run loop. Subsequent
--- bus traffic flows through agentic_workflow's transforms; observers
--- registered here fire as turns complete.
+-- bus traffic flows through conversation-manager's projection; observers
+-- registered here fire as canonical turns complete.
 --
 -- ### Output formats
 --
---   text (default)   — stream chat.stream.delta to stdout in real time;
+--   text (default)   — stream canonical text deltas to stdout in real time;
 --                      tool-call one-liners to stderr; trailing newline
 --                      on the orchestrator-run tool.result close.
 --   json             — single JSON line per turn on completion:
 --                      { answer, tool_calls, duration_ms }.
---   stream-json      — passthrough: every chat.* / mag.* / tool.*
+--   stream-json      — passthrough: every conversation.* / mag.* / tool.*
 --                      envelope as one JSON line on stdout (NCP wire
 --                      format). The
 --                      user's prompt is NOT emitted as a chat.input.submit
@@ -38,7 +36,7 @@
 -- The known caveat with `nefor.io.read_line` is that it blocks the Lua
 -- VM. That makes a `while line do submit; wait end` loop impossible —
 -- there's no way to wait for events while holding the VM. We sidestep
--- that: in REPL mode, on_complete reads the next line and submits it.
+-- that: in REPL mode, the canonical terminal callback reads the next line.
 -- The "loop" is a chain of in-process callbacks. EOF on read_line ends
 -- the session via `nefor.engine.exit(0)`.
 --
@@ -47,6 +45,7 @@
 local M = {}
 
 local agentic_workflow = require("libs.agentic-loop")
+local conversation_projection = require("libs.chat.conversation_projection")
 local json = nefor.json
 
 -- Argv parser. Hand-rolled, no external dep. Recognises:
@@ -89,11 +88,11 @@ EOF (Ctrl-D). The REPL drives the same agentic_workflow as the TUI, so
 behaviour parity is by construction.
 
 OUTPUT FORMATS:
-  text          stream chat.stream.delta to stdout; tool one-liners to
+  text          stream conversation text deltas to stdout; tool one-liners to
                 stderr; trailing newline on completion. Default.
   json          one JSON line per turn at completion:
                 { "answer": "...", "tool_calls": [...], "duration_ms": ... }
-  stream-json   passthrough: every chat.*/mag.*/tool.* envelope as one
+  stream-json   passthrough: every conversation.*/mag.*/tool.* envelope as one
                 JSON line on stdout. Matches NCP wire format.
 ]]
 
@@ -197,12 +196,7 @@ local function build_prompt_with_file(prompt, file_path)
   return header .. (prompt or ""), nil
 end
 
--- Output handlers.
---
--- `text` format streams via on_stream / on_tool_*. `json` accumulates
--- final state and prints once on on_complete. `stream-json` registers
--- nefor.bus.on_event handlers for every chat.*/mag.*/tool.* kind and
--- prints each envelope as a JSON line.
+-- Output handlers consume the same universal projection as the TUI.
 
 local function write_stdout(s) io.stdout:write(s); io.stdout:flush() end
 local function write_stderr(s) io.stderr:write(s); io.stderr:flush() end
@@ -220,47 +214,9 @@ local function now_ms()
   return (((tonumber(h) * 60) + tonumber(m)) * 60 + tonumber(s)) * 1000 + tonumber(ms)
 end
 
-local function install_text_format(_gate)
-  -- The CLI prints the normalized terminal result on completion. Provider
-  -- stream deltas remain presentation/observability events and are not a
-  -- second result channel.
-  agentic_workflow.on_stream(function(_text) end)
-  agentic_workflow.on_tool_start(function(_id, name, input)
-    -- One-liner to stderr keeps stdout pipe-clean.
-    local input_preview
-    if type(input) == "table" then
-      local ok, encoded = pcall(json.encode, input)
-      input_preview = ok and encoded or "?"
-      if #input_preview > 80 then
-        input_preview = input_preview:sub(1, 77) .. "..."
-      end
-    else
-      input_preview = tostring(input)
-    end
-    write_stderr("[tool: " .. tostring(name) .. "(" .. input_preview .. ")]\n")
-  end)
-  agentic_workflow.on_tool_end(function(_id, output, err)
-    if err then
-      write_stderr("[tool error: " .. tostring(output) .. "]\n")
-    end
-  end)
-end
-
-local function install_json_format(state)
-  -- JSON mode prints the normalized terminal result supplied by the
-  -- agentic-loop boundary. Streams are presentation events only; using them
-  -- as the result would make non-streaming and suppressed relay turns empty.
-  state.tool_calls = {}
-  agentic_workflow.on_tool_start(function(id, name, input)
-    state.tool_calls[#state.tool_calls + 1] = {
-      id = id, name = name, input = input,
-    }
-  end)
-end
-
 local function install_stream_json_format()
-  -- Passthrough: subscribe to chat.* and graph.* kinds; emit each
-  -- envelope as one JSON line. The handler receives a log-entry table
+  -- Passthrough: subscribe to universal conversation and run/tool kinds.
+  -- Each envelope is one JSON line. The handler receives a log-entry table
   -- (`{ ts, origin, target, payload }`); `payload` is the already-
   -- serialised envelope JSON, so we emit it verbatim — no re-encoding,
   -- no decode-then-encode round trip. Matches NCP's wire format.
@@ -271,7 +227,7 @@ local function install_stream_json_format()
       if payload:sub(-1) ~= "\n" then write_stdout("\n") end
     end
   end
-  nefor.bus.on_event("chat.*", emit_env)
+  nefor.bus.on_event("conversation.*", emit_env)
   -- Kernel-run lifecycle (mag.run_started / mag.run_result / actor
   -- spawn-ready events) — the lead's turn-programs and its dispatched
   -- runs both execute on the mag kernel.
@@ -280,6 +236,53 @@ local function install_stream_json_format()
   -- `tool.result { id=<run_id|firing_id>, result | error }`. Include
   -- the family so stream-json transcripts retain run-close visibility.
   nefor.bus.on_event("tool.*", emit_env)
+end
+
+local function preview(value)
+  if type(value) == "string" then return value end
+  local ok, encoded = pcall(json.encode, value)
+  return ok and encoded or tostring(value)
+end
+
+local function install_conversation_output(format, state, gate)
+  state.projection = conversation_projection.new()
+  state.tool_calls = {}
+
+  local function consume(entry)
+    local payload = type(entry) == "table" and entry.payload or nil
+    if type(payload) ~= "string" or payload == "" then return end
+    local ok, envelope = pcall(json.decode, payload)
+    if not ok or type(envelope) ~= "table" or type(envelope.body) ~= "table" then return end
+    local projection, actions = conversation_projection.reduce(state.projection, envelope.body)
+    state.projection = projection
+    for _, item in ipairs(actions) do
+      if item.kind == "text_delta" then
+        if format == "text" and not gate.suppress_stream then write_stdout(item.text) end
+      elseif item.kind == "tool_started" then
+        state.tool_calls[#state.tool_calls + 1] = {
+          id = item.exchange_id, name = item.name, input = item.arguments,
+        }
+        if format == "text" then
+          local input = preview(item.arguments)
+          if #input > 80 then input = input:sub(1, 77) .. "..." end
+          write_stderr("[tool: " .. tostring(item.name) .. "(" .. input .. ")]\n")
+        end
+        if state.on_tool_started then state.on_tool_started(item.name, item.arguments) end
+      elseif item.kind == "tool_completed" and item.error and format == "text" then
+        write_stderr("[tool error: " .. preview(item.output) .. "]\n")
+      elseif item.kind == "turn_completed" and state.on_terminal then
+        state.on_terminal(item.turn_id, "success", item.answer, item.terminal)
+      elseif item.kind == "turn_failed" and state.on_terminal then
+        state.on_terminal(item.turn_id, "error", nil, item.terminal)
+      elseif item.kind == "turn_interrupted" and state.on_terminal then
+        state.on_terminal(item.turn_id, "interrupted", nil, item.terminal)
+      end
+    end
+  end
+
+  nefor.bus.on_event("conversation.active.changed", consume)
+  nefor.bus.on_event("conversation.projection.delta", consume)
+  nefor.bus.on_event("conversation.snapshot", consume)
 end
 
 -- Run modes defer the first prompt until startup-readiness has observed
@@ -305,12 +308,12 @@ local function wait_until_ready(on_ready)
   }
 end
 
--- Single-shot: register on_complete, wait for the readiness barrier, submit
--- once, return. on_complete prints the final output (text or JSON)
+-- Single-shot: register the canonical turn terminal callback, wait for the
+-- readiness barrier, submit once. The callback prints final output
 -- and exits.
 --
 -- Async dispatch caveat: when the orchestrator turn executes a kernel
--- run (the lead's `mag` tool with action=execute) the first on_complete
+-- run (the lead's `mag` tool with action=execute) the first terminal projection
 -- fires WHILE the run is still going. agentic_workflow then queues the
 -- run's eventual result and re-submits a relay turn. We need to wait
 -- through that second turn to print the actual final answer —
@@ -319,11 +322,11 @@ local function is_async_dispatch(name, input)
   return name == "mag" and type(input) == "table" and input.action == "execute"
 end
 
-local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
+local function run_single_shot(prompt, format, state, turn_start_ms, gate)
   local async_dispatch_inflight = false
   local already_exited = false
 
-  agentic_workflow.on_tool_start(function(_id, name, input)
+  state.on_tool_started = function(name, input)
     if is_async_dispatch(name, input) then
       async_dispatch_inflight = true
       -- Suppress text streaming for the first turn — the user wants
@@ -331,23 +334,23 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
       -- The relay turn re-opens the gate.
       if gate then gate.suppress_stream = true end
     end
-  end)
+  end
 
-  local function emit_completion(status, answer)
+  local function emit_completion(status, answer, terminal)
     if already_exited then return end
     already_exited = true
     if format == "json" then
-      local duration_ms = now_ms() - turn_start_ms
+      local duration_ms = type(terminal) == "table" and terminal.duration_ms
+        or (now_ms() - turn_start_ms)
       local payload = {
         answer = type(answer) == "string" and answer or "",
-        tool_calls = json_state.tool_calls or {},
+        tool_calls = state.tool_calls or {},
         duration_ms = duration_ms,
         status = status,
       }
       local ok, encoded = pcall(json.encode, payload)
       if ok then write_stdout(encoded .. "\n") end
     elseif format == "text" then
-      if type(answer) == "string" and #answer > 0 then write_stdout(answer) end
       write_stdout("\n")
     end
     -- stream-json: nothing extra; the run-close tool.result already
@@ -355,7 +358,7 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
     nefor.engine.exit(0)
   end
 
-  agentic_workflow.on_complete(function(_run_id, status, answer)
+  state.on_terminal = function(_turn_id, status, answer, terminal)
     if async_dispatch_inflight then
       -- Suppress the first complete; reset the flag so the next turn
       -- (relay of the deferred run result) is the one we exit on.
@@ -367,8 +370,8 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
       -- first turn belongs in the report alongside any relay-turn calls.
       return
     end
-    emit_completion(status, answer)
-  end)
+    emit_completion(status, answer, terminal)
+  end
 
   wait_until_ready(function()
     agentic_workflow.submit(prompt)
@@ -376,20 +379,20 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
 end
 
 -- REPL: wait for ready sentinel, then read first line, submit;
--- on_complete reads the next line and submits again. EOF on read_line
+-- the terminal callback reads the next line and submits again. EOF on read_line
 -- → exit(0).
 --
 -- Async dispatch caveat (same as single-shot): if a turn executes a
--- kernel run, we get TWO on_complete events back to back — one for
+-- kernel run, we get two terminal turn projections — one for
 -- the orchestrator's first turn (returns the transitional ack) and
 -- one for the deferred-result relay turn. We only want to read the
 -- next user line after the relay turn lands.
-local function run_repl(format, json_state, gate)
+local function run_repl(format, state, gate)
   local async_dispatch_inflight = false
 
   local function reset_json_state()
     if format == "json" then
-      json_state.tool_calls = {}
+      state.tool_calls = {}
     end
   end
 
@@ -397,22 +400,21 @@ local function run_repl(format, json_state, gate)
     if format == "json" then
       local payload = {
         answer = type(answer) == "string" and answer or "",
-        tool_calls = json_state.tool_calls or {},
+        tool_calls = state.tool_calls or {},
       }
       local ok, encoded = pcall(json.encode, payload)
       if ok then write_stdout(encoded .. "\n") end
     elseif format == "text" then
-      if type(answer) == "string" and #answer > 0 then write_stdout(answer) end
       write_stdout("\n")
     end
   end
 
-  agentic_workflow.on_tool_start(function(_id, name, input)
+  state.on_tool_started = function(name, input)
     if is_async_dispatch(name, input) then
       async_dispatch_inflight = true
       if gate then gate.suppress_stream = true end
     end
-  end)
+  end
 
   local function read_and_submit()
     write_stderr("> ")
@@ -433,7 +435,7 @@ local function run_repl(format, json_state, gate)
     agentic_workflow.submit(line)
   end
 
-  agentic_workflow.on_complete(function(_run_id, _status, answer)
+  state.on_terminal = function(_turn_id, _status, answer, _terminal)
     if async_dispatch_inflight then
       async_dispatch_inflight = false
       if gate then gate.suppress_stream = false end
@@ -442,7 +444,7 @@ local function run_repl(format, json_state, gate)
     end
     emit_completion_output(answer)
     read_and_submit()
-  end)
+  end
 
   wait_until_ready(read_and_submit)
 end
@@ -500,14 +502,8 @@ function M.run(argv)
   -- async kernel-dispatch deferral demands holding back the first turn.
   local gate = { suppress_stream = false }
 
-  -- Wire output observers based on format.
-  if opts.format == "text" then
-    install_text_format(gate)
-  elseif opts.format == "json" then
-    install_json_format(state)
-  elseif opts.format == "stream-json" then
-    install_stream_json_format()
-  end
+  install_conversation_output(opts.format, state, gate)
+  if opts.format == "stream-json" then install_stream_json_format() end
 
   -- Branch on mode.
   if opts.prompt ~= nil then

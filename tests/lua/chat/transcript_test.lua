@@ -31,31 +31,17 @@ local initial = {
   pending = true,
   turn_started_at = 900,
 }
-local ended, handled = transcript.reduce_assistant_event(initial, {
-  kind = "chat.stream.end",
-  text = "",
-  model = "structured-model",
-  duration_ms = 75,
-})
-eq(handled, true)
+local ended = transcript.finalize_assistant(initial, "", "structured-model", 75)
 eq(#ended.entries, 1)
 eq(ended.entries[1].text, "")
 eq(ended.entries[1].model, "structured-model")
 eq(ended.pending_assistant_projection, 1)
 
-local with_stats = transcript.reduce_assistant_event(ended, {
-  kind = "chat.session.stats",
-  last_turn_output_tokens = 42,
-  last_turn_duration_ms = 80,
-})
+local with_stats = transcript.attach_latest_assistant_stats(ended, 42, 80)
 eq(with_stats.entries[1].output_tokens, 42)
 eq(with_stats.entries[1].duration_ms, 80)
 
-local projected = transcript.reduce_assistant_event(with_stats, {
-  kind = "chat.message.append",
-  role = "assistant",
-  text = "validated answer",
-})
+local projected = select(1, transcript.project_assistant_message(with_stats, "validated answer"))
 eq(#projected.entries, 1, "durable answer reuses the provider-owned entry")
 eq(projected.entries[1].text, "validated answer")
 eq(projected.entries[1].model, "structured-model")
@@ -63,10 +49,8 @@ eq(projected.entries[1].output_tokens, 42)
 eq(projected.entries[1].duration_ms, 80)
 eq(projected.pending_assistant_projection, nil)
 
-local ordinary = transcript.reduce_assistant_event({ entries = {} }, {
-  kind = "chat.message.append",
-  role = "assistant",
-  text = "ordinary answer",
+local ordinary = transcript.push_entry({ entries = {} }, {
+  role = "assistant", kind = "text", text = "ordinary answer",
 })
 eq(#ordinary.entries, 1, "append without projection creates a new entry")
 eq(ordinary.entries[1].text, "ordinary answer")
@@ -105,9 +89,7 @@ local projected_round = transcript.finalize_assistant({
 }, "", "structured-model", 10)
 projected_round = transcript.append_graph_result(projected_round, graph("projected"))
 eq(#projected_round.entries, 1, "empty structured answer keeps result buffered")
-projected_round = transcript.reduce_assistant_event(projected_round, {
-  kind = "chat.message.append", role = "assistant", text = "final answer",
-})
+projected_round = select(1, transcript.project_assistant_message(projected_round, "final answer"))
 projected_round = transcript.flush_graph_results_if_stable(projected_round)
 eq(projected_round.entries[1].text, "final answer")
 eq(projected_round.entries[2].run_id, "projected",
@@ -148,12 +130,8 @@ eq(terminal_again.entries[2].text, "durable answer")
 local reasoning_only = transcript.append_reasoning_delta({
   entries = {}, pending = true, turn_started_at = 900,
 }, "partial reasoning")
-reasoning_only = transcript.reduce_assistant_event(reasoning_only, {
-  kind = "chat.stream.end", model = "reasoning-model",
-})
-reasoning_only = transcript.reduce_assistant_event(reasoning_only, {
-  kind = "chat.session.stats", last_turn_output_tokens = 7,
-})
+reasoning_only = transcript.finalize_assistant(reasoning_only, nil, "reasoning-model")
+reasoning_only = transcript.attach_latest_assistant_stats(reasoning_only, 7, nil)
 reasoning_only = transcript.close_lead_unit(reasoning_only)
 eq(reasoning_only.in_flight, nil, "abnormal close clears reasoning-only in-flight ownership")
 eq(reasoning_only.entries[1].text, "", "abnormal close does not synthesize provider text")
@@ -170,12 +148,8 @@ local partial_text = transcript.append_reasoning_delta({
   entries = {}, pending = true, turn_started_at = 900,
 }, "why")
 partial_text = transcript.append_assistant_delta(partial_text, "partial answer")
-partial_text = transcript.reduce_assistant_event(partial_text, {
-  kind = "chat.session.stats", last_turn_output_tokens = 3, last_turn_duration_ms = 12,
-})
-partial_text = transcript.reduce_assistant_event(partial_text, {
-  kind = "chat.stream.end", model = "partial-model",
-})
+partial_text = transcript.attach_latest_assistant_stats(partial_text, 3, 12)
+partial_text = transcript.finalize_assistant(partial_text, nil, "partial-model")
 partial_text = transcript.close_lead_unit(partial_text)
 eq(partial_text.entries[1].text, "partial answer", "partial provider text is preserved")
 eq(partial_text.entries[1].reasoning.text, "why", "partial reasoning is preserved")

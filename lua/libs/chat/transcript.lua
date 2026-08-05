@@ -186,11 +186,8 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
   })
 end
 
--- Structured-output providers finish the visible provider stream before the
--- agentic loop projects the validated final answer as chat.message.append.
--- Keep both halves in the provider entry so its reasoning, content, and stats
--- retain one chronological position even when an asynchronous graph result
--- lands between stream completion and durable projection.
+-- A completed canonical message may fill an empty streamed entry. Keep both
+-- halves in one chronological position when a graph result lands between them.
 function M.project_assistant_message(state, text)
   local idx = state.pending_assistant_projection
   if idx == nil then return state, false end
@@ -246,34 +243,6 @@ function M.close_lead_unit(state)
     pending = false,
     turn_started_at = NIL_SENTINEL,
   })
-end
-
--- Canonical entry-state transition for assistant events shared by every chat
--- composition. Config reducers retain routing, capture, and aggregate-status
--- policy; this reducer alone decides whether a durable assistant append fills
--- a provider-owned empty entry or creates a new transcript entry.
-function M.reduce_assistant_event(state, msg)
-  if msg.kind == "chat.stream.end" then
-    return M.finalize_assistant(state, msg.text, msg.model, msg.duration_ms), true
-  end
-
-  if msg.kind == "chat.session.stats" then
-    local output_tokens = msg.last_turn_output_tokens or msg.completion_tokens
-    local duration_ms = msg.last_turn_duration_ms or msg.duration_ms
-    if output_tokens == nil and duration_ms == nil then return state, true end
-    return M.attach_latest_assistant_stats(state, output_tokens, duration_ms), true
-  end
-
-  if msg.kind ~= "chat.message.append" or msg.role ~= "assistant" then
-    return state, false
-  end
-  local text = msg.text or ""
-  if text == "" then return state, true end
-  local projected, matched = M.project_assistant_message(state, text)
-  if matched then return projected, true end
-  return M.push_entry(projected, {
-    role = "assistant", text = text, kind = "text",
-  }), true
 end
 
 function M.attach_tool_end(state, id, output, error_flag)

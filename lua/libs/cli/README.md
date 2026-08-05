@@ -1,6 +1,6 @@
 # agentic-cli
 
-Headless CLI plugin for nefor. Surfaces `agentic-loop` as a stdin/stdout interface — same agentic workflow as the TUI, different surface.
+Headless CLI plugin for nefor. Prompts enter through `agentic-loop`; output comes from conversation-manager's provider-neutral projection, the same source rendered by the TUI.
 
 The composition must call `configure { readiness = ... }` with its required plugin names, complete required tool-name catalog, source-to-tool diagnostics, and optional timeout. Prompt submission is held until all required plugin liveness events and one complete `tool-gate` public catalog have been observed; timeout exits with the missing plugins, tools, and expected advertisement sources rather than hanging.
 
@@ -28,9 +28,9 @@ nefor plugin agentic-cli --format stream-json "do something"
 
 ## Output formats
 
-- **text** (default) — streams `chat.stream.delta` to stdout in real time; tool one-liners to stderr.
+- **text** (default) — streams canonical conversation text deltas to stdout in real time; tool one-liners to stderr.
 - **json** — single JSON line per turn on completion: `{ answer, tool_calls, duration_ms }`.
-- **stream-json** — every `chat.*` / `mag.*` / `tool.*` envelope as one JSON line on stdout (NCP wire format).
+- **stream-json** — every `conversation.*` / `mag.*` / `tool.*` envelope as one JSON line on stdout (NCP wire format).
 
 ## Flags
 

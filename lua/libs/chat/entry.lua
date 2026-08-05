@@ -94,10 +94,11 @@ end
 function M.compaction(opts)
   opts = opts or {}
   local v = next_v()
-  log.log("entry", "create kind=compaction chat_id=%s v=%d", opts.chat_id or "?", v)
+  log.log("entry", "create kind=compaction request_id=%s v=%d", opts.request_id or "?", v)
   return {
     kind = "compaction", role = "system",
-    chat_id = opts.chat_id,
+    request_id = opts.request_id,
+    conversation_id = opts.conversation_id,
     provider = opts.provider,
     model = opts.model,
     strategy = opts.strategy,
