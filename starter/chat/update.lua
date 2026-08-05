@@ -1750,10 +1750,7 @@ local function apply_conversation_action(state, item)
     local terminal = item.terminal or {}
     local next_state = state
     local usage = type(terminal.usage) == "table" and terminal.usage or {}
-    next_state = transcript.attach_latest_assistant_stats(
-      next_state,
-      usage.output_tokens or usage.completion_tokens,
-      terminal.duration_ms)
+    next_state = transcript.attach_latest_assistant_terminal(next_state, terminal)
     local stats = shallow_merge(next_state.stats or {}, {
       model = terminal.model,
       last_turn_duration_ms = terminal.duration_ms,

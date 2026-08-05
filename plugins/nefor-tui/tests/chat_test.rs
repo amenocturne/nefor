@@ -626,12 +626,8 @@ fn conversation_projection_appends_to_transcript_with_terminal_metadata() {
     // cue is the absence of the user block's left bar. The per-turn
     // footer marker `▣` + model name is the assistant signature.
     assert!(
-        out.contains('▣') && out.contains("qwen-test"),
-        "per-turn footer (▣ <model>) missing after stream end: {out:?}"
-    );
-    assert!(
-        out.contains("42ms") && out.contains("48 tok/s"),
-        "manager terminal duration and usage should reach the turn footer: {out:?}"
+        out.contains("▣ qwen-test · 42ms · 48 tok/s"),
+        "manager terminal metadata should reach one canonical turn footer: {out:?}"
     );
 }
 

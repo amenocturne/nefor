@@ -155,6 +155,16 @@ function M.set_turn_stats(entry, output_tokens, duration_ms)
   return new
 end
 
+function M.set_turn_terminal(entry, terminal)
+  terminal = terminal or {}
+  local usage = type(terminal.usage) == "table" and terminal.usage or {}
+  local new = M.set_turn_stats(entry,
+    usage.output_tokens or usage.completion_tokens,
+    terminal.duration_ms)
+  if terminal.model ~= nil then new.model = terminal.model end
+  return new
+end
+
 function M.set_output(entry, output, err_flag)
   local new = copy(entry)
   new.output = output

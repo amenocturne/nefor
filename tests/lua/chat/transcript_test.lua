@@ -37,14 +37,20 @@ eq(ended.entries[1].text, "")
 eq(ended.entries[1].model, "structured-model")
 eq(ended.pending_assistant_projection, 1)
 
-local with_stats = transcript.attach_latest_assistant_stats(ended, 42, 80)
+local with_stats = transcript.attach_latest_assistant_terminal(ended, {
+  model = "late-model",
+  duration_ms = 80,
+  usage = { output_tokens = 42 },
+})
 eq(with_stats.entries[1].output_tokens, 42)
 eq(with_stats.entries[1].duration_ms, 80)
+eq(with_stats.entries[1].model, "late-model",
+  "late turn metadata updates the completed assistant footer")
 
 local projected = select(1, transcript.project_assistant_message(with_stats, "validated answer"))
 eq(#projected.entries, 1, "durable answer reuses the provider-owned entry")
 eq(projected.entries[1].text, "validated answer")
-eq(projected.entries[1].model, "structured-model")
+eq(projected.entries[1].model, "late-model")
 eq(projected.entries[1].output_tokens, 42)
 eq(projected.entries[1].duration_ms, 80)
 eq(projected.pending_assistant_projection, nil)
