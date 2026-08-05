@@ -7,6 +7,7 @@ local C       = common.C
 local STYLE   = common.STYLE
 local humanize_tokens = common.humanize_tokens
 local usage_view = require("libs.chat.usage")
+local extensions = require("libs.chat.extensions")
 
 local M = {}
 
@@ -15,8 +16,9 @@ M.MODE_BORDER_STYLES = {
 }
 
 function M.input_border_style(state, focused)
-  if not focused then return STYLE.input_border_unfocused end
-  return M.MODE_BORDER_STYLES[state.mode or "default"] or STYLE.input_border
+  local canonical = not focused and STYLE.input_border_unfocused
+    or M.MODE_BORDER_STYLES[state.mode or "default"] or STYLE.input_border
+  return extensions.input_border_style(state, focused, canonical)
 end
 
 local function ctx_bar(used, max)
@@ -65,7 +67,7 @@ local function ctx_bar(used, max)
 end
 
 local function build_segments(state)
-  local segs = {}
+  local segs = extensions.status_segments(state)
   if state.gate_mode == "safe" then
     segs[#segs + 1] = { spans = { { text = "SAFE", fg = C.status_ok, bold = true } } }
   elseif state.gate_mode == "yolo" then

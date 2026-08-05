@@ -25,6 +25,7 @@ local workflow_controls = require("libs.chat.workflow_controls")
 local exit_controls = require("libs.chat.exit_controls")
 local queued_input = require("libs.chat.queued_input")
 local mag_run_bindings = require("libs.mag-run-bindings")
+local extensions   = require("libs.chat.extensions")
 
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
@@ -253,6 +254,40 @@ local function handle_input_submit(msg, state)
   if #text == 0 then return state, {} end
   -- Slash dispatch.
   local cmd, args, _has_ws = slash.parse(text)
+  local extension_state, extension_effects = extensions.handle_command(
+    cmd, args, state, {
+      patch = function(patch)
+        return shallow_merge(state, patch or {})
+      end,
+      finish = function(patch)
+        return shallow_merge(state, shallow_merge({
+          input_value = "",
+          completion = NIL_SENTINEL,
+        }, patch or {}))
+      end,
+      new_session = function(patch)
+        local reset = flush_before_transcript_replace(state)
+        reset_transcript_scroll()
+        return shallow_merge(reset, shallow_merge({
+          entries = {}, in_flight = NIL_SENTINEL,
+          pending_graph_results = NIL_SENTINEL, input_value = "",
+          pending = false, completion = NIL_SENTINEL,
+          runs = {}, sidebar_folds = {},
+          node_previews = {}, preview_registry = {}, scope_to_run = {},
+          turn_started_at = NIL_SENTINEL,
+          last_turn_duration_ms = NIL_SENTINEL,
+          last_esc_ms = NIL_SENTINEL,
+          escape_token = NIL_SENTINEL,
+          escape_count = NIL_SENTINEL,
+          history_cursor = NIL_SENTINEL,
+          popup = NIL_SENTINEL,
+          queued_entry_idx = NIL_SENTINEL,
+        }, patch or {}))
+      end,
+    })
+  if extension_state ~= nil then
+    return extension_state, extension_effects
+  end
   if cmd == "quit" or cmd == "exit" then
     return state, { { kind = "exit" } }
   end

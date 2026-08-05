@@ -138,6 +138,46 @@ fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
     )
 }
 
+fn canonical_chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
+    ensure_test_data_home();
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("repo root")
+        .to_path_buf();
+    let source = std::fs::read_to_string(repo_root.join("starter/chat/init.lua"))
+        .expect("read canonical chat entry");
+    format!(
+        r#"
+        local real_getenv = os.getenv
+        local overrides = {{
+          NEFOR_CONFIG_DIR = {config:?},
+          NEFOR_STARTER_CONFIG_DIR = {config:?},
+          NEFOR_STARTER_CHAT_DIR = {chat:?},
+          NEFOR_LOCAL_DIR = {repo:?},
+          NEFOR_TUI_LUA_DIR = {tui:?},
+          NEFOR_LUA_DIR = {lua:?},
+          NEFOR_DEFAULT_PROVIDER = "mock-plugin",
+          NEFOR_DEFAULT_MODEL = "mock-model",
+        }}
+        os.getenv = function(name)
+          if overrides[name] ~= nil then return overrides[name] end
+          return real_getenv(name)
+        end
+        os.execute = function() return true end
+        {source}
+        "#,
+        config = config_dir.display().to_string(),
+        chat = repo_root.join("starter/chat").display().to_string(),
+        repo = repo_root.display().to_string(),
+        tui = repo_root
+            .join("plugins/nefor-tui/lua")
+            .display()
+            .to_string(),
+        lua = repo_root.join("lua").display().to_string(),
+    )
+}
+
 fn render_str(engine: &mut Engine) -> String {
     match engine.render_if_dirty().expect("render") {
         Some(bytes) => String::from_utf8(bytes).expect("ansi is utf-8"),
@@ -9339,6 +9379,179 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
         !cold_render.contains("hidden late payload"),
         "{cold_render}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn config_chat_extension_coexists_with_canonical_conversation_projection() {
+    let temp = tempfile::tempdir().expect("chat extension tempdir");
+    let config = temp.path().join("config");
+    std::fs::create_dir_all(config.join("config")).expect("config module dir");
+    std::fs::create_dir_all(config.join("chat")).expect("poison chat dir");
+    std::fs::write(
+        config.join("chat/update.lua"),
+        "error('foreign config shadowed canonical chat.update')",
+    )
+    .expect("write poison reducer");
+    std::fs::write(
+        config.join("chat/statusline.lua"),
+        "error('foreign config shadowed canonical chat.statusline')",
+    )
+    .expect("write poison statusline");
+    std::fs::write(
+        config.join("chat/slash.lua"),
+        "error('foreign config shadowed canonical chat.slash')",
+    )
+    .expect("write poison slash registry");
+    std::fs::write(
+        config.join("config/init.lua"),
+        r#"
+        return { active = {
+          default_provider = "mock-plugin",
+          default_model = "mock-model",
+          default_reasoning_effort = "medium",
+          chat_extension = "test-chat-extension",
+        } }
+        "#,
+    )
+    .expect("write config");
+    std::fs::write(
+        config.join("test-chat-extension.lua"),
+        r#"
+        local function effect(kind, value)
+          return { kind = "send_to", target = "engine",
+            body = { kind = kind, value = value } }
+        end
+        return {
+          initial_state = function(_state) return { extension_value = "ready" } end,
+          commands = {
+            {
+              name = "echo", hint = "set extension state", takes_args = true,
+              arg_completions = { { name = "hello", hint = "test value" } },
+              run = function(args, state, api)
+                assert(state.extension_value ~= nil)
+                return api.finish({ extension_value = args or "" }),
+                  { effect("test.extension.echo", args) }
+              end,
+            },
+            {
+              name = "mode", extend = true,
+              arg_completions = { { name = "audio", hint = "test mode" } },
+              run = function(args, _state, api)
+                if args ~= "audio" then return nil end
+                return api.new_session({
+                  mode = "audio", provider = "audio-provider", model = "audio-model",
+                }), {
+                  effect("sessions.new_request"),
+                  { kind = "send_to", target = "engine", body = {
+                    kind = "chat.model.set", provider = "audio-provider", model = "audio-model",
+                  } },
+                }
+              end,
+            },
+            {
+              name = "mutate", hint = "prove state is immutable", takes_args = false,
+              run = function(_args, state, _api)
+                state.mode = "corrupted"
+              end,
+            },
+          },
+          status_segments = function(state)
+            return { { spans = { { text = "EXT:" .. tostring(state.extension_value) } } } }
+          end,
+        }
+        "#,
+    )
+    .expect("write extension");
+
+    let mut engine = Engine::new(120, 40).expect("engine");
+    engine
+        .load_scenario(&canonical_chat_lua_source_for_config(&config))
+        .expect("load canonical chat with extension");
+    let initial = render_snapshot(&mut engine);
+    assert!(initial.contains("EXT:ready"), "{initial}");
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.changed", "value": "/echo " }),
+    );
+    let state = engine.state_table().expect("state");
+    let completion: mlua::Table = state.get("completion").expect("completion");
+    let matches: mlua::Table = completion.get("matches").expect("matches");
+    let names = matches
+        .sequence_values::<mlua::Table>()
+        .map(|entry| entry.unwrap().get::<String>("name").unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name == "echo hello"), "{names:?}");
+    drop(state);
+
+    dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/echo configured" }),
+    );
+    let state = engine.state_table().expect("state");
+    assert_eq!(
+        state.get::<String>("extension_value").unwrap(),
+        "configured"
+    );
+    drop(state);
+    assert!(engine
+        .take_emit_queue()
+        .iter()
+        .any(|(_, body)| body.get("kind") == Some(&json!("test.extension.echo"))));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/mode audio" }),
+    );
+    let state = engine.state_table().expect("state");
+    assert_eq!(state.get::<String>("mode").unwrap(), "audio");
+    assert_eq!(state.get::<String>("provider").unwrap(), "audio-provider");
+    assert_eq!(state.get::<String>("model").unwrap(), "audio-model");
+    drop(state);
+
+    fixture_assistant_delta(&mut engine, "CANONICAL ANSWER");
+    fixture_assistant_completed(
+        &mut engine,
+        Some("CANONICAL ANSWER".into()),
+        json!({
+            "model": "ext-model", "duration_ms": 2_000,
+            "usage": { "output_tokens": 40 }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "LEGACY DUPLICATE" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "text": "LEGACY DUPLICATE",
+            "model": "legacy-model", "duration_ms": 99_000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.session.stats", "model": "legacy-model",
+            "duration_ms": 99_000, "output_tokens": 1 }),
+    );
+    let snapshot = render_snapshot(&mut engine);
+    assert!(snapshot.contains("CANONICAL ANSWER"), "{snapshot}");
+    assert!(!snapshot.contains("LEGACY DUPLICATE"), "{snapshot}");
+    assert!(!snapshot.contains("legacy-model"), "{snapshot}");
+    assert_eq!(
+        snapshot.matches("▣ ext-model · 2s · 20 tok/s").count(),
+        1,
+        "extension must not duplicate the canonical terminal footer:\n{snapshot}"
+    );
+
+    let mutation = json!({ "kind": "input.submit", "value": "/mutate" });
+    let mutation_body = mutation.as_object().expect("mutation body").clone();
+    let error = engine
+        .dispatch_envelope_body(&mutation_body)
+        .expect_err("extension must not mutate canonical state");
+    assert!(error.to_string().contains("read-only"), "{error}");
+    let state = engine.state_table().expect("state after rejected mutation");
+    assert_eq!(state.get::<String>("mode").unwrap(), "audio");
 }
 
 #[test]

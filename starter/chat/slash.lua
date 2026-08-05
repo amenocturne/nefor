@@ -4,8 +4,9 @@
 -- module owns the data (slash list, @-path filesystem source).
 
 local M = {}
+local extensions = require("libs.chat.extensions")
 
-M.COMMANDS = {
+M.BASE_COMMANDS = {
   { name = "new",     aliases = { "clear" }, hint = "start a fresh chat (clears transcript)", takes_args = false },
   { name = "help",    aliases = {},          hint = "show the help popup",                    takes_args = false },
   { name = "quit",    aliases = { "exit" },  hint = "exit nefor",                             takes_args = false },
@@ -30,6 +31,10 @@ M.COMMANDS = {
   { name = "raw",     aliases = {},          hint = "reveal one tool receipt by id",          takes_args = true },
 }
 
+local function commands()
+  return extensions.commands(M.BASE_COMMANDS)
+end
+
 local function command_matches(cmd, q)
   if cmd.name:lower():sub(1, #q) == q then return true end
   for _, a in ipairs(cmd.aliases or {}) do
@@ -39,7 +44,7 @@ local function command_matches(cmd, q)
 end
 
 local function command_by_exact_name_or_alias(q)
-  for _, cmd in ipairs(M.COMMANDS) do
+  for _, cmd in ipairs(commands()) do
     if cmd.name:lower() == q then return cmd end
     for _, a in ipairs(cmd.aliases or {}) do
       if a:lower() == q then return cmd end
@@ -50,7 +55,7 @@ end
 
 local function ranked_command_matches(q)
   local ranked = {}
-  for idx, cmd in ipairs(M.COMMANDS) do
+  for idx, cmd in ipairs(commands()) do
     if command_matches(cmd, q) then ranked[#ranked + 1] = { entry = cmd, order = idx } end
   end
   table.sort(ranked, function(a, b)
@@ -109,7 +114,7 @@ function M.parse(text)
   -- like `/safe`, `/auto`, and `/yolo` still work.
   if text:find("^/[^%s]+/") then
     local known = false
-    for _, entry in ipairs(M.COMMANDS) do
+    for _, entry in ipairs(commands()) do
       if entry.name == cmd then known = true; break end
     end
     if not known then return nil, nil, false end
@@ -253,7 +258,7 @@ function M.completions()
     {
       trigger      = "/",
       anchor       = "start",
-      source       = function() return M.COMMANDS end,
+      source       = commands,
       filter       = function(_, body) return slash_filter(body or "") end,
       format_entry = slash_format,
       apply        = slash_apply,
@@ -261,7 +266,7 @@ function M.completions()
     {
       trigger      = "/",
       anchor       = "start-spaced",
-      source       = function() return M.COMMANDS end,
+      source       = commands,
       filter       = function(_, body) return slash_filter(body or "") end,
       format_entry = slash_format,
       apply        = slash_apply,

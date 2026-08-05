@@ -108,17 +108,14 @@ do
     error("starter/chat.lua: could not locate plugins/nefor-tui/lua/init.lua")
   end
 
-  -- Starter chat-sub dir holds the submodules. Defaults to
-  -- `<NEFOR_CONFIG_DIR>/chat` (the user installs starter/ as their
-  -- config dir; chat/ is a sibling of init.lua).
-  -- Order matters: chat/* is the user-editable surface (the engine
-  -- runs the copy at $NEFOR_CONFIG_DIR/chat/init.lua, and user edits
-  -- to sibling submodules should win). Prefer config_dir over local or
-  -- pm-cloned upstream copies. NEFOR_DEV_DIR still wins overall for
-  -- in-repo iteration.
+  -- The entry script and its sibling modules are one canonical consumer.
+  -- NEFOR_CONFIG_DIR is deliberately absent: foreign configs contribute
+  -- only `config.active.chat_extension` and cannot shadow update/slash/
+  -- statusline with stale reducer copies. nefor-tui exports the `--script`
+  -- parent as NEFOR_STARTER_CHAT_DIR; explicit overrides remain available to
+  -- in-process tests and development launchers.
   local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/update.lua", table.pack(
     dev_dir    and (dev_dir    .. "/starter/chat") or nil,
-    config_dir and (config_dir .. "/chat") or nil,
     local_dir  and (local_dir  .. "/starter/chat") or nil,
     detected_dir and (detected_dir .. "/starter/chat") or nil,
     pm_root    and (pm_root    .. "/starter/chat") or nil,
@@ -131,8 +128,8 @@ do
 
   local chat_parent = chat_dir:match("^(.*)/chat$")
   local config_lua_dir = pick_dir("NEFOR_STARTER_CONFIG_DIR", "/config/init.lua", table.pack(
-    dev_dir    and (dev_dir    .. "/starter") or nil,
     config_dir,
+    dev_dir    and (dev_dir    .. "/starter") or nil,
     local_dir  and (local_dir  .. "/starter") or nil,
     detected_dir and (detected_dir .. "/starter") or nil,
     chat_parent,
@@ -204,15 +201,18 @@ do
   table.insert(searchers, 1, make_prefix_searcher("chat",       chat_dir))
 end
 
-local history = require("libs.chat.history")
-local view    = require("libs.chat.view")
-local update  = require("chat.update")
-
 local function active_config()
   local ok, cfg = pcall(function() return require("config").active end)
   if ok and type(cfg) == "table" then return cfg end
   return {}
 end
+
+local extensions = require("libs.chat.extensions")
+extensions.load(active_config())
+
+local history = require("libs.chat.history")
+local view    = require("libs.chat.view")
+local update  = require("chat.update")
 
 local function sidebar_fixture_runs()
   if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") ~= "1" then return {} end
@@ -249,7 +249,7 @@ local function initial_state()
   if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1" and next(fixture_runs) == nil then
     error("sidebar overflow fixture environment was visible but fixture construction failed")
   end
-  return {
+  local state = {
     entries          = {},
     in_flight        = nil,
     pending_graph_results = nil,
@@ -305,6 +305,11 @@ local function initial_state()
     prompt_history   = history.load(),
     history_cursor   = nil,
   }
+  local patch = extensions.initial_patch(state)
+  if patch ~= nil then
+    for key, value in pairs(patch) do state[key] = value end
+  end
+  return state
 end
 
 tui.start {
