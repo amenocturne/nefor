@@ -127,6 +127,8 @@ fn canonical_chat_lua_source_for_config(config_dir: &std::path::Path) -> String 
         end
         os.execute = function() return true end
         {source}
+        local config_ok, config_error = pcall(function() return require("config").active end)
+        assert(config_ok, tostring(config_error))
         "#,
         config = config_dir.display().to_string(),
         chat = repo_root.join("starter/chat").display().to_string(),
@@ -9068,6 +9070,7 @@ fn personal_extension_behavior_uses_canonical_tui() {
     let temp = tempfile::tempdir().expect("personal chat tempdir");
     let config = temp.path().join("config");
     std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::create_dir_all(config.join("mag/lib")).expect("catalog dir");
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(personal_config.join("config"), config.join("config"))
@@ -9082,6 +9085,16 @@ fn personal_extension_behavior_uses_canonical_tui() {
             config.join("chat-save.lua"),
         )
         .expect("link personal chat save helper");
+        std::os::unix::fs::symlink(
+            personal_config.join("tool-catalog.lua"),
+            config.join("tool-catalog.lua"),
+        )
+        .expect("link personal tool catalog loader");
+        std::os::unix::fs::symlink(
+            personal_config.join("mag/lib/tool-catalog.json"),
+            config.join("mag/lib/tool-catalog.json"),
+        )
+        .expect("link personal tool catalog");
         std::os::unix::fs::symlink(
             personal_config.join("gemma-audio-core.lua"),
             config.join("gemma-audio-core.lua"),
