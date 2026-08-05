@@ -226,6 +226,12 @@ local function persist_envelope(entry)
   if ok and type(decoded) == "table" and type(decoded.body) == "table" then
     local kind = decoded.body.kind
     if type(kind) == "string" and kind:sub(1, 9) == "sessions." then return end
+    if type(kind) == "string" and kind:sub(1, 13) == "conversation." then
+      local canonical = kind == "conversation.fact.recorded"
+        and decoded.from == "conversation-manager"
+        and decoded.body.duplicate ~= true
+      if not canonical then return end
+    end
   end
 
   local is_user_submit = ok

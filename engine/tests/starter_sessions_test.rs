@@ -74,7 +74,7 @@ fn jsonl_excludes_session_control_events() {
             return {
                 ts      = "2026-05-04T00:00:00.000Z",
                 origin  = origin,
-                payload = json.encode({ type = "event", body = body }),
+                payload = json.encode({ type = "event", from = origin, body = body }),
             }
         end
         -- User submit opens the lazy session file.
@@ -86,6 +86,13 @@ fn jsonl_excludes_session_control_events() {
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.resume_done", session_id = "y" }))
         -- Another normal entry.
         sessions_test._persist_envelope(entry("ollama", { kind = "chat.message.append", role = "user", text = "hi" }))
+        -- Conversation-manager uses a single event-sourcing boundary. Commands,
+        -- projections, and forged records are ephemeral; only its canonical fact persists.
+        sessions_test._persist_envelope(entry("lead", { kind = "conversation.fact.append", fact = {} }))
+        sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.projection.delta", sequence = 1 }))
+        sessions_test._persist_envelope(entry("other", { kind = "conversation.fact.recorded", event = {} }))
+        sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.fact.recorded", duplicate = true, event = {} }))
+        sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.fact.recorded", event = { sequence = 1 } }))
         "#,
     )
     .exec()
@@ -94,11 +101,11 @@ fn jsonl_excludes_session_control_events() {
     // Read the file back and assert the filter behaviour.
     let body = std::fs::read_to_string(&session_path).expect("read jsonl");
     let lines: Vec<&str> = body.lines().collect();
-    // Header + 2 normal entries (the four sessions.* drops).
+    // Header + 2 normal entries + the one canonical conversation fact.
     assert_eq!(
         lines.len(),
-        3,
-        "expected header + 2 entries, got {}: {body}",
+        4,
+        "expected header + 3 entries, got {}: {body}",
         lines.len()
     );
     // Header line carries `_session: true`.
@@ -118,6 +125,11 @@ fn jsonl_excludes_session_control_events() {
         lines[2].contains("chat.message.append"),
         "second non-header entry should be chat.message.append: {}",
         lines[2]
+    );
+    assert!(
+        lines[3].contains("conversation.fact.recorded"),
+        "only the manager-authored canonical fact should persist: {}",
+        lines[3]
     );
     // Belt-and-braces: confirm no sessions.* string snuck through.
     for line in lines.iter().skip(1) {

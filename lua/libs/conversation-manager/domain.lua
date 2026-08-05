@@ -71,7 +71,10 @@ handlers.created = function(conversation, event)
     provenance = copy(event.provenance or {}),
     messages = {}, message_by_id = {},
     exchanges = {}, exchange_by_id = {},
-    retries = {}, events = {}, last_sequence = 0,
+    retries = {},
+    turns = {}, turn_by_id = {},
+    compactions = {}, compaction_by_id = {},
+    events = {}, last_sequence = 0,
   }
 end
 
@@ -87,7 +90,14 @@ handlers.message_started = function(c, event)
   ok, e = require_id(event, "message_id"); if not ok then return nil, e end
   if c.message_by_id[event.message_id] then return err("message_id_conflict", { message_id = event.message_id }) end
   if not roles[event.role] then return err("invalid_role", { message_id = event.message_id, role = event.role }) end
-  local message = { id = event.message_id, role = event.role, status = "open", chunks = {}, attempts = {} }
+  local turn = event.turn_id and c.turn_by_id[event.turn_id] or nil
+  if event.turn_id and not turn then return err("turn_not_found", { turn_id = event.turn_id }) end
+  if turn and turn.status ~= "open" then return err("turn_not_open", { turn_id = turn.id, status = turn.status }) end
+  local message = {
+    id = event.message_id, role = event.role, status = "open",
+    turn_id = event.turn_id, tool_call_id = event.tool_call_id,
+    tool_name = event.tool_name, chunks = {}, attempts = {},
+  }
   c.messages[#c.messages + 1] = message; c.message_by_id[message.id] = message
   return c
 end
@@ -163,7 +173,24 @@ handlers.message_completed = function(c, event)
       return err("tool_call_incomplete", { exchange_id = exchange.id, message_id = message.id })
     end
   end
-  message.status = "completed"; message.completion = copy(event.completion or {})
+  message.status = "completed"
+  message.completion = copy(event.completion or {})
+  message.terminal = {
+    model = event.model,
+    duration_ms = event.duration_ms,
+    usage = copy(event.usage),
+    finish_reason = event.finish_reason,
+  }
+  return c
+end
+
+handlers.message_interrupted = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local message = find_message(c, event.message_id)
+  if not message then return err("message_not_found", { message_id = event.message_id }) end
+  if message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  message.status = "interrupted"
+  message.terminal = copy(event.detail or event.terminal or {})
   return c
 end
 
@@ -179,6 +206,96 @@ handlers.retry_started = function(c, event)
   if message then message.attempts[#message.attempts + 1] = retry end
   return c
 end
+
+handlers.turn_started = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  ok, e = require_id(event, "turn_id"); if not ok then return nil, e end
+  ok, e = require_id(event, "run_id"); if not ok then return nil, e end
+  if c.turn_by_id[event.turn_id] then return err("turn_id_conflict", { turn_id = event.turn_id }) end
+  local turn = {
+    id = event.turn_id,
+    run_id = event.run_id,
+    actor_id = event.actor_id,
+    status = "open",
+    provenance = copy(event.provenance or {}),
+    message_start = #c.messages + 1,
+    sequence_start = event.sequence,
+  }
+  c.turns[#c.turns + 1] = turn
+  c.turn_by_id[turn.id] = turn
+  return c
+end
+
+local function finish_turn(status)
+  return function(c, event)
+    local ok, e = require_live(c, event); if not ok then return nil, e end
+    local turn = c.turn_by_id[event.turn_id]
+    if not turn then return err("turn_not_found", { turn_id = event.turn_id }) end
+    if turn.status ~= "open" then return err("turn_not_open", { turn_id = turn.id, status = turn.status }) end
+    if event.run_id ~= turn.run_id then
+      return err("turn_run_mismatch", { turn_id = turn.id, expected = turn.run_id, actual = event.run_id })
+    end
+    for _, message in ipairs(c.messages) do
+      if message.turn_id == turn.id and message.status == "open" then
+        return err("open_message_at_turn_terminal", { turn_id = turn.id, message_id = message.id })
+      end
+    end
+    turn.status = status
+    turn.message_end = #c.messages
+    turn.sequence_end = event.sequence
+    turn.terminal = copy(event.detail or event.terminal or {})
+    return c
+  end
+end
+handlers.turn_completed = finish_turn("completed")
+handlers.turn_failed = finish_turn("failed")
+handlers.turn_interrupted = finish_turn("interrupted")
+
+handlers.context_compaction_requested = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  ok, e = require_id(event, "request_id"); if not ok then return nil, e end
+  if c.compaction_by_id[event.request_id] then
+    return err("compaction_request_conflict", { request_id = event.request_id })
+  end
+  if type(event.history_cutoff) ~= "number" or event.history_cutoff % 1 ~= 0 or event.history_cutoff < 0 then
+    return err("invalid_history_cutoff", { request_id = event.request_id, history_cutoff = event.history_cutoff })
+  end
+  local compaction = {
+    request_id = event.request_id,
+    status = "pending",
+    history_cutoff = event.history_cutoff,
+    requested_sequence = event.sequence,
+  }
+  c.compactions[#c.compactions + 1] = compaction
+  c.compaction_by_id[compaction.request_id] = compaction
+  return c
+end
+
+local function finish_compaction(status)
+  return function(c, event)
+    local ok, e = require_live(c, event); if not ok then return nil, e end
+    local compaction = c.compaction_by_id[event.request_id]
+    if not compaction then return err("compaction_request_not_found", { request_id = event.request_id }) end
+    if compaction.status ~= "pending" then
+      return err("compaction_request_terminal", { request_id = event.request_id, status = compaction.status })
+    end
+    if status == "completed" then
+      if event.checkpoint == nil then return err("missing_checkpoint", { request_id = event.request_id }) end
+      if event.compatibility ~= nil and type(event.compatibility) ~= "table" then
+        return err("invalid_checkpoint_compatibility", { request_id = event.request_id })
+      end
+      compaction.checkpoint = copy(event.checkpoint)
+      compaction.compatibility = copy(event.compatibility or {})
+    else
+      compaction.error = copy(event.error)
+    end
+    compaction.status = status
+    compaction.terminal_sequence = event.sequence
+    return c
+  end
+end
+handlers.context_compaction_completed = finish_compaction("completed")
+handlers.context_compaction_failed = finish_compaction("failed")
 
 local function terminate(status)
   return function(c, event)
@@ -209,6 +326,16 @@ function M.fold(conversation, event)
     if event.conversation_id ~= conversation.id then return err("conversation_id_mismatch", { expected = conversation.id, actual = event.conversation_id }) end
     if event.sequence ~= conversation.last_sequence + 1 then return err("noncontiguous_sequence", { conversation_id = conversation.id, expected = conversation.last_sequence + 1, actual = event.sequence }) end
   end
+  if conversation and event.turn_id and event.kind ~= "turn_started" then
+    local turn = conversation.turn_by_id[event.turn_id]
+    if not turn then return err("turn_not_found", { turn_id = event.turn_id }) end
+    if event.run_id ~= nil and event.run_id ~= turn.run_id then
+      return err("turn_run_mismatch", { turn_id = turn.id, expected = turn.run_id, actual = event.run_id })
+    end
+    if event.actor_id ~= nil and turn.actor_id ~= nil and event.actor_id ~= turn.actor_id then
+      return err("turn_actor_mismatch", { turn_id = turn.id, expected = turn.actor_id, actual = event.actor_id })
+    end
+  end
   local next_conversation = copy(conversation)
   local folded, e = handler(next_conversation, event); if not folded then return nil, e end
   folded.last_sequence = event.sequence
@@ -220,6 +347,7 @@ function M.read_model(conversation)
   if not conversation then return nil end
   local out = copy(conversation)
   out.message_by_id = nil; out.exchange_by_id = nil
+  out.turn_by_id = nil; out.compaction_by_id = nil
   return out
 end
 

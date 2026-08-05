@@ -1,5 +1,6 @@
 local manager = require("libs.conversation-manager")
 local domain = manager.domain
+local projection = require("libs.conversation-manager.projection")
 local replay_window = require("core.history_replay")
 
 local M = {}
@@ -52,22 +53,50 @@ function M.build(options)
     session_id = next_session_id
   end
 
-  local function handle_append(body)
-    if replay_active() then return end
-    local fact = body.fact
-    local conversation, e, duplicate, event = store:append(fact)
-    if not conversation then reject(fact, e); return end
+  local function publish_recorded(event, duplicate, conversation, before)
     send({
       kind = "conversation.fact.recorded",
       event = event,
       duplicate = duplicate,
       session_id = session_id,
     })
+    if not duplicate then
+      send({
+        kind = "conversation.projection.delta",
+        conversation_id = event.conversation_id,
+        sequence = event.sequence,
+        change = projection.change(before, conversation, event),
+      })
+    end
+  end
+
+  local function append_fact(fact)
+    local before = type(fact) == "table" and store:get(fact.conversation_id) or nil
+    local conversation, e, duplicate, event = store:append(fact)
+    if not conversation then reject(fact, e); return nil end
+    publish_recorded(event, duplicate, conversation, before)
+    return conversation
+  end
+
+  local function handle_append(body)
+    if replay_active() then return end
+    append_fact(body.fact)
   end
 
   local function handle_recorded(body)
-    local _, e = store:apply_recorded(body.event)
+    local event = body.event
+    local before = type(event) == "table" and store:get(event.conversation_id) or nil
+    local conversation, e, duplicate = store:apply_recorded(event)
     if e then diagnose(body.event, e) end
+    if conversation and not duplicate and replay_active() then
+      send({
+        kind = "conversation.projection.delta",
+        conversation_id = event.conversation_id,
+        sequence = event.sequence,
+        replay = true,
+        change = projection.change(before, conversation, event),
+      })
+    end
   end
 
   local function handle_get(body)
@@ -81,13 +110,13 @@ function M.build(options)
       })
       return
     end
-    local conversation = store:get(body.conversation_id)
+    local conversation = projection.conversation(store:get(body.conversation_id))
     send({
       kind = "conversation.snapshot",
       request_id = body.request_id,
       conversation_id = body.conversation_id,
       found = conversation ~= nil,
-      conversation = conversation,
+      projection = conversation,
     })
   end
 
@@ -104,7 +133,66 @@ function M.build(options)
     send({
       kind = "conversation.list",
       request_id = body.request_id,
-      conversations = store:list(),
+      conversations = (function()
+        local out = {}
+        for _, conversation in ipairs(store:list()) do out[#out + 1] = projection.conversation(conversation) end
+        return out
+      end)(),
+    })
+  end
+
+  local function handle_context(body)
+    if replay_active() then return end
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id)
+        or (body.compatibility ~= nil and type(body.compatibility) ~= "table") then
+      send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_context_request" })
+      return
+    end
+    local context = projection.context(store:get(body.conversation_id), body.compatibility)
+    send({
+      kind = "conversation.context.snapshot",
+      request_id = body.request_id,
+      conversation_id = body.conversation_id,
+      found = context ~= nil,
+      context = context,
+    })
+  end
+
+  local function handle_compaction_request(body)
+    if replay_active() then return end
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id) then
+      send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_compaction_request" })
+      return
+    end
+    local conversation = store:get(body.conversation_id)
+    if not conversation then
+      reject({ event_id = "compaction:" .. body.request_id .. ":requested", conversation_id = body.conversation_id },
+        { code = "conversation_not_found", context = { request_id = body.request_id } })
+      return
+    end
+    append_fact({
+      event_id = "compaction:" .. body.request_id .. ":requested",
+      conversation_id = body.conversation_id,
+      kind = "context_compaction_requested",
+      request_id = body.request_id,
+      history_cutoff = projection.context(conversation, nil).history_length,
+    })
+  end
+
+  local function handle_compaction_terminal(body, kind)
+    if replay_active() then return end
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id) then
+      send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_compaction_terminal" })
+      return
+    end
+    append_fact({
+      event_id = "compaction:" .. body.request_id .. ":" .. (kind == "context_compaction_completed" and "completed" or "failed"),
+      conversation_id = body.conversation_id,
+      kind = kind,
+      request_id = body.request_id,
+      checkpoint = domain.copy(body.checkpoint),
+      compatibility = domain.copy(body.compatibility),
+      error = domain.copy(body.error),
     })
   end
 
@@ -131,6 +219,14 @@ function M.build(options)
     end
     if body.kind == "conversation.get.request" then handle_get(body); return end
     if body.kind == "conversation.list.request" then handle_list(body); return end
+    if body.kind == "conversation.context.request" then handle_context(body); return end
+    if body.kind == "conversation.context.compact.request" then handle_compaction_request(body); return end
+    if body.kind == "conversation.context.compact.complete" then
+      handle_compaction_terminal(body, "context_compaction_completed"); return
+    end
+    if body.kind == "conversation.context.compact.failed" then
+      handle_compaction_terminal(body, "context_compaction_failed"); return
+    end
   end
 
   return {
