@@ -11,17 +11,9 @@
 -- bridge like any kernel run — the final response lands in the sink, the
 -- terminal `mag.run_result` closes the turn, and the constellation dies.
 --
--- What outlives turns lives HERE:
---   * canonical history — per completed turn the llm's FULL transcript delta
---     (user task, assistant tool-call turns, tool results, final answer —
---     ridden back on `mag.run_result result.transcript_delta`, see
---     factories/llm.lua "Transcript delta") is appended and seeded into the
---     next turn's llm via `params.history`, so the next turn replays what the
---     model SAW, not just what it said. A turn that ends without a delta
---     (killed/failed, or a non-llm program) falls back to the bare
---     `{ user message, answer }` pair. `agentic_loop.turn_recorded` markers
---     on the bus make the history rebuildable on /resume.
---   * queueing/orchestration — queued-message promotion while busy, the
+-- What outlives turns lives in conversation-manager. This actor caches only
+-- its universal context projection and never folds provider or MAG facts.
+-- What remains HERE is queueing/orchestration — queued-message promotion while busy, the
 --     deferred relay queue for dispatched-run completions
 --     (lead-workflow → relay_run_completion), model/profile switching, the
 --     statusline runtime states.
@@ -54,8 +46,8 @@
 --   * `mag.run_result { run_id, status }`— close the turn
 --   * `<gate>.tool.invoke` / `tool.result` (lead-scoped ids) — transcript
 --     tool events + observers
---   * `agentic_loop.turn_recorded`       — replay: rebuild history
---   * `agentic_loop.compaction_recorded` — replay: restore compacted context
+--   * `conversation.projection.delta`    — update the disposable context cache
+--   * `conversation.context.snapshot`    — restore/query universal model context
 --   * `sessions.session_end`             — teardown
 
 local json = nefor.json
@@ -65,6 +57,7 @@ local ids             = require("core.ids")
 local results_lib     = require("libs.agentic-loop.results")
 local history_replay  = require("core.history_replay")
 local session_config  = require("libs.agentic-loop.session_config")
+local conversation_projection = require("libs.agentic-loop.conversation_projection")
 
 local state = {
   -- Orchestrator config — mutated by configure() / chat.model.set.
@@ -89,17 +82,14 @@ local state = {
     load_id    = nil,   ---@type string|nil  in-flight mag.load request id
   },
 
-  -- Canonical conversation history: provider-dialect messages, the full
-  -- transcript delta per completed turn (bare user+assistant pair when a
-  -- turn ends without one). Seeded into each turn's llm via params.history;
-  -- rebuilt on /resume from turn_recorded markers.
-  history = {},                 ---@type table
-  -- Provider-native context compacted through history[history_len]. The full
-  -- canonical transcript remains above as the lossless fallback for a later
-  -- provider/model switch; matching turns seed the opaque artifact plus only
-  -- messages recorded after its cutoff.
-  compaction = nil,             ---@type table|nil
+  -- Read-only projection of conversation-manager's canonical recorded facts.
+  -- The loop never folds its outbound append requests optimistically: the
+  -- manager's recorded acknowledgement is the sole commit boundary.
+  conversation = conversation_projection.new(),
+  conversation_id = nil,
+  pending_conversation_create = nil,
   pending_compaction = nil,     ---@type table|nil
+  pending_context_request = nil,
 
   current_run_id = nil,         ---@type string|nil
   -- The in-flight turn: { run_id, user_text, scope, chat_prefix, streamed }.
@@ -135,6 +125,56 @@ local emit           = envelope.emit
 
 local format_deferred = results_lib.format_deferred
 
+local function conversation_history()
+  return state.conversation:history()
+end
+
+local function conversation_commit_pending()
+  return state.pending_compaction ~= nil
+      or state.pending_context_request ~= nil
+end
+
+local function append_conversation_fact(fact)
+  emit("conversation-manager", {
+    kind = "conversation.fact.append",
+    fact = fact,
+  })
+end
+
+local function ensure_conversation_id()
+  local conversation_id = state.conversation_id
+  if conversation_id ~= nil then return conversation_id end
+  conversation_id = "conversation-" .. envelope.uuid_lite()
+  local event_id = "conversation-event-" .. envelope.uuid_lite()
+  state.conversation_id = conversation_id
+  state.pending_conversation_create = event_id
+  append_conversation_fact({
+    kind = "created",
+    event_id = event_id,
+    conversation_id = conversation_id,
+    provenance = { surface = "lead" },
+  })
+  return conversation_id
+end
+
+local function conversation_ready()
+  return state.conversation_id ~= nil
+      and state.conversation:id() == state.conversation_id
+      and state.pending_conversation_create == nil
+end
+
+local function request_context(reason)
+  if not conversation_ready() then return false end
+  local request_id = "conversation-context-" .. envelope.uuid_lite()
+  state.pending_context_request = { id = request_id, reason = reason }
+  emit("conversation-manager", {
+    kind = "conversation.context.request",
+    request_id = request_id,
+    conversation_id = state.conversation_id,
+  })
+  return true
+end
+
 local function starts_with(s, prefix)
   return type(s) == "string" and type(prefix) == "string" and #prefix > 0
     and s:sub(1, #prefix) == prefix
@@ -156,6 +196,7 @@ end
 
 local function emit_idle_if_idle(run_id)
   if state.current_run_id ~= nil then return end
+  if conversation_commit_pending() then return end
   if #state.deferred_queue > 0 then return end
   if #state.pending_user_inputs > 0 then return end
   emit_runtime_state("agentic_loop.idle", { run_id = run_id })
@@ -466,6 +507,12 @@ end
 -- canonical history onto the lead llm actor, and submits `mag.execute`.
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
+  local conversation_id = ensure_conversation_id()
+  if not conversation_ready() then
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = user_text
+    ensure_lead_program_loaded()
+    return nil
+  end
   local p = state.lead_program
   if p.artifact == nil then
     -- Program not compiled yet: queue the text and (re)kick the load; the
@@ -483,26 +530,14 @@ local function submit_orchestrator_run(user_text)
     end
   end
 
-  local history = state.history
-  local context_artifact = nil
-  local compaction = state.compaction
-  if type(compaction) == "table"
-      and compaction.provider == state.config.provider
-      and compaction.model == state.config.model
-      and type(compaction.model_context_artifact) == "table"
-      and type(compaction.history_len) == "number" then
-    history = {}
-    for i = compaction.history_len + 1, #state.history do
-      history[#history + 1] = state.history[i]
-    end
-    context_artifact = deep_clone(compaction.model_context_artifact)
-  end
+  local full_history = conversation_history()
+  local history = full_history
+  local conversation_context = state.conversation:context()
   local overlay_params = {
     history = deep_clone(history),
+    conversation_id = conversation_id,
+    conversation_context = deep_clone(conversation_context),
   }
-  if context_artifact ~= nil then
-    overlay_params.context_artifact = context_artifact
-  end
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
     overlay_params.provider = state.config.provider
   end
@@ -526,10 +561,13 @@ local function submit_orchestrator_run(user_text)
   state.current_run_id = run_id
   state.current_turn = {
     run_id    = run_id,
+    turn_id   = run_id,
     user_text = user_text or "",
     scope     = nil,
     chat_prefix = nil,
     streamed  = false,
+    manager_terminal = false,
+    result_body = nil,
   }
   emit_runtime_state("agentic_loop.run_start", { run_id = run_id })
 
@@ -538,7 +576,9 @@ local function submit_orchestrator_run(user_text)
     kind           = "mag.execute",
     id             = run_id,
     run_id         = run_id,
+    turn_id        = run_id,
     run_name       = "lead",
+    conversation_id = conversation_id,
     session_id     = sessions.current_id(),
     principal      = "lead",
     artifact       = artifact,
@@ -547,7 +587,7 @@ local function submit_orchestrator_run(user_text)
   nefor.log.info("agentic-loop: lead turn submitted to mag kernel", {
     run_id = run_id,
     text_preview = string.sub(user_text or "", 1, 80),
-    history_len = #state.history,
+    history_len = #full_history,
   })
   return run_id
 end
@@ -575,6 +615,7 @@ end
 -- by lead-workflow and mag-eval (relay_run_completion).
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
+  if conversation_commit_pending() or not conversation_ready() then return end
   local merged = drain_deferred_text()
   if type(merged) ~= "string" then return end
   nefor.log.info("agentic-loop: flushing deferred run completions", {
@@ -585,6 +626,8 @@ end
 
 flush_pending_user_inputs = function()
   if state.current_run_id ~= nil then return end
+  if conversation_commit_pending() or not conversation_ready() then return end
+  if state.lead_program.artifact == nil then return end
   if #state.pending_user_inputs == 0 then return end
   local inputs = state.pending_user_inputs
   local combined = table.concat(inputs, "\n")
@@ -614,7 +657,8 @@ end
 -- reaps the constellation through the fold — kill handlers run, so the
 -- in-flight provider request's cancel envelope reaches the bus — and
 -- settles the turn as `mag.run_result status:"killed"` (handled below:
--- turn aborted, no history append). Run state clears on that reply, not
+-- turn interrupted). Run state clears after both that reply and the manager's
+-- terminal turn projection, not
 -- here, so a duplicate Esc is a kernel-side no-op.
 local function kill_active_lead_run()
   if state.current_run_id == nil then return false end
@@ -631,9 +675,8 @@ end
 -- subprocess dies, a provider round aborts); the lead re-fires with that
 -- failure in context and winds the turn down with a real final answer. The run
 -- SURVIVES — `current_run_id` stays set — so the turn closes through the normal
--- `mag.run_result status:"completed"` path: history records itself and
--- `agentic_loop.turn_recorded` rides the bus. That is what structurally kills
--- the amnesia: there is no killed-without-record turn on this path.
+-- `mag.run_result status:"completed"` path. The manager's terminal projection
+-- is the commit boundary, so there is no completed-but-unrecorded promotion.
 local function interrupt_active_lead_run()
   if state.current_run_id == nil then
     -- The lead is idle: it dispatched fire-and-forget sub-runs (the `mag`
@@ -753,9 +796,12 @@ local function new_chat()
   state.pending_user_inputs = {}
   state.pending_inputs_projected = 0
   state.pending_steer = nil
-  state.history = {}
-  state.compaction = nil
+  state.conversation:reset()
+  state.conversation_id = nil
+  state.pending_conversation_create = nil
   state.pending_compaction = nil
+  state.pending_context_request = nil
+  ensure_conversation_id()
 end
 
 local function compaction_failure(message, pending)
@@ -769,18 +815,6 @@ local function compaction_failure(message, pending)
   })
 end
 
-local function compaction_history_start(provider, model)
-  local compaction = state.compaction
-  if type(compaction) == "table"
-      and compaction.provider == provider
-      and compaction.model == model
-      and type(compaction.model_context_artifact) == "table"
-      and type(compaction.history_len) == "number" then
-    return compaction.history_len + 1, compaction.model_context_artifact
-  end
-  return 1, nil
-end
-
 local function handle_chat_compaction_request(body)
   if state.pending_compaction ~= nil then
     compaction_failure("context compaction is already in progress")
@@ -790,108 +824,30 @@ local function handle_chat_compaction_request(body)
     compaction_failure("cannot compact context while a lead turn is running")
     return
   end
-  if #state.history == 0 then
+  local history = conversation_history()
+  if #history == 0 then
     compaction_failure("nothing to compact")
     return
   end
 
-  local provider = type(body.provider) == "string" and #body.provider > 0
-    and body.provider or state.config.provider
-  if type(provider) ~= "string" or #provider == 0 then
-    compaction_failure("no active provider to compact")
+  if not conversation_ready() then
+    compaction_failure("conversation context is not ready")
     return
   end
-  local model = state.config.model
-  local trigger = type(body.trigger) == "string" and #body.trigger > 0
-    and body.trigger or "manual"
-  local chat_id = "agentic-loop.compact-" .. envelope.uuid_lite()
-  local pending = {
-    chat_id = chat_id,
-    provider = provider,
-    model = model,
-    trigger = trigger,
-  }
+  local request_id = "conversation-compaction-" .. envelope.uuid_lite()
+  local pending = { request_id = request_id, trigger = body.trigger or "manual" }
   state.pending_compaction = pending
-
-  emit(provider, {
-    kind = provider .. ".chat.create",
-    chat_id = chat_id,
-    model = model,
-    system = system_with_mag_context(state.config.system),
-    reasoning_effort = state.config.reasoning_effort,
-  })
-  local first_message, artifact = compaction_history_start(provider, model)
-  if artifact ~= nil then
-    emit(provider, {
-      kind = provider .. ".chat.compaction.restore",
-      chat_id = chat_id,
-      model_context_artifact = deep_clone(artifact),
-    })
-  end
-  for i = first_message, #state.history do
-    emit(provider, {
-      kind = provider .. ".chat.append",
-      chat_id = chat_id,
-      message = deep_clone(state.history[i]),
-    })
-  end
-  emit(provider, {
-    kind = provider .. ".chat.compact",
-    chat_id = chat_id,
-    trigger = trigger,
+  emit("conversation-manager", {
+    kind = "conversation.context.compact.request",
+    request_id = request_id,
+    conversation_id = state.conversation_id,
+    provider = state.config.provider,
   })
 end
 
-local function handle_chat_compaction_commit(body)
-  local pending = state.pending_compaction
-  if type(pending) ~= "table" or body.chat_id ~= pending.chat_id then return end
-  if type(body.provider) == "string" and body.provider ~= pending.provider then return end
-  local artifact = body.model_context_artifact
-  if type(artifact) ~= "table" or type(artifact.items) ~= "table" then
-    state.pending_compaction = nil
-    emit(pending.provider, {
-      kind = pending.provider .. ".chat.delete",
-      chat_id = pending.chat_id,
-    })
-    compaction_failure("provider returned an invalid compaction artifact", pending)
-    return
-  end
-
-  state.compaction = {
-    provider = pending.provider,
-    model = pending.model,
-    history_len = #state.history,
-    model_context_artifact = deep_clone(artifact),
-  }
-  state.pending_compaction = nil
-  emit(pending.provider, {
-    kind = pending.provider .. ".chat.delete",
-    chat_id = pending.chat_id,
-  })
-  emit(nil, {
-    kind = "agentic_loop.compaction_recorded",
-    provider = pending.provider,
-    model = pending.model,
-    model_context_artifact = deep_clone(artifact),
-  })
-end
-
-local function handle_chat_compaction_error(body)
-  local pending = state.pending_compaction
-  if type(pending) ~= "table" or body.chat_id ~= pending.chat_id then return false end
-  state.pending_compaction = nil
-  emit(pending.provider, {
-    kind = pending.provider .. ".chat.delete",
-    chat_id = pending.chat_id,
-  })
-  compaction_failure(tostring(body.message or body.error or "context compaction failed"), pending)
-  return true
-end
-
--- Mid-chat /model picker. History is canonical here and seeded per turn
--- via params.history, so BOTH a model-only switch and a cross-provider
--- switch keep full conversation continuity with no provider-side rebuild:
--- the next turn replays the same history against the new provider/model.
+-- Mid-chat /model picker. A switch refreshes the manager-owned universal
+-- context before another turn may start; the provider edge decides whether
+-- its opaque checkpoint is compatible or full history is required.
 local function set_model(provider, model)
   if type(provider) == "string" and #provider > 0 then
     state.config.provider = provider
@@ -940,8 +896,21 @@ local function handle_chat_input_submit(body)
     user_queued = #state.pending_user_inputs,
   })
 
-  if state.current_run_id ~= nil then
+  ensure_conversation_id()
+  if state.current_run_id ~= nil or conversation_commit_pending()
+      or not conversation_ready() then
+    local projects_immediately = state.current_run_id == nil
+        and #state.pending_user_inputs == 0
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    if projects_immediately then
+      state.pending_inputs_projected = 1
+      emit("nefor-tui", {
+        kind = "chat.message.append",
+        role = "user",
+        text = text,
+      })
+    end
+    ensure_lead_program_loaded()
     return
   end
 
@@ -982,7 +951,7 @@ local function handle_chat_reset()
     dropped_deferred = #state.deferred_queue,
     dropped_pending_inputs = #state.pending_user_inputs,
     had_run = state.current_run_id ~= nil,
-    history_len = #state.history,
+    history_len = #conversation_history(),
   })
   new_chat()
   emit_idle_state("reset")
@@ -996,6 +965,7 @@ local function handle_chat_model_set(body)
       provider = provider, model = model, previous = state.config.model,
     })
     set_model(provider, model)
+    request_context("model-changed")
   end
 end
 
@@ -1137,80 +1107,9 @@ local function mag_result_text(result)
   if type(result.final_answer) == "string" and #result.final_answer > 0 then
     return result.final_answer
   end
-  local bare = {}
-  for k, v in pairs(result) do
-    if k ~= "transcript_delta" then bare[k] = v end
-  end
-  local ok, encoded = pcall(json.encode, bare)
+  local ok, encoded = pcall(json.encode, result)
   if ok and type(encoded) == "string" then return encoded end
   return nil
-end
-
--- Validate a transcript delta into recordable messages: a non-empty array of
--- role-tagged message tables, or nil. Arrives off the wire (mag.run_result →
--- result.transcript_delta) or from a replayed turn_recorded marker, so the
--- shape is checked once here; an ill-shaped delta falls back to the bare
--- {user, answer} pair rather than corrupting the seed.
-local function transcript_messages(delta)
-  if type(delta) ~= "table" or #delta == 0 then return nil end
-  for i = 1, #delta do
-    local m = delta[i]
-    if type(m) ~= "table" or type(m.role) ~= "string" or #m.role == 0 then
-      return nil
-    end
-  end
-  return delta
-end
-
--- Commit one turn to the canonical conversation history and log the durable
--- `turn_recorded` marker (replayed on /resume to rebuild state.history). Every
--- terminal path that must preserve context routes through here. A completed
--- turn carries the llm's transcript delta — the user task plus every tool
--- exchange plus the final answer, recorded verbatim so the next turn's seed
--- replays what the model saw. A turn without a usable delta (killed/failed,
--- or a program that didn't end in an llm) records the bare `{ user, answer }`
--- pair. Skips empty user_text (a relay/system turn with no message to
--- preserve). The marker carries `messages` (the recorded delta) alongside the
--- `user`/`answer` summary fields session tooling reads.
-local function record_turn(run_id, user_text, answer, transcript_delta)
-  if type(user_text) ~= "string" or #user_text == 0 then return end
-  local messages = transcript_messages(transcript_delta)
-  if messages ~= nil then
-    for _, m in ipairs(messages) do
-      state.history[#state.history + 1] = m
-    end
-  else
-    state.history[#state.history + 1] = { role = "user", content = user_text }
-    state.history[#state.history + 1] = { role = "assistant", content = answer }
-  end
-  emit(nil, {
-    kind     = "agentic_loop.turn_recorded",
-    run_id   = run_id,
-    user     = user_text,
-    answer   = answer,
-    messages = messages,
-  })
-end
-
-local function failure_transcript_delta(delta, marker)
-  local messages = transcript_messages(delta)
-  if messages == nil then return nil end
-  local out = {}
-  for i, message in ipairs(messages) do out[i] = message end
-  out[#out + 1] = { role = "assistant", content = marker }
-  return out
-end
-
--- The assistant-slot placeholder for a turn that ended without a real answer.
--- A user-initiated hard kill or the graceful "interrupted by
--- user" settle) records the same honest marker the user saw; any other failure
--- records its error so the next turn can see what broke.
-local function aborted_turn_marker(err)
-  local text = tostring(err or "")
-  if #text == 0 or text:find("interrupt", 1, true) then
-    return "[interrupted by user]"
-  end
-  return "[turn failed: " .. text .. "]"
 end
 
 -- Terminal close of the lead's turn-program.
@@ -1218,16 +1117,11 @@ end
 --     prefix-bound stream (exactly how the lead's final answer renders
 --     today); when no stream flowed (a non-streaming provider), the text
 --     is appended so the turn is never silently empty. Canonical history
---     gains the turn's transcript delta (bare `{ user, answer }` pair when
---     the result carries none), and a turn_recorded marker rides the bus
---     so /resume can rebuild it.
---   failed — surfaced in chat as a structured error, AND the turn is recorded
---     with a placeholder answer so context survives (an interrupted lead
---     turn settles here; without the record the next turn seeds blind).
---   killed — turn aborted (hard kill): no transcript append,
---     but the turn IS recorded with an interrupted placeholder so the
---     user's message survives into the next turn's seed.
-local function handle_mag_run_result(body)
+--     waits for conversation-manager's correlated terminal turn projection,
+--     so the next queued turn can only start from committed context.
+--   failed/killed — surfaced locally after the manager has committed the
+--     corresponding failed/interrupted terminal projection.
+local function finish_mag_run_result(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
   local run_id = turn.run_id
@@ -1237,10 +1131,6 @@ local function handle_mag_run_result(body)
   if body.status == "completed" then
     local agent_error = agent_error_display(body.result)
     if agent_error ~= nil then
-      local marker = aborted_turn_marker(agent_error.message)
-      local delta = type(body.result) == "table"
-        and failure_transcript_delta(body.result.transcript_delta, marker) or nil
-      record_turn(run_id, turn.user_text, marker, delta)
       if not turn.streamed and type(agent_error.partial) == "string"
           and #agent_error.partial > 0 then
         emit("nefor-tui", {
@@ -1258,7 +1148,7 @@ local function handle_mag_run_result(body)
       nefor.log.warn("agentic-loop: lead turn returned AgentError", {
         run_id = run_id,
         error = agent_error.message,
-        history_len = #state.history,
+        history_len = #conversation_history(),
       })
       fire_observers(state.complete_observers, run_id, "error")
       flush_deferred()
@@ -1267,8 +1157,6 @@ local function handle_mag_run_result(body)
       return
     end
     local answer = mag_result_text(body.result) or ""
-    local delta = type(body.result) == "table" and body.result.transcript_delta or nil
-    record_turn(run_id, turn.user_text, answer, delta)
     if not turn.streamed and #answer > 0 then
       emit("nefor-tui", {
         kind = "chat.message.append",
@@ -1278,7 +1166,7 @@ local function handle_mag_run_result(body)
     end
     nefor.log.info("agentic-loop: lead turn completed", {
       run_id = run_id, streamed = turn.streamed,
-      answer_len = #answer, history_len = #state.history,
+      answer_len = #answer, history_len = #conversation_history(),
     })
     fire_observers(state.complete_observers, run_id, "success", answer)
     flush_deferred()
@@ -1289,12 +1177,10 @@ local function handle_mag_run_result(body)
 
   if body.status == "killed" then
     -- A killed turn (hard kill) still preserves context: the
-    -- user's message plus an interrupted placeholder land in history so the
-    -- next turn is not seeded blind. The transcript already carries the
-    -- interrupt notice from cancel_all.
-    record_turn(run_id, turn.user_text, aborted_turn_marker(body.error))
+    -- The manager's interrupted projection already owns the durable context;
+    -- the transcript notice from cancel_all remains presentation-only.
     nefor.log.info("agentic-loop: lead turn killed", {
-      run_id = run_id, history_len = #state.history,
+      run_id = run_id, history_len = #conversation_history(),
     })
     fire_observers(state.complete_observers, run_id, "killed")
     if #state.pending_user_inputs > 0 then
@@ -1313,18 +1199,131 @@ local function handle_mag_run_result(body)
     message = display.message,
     retryable = display.retryable,
   })
-  -- Preserve context: record the turn with a placeholder answer so the user's
-  -- message survives into the next turn's seed (an interrupted lead turn
-  -- settles here). Without this the next turn seeds blind — the amnesia bug.
-  record_turn(run_id, turn.user_text, aborted_turn_marker(body.error))
+  -- Durable failed-turn context was committed by conversation-manager before
+  -- this local settlement path became eligible.
   nefor.log.warn("agentic-loop: lead turn failed", {
     run_id = run_id, error = body.error, status = body.status,
-    history_len = #state.history,
+    history_len = #conversation_history(),
   })
   fire_observers(state.complete_observers, run_id, tostring(body.status))
   flush_deferred()
   flush_pending_user_inputs()
   emit_idle_if_idle(run_id)
+end
+
+local function handle_mag_run_result(body)
+  local turn = state.current_turn
+  if turn == nil or body.run_id ~= turn.run_id then return end
+  turn.result_body = deep_clone(body)
+  if turn.manager_terminal then finish_mag_run_result(turn.result_body) end
+end
+
+local terminal_turn_changes = {
+  turn_completed = true,
+  turn_failed = true,
+  turn_interrupted = true,
+}
+
+local function handle_conversation_projection_delta(body)
+  local change = body.change
+  if type(change) ~= "table" then return end
+  if not state.conversation:apply_delta(body) then return end
+
+  if change.kind == "conversation_created" then
+    state.conversation_id = body.conversation_id
+    state.pending_conversation_create = nil
+    flush_pending_user_inputs()
+    flush_deferred()
+    return
+  end
+
+  if terminal_turn_changes[change.kind] then
+    local turn = state.current_turn
+    if turn ~= nil and change.run_id == turn.run_id
+        and change.turn_id == turn.turn_id then
+      turn.manager_terminal = true
+      if turn.result_body ~= nil then finish_mag_run_result(turn.result_body) end
+    end
+    return
+  end
+
+  local pending = state.pending_compaction
+  local change_request_id = change.request_id
+      or (type(change.compaction) == "table" and change.compaction.request_id)
+  if type(pending) == "table" and change_request_id == pending.request_id then
+    if change.kind == "context_compaction_completed" then
+      state.pending_compaction = nil
+      emit("nefor-tui", {
+        kind = "chat.compaction.commit",
+        request_id = change_request_id,
+        provider = state.config.provider,
+        model = state.config.model,
+        display_summary = "Context compacted.",
+      })
+      request_context("compaction-completed")
+    elseif change.kind == "context_compaction_failed" then
+      state.pending_compaction = nil
+      local detail = type(change.compaction) == "table" and change.compaction.error
+        or change.error
+      compaction_failure(tostring(detail or "context compaction failed"), pending)
+      flush_pending_user_inputs()
+      flush_deferred()
+    end
+  end
+end
+
+local function handle_conversation_context_snapshot(body)
+  local pending = state.pending_context_request
+  if type(pending) ~= "table" or body.request_id ~= pending.id then return end
+  state.pending_context_request = nil
+  if body.found ~= true or not state.conversation:apply_snapshot(body) then
+    emit("nefor-tui", {
+      kind = "chat.error.append",
+      title = "Conversation context unavailable",
+      message = "Conversation manager returned no matching context.",
+      retryable = true,
+    })
+    return
+  end
+  flush_pending_user_inputs()
+  flush_deferred()
+  emit_idle_if_idle()
+end
+
+local function handle_conversation_rejection(body)
+  if body.event_id == state.pending_conversation_create then
+    state.pending_conversation_create = nil
+    state.conversation_id = nil
+    emit("nefor-tui", {
+      kind = "chat.error.append",
+      title = "Conversation unavailable",
+      message = tostring(body.code or "conversation manager rejected creation"),
+      retryable = true,
+    })
+    return
+  end
+  local pending = state.pending_compaction
+  if type(pending) == "table"
+      and body.event_id == "compaction:" .. pending.request_id .. ":requested" then
+    state.pending_compaction = nil
+    compaction_failure(tostring(body.code or "context compaction rejected"), pending)
+    flush_pending_user_inputs()
+    flush_deferred()
+  end
+end
+
+local function handle_conversation_query_rejection(body)
+  local pending = state.pending_context_request
+  if type(pending) ~= "table" or body.request_id ~= pending.id then return end
+  state.pending_context_request = nil
+  emit("nefor-tui", {
+    kind = "chat.error.append",
+    title = "Conversation context unavailable",
+    message = tostring(body.code or "conversation context query rejected"),
+    retryable = true,
+  })
+  flush_pending_user_inputs()
+  flush_deferred()
 end
 
 -- Lead-scoped gated tool invocations → transcript tool events + the
@@ -1391,9 +1390,11 @@ local function teardown_for_session_end()
   state.pending_user_inputs = {}
   state.pending_inputs_projected = 0
   state.pending_steer       = nil
-  state.history            = {}
-  state.compaction         = nil
+  state.conversation:reset()
+  state.conversation_id = nil
+  state.pending_conversation_create = nil
   state.pending_compaction = nil
+  state.pending_context_request = nil
   emit_idle_state("session-ended")
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
@@ -1550,10 +1551,8 @@ function M._teardown_for_session_end() return teardown_for_session_end() end
 
 function M.config() return state.config end
 
--- The canonical conversation history (read-only view; the recorded
--- transcript per completed turn). Tests and surfaces read it; mutations
--- belong to the turn lifecycle only.
-function M.history() return state.history end
+-- Disposable read-only cache of conversation-manager's universal messages.
+function M.history() return conversation_history() end
 
 local function receive_msg(entry)
   -- Skip per-peer broadcast fan-out entries. The broker (and ncp.lua)
@@ -1570,8 +1569,26 @@ local function receive_msg(entry)
   -- Engine shutdown — sessions handles persistence; nothing for us.
   if kind == "engine.shutdown" then return end
 
+  if kind == "conversation.projection.delta" then
+    handle_conversation_projection_delta(body)
+    return
+  end
+  if kind == "conversation.context.snapshot" then
+    handle_conversation_context_snapshot(body)
+    return
+  end
+  if kind == "conversation.fact.rejected" then
+    handle_conversation_rejection(body)
+    return
+  end
+  if kind == "conversation.query.rejected" then
+    handle_conversation_query_rejection(body)
+    return
+  end
+
   if history_replay.active() then
-    -- Replay rebuilds state from markers; input handlers must not
+    -- conversation-manager rebuilds and publishes the universal projection;
+    -- input handlers must not
     -- re-fire (a replayed chat.input.submit would spawn a fresh turn
     -- the user already saw the answer for).
     if kind == "chat.input.submit"
@@ -1582,36 +1599,6 @@ local function receive_msg(entry)
         or kind == "chat.model.set"
         or kind == "chat.reasoning.set"
         or kind == "chat.compaction.request" then
-      return
-    end
-    -- Canonical-history rebuild: each completed turn logged one
-    -- turn_recorded marker; replaying them restores the conversation the
-    -- next turn seeds into its llm. A marker carrying the turn's recorded
-    -- transcript messages replays them verbatim; an older/delta-less marker
-    -- falls back to the bare pair.
-    if kind == "agentic_loop.turn_recorded" then
-      local messages = transcript_messages(body.messages)
-      if messages ~= nil then
-        for _, m in ipairs(messages) do
-          state.history[#state.history + 1] = m
-        end
-      elseif type(body.user) == "string" then
-        state.history[#state.history + 1] = { role = "user", content = body.user }
-        state.history[#state.history + 1] = { role = "assistant", content = tostring(body.answer or "") }
-      end
-      return
-    end
-    if kind == "agentic_loop.compaction_recorded" then
-      if type(body.provider) == "string"
-          and type(body.model_context_artifact) == "table"
-          and type(body.model_context_artifact.items) == "table" then
-        state.compaction = {
-          provider = body.provider,
-          model = body.model,
-          history_len = #state.history,
-          model_context_artifact = deep_clone(body.model_context_artifact),
-        }
-      end
       return
     end
     -- Everything else during replay: kernel/turn lifecycle events are
@@ -1627,7 +1614,6 @@ local function receive_msg(entry)
   if kind == "chat.model.set" then handle_chat_model_set(body); return end
   if kind == "chat.reasoning.set" then handle_chat_reasoning_set(body); return end
   if kind == "chat.compaction.request" then handle_chat_compaction_request(body); return end
-  if kind == "chat.compaction.commit" then handle_chat_compaction_commit(body); return end
 
   -- Turn-program load handshake.
   if kind == "mag.loaded" then handle_lead_program_loaded(body); return end
@@ -1640,7 +1626,6 @@ local function receive_msg(entry)
 
   -- Lead-scoped tool + stream observation.
   if type(kind) == "string" then
-    if kind:match("%.chat%.error$") and handle_chat_compaction_error(body) then return end
     if kind:match("%.tool%.invoke$") then handle_gate_invoke(body); return end
     if kind == "tool.result" then handle_gate_result(body); return end
     if kind == "chat.stream.delta" or kind == "chat.stream.end" then
@@ -1714,15 +1699,18 @@ if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     teardown_for_session_end()
   end)
-  -- Restore active provider+model, and start the canonical-history
-  -- rebuild from a clean slate, on every replay start. /resume drives
-  -- the replay markers; /new fires them too with an empty log, where
-  -- both are no-ops.
+  -- Restore active provider+model while conversation-manager rebuilds and
+  -- publishes the universal projection from the replayed canonical facts.
   nefor.bus.on_event("sessions.replay.start", function(_entry)
-    state.history = {}
-    state.compaction = nil
+    state.conversation:reset()
+    state.conversation_id = nil
+    state.pending_conversation_create = nil
     state.pending_compaction = nil
+    state.pending_context_request = nil
     restore_active_model_from_session_log()
+  end)
+  nefor.bus.on_event("sessions.replay.end", function(_entry)
+    if conversation_ready() then request_context("resume") end
   end)
 end
 
@@ -1749,9 +1737,11 @@ M._internals  = {
       llm_actor = nil,
       load_id = nil,
     }
-    state.history = {}
-    state.compaction = nil
+    state.conversation:reset()
+    state.conversation_id = nil
+    state.pending_conversation_create = nil
     state.pending_compaction = nil
+    state.pending_context_request = nil
     state.current_run_id = nil
     state.current_turn = nil
     state.deferred_queue = {}

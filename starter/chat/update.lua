@@ -1301,7 +1301,6 @@ local function handle_plan_append(msg, state)
 end
 
 local function handle_compaction_commit(msg, state)
-  if type(msg.model_context_artifact) ~= "table" then return state, {} end
   local pending_idx
   for i = #state.entries, 1, -1 do
     local e = state.entries[i]
@@ -1322,7 +1321,6 @@ local function handle_compaction_commit(msg, state)
     strategy = msg.strategy,
     trigger = msg.trigger,
     display_summary = msg.display_summary,
-    model_context_artifact = msg.model_context_artifact,
     metadata = msg.metadata,
   })
   local entries = {}

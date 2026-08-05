@@ -40,8 +40,56 @@ local function make_entry(origin, body)
   }
 end
 
-local function send_to_loop(origin, body)
+local manager_sequence = 0
+local manager_conversation_id = nil
+
+local function raw_send_to_loop(origin, body)
   agentic_loop.receive_msg(make_entry(origin, body))
+end
+
+local function manager_delta(change)
+  manager_sequence = manager_sequence + 1
+  raw_send_to_loop("conversation-manager", {
+    kind = "conversation.projection.delta",
+    conversation_id = manager_conversation_id,
+    sequence = manager_sequence,
+    change = change,
+  })
+end
+
+local function result_context_messages(body)
+  local result = type(body.result) == "table" and body.result or {}
+  local delta = result.test_context_messages
+  if type(delta) == "table" and #delta > 0 then return delta end
+  local turn = agentic_loop._internals.state.current_turn or {}
+  local answer = result.text or result.final_answer
+  if type(answer) ~= "string" then
+    local error_text = tostring(body.error or body.status)
+    answer = (body.status == "killed" or error_text:find("interrupt", 1, true))
+      and "[interrupted by user]"
+      or "[turn failed: " .. error_text .. "]"
+  end
+  return {
+    { role = "user", content = turn.user_text or "" },
+    { role = "assistant", content = answer },
+  }
+end
+
+local function send_to_loop(origin, body)
+  if origin == "mag" and body.kind == "mag.run_result" then
+    manager_delta({
+      kind = "message_completed",
+      context_messages = result_context_messages(body),
+    })
+    local terminal = body.status == "completed" and "turn_completed"
+      or body.status == "killed" and "turn_interrupted" or "turn_failed"
+    manager_delta({
+      kind = terminal,
+      turn_id = body.run_id,
+      run_id = body.run_id,
+    })
+  end
+  raw_send_to_loop(origin, body)
 end
 
 local function decode_calls()
@@ -214,6 +262,8 @@ local function task_prompt(modification)
 end
 
 local function fresh_loop()
+  manager_sequence = 0
+  manager_conversation_id = nil
   agentic_loop._internals.reset()
   agentic_loop.configure {
     provider = "mock", model = "test-model",
@@ -224,6 +274,17 @@ local function fresh_loop()
   }
   _test.set_plugins({ "mock", "mag", "nefor-tui" })
   _test.calls_clear()
+end
+
+local function project_pending_conversation(calls)
+  local append = find_kind(calls, "conversation.fact.append")
+  if append == nil or type(append.body.fact) ~= "table"
+      or append.body.fact.kind ~= "created" then
+    return false
+  end
+  manager_conversation_id = append.body.fact.conversation_id
+  manager_delta({ kind = "conversation_created", conversation = { context_messages = {} } })
+  return true
 end
 
 -- The legacy/default composition searches only the config-owned library.
@@ -284,6 +345,7 @@ local function begin_turn(text)
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = text })
   local calls = decode_calls()
+  if project_pending_conversation(calls) then calls = decode_calls() end
   local load = find_kind(calls, "mag.load")
   if load ~= nil then
     assert_eq(load.target, "mag", "mag.load targets the mag plugin")
@@ -344,6 +406,7 @@ do
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "cold one" })
   local calls = decode_calls()
   local load = find_kind(calls, "mag.load")
+  project_pending_conversation(calls)
   assert(load ~= nil, "cold submit loads the turn program")
   assert(find_call(calls, "chat.message.append", "user", "cold one") ~= nil,
     "initial cold submit emits its durable projection immediately")
@@ -481,10 +544,8 @@ do
   calls = decode_calls()
   assert_eq(find_call(calls, "chat.message.append", "assistant"), nil,
     "streamed answer must not double-render on run close")
-  local recorded = find_kind(calls, "agentic_loop.turn_recorded")
-  assert(recorded ~= nil, "completed turn emits its turn_recorded marker")
-  assert_eq(recorded.body.user, "hello lead", "marker carries the user message")
-  assert_eq(recorded.body.answer, "the answer", "marker carries the answer text")
+  assert_eq(find_kind(calls, "agentic_loop.turn_recorded"), nil,
+    "completed turn does not emit a competing history marker")
   assert(find_kind(calls, "agentic_loop.idle") ~= nil,
     "completed turn with empty queues goes idle")
 
@@ -511,10 +572,42 @@ do
   assert_eq(seeded[2].content, "the answer")
 end
 
--- (/compact) canonical history is materialized into a temporary provider chat
--- with an explicit id. The returned native artifact becomes the seed for
--- future ephemeral MAG chats, while the full transcript stays available when
--- the user later switches provider/model.
+-- Queue promotion waits for both MAG settlement and the manager's correlated
+-- terminal watermark. A fast mag.run_result cannot seed the next turn from
+-- context which has not reached the canonical projection yet.
+do
+  fresh_loop()
+  local first = begin_turn("persist before promote")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued next" })
+  _test.calls_clear()
+  raw_send_to_loop("mag", {
+    kind = "mag.run_result", run_id = first.body.run_id,
+    status = "completed", result = { text = "committed answer" },
+  })
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil,
+    "mag settlement alone does not promote queued input")
+  manager_delta({
+    kind = "message_completed",
+    context_messages = {
+      { role = "user", content = "persist before promote" },
+      { role = "assistant", content = "committed answer" },
+    },
+  })
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil,
+    "message projection alone is not the terminal commit boundary")
+  manager_delta({
+    kind = "turn_completed",
+    turn_id = first.body.run_id,
+    run_id = first.body.run_id,
+  })
+  local promoted = find_kind(decode_calls(), "mag.execute")
+  assert(promoted ~= nil, "matching terminal projection promotes queued input")
+  assert_eq(#promoted.body.params_overlay["lead.llm"].history, 2,
+    "promoted turn sees manager-committed context")
+end
+
+-- (/compact) the loop delegates universally and forwards the manager's opaque
+-- context projection without interpreting provider compatibility.
 do
   fresh_loop()
   local first = begin_bound_turn("before compaction", "r30")
@@ -530,89 +623,51 @@ do
     trigger = "manual",
   })
   local calls = decode_calls()
-  local create = find_kind(calls, "mock.chat.create")
-  local compact = find_kind(calls, "mock.chat.compact")
-  assert(create ~= nil, "compaction materializes a temporary provider chat")
-  assert(compact ~= nil, "compaction sends the low-level provider request")
-  assert(type(create.body.chat_id) == "string" and #create.body.chat_id > 0,
-    "temporary compaction chat has an explicit id")
-  assert_eq(compact.body.chat_id, create.body.chat_id,
-    "chat.compact targets the materialized chat")
-  assert_eq(compact.target, "mock", "low-level compaction targets the active provider")
+  local compact = find_kind(calls, "conversation.context.compact.request")
+  assert(compact ~= nil, "compaction delegates to conversation-manager")
+  assert_eq(compact.target, "conversation-manager")
+  assert_eq(find_kind(calls, "mock.chat.create"), nil,
+    "agentic-loop does not orchestrate provider chats")
 
-  local appended = {}
-  for _, call in ipairs(calls) do
-    if call.body.kind == "mock.chat.append" then appended[#appended + 1] = call end
-  end
-  assert_eq(#appended, 2, "the full canonical pair is materialized for first compaction")
-  assert_eq(appended[1].body.chat_id, create.body.chat_id)
-  assert_eq(appended[1].body.message.content, "before compaction")
-  assert_eq(appended[2].body.message.content, "remember this")
-
-  local artifact = {
-    kind = "responses.compaction",
-    items = {
-      { type = "compaction", encrypted_content = "sealed-history" },
-    },
-  }
   _test.calls_clear()
-  send_to_loop("mock", {
-    kind = "chat.compaction.commit",
-    chat_id = create.body.chat_id,
-    provider = "mock",
-    model = "test-model",
-    trigger = "manual",
-    model_context_artifact = artifact,
+  manager_delta({
+    kind = "context_compaction_completed",
+    compaction = {
+      request_id = compact.body.request_id,
+      status = "completed",
+      history_cutoff = 2,
+    },
   })
   calls = decode_calls()
-  local deleted = find_kind(calls, "mock.chat.delete")
-  assert(deleted ~= nil, "the temporary compaction chat is deleted after commit")
-  assert_eq(deleted.body.chat_id, create.body.chat_id)
-  local recorded = find_kind(calls, "agentic_loop.compaction_recorded")
-  assert(recorded ~= nil, "the opaque compaction artifact gets a durable replay marker")
-  assert_eq(recorded.body.model_context_artifact.items[1].encrypted_content,
-    "sealed-history")
+  local query = find_kind(calls, "conversation.context.request")
+  assert(query ~= nil, "completed compaction refreshes universal context")
+  send_to_loop("conversation-manager", {
+    kind = "conversation.context.snapshot",
+    request_id = query.body.request_id,
+    conversation_id = manager_conversation_id,
+    found = true,
+    context = {
+      messages = agentic_loop.history(),
+      tail_messages = {},
+      history_length = 2,
+      compaction = {
+        status = "completed", history_cutoff = 2,
+        compatibility = { opaque = "provider-owned" },
+        checkpoint = { sealed = "history" },
+      },
+    },
+  })
 
   local second = begin_turn("after compaction")
   local second_overlay = second.body.params_overlay["lead.llm"]
-  assert_eq(second_overlay.context_artifact.items[1].encrypted_content,
-    "sealed-history", "the next ephemeral chat restores the native artifact")
-  assert_eq(#second_overlay.history, 0,
-    "messages already represented by the artifact are not replayed again")
-  send_to_loop("mag", {
-    kind = "mag.run_result", run_id = second.body.run_id,
-    status = "completed", result = { text = "new answer" },
-  })
-
-  local third = begin_turn("same provider again")
-  local third_overlay = third.body.params_overlay["lead.llm"]
-  assert(third_overlay.context_artifact ~= nil,
-    "matching provider/model keeps using the compacted context")
-  assert_eq(#third_overlay.history, 2,
-    "only post-compaction messages accompany the restored artifact")
-  assert_eq(third_overlay.history[1].content, "after compaction")
-  send_to_loop("mag", {
-    kind = "mag.run_result", run_id = third.body.run_id,
-    status = "completed", result = { text = "third answer" },
-  })
-
-  send_to_loop("nefor-tui", {
-    kind = "chat.model.set",
-    provider = "other-provider",
-    model = "other-model",
-  })
-  local switched = begin_turn("cross-provider fallback")
-  local switched_overlay = switched.body.params_overlay["lead.llm"]
-  assert_eq(switched_overlay.context_artifact, nil,
-    "provider-specific native context is not sent across providers")
-  assert_eq(#switched_overlay.history, 6,
-    "the lossless canonical transcript backs a cross-provider switch")
-  assert_eq(switched_overlay.history[1].content, "before compaction")
+  assert_eq(second_overlay.conversation_context.compaction.checkpoint.sealed,
+    "history", "opaque checkpoint stays inside universal context")
+  assert_eq(#second_overlay.history, 2,
+    "temporary history overlay remains the manager's full neutral context")
 end
 
--- (full-transcript recording) a completed turn whose result carries the llm's
--- transcript_delta records the WHOLE turn — tool exchanges included — so the
--- next turn's seed replays what the model saw, not just what it said.
+-- (universal context projection) manager-projected tool exchanges are seeded
+-- into the next turn exactly as the model-visible neutral context.
 do
   fresh_loop()
   local exec = begin_bound_turn("read the config", "r21")
@@ -641,7 +696,7 @@ do
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec.body.run_id,
     status = "completed",
-    result = { text = "the config sets provider mock", transcript_delta = delta },
+    result = { text = "the config sets provider mock", test_context_messages = delta },
   })
 
   local history = agentic_loop.history()
@@ -651,36 +706,13 @@ do
   assert_eq(history[3].role, "tool", "the tool result survives into canonical history")
   assert_eq(history[3].content, "-- config body", "the tool result is verbatim")
 
-  local recorded = find_kind(decode_calls(), "agentic_loop.turn_recorded")
-  assert(recorded ~= nil, "the turn_recorded marker fires")
-  assert_eq(#recorded.body.messages, 4, "the marker carries the recorded messages for /resume")
-  assert_eq(recorded.body.user, "read the config", "the marker keeps the user summary field")
-  assert_eq(recorded.body.answer, "the config sets provider mock",
-    "the marker keeps the answer summary field")
-  assert(string.find(json.encode(recorded.body), notice_text, 1, true) == nil,
-    "instruction notice text never enters agentic_loop.turn_recorded")
+  assert_eq(find_kind(decode_calls(), "agentic_loop.turn_recorded"), nil,
+    "the loop emits no competing durable history marker")
 
   local exec2 = begin_turn("and the model?")
   local seeded = exec2.body.params_overlay["lead.llm"].history
   assert_eq(#seeded, 4, "the next turn seeds the full recorded transcript")
   assert_eq(seeded[3].tool_call_id, "call-1", "the seeded tool result stays paired with its call")
-end
-
--- (ill-shaped delta) a transcript_delta that is not an array of role-tagged
--- messages falls back to the bare {user, answer} pair instead of corrupting
--- the next turn's seed.
-do
-  fresh_loop()
-  local exec = begin_bound_turn("odd result", "r22")
-  send_to_loop("mag", {
-    kind = "mag.run_result", run_id = exec.body.run_id,
-    status = "completed",
-    result = { text = "fine", transcript_delta = { "loose string", { content = "no role" } } },
-  })
-  local history = agentic_loop.history()
-  assert_eq(#history, 2, "an ill-shaped delta records the bare pair")
-  assert_eq(history[1].content, "odd result", "the user message survives")
-  assert_eq(history[2].content, "fine", "the answer survives")
 end
 
 -- (ambient MAG context caching) the static section (inventory + canonical
@@ -740,8 +772,8 @@ do
   assert_eq(history[1].content, "doomed", "failed turn preserves the user message")
   assert_eq(history[2].content, "[turn failed: provider exploded]",
     "a non-interrupt failure records its error as the placeholder answer")
-  local recorded = find_kind(calls, "agentic_loop.turn_recorded")
-  assert(recorded ~= nil, "failed turn emits its turn_recorded marker for /resume")
+  assert_eq(find_kind(calls, "agentic_loop.turn_recorded"), nil,
+    "failed turn relies on manager projection persistence")
   -- The loop is free again.
   local exec2 = begin_turn("retry")
   assert(exec2 ~= nil, "a failed turn releases the single-flight slot")
@@ -892,8 +924,8 @@ do
   assert_eq(history[1].content, "kill me", "killed turn preserves the user message")
   assert_eq(history[2].content, "[interrupted by user]",
     "killed turn records the interrupt placeholder as the answer")
-  assert(find_kind(calls, "agentic_loop.turn_recorded") ~= nil,
-    "killed turn emits its turn_recorded marker for /resume")
+  assert_eq(find_kind(calls, "agentic_loop.turn_recorded"), nil,
+    "killed turn relies on manager projection persistence")
   -- A killed turn stays quiet in the transcript (the interrupt notice already
   -- rode cancel_all) — only the history store is fed.
   assert_eq(find_call(calls, "chat.message.append", "assistant"), nil,
@@ -1041,18 +1073,16 @@ do
     "the interrupted run is still active — a fresh submit queues, not dispatches")
 
   -- the interrupted turn winds down COMPLETED (the lead re-fired with the
-  -- interrupted tool result and produced a final answer): history records
-  -- itself and turn_recorded fires. This is the amnesia fix.
+  -- interrupted tool result and produced a final answer): manager context is
+  -- committed before queued work can promote. This is the amnesia fix.
   _test.calls_clear()
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec.body.run_id,
     status = "completed", result = { text = "stopped as you asked" },
   })
   calls = decode_calls()
-  local recorded = find_kind(calls, "agentic_loop.turn_recorded")
-  assert(recorded ~= nil, "the interrupted-but-completed turn records its history marker")
-  assert_eq(recorded.body.user, "run a long bash",
-    "the marker carries the ORIGINAL user message (the interrupted turn IS in history)")
+  assert_eq(find_kind(calls, "agentic_loop.turn_recorded"), nil,
+    "interrupted completion emits no private history marker")
   assert_eq(#agentic_loop.history(), 2,
     "history gains the {user, answer} pair — the interrupted turn is remembered")
 end
@@ -1117,9 +1147,8 @@ do
     "the relay turn carries the interruption reason")
 end
 
--- (replay gating + history rebuild) replayed input envelopes must not
--- re-orchestrate; replayed turn_recorded markers rebuild the canonical
--- history the next live turn seeds.
+-- (replay gating + context rebuild) replayed input envelopes must not
+-- re-orchestrate; manager projection/context rebuilds the next live seed.
 do
   fresh_loop()
   local replay_window = require("core.history_replay")
@@ -1132,39 +1161,37 @@ do
   assert_eq(find_kind(decode_calls(), "mag.load"), nil,
     "a replayed chat.input.submit must not trigger a program load")
 
-  send_to_loop("engine", {
-    kind = "agentic_loop.turn_recorded",
-    user = "old question", answer = "old answer",
-  })
-  send_to_loop("engine", {
-    kind = "agentic_loop.compaction_recorded",
-    provider = "mock",
-    model = "test-model",
-    model_context_artifact = {
-      kind = "responses.compaction",
-      items = {
-        { type = "compaction", encrypted_content = "replayed-seal" },
-      },
-    },
-  })
-  -- A marker carrying the turn's recorded transcript replays it verbatim —
-  -- tool exchanges included (the delta-less marker above took the pair path).
-  send_to_loop("engine", {
-    kind = "agentic_loop.turn_recorded",
-    user = "tooled question", answer = "tooled answer",
-    messages = {
-      { role = "user", content = "tooled question" },
-      { role = "assistant", content = "",
-        tool_calls = { { id = "call-9", type = "function",
-          ["function"] = { name = "list_dir", arguments = "{}" } } } },
-      { role = "tool", tool_call_id = "call-9", name = "list_dir", content = "listing" },
-      { role = "assistant", content = "tooled answer" },
-    },
-  })
+  manager_conversation_id = "resumed-conversation"
+  manager_delta({ kind = "conversation_created", conversation = {} })
+  local resumed_messages = {
+    { role = "user", content = "old question" },
+    { role = "assistant", content = "old answer" },
+    { role = "user", content = "tooled question" },
+    { role = "assistant", content = "",
+      tool_calls = { { id = "call-9", name = "list_dir", arguments = "{}" } } },
+    { role = "tool", tool_call_id = "call-9", name = "list_dir", content = "listing" },
+    { role = "assistant", content = "tooled answer" },
+  }
+  manager_delta({ kind = "message_completed", context_messages = resumed_messages })
+  _test.calls_clear()
   _test.fire_bus("sessions.replay.end", { session_id = "resume-1" })
+  local query = find_kind(decode_calls(), "conversation.context.request")
+  assert(query ~= nil, "replay completion requests the manager context snapshot")
+  send_to_loop("conversation-manager", {
+    kind = "conversation.context.snapshot",
+    request_id = query.body.request_id,
+    conversation_id = manager_conversation_id,
+    found = true,
+    context = {
+      messages = resumed_messages,
+      tail_messages = resumed_messages,
+      history_length = #resumed_messages,
+      compaction = { status = "completed", checkpoint = { sealed = "resume" } },
+    },
+  })
 
   local history = agentic_loop.history()
-  assert_eq(#history, 6, "replayed markers rebuilt the canonical history")
+  assert_eq(#history, 6, "manager projection rebuilt the canonical context")
   assert_eq(history[1].content, "old question")
   assert_eq(history[2].content, "old answer")
   assert_eq(history[4].tool_calls[1].id, "call-9",
@@ -1173,12 +1200,10 @@ do
 
   local exec = begin_turn("post-resume")
   local overlay = exec.body.params_overlay["lead.llm"]
-  assert_eq(overlay.context_artifact.items[1].encrypted_content, "replayed-seal",
-    "the post-resume turn restores the replayed compaction artifact")
+  assert_eq(overlay.conversation_context.compaction.checkpoint.sealed, "resume",
+    "the post-resume turn forwards the manager's opaque context")
   local seeded = overlay.history
-  assert_eq(#seeded, 4,
-    "only messages recorded after the replayed compaction marker accompany it")
-  assert_eq(seeded[1].content, "tooled question")
+  assert_eq(#seeded, 6, "temporary history overlay carries full universal messages")
 end
 
 -- (/new) chat.reset clears queue + history so the next turn is fresh.
@@ -1190,8 +1215,10 @@ do
     status = "completed", result = { text = "yo" },
   })
   assert_eq(#agentic_loop.history(), 2, "turn recorded before reset")
+  _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.reset" })
   assert_eq(#agentic_loop.history(), 0, "chat.reset clears canonical history")
+  project_pending_conversation(decode_calls())
   local exec2 = begin_turn("fresh start")
   local seeded = exec2.body.params_overlay["lead.llm"].history
   assert(next(seeded) == nil, "post-/new turn seeds empty history")
