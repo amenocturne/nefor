@@ -400,11 +400,12 @@ fn append_canonical_message(
     );
 }
 
-fn append_canonical_assistant_turn(
+fn append_canonical_assistant_terminal(
     engine: &mut Engine,
     conversation_id: &str,
     turn_id: &str,
     text: &str,
+    terminal_kind: &str,
     terminal: JsonValue,
 ) {
     let message_id = format!("{turn_id}-assistant");
@@ -446,9 +447,26 @@ fn append_canonical_assistant_turn(
         engine,
         json!({
             "kind": "conversation.projection.delta", "conversation_id": conversation_id,
-            "change": { "kind": "turn_completed", "turn_id": turn_id,
+            "change": { "kind": terminal_kind, "turn_id": turn_id,
                 "run_id": turn_id, "terminal": terminal }
         }),
+    );
+}
+
+fn append_canonical_assistant_turn(
+    engine: &mut Engine,
+    conversation_id: &str,
+    turn_id: &str,
+    text: &str,
+    terminal: JsonValue,
+) {
+    append_canonical_assistant_terminal(
+        engine,
+        conversation_id,
+        turn_id,
+        text,
+        "turn_completed",
+        terminal,
     );
 }
 
@@ -1101,12 +1119,14 @@ fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
         json!({ "model": "gpt-test", "duration_ms": 2_000,
             "usage": { "output_tokens": 40 } }),
     );
-    append_canonical_message(
+    dispatch_event(
         &mut engine,
-        "root",
-        "interrupt",
-        "system",
-        "[interrupted by user — cancelling in-flight work]",
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": "root",
+            "change": { "kind": "turn_interrupted", "turn_id": "interrupt",
+                "run_id": "interrupt",
+                "terminal": { "reason": "[interrupted by user — cancelling in-flight work]" } }
+        }),
     );
 
     let out = render_str(&mut engine);
@@ -1131,20 +1151,15 @@ fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() 
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
-    append_canonical_assistant_turn(
+    append_canonical_assistant_terminal(
         &mut engine,
         "root",
         "failed-turn",
         "",
+        "turn_failed",
         json!({ "model": "gpt-test", "duration_ms": 2_000,
+            "error": "[lead turn failed] terminal MAG failure",
             "usage": { "output_tokens": 40 } }),
-    );
-    append_canonical_message(
-        &mut engine,
-        "root",
-        "failure",
-        "system",
-        "[lead turn failed] terminal MAG failure",
     );
     append_canonical_message(&mut engine, "root", "next-user", "user", "next turn");
     append_canonical_assistant_turn(&mut engine, "root", "next-turn", "later answer", json!({}));
@@ -1445,7 +1460,7 @@ fn accepted_steering_reconciles_indexed_entry_after_non_tail_interleaving() {
     submit_text(&mut engine, "queued-owned");
     let _ = engine.take_emit_queue();
 
-    fixture_message(&mut engine, "system", "interleaved-result");
+    fixture_message(&mut engine, "assistant", "interleaved-result");
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
     fixture_message(&mut engine, "user", "queued-owned");
 

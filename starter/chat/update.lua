@@ -1712,6 +1712,31 @@ local function retain_optimistic_entries(state)
   return retained, pending_user_echo_idx, queued_entry_idx
 end
 
+local function settle_terminal_provider_round(state, terminal)
+  terminal = type(terminal) == "table" and terminal or {}
+  local entry_start = type(state.active_turn_entry_start) == "number"
+      and state.active_turn_entry_start or (#(state.entries or {}) + 1)
+  local function has_assistant_since(entries)
+    for index = entry_start, #(entries or {}) do
+      if entries[index].role == "assistant" then return true end
+    end
+    return false
+  end
+
+  local has_assistant = has_assistant_since(state.entries)
+  local next_state = state
+  if state.in_flight ~= nil
+      or (not has_assistant and (terminal.model ~= nil or terminal.duration_ms ~= nil)) then
+    next_state = transcript.finalize_assistant(
+      state, nil, terminal.model, terminal.duration_ms)
+    has_assistant = has_assistant_since(next_state.entries)
+  end
+  if has_assistant then
+    next_state = transcript.attach_latest_assistant_terminal(next_state, terminal)
+  end
+  return transcript.close_lead_unit(next_state)
+end
+
 local function apply_conversation_action(state, item)
   if item.kind == "active_changed" then
     local entries, pending_user_echo_idx, queued_entry_idx = retain_optimistic_entries(state)
@@ -1721,18 +1746,28 @@ local function apply_conversation_action(state, item)
       pending_user_echo_idx = pending_user_echo_idx or NIL_SENTINEL,
       queued_entry_idx = queued_entry_idx or NIL_SENTINEL,
       in_flight = NIL_SENTINEL,
+      active_turn_id = NIL_SENTINEL,
+      active_turn_entry_start = NIL_SENTINEL,
     })
   end
   if item.kind == "active_cleared" then
-    return shallow_merge(state, { conversation_id = NIL_SENTINEL })
+    return shallow_merge(state, {
+      conversation_id = NIL_SENTINEL,
+      active_turn_id = NIL_SENTINEL,
+      active_turn_entry_start = NIL_SENTINEL,
+    })
   end
   if item.kind == "snapshot_reset" then
     state = close_and_flush_lead_unit(state)
     return shallow_merge(state, { entries = {} })
   end
   if item.kind == "turn_started" then
+    if state.active_turn_id == item.turn_id then
+      return shallow_merge(state, { pending = true })
+    end
     return shallow_merge(state, {
       active_turn_id = item.turn_id,
+      active_turn_entry_start = #(state.entries or {}) + 1,
       pending = true,
     })
   end
@@ -1782,9 +1817,8 @@ local function apply_conversation_action(state, item)
   end
   if item.kind == "turn_completed" then
     local terminal = item.terminal or {}
-    local next_state = state
+    local next_state = settle_terminal_provider_round(state, terminal)
     local usage = type(terminal.usage) == "table" and terminal.usage or {}
-    next_state = transcript.attach_latest_assistant_terminal(next_state, terminal)
     local stats = shallow_merge(next_state.stats or {}, {
       model = terminal.model,
       last_turn_duration_ms = terminal.duration_ms,
@@ -1794,6 +1828,7 @@ local function apply_conversation_action(state, item)
     local patch = {
       stats = stats,
       active_turn_id = NIL_SENTINEL,
+      active_turn_entry_start = NIL_SENTINEL,
       current_context_tokens = usage.input_tokens or usage.prompt_tokens,
     }
     if terminal.model ~= nil then
@@ -1803,17 +1838,20 @@ local function apply_conversation_action(state, item)
     return transcript.flush_graph_results_if_stable(shallow_merge(next_state, patch))
   end
   if item.kind == "turn_interrupted" then
-    local next_state = transcript.close_lead_unit(state)
+    local terminal = item.terminal or {}
+    local next_state = settle_terminal_provider_round(state, terminal)
     return transcript.push_entry(shallow_merge(next_state, {
       active_turn_id = NIL_SENTINEL,
-    }), Entry.system(display_value((item.terminal or {}).reason or "interrupted")))
+      active_turn_entry_start = NIL_SENTINEL,
+    }), Entry.system(display_value(terminal.reason or "interrupted")))
   end
   if item.kind == "turn_failed" or item.kind == "conversation_failed" then
     local terminal = item.terminal or {}
     local message = item.message or terminal.error or terminal.message or "The conversation failed."
-    local next_state = transcript.close_lead_unit(state)
+    local next_state = settle_terminal_provider_round(state, terminal)
     return transcript.push_entry(shallow_merge(next_state, {
       active_turn_id = NIL_SENTINEL,
+      active_turn_entry_start = NIL_SENTINEL,
     }), Entry.error("Conversation failed", display_value(message), true))
   end
   if item.kind == "conversation_interrupted" then
