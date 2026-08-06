@@ -44,6 +44,46 @@ local function find_kind(msgs, kind)
   return nil
 end
 
+local function conversation_messages(facts)
+  local messages, by_id = {}, {}
+  for _, fact in ipairs(facts) do
+    if fact.kind == "message_started" then
+      local message = {
+        role = fact.role,
+        text = "",
+        structured = {},
+        completed = false,
+      }
+      messages[#messages + 1] = message
+      by_id[fact.message_id] = message
+    elseif fact.kind == "content_chunk_appended" then
+      local message = by_id[fact.message_id]
+      if message and fact.chunk.kind == "text" then
+        message.text = message.text .. fact.chunk.data
+      elseif message and fact.chunk.kind == "structured" then
+        message.structured[#message.structured + 1] = fact.chunk.data
+      end
+    elseif fact.kind == "message_completed" then
+      local message = by_id[fact.message_id]
+      if message then message.completed = true end
+    end
+  end
+  local completed = {}
+  for _, message in ipairs(messages) do
+    if message.completed then
+      if message.text ~= "" then
+        message.content = message.text
+      elseif #message.structured == 1 then
+        message.content = message.structured[1]
+      else
+        message.content = message.structured
+      end
+      completed[#completed + 1] = message
+    end
+  end
+  return completed
+end
+
 -- Build a single boundary activation (routing.lua, the kernel⇄factory
 -- contract): one delivered { from, tag, message } triple. The adapter is a
 -- union-input actor firing on any, so one triple is the activation it sees.
@@ -225,8 +265,13 @@ do
     } },
   } } }
   local provider_messages, provider_emit = capture()
+  local facts = {}
   local provider = assert(llm.construct("fan-in.llm", { provider = "fake-provider" }, provider_emit, {
-    conversation = { id = "fan-in:conversation", turn_id = "fan-in:turn", emit = function(_) end },
+    conversation = {
+      id = "fan-in:conversation",
+      turn_id = "fan-in:turn",
+      emit = function(fact) facts[#facts + 1] = fact end,
+    },
   }))
   local adapter_messages, adapter_emit = capture()
   local entry = adapter.construct("fan-in.entry", { schema = product_schema }, function(message)
@@ -247,18 +292,20 @@ do
 
   local invoke = find_kind(provider_messages, "capability.invoke")
   assert_true(invoke ~= nil, "the provider boundary emits a provider-free capability.invoke")
-  assert_eq(#invoke.request.input.messages, 2,
-    "capability.invoke receives the adapter's native message list unchanged")
-  assert_eq(invoke.request.input.messages[1].content.mag_type.root.name, "Task",
-    "provider request position one retains the Task envelope")
-  assert_eq(invoke.request.input.messages[2].content.value.type, "final-id",
-    "provider request position two retains constructor identity")
-  assert_eq(#invoke.request.input.messages[2].content.value.value.content, 2048,
-    "downstream provider receives the canonical final value")
-  assert_eq(invoke.request.input.messages[2].content.value.value.transcript_delta, nil,
-    "downstream provider receives no worker transcript metadata")
-  assert_eq(invoke.request.input.messages[2].content.value.value.result, nil,
-    "downstream provider receives no raw provider result")
+  assert_true(invoke.request.input == nil,
+    "capability.invoke does not duplicate the adapter's native message list")
+  local history = conversation_messages(facts)
+  assert_eq(#history, 2, "the adapter's native message list is recorded once")
+  assert_eq(history[1].content.mag_type.root.name, "Task",
+    "canonical position one retains the Task envelope")
+  assert_eq(history[2].content.value.type, "final-id",
+    "canonical position two retains constructor identity")
+  assert_eq(#history[2].content.value.value.content, 2048,
+    "canonical context receives the final value")
+  assert_eq(history[2].content.value.value.transcript_delta, nil,
+    "canonical context receives no worker transcript metadata")
+  assert_eq(history[2].content.value.value.result, nil,
+    "canonical context receives no raw provider result")
 end
 
 print("mag-kernel adapter_test: all assertions passed")

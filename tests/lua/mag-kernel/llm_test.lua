@@ -62,6 +62,68 @@ local function conversation(id, facts)
   }, facts
 end
 
+local function conversation_messages(facts)
+  local messages, by_id, exchanges = {}, {}, {}
+  for _, fact in ipairs(facts) do
+    if fact.kind == "message_started" then
+      local message = {
+        role = fact.role,
+        content = nil,
+        text = "",
+        structured = {},
+        tool_call_id = fact.tool_call_id,
+        name = fact.name,
+        tool_calls = {},
+        completed = false,
+      }
+      messages[#messages + 1] = message
+      by_id[fact.message_id] = message
+    elseif fact.kind == "content_chunk_appended" then
+      local message = by_id[fact.message_id]
+      if message and fact.chunk.kind == "text" then
+        message.text = message.text .. fact.chunk.data
+      elseif message and fact.chunk.kind == "structured" then
+        message.structured[#message.structured + 1] = fact.chunk.data
+      end
+    elseif fact.kind == "tool_exchange_started" then
+      exchanges[fact.exchange_id] = {
+        message = by_id[fact.message_id],
+        tool_call_id = fact.tool_call_id,
+        name = fact.tool_name,
+      }
+    elseif fact.kind == "tool_call_completed" then
+      local exchange = exchanges[fact.exchange_id]
+      if exchange and exchange.message then
+        exchange.message.tool_calls[#exchange.message.tool_calls + 1] = {
+          id = exchange.tool_call_id,
+          name = fact.call.name or exchange.name,
+          arguments = fact.call.arguments,
+        }
+      end
+    elseif fact.kind == "message_completed" then
+      local message = by_id[fact.message_id]
+      if message then message.completed = true end
+    end
+  end
+  local completed = {}
+  for _, message in ipairs(messages) do
+    if message.completed then
+      if message.text ~= "" then
+        message.content = message.text
+      elseif #message.structured == 1 then
+        message.content = message.structured[1]
+      elseif #message.structured > 1 then
+        message.content = message.structured
+      end
+      message.text = nil
+      message.structured = nil
+      message.completed = nil
+      completed[#completed + 1] = message
+    end
+  end
+  return completed
+end
+
 -- Construct an llm instance with a fresh capture. Consumes the ready confirm.
 local function make(id, params)
   local msgs, emit = capture()
@@ -105,7 +167,7 @@ end
 -- ==================================================================
 
 do
-  local instance, msgs = make("lead.llm", { provider = "p" })
+  local instance, msgs, facts = make("lead.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "first" } } }))
   local first = find_last_kind(msgs, "capability.invoke")
   assert_true(instance.handle_steer({ role = "user", content = "queued" }),
@@ -118,14 +180,16 @@ do
   assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
     "a queued steer keeps the run open instead of finishing after the current answer")
   local second = find_last_kind(msgs, "capability.invoke")
-  local history = second.request.input.messages
+  local history = conversation_messages(facts)
   assert_eq(history[1].content, "first", "original user message stays first")
   assert_eq(history[2].content, "current answer", "current assistant turn finishes before steer")
   assert_eq(history[3].content, "queued", "steer is the next user turn")
+  assert_true(second.request.input == nil,
+    "the next provider invocation does not duplicate canonical history")
 end
 
 do
-  local instance, msgs = make("lead-tools.llm", { provider = "p" })
+  local instance, msgs, facts = make("lead-tools.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "first" } } }))
   local first = find_last_kind(msgs, "capability.invoke")
   instance.handle_steer({ role = "user", content = "queued" })
@@ -141,9 +205,11 @@ do
   } }))
 
   local second = find_last_kind(msgs, "capability.invoke")
-  local history = second.request.input.messages
+  local history = conversation_messages(facts)
   assert_eq(history[#history - 1].role, "tool", "tool result precedes steering")
   assert_eq(history[#history].content, "queued", "steering is appended after tool results")
+  assert_true(second.request.input == nil,
+    "the continuation invocation stays thin")
 end
 
 -- ==================================================================
@@ -151,7 +217,7 @@ end
 -- ==================================================================
 
 do
-  local instance, msgs = make("docs-explorer.llm", {
+  local instance, msgs, facts = make("docs-explorer.llm", {
     model = "opus",
     system = "Explore the codebase.",
     tools = { "fs/read", "grep" },
@@ -163,7 +229,9 @@ do
   assert_true(ready ~= nil and ready.from == "docs-explorer.llm",
     "construction emits an id-signed ready confirm")
 
-  local completion = instance.deliver(turn({ messages = { "prior turn" } }))
+  local completion = instance.deliver(turn({ messages = {
+    { role = "user", content = "prior turn" },
+  } }))
   assert_eq(completion.status, "pending", "a provider turn defers completion")
 
   local inv = find_kind(msgs, "capability.invoke")
@@ -171,10 +239,14 @@ do
   assert_eq(inv.from, "docs-explorer.llm", "capability.invoke is id-signed")
   assert_eq(inv.capability, "chatgpt-provider", "invokes the params-selected provider capability")
   assert_eq(inv.request.model, "opus", "request carries params.model")
-  assert_eq(inv.request.system, "Explore the codebase.", "request carries params.system")
   assert_eq(inv.request.tools[1], "fs/read", "request carries params.tools")
   assert_eq(inv.request.reasoning_effort, "high", "request carries the resolved reasoning effort")
-  assert_eq(inv.request.input.messages[1], "prior turn", "request carries the incoming turn message")
+  assert_true(inv.request.system == nil and inv.request.input == nil,
+    "provider invocation contains metadata but no canonical conversation payload")
+  local history = conversation_messages(facts)
+  assert_eq(history[1].role, "system", "params.system becomes canonical context")
+  assert_eq(history[1].content, "Explore the codebase.", "canonical system content is preserved")
+  assert_eq(history[2].content, "prior turn", "the incoming turn becomes canonical context")
   assert_true(type(inv.ref) == "string" and inv.ref:find("@r1", 1, true) ~= nil,
     "factory mints a request-scoped correlation handle")
   assert_eq(inv.request.chat_id, nil, "provider requests carry no legacy chat_id")
@@ -245,12 +317,12 @@ end
 -- ==================================================================
 
 do
-  local instance, msgs = make("agent.llm", { provider = "p" })
+  local instance, msgs, facts = make("agent.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "list the repo" } } }))
   local r1 = find_kind(msgs, "capability.invoke")
   assert_true(r1.ref:find("@r1", 1, true) ~= nil,
     "the first activation mints @r1, not a continued counter")
-  assert_eq(#r1.request.input.messages, 1, "round 1 carries the seed turn alone")
+  assert_eq(#conversation_messages(facts), 1, "round 1 records the seed turn once")
 
   instance.deliver({
     kind = "reply",
@@ -278,18 +350,20 @@ do
   -- WHOLE conversation: [user, assistant(tool_calls), tool]. A request carrying
   -- only the tool result is exactly what a real provider rejects ("tool message
   -- without preceding tool_calls") — the session-27c60892 r4 failure.
-  local replay = r2.request.input.messages
-  assert_eq(#replay, 3, "round 2 replays the whole transcript")
+  local replay = conversation_messages(facts)
+  assert_eq(#replay, 3, "round 2 reads the whole canonical transcript")
   assert_eq(replay[1].role, "user", "transcript starts with the seed turn")
   assert_eq(replay[1].content, "list the repo", "the seed turn is verbatim")
   assert_eq(replay[2].role, "assistant", "the model's tool-call turn is recorded")
   assert_eq(replay[2].tool_calls[1].id, "call-1", "the recorded call keeps the model's id")
-  assert_eq(replay[2].tool_calls[1]["function"].name, "list_dir",
-    "the recorded call is in the provider wire shape")
-  assert_eq(replay[2].tool_calls[1]["function"].arguments, "{\"path\":\".\"}",
-    "arguments re-encode as the wire's JSON string")
+  assert_eq(replay[2].tool_calls[1].name, "list_dir",
+    "the recorded call keeps its universal tool name")
+  assert_eq(replay[2].tool_calls[1].arguments.path, ".",
+    "canonical arguments stay structured")
   assert_eq(replay[3].role, "tool", "the tool result follows the call")
   assert_eq(replay[3].tool_call_id, "call-1", "the tool result pairs with the call id")
+  assert_true(r2.request.input == nil,
+    "round 2 does not replay the transcript on the bus")
 end
 
 -- ==================================================================
@@ -302,7 +376,7 @@ do
     { role = "user", content = "what is the plan?" },
     { role = "assistant", content = "step one, then step two." },
   }
-  local instance, msgs = make("turn.llm", {
+  local instance, msgs, facts = make("turn.llm", {
     provider = "p",
     system = "You are the lead.",
     history = seed,
@@ -310,32 +384,33 @@ do
   instance.deliver(turn({ messages = { { role = "user", content = "do step one" } } }))
 
   local inv = find_kind(msgs, "capability.invoke")
-  local sent = inv.request.input.messages
-  assert_eq(#sent, 3, "round 1 replays the seed ahead of the activation turn")
-  assert_eq(sent[1].role, "user", "seed message 1 leads the request")
-  assert_eq(sent[1].content, "what is the plan?", "seed message 1 is verbatim")
-  assert_eq(sent[2].role, "assistant", "seed message 2 follows in order")
-  assert_eq(sent[2].content, "step one, then step two.", "seed message 2 is verbatim")
-  assert_eq(sent[3].role, "user", "the activation turn comes after the whole seed")
-  assert_eq(sent[3].content, "do step one", "the activation turn is verbatim")
+  local sent = conversation_messages(facts)
+  assert_eq(#sent, 4, "round 1 records system, seed, and activation once")
+  assert_eq(sent[1].role, "system", "the authored system message leads canonical context")
+  assert_eq(sent[1].content, "You are the lead.", "the system message is verbatim")
+  assert_eq(sent[2].role, "user", "seed message 1 follows the system message")
+  assert_eq(sent[2].content, "what is the plan?", "seed message 1 is verbatim")
+  assert_eq(sent[3].role, "assistant", "seed message 2 follows in order")
+  assert_eq(sent[3].content, "step one, then step two.", "seed message 2 is verbatim")
+  assert_eq(sent[4].role, "user", "the activation turn comes after the whole seed")
+  assert_eq(sent[4].content, "do step one", "the activation turn is verbatim")
 
   -- System precedence: params.system and params.history are orthogonal
-  -- channels. params.system rides the request's system field; a system-role
-  -- seed entry is neither lifted into it nor stripped — it replays verbatim
-  -- as an ordinary leading transcript message.
-  assert_eq(inv.request.system, "You are the lead.", "params.system stays the system channel")
-  local i2, m2 = make("sys.llm", {
+  -- authored inputs. Both become canonical messages in their original order.
+  assert_true(inv.request.system == nil and inv.request.input == nil,
+    "authored context stays out of the provider invocation")
+  local i2, _, f2 = make("sys.llm", {
     provider = "p",
     system = "from params",
     history = { { role = "system", content = "from seed" } },
   })
   i2.deliver(turn({ messages = { { role = "user", content = "go" } } }))
-  local inv2 = find_kind(m2, "capability.invoke")
-  assert_eq(inv2.request.system, "from params",
-    "a system-role seed entry does not displace params.system")
-  assert_eq(inv2.request.input.messages[1].role, "system",
-    "the system-role seed entry replays verbatim in the transcript")
-  assert_eq(inv2.request.input.messages[1].content, "from seed",
+  local authored = conversation_messages(f2)
+  assert_eq(authored[1].content, "from params",
+    "params.system remains the first authored system message")
+  assert_eq(authored[2].role, "system",
+    "the system-role seed entry remains a system message")
+  assert_eq(authored[2].content, "from seed",
     "the seed's system content is untouched")
 end
 
@@ -345,7 +420,7 @@ end
 -- ==================================================================
 
 do
-  local instance, msgs = make("turn.llm", {
+  local instance, msgs, facts = make("turn.llm", {
     provider = "p",
     history = {
       { role = "user", content = "earlier question" },
@@ -360,7 +435,8 @@ do
   })
   instance.deliver(turn({ messages = { { role = "user", content = "new question" } } }))
   local r1 = find_kind(msgs, "capability.invoke")
-  assert_eq(#r1.request.input.messages, 5, "round 1 carries seed (4) + activation (1)")
+  assert_eq(#conversation_messages(facts), 5,
+    "round 1 records seed (4) + activation (1) canonically")
 
   instance.deliver({
     kind = "reply",
@@ -379,8 +455,8 @@ do
   for _, m in ipairs(msgs) do
     if m.kind == "capability.invoke" and m ~= r1 then r2 = m end
   end
-  local replay = r2.request.input.messages
-  assert_eq(#replay, 7, "round 2 replays seed + accumulated turns")
+  local replay = conversation_messages(facts)
+  assert_eq(#replay, 7, "round 2 sees seed + accumulated canonical turns")
   assert_eq(replay[1].content, "earlier question", "the seed prefix still leads")
   assert_eq(replay[2].tool_calls[1].id, "call-0", "the seeded tool-call turn survives verbatim")
   assert_eq(replay[3].tool_call_id, "call-0", "the seeded tool result stays paired")
@@ -389,6 +465,8 @@ do
   assert_eq(replay[6].role, "assistant", "the accumulated tool-call turn is recorded after it")
   assert_eq(replay[6].tool_calls[1].id, "call-1", "the live call keeps the model's id")
   assert_eq(replay[7].tool_call_id, "call-1", "the live tool result closes the sequence")
+  assert_true(r2.request.input == nil,
+    "the accumulated transcript remains outside the provider invocation")
 end
 
 -- ==================================================================
@@ -434,7 +512,8 @@ do
     if fact.kind == "tool_exchange_started" then exchanges = exchanges + 1 end
     if fact.kind == "tool_result_recorded" then results = results + 1 end
   end
-  assert_eq(started, 4, "only live user, assistant-call, tool, and answer messages become facts")
+  assert_eq(started, 6,
+    "seed and live user, assistant-call, tool, and answer messages are canonical facts")
   assert_eq(exchanges, 1, "the provider tool call becomes one canonical exchange")
   assert_eq(results, 1, "the matching tool result settles that exchange")
 
@@ -530,10 +609,10 @@ do
 
   instance.deliver(turn({ messages = { { role = "user", content = "first firing" } } }))
   local first_request = find_last_kind(msgs, "capability.invoke")
-  assert_eq(first_request.request.conversation_context.watermark, "manager-watermark",
-    "MAG forwards manager context without interpreting it")
-  assert_true(first_request.request.context_artifact == nil,
-    "the removed provider artifact compatibility field is never forwarded")
+  assert_true(first_request.request.conversation_context == nil,
+    "MAG never forwards a duplicate manager conversation projection")
+  assert_true(first_request.request.context_artifact == nil and first_request.request.input == nil,
+    "removed provider context compatibility fields are never forwarded")
   instance.deliver({ kind = "reply", ref = first_request.ref, result = { text = "first answer" } })
 
   instance.deliver(turn({ messages = { { role = "user", content = "second firing" } } }))
@@ -621,29 +700,29 @@ end
 -- ==================================================================
 
 do
-  local plain, pm = make("plain.llm", { provider = "p", model = "opus" })
+  local plain, pm, pfacts = make("plain.llm", { provider = "p", model = "opus" })
   plain.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   local pi = find_kind(pm, "capability.invoke")
-  assert_eq(#pi.request.input.messages, 1, "no seed: round 1 carries the activation turn alone")
-  assert_eq(pi.request.input.messages[1].content, "go", "the activation turn is verbatim")
+  local plain_history = conversation_messages(pfacts)
+  assert_eq(#plain_history, 1, "no seed: round 1 records the activation turn alone")
+  assert_eq(plain_history[1].content, "go", "the activation turn is verbatim")
   assert_true(pi.ref:find("@r1", 1, true) ~= nil, "no seed: the round counter starts at @r1")
 
-  local empty, em = make("empty.llm", { provider = "p", model = "opus", history = {} })
+  local empty, _, efacts = make("empty.llm", { provider = "p", model = "opus", history = {} })
   empty.deliver(turn({ messages = { { role = "user", content = "go" } } }))
-  local ei = find_kind(em, "capability.invoke")
-  assert_eq(#ei.request.input.messages, #pi.request.input.messages,
-    "an empty seed sends the same message count as no seed")
-  assert_eq(ei.request.input.messages[1].content, pi.request.input.messages[1].content,
-    "an empty seed sends the same content as no seed")
+  local empty_history = conversation_messages(efacts)
+  assert_eq(#empty_history, #plain_history,
+    "an empty seed records the same message count as no seed")
+  assert_eq(empty_history[1].content, plain_history[1].content,
+    "an empty seed records the same content as no seed")
 
   -- The seed is copied, not aliased: mutating the caller's table after
   -- construct does not bleed into the replayed transcript.
   local caller_seed = { { role = "user", content = "seeded" } }
-  local aliased, am = make("alias.llm", { provider = "p", history = caller_seed })
+  local aliased, _, afacts = make("alias.llm", { provider = "p", history = caller_seed })
   caller_seed[2] = { role = "user", content = "injected later" }
   aliased.deliver(turn({ messages = { { role = "user", content = "go" } } }))
-  local ai = find_kind(am, "capability.invoke")
-  assert_eq(#ai.request.input.messages, 2,
+  assert_eq(#conversation_messages(afacts), 2,
     "post-construct mutation of the caller's seed table does not reach the transcript")
 end
 
