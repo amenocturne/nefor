@@ -135,6 +135,14 @@ build:
 bench-mag *args:
     cargo bench -p nefor-mag --bench mag_compile -- {{args}}
 
+# Browse aggregate byte anatomy for sessions in the resolved Nefor data directory.
+inspect-sessions host="127.0.0.1" port="3939":
+    NEFOR_SESSION_INSPECTOR_HOST={{host}} NEFOR_SESSION_INSPECTOR_PORT={{port}} bun tools/session-inspector/server.ts
+
+# Focused backend and persistence-boundary tests for the session inspector.
+test-session-inspector:
+    bun test tools/session-inspector/server.test.ts
+
 # Print the workspace version — the single source of truth (Cargo.toml
 # [workspace.package]). The pre-push hook derives the release tag from this, so
 # bumping it here (and pushing) is all it takes to cut v<version>.

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Local structural explorer for Nefor session logs">
+  <title>Nefor session inspector</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%233093ed'/%3E%3Cpath d='M18 46V18h12c11 0 16 4 16 13 0 7-4 11-11 12l12 3H35l-10-3v3zM25 25v11h5c6 0 9-1 9-5s-3-6-9-6z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <p class="eyebrow">Nefor developer tools</p>
+      <h1>Session inspector</h1>
+      <p class="lede">See which event families, message fields, previews, and workflow values occupy each session—without retaining raw contents.</p>
+    </div>
+    <div class="store-total" aria-live="polite">
+      <span>Session store</span>
+      <strong id="store-total">—</strong>
+      <small id="store-count">Loading…</small>
+    </div>
+  </header>
+
+  <main>
+    <section class="session-picker" aria-labelledby="session-picker-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-number">01</p>
+          <h2 id="session-picker-title">Choose a session</h2>
+        </div>
+        <code id="data-dir"></code>
+      </div>
+      <div class="picker-controls">
+        <label>
+          Filter
+          <input id="session-filter" type="search" placeholder="Session id">
+        </label>
+        <label>
+          Order
+          <select id="session-order">
+            <option value="size">Largest first</option>
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+          </select>
+        </label>
+      </div>
+      <label class="session-select-label" for="session-select">Available sessions</label>
+      <select id="session-select" class="session-select" size="9" aria-describedby="session-detail"></select>
+      <div class="selection-footer">
+        <p id="session-detail" class="selection-detail">Select a session to inspect.</p>
+        <button id="analyze" type="button" disabled>Analyze selected session</button>
+      </div>
+      <div id="analysis-status" class="analysis-status" hidden>
+        <div class="status-line">
+          <span id="status-label">Queued</span>
+          <span id="status-value">0%</span>
+        </div>
+        <progress id="status-progress" max="1" value="0"></progress>
+      </div>
+      <p id="error" class="error" role="alert" hidden></p>
+    </section>
+
+    <section id="results" hidden aria-labelledby="results-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-number">02</p>
+          <h2 id="results-title">Byte anatomy</h2>
+        </div>
+        <span id="scan-time" class="muted"></span>
+      </div>
+
+      <div id="stats" class="stats"></div>
+
+      <div class="subsection">
+        <h3>Semantic families</h3>
+        <div id="category-stack" class="category-stack" aria-label="Session bytes by semantic event family"></div>
+        <div id="category-legend" class="legend"></div>
+      </div>
+
+      <div class="subsection">
+        <h3>Event kinds</h3>
+        <p class="muted">Select a kind to see which body fields carry its weight.</p>
+        <div class="kind-layout">
+          <div id="kind-list" class="kind-list"></div>
+          <div id="field-panel" class="field-panel"></div>
+        </div>
+      </div>
+
+      <div id="pairing-section" class="subsection">
+        <h3>Exact mirrored content</h3>
+        <div id="pairing" class="pairing"></div>
+      </div>
+
+      <div class="subsection">
+        <h3>Largest individual records</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Kind</th><th class="numeric">Size</th><th>Body fields</th></tr></thead>
+            <tbody id="largest"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>Localhost only · aggregate sizes and hashes are cached · raw message values are discarded during analysis</footer>
+</body>
+</html>
