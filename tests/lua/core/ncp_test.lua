@@ -578,6 +578,12 @@ local openai_provider  = require("libs.compositors.provider")
 local function build_provider_chain(name, opts)
   opts = opts or {}
   opts.agentic_loop = agentic_loop_mod
+  opts.conversations = opts.conversations or {
+    context = function()
+      return { messages = {}, watermark = 0 }
+    end,
+    watermark = function() return 0 end,
+  }
   local spec = openai_provider.spawn_spec(name, { "/bin/true" }, opts)
   return { from_plugin = spec.from_plugin, to_plugin = spec.to_plugin }
 end

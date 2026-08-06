@@ -174,14 +174,10 @@ function M.translator(name)
     local k = body.kind
     if type(k) ~= "string" then return body end
 
-    if k == kinds.completion_request then
-      if type(body.request_id) ~= "string" or body.request_id == "" then return nil end
-      if type(body.messages) ~= "table" then return nil end
-      return body
-    elseif k == kinds.completion_cancel then
-      if type(body.request_id) ~= "string" or body.request_id == "" then return nil end
-      return body
-    end
+    -- Direct completion requests are private compositor-to-process traffic.
+    -- Never accept their native wire kinds from the public bus; the compositor
+    -- calls complete/cancel_completion and delivers the resulting body itself.
+    if k == kinds.completion_request or k == kinds.completion_cancel then return nil end
 
     if k == kinds.chat_create and type(body.chat_id) == "string" then
       return body
@@ -317,6 +313,34 @@ function M.translator(name)
     return out
   end
 
+  -- Lower one provider-neutral invocation plus a manager-owned conversation
+  -- view into the process's private completion wire shape. The returned table
+  -- is for nefor.engine.deliver only; publishing it would duplicate history.
+  local function complete(request, context)
+    assert(type(request) == "table", "openai-provider.complete: request required")
+    assert(type(request.request_id) == "string" and request.request_id ~= "",
+      "openai-provider.complete: request_id required")
+    assert(type(context) == "table" and type(context.messages) == "table",
+      "openai-provider.complete: conversation context required")
+
+    local body = clone_table(request)
+    body.kind = kinds.completion_request
+    body.provider = nil
+    body.watermark = nil
+    body.messages = {}
+    for index, message in ipairs(context.messages) do
+      body.messages[index] = context_message(message)
+    end
+    body.conversation_context = nil
+    return body
+  end
+
+  local function cancel_completion(request_id)
+    assert(type(request_id) == "string" and request_id ~= "",
+      "openai-provider.cancel_completion: request_id required")
+    return { kind = kinds.completion_cancel, request_id = request_id }
+  end
+
   local function compact_context(_)
     return nil, "context compaction is not supported by " .. name
   end
@@ -328,6 +352,8 @@ function M.translator(name)
     inbound                    = inbound,
     publish                    = publish,
     deliver                    = deliver,
+    complete                   = complete,
+    cancel_completion          = cancel_completion,
     cancel                     = cancel,
     compact_context            = compact_context,
     context_message            = context_message,

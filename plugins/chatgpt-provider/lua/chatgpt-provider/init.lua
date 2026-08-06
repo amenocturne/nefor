@@ -20,44 +20,34 @@ local function translator(name)
   t.kinds.usage_updated = prefix .. "usage.updated"
   t.kinds.usage_error = prefix .. "usage.error"
 
-  t.complete = function(request)
+  t.complete = function(request, context)
     assert(type(request) == "table", "chatgpt-provider.complete: request required")
     assert(type(request.request_id) == "string" and #request.request_id > 0,
       "chatgpt-provider.complete: request_id required")
-    assert(type(request.messages) == "table",
-      "chatgpt-provider.complete: complete messages/history required")
+    assert(type(context) == "table" and type(context.messages) == "table",
+      "chatgpt-provider.complete: conversation context required")
     local body = copy(request)
+    body.provider = nil
+    body.watermark = nil
     body.messages = {}
-    for index, message in ipairs(request.messages) do
+    for index, message in ipairs(context.messages) do
       body.messages[index] = t.context_message(message)
     end
-    local context = body.conversation_context
-    if type(context) == "table" then
-      local lowered_context = copy(context)
-      local messages = type(context.messages) == "table" and context.messages or {}
-      lowered_context.messages = {}
-      for index, message in ipairs(messages) do
-        lowered_context.messages[index] = t.context_message(message)
-      end
-      lowered_context.tail_messages = {}
-      for index, message in ipairs(context.tail_messages or {}) do
-        lowered_context.tail_messages[index] = t.context_message(message)
-      end
-      -- The manager projection is the canonical completed prefix. The
-      -- request-local transcript can already contain the input that triggered
-      -- this turn, before that input has reached the projection. Preserve that
-      -- suffix in both full and compacted contexts.
-      for index = #messages + 1, #body.messages do
-        lowered_context.messages[index] = body.messages[index]
-        lowered_context.tail_messages[#lowered_context.tail_messages + 1] = body.messages[index]
-      end
-      body.conversation_context = lowered_context
+    local lowered_context = copy(context)
+    lowered_context.messages = {}
+    for index, message in ipairs(context.messages) do
+      lowered_context.messages[index] = t.context_message(message)
     end
+    lowered_context.tail_messages = {}
+    for index, message in ipairs(context.tail_messages or {}) do
+      lowered_context.tail_messages[index] = t.context_message(message)
+    end
+    body.conversation_context = lowered_context
     body.kind = t.kinds.completion_request
     return body
   end
 
-  t.cancel = function(request_id)
+  t.cancel_completion = function(request_id)
     assert(type(request_id) == "string" and #request_id > 0,
       "chatgpt-provider.cancel: request_id required")
     return { kind = t.kinds.completion_cancel, request_id = request_id }
@@ -118,14 +108,8 @@ local function translator(name)
 
   t.inbound = function(env)
     local body = type(env) == "table" and env.body or nil
-    if type(body) == "table" and body.kind == t.kinds.completion_request then
-      return t.complete(body)
-    end
-    if type(body) == "table" and body.kind == "ProviderRequest" then
-      if body.provider ~= nil and body.provider ~= name then return nil end
-      if body.cancel == true then return t.cancel(body.request_id) end
-      return t.complete(body)
-    end
+    if type(body) == "table" and (body.kind == t.kinds.completion_request
+        or body.kind == "ProviderRequest") then return nil end
     if type(body) == "table" and body.kind == "chat.usage.requested" then
       if body.provider ~= name then return nil end
       return { kind = t.kinds.usage_requested }

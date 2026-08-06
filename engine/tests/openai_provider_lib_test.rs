@@ -729,35 +729,22 @@ fn chatgpt_direct_completion_lowers_manager_history_without_dropping_run_input()
             r#"
             local chatgpt = require("chatgpt-provider")
             local t = chatgpt.translator("chatgpt")
-            local request = t.inbound({
-                type = "event", from = "mag",
-                body = {
-                    kind = "chatgpt.completion.request",
-                    request_id = "request-1",
-                    messages = {
-                        { role = "user", content = "earlier input" },
-                        {
-                            role = "assistant", content = "",
-                            tool_calls = {{
-                                id = "call-1", name = "read_file",
-                                arguments = { path = "x" }, status = "call_completed",
-                            }},
-                        },
-                        { role = "user", content = "current input" },
+            local request = t.complete({
+                request_id = "request-1",
+            }, {
+                messages = {
+                    { role = "user", content = "earlier input" },
+                    {
+                        role = "assistant", content = "",
+                        tool_calls = {{
+                            id = "call-1", name = "read_file",
+                            arguments = { path = "x" }, status = "call_completed",
+                        }},
                     },
-                    conversation_context = {
-                        messages = {
-                            { role = "user", content = "earlier input" },
-                            {
-                                role = "assistant", content = "",
-                                tool_calls = {{
-                                    id = "call-1", name = "read_file",
-                                    arguments = { path = "x" }, status = "call_completed",
-                                }},
-                            },
-                        },
-                        tail_messages = {},
-                    },
+                    { role = "user", content = "current input" },
+                },
+                tail_messages = {
+                    { role = "user", content = "current input" },
                 },
             })
             local call = request.conversation_context.messages[2].tool_calls[1]

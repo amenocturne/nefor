@@ -36,8 +36,9 @@
 --   chat.model.set                 → <prefix>.model.set
 --   chat.reasoning.set             → <prefix>.reasoning.set
 --
--- Replay is inert at this boundary: provider requests carry complete
--- conversation-manager context and never rebuild process-local chats.
+-- Replay is inert at this boundary. Live invocations carry only correlation
+-- and provider options; this actor reads the manager-owned conversation view
+-- and delivers the expanded native request directly to its process.
 
 local M = {}
 
@@ -70,6 +71,11 @@ local M = {}
 --   agentic_loop (required) — the agentic-loop module table, injected
 --     by the caller. Eliminates the require-time cycle between this
 --     compositor and agentic-loop.
+--
+--   conversations (required) — conversation-manager's runtime read facet.
+--     context(conversation_id) supplies provider-neutral history and
+--     watermark(conversation_id) optionally verifies invoke ordering. The
+--     expanded context is delivered only to this provider process.
 function M.spawn_spec(name, command, opts)
   if type(name) ~= "string" or #name == 0 then
     error("provider.spawn_spec: name required, got " .. type(name))
@@ -83,11 +89,16 @@ function M.spawn_spec(name, command, opts)
   if al == nil then
     error("provider.spawn_spec: opts.agentic_loop is required")
   end
+  local conversations = opts.conversations
+  if type(conversations) ~= "table" or type(conversations.context) ~= "function" then
+    error("provider.spawn_spec: opts.conversations read facet is required")
+  end
 
   local provider_lib = require(opts.translator_lib or "openai-provider")
   local translator = provider_lib.translator(name)
   local kinds = translator.kinds
   local pending_compactions = {}
+  local pending_requests = {}
 
   local function emit_synthetic(from, body)
     nefor.engine.send(nefor.json.encode({
@@ -113,6 +124,97 @@ function M.spawn_spec(name, command, opts)
     return out
   end
 
+  local function read_context(conversation_id)
+    local ok, context = pcall(conversations.context, conversations, conversation_id)
+    if not ok or type(context) ~= "table" then return nil end
+    return context
+  end
+
+  local function read_watermark(conversation_id, context)
+    if type(conversations.watermark) == "function" then
+      local ok, watermark = pcall(conversations.watermark, conversations, conversation_id)
+      if ok and type(watermark) == "number" then return watermark end
+    end
+    return type(context) == "table" and context.watermark or nil
+  end
+
+  local function report(body)
+    local reported = clone_table(body or {})
+    reported.kind = "conversation.provider.event.reported"
+    reported.provider = name
+    emit_synthetic(name, reported)
+  end
+
+  local function fail_request(body, code, message)
+    report({
+      request_id = body and body.request_id,
+      conversation_id = body and body.conversation_id,
+      event = "failed",
+      error = { code = code, message = message },
+      message = message,
+    })
+  end
+
+  local function begin_request(body)
+    if body.provider ~= name then return false end
+    if type(body.request_id) ~= "string" or body.request_id == ""
+        or type(body.conversation_id) ~= "string" or body.conversation_id == "" then
+      fail_request(body, "invalid_provider_invocation", "provider invocation needs request_id and conversation_id")
+      return true
+    end
+    if pending_requests[body.request_id] then
+      fail_request(body, "duplicate_provider_invocation", "provider request is already in flight")
+      return true
+    end
+
+    local context = read_context(body.conversation_id)
+    if not context then
+      fail_request(body, "conversation_not_found", "conversation context is unavailable")
+      return true
+    end
+    local watermark = read_watermark(body.conversation_id, context)
+    if type(body.watermark) == "number"
+        and (type(watermark) ~= "number" or watermark < body.watermark) then
+      fail_request(body, "conversation_watermark_stale", "conversation context has not reached the invocation watermark")
+      return true
+    end
+
+    local request = {
+      request_id = body.request_id,
+      conversation_id = body.conversation_id,
+      model = body.model,
+      reasoning_effort = body.reasoning_effort,
+      tools = clone_table(body.tools),
+      output_schema = clone_table(body.output_schema),
+      max_corrections = body.max_corrections,
+      invocation = clone_table(body.invocation),
+    }
+    local ok, native = pcall(translator.complete, request, context)
+    if not ok or type(native) ~= "table" then
+      fail_request(body, "provider_request_lowering_failed", ok and "provider returned no request" or tostring(native))
+      return true
+    end
+
+    pending_requests[body.request_id] = { conversation_id = body.conversation_id }
+    local delivered, delivery_error = pcall(translator.deliver, native)
+    if not delivered then
+      pending_requests[body.request_id] = nil
+      fail_request(body, "provider_request_delivery_failed", tostring(delivery_error))
+    end
+    return true
+  end
+
+  local function cancel_request(body)
+    if body.provider ~= nil and body.provider ~= name then return false end
+    local request_id = body.request_id
+    local pending = type(request_id) == "string" and pending_requests[request_id] or nil
+    if not pending then return body.provider == name end
+    pending_requests[request_id] = nil
+    local ok, native = pcall(translator.cancel_completion, request_id)
+    if ok and type(native) == "table" then translator.deliver(native) end
+    return true
+  end
+
   local function publish_compaction_failed(change, message)
     emit_synthetic(name, {
       kind = "conversation.context.compact.failed",
@@ -123,8 +225,17 @@ function M.spawn_spec(name, command, opts)
   end
 
   local function begin_compaction(change)
-    if change.provider ~= name then return true end
-    local plan, message = translator.compact_context(change)
+    local selected_provider = change.provider
+      or (type(change.compaction) == "table" and change.compaction.provider)
+    if selected_provider ~= name then return true end
+    local context = read_context(change.conversation_id)
+    if not context then
+      publish_compaction_failed(change, "conversation context is unavailable")
+      return true
+    end
+    local lowered = clone_table(change)
+    lowered.context = context
+    local plan, message = translator.compact_context(lowered)
     if not plan then
       publish_compaction_failed(change, message or "context compaction is unsupported")
       return true
@@ -220,9 +331,23 @@ function M.spawn_spec(name, command, opts)
         env.body.message = env.body.message or env.body.error or "provider error"
       end
 
-      local body = translator.outbound(env)
-      if body ~= nil then
-        translator.publish(env.from or name, body)
+      local translated = translator.outbound(env)
+      if type(translated) == "table" and translated.kind == kinds.completion_event then
+        local request_id = translated.request_id
+        if type(request_id) == "string" and pending_requests[request_id] then
+          translated.kind = nil
+          report(translated)
+          if translated.event == "completed" or translated.event == "result"
+              or translated.event == "failed" or translated.event == "error"
+              or translated.event == "interrupted" then
+            pending_requests[request_id] = nil
+          end
+        end
+        goto continue
+      end
+
+      if translated ~= nil then
+        translator.publish(env.from or name, translated)
       end
       ::continue::
     end
@@ -245,6 +370,14 @@ function M.spawn_spec(name, command, opts)
           if hooks.intercept_to_plugin(env) == false then
             goto continue
           end
+        end
+        if type(env.body) == "table" and env.body.kind == "conversation.provider.invoke" then
+          begin_request(env.body)
+          goto continue
+        end
+        if type(env.body) == "table" and env.body.kind == "conversation.provider.cancel" then
+          cancel_request(env.body)
+          goto continue
         end
         if type(env.body) == "table"
             and env.body.kind == "chat.reasoning.set"
@@ -280,6 +413,9 @@ function M.spawn_spec(name, command, opts)
     from_plugin = from_plugin,
     to_plugin   = to_plugin,
     receive_msg = function(_) end,
+    _internals = {
+      pending_requests = function() return pending_requests end,
+    },
   }
 end
 

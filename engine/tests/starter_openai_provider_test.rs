@@ -92,6 +92,15 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
         local op = require("libs.compositors.provider")
         local spec = op.spawn_spec("chatgpt", { "/bin/true" }, {
           agentic_loop = {}, translator_lib = "chatgpt-provider",
+          conversations = {
+            context = function(_, conversation_id)
+              assert(conversation_id == "lead")
+              return {
+                messages = {{ role = "user", content = "full context" }},
+                tail_messages = {}, watermark = 7,
+              }
+            end,
+          },
         })
         spec.to_plugin({{
           type = "event", from = "conversation-manager",
@@ -102,10 +111,6 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
               kind = "context_compaction_pending",
               provider = "chatgpt",
               compaction = { request_id = "compact-1" },
-              context = {
-                messages = {{ role = "user", content = "full context" }},
-                tail_messages = {},
-              },
             },
           },
         }})
@@ -147,7 +152,14 @@ fn unsupported_provider_returns_universal_compaction_failure() {
     lua.load(
         r#"
         local op = require("libs.compositors.provider")
-        local spec = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} })
+        local spec = op.spawn_spec("ollama", { "/bin/true" }, {
+          agentic_loop = {},
+          conversations = {
+            context = function()
+              return { messages = {{ role = "user", content = "context" }}, watermark = 3 }
+            end,
+          },
+        })
         spec.to_plugin({{
           type = "event", from = "conversation-manager",
           body = {
@@ -157,7 +169,6 @@ fn unsupported_provider_returns_universal_compaction_failure() {
               kind = "context_compaction_pending",
               provider = "ollama",
               compaction = { request_id = "compact-2" },
-              context = { messages = {{ role = "user", content = "context" }} },
             },
           },
         }})
@@ -169,6 +180,130 @@ fn unsupported_provider_returns_universal_compaction_failure() {
     )
     .exec()
     .expect("unsupported compaction failure");
+}
+
+#[test]
+fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local op = require("libs.compositors.provider")
+        local spec = op.spawn_spec("ollama", { "/bin/true" }, {
+          agentic_loop = {},
+          conversations = {
+            context = function(_, conversation_id)
+              assert(conversation_id == "conversation-1")
+              return {
+                messages = {
+                  { role = "system", content = "private system" },
+                  { role = "user", content = "private history" },
+                },
+                watermark = 11,
+              }
+            end,
+            watermark = function() return 11 end,
+          },
+        })
+        spec.to_plugin({{
+          type = "event", from = "conversation-manager",
+          body = {
+            kind = "conversation.provider.invoke", provider = "ollama",
+            request_id = "request-1", conversation_id = "conversation-1",
+            watermark = 11, model = "qwen", tools = { "read_file" },
+          },
+        }})
+
+        local delivered = _test.delivered()
+        assert(#delivered == 1)
+        assert(delivered[1].kind == "ollama.completion.request")
+        assert(delivered[1].body.request_id == "request-1")
+        assert(delivered[1].body.model == "qwen")
+        assert(#delivered[1].body.messages == 2)
+        assert(delivered[1].body.messages[1].content == "private system")
+        assert(delivered[1].body.messages[2].content == "private history")
+        assert(#_test.sent() == 0)
+
+        -- Even a fully expanded native request arriving on the public bus is
+        -- inert. Only the compositor may construct and direct-deliver it.
+        spec.to_plugin({{
+          type = "event", from = "legacy-producer",
+          body = {
+            kind = "ollama.completion.request", request_id = "leaked",
+            messages = {{ role = "user", content = "must not be delivered" }},
+          },
+        }})
+        assert(#_test.delivered() == 0)
+
+        spec.from_plugin({{
+          type = "event", from = "ollama",
+          body = {
+            kind = "ollama.completion.event", request_id = "request-1",
+            event = "text_delta", text = "hello", opaque = "preserved",
+          },
+        }})
+        local sent = _test.sent()
+        assert(#sent == 1)
+        assert(sent[1].kind == "conversation.provider.event.reported")
+        assert(sent[1].body.provider == "ollama")
+        assert(sent[1].body.request_id == "request-1")
+        assert(sent[1].body.event == "text_delta")
+        assert(sent[1].body.text == "hello" and sent[1].body.opaque == "preserved")
+
+        spec.from_plugin({{
+          type = "event", from = "ollama",
+          body = {
+            kind = "ollama.completion.event", request_id = "request-1",
+            event = "completed", result = { text = "hello" },
+          },
+        }})
+        assert(#_test.sent() == 1)
+        assert(next(spec._internals.pending_requests()) == nil)
+        "#,
+    )
+    .exec()
+    .expect("drive private provider request lifecycle");
+}
+
+#[test]
+fn provider_adapter_cancels_private_request_without_publishing_native_control() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local op = require("libs.compositors.provider")
+        local spec = op.spawn_spec("ollama", { "/bin/true" }, {
+          agentic_loop = {},
+          conversations = {
+            context = function()
+              return { messages = {{ role = "user", content = "hello" }}, watermark = 1 }
+            end,
+          },
+        })
+        spec.to_plugin({{
+          type = "event", from = "conversation-manager",
+          body = {
+            kind = "conversation.provider.invoke", provider = "ollama",
+            request_id = "request-2", conversation_id = "conversation-1", watermark = 1,
+          },
+        }})
+        assert(#_test.delivered() == 1)
+        spec.to_plugin({{
+          type = "event", from = "conversation-manager",
+          body = { kind = "conversation.provider.cancel", request_id = "request-2" },
+        }})
+        local delivered = _test.delivered()
+        assert(#delivered == 1)
+        assert(delivered[1].kind == "ollama.completion.cancel")
+        assert(delivered[1].body.request_id == "request-2")
+        assert(#_test.sent() == 0)
+        assert(next(spec._internals.pending_requests()) == nil)
+        "#,
+    )
+    .exec()
+    .expect("cancel private provider request");
 }
 
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
@@ -224,6 +359,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         let row = lua.create_table()?;
         row.set("from", env.get::<Value>("from")?)?;
         row.set("kind", body.get::<Value>("kind").unwrap_or(Value::Nil))?;
+        row.set("body", body.clone())?;
         row.set(
             "chat_id",
             body.get::<Value>("chat_id").unwrap_or(Value::Nil),
@@ -282,6 +418,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         row.set("conversation_id", conversation_id)?;
         row.set("role", message_role)?;
         row.set("content", message_content)?;
+        row.set("body", body)?;
         let n = log.len()?;
         log.set(n + 1, row)?;
         Ok(())
