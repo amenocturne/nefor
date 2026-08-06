@@ -179,6 +179,24 @@ fn popup_header_paints_over_underlay() {
         !header.contains("UNDERLAY"),
         "blank popup header cells must paint over the underlying surface:\n{snapshot}"
     );
+
+    let bottom = lines
+        .iter()
+        .position(|line| line.contains('╰'))
+        .expect("popup bottom border");
+    for (row, line) in lines.iter().enumerate().take(bottom).skip(top + 1) {
+        let chars: Vec<_> = line.chars().collect();
+        assert_eq!(
+            chars.get(left),
+            Some(&'│'),
+            "popup row {row} is missing its left border:\n{snapshot}"
+        );
+        assert_eq!(
+            chars.get(right),
+            Some(&'│'),
+            "popup row {row} is missing its right border:\n{snapshot}"
+        );
+    }
 }
 
 #[test]
