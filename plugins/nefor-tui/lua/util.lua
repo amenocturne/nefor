@@ -140,11 +140,17 @@ function M.bordered_popup_shell(scroll_key, child, border_style, stick_to, heade
   children[#children + 1] = tui.expanded { child = body_row }
   if footer ~= nil then children[#children + 1] = inset(footer) end
   children[#children + 1] = rule_row("╰", "╯")
-  return tui.column {
+  local shell = tui.column {
     key = scroll_key .. "_surface",
     selectable = true,
     gap = 0,
     children = children,
+  }
+  return tui.stack {
+    children = {
+      tui.fill { char = " " },
+      shell,
+    },
   }
 end
 

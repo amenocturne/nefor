@@ -149,6 +149,39 @@ fn popup_chrome_blocks_selection_from_selectable_underlay() {
 }
 
 #[test]
+fn popup_header_paints_over_underlay() {
+    let mut engine = Engine::new(60, 16).expect("engine");
+    engine
+        .load_scenario(&popup_selection_scenario())
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+
+    let snapshot = engine.snapshot();
+    let lines: Vec<_> = snapshot.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains('╭'))
+        .expect("popup top border");
+    let left = lines[top]
+        .chars()
+        .position(|ch| ch == '╭')
+        .expect("popup left edge");
+    let right = lines[top]
+        .chars()
+        .position(|ch| ch == '╮')
+        .expect("popup right edge");
+    let header: String = lines[top + 1]
+        .chars()
+        .skip(left)
+        .take(right - left + 1)
+        .collect();
+    assert!(
+        !header.contains("UNDERLAY"),
+        "blank popup header cells must paint over the underlying surface:\n{snapshot}"
+    );
+}
+
+#[test]
 fn first_render_with_stick_to_end_pins_to_bottom() {
     let mut engine = Engine::new(40, 8).expect("engine");
     engine.load_scenario(SCROLLABLE_SCENARIO).expect("scenario");

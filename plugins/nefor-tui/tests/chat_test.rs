@@ -3895,13 +3895,13 @@ fn mag_terminal_results_do_not_close_the_lead_placeholder() {
         &mut engine,
         json!({ "kind": "mag.run_result", "run_id": "sub-run", "status": "completed" }),
     );
-    assert!(render_str(&mut engine).contains("[thinking"));
+    assert!(render_snapshot(&mut engine).contains("[thinking"));
 
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "killed" }),
     );
-    assert!(render_str(&mut engine).contains("[thinking"));
+    assert!(render_snapshot(&mut engine).contains("[thinking"));
 }
 
 #[test]
