@@ -1,9 +1,9 @@
 //! Capability bridge between the kernel's generic capability protocol and the
 //! canonical provider/tool protocols on the bus.
 //!
-//! Provider calls are single-shot: one `<provider>.completion.request` carries
-//! the complete request and one kernel correlation id. Provider events carry
-//! that same `request_id`; only terminal events settle the kernel capability.
+//! Provider calls cross MAG as thin conversation-manager commands. The manager
+//! owns durable conversation state and relays public provider events; MAG never
+//! serializes a request transcript or provider-specific protocol onto the bus.
 //! Tool calls retain the existing stateless tool-gate rewrite.
 
 use std::collections::HashMap;
@@ -12,18 +12,15 @@ use serde_json::{Map, Value};
 
 const TOOL_INVOKE: &str = "tool.invoke";
 const TOOL_CANCEL: &str = "tool.cancel";
-const PROVIDER_EVENT: &str = "completion.event";
+const PROVIDER_INVOKE_REQUEST: &str = "conversation.provider.invoke.request";
+const PROVIDER_CANCEL_REQUEST: &str = "conversation.provider.cancel.request";
+const PROVIDER_EVENT: &str = "conversation.provider.event";
+const CONVERSATION_MANAGER: &str = "conversation-manager";
 
 struct PendingProvider {
     provider: String,
     structured_output: bool,
     tool_calls: Vec<Value>,
-}
-
-#[derive(Debug, Clone)]
-struct AdvertisedTool {
-    owner: String,
-    spec: Value,
 }
 
 /// A terminal provider response ready for `kernel.bus_response`.
@@ -37,7 +34,6 @@ pub struct ProviderReply {
 /// composition-owned tool-gate target.
 pub struct CapabilityBridge {
     pending_providers: HashMap<String, PendingProvider>,
-    advertised_tools: Option<HashMap<String, AdvertisedTool>>,
     gate: String,
 }
 
@@ -45,47 +41,8 @@ impl CapabilityBridge {
     pub fn new(gate: impl Into<String>) -> Self {
         Self {
             pending_providers: HashMap::new(),
-            advertised_tools: None,
             gate: gate.into(),
         }
-    }
-
-    /// Replace the runtime tool snapshot from the composition's canonical gate.
-    ///
-    /// The gate has already rejected malformed schemas and owner collisions.
-    /// MAG therefore treats its flattened `tool.register` event as immutable
-    /// descriptor data for subsequent provider requests, rather than asking
-    /// each provider to independently resolve an authored name list later.
-    pub fn observe_tool_register(&mut self, source: &str, body: &Map<String, Value>) -> bool {
-        if source != self.gate || body.get("kind").and_then(Value::as_str) != Some("tool.register")
-        {
-            return false;
-        }
-
-        let Some(tools) = body.get("tools").and_then(Value::as_array) else {
-            return false;
-        };
-        let mut snapshot = HashMap::with_capacity(tools.len());
-        for spec in tools {
-            let Some(name) = spec.get("name").and_then(Value::as_str) else {
-                return false;
-            };
-            let Some(owner) = spec.get("owner").and_then(Value::as_str) else {
-                return false;
-            };
-            if name.is_empty() || owner.is_empty() || snapshot.contains_key(name) {
-                return false;
-            }
-            snapshot.insert(
-                name.to_owned(),
-                AdvertisedTool {
-                    owner: owner.to_owned(),
-                    spec: spec.clone(),
-                },
-            );
-        }
-        self.advertised_tools = Some(snapshot);
-        true
     }
 
     pub fn translate_emit(&mut self, body: Map<String, Value>) -> Vec<Map<String, Value>> {
@@ -106,43 +63,27 @@ impl CapabilityBridge {
         };
         let request_id = request_id.to_owned();
         let provider = provider.to_owned();
-        let mut request = body
+        let args = body
             .get("args")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        // The kernel's ProviderInput wrapper is an internal activation shape;
-        // the provider protocol owns one canonical top-level message history.
-        if let Some(input) = request.remove("input") {
-            if let Some(messages) = input
-                .as_object()
-                .and_then(|input| input.get("messages"))
-                .cloned()
-            {
-                request.insert("messages".into(), messages);
-            }
-        }
-        if let (Some(catalog), Some(names)) = (
-            self.advertised_tools.as_ref(),
-            request.get("tools").and_then(Value::as_array),
-        ) {
-            let requested = names.iter().filter_map(Value::as_str).collect::<Vec<_>>();
-            if requested.len() == names.len() {
-                let mut specs = Vec::with_capacity(requested.len());
-                for name in requested {
-                    if let Some(tool) = catalog.get(name) {
-                        debug_assert!(!tool.owner.is_empty());
-                        specs.push(tool.spec.clone());
-                    }
-                }
-                request.insert("tool_specs".into(), Value::Array(specs));
-            }
-        }
-        request.insert(
-            "kind".into(),
-            Value::String(format!("{provider}.completion.request")),
-        );
+        let mut request = Map::new();
+        request.insert("kind".into(), Value::String(PROVIDER_INVOKE_REQUEST.into()));
+        request.insert("provider".into(), Value::String(provider.clone()));
         request.insert("request_id".into(), Value::String(request_id.clone()));
+        for key in [
+            "conversation_id",
+            "model",
+            "reasoning_effort",
+            "tools",
+            "output_schema",
+            "max_corrections",
+        ] {
+            if let Some(value) = args.get(key).filter(|value| !value.is_null()) {
+                request.insert(key.into(), value.clone());
+            }
+        }
         if let Some(invocation @ Value::Object(_)) = body.get("invocation") {
             request.insert("invocation".into(), invocation.clone());
         }
@@ -167,10 +108,8 @@ impl CapabilityBridge {
         };
         if let Some(pending) = self.pending_providers.remove(request_id) {
             let mut out = Map::new();
-            out.insert(
-                "kind".into(),
-                Value::String(format!("{}.completion.cancel", pending.provider)),
-            );
+            out.insert("kind".into(), Value::String(PROVIDER_CANCEL_REQUEST.into()));
+            out.insert("provider".into(), Value::String(pending.provider));
             out.insert("request_id".into(), Value::String(request_id.to_owned()));
             return vec![out];
         }
@@ -182,12 +121,16 @@ impl CapabilityBridge {
     /// event suffixes.
     pub fn provider_request_id<'a>(
         &'a self,
+        source: &str,
         kind: &str,
         body: &'a Map<String, Value>,
     ) -> Option<&'a str> {
         let request_id = body.get("request_id").and_then(Value::as_str)?;
         let pending = self.pending_providers.get(request_id)?;
-        (kind == format!("{}.{}", pending.provider, PROVIDER_EVENT)).then_some(request_id)
+        let provider_matches =
+            body.get("provider").and_then(Value::as_str) == Some(pending.provider.as_str());
+        (source == CONVERSATION_MANAGER && kind == PROVIDER_EVENT && provider_matches)
+            .then_some(request_id)
     }
 
     pub fn is_structured_request(&self, request_id: &str) -> bool {
@@ -199,7 +142,9 @@ impl CapabilityBridge {
     /// Record non-terminal provider data or consume a terminal event. Unknown,
     /// late, and cross-provider events are ignored.
     pub fn take_reply(&mut self, kind: &str, body: &Map<String, Value>) -> Option<ProviderReply> {
-        let request_id = self.provider_request_id(kind, body)?.to_owned();
+        let request_id = self
+            .provider_request_id(CONVERSATION_MANAGER, kind, body)?
+            .to_owned();
         let event = body.get("event").and_then(Value::as_str)?;
 
         if event == "tool_call" {
@@ -254,16 +199,7 @@ impl CapabilityBridge {
 }
 
 fn is_provider_invoke(body: &Map<String, Value>) -> bool {
-    let Some(args) = body.get("args").and_then(Value::as_object) else {
-        return false;
-    };
-    args.get("messages").and_then(Value::as_array).is_some()
-        || args
-            .get("input")
-            .and_then(Value::as_object)
-            .and_then(|input| input.get("messages"))
-            .and_then(Value::as_array)
-            .is_some()
+    body.get("class").and_then(Value::as_str) == Some("provider")
 }
 
 fn provider_tool_call(body: &Map<String, Value>) -> Value {
@@ -343,6 +279,7 @@ mod tests {
     fn provider_invoke(request_id: &str, provider: &str, messages: Value) -> Map<String, Value> {
         obj(json!({
             "kind": "tool.invoke",
+            "class": "provider",
             "id": request_id,
             "name": provider,
             "args": {
@@ -357,104 +294,15 @@ mod tests {
 
     fn event(request_id: &str, provider: &str, name: &str, fields: Value) -> Map<String, Value> {
         let mut body = fields.as_object().expect("fields").clone();
-        body.insert(
-            "kind".into(),
-            Value::String(format!("{provider}.completion.event")),
-        );
+        body.insert("kind".into(), Value::String(PROVIDER_EVENT.into()));
+        body.insert("provider".into(), Value::String(provider.into()));
         body.insert("request_id".into(), Value::String(request_id.into()));
         body.insert("event".into(), Value::String(name.into()));
         body
     }
 
-    fn register(tools: Value) -> Map<String, Value> {
-        obj(json!({"kind": "tool.register", "tools": tools}))
-    }
-
     #[test]
-    fn provider_requests_project_authored_names_through_the_gate_snapshot() {
-        let mut bridge = CapabilityBridge::new("tool-gate");
-        let snapshot = register(json!([
-            {
-                "name": "read_file",
-                "owner": "basic-tools",
-                "description": "Read a file.",
-                "parameters": {"type": "object"},
-                "display": {"label": "Read", "result": {"kind": "content"}}
-            },
-            {
-                "name": "instructions",
-                "owner": "read-only-tools",
-                "description": "Load instructions.",
-                "parameters": {"type": "object"},
-                "display": {"label": "Instructions", "result": {"kind": "content"}}
-            }
-        ]));
-        assert!(bridge.observe_tool_register("tool-gate", &snapshot));
-
-        let mut invoke = provider_invoke("req-projected", "provider-a", json!([]));
-        invoke
-            .get_mut("args")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert(
-                "tools".into(),
-                json!(["read_file", "python-read", "instructions"]),
-            );
-        let out = bridge.translate_emit(invoke);
-
-        assert_eq!(
-            out[0]["tools"],
-            json!(["read_file", "python-read", "instructions"]),
-            "the authored list remains the immutable invocation allowlist"
-        );
-        assert_eq!(out[0]["tool_specs"].as_array().unwrap().len(), 2);
-        assert_eq!(out[0]["tool_specs"][0]["name"], "read_file");
-        assert_eq!(out[0]["tool_specs"][0]["owner"], "basic-tools");
-        assert_eq!(out[0]["tool_specs"][1]["name"], "instructions");
-    }
-
-    #[test]
-    fn only_the_named_gate_can_replace_the_tool_snapshot() {
-        let mut bridge = CapabilityBridge::new("custom-gate");
-        let foreign = register(json!([{
-            "name": "stale", "owner": "foreign", "description": "",
-            "parameters": {}, "display": {"label": "Stale", "result": {"kind": "content"}}
-        }]));
-        assert!(!bridge.observe_tool_register("tool-gate", &foreign));
-
-        let canonical = register(json!([{
-            "name": "read_file", "owner": "basic-tools", "description": "",
-            "parameters": {}, "display": {"label": "Read", "result": {"kind": "content"}}
-        }]));
-        assert!(bridge.observe_tool_register("custom-gate", &canonical));
-        let replacement = register(json!([]));
-        assert!(bridge.observe_tool_register("custom-gate", &replacement));
-
-        let mut invoke = provider_invoke("req-empty", "provider-a", json!([]));
-        invoke
-            .get_mut("args")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert("tools".into(), json!(["read_file"]));
-        let out = bridge.translate_emit(invoke);
-        assert_eq!(out[0]["tool_specs"], json!([]));
-    }
-
-    #[test]
-    fn provider_fallback_remains_available_before_the_first_gate_snapshot() {
-        let mut bridge = CapabilityBridge::new("tool-gate");
-        let mut invoke = provider_invoke("req-legacy", "provider-a", json!([]));
-        invoke
-            .get_mut("args")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert("tools".into(), json!(["read_file"]));
-        let out = bridge.translate_emit(invoke);
-        assert!(out[0].get("tool_specs").is_none());
-    }
-
-    #[test]
-    fn provider_invoke_emits_one_request_with_full_history_once() {
+    fn provider_invoke_emits_one_thin_manager_request() {
         let mut bridge = CapabilityBridge::new("tool-gate");
         let messages = json!([
             {"role": "user", "content": "first"},
@@ -467,15 +315,18 @@ mod tests {
         let out = bridge.translate_emit(invoke);
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["kind"], "provider-a.completion.request");
+        assert_eq!(out[0]["kind"], PROVIDER_INVOKE_REQUEST);
+        assert_eq!(out[0]["provider"], "provider-a");
         assert_eq!(out[0]["request_id"], "req-1");
         assert_eq!(out[0]["conversation_id"], "conversation-stable");
-        assert_eq!(out[0]["messages"], messages);
         assert_eq!(out[0]["invocation"], invocation);
         assert!(out[0].get("input").is_none());
+        assert!(out[0].get("messages").is_none());
+        assert!(out[0].get("system").is_none());
+        assert!(out[0].get("tool_specs").is_none());
         assert!(out[0].get("chat_id").is_none());
         let wire = serde_json::to_string(&out).expect("serialize");
-        assert_eq!(wire.matches("first").count(), 1);
+        assert!(!wire.contains("first"));
         assert!(!wire.contains(".chat."));
         assert!(!wire.contains("history"));
     }
@@ -511,7 +362,9 @@ mod tests {
         assert_eq!(
             cancel,
             vec![obj(json!({
-                "kind": "provider-a.completion.cancel", "request_id": "req-1"
+                "kind": PROVIDER_CANCEL_REQUEST,
+                "provider": "provider-a",
+                "request_id": "req-1"
             }))]
         );
         let late = event("req-1", "provider-a", "completed", json!({"text": "late"}));
@@ -527,7 +380,10 @@ mod tests {
         for name in ["text_delta", "reasoning_delta", "retry", "usage"] {
             let body = event("req-1", "provider-a", name, json!({"text": "chunk"}));
             let kind = body["kind"].as_str().unwrap();
-            assert_eq!(bridge.provider_request_id(kind, &body), Some("req-1"));
+            assert_eq!(
+                bridge.provider_request_id(CONVERSATION_MANAGER, kind, &body),
+                Some("req-1")
+            );
             assert!(bridge.take_reply(kind, &body).is_none());
         }
         let tool = event(

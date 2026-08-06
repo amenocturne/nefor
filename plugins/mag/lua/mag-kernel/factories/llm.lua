@@ -35,7 +35,6 @@ M.declaration = {
     model = "string?", system = "string?", tools = "table?",
     profile = "string?", reasoning_effort = "string?",
     provider = "string?", history = "table?",
-    conversation_context = "table?",
     conversation_id = "string?",
     turn_id = "string?",
   },

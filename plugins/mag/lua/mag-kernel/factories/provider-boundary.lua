@@ -1,14 +1,14 @@
--- Shared provider round/request lifecycle for provider-boundary factories.
+-- Shared provider round lifecycle for provider-boundary factories.
 -- Classification policy stays in the thin consumer (`llm` or
--- `structured-output`); correlation, history, tool calls, cancellation and
--- drain behavior live here once. Canonical conversation history is emitted as
--- facts and projected outside this request-local boundary.
+-- `structured-output`); correlation, tool calls, cancellation and drain
+-- behavior live here once. Canonical conversation history is emitted as facts;
+-- provider actors reconstruct their private request view from that shared state.
 
 local kinds = require("kinds")
 local conversation_facts = require("conversation-facts")
 local M = {}
 
-local function copy_history(id, factory_name, seed)
+local function validate_seed_history(id, factory_name, seed)
   local copied = {}
   if seed == nil then return copied end
   if type(seed) ~= "table" then
@@ -58,8 +58,13 @@ function M.construct(id, params, emit, options)
   if type(provider) ~= "string" or provider == "" then
     return nil, string.format("%s '%s': params.provider is required", factory_name, tostring(id))
   end
-  local request_messages, history_error = copy_history(id, factory_name, params.history)
-  if not request_messages then return nil, history_error end
+  local seed_history, history_error = validate_seed_history(id, factory_name, params.history)
+  if not seed_history then return nil, history_error end
+  -- The seed is recorded into the canonical conversation on first firing. Do
+  -- not leave another transcript reachable through the actor's params table.
+  params.history = nil
+  local system_prompt = params.system
+  params.system = nil
 
   local conversation = options.conversation
   if type(conversation) ~= "table" or type(conversation.id) ~= "string"
@@ -90,6 +95,7 @@ function M.construct(id, params, emit, options)
   local facts = nil
   local firing_sequence = 0
   local conversation_created = conversation.is_root
+  local seed_recorded = false
 
   local function start_firing()
     firing_sequence = firing_sequence + 1
@@ -106,6 +112,15 @@ function M.construct(id, params, emit, options)
     if not conversation_created then
       facts:create(provenance)
       conversation_created = true
+    end
+    if not seed_recorded then
+      if type(system_prompt) == "string" and system_prompt ~= "" then
+        facts:seed_message({ role = "system", content = system_prompt })
+      end
+      for _, message in ipairs(seed_history) do facts:seed_message(message) end
+      system_prompt = nil
+      seed_history = nil
+      seed_recorded = true
     end
     facts:start_turn()
     streamed_message_id = nil
@@ -134,7 +149,6 @@ function M.construct(id, params, emit, options)
   end
 
   function state:append(message, completion)
-    request_messages[#request_messages + 1] = message
     if message.role == "assistant" and streamed_message_id then
       local content = message.content
       if type(content) == "string" and content ~= "" then
@@ -173,7 +187,7 @@ function M.construct(id, params, emit, options)
     facts:fail_turn(merge_terminal({ error = detail }))
   end
 
-  local function extend_history(input)
+  local function record_input(input)
     if type(input) == "string" then
       state:append({ role = "user", content = input })
     elseif type(input) == "table" and type(input.messages) == "table" then
@@ -186,8 +200,6 @@ function M.construct(id, params, emit, options)
   end
 
   local function build_request()
-    local messages = {}
-    for i, message in ipairs(request_messages) do messages[i] = message end
     local model = params.model
     if type(model) == "table" then
       model = model.present and model.value or nil
@@ -195,13 +207,10 @@ function M.construct(id, params, emit, options)
     return {
       conversation_id = conversation.id,
       model = model,
-      system = params.system,
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,
-      conversation_context = params.conversation_context,
       output_schema = params.schema,
       max_corrections = params.max_corrections,
-      input = { messages = messages },
     }
   end
 
@@ -211,6 +220,7 @@ function M.construct(id, params, emit, options)
     pending = { request_id = id .. "@r" .. tostring(seq) }
     state:emit({
       kind = "capability.invoke",
+      class = "provider",
       capability = provider,
       request = build_request(),
       ref = pending.request_id,
@@ -306,7 +316,7 @@ function M.construct(id, params, emit, options)
     awaiting_continuation = false
     if not continuation then start_firing() end
     if not turn_active then turn_active = true end
-    extend_history(((activation.messages or {})[1] or {}).message)
+    record_input(((activation.messages or {})[1] or {}).message)
     append_steered_messages()
     if not continuation and options.on_turn_start then options.on_turn_start(state) end
     invoke_provider()

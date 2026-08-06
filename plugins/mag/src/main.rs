@@ -496,13 +496,13 @@ async fn handle_event(
         Some(k) => k,
         None => return Ok(()),
     };
-    if bridge.observe_tool_register(source, body) {
-        return Ok(());
-    }
     // Canonical provider events correlate themselves by request_id. Terminal
     // events settle the kernel capability; streaming and other telemetry remain
     // observational and keep the request open. Unknown and late ids are ignored.
-    if let Some(request_id) = bridge.provider_request_id(kind, body).map(str::to_owned) {
+    if let Some(request_id) = bridge
+        .provider_request_id(source, kind, body)
+        .map(str::to_owned)
+    {
         if let Some(event @ ("text_delta" | "reasoning_delta")) =
             body.get("event").and_then(Value::as_str)
         {
@@ -2004,8 +2004,9 @@ mod tests {
             let mut body = fields.as_object().expect("event fields").clone();
             body.insert(
                 "kind".into(),
-                Value::String("provider-a.completion.event".into()),
+                Value::String("conversation.provider.event".into()),
             );
+            body.insert("provider".into(), Value::String("provider-a".into()));
             body.insert("request_id".into(), Value::String(request_id.into()));
             body.insert("event".into(), Value::String(event.into()));
             body
@@ -2068,7 +2069,8 @@ mod tests {
             .into_iter()
             .flat_map(|body| bridge.translate_emit(body))
             .find(|body| {
-                body.get("kind").and_then(Value::as_str) == Some("provider-a.completion.request")
+                body.get("kind").and_then(Value::as_str)
+                    == Some("conversation.provider.invoke.request")
             })
             .expect("provider request");
         let request_id = request["request_id"]
@@ -2115,7 +2117,7 @@ mod tests {
         ] {
             handle_event(
                 &out_tx,
-                "provider-a",
+                "conversation-manager",
                 &body,
                 &mut program,
                 &host,

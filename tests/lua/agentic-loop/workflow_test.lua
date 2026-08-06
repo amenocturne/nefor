@@ -123,6 +123,16 @@ local function find_kind(calls, kind)
   return nil
 end
 
+local function find_fact(calls, kind)
+  for _, c in ipairs(calls) do
+    if c.body.kind == "conversation.fact.append"
+        and type(c.body.fact) == "table" and c.body.fact.kind == kind then
+      return c.body.fact
+    end
+  end
+  return nil
+end
+
 local function assert_list_eq(actual, expected, msg)
   assert_eq(type(actual), "table", (msg or "list") .. " is a table")
   assert_eq(#actual, #expected, (msg or "list") .. " length")
@@ -287,11 +297,27 @@ local function project_pending_conversation(calls)
     kind = "conversation_created",
     conversation = { provenance = append.body.fact.provenance },
   })
-  local active = find_kind(decode_calls(), "conversation.active.set")
+  local projected_calls = decode_calls()
+  local active = find_kind(projected_calls, "conversation.active.set")
   assert(active ~= nil, "canonical root creation publishes the active binding")
   assert_eq(active.target, "conversation-manager", "active binding targets the manager")
   assert_eq(active.body.conversation_id, manager_conversation_id,
     "active binding names the canonical root")
+  local system_started = find_fact(projected_calls, "message_started")
+  local system_chunk = find_fact(projected_calls, "content_chunk_appended")
+  local system_completed = find_fact(projected_calls, "message_completed")
+  assert(system_started ~= nil and system_started.role == "system",
+    "new root records one canonical system message")
+  assert(type(system_chunk.chunk) == "table"
+      and type(system_chunk.chunk.data) == "string"
+      and system_chunk.chunk.data:find("lead system prompt", 1, true),
+    "canonical system message carries the configured prompt")
+  assert(system_chunk.chunk.data:find("## MAG workspace", 1, true),
+    "canonical system message carries ambient MAG context")
+  manager_delta({
+    kind = "message_completed",
+    message_id = system_completed.message_id,
+  })
   return true
 end
 
@@ -499,32 +525,13 @@ do
     "cloning the compiled artifact preserves empty descriptor arrays")
   local overlay = exec.body.params_overlay["lead.llm"]
   assert(type(overlay) == "table", "params overlay keys the derived llm actor")
-  -- The base system prompt leads, with the ambient MAG-workspace block
-  -- appended (workspace dir + inlined patterns).
-  assert(type(overlay.system) == "string"
-    and overlay.system:sub(1, #"lead system prompt") == "lead system prompt",
-    "the configured system prompt leads the overlay")
-  assert(string.find(overlay.system, "## MAG workspace", 1, true) ~= nil,
-    "the ambient MAG workspace block is appended to the system overlay")
-  assert(string.find(overlay.system, "workspace dir:", 1, true) ~= nil,
-    "the block names the session workspace dir")
-  assert(string.find(overlay.system, "wf-mag-session", 1, true) ~= nil,
-    "the workspace dir is anchored to the active session")
-  assert(string.find(overlay.system, "MAG graph cookbook", 1, true) ~= nil,
-    "patterns.md is inlined into the block")
-  assert(string.find(overlay.system, "(require", 1, true) ~= nil,
-    "the inlined contract carries current literal require syntax")
-  assert(string.find(overlay.system, "Never write `(import ...)`", 1, true) ~= nil,
-    "the ambient authoring contract explicitly rejects import syntax")
-  assert(string.find(overlay.system, "### lib/types.mag", 1, true) == nil,
-    "the ambient context does not promise the removed types library")
-  assert(string.find(overlay.system, "### lib/templates.mag", 1, true) == nil,
-    "the ambient context does not promise the removed templates library")
+  assert_eq(overlay.system, nil,
+    "system content is canonical conversation state, not an execute overlay")
   assert_eq(overlay.provider, "mock", "live provider overlays the llm actor")
   assert_eq(overlay.model, "test-model", "live model overlays the llm actor")
   assert_eq(overlay.reasoning_effort, "high", "reasoning effort overlays the llm actor")
-  assert(type(overlay.history) == "table" and next(overlay.history) == nil,
-    "first turn seeds empty history")
+  assert_eq(overlay.history, nil,
+    "history is reconstructed by providers rather than persisted in execute")
   -- The runtime-state envelope for the statusline fired.
   local calls = decode_calls()
   assert(find_kind(calls, "agentic_loop.run_start") ~= nil,
@@ -606,10 +613,8 @@ do
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "second turn executes")
   assert_eq(task_prompt(exec2.body.artifact.data), "and more?")
-  local seeded = exec2.body.params_overlay["lead.llm"].history
-  assert_eq(#seeded, 2, "second turn's llm seeds the prior turn's pair")
-  assert_eq(seeded[1].content, "hello lead")
-  assert_eq(seeded[2].content, "the answer")
+  assert_eq(exec2.body.params_overlay["lead.llm"].history, nil,
+    "second turn does not persist the prior transcript in MAG")
 end
 
 -- Queue promotion waits for both MAG settlement and the manager's correlated
@@ -642,8 +647,8 @@ do
   })
   local promoted = find_kind(decode_calls(), "mag.execute")
   assert(promoted ~= nil, "matching terminal projection promotes queued input")
-  assert_eq(#promoted.body.params_overlay["lead.llm"].history, 2,
-    "promoted turn sees manager-committed context")
+  assert_eq(promoted.body.params_overlay["lead.llm"].history, nil,
+    "promoted turn leaves context reconstruction to the provider")
 end
 
 -- (/compact) the loop delegates universally and forwards the manager's opaque
@@ -701,10 +706,10 @@ do
 
   local second = begin_turn("after compaction")
   local second_overlay = second.body.params_overlay["lead.llm"]
-  assert_eq(second_overlay.conversation_context.compaction.checkpoint.sealed,
-    "history", "opaque checkpoint stays inside universal context")
-  assert_eq(#second_overlay.history, 2,
-    "temporary history overlay remains the manager's full neutral context")
+  assert_eq(second_overlay.conversation_context, nil,
+    "opaque provider checkpoints never enter MAG overlays")
+  assert_eq(second_overlay.history, nil,
+    "canonical history never enters MAG overlays")
 end
 
 -- (universal context projection) manager-projected tool exchanges are seeded
@@ -751,9 +756,8 @@ do
     "the loop emits no competing durable history marker")
 
   local exec2 = begin_turn("and the model?")
-  local seeded = exec2.body.params_overlay["lead.llm"].history
-  assert_eq(#seeded, 4, "the next turn seeds the full recorded transcript")
-  assert_eq(seeded[3].tool_call_id, "call-1", "the seeded tool result stays paired with its call")
+  assert_eq(exec2.body.params_overlay["lead.llm"].history, nil,
+    "the next turn reconstructs the tool transcript through the provider")
 end
 
 -- (ambient MAG context caching) the static section (inventory + canonical
@@ -762,15 +766,15 @@ end
 do
   fresh_loop()
   local exec1 = begin_turn("first ambient")
-  assert(string.find(exec1.body.params_overlay["lead.llm"].system,
-    "## MAG workspace", 1, true) ~= nil, "turn 1 carries the MAG workspace block")
+  assert_eq(exec1.body.params_overlay["lead.llm"].system, nil,
+    "turn 1 does not duplicate the canonical system message")
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec1.body.run_id,
     status = "completed", result = { text = "a1" },
   })
   local exec2 = begin_turn("second ambient")
-  assert(string.find(exec2.body.params_overlay["lead.llm"].system,
-    "## MAG workspace", 1, true) ~= nil, "turn 2 also carries the block")
+  assert_eq(exec2.body.params_overlay["lead.llm"].system, nil,
+    "turn 2 does not duplicate the canonical system message")
   assert_eq(agentic_loop._internals.state.mag_context.static_builds, 1,
     "the static MAG section is read from disk once and cached across turns")
 end
@@ -975,8 +979,8 @@ do
   -- The loop is free again, and the next turn seeds the preserved context.
   local exec_after = begin_turn("after kill")
   assert(exec_after ~= nil, "a killed turn releases the slot")
-  assert_eq(#exec_after.body.params_overlay["lead.llm"].history, 2,
-    "the turn after a kill seeds the preserved {user, placeholder} pair")
+  assert_eq(exec_after.body.params_overlay["lead.llm"].history, nil,
+    "the turn after a kill reconstructs preserved context outside MAG")
 end
 
 -- (queued promotion) messages submitted while busy queue, then promote
@@ -1004,8 +1008,8 @@ do
   assert(exec2 ~= nil, "queued input promotes into a fresh turn on close")
   assert_eq(task_prompt(exec2.body.artifact.data), "second",
     "the promoted turn carries the queued text")
-  local seeded = exec2.body.params_overlay["lead.llm"].history
-  assert_eq(#seeded, 2, "the promoted turn seeds the finished turn's history")
+  assert_eq(exec2.body.params_overlay["lead.llm"].history, nil,
+    "the promoted turn reconstructs finished context outside MAG")
 end
 
 
@@ -1249,10 +1253,10 @@ do
 
   local exec = begin_turn("post-resume")
   local overlay = exec.body.params_overlay["lead.llm"]
-  assert_eq(overlay.conversation_context.compaction.checkpoint.sealed, "resume",
-    "the post-resume turn forwards the manager's opaque context")
-  local seeded = overlay.history
-  assert_eq(#seeded, 6, "temporary history overlay carries full universal messages")
+  assert_eq(overlay.conversation_context, nil,
+    "the post-resume turn does not forward provider-private checkpoints")
+  assert_eq(overlay.history, nil,
+    "the post-resume turn does not duplicate universal messages")
 end
 
 -- (/new) chat.reset clears queue + history so the next turn is fresh.
@@ -1269,8 +1273,8 @@ do
   assert_eq(#agentic_loop.history(), 0, "chat.reset clears canonical history")
   project_pending_conversation(decode_calls())
   local exec2 = begin_turn("fresh start")
-  local seeded = exec2.body.params_overlay["lead.llm"].history
-  assert(next(seeded) == nil, "post-/new turn seeds empty history")
+  assert_eq(exec2.body.params_overlay["lead.llm"].history, nil,
+    "post-/new turn leaves history reconstruction to the provider")
 end
 
 -- Public CLI observers consume canonical conversation chunks and ignore

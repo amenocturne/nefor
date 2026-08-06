@@ -95,6 +95,15 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         r#"
         local factory = require("factories.structured-output")
         local emitted = {}
+        local facts = {}
+        local function last_text()
+          for i = #facts, 1, -1 do
+            local chunk = facts[i].chunk
+            if type(chunk) == "table" and type(chunk.data) == "string" then
+              return chunk.data
+            end
+          end
+        end
         local function emit(message) emitted[#emitted + 1] = message end
         local schema = {
           version = 1,
@@ -104,12 +113,14 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }
         local actor, err = factory.construct("typed", {
           provider = "mock-provider", schema = schema, tools = { "read_file" },
+          system = "canonical system",
           max_corrections = 2,
           output_type = "output-type-tag",
           error_type = "agent-error-tag",
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
-        }, emit, { conversation = { id = "typed:conversation", turn_id = "typed:turn", emit = function(_) end } })
+        }, emit, { conversation = { id = "typed:conversation", turn_id = "typed:turn",
+          emit = function(fact) facts[#facts + 1] = fact end } })
         assert(actor, err)
 
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
@@ -122,6 +133,16 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         assert(first_request.output_schema.required[1] == "task")
         assert(first_request.output_schema.additionalProperties == false)
         assert(first_request.max_corrections == 2)
+        assert(first_request.input == nil)
+        assert(first_request.system == nil)
+        local seeded_system = false
+        for _, fact in ipairs(facts) do
+          if fact.kind == "message_started" and fact.role == "system" then
+            assert(fact.turn_id == nil)
+            seeded_system = true
+          end
+        end
+        assert(seeded_system, "authored system is recorded once as a canonical message")
 
         actor.deliver({ kind = "reply", result = { tool_calls = {{
           id = "call-1", name = "read_file", args = { path = "x" }
@@ -133,14 +154,14 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         }}}})
         actor.deliver({ kind = "reply", result = { text = "not json" } })
         assert(emitted[#emitted].kind == "capability.invoke")
-        local correction = emitted[#emitted].request.input.messages
-        correction = correction[#correction].content
+        assert(emitted[#emitted].request.input == nil)
+        local correction = last_text()
         assert(correction:find("malformed_json"), correction)
 
         actor.deliver({ kind = "reply", result = { text = [[{"task":4}]] } })
         assert(emitted[#emitted].kind == "capability.invoke")
-        local messages = emitted[#emitted].request.input.messages
-        assert(messages[#messages].content:find("%$%.task"))
+        assert(emitted[#emitted].request.input == nil)
+        assert(last_text():find("%$%.task"))
 
         actor.deliver({ kind = "reply", result = { text = [[{"task":"build"}]] } })
         assert(emitted[#emitted - 1].kind == "nefor.agent.Result")
@@ -159,6 +180,7 @@ fn exhausted_corrections_emit_agent_error_without_attempt_count() {
         r#"
         local factory = require("factories.structured-output")
         local emitted = {}
+        local facts = {}
         local actor = assert(factory.construct("typed", {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "string" } },
@@ -230,6 +252,15 @@ fn wrapped_retry_requests_provider_envelope_and_named_union_routes_constructor()
         r#"
         local factory = require("factories.structured-output")
         local emitted = {}
+        local facts = {}
+        local function last_text()
+          for i = #facts, 1, -1 do
+            local chunk = facts[i].chunk
+            if type(chunk) == "table" and type(chunk.data) == "string" then
+              return chunk.data
+            end
+          end
+        end
         local actor = assert(factory.construct("named-union", {
           provider = "mock-provider",
           schema = { version = 1, root = { kind = "named", name = "Choice", body = {
@@ -246,13 +277,15 @@ fn wrapped_retry_requests_provider_envelope_and_named_union_routes_constructor()
           provider_error_type = "provider-error-tag",
           validation_error_type = "validation-error-tag"
         }, function(message) emitted[#emitted + 1] = message end,
-          { conversation = { id = "named-union:conversation", turn_id = "named-union:turn", emit = function(_) end } }))
+          { conversation = { id = "named-union:conversation", turn_id = "named-union:turn",
+            emit = function(fact) facts[#facts + 1] = fact end } }))
         actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
           messages = {{ role = "user", content = "answer" }}
         }}}})
         actor.deliver({ kind = "reply", result = { text = [[{"type":"left-tag","value":{"answer":42}}]] } })
         local request = emitted[#emitted].request
-        local prompt = request.input.messages[#request.input.messages].content
+        assert(request.input == nil)
+        local prompt = last_text()
         assert(prompt:find([[{"value": <corrected value>}]], 1, true), prompt)
         actor.deliver({ kind = "reply", result = { text = [[{"value":{"type":"left-tag","value":{"answer":42}}}]] } })
         local terminal = emitted[#emitted - 1]

@@ -2,8 +2,8 @@
 //! rerunnable against the real plugin process.
 //!
 //! The fixture speaks both canonical capability protocols. Provider turns are
-//! single `<provider>.completion.request` messages answered by correlated
-//! `<provider>.completion.event` observations and terminal events. Tool calls
+//! thin `conversation.provider.invoke.request` messages answered by correlated
+//! manager-relayed `conversation.provider.event` observations. Tool calls
 //! are rewritten onto `<gate>.tool.invoke` and answered with `tool.result`.
 //! Every response is driven by observed request content and correlated only by
 //! the request's opaque `request_id`; no provider-owned conversation state is
@@ -106,8 +106,11 @@ async fn write_env(stdin: &mut ChildStdin, env: Envelope) {
 }
 
 async fn send_event(stdin: &mut ChildStdin, body: Map<String, Value>) {
-    let source = if body.get("kind").and_then(Value::as_str) == Some("mag.execute") {
+    let kind = body.get("kind").and_then(Value::as_str);
+    let source = if kind == Some("mag.execute") {
         PluginName::new("custom-runner").expect("custom runner plugin name")
+    } else if kind == Some("conversation.provider.event") {
+        PluginName::new("conversation-manager").expect("manager plugin name")
     } else {
         PluginName::engine()
     };
@@ -224,8 +227,9 @@ fn completion_event(
     let mut body = fields;
     body.insert(
         "kind".into(),
-        Value::String(format!("{PROVIDER}.completion.event")),
+        Value::String("conversation.provider.event".into()),
     );
+    body.insert("provider".into(), Value::String(PROVIDER.into()));
     body.insert("request_id".into(), Value::String(request_id.to_owned()));
     body.insert("event".into(), Value::String(event.to_owned()));
     body
@@ -317,7 +321,8 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     let mut a2_pending_request: Option<String> = None;
     let mut a2_kill_sent = false;
     let mut a2_void_sent = false;
-    let request_kind = format!("{PROVIDER}.completion.request");
+    let request_kind = "conversation.provider.invoke.request";
+    let mut provider_rounds = std::collections::HashMap::<String, usize>::new();
     let run_result;
 
     loop {
@@ -399,23 +404,27 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                 let request_id = body
                     .get("request_id")
                     .and_then(Value::as_str)
-                    .expect("completion.request carries request_id")
+                    .expect("provider invoke carries request_id")
                     .to_owned();
-                let messages = body
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .expect("completion.request carries messages");
-                let initial_prompt = messages
-                    .first()
-                    .and_then(|message| message.get("content"))
+                assert!(
+                    body.get("messages").is_none(),
+                    "thin invoke carries no transcript"
+                );
+                assert!(
+                    body.get("system").is_none(),
+                    "thin invoke carries no system prompt"
+                );
+                let actor = body
+                    .get("invocation")
+                    .and_then(|invocation| invocation.get("actor_id"))
                     .and_then(Value::as_str)
-                    .expect("initial prompt is textual");
-                let has_tool_result = messages
-                    .iter()
-                    .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+                    .expect("provider invocation identifies the actor")
+                    .to_owned();
+                let round = provider_rounds.entry(actor.clone()).or_default();
+                *round += 1;
 
-                match (initial_prompt, has_tool_result) {
-                    ("go-a1", false) => {
+                match (actor.as_str(), *round) {
+                    ("a1.llm", 1) => {
                         provider_agents.insert("a1".to_owned());
                         send_event(
                             &mut stdin,
@@ -438,7 +447,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                         )
                         .await;
                     }
-                    ("go-a1", true) => {
+                    ("a1.llm", 2) => {
                         send_event(
                             &mut stdin,
                             completion_event(
@@ -460,7 +469,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                         )
                         .await;
                     }
-                    ("go-a2", false) => {
+                    ("a2.llm", 1) => {
                         provider_agents.insert("a2".to_owned());
                         a2_pending_request = Some(request_id);
                         if !a2_kill_sent {
@@ -480,15 +489,10 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                             send_event(&mut stdin, apply).await;
                         }
                     }
-                    other => panic!("unexpected provider request history {other:?}: {body:?}"),
+                    other => panic!("unexpected provider invocation {other:?}: {body:?}"),
                 }
             }
-            k if k == format!("{PROVIDER}.chat.cancel") => {
-                panic!(
-                    "legacy provider cancellation reached the wire; expected {PROVIDER}.completion.cancel correlated by request_id: {body:?}"
-                );
-            }
-            k if k == format!("{PROVIDER}.completion.cancel") => {
+            "conversation.provider.cancel.request" => {
                 let request_id = body
                     .get("request_id")
                     .and_then(Value::as_str)

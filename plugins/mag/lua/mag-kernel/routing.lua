@@ -940,6 +940,7 @@ function M:on_capability_invoke(id, message)
   end
   self.bus_emit({
     kind = "tool.invoke",
+    class = message.class,
     id = request_id,
     from = id,
     name = message.capability,

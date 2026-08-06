@@ -1,11 +1,11 @@
 -- lua/libs/agentic-loop/init.lua — the lead's turn spawner.
 --
 -- The lead's turn is a short-lived MAG program over a persistent chat:
--- turn-as-function, `(history, message) -> response`. Per user message this
+-- turn-as-function, `(conversation, message) -> response`. Per user message this
 -- actor clones the shipped turn-program (agentic-loop/lead-turn.mag,
 -- compiled once via `mag.load` and cached), sets the initial `mag.Task`
--- payload to the message, overlays the live config (system prompt,
--- provider/model/reasoning effort) plus the canonical history onto the lead
+-- payload to the message, overlays the live provider/model/reasoning effort
+-- plus the canonical conversation identity onto the lead
 -- llm actor, and submits it with `mag.execute`. The constellation runs on
 -- the mag kernel — the lead's tool surface rides the tool-gate capability
 -- bridge like any kernel run — the final response lands in the sink, the
@@ -84,6 +84,7 @@ local state = {
   conversation = conversation_projection.new(),
   conversation_id = nil,
   pending_conversation_create = nil,
+  pending_system_seed = nil,    ---@type table|nil
   pending_compaction = nil,     ---@type table|nil
   pending_context_request = nil,
 
@@ -102,7 +103,7 @@ local state = {
   tool_end_observers     = {},  ---@type table
   complete_observers     = {},  ---@type table
 
-  -- Ambient MAG context injected into each turn's system overlay so the
+  -- Ambient MAG context recorded once in the conversation's system message so the
   -- lead can start writing MAG without a discovery round-trip. `static`
   -- (inventory + patterns + types + template signatures + prompt roster)
   -- is read once from the config lib dir and cached process-wide; the
@@ -165,6 +166,7 @@ local function conversation_ready()
   return state.conversation_id ~= nil
       and state.conversation:id() == state.conversation_id
       and state.pending_conversation_create == nil
+      and state.pending_system_seed == nil
 end
 
 local function record_configuration()
@@ -223,8 +225,9 @@ end
 -- ── ambient MAG context ───────────────────────────────────────────────
 --
 -- The lead used to pay a `mag-env` round-trip (plus reading patterns.md)
--- before writing any MAG. That context is now ambient: appended to every
--- turn's `system` overlay. Contents: the session workspace dir, the seeded
+-- before writing any MAG. That context is now ambient: appended to the
+-- conversation's canonical system message. Contents: the session workspace
+-- dir, the seeded
 -- lib/ inventory, patterns.md inlined (the canonical authoring contract),
 -- and the prompt roster.
 --
@@ -359,8 +362,8 @@ local function mag_workspace_block()
   return table.concat(lines, "\n")
 end
 
--- Append the ambient MAG context to a turn's system prompt. The block is
--- additive: an empty base system prompt still carries the context.
+-- Append the ambient MAG context to the conversation's system prompt. The
+-- block is additive: an empty base system prompt still carries the context.
 local function system_with_mag_context(base)
   local block = mag_workspace_block()
   if type(block) ~= "string" then return base end
@@ -368,6 +371,45 @@ local function system_with_mag_context(base)
     return base .. "\n\n" .. block
   end
   return block
+end
+
+-- Seed system content once into the append-only conversation. Provider actors
+-- reconstruct it through conversation-manager like every other message; neither
+-- MAG execution overlays nor provider invocation commands retain another copy.
+local function record_system_prompt(conversation_id)
+  local base = (type(state.config.system) == "string" and #state.config.system > 0)
+    and state.config.system or nil
+  local system = system_with_mag_context(base)
+  if type(system) ~= "string" or system == "" then return false end
+
+  local message_id = conversation_id .. ":system"
+  local completed_event_id = "conversation-event-" .. envelope.uuid_lite()
+  state.pending_system_seed = {
+    message_id = message_id,
+    completed_event_id = completed_event_id,
+  }
+  append_conversation_fact({
+    kind = "message_started",
+    event_id = "conversation-event-" .. envelope.uuid_lite(),
+    conversation_id = conversation_id,
+    message_id = message_id,
+    role = "system",
+  })
+  append_conversation_fact({
+    kind = "content_chunk_appended",
+    event_id = "conversation-event-" .. envelope.uuid_lite(),
+    conversation_id = conversation_id,
+    message_id = message_id,
+    chunk = { kind = "text", data = system },
+  })
+  append_conversation_fact({
+    kind = "message_completed",
+    event_id = completed_event_id,
+    conversation_id = conversation_id,
+    message_id = message_id,
+    completion = {},
+  })
+  return true
 end
 
 -- ── the turn-program ──────────────────────────────────────────────────
@@ -391,8 +433,8 @@ local function lead_program_module_roots(source_dir)
   return roots
 end
 
--- Deep-copy JSON-shaped data (the cached modification / history are cloned
--- per turn so per-turn mutation never leaks into the cache). Decoded JSON
+-- Deep-copy JSON-shaped data (the cached modification is cloned per turn so
+-- per-turn mutation never leaks into the cache). Decoded JSON
 -- arrays carry a private mlua metatable, which is the only distinction
 -- between an empty `[]` and `{}`; semantic type descriptors rely on it.
 local function deep_clone(value)
@@ -524,7 +566,9 @@ end
 
 -- Spawn one turn-program for `user_text`. Clones the cached modification,
 -- points the initial mag.Task at the message, overlays live config +
--- canonical history onto the lead llm actor, and submits `mag.execute`.
+-- canonical conversation identity onto the lead llm actor, and submits
+-- `mag.execute`. The provider actor reads history from conversation-manager;
+-- duplicating it in this persisted command would make session growth quadratic.
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
   local conversation_id = ensure_conversation_id()
@@ -550,13 +594,8 @@ local function submit_orchestrator_run(user_text)
     end
   end
 
-  local full_history = conversation_history()
-  local history = full_history
-  local conversation_context = state.conversation:context()
   local overlay_params = {
-    history = deep_clone(history),
     conversation_id = conversation_id,
-    conversation_context = deep_clone(conversation_context),
   }
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
     overlay_params.provider = state.config.provider
@@ -567,16 +606,6 @@ local function submit_orchestrator_run(user_text)
   if type(state.config.reasoning_effort) == "string" and #state.config.reasoning_effort > 0 then
     overlay_params.reasoning_effort = state.config.reasoning_effort
   end
-  -- Ambient MAG context: append the workspace/lib block to the system
-  -- overlay so the lead can write MAG immediately (no mag-env round-trip).
-  -- Additive — an empty base system prompt still carries the block.
-  local base_system = (type(state.config.system) == "string" and #state.config.system > 0)
-    and state.config.system or nil
-  local system = system_with_mag_context(base_system)
-  if type(system) == "string" and #system > 0 then
-    overlay_params.system = system
-  end
-
   local run_id = ids.mint_chat_run_id()
   state.current_run_id = run_id
   state.current_turn = {
@@ -605,7 +634,7 @@ local function submit_orchestrator_run(user_text)
   nefor.log.info("agentic-loop: lead turn submitted to mag kernel", {
     run_id = run_id,
     text_preview = string.sub(user_text or "", 1, 80),
-    history_len = #full_history,
+    history_len = #conversation_history(),
   })
   return run_id
 end
@@ -790,6 +819,7 @@ local function new_chat()
   state.conversation:reset()
   state.conversation_id = nil
   state.pending_conversation_create = nil
+  state.pending_system_seed = nil
   state.pending_compaction = nil
   state.pending_context_request = nil
   ensure_conversation_id()
@@ -1207,6 +1237,17 @@ local function handle_conversation_projection_delta(body)
       request_id = "conversation-active-" .. envelope.uuid_lite(),
       conversation_id = body.conversation_id,
     })
+    if not record_system_prompt(body.conversation_id) then
+      flush_pending_user_inputs()
+      flush_deferred()
+    end
+    return
+  end
+
+  local pending_system = state.pending_system_seed
+  if change.kind == "message_completed" and type(pending_system) == "table"
+      and change.message_id == pending_system.message_id then
+    state.pending_system_seed = nil
     flush_pending_user_inputs()
     flush_deferred()
     return
@@ -1277,6 +1318,18 @@ local function handle_conversation_rejection(body)
     })
     return
   end
+  local pending_system = state.pending_system_seed
+  if type(pending_system) == "table"
+      and body.event_id == pending_system.completed_event_id then
+    state.pending_system_seed = nil
+    emit("nefor-tui", {
+      kind = "chat.error.append",
+      title = "Conversation unavailable",
+      message = tostring(body.code or "conversation manager rejected the system prompt"),
+      retryable = true,
+    })
+    return
+  end
   local pending = state.pending_compaction
   if type(pending) == "table"
       and body.event_id == "compaction:" .. pending.request_id .. ":requested" then
@@ -1342,6 +1395,7 @@ local function teardown_for_session_end()
   state.conversation:reset()
   state.conversation_id = nil
   state.pending_conversation_create = nil
+  state.pending_system_seed = nil
   state.pending_compaction = nil
   state.pending_context_request = nil
   emit_idle_state("session-ended")
@@ -1630,6 +1684,7 @@ M._internals  = {
     state.conversation:reset()
     state.conversation_id = nil
     state.pending_conversation_create = nil
+    state.pending_system_seed = nil
     state.pending_compaction = nil
     state.pending_context_request = nil
     state.current_run_id = nil

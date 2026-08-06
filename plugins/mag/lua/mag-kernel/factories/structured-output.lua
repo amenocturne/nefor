@@ -33,7 +33,6 @@ M.declaration = {
     output_type = "string", error_type = "string",
     provider_error_type = "string", validation_error_type = "string",
     max_corrections = "number",
-    conversation_context = "table?",
     conversation_id = "string?",
     turn_id = "string?",
   },
