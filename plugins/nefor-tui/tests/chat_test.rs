@@ -3758,7 +3758,7 @@ fn canonical_turn_completion_reconciles_pending_before_mag_result() {
     let settled = render_str(&mut engine);
     assert!(
         !settled.contains("[thinking"),
-        "lead terminal result must reconcile the pending placeholder: {settled}"
+        "MAG lifecycle must not disturb the canonical terminal: {settled}"
     );
 
     dispatch_event(
@@ -3767,6 +3767,45 @@ fn canonical_turn_completion_reconciles_pending_before_mag_result() {
     );
     let duplicate = render_str(&mut engine);
     assert!(!duplicate.contains("[thinking"));
+}
+
+#[test]
+fn mag_result_before_canonical_completion_does_not_duplicate_assistant() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first turn");
+    let _ = engine.take_emit_queue();
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "lead-run",
+            "run_name": "lead", "principal": "lead"
+        }),
+    );
+    fixture_assistant_delta(&mut engine, "provider answer");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_complete", "run_id": "lead-run" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "completed" }),
+    );
+
+    fixture_assistant_completed(
+        &mut engine,
+        Some("provider answer".into()),
+        json!({ "model": "mock-model", "duration_ms": 1_000 }),
+    );
+    let settled = render_snapshot(&mut engine);
+    assert_eq!(
+        settled.matches("provider answer").count(),
+        1,
+        "canonical completion must finalize the streamed entry in place:\n{settled}"
+    );
+    assert_eq!(settled.matches("▣ mock-model · 1s").count(), 1, "{settled}");
 }
 
 #[test]
@@ -3836,7 +3875,7 @@ fn abnormal_lead_close_settles_partial_reasoning_and_text() {
 }
 
 #[test]
-fn foreign_terminal_result_does_not_close_the_lead_placeholder() {
+fn mag_terminal_results_do_not_close_the_lead_placeholder() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -3862,7 +3901,7 @@ fn foreign_terminal_result_does_not_close_the_lead_placeholder() {
         &mut engine,
         json!({ "kind": "mag.run_result", "run_id": "lead-run", "status": "killed" }),
     );
-    assert!(!render_str(&mut engine).contains("[thinking"));
+    assert!(render_str(&mut engine).contains("[thinking"));
 }
 
 #[test]
