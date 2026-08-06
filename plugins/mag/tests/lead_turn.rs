@@ -19,7 +19,7 @@
 //!
 //! Test 2 (interrupt = kill): `mag.kill_run` mid-provider-round reaps the
 //! constellation through the fold — the dying llm's
-//! `<provider>.completion.cancel` reaches the wire (provider cancel observed) —
+//! `conversation.provider.cancel.request` reaches the wire —
 //! and settles the pending execute as `mag.run_result status:"killed"`.
 
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The turn spawner appends a `## MAG workspace` block to the system
 /// overlay (starter/agentic-loop): the session workspace dir plus the
 /// inlined canonical patterns document. Here we build a representative overlay the
-/// same way and assert it reaches the provider intact on completion.request.
+/// same way and assert it is recorded once as canonical conversation facts.
 const LEAD_SYSTEM: &str = "you are the lead\n\n\
 ## MAG workspace\n\n\
 workspace dir: /tmp/nefor/sessions/lead-turn-session/mag\n\n\
@@ -147,8 +147,11 @@ async fn write_env(stdin: &mut ChildStdin, env: Envelope) {
 }
 
 async fn send_event(stdin: &mut ChildStdin, body: Map<String, Value>) {
-    let source = if body.get("kind").and_then(Value::as_str) == Some("mag.execute") {
+    let kind = body.get("kind").and_then(Value::as_str);
+    let source = if kind == Some("mag.execute") {
         PluginName::new("agentic-loop").expect("agentic-loop plugin name")
+    } else if kind == Some("conversation.provider.event") {
+        PluginName::new("conversation-manager").expect("conversation-manager plugin name")
     } else {
         PluginName::engine()
     };
@@ -190,6 +193,57 @@ async fn shutdown(mut stdin: ChildStdin, mut child: Child) {
 
 fn obj(v: Value) -> Map<String, Value> {
     v.as_object().expect("object").clone()
+}
+
+fn assert_thin_provider_request(request: &Map<String, Value>, provider: &str) {
+    assert_eq!(
+        request.get("kind").and_then(Value::as_str),
+        Some("conversation.provider.invoke.request")
+    );
+    assert_eq!(
+        request.get("provider").and_then(Value::as_str),
+        Some(provider)
+    );
+    for forbidden in ["messages", "system", "tool_specs"] {
+        assert!(
+            request.get(forbidden).is_none(),
+            "thin provider request must not carry {forbidden}: {request:?}"
+        );
+    }
+}
+
+async fn next_provider_request_with_facts<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    provider: &str,
+) -> (Map<String, Value>, Vec<Value>) {
+    let mut facts = Vec::new();
+    loop {
+        let body = next_event(reader, "conversation.provider.invoke.request").await;
+        match body.get("kind").and_then(Value::as_str) {
+            Some("conversation.fact.append") => {
+                facts.push(body.get("fact").cloned().expect("append carries fact"));
+            }
+            Some("conversation.provider.invoke.request") => {
+                assert_thin_provider_request(&body, provider);
+                return (body, facts);
+            }
+            Some("mag.error" | "mag.run_failed") => {
+                panic!("MAG failure while expecting provider request: {body:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn next_provider_request<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    provider: &str,
+) -> Map<String, Value> {
+    next_provider_request_with_facts(reader, provider).await.0
+}
+
+fn facts_json(facts: &[Value]) -> String {
+    serde_json::to_string(facts).expect("serialize canonical facts")
 }
 
 /// Load the shipped lead turn-program and return its compiled artifact.
@@ -275,8 +329,9 @@ fn completed(provider: &str, request_id: &str, fields: Value) -> Map<String, Val
     let mut body = fields.as_object().expect("completion fields").clone();
     body.insert(
         "kind".into(),
-        Value::String(format!("{provider}.completion.event")),
+        Value::String("conversation.provider.event".into()),
     );
+    body.insert("provider".into(), Value::String(provider.to_owned()));
     body.insert("request_id".into(), Value::String(request_id.to_owned()));
     body.insert("event".into(), Value::String("completed".into()));
     body
@@ -386,8 +441,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     )
     .await;
 
-    let create_kind = format!("{MOCK}.completion.request");
-    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    let create = next_provider_request(&mut reader, MOCK).await;
     let first_chat = create["request_id"].as_str().unwrap().to_owned();
     assert_eq!(create.pointer_str("/output_schema/type"), Some("object"));
     assert_eq!(
@@ -406,14 +460,18 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     )
     .await;
 
-    let create2 = next_event_of_kind(&mut reader, &create_kind).await;
+    let (create2, correction_facts) = next_provider_request_with_facts(&mut reader, MOCK).await;
     let second_chat = create2
         .get("request_id")
         .and_then(Value::as_str)
         .unwrap()
         .to_owned();
-    let correction_history = serde_json::to_string(&create2["messages"]).unwrap();
-    assert!(correction_history.contains("malformed_json"));
+    let correction_history = facts_json(&correction_facts);
+    assert!(
+        correction_history.contains("malformed_json")
+            || correction_history.contains("invalid_json"),
+        "correction diagnostics are retained as canonical facts: {correction_facts:?}"
+    );
     send_event(
         &mut stdin,
         completed(MOCK, &second_chat, json!({ "text": "{\"task\":\"build\",\"description\":\"Implement it\",\"dependent-tasks\":[]}" })),
@@ -467,8 +525,7 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     )
     .await;
 
-    let builder_create =
-        next_event_of_kind(&mut reader, &format!("{MOCK}.completion.request")).await;
+    let builder_create = next_provider_request(&mut reader, MOCK).await;
     let builder_id = builder_create["request_id"].as_str().unwrap().to_owned();
     send_event(
         &mut stdin,
@@ -476,13 +533,13 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     )
     .await;
 
-    let reviewer_create =
-        next_event_of_kind(&mut reader, &format!("{MOCK}.completion.request")).await;
+    let (reviewer_create, reviewer_facts) =
+        next_provider_request_with_facts(&mut reader, MOCK).await;
     let reviewer_id = reviewer_create["request_id"].as_str().unwrap().to_owned();
-    let reviewer_history = serde_json::to_string(&reviewer_create["messages"]).unwrap();
+    let reviewer_history = facts_json(&reviewer_facts);
     assert!(
         reviewer_history.contains("partial builder notes"),
-        "reviewer did not receive builder last_output"
+        "builder output was not recorded before the reviewer invocation"
     );
     send_event(
         &mut stdin,
@@ -561,32 +618,13 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     )
     .await;
 
-    let planner = loop {
-        let event = next_event(&mut reader, "planner completion.request").await;
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.completion.request") {
-            break event;
-        }
-        if event.get("kind").and_then(Value::as_str) == Some("mag.error") {
-            panic!("dynamic execute: {event:?}");
-        }
-    };
+    let planner = next_provider_request(&mut reader, "mock-provider").await;
     let planner_id = planner["request_id"].as_str().unwrap().to_owned();
     complete_chat(&mut reader, &mut stdin, &planner_id,
       r#"{"value":[{"task":"a","description":"first","dependent_tasks":[]},{"task":"a.collect","description":"second","dependent_tasks":["a"]}]}"#).await;
 
-    let first = loop {
-        let event = next_event(&mut reader, "first worker completion.request").await;
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.completion.request") {
-            break event;
-        }
-        if matches!(
-            event.get("kind").and_then(Value::as_str),
-            Some("mag.error" | "mag.run_result")
-        ) {
-            panic!("planner expansion failed: {event:?}");
-        }
-    };
-    let second = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let first = next_provider_request(&mut reader, "mock-provider").await;
+    let second = next_provider_request(&mut reader, "mock-provider").await;
     let first_id = first["request_id"].as_str().unwrap().to_owned();
     let second_id = second["request_id"].as_str().unwrap().to_owned();
     assert_ne!(
@@ -613,7 +651,8 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     )
     .await;
 
-    let summary_create = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let (summary_create, summary_facts) =
+        next_provider_request_with_facts(&mut reader, "mock-provider").await;
     assert_eq!(
         summary_create.pointer_str("/output_schema/type"),
         Some("object")
@@ -632,14 +671,15 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     assert!(!output_schema.contains_key("version"));
     assert!(!output_schema.contains_key("root"));
     let summary_id = summary_create["request_id"].as_str().unwrap().to_owned();
-    let ordered = summary_create["messages"]
-        .as_array()
-        .and_then(|messages| {
-            messages
-                .iter()
-                .find_map(|message| message.get("content")?.as_array())
+    let ordered = summary_facts
+        .iter()
+        .find_map(|fact| {
+            (fact.get("actor_id").and_then(Value::as_str) == Some("summarizer.llm")
+                && fact.get("kind").and_then(Value::as_str) == Some("content_chunk_appended"))
+            .then(|| fact.pointer("/chunk/data").and_then(Value::as_array))
+            .flatten()
         })
-        .expect("typed worker list reached summarizer");
+        .expect("ordered worker results are canonical summarizer input");
     assert_eq!(ordered[0]["task"], "a");
     assert_eq!(ordered[1]["task"], "a.collect");
     send_event(
@@ -679,7 +719,7 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
         ),
     )
     .await;
-    let planner = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let planner = next_provider_request(&mut reader, "mock-provider").await;
     complete_chat(
         &mut reader,
         &mut stdin,
@@ -695,7 +735,9 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
                 "zero branch spawned dynamic actor {id}"
             );
         }
-        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.completion.request") {
+        if event.get("kind").and_then(Value::as_str) == Some("conversation.provider.invoke.request")
+        {
+            assert_thin_provider_request(&event, "mock-provider");
             break event;
         }
     };
@@ -747,7 +789,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         ),
     )
     .await;
-    let planner = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let planner = next_provider_request(&mut reader, "mock-provider").await;
     complete_chat(
         &mut reader,
         &mut stdin,
@@ -755,7 +797,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         r#"{"value":[{"task":"duplicate","description":"only","dependent_tasks":[]}]}"#,
     )
     .await;
-    let worker = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let worker = next_provider_request(&mut reader, "mock-provider").await;
     assert!(worker["request_id"].as_str().is_some());
     complete_chat(
         &mut reader,
@@ -764,7 +806,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         r#"{"task":"duplicate","description":"done"}"#,
     )
     .await;
-    let summary = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+    let summary = next_provider_request(&mut reader, "mock-provider").await;
     complete_chat(
         &mut reader,
         &mut stdin,
@@ -800,7 +842,7 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
     )
     .await;
     for _ in 0..3 {
-        let request = next_event_of_kind(&mut reader, "mock-provider.completion.request").await;
+        let request = next_provider_request(&mut reader, "mock-provider").await;
         complete_chat(
             &mut reader,
             &mut stdin,
@@ -881,15 +923,14 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         .expect("mag.run_started carries the run's wire-id scope token")
         .to_owned();
 
-    // The bridge drives the provider round: completion.request carries the
-    // overlaid system + the program-authored tool surface, keyed by a
-    // scope-prefixed chat handle.
-    let create_kind = format!("{PROVIDER}.completion.request");
-    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    // The bridge drives a thin manager request keyed by a scope-prefixed
+    // correlation handle. Full conversation content exists only as canonical
+    // facts emitted before the request.
+    let (create, initial_facts) = next_provider_request_with_facts(&mut reader, PROVIDER).await;
     let request_id = create
         .get("request_id")
         .and_then(Value::as_str)
-        .expect("completion.request carries request_id")
+        .expect("provider request carries request_id")
         .to_owned();
     assert!(
         request_id.starts_with(&format!("{scope}/")),
@@ -898,27 +939,24 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let conversation_id = create
         .get("conversation_id")
         .and_then(Value::as_str)
-        .expect("completion.request carries conversation identity")
+        .expect("provider request carries conversation identity")
         .to_owned();
     assert_eq!(
         conversation_id, CONVERSATION_ID,
         "provider routing is owned by the durable conversation"
     );
-    let system = create
-        .get("system")
-        .and_then(Value::as_str)
-        .expect("completion.request carries the spawner's system overlay");
+    let canonical_initial = facts_json(&initial_facts);
     assert!(
-        system.contains("## MAG workspace"),
-        "the ambient MAG workspace block reaches the provider; got {system:?}"
+        canonical_initial.contains("## MAG workspace"),
+        "the ambient MAG workspace block is canonical: {initial_facts:?}"
     );
     assert!(
-        system.contains("workspace dir: /tmp/nefor/sessions/lead-turn-session/mag"),
-        "the block carries the session workspace dir; got {system:?}"
+        canonical_initial.contains("workspace dir: /tmp/nefor/sessions/lead-turn-session/mag"),
+        "the canonical block carries the session workspace dir: {initial_facts:?}"
     );
     assert!(
-        system.contains("MAG patterns"),
-        "the block inlines the patterns doc; got {system:?}"
+        canonical_initial.contains("MAG patterns"),
+        "the canonical block inlines the patterns doc: {initial_facts:?}"
     );
     assert_eq!(
         create.get("model").and_then(Value::as_str),
@@ -927,7 +965,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let tools = create
         .get("tools")
         .and_then(Value::as_array)
-        .expect("completion.request advertises the program-authored tool surface");
+        .expect("thin request names the program-authored tool surface");
     let tool_names: Vec<&str> = tools.iter().filter_map(Value::as_str).collect();
     for expected in ["read_file", "write-review", "mag", "mag-eval"] {
         assert!(
@@ -945,10 +983,9 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         );
     }
 
-    // Turn 1, round 1: the request carries the task as its only message.
-    assert_eq!(
-        create.pointer_str("/messages/0/content/value/prompt"),
-        Some("what is in the repo?"),
+    assert!(
+        canonical_initial.contains("what is in the repo?"),
+        "the task is recorded before invoking the provider: {initial_facts:?}"
     );
 
     // The model calls a tool → the gate invoke rides a scope-prefixed
@@ -1014,7 +1051,8 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     .await;
 
     // Round 2: the tool result feeds exactly one fresh provider round; answer final.
-    let create2 = next_event_of_kind(&mut reader, &create_kind).await;
+    let (create2, continuation_facts) =
+        next_provider_request_with_facts(&mut reader, PROVIDER).await;
     let request_id2 = create2
         .get("request_id")
         .and_then(Value::as_str)
@@ -1029,24 +1067,23 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         Some(conversation_id.as_str()),
         "round 2 reuses the durable conversation identity"
     );
-    let continuation_messages = create2["messages"].as_array().expect("round 2 messages");
-    let tool_results: Vec<&Value> = continuation_messages
+    let continuation_history = facts_json(&continuation_facts);
+    let recorded_tool_results: Vec<&Value> = continuation_facts
         .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter(|fact| fact.get("kind").and_then(Value::as_str) == Some("tool_result_recorded"))
         .collect();
     assert_eq!(
-        tool_results.len(),
+        recorded_tool_results.len(),
         1,
-        "the original gate result reaches provider history exactly once"
+        "the original gate result has one canonical semantic fact: {continuation_facts:?}"
     );
     assert_eq!(
-        tool_results[0].pointer("/content").and_then(Value::as_str),
-        Some("# nefor")
+        recorded_tool_results[0].get("result"),
+        Some(&json!("# nefor"))
     );
-    let provider_history = serde_json::to_string(continuation_messages).unwrap();
     assert!(
-        !provider_history.contains(notice_text),
-        "instruction notices are absent from provider history"
+        !continuation_history.contains(notice_text),
+        "instruction notices are absent from canonical conversation history"
     );
     send_event(
         &mut stdin,
@@ -1095,23 +1132,25 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     )
     .await;
 
-    let turn2 = next_event_of_kind(&mut reader, &create_kind).await;
+    let (turn2, turn2_facts) = next_provider_request_with_facts(&mut reader, PROVIDER).await;
     assert_eq!(
         turn2.get("conversation_id").and_then(Value::as_str),
         Some(conversation_id.as_str()),
         "a later MAG run for the same conversation keeps provider cache affinity"
     );
-    let messages = turn2["messages"].as_array().expect("turn 2 messages");
-    assert_eq!(messages[0]["role"], "user");
-    assert_eq!(messages[0]["content"], "what is in the repo?");
-    assert_eq!(messages[1]["role"], "assistant");
-    assert_eq!(messages[1]["content"], "the repo holds nefor");
-    assert_eq!(messages[2]["role"], "user");
-    assert_eq!(
-        messages[2]
-            .pointer("/content/value/prompt")
-            .and_then(Value::as_str),
-        Some("and what else?")
+    let turn2_history = facts_json(&turn2_facts);
+    let first_user = turn2_history
+        .find("what is in the repo?")
+        .expect("seeded user message is canonical");
+    let first_answer = turn2_history
+        .find("the repo holds nefor")
+        .expect("seeded assistant message is canonical");
+    let second_user = turn2_history
+        .find("and what else?")
+        .expect("second user message is canonical");
+    assert!(
+        first_user < first_answer && first_answer < second_user,
+        "seeded history precedes the new task in canonical fact order: {turn2_facts:?}"
     );
 
     shutdown(stdin, child).await;
@@ -1150,13 +1189,13 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
     )
     .await;
 
-    // Wait until the provider round is in flight (completion.request on the
-    // wire, no reply sent) — the llm actor now holds live external work.
-    let request = next_event_of_kind(&mut reader, &format!("{PROVIDER}.completion.request")).await;
+    // Wait until the thin provider round is in flight (no reply sent) — the
+    // llm actor now holds live external work.
+    let request = next_provider_request(&mut reader, PROVIDER).await;
     let request_id = request
         .get("request_id")
         .and_then(Value::as_str)
-        .expect("completion.request carries request_id")
+        .expect("provider request carries request_id")
         .to_owned();
 
     // Esc: the control plane kills the run.
@@ -1167,8 +1206,8 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
     .await;
 
     // The reap runs kill handlers through the fold: the dying llm's
-    // provider-cancel envelope reaches the wire BEFORE the terminal reply.
-    let cancel_kind = format!("{PROVIDER}.completion.cancel");
+    // provider-cancel request reaches the wire BEFORE the terminal reply.
+    let cancel_kind = "conversation.provider.cancel.request";
     let mut saw_cancel = false;
     let result = loop {
         let body = next_event(&mut reader, "kill aftermath").await;
@@ -1260,12 +1299,12 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
     .await;
 
     // Round 1: drive the provider round to a tool call.
-    let create_kind = format!("{PROVIDER}.completion.request");
-    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    let create_kind = "conversation.provider.invoke.request";
+    let create = next_provider_request(&mut reader, PROVIDER).await;
     let request_id = create
         .get("request_id")
         .and_then(Value::as_str)
-        .expect("completion.request carries request_id")
+        .expect("provider request carries request_id")
         .to_owned();
     send_event(
         &mut stdin,
@@ -1298,13 +1337,21 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
 
     // Real termination: a tool.cancel for the open correlation reaches the wire
     // (→ the gate would forward it to the owning source and kill the child).
-    // The lead llm re-fires: a fresh completion.request whose transcript carries the
-    // interrupted tool result as a readable `[tool error] interrupted by user`.
+    // The lead llm re-fires with the interrupted tool result recorded as
+    // canonical conversation facts before the next thin provider request.
     let cancel_kind = format!("{GATE}.tool.cancel");
     let mut saw_cancel = false;
+    let mut interruption_facts = Vec::new();
     let request_id2 = loop {
         let body = next_event(&mut reader, "interrupt aftermath").await;
         match body.get("kind").and_then(Value::as_str) {
+            Some("conversation.fact.append") => {
+                interruption_facts.push(
+                    body.get("fact")
+                        .cloned()
+                        .expect("append carries interrupted tool fact"),
+                );
+            }
             Some(k) if k == cancel_kind => {
                 assert_eq!(
                     body.get("id").and_then(Value::as_str),
@@ -1314,6 +1361,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
                 saw_cancel = true;
             }
             Some(k) if k == create_kind => {
+                assert_thin_provider_request(&body, PROVIDER);
                 let c2 = body
                     .get("request_id")
                     .and_then(Value::as_str)
@@ -1323,11 +1371,6 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
                     c2, request_id,
                     "the re-fire runs on a fresh provider request"
                 );
-                let history = serde_json::to_string(&body["messages"]).unwrap();
-                assert!(
-                    history.contains("[tool error] interrupted by user"),
-                    "the lead re-fired with the interrupted result as a readable tool turn"
-                );
                 break c2;
             }
             _ => {}
@@ -1336,6 +1379,10 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
     assert!(
         saw_cancel,
         "a tool.cancel for the in-flight call reached the wire"
+    );
+    assert!(
+        facts_json(&interruption_facts).contains("[tool error] interrupted by user"),
+        "the readable interrupted tool result is canonical before re-fire: {interruption_facts:?}"
     );
 
     // The re-fired round produces the real final answer; the run completes
@@ -1376,7 +1423,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
 /// let its llm re-fire to a phantom "Completed". Here the interrupt cancels the
 /// in-flight tool (a `tool-gate.tool.cancel` reaches the wire → the bash dies)
 /// AND ends the run FAILED — `mag.run_result status:"failed" error:"interrupted
-/// by user"`, and the llm NEVER re-fires (no round-2 `completion.request`). This pins
+/// by user"`, and the llm NEVER re-fires (no round-2 provider request). This pins
 /// the incident's fix through the real plugin + bridge + kernel.
 #[tokio::test]
 async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_refire() {
@@ -1411,12 +1458,12 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
     .await;
 
     // Round 1: drive the provider round to a tool call.
-    let create_kind = format!("{PROVIDER}.completion.request");
-    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    let create_kind = "conversation.provider.invoke.request";
+    let create = next_provider_request(&mut reader, PROVIDER).await;
     let request_id = create
         .get("request_id")
         .and_then(Value::as_str)
-        .expect("completion.request carries request_id")
+        .expect("provider request carries request_id")
         .to_owned();
     send_event(
         &mut stdin,
@@ -1453,7 +1500,7 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
 
     // The run ends failed with NO re-fire: a tool.cancel for the in-flight call
     // reaches the wire, and the terminal reply is `status:"failed"`. Crucially,
-    // NO round-2 completion.request appears — the llm never gets to answer "Completed".
+    // NO round-2 provider request appears — the llm never gets to answer "Completed".
     let cancel_kind = format!("{GATE}.tool.cancel");
     let mut saw_cancel = false;
     let result = loop {
@@ -1468,8 +1515,9 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
                 saw_cancel = true;
             }
             Some(k) if k == create_kind => {
+                assert_thin_provider_request(&body, PROVIDER);
                 panic!(
-                    "the terminated run's llm must NOT re-fire — saw a round-2 completion.request"
+                    "the terminated run's llm must NOT re-fire — saw a round-2 provider request"
                 );
             }
             Some("mag.run_result") => break body,
