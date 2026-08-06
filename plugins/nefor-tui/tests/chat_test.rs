@@ -9731,27 +9731,7 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     assert_eq!(label(&cold, "late").as_deref(), Some("Late attach catalog"));
 }
 
-// Generic factory-declared node inspector regressions.
-fn advertise_preview(
-    engine: &mut Engine,
-    implementation: &str,
-    preview: JsonValue,
-    bindings: JsonValue,
-) {
-    dispatch_event(
-        engine,
-        json!({
-            "kind": "mag.hello",
-            "foreign_contracts": [{
-                "identity": format!("nefor.factory.{implementation}"),
-                "implementation": implementation,
-                "preview": preview,
-                "preview_bindings": bindings,
-            }]
-        }),
-    );
-}
-
+// Consumer-local node projection regressions.
 fn open_single_node(engine: &mut Engine, factory: &str, actor: &str) {
     let _ = render_str(engine);
     dispatch_event(
@@ -9776,37 +9756,20 @@ fn open_single_node(engine: &mut Engine, factory: &str, actor: &str) {
 }
 
 #[test]
-fn declared_preview_interprets_without_factory_specific_renderer_and_updates_live() {
+fn tui_projects_generic_diagnostics_without_factory_specific_renderer() {
     let mut engine = Engine::new(120, 32).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    advertise_preview(
-        &mut engine,
-        "third-party",
-        json!({
-            "kind": "column", "gap": 1, "children": [
-                { "kind": "text", "value": { "binding": "lifecycle", "name": "status" }, "style": "status" },
-                { "kind": "stream", "source": { "binding": "stream", "name": "events", "schema": "table" },
-                  "item": { "kind": "cases", "values": {
-                      "line": { "kind": "text", "value": { "binding": "item", "name": "text" }, "wrap": "word" }
-                  } },
-                  "empty": { "kind": "text", "value": "waiting", "style": "dim" }
-                }
-            ]
-        }),
-        json!({ "events": { "kind": "stream", "schema": "table" } }),
-    );
     open_single_node(&mut engine, "third-party", "custom.node");
     let initial = render_snapshot(&mut engine);
     assert!(
-        initial.contains("waiting"),
-        "empty declaration content must render: {initial}"
+        initial.contains("third-party · pending"),
+        "local projection must render actor lifecycle: {initial}"
     );
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "mag.node_preview", "run_id": "preview-run", "id": "custom.node",
-            "operation": "append", "binding": "events", "observation_seq": 8,
-            "value": { "kind": "line", "text": "LIVE THIRD PARTY CONTENT" }
+            "kind": "mag.diagnostic", "run_id": "preview-run", "from": "custom.node",
+            "diagnostic": { "kind": "line", "text": "LIVE THIRD PARTY CONTENT" }
         }),
     );
     let frame = render_snapshot(&mut engine);
@@ -9838,56 +9801,52 @@ fn declared_preview_interprets_without_factory_specific_renderer_and_updates_liv
 }
 
 #[test]
-fn generic_input_and_output_preview_references_materialize_endpoint_observations() {
+fn generic_arrivals_and_firings_materialize_tui_inputs_and_outputs() {
     let mut engine = Engine::new(100, 26).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    advertise_preview(
+    open_single_node(&mut engine, "endpoints", "endpoint.node");
+    dispatch_event(
         &mut engine,
-        "endpoints",
-        json!({ "kind": "column", "children": [
-            { "kind": "text", "value": { "binding": "input", "name": "request" } },
-            { "kind": "text", "value": { "binding": "output", "name": "response" } }
-        ] }),
         json!({
-            "request": { "kind": "input" },
-            "response": { "kind": "output" }
+            "kind": "mag.arrival", "run_id": "preview-run", "arrival_id": "arrival:input",
+            "from": "source.node", "wire": "request", "semantic_type_id": "request",
+            "value": "GENERIC INPUT OBSERVED"
         }),
     );
-    open_single_node(&mut engine, "endpoints", "endpoint.node");
-    for (binding_kind, binding, value) in [
-        ("input", "request", "GENERIC INPUT OBSERVED"),
-        ("output", "response", "GENERIC OUTPUT OBSERVED"),
-    ] {
-        dispatch_event(
-            &mut engine,
-            json!({
-                "kind": "mag.node_preview", "run_id": "preview-run", "id": "endpoint.node",
-                "operation": "set", "binding_kind": binding_kind,
-                "binding": binding, "value": value
-            }),
-        );
-    }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.firing", "run_id": "preview-run", "id": "endpoint.node",
+            "port": "input", "shape": "single",
+            "arrivals": [{ "arrival_id": "arrival:input", "wire": "request" }]
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.arrival", "run_id": "preview-run", "arrival_id": "arrival:output",
+            "from": "endpoint.node", "wire": "response", "semantic_type_id": "response",
+            "value": "GENERIC OUTPUT OBSERVED"
+        }),
+    );
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("show projected endpoint details");
     let frame = render_snapshot(&mut engine);
     assert!(frame.contains("GENERIC INPUT OBSERVED"), "{frame}");
     assert!(frame.contains("GENERIC OUTPUT OBSERVED"), "{frame}");
 }
 
 #[test]
-fn completed_preview_remains_inspectable_after_linger_and_is_bounded_to_latest_run() {
+fn completed_local_projection_remains_inspectable_and_bounded_to_latest_run() {
     let mut engine = Engine::new(110, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    advertise_preview(
-        &mut engine,
-        "retained",
-        json!({ "kind": "text", "value": { "binding": "output", "name": "result" } }),
-        json!({ "result": { "kind": "output" } }),
-    );
     open_single_node(&mut engine, "retained", "retained.node");
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "mag.node_preview", "run_id": "preview-run", "id": "retained.node",
-            "operation": "set", "binding_kind": "output", "binding": "result",
+            "kind": "mag.arrival", "run_id": "preview-run", "arrival_id": "arrival:result",
+            "from": "retained.node", "wire": "result", "semantic_type_id": "result",
             "value": "RETAINED COMPLETED OUTPUT"
         }),
     );
@@ -9963,7 +9922,7 @@ fn completed_preview_remains_inspectable_after_linger_and_is_bounded_to_latest_r
 }
 
 #[test]
-fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
+fn consumer_projection_keeps_raw_tool_payloads_behind_details() {
     let mut engine = Engine::new(110, 72).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     dispatch_event(
@@ -9974,63 +9933,42 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
             { "name": "run_tool", "display": { "label": "Run tool", "primary": { "arg": "name" }, "result": { "kind": "content" } } }
         ] }),
     );
-    advertise_preview(
-        &mut engine,
-        "transcriptish",
-        json!({
-            "kind": "stream", "source": { "binding": "stream", "name": "transcript", "schema": "table" },
-            "item": { "kind": "cases", "values": {
-                "reasoning": { "kind": "value", "value": { "binding": "item", "name": "text" }, "format": "reasoning", "style": "reasoning" },
-                "assistant": { "kind": "markdown", "value": { "binding": "item", "name": "text" } },
-                "tool_call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
-                "tool_result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" },
-                "call": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_call" },
-                "result": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result" },
-                "error": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "tool_result", "style": "error" }
-            } }
-        }),
-        json!({ "transcript": { "kind": "stream", "schema": "table" } }),
-    );
     open_single_node(&mut engine, "transcriptish", "agent.node");
-    for (seq, value) in [
-        (1, json!({ "kind": "reasoning", "text": "reason " })),
-        (2, json!({ "kind": "reasoning", "text": "continued" })),
-        (
-            3,
-            json!({ "kind": "assistant", "text": "## Answer\ncomplete prose" }),
-        ),
-        (
-            4,
-            json!({ "kind": "tool_call", "value": { "id": "call-1", "name": "skill", "arguments": { "name": ["dev"], "debug_wrapper": "CALL-WRAPPER-MUST-STAY-HIDDEN" } } }),
-        ),
-        (
-            5,
-            json!({ "kind": "tool_result", "value": { "id": "call-1", "name": "skill", "output": "# Dev skill\nLARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN\nfull workflow body" } }),
-        ),
-        (
-            6,
-            json!({ "kind": "call", "value": { "id": "list-raw-id", "name": "list_dir", "arguments": { "path": "/project/src", "debug_wrapper": "LIST-WRAPPER-MUST-STAY-HIDDEN" } } }),
-        ),
-        (
-            7,
-            json!({ "kind": "result", "value": { "id": "list-raw-id", "name": "list_dir", "output": "(f) lib.rs\nLARGE-LIST-RESULT-MUST-STAY-HIDDEN\n" } }),
-        ),
-        (
-            8,
-            json!({ "kind": "call", "value": { "id": "error-raw-id", "name": "run_tool", "arguments": { "name": "deploy", "secret": "ERROR-CALL-MUST-STAY-HIDDEN" } } }),
-        ),
-        (
-            9,
-            json!({ "kind": "error", "value": { "id": "error-raw-id", "name": "run_tool", "error": "permission denied: concise cause. XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN" } }),
-        ),
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mock.completion.request", "request_id": "provider-1",
+            "invocation": { "run_id": "preview-run", "actor_id": "agent.node" }
+        }),
+    );
+    for (event, text) in [
+        ("reasoning_delta", "reason "),
+        ("reasoning_delta", "continued"),
+        ("text_delta", "## Answer\ncomplete prose"),
     ] {
         dispatch_event(
             &mut engine,
             json!({
-                "kind": "mag.node_preview", "run_id": "preview-run", "id": "agent.node",
-                "operation": "append", "binding": "transcript", "observation_seq": seq, "value": value
+                "kind": "mock.completion.event", "request_id": "provider-1",
+                "event": event, "text": text
             }),
         );
+    }
+    for (id, name, args, output, error) in [
+        ("call-1", "skill", json!({ "name": ["dev"], "debug_wrapper": "CALL-WRAPPER-MUST-STAY-HIDDEN" }),
+          Some("# Dev skill\nLARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN\nfull workflow body"), None),
+        ("list-raw-id", "list_dir", json!({ "path": "/project/src", "debug_wrapper": "LIST-WRAPPER-MUST-STAY-HIDDEN" }),
+          Some("(f) lib.rs\nLARGE-LIST-RESULT-MUST-STAY-HIDDEN\n"), None),
+        ("error-raw-id", "run_tool", json!({ "name": "deploy", "secret": "ERROR-CALL-MUST-STAY-HIDDEN" }),
+          None, Some("permission denied: concise cause. XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN")),
+    ] {
+        dispatch_event(&mut engine, json!({
+            "kind": "tool-gate.tool.invoke", "id": id, "name": name, "args": args,
+            "invocation": { "run_id": "preview-run", "actor_id": "agent.node" }
+        }));
+        dispatch_event(&mut engine, json!({
+            "kind": "tool.result", "id": id, "output": output, "error": error
+        }));
     }
     let frame = render_snapshot(&mut engine);
     for expected in [
@@ -10148,32 +10086,19 @@ fn node_and_group_previews_keep_raw_tool_payloads_behind_details() {
 }
 
 #[test]
-fn structured_validation_preview_never_renders_rejected_candidate_json() {
+fn generic_validation_diagnostic_never_renders_rejected_candidate_json() {
     let mut engine = Engine::new(110, 32).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    advertise_preview(
-        &mut engine,
-        "structured-output",
-        json!({
-            "kind": "stream",
-            "source": { "binding": "stream", "name": "transcript", "schema": "table" },
-            "item": { "kind": "cases", "values": {
-                "validation": { "kind": "value", "value": { "binding": "item", "name": "value" }, "format": "validation", "style": "error", "wrap": "word" }
-            } }
-        }),
-        json!({ "transcript": { "kind": "stream", "schema": "table" } }),
-    );
     open_single_node(&mut engine, "structured-output", "typed.node");
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "mag.node_preview", "run_id": "preview-run", "id": "typed.node",
-            "operation": "append", "binding": "transcript", "observation_seq": 1,
-            "value": { "kind": "validation", "value": {
+            "kind": "mag.diagnostic", "run_id": "preview-run", "from": "typed.node",
+            "diagnostic": {
                 "attempt": 1,
-                "output": { "raw_machine_secret": "REJECTED-CANDIDATE-MUST-NEVER-RENDER" },
+                "kind": "validation",
                 "violations": [{ "path": "$.content", "message": "required" }]
-            } }
+            }
         }),
     );
 
@@ -10200,27 +10125,10 @@ fn structured_validation_preview_never_renders_rejected_candidate_json() {
 }
 
 #[test]
-fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_widths() {
-    let declaration = json!({
-        "kind": "column", "gap": 1, "children": [
-            { "kind": "text", "value": { "binding": "param", "name": "command" }, "style": "command", "wrap": "word" },
-            { "kind": "stream", "source": { "binding": "stream", "name": "terminal_events", "schema": "table" },
-              "item": { "kind": "cases", "values": {
-                  "stdout": { "kind": "text", "value": { "binding": "item", "name": "text" }, "style": "stdout", "wrap": "word" },
-                  "stderr": { "kind": "text", "value": { "binding": "item", "name": "text" }, "style": "stderr", "wrap": "word" }
-              } }
-            }
-        ]
-    });
+fn tui_terminal_projection_preserves_exact_large_multiline_tool_streams() {
     for width in [58, 150] {
-        let mut engine = Engine::new(width, 28).expect("engine");
+        let mut engine = Engine::new(width, 40).expect("engine");
         engine.load_scenario(&chat_lua_source()).expect("load");
-        advertise_preview(
-            &mut engine,
-            "terminalish",
-            declaration.clone(),
-            json!({ "terminal_events": { "kind": "stream", "schema": "table" } }),
-        );
         dispatch_event(
             &mut engine,
             json!({
@@ -10230,22 +10138,21 @@ fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_wi
         dispatch_event(
             &mut engine,
             json!({
-                "kind": "mag.actor_spawned", "run_id": "preview-run", "id": "shell.node", "factory": "terminalish"
+                "kind": "mag.actor_spawned", "run_id": "preview-run", "id": "shell.node", "factory": "terminalish",
+                "spec": { "params": { "command": "printf 'EXACT COMMAND WITH SPACES'" } }
             }),
         );
         dispatch_event(
             &mut engine,
             json!({
-                "kind": "mag.modification_applied", "run_id": "preview-run", "modification": {
-                    "actors": [{ "id": "shell.node", "params": { "command": "printf 'EXACT COMMAND WITH SPACES'" } }]
-                }
+                "kind": "mock.completion.request", "request_id": "terminal-cap",
+                "invocation": { "run_id": "preview-run", "actor_id": "shell.node" }
             }),
         );
-        for (seq, stream, text) in [
-            (1, "stdout", "ALPHA-LINE\n"),
-            (2, "stderr", "ERROR-LINE\n"),
+        for (stream, text) in [
+            ("stdout", "ALPHA-LINE\n"),
+            ("stderr", "ERROR-LINE\n"),
             (
-                3,
                 "stdout",
                 "OMEGA-CONTENT-THAT-MUST-NOT-BE-CLIPPED-0123456789",
             ),
@@ -10253,9 +10160,7 @@ fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_wi
             dispatch_event(
                 &mut engine,
                 json!({
-                    "kind": "mag.node_preview", "run_id": "preview-run", "id": "shell.node",
-                    "operation": "append", "binding": "terminal_events", "observation_seq": seq,
-                    "value": { "kind": stream, "text": text }
+                    "kind": "tool.stream", "id": "terminal-cap", "stream": stream, "text": text
                 }),
             );
         }
@@ -10266,6 +10171,7 @@ fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_wi
         let _ = render_str(&mut engine);
         engine.handle_key(key("down")).unwrap();
         engine.handle_key(key("space")).unwrap();
+        engine.handle_key(key("ctrl_o")).unwrap();
         let _ = render_str(&mut engine);
         let frame = engine
             .snapshot()
@@ -10287,28 +10193,23 @@ fn terminal_preview_preserves_exact_large_multiline_chunks_at_narrow_and_wide_wi
 }
 
 #[test]
-fn appended_preview_output_does_not_steal_manual_scroll_position() {
+fn appended_consumer_projection_does_not_steal_manual_scroll_position() {
     let mut engine = Engine::new(100, 26).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    advertise_preview(
-        &mut engine,
-        "scrolling",
-        json!({
-            "kind": "stream", "source": { "binding": "stream", "name": "events", "schema": "table" },
-            "item": { "kind": "cases", "values": {
-                "line": { "kind": "text", "value": { "binding": "item", "name": "text" }, "wrap": "word" }
-            } }
-        }),
-        json!({ "events": { "kind": "stream", "schema": "table" } }),
-    );
     open_single_node(&mut engine, "scrolling", "scroll.node");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke", "id": "scroll-cap", "name": "stream",
+            "args": {}, "invocation": { "run_id": "preview-run", "actor_id": "scroll.node" }
+        }),
+    );
     for seq in 1..=50 {
         dispatch_event(
             &mut engine,
             json!({
-                "kind": "mag.node_preview", "run_id": "preview-run", "id": "scroll.node",
-                "operation": "append", "binding": "events", "observation_seq": seq,
-                "value": { "kind": "line", "text": format!("line {seq:02}") }
+                "kind": "tool.stream", "id": "scroll-cap", "stream": "stdout",
+                "text": format!("line {seq:02}")
             }),
         );
     }
@@ -10324,9 +10225,8 @@ fn appended_preview_output_does_not_steal_manual_scroll_position() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "mag.node_preview", "run_id": "preview-run", "id": "scroll.node",
-            "operation": "append", "binding": "events", "observation_seq": 51,
-            "value": { "kind": "line", "text": "new tail output" }
+            "kind": "tool.stream", "id": "scroll-cap", "stream": "stdout",
+            "text": "new tail output"
         }),
     );
     let _ = render_str(&mut engine);
@@ -10351,12 +10251,6 @@ fn appended_preview_output_does_not_steal_manual_scroll_position() {
 fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
     let mut engine = Engine::new(100, 26).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    advertise_preview(
-        &mut engine,
-        "readonly",
-        json!({ "kind": "text", "value": "immutable" }),
-        json!({}),
-    );
     open_single_node(&mut engine, "readonly", "readonly.node");
     let _ = render_str(&mut engine);
     let before = engine.take_emit_queue();

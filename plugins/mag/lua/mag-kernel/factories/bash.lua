@@ -46,14 +46,12 @@
 local kinds = require("kinds")
 
 local M = {}
-local preview_components = require("preview-components")
 
 -- The factory's own computed-failure tag (NOT the kernel-synthesized
 -- mag.Failed — routing.lua emits that; a factory never returns it).
 local COMMAND_FAILED = "mag.CommandFailed"
 
 M.declaration = {
-  preview = preview_components.terminal(),
   name = "bash",
   semantic = {
     input={kind="union",items={{kind="primitive",name="Unit"},{kind="named",name="nefor.contracts.Text",arguments={}}}},
@@ -126,7 +124,6 @@ function M.construct(id, params, emit, deps)
     return nil, "bash actor params.timeout_ms must be a Timeout record"
   end
   local timeout_ms = timeout.present and timeout.milliseconds or nil
-  local preview_emit = deps and deps.preview
   if timeout_ms ~= nil and (type(timeout_ms) ~= "number" or timeout_ms < 1) then
     return nil, "bash actor params.timeout_ms must be a positive number of milliseconds"
   end
@@ -156,7 +153,6 @@ function M.construct(id, params, emit, deps)
     pending[ref.call] = nil
 
     if activation.error ~= nil then
-      if preview_emit then preview_emit("set", "exit", { kind = "capability_error", error = tostring(activation.error) }) end
       return {
         status = "failed",
         failure = COMMAND_FAILED,
@@ -164,7 +160,6 @@ function M.construct(id, params, emit, deps)
       }
     end
     if type(activation.result) ~= "string" then
-      if preview_emit then preview_emit("set", "exit", { kind = "capability_error", error = "bash capability returned a non-text result" }) end
       return {
         status = "failed",
         failure = COMMAND_FAILED,
@@ -173,8 +168,8 @@ function M.construct(id, params, emit, deps)
     end
 
     local stdout, stderr, exit = parse_output(activation.result)
-    if preview_emit then
-      preview_emit("set", "exit", { kind = exit == "0" and "exited" or "failed", code = exit })
+    if deps and type(deps.diagnostic) == "function" then
+      deps.diagnostic({ kind = "process_exit", code = tonumber(exit) or exit })
     end
     if exit == "0" then
       emit(sign({ kind = "mag.Text", value = { content = stdout }, text = stdout }))
@@ -202,9 +197,6 @@ function M.construct(id, params, emit, deps)
       local message = one.message or {}
       local value = message.value
       stdin = type(value) == "table" and value.content or message.text or ""
-      if preview_emit and stdin ~= "" then
-        preview_emit("append", "terminal_events", { kind = "stdin", text = stdin })
-      end
     end
     seq = seq + 1
     pending[seq] = true

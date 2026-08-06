@@ -62,7 +62,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   local decl, err = reg:register({ declaration = bash.declaration, construct = bash.construct })
   assert_true(decl ~= nil and err == nil, "bash factory registers cleanly: " .. tostring(err))
 
@@ -80,7 +80,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({ declaration = bash.declaration, construct = bash.construct })
   reg:register({ declaration = sink.declaration, construct = sink.construct })
 

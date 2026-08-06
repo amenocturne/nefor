@@ -62,7 +62,7 @@ local function harness()
   local events = {}
   local captured_provider_input = {}
 
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({ declaration = run_tool.declaration, construct = run_tool.construct })
   reg:register({ declaration = tool_res.declaration, construct = tool_res.construct })
   reg:register({

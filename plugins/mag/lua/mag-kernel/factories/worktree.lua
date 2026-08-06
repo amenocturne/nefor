@@ -1,5 +1,4 @@
 local kinds = require("kinds")
-local preview_components = require("preview-components")
 
 local M = {}
 
@@ -20,7 +19,6 @@ local function declaration(config)
   end
   return {
     name = config.factory,
-    preview = preview_components.input_output(),
     semantic = {
       input={kind="primitive",name="Unit"},
       output=WORKTREE_TYPE,

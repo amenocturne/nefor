@@ -76,7 +76,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   for _, mod in ipairs({ run_tool, tool_result }) do
     local decl, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     assert_true(decl ~= nil and err == nil,
@@ -277,39 +277,24 @@ end
 
 do
   local null = nefor.json.decode("null")
-  local run_previews, run_msgs, run_emit = {}, capture()
-  local run = run_tool.construct("rt", {}, run_emit, {
-    preview = function(operation, binding, value)
-      run_previews[#run_previews + 1] = { operation = operation, binding = binding, value = value }
-      return true
-    end,
-  })
+  local run_msgs, run_emit = capture()
+  local run = run_tool.construct("rt", {}, run_emit)
   run.deliver(single("llm", "generic-tool.ToolCalls", {
     calls = { { id = "null-1", name = "nullable", args = {} } },
   }))
   local invoke = find_kind(run_msgs, "capability.invoke")
   run.deliver(reply(invoke.ref, { content = null }))
-  assert_eq(#run_previews, 2, "run-tool observes the call and null-bearing result")
-  assert_eq(run_previews[2].binding, "tool_events", "run-tool result uses the tool event stream")
-  assert_eq(nefor.json.encode(run_previews[2].value.value.output), '{"content":null}',
-    "run-tool preview preserves JSON null in the tool output")
+  local handle = find_kind(run_msgs, "generic-tool.ToolHandle")
+  assert_eq(nefor.json.encode(handle.results[1].output), '{"content":null}',
+    "run-tool preserves JSON null in its canonical output")
 
-  local result_previews, result_msgs, result_emit = {}, capture()
-  local result = tool_result.construct("tr", {}, result_emit, {
-    preview = function(operation, binding, value)
-      result_previews[#result_previews + 1] = { operation = operation, binding = binding, value = value }
-      return true
-    end,
-  })
+  local result_msgs, result_emit = capture()
+  local result = tool_result.construct("tr", {}, result_emit)
   result.deliver(single("run-tool", "generic-tool.ToolHandle", {
     results = { { id = "null-1", name = "nullable", output = { content = null } } },
   }))
-  assert_eq(#result_previews, 1, "tool-result observes the null-bearing result")
-  assert_eq(result_previews[1].binding, "tool_events", "tool-result uses the tool event stream")
-  assert_eq(nefor.json.encode(result_previews[1].value.value.output), '{"content":null}',
-    "tool-result preview preserves JSON null in the tool output")
   assert_true(find_kind(result_msgs, "generic-provider.ProviderOut") ~= nil,
-    "preview projection does not change tool-result execution")
+    "tool-result adapts the null-bearing result without a projection side channel")
 end
 
 -- ==================================================================

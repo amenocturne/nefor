@@ -50,7 +50,7 @@ local function harness(factories)
   local bus = {}
   local events = {}
   local inv = inventory.new({ log = log })
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   for _, factory in pairs(factories) do
     local entry = factory.declaration and factory or {
       declaration = factory,

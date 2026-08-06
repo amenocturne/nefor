@@ -143,6 +143,9 @@ impl CapabilityBridge {
             Value::String(format!("{provider}.completion.request")),
         );
         request.insert("request_id".into(), Value::String(request_id.clone()));
+        if let Some(invocation @ Value::Object(_)) = body.get("invocation") {
+            request.insert("invocation".into(), invocation.clone());
+        }
 
         let structured_output = request
             .get("output_schema")
@@ -458,13 +461,17 @@ mod tests {
             {"role": "assistant", "content": "second"},
             {"role": "user", "content": "third"}
         ]);
-        let out = bridge.translate_emit(provider_invoke("req-1", "provider-a", messages.clone()));
+        let mut invoke = provider_invoke("req-1", "provider-a", messages.clone());
+        let invocation = json!({"run_id": "run-1", "actor_id": "worker"});
+        invoke.insert("invocation".into(), invocation.clone());
+        let out = bridge.translate_emit(invoke);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["kind"], "provider-a.completion.request");
         assert_eq!(out[0]["request_id"], "req-1");
         assert_eq!(out[0]["conversation_id"], "conversation-stable");
         assert_eq!(out[0]["messages"], messages);
+        assert_eq!(out[0]["invocation"], invocation);
         assert!(out[0].get("input").is_none());
         assert!(out[0].get("chat_id").is_none());
         let wire = serde_json::to_string(&out).expect("serialize");

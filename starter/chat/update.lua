@@ -273,7 +273,7 @@ local function handle_input_submit(msg, state)
           pending_graph_results = NIL_SENTINEL, input_value = "",
           pending = false, completion = NIL_SENTINEL,
           runs = {}, sidebar_folds = {},
-          node_previews = {}, preview_registry = {}, scope_to_run = {},
+          node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           last_esc_ms = NIL_SENTINEL,
@@ -299,7 +299,7 @@ local function handle_input_submit(msg, state)
       pending_graph_results = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
       runs = {}, sidebar_folds = {},
-      node_previews = {}, preview_registry = {}, scope_to_run = {},
+      node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
       last_esc_ms = NIL_SENTINEL,
@@ -497,7 +497,7 @@ local function handle_input_submit(msg, state)
         pending_graph_results = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
         runs = {}, sidebar_folds = {},
-        node_previews = {}, preview_registry = {}, scope_to_run = {},
+        node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
@@ -584,7 +584,7 @@ local function handle_input_submit(msg, state)
         entries = {}, in_flight = NIL_SENTINEL,
         pending_graph_results = NIL_SENTINEL,
         pending = false, runs = {}, sidebar_folds = {},
-        node_previews = {}, preview_registry = {}, scope_to_run = {},
+        node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -911,7 +911,7 @@ local function handle_session_end(_msg, state)
     escape_token     = NIL_SENTINEL,
     escape_count     = NIL_SENTINEL,
     runs             = {},
-    node_previews    = {}, preview_registry = {},
+    node_previews    = {}, mag_arrivals = {}, capability_owners = {},
     scope_to_run     = {},
     sidebar_folds    = {},
     conversation_id = NIL_SENTINEL,
@@ -944,7 +944,7 @@ local function handle_session_start(msg, state)
   return shallow_merge(state, {
     session_id = msg.session_id,
     runs = runs,
-    node_previews = {}, preview_registry = {}, scope_to_run = {},
+    node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
     conversation_id = NIL_SENTINEL,
     conversation_projection = conversation_projection.new(),
     instruction_notice_ids = {},
@@ -1027,7 +1027,7 @@ local function handle_instruction_notice(msg, state)
   end
   if invocation.principal == "subagent" then
     -- Instruction notices remain visible in the lead transcript only; actor
-    -- previews are populated by their declared telemetry and provider traffic.
+    -- details are projected locally from generic MAG and provider traffic.
     return state, {}
   end
   if invocation.principal ~= "lead" then
@@ -1483,16 +1483,11 @@ end
 -- every event carries its `run_id` — panel state keys straight off it,
 -- so overlapping runs render independently.
 
-local function handle_mag_contracts(msg, state)
-  return preview_state.advertise(state, msg.foreign_contracts), {}
-end
-
-local function handle_mag_node_preview(msg, state)
-  if state.replay_mode then return state, {} end
-  local next = preview_state.observe(state, msg, tui.now_ms())
+local function finish_projection_update(state, next, msg)
   if next ~= state and state.popup and state.popup.variant == "node_inspector"
       and state.popup.run_id == msg.run_id
-      and (state.popup.actor_id == nil or state.popup.actor_id == msg.id) then
+      and (state.popup.actor_id == nil or state.popup.actor_id == msg.id
+        or state.popup.actor_id == msg.from) then
     local at_end = false
     local ok, position = pcall(tui.scroll_position, "popup_node_inspector")
     if ok and type(position) == "table" then
@@ -1506,9 +1501,19 @@ local function handle_mag_node_preview(msg, state)
   return next, {}
 end
 
-local function handle_mag_modification_applied(msg, state)
+local function handle_mag_arrival(msg, state)
   if state.replay_mode then return state, {} end
-  return preview_state.apply_modification(state, msg, tui.now_ms()), {}
+  return finish_projection_update(state, preview_state.arrival(state, msg, tui.now_ms()), msg)
+end
+
+local function handle_mag_firing(msg, state)
+  if state.replay_mode then return state, {} end
+  return finish_projection_update(state, preview_state.firing(state, msg, tui.now_ms()), msg)
+end
+
+local function handle_mag_diagnostic(msg, state)
+  if state.replay_mode then return state, {} end
+  return finish_projection_update(state, preview_state.diagnostic(state, msg, tui.now_ms()), msg)
 end
 
 local function handle_mag_run_started(msg, state)
@@ -1536,7 +1541,7 @@ local function handle_mag_actor_spawned(msg, state)
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
   local next = run_panel.actor_spawned(state, run_id, id, msg.factory, tui.now_ms())
-  return preview_state.spawn(next, run_id, id, msg.factory, tui.now_ms()), {}
+  return preview_state.spawn(next, run_id, id, msg.factory, msg.spec, tui.now_ms()), {}
 end
 
 local function handle_mag_actor_ready(msg, state)
@@ -1566,7 +1571,8 @@ local function handle_mag_actor_idle(msg, state)
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
   local now = tui.now_ms()
-  return preview_state.lifecycle(run_panel.actor_idle(state, run_id, id, now), run_id, id, "idle", now), {}
+  return preview_state.lifecycle(run_panel.actor_idle(state, run_id, id, now),
+    run_id, id, "idle", now, msg.completion), {}
 end
 
 local function handle_mag_actor_killed(msg, state)
@@ -1903,13 +1909,12 @@ local handlers = {
   ["chat.auth.status"]            = handle_auth_status,
   ["chat.tool.popup_request"]     = handle_tool_popup_request,
   ["tool-gate.mode_changed"]      = handle_gate_mode_changed,
-  ["mag.hello"]                   = handle_mag_contracts,
-  ["mag.loaded"]                  = handle_mag_contracts,
   ["mag.run_started"]             = handle_mag_run_started,
   ["mag.approval_request"]        = handle_mag_approval_request,
   ["mag.approval_cancel"]         = handle_mag_approval_cancel,
-  ["mag.node_preview"]            = handle_mag_node_preview,
-  ["mag.modification_applied"]    = handle_mag_modification_applied,
+  ["mag.arrival"]                 = handle_mag_arrival,
+  ["mag.firing"]                  = handle_mag_firing,
+  ["mag.diagnostic"]              = handle_mag_diagnostic,
   ["mag.actor_spawned"]           = handle_mag_actor_spawned,
   ["mag.actor_ready"]             = handle_mag_actor_ready,
   ["mag.actor_busy"]              = handle_mag_actor_busy,
@@ -2260,7 +2265,15 @@ function M.update(msg, state)
   if handler then
     next_state, effects = handler(msg, state)
   else
-    next_state, effects = route_keys_and_popups(msg, state)
+    local observed = state.replay_mode and state
+      or preview_state.observe_capability(state, msg, tui.now_ms())
+    if observed ~= state then
+      local owner = (observed.capability_owners or {})[msg.request_id or msg.id]
+      if owner then
+        next_state, effects = finish_projection_update(state, observed,
+          { run_id = owner.run_id, id = owner.actor_id })
+      else next_state, effects = observed, {} end
+    else next_state, effects = route_keys_and_popups(msg, state) end
   end
   -- Model and geometry can change without a navigation key (actor events,
   -- folds, linger pruning). Keep the focused selection valid and visible.

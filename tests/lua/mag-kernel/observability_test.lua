@@ -151,7 +151,7 @@ do
   end
 
   local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({
     declaration = {
       name = "worker",
@@ -228,7 +228,7 @@ do
   -- Non-sink actor: its declared output persists through routing, keyed by id.
   local persisted = {}
   local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({
     declaration = { name = "worker", params = {}, inputs = { input = "stub.In" }, outputs = { "stub.Out" } },
     construct = function(id) return { id = id } end,
@@ -275,7 +275,7 @@ end
 
 do
   local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   local delivered = {}
   reg:register({
     declaration = { name = "entry", params = {}, inputs = { input = "seed.In" }, outputs = {} },
@@ -319,67 +319,33 @@ do
 end
 
 -- ==================================================================
--- 5. preview telemetry is schema-checked at the kernel emitter boundary
+-- 5. generic interface data is owned and checked as serializable plain data
 -- ==================================================================
 
 do
-  local preview = require("preview")
-  local events, warnings = {}, {}
-  local inv = inventory.new({ log = silent_log() })
-  local reg = Registry.new()
-  local declaration = {
-    name = "observed", params = {}, inputs = { named = "stub.In" }, outputs = { "stub.Out" },
-    preview = preview.column { children = {
-      preview.value { value = preview.state("status", "string") },
-      preview.stream { source = preview.stream_ref("items", { kind = "record", fields = { text = "string" } }),
-        item = preview.value { value = preview.item("text") } },
-      preview.stream { source = preview.stream_ref("data_items", { kind = "record", fields = { value = "data" } }),
-        item = preview.value { value = preview.item("value") } },
-      preview.stream { source = preview.stream_ref("list_items", { kind = "record", fields = { value = "data" } }),
-        item = preview.value { value = preview.item("value") } },
-    } },
-  }
-  local _, err = reg:register({ declaration = declaration, construct = function(id) return { id = id } end })
-  assert_eq(err, nil, "observed factory registers")
-  local router = routing.new({
-    inventory = inv, registry = reg, events = function(e) events[#events + 1] = e end,
-    log = { info = noop, error = noop, warn = function(message) warnings[#warnings + 1] = message end },
-  })
-  inv.apply({ actors = { actor_spec("O", "observed", {}, {}) } })
-  local observe = router:preview_emitter("O")
-  assert_true(observe("set", "status", "working"), "valid state set accepted")
-  assert_true(observe("append", "items", { text = "complete" }), "valid stream append accepted")
-  assert_true(observe("append", "data_items", { value = nefor.json.decode("null") }),
-    "JSON null sentinel is accepted as serializable data")
-  assert_true(observe("append", "list_items", { value = nefor.json.decode("[]") }),
-    "host-decoded JSON arrays retain serializable array identity")
-  assert_true(not observe("append", "items", { text = 7 }), "invalid stream item rejected")
-  assert_true(not observe("append", "items", { text = function() end }),
-    "non-serializable stream item rejected")
-  assert_true(not observe("set", "items", {}), "wrong operation rejected")
-  assert_true(not observe("update", "status", {}), "update rejected for non-record state")
-  assert_eq(#events, 4, "only valid observations reached the event sink")
-  assert_eq(#warnings, 4, "every malformed observation was isolated and logged")
+  local plain_data = require("plain-data")
+  local source = { text = "complete", null = nefor.json.decode("null"),
+    list = nefor.json.decode("[]") }
+  local owned, err = plain_data.owned(source, "fact")
+  assert_eq(err, nil, "serializable generic data is accepted")
+  assert_true(owned ~= source and owned.text == source.text, "interface data is copied on ownership")
+  local invalid, invalid_error = plain_data.owned({ callback = function() end }, "fact")
+  assert_eq(invalid, nil, "non-serializable generic data is rejected")
+  assert_true(invalid_error:find("function values", 1, true) ~= nil,
+    "serialization rejection identifies the invalid value")
 end
 
 -- ==================================================================
--- 6. kernel observes every assembled activation and declared output, preserving
--- named endpoint identity plus the generic `last` binding in wire order
+-- 6. kernel publishes each arrival once and firings reference arrival ids;
+-- presentation aliases are deliberately absent from the shared interface
 -- ==================================================================
 
 do
-  local preview = require("preview")
   local events = {}
   local inv = inventory.new({ log = silent_log() })
   local reg = Registry.new()
   local declaration = {
     name = "endpoint-observed", params = {}, inputs = { named = "stub.In" }, outputs = { "stub.Out" },
-    preview = preview.column { children = {
-      preview.value { value = preview.input("named") },
-      preview.value { value = preview.input("last") },
-      preview.value { value = preview.output("stub.Out") },
-      preview.value { value = preview.output("last") },
-    } },
   }
   reg:register({ declaration = declaration, construct = function(id, _, emit)
     local instance = { id = id }
@@ -390,26 +356,42 @@ do
     emit({ kind = "mag.ready", from = id })
     return instance
   end })
+  reg:register({
+    declaration = { name = "observed-sink", params = {},
+      inputs = { input = "stub.Out" }, outputs = {} },
+    construct = function(id, _, emit)
+      emit({ kind = "mag.ready", from = id })
+      return { id = id, deliver = function(_) return "ok" end }
+    end,
+  })
   local router = routing.new({ inventory = inv, registry = reg, events = function(e) events[#events + 1] = e end })
   router:set_construct(function(record)
-    return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {
-      preview = router:preview_emitter(record.id),
-    })
+    return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
   end)
-  inv.apply({ actors = { actor_spec("E", "endpoint-observed", {}, {}) } })
+  inv.apply({ actors = {
+    actor_spec("E", "endpoint-observed", {}, { ["stub.Out"] = {
+      { actor = "D1", wire = "stub.Out" }, { actor = "D2", wire = "stub.Out" },
+    } }),
+    actor_spec("D1", "observed-sink", {}, {}),
+    actor_spec("D2", "observed-sink", {}, {}),
+  } })
   router:deliver("E", "source", "stub.In", { kind = "stub.In", value = "full-value" })
-  local observed = {}
+  local arrivals, firings = {}, {}
   for _, event in ipairs(events) do
-    if event.kind == "mag.node_preview" then observed[#observed + 1] = event end
+    if event.kind == "mag.arrival" then arrivals[#arrivals + 1] = event end
+    if event.kind == "mag.firing" then firings[#firings + 1] = event end
   end
-  assert_eq(#observed, 4, "named and last input/output observations emitted")
-  assert_eq(observed[1].binding_kind, "input", "input is observed before delivery")
-  assert_eq(observed[1].binding, "named", "named input port retained")
-  assert_eq(observed[2].binding, "last", "generic last input follows named input")
-  assert_eq(observed[3].binding_kind, "output", "declared output observed on emit")
-  assert_eq(observed[3].binding, "stub.Out", "named output wire retained")
-  assert_eq(observed[4].binding, "last", "generic last output follows named output")
-  assert_eq(observed[4].value.value, "full-value", "output observation is complete, not clipped")
+  assert_eq(#arrivals, 2, "input and output payloads are each published once")
+  assert_eq(#firings, 3, "source activation and both consumers each publish one firing")
+  assert_eq(firings[1].arrivals[1].arrival_id, arrivals[1].arrival_id,
+    "firing references the canonical input arrival")
+  assert_eq(arrivals[2].wire, "stub.Out", "declared output wire is retained")
+  assert_eq(arrivals[2].value.value, "full-value", "output fact is complete, not clipped")
+  assert_eq(firings[2].arrivals[1].arrival_id, arrivals[2].arrival_id,
+    "first fan-out consumer references the one output arrival")
+  assert_eq(firings[3].arrivals[1].arrival_id, arrivals[2].arrival_id,
+    "second fan-out consumer references the same output arrival")
+  assert_true(arrivals[2].binding == nil, "shared facts contain no consumer alias")
 end
 
 print("mag-kernel observability_test: all cases passed")

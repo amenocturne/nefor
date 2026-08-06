@@ -83,7 +83,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   local decl, err = reg:register({ declaration = llm.declaration, construct = llm.construct })
   assert_true(decl ~= nil and err == nil, "llm factory registers cleanly")
   assert_eq(reg:declared_input("llm", "provider_input"), "generic-provider.ProviderOut",
@@ -700,7 +700,7 @@ do
 
   -- Registry construction propagates the same nil + error (init.lua's
   -- set_construct then logs it and never binds, so the actor never readies).
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({ declaration = llm.declaration, construct = llm.construct })
   local rinst, rerr = reg:construct("llm", "r.llm", {}, emit, {})
   assert_true(rinst == nil and type(rerr) == "string" and rerr:find("provider", 1, true) ~= nil,

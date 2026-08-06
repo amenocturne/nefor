@@ -56,7 +56,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   local decl, err = reg:register({ declaration = adapter.declaration, construct = adapter.construct })
   assert_true(decl ~= nil and err == nil, "adapter factory registers cleanly: " .. tostring(err))
 

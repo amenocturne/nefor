@@ -28,7 +28,7 @@
 local shape = require("shape")
 local kinds = require("kinds")
 local type_node = require("type-node")
-local preview = require("preview")
+local plain_data = require("plain-data")
 
 local registry = {}
 registry.__index = registry
@@ -85,7 +85,7 @@ local RESERVED_ROUTE_KEYS = {
 --   inputs  { <name> = <shape> }    named input ports, each a shape.* value
 --   outputs { <tag>, ... }          fully-qualified output tags produced
 --   signals { <signal>, ... }       signals the factory handles (declared only)
-local function validate_declaration(decl, require_preview)
+local function validate_declaration(decl)
   if type(decl) ~= "table" then
     return nil, "declaration must be a table"
   end
@@ -203,28 +203,16 @@ local function validate_declaration(decl, require_preview)
     end
   end
 
-  if require_preview and decl.preview == nil then
-    return nil, "declaration.preview is required"
-  end
-  if decl.preview ~= nil then
-    local validated_preview, preview_error = preview.validate(decl.preview, decl)
-    if not validated_preview then return nil, preview_error end
-    decl.preview = validated_preview.description
-    decl.preview_bindings = preview.binding_contract(validated_preview)
-  end
-
-  local owned, ownership_error = preview.owned(decl, "declaration")
+  local owned, ownership_error = plain_data.owned(decl, "declaration")
   if not owned then return nil, ownership_error end
   return owned
 end
 
 -- ---- construction -----------------------------------------------------------
 
-function registry.new(opts)
-  opts = opts or {}
+function registry.new()
   return setmetatable({
     factories = {}, identities = {},
-    require_preview = opts.require_preview ~= false,
   }, registry)
 end
 
@@ -234,7 +222,7 @@ function registry:register(entry)
   if type(entry) ~= "table" then
     return nil, "register expects { declaration = {...}, construct = fn }"
   end
-  local decl, err = validate_declaration(entry.declaration, self.require_preview)
+  local decl, err = validate_declaration(entry.declaration)
   if not decl then
     return nil, err
   end
@@ -265,7 +253,7 @@ end
 function registry:lookup(name)
   local found = resident_factory(self, name)
   if not found then return nil end
-  return { declaration = preview.deep_copy(found.declaration), construct = found.construct }
+  return { declaration = plain_data.copy(found.declaration), construct = found.construct }
 end
 
 -- The registered factory names, sorted for a stable surface. This is the
@@ -282,7 +270,7 @@ end
 
 registry.declaration = function(self, name)
   local f = resident_factory(self, name)
-  return f and preview.deep_copy(f.declaration) or nil
+  return f and plain_data.copy(f.declaration) or nil
 end
 
 -- Serializable immutable input for MAG libraries and their generic checker.
@@ -323,8 +311,6 @@ function registry:contracts(array_mt)
         semantic = decl.semantic,
       },
       signals = array_copy(decl.signals),
-      preview = preview.deep_copy(decl.preview),
-      preview_bindings = preview.deep_copy(decl.preview_bindings),
     }
   end
   return out

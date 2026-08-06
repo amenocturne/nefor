@@ -265,12 +265,11 @@ local function initial_state()
     sidebar_cursor   = 1,
     runs             = fixture_runs,
     sidebar_folds    = {},
-    -- Generic current-session node previews: advertised declarations plus
-    -- materialized lifecycle/binding state. Scope maps provider chat ids back
-    -- to their owning run for full LLM observation traffic.
+    -- TUI-local projection of canonical MAG/capability facts.
     scope_to_run     = {},
-    preview_registry = {},
     node_previews    = {},
+    mag_arrivals     = {},
+    capability_owners = {},
     popup            = nil,
     stats            = {},
     current_context_tokens = nil,

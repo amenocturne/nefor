@@ -27,10 +27,8 @@
 local kinds = require("kinds")
 
 local M = {}
-local preview_components = require("preview-components")
 
 M.declaration = {
-  preview = preview_components.sink(),
   name = "sink",
   type_variables = { "T" },
   semantic = {

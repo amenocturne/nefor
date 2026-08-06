@@ -60,7 +60,6 @@
 local kinds = require("kinds")
 
 local M = {}
-local preview_components = require("preview-components")
 
 local FINAL_ANSWER = "generic-provider.FinalAnswer"
 local PROVIDER_INPUT = "generic-provider.ProviderOut"
@@ -68,7 +67,6 @@ local REJECTED = "human.Rejected"
 local AGENT_RESULT = "nefor.agent.Result"
 
 M.declaration = {
-  preview = preview_components.input_output(),
   name = "adapter",
   type_variables = { "T" },
   semantic = {

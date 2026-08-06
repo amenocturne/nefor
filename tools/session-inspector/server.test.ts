@@ -23,7 +23,7 @@ const fixture = async () => {
   const lines = [
     envelope({ kind: "chat.history.message", provider: "chatgpt", chat_id: "c1", message }),
     envelope({ kind: "chatgpt.chat.append", chat_id: "c1", message }),
-    envelope({ kind: "mag.node_preview", run_id: "r1", id: "lead", value: "preview" }),
+    envelope({ kind: "mag.arrival", run_id: "r1", arrival_id: "arrival:1", from: "lead", value: "canonical" }),
   ];
   await writeFile(join(sessionsDir, "session-one.jsonl"), `${lines.join("\n")}\n`);
   return { root, dataDir, sessionsDir, cacheDir };

@@ -159,6 +159,38 @@ The buffering lives in the kernel because it is the flip side of kill —
 spawn = register + buffer, kill = unroute + drop — and factory-side buffering
 would have every factory reimplement the same machinery.
 
+### Canonical observation interface
+
+MAG publishes execution facts, never consumer presentation. Every plugin still
+receives the shared bus; each consumer actor projects the facts it needs in its
+own Lua state.
+
+- `mag.actor_spawned { run_id, id, factory, spec }` owns the immutable actor
+  structure once: params, input/output endpoints, evidence, and routes.
+- `mag.arrival { run_id, arrival_id, from, edge_id, wire,
+  semantic_type_id, semantic_type, constructor_id, value }` owns one complete
+  payload. Fan-out reuses the same arrival; it does not copy the value per
+  destination.
+- `mag.firing { run_id, id, port, shape, arrivals }` records one activation by
+  referencing arrival ids. It carries no payload copy.
+- `mag.diagnostic { run_id, from, diagnostic }` carries serializable domain
+  diagnostics such as validation failures or process exit facts. Diagnostics
+  describe what happened; they do not prescribe a view.
+- Provider completion and tool events remain their canonical bus events. MAG
+  preserves invocation provenance on requests so a consumer can correlate the
+  subsequent request-id stream locally; MAG does not wrap or replay those
+  events as actor display data.
+
+`mag.modification_applied` is a structural summary (`spawned`, `killed`) rather
+than a second copy of the modification. Spawn specs and arrival facts already
+own the data. Rejected modifications may retain the attempted modification as
+diagnostic evidence because no accepted fact owns it.
+
+Aliases, chronological activity lists, hidden/expanded formatting, and
+factory-specific affordances belong to the consumer. For example, the TUI may
+derive a local `last` input/output alias, but `last` is not part of MAG's
+interface and is never persisted as another payload.
+
 ### Activity (control-plane events)
 
 Construction is signaled once, by `mag.actor_ready`. Everything after is a

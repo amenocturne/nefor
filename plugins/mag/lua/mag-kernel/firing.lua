@@ -87,15 +87,20 @@ end
 -- yields one activation per complete set now assembleable (usually zero or
 -- one, but a backlog can release several).
 function M:offer(from, tag, message)
-  if self.semantic and typed_value.is_trusted(message) then
-    return self:offer_typed(message)
+  local arrival = nil
+  if typed_value.is_trusted(message) then
+    arrival = message
+    if self.semantic then return self:offer_typed(arrival) end
+    from, tag, message = arrival.from, arrival.protocol_wire, arrival.payload
   end
   if not self.tags[tag] then
     return {}
   end
 
   if self.kind ~= "product" then
-    return { { shape = self.kind, messages = { { from = from, tag = tag, message = message } } } }
+    return { { shape = self.kind, messages = {
+      { from = from, tag = tag, message = message, arrival = arrival },
+    } } }
   end
 
   -- product: file into the sender-bound slot's FIFO, then drain every
@@ -106,7 +111,7 @@ function M:offer(from, tag, message)
   if not q then
     return {}
   end
-  q[#q + 1] = { from = from, tag = tag, message = message }
+  q[#q + 1] = { from = from, tag = tag, message = message, arrival = arrival }
 
   local activations = {}
   while self:_complete() do

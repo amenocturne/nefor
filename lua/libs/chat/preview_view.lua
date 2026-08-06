@@ -1,19 +1,10 @@
--- Generic interpreter for serialized factory preview descriptions.
--- Concrete factory names never participate in rendering.
+-- TUI-owned rendering of the TUI's local projection of generic MAG facts.
+-- No factory or producer supplies presentation instructions.
 local common = require("libs.chat.common")
 local preview_state = require("libs.chat.preview_state")
 local STYLE = common.STYLE
-local MARKDOWN_THEME = common.MARKDOWN_THEME
 
 local M = {}
-
-local STYLE_NAMES = {
-  section = STYLE.popup_user, status = STYLE.status, dim = STYLE.status_dim,
-  reasoning = STYLE.reasoning, assistant = STYLE.status,
-  command = STYLE.popup_user, stdin = STYLE.system, stdout = STYLE.status,
-  stderr = STYLE.tool_error, tool_call = STYLE.system,
-  tool_result = STYLE.status_ok, error = STYLE.tool_error,
-}
 
 local function encode(value, depth, seen)
   if type(value) == "string" then return value end
@@ -112,106 +103,46 @@ local function reasoning_value(value, ctx)
     .. text:gsub("\n", "\n  ")
 end
 
-local function format_value(value, format, ctx)
-  if format == "reasoning" then return reasoning_value(value, ctx) end
-  if format == "tool_call" then return tool_value(value, false, ctx) end
-  if format == "tool_result" then return tool_value(value, true, ctx) end
-  if format == "validation" and type(value) == "table" then
-    if ctx.state.expanded_details ~= true then
-      return "validation attempt " .. tostring(value.attempt or "?") .. " · details hidden"
-    end
-    return "validation attempt " .. tostring(value.attempt or "?")
-      .. "\nviolations:\n" .. encode(value.violations)
-  end
-  return encode(value)
-end
 M.format_value = encode
 
-local function resolve(ref, ctx)
-  if type(ref) ~= "table" or not ref.binding then return ref end
-  if ref.binding == "param" then return (ctx.node.params or {})[ref.name] end
-  if ref.binding == "input" then return (ctx.node.inputs or {})[ref.name] end
-  if ref.binding == "output" then return (ctx.node.outputs or {})[ref.name] end
-  if ref.binding == "state" then return (ctx.node.states or {})[ref.name] end
-  if ref.binding == "stream" then return (ctx.node.streams or {})[ref.name] or {} end
-  if ref.binding == "item" then return type(ctx.item) == "table" and ctx.item[ref.name] or nil end
-  if ref.binding == "lifecycle" then
-    if ref.name == "run_id" then return ctx.run_id end
-    if ref.name == "run_name" then return ctx.run and ctx.run.run_name end
-    if ref.name == "actor_id" then return ctx.actor_id end
-    if ref.name == "factory" then return ctx.node.factory end
-    return ctx.node[ref.name]
+local function section(title, values)
+  local keys = {}
+  for key in pairs(values or {}) do
+    if key ~= "last" then keys[#keys + 1] = key end
   end
-end
-
-local render
-
-local function render_collection(desc, ctx)
-  local values = resolve(desc.source, ctx) or {}
-  local children = {}
-  for index, wrapped in ipairs(values) do
-    local item = wrapped.value ~= nil and wrapped.value or wrapped
-    local template = desc.item
-    if template and template.kind == "cases" then
-      template = template.values and template.values[type(item) == "table" and item.kind or nil]
-    end
-    if template then children[#children + 1] = render(template, {
-      state = ctx.state, node = ctx.node, run = ctx.run, run_id = ctx.run_id,
-      actor_id = ctx.actor_id, item = item, is_last = index == #values,
-    }) end
+  if #keys == 0 and values and values.last ~= nil then keys[1] = "last" end
+  table.sort(keys)
+  if #keys == 0 then return nil end
+  local children = { tui.text { content = title, style = STYLE.popup_user, wrap = "none" } }
+  for _, key in ipairs(keys) do
+    children[#children + 1] = tui.text {
+      content = tostring(key) .. "\n" .. encode(values[key]), style = STYLE.status, wrap = "word",
+    }
   end
-  if #children == 0 and desc.empty then children[1] = render(desc.empty, ctx) end
-  return tui.column { gap = desc.gap or 0, key = desc.key, children = children }
-end
-
-render = function(desc, ctx)
-  if type(desc) ~= "table" then
-    return tui.text { content = "preview error: malformed description", style = STYLE.tool_error, wrap = "word" }
-  end
-  local kind = desc.kind
-  if kind == "column" or kind == "row" then
-    local children = {}
-    for _, child in ipairs(desc.children or {}) do children[#children + 1] = render(child, ctx) end
-    return tui[kind] { gap = desc.gap or 0, key = desc.key, children = children }
-  elseif kind == "padding" then
-    return tui.padding { value = desc.value or { top = desc.top or 0, right = desc.right or 0,
-      bottom = desc.bottom or 0, left = desc.left or 0 }, key = desc.key, child = render(desc.child, ctx) }
-  elseif kind == "block" then
-    return common.bordered_box(render(desc.child, ctx), STYLE_NAMES[desc.style] or STYLE.footer, desc.key)
-  elseif kind == "spacer" then
-    return tui.spacer { flex = desc.flex, key = desc.key }
-  elseif kind == "text" then
-    return tui.text { content = tostring(resolve(desc.value, ctx) or ""),
-      style = STYLE_NAMES[desc.style], wrap = desc.wrap or "word", key = desc.key }
-  elseif kind == "spans" then
-    local value = resolve(desc.value, ctx)
-    local spans = {}
-    for _, span in ipairs(type(value) == "table" and value or {}) do
-      spans[#spans + 1] = type(span) == "table" and span or { text = tostring(span) }
-    end
-    return tui.spans { spans = spans, wrap = desc.wrap or "word", key = desc.key }
-  elseif kind == "markdown" then
-    return tui.markdown { source = tostring(resolve(desc.value, ctx) or ""),
-      theme = MARKDOWN_THEME, wrap = desc.wrap or "word", key = desc.key }
-  elseif kind == "value" then
-    return tui.text { content = format_value(resolve(desc.value, ctx), desc.format, ctx),
-      style = STYLE_NAMES[desc.style], wrap = desc.wrap or "word", key = desc.key }
-  elseif kind == "stream" or kind == "list" then
-    return render_collection(desc, ctx)
-  end
-  return tui.text { content = "preview error: unsupported primitive " .. tostring(kind),
-    style = STYLE.tool_error, wrap = "word" }
+  return tui.column { gap = 1, children = children }
 end
 
 function M.node(state, run_id, actor_id)
   local node = preview_state.node(state, run_id, actor_id)
-  local contract = preview_state.contract(state, node)
   if not node then return tui.text { content = "Node is no longer available.", style = STYLE.status_dim } end
-  if not contract or not contract.preview then
-    return tui.text { content = "Preview declaration is unavailable.", style = STYLE.tool_error }
+  local children = {
+    tui.text { content = tostring(node.factory or "actor") .. " · " .. tostring(node.status or "pending"),
+      style = STYLE.status, wrap = "word" },
+  }
+  local sections = { section("Params", node.params), section("Input", node.inputs),
+    section("Output", node.outputs) }
+  for index = 1, 3 do
+    local candidate = sections[index]
+    if candidate then children[#children + 1] = candidate end
   end
-  return render(contract.preview, { state = state, node = node,
-    run = (state.runs or {})[run_id], run_id = run_id, actor_id = actor_id })
+  local items = preview_state.merged(state, run_id, function(id) return id == actor_id end)
+  if #items > 0 then
+    children[#children + 1] = tui.text { content = "Activity", style = STYLE.popup_user, wrap = "none" }
+    for index, item in ipairs(items) do
+      children[#children + 1] = M.activity(item, state, node, index == #items)
+    end
+  end
+  return tui.column { gap = 1, children = children }
 end
 
 function M.activity(item, state, node, is_last)
@@ -228,6 +159,18 @@ function M.activity(item, state, node, is_last)
       state = state, node = node or {},
     }), style = result and (kind == "error" and STYLE.tool_error or STYLE.status_ok)
       or STYLE.system, wrap = "word" }
+  elseif kind == "diagnostic" and type(value.value) == "table" then
+    local diagnostic = value.value
+    if diagnostic.kind == "validation" then
+      local content = "validation attempt " .. tostring(diagnostic.attempt or "?")
+      if state.expanded_details == true then
+        content = content .. "\nviolations:\n" .. encode(diagnostic.violations)
+      else
+        content = content .. " · details hidden"
+      end
+      return tui.text { content = content, style = STYLE.tool_error, wrap = "word" }
+    end
+    return tui.text { content = encode(diagnostic), style = STYLE.status_dim, wrap = "word" }
   end
   local label = kind or item.binding
   local content

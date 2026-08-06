@@ -22,6 +22,7 @@ local Registry = require("registry")
 local routing = require("routing")
 local modlog = require("modlog")
 local observer = require("observer")
+local plain_data = require("plain-data")
 local stub = require("factories.stub")
 local sink = require("factories.sink")
 local source = require("factories.source")
@@ -69,7 +70,7 @@ end
 -- Build the registry and seed the factories shipped with the kernel. The
 -- registry is read-only after seeding and shared by every run context.
 local function build_registry()
-  local reg = Registry.new({ require_preview = true })
+  local reg = Registry.new()
   local function seed(mod)
     local _, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     if err then
@@ -377,7 +378,6 @@ local function new_run_context(meta)
       writer = function(output)
         return persist_output(record.id, output)
       end,
-      preview = router:preview_emitter(record.id),
       conversation = {
         id = actor_conversation_id,
         root_id = ctx.conversation_id,
@@ -396,12 +396,17 @@ local function new_run_context(meta)
       },
       diagnostic = function(diagnostic)
         diagnostic = diagnostic or {}
+        local owned, diagnostic_error = plain_data.owned(diagnostic, "diagnostic")
+        if not owned then
+          log.warn("diagnostic dropped: " .. tostring(diagnostic_error))
+          return false
+        end
         emit_event({
           kind = "mag.diagnostic",
-          code = diagnostic.kind,
           from = record.id,
-          gate = diagnostic.gate,
+          diagnostic = owned,
         })
+        return true
       end,
     }
     return registry:construct(record.factory, record.id, record.params, emit, deps)

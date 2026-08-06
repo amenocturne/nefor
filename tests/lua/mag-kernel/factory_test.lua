@@ -62,7 +62,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   local decl, err = reg:register({ declaration = stub.declaration, construct = stub.construct })
   assert_true(decl ~= nil and err == nil, "stub factory registers cleanly")
   assert_true(reg:lookup("stub") ~= nil, "registered stub is looked up by name")
@@ -100,7 +100,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   local ok, err = reg:register({ declaration = { name = "", inputs = {}, outputs = {} }, construct = function() end })
   assert_true(ok == nil and type(err) == "string", "empty factory name rejected")
 
@@ -115,7 +115,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({ declaration = stub.declaration, construct = stub.construct })
 
   -- construct-side rejection
@@ -139,7 +139,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
   reg:register({ declaration = stub.declaration, construct = stub.construct })
 
   local bad = reg:validate_modification({
@@ -195,7 +195,7 @@ end
 -- ==================================================================
 
 do
-  local reg = Registry.new({ require_preview = false })
+  local reg = Registry.new()
 
   -- A producer whose single output feeds three differently-shaped consumers.
   reg:register({

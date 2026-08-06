@@ -78,7 +78,6 @@ function M.construct(id, params, emit, options)
 
   local instance = { id = id }
   local state = {}
-  local observe = type(options.preview) == "function" and options.preview or function() return false end
   local seq = 0
   local pending = nil
   local draining = false
@@ -152,14 +151,8 @@ function M.construct(id, params, emit, options)
     else
       facts:message(message, completion)
     end
-    if type(message.tool_calls) == "table" then
-      for _, call in ipairs(message.tool_calls) do
-        observe("append", "transcript", { kind = "tool_call", value = call })
-      end
-    end
   end
   function state:emit(message) emit(sign(message)) end
-  function state:observe(operation, binding, value) return observe(operation, binding, value) end
   function state:is_draining() return draining end
   function state:finish(message, terminal_detail)
     self:emit(message)

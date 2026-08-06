@@ -520,7 +520,7 @@ function M.node_inspector(state)
       children[#children + 1] = preview_view.node(state, p.run_id, actor_id)
     end
     if #children == 0 then children[1] = tui.text {
-      content = "No node previews were captured.", style = STYLE.status_dim } end
+      content = "No node details were captured.", style = STYLE.status_dim } end
     local run = (state.runs or {})[p.run_id]
     local header = tui.column { gap = 0, children = {
       tui.text { content = "run " .. run_ident_of(run, p.run_id)

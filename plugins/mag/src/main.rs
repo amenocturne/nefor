@@ -2127,31 +2127,16 @@ mod tests {
         }
         drop(out_tx);
 
-        let mut transcript_appends = Vec::new();
         let mut terminal_result = None;
         while let Some(outgoing) = out_rx.recv().await {
             let Body::Event(body) = outgoing.body else {
                 continue;
             };
-            if body.get("kind").and_then(Value::as_str) == Some("mag.node_preview")
-                && body.get("binding").and_then(Value::as_str) == Some("transcript")
-                && body.get("operation").and_then(Value::as_str) == Some("append")
-            {
-                transcript_appends.push(body["value"].clone());
-            }
             if body.get("kind").and_then(Value::as_str) == Some(RUN_RESULT_KIND) {
                 terminal_result = body.get("result").cloned();
             }
         }
 
-        assert_eq!(
-            transcript_appends,
-            vec![
-                serde_json::json!({"kind":"assistant","text":"visible"}),
-                serde_json::json!({"kind":"reasoning","text":"thinking"}),
-            ],
-            "only provider deltas append preview transcript content, in wire order"
-        );
         let result = terminal_result.expect("durable terminal result");
         assert_eq!(result["value"]["content"], "semantic-only");
         assert_eq!(result["final_answer"], "semantic-only");

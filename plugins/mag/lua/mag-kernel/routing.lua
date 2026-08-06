@@ -67,7 +67,7 @@ local firing = require("firing")
 local correlation = require("correlation")
 local kinds = require("kinds")
 local typed_value = require("typed-value")
-local preview = require("preview")
+local plain_data = require("plain-data")
 
 local M = {}
 M.__index = M
@@ -115,7 +115,8 @@ local EVT_RUN_FAILED = kinds.run_failed
 -- ticking needs exactly these transitions.
 local EVT_ACTOR_BUSY = "mag.actor_busy"
 local EVT_ACTOR_IDLE = "mag.actor_idle"
-local EVT_NODE_PREVIEW = "mag.node_preview"
+local EVT_ARRIVAL = "mag.arrival"
+local EVT_FIRING = "mag.firing"
 local EVT_EMISSION_IGNORED = "mag.emission_ignored"
 -- The approval boundary's control-plane events (kinds.lua): the intercepted
 -- ApprovalRequest / ApprovalCancel emits surface under these kinds, run_id-
@@ -177,6 +178,7 @@ function M.new(opts)
     busy = {}, -- id -> busy-since stamp while an activation window is open
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
     generations = {}, -- id -> emitter generation currently authorized to speak
+    published_arrivals = {}, -- arrival id -> true once its payload became a bus fact
     result_boundary = nil, -- compiled StoredPort; structural, never a factory
     arrival_seq = 0,
   }, M)
@@ -210,43 +212,41 @@ function M:emitter(id)
   end
 end
 
-function M:preview_emitter(id)
-  return function(operation, binding, value)
-    local actor = self.inventory.get(id)
-    local declaration = actor and self.registry:declaration(actor.factory)
-    local validated = declaration and { bindings = declaration.preview_bindings }
-    local ok, err = preview.validate_update(validated, operation, binding, value)
-    if not ok then
-      self.log.warn(string.format(
-        "actor '%s' preview update rejected for binding '%s': %s",
-        tostring(id), tostring(binding), tostring(err)))
-      return false
-    end
-    self.events({ kind = EVT_NODE_PREVIEW, id = id, operation = operation,
-      binding = binding, value = preview.deep_copy(value) })
-    return true
-  end
+function M:publish_arrival(arrival)
+  if self.published_arrivals[arrival.arrival_id] then return end
+  self.published_arrivals[arrival.arrival_id] = true
+  self.events({
+    kind = EVT_ARRIVAL,
+    arrival_id = arrival.arrival_id,
+    from = arrival.from,
+    edge_id = arrival.edge_id,
+    wire = arrival.protocol_wire,
+    semantic_type_id = arrival.type_id,
+    semantic_type = plain_data.copy(arrival.type),
+    constructor_id = arrival.constructor_id,
+    value = plain_data.copy(arrival.payload),
+  })
 end
 
-function M:observe_endpoint(id, endpoint, binding, value)
-  self.events({
-    kind = EVT_NODE_PREVIEW,
-    id = id,
-    operation = "set",
-    binding_kind = endpoint,
-    binding = binding,
-    value = preview.deep_copy(value),
-  })
-  if binding ~= "last" then
-    self.events({
-      kind = EVT_NODE_PREVIEW,
-      id = id,
-      operation = "set",
-      binding_kind = endpoint,
-      binding = "last",
-      value = preview.deep_copy(value),
-    })
+function M:publish_firing(id, activation)
+  local arrivals = {}
+  for index, message in ipairs(activation.messages or {}) do
+    local arrival = message.arrival
+    if arrival then
+      arrivals[index] = {
+        arrival_id = arrival.arrival_id,
+        edge_id = arrival.edge_id,
+        wire = arrival.protocol_wire,
+      }
+    end
   end
+  self.events({
+    kind = EVT_FIRING,
+    id = id,
+    port = activation.observed_port,
+    shape = activation.shape,
+    arrivals = arrivals,
+  })
 end
 
 -- Dispatch one emitted, id-signed message. Reserved kinds are intercepted;
@@ -353,7 +353,7 @@ function M:on_emit(id, message, generation)
     else
       self.persist_output(id, observed)
     end
-    self:observe_endpoint(id, "output", kind, observed)
+    self:publish_arrival(arrival)
     if self.observe_output(id, kind, observed) == false then return false end
     self:route_output(id, kind, observed, arrival)
   end
@@ -487,32 +487,35 @@ function M:route_output(sender_id, tag, message, source_arrival)
   if not dests then
     return
   end
-  for _, destination in ipairs(dests) do
-    local source = source_arrival
-    if not source then
-      local source_type_id = destination.source_type_id or tostring(tag)
-      local source_type
-      if destination.source_type_id then
-        source_type = self:descriptor_for_id(sender_id, source_type_id)
-      else
-        source_type = {
-          kind = "named",
-          name = "legacy." .. tostring(tag),
-          arguments = {},
-        }
-      end
-      source = typed_value.factory({
-        arrival_id = self:next_arrival_id(),
-        from = sender_id,
-        edge_id = "kernel:" .. tostring(sender_id) .. ":" .. tostring(tag),
-        type_id = source_type_id,
-        type = source_type,
-        constructor_id = source_type_id,
-        protocol_wire = tag,
-        product_position = -1,
-        payload = message,
-      })
+  local source = source_arrival
+  if not source then
+    local first_destination = dests[1]
+    if not first_destination then return end
+    local source_type_id = first_destination.source_type_id or tostring(tag)
+    local source_type
+    if first_destination.source_type_id then
+      source_type = self:descriptor_for_id(sender_id, source_type_id)
+    else
+      source_type = {
+        kind = "named",
+        name = "legacy." .. tostring(tag),
+        arguments = {},
+      }
     end
+    source = typed_value.factory({
+      arrival_id = self:next_arrival_id(),
+      from = sender_id,
+      edge_id = "kernel:" .. tostring(sender_id) .. ":" .. tostring(tag),
+      type_id = source_type_id,
+      type = source_type,
+      constructor_id = source_type_id,
+      protocol_wire = tag,
+      product_position = -1,
+      payload = message,
+    })
+  end
+  self:publish_arrival(source)
+  for _, destination in ipairs(dests) do
     local dest = self.inventory.get(destination.actor)
     local input = dest and dest.input
     local accepts = true
@@ -566,6 +569,7 @@ function M:deliver(dest_id, arrival, legacy_tag, legacy_message)
     self.log.info(string.format("send dropped: target '%s' is dead", tostring(dest_id)))
     return
   end
+  self:publish_arrival(arrival)
   self:fire(dest_id, arrival)
 end
 
@@ -656,12 +660,12 @@ function M:fire(dest_id, arrival, legacy_tag, legacy_message)
       payload = legacy_message,
     })
   end
+  self:publish_arrival(arrival)
   local ports = self:machines_for(dest_id)
   for port, machine in pairs(ports) do
     if machine:accepts(arrival.protocol_wire) then
-      local offered = machine.semantic and arrival or arrival.payload
       for _, activation in ipairs(machine:offer(
-        arrival.from, arrival.protocol_wire, offered)) do
+        arrival.from, arrival.protocol_wire, arrival)) do
         local values = {}
         for index, message in ipairs(activation.messages or {}) do
           values[index] = message.message
@@ -815,10 +819,8 @@ function M:activate(id, activation)
     self.log.warn(string.format("actor '%s' has no deliver entry point", tostring(id)))
     return
   end
+  self:publish_firing(id, activation)
   self:mark_busy(id)
-  if activation.observed_port then
-    self:observe_endpoint(id, "input", activation.observed_port, activation.observed_value)
-  end
   local completion = instance.deliver(activation)
   self:apply_completion(id, completion)
 end
@@ -956,8 +958,6 @@ function M:bus_observation(response)
   response = response or {}
   local entry = self.correlation:peek(response.id)
   if not entry then return false end
-  local observe = self:preview_emitter(entry.requester)
-  observe(response.operation, response.binding, response.value)
   local instance = self.instances[entry.requester]
   if instance and type(instance.handle_observation) == "function" then
     instance.handle_observation(response)

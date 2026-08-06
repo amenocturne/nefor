@@ -3,11 +3,9 @@
 -- bounded correction policy.
 local boundary = require("factories.provider-boundary")
 local M = {}
-local preview_components = require("preview-components")
 local RESULT = "nefor.agent.Result"
 
 M.declaration = {
-  preview = preview_components.structured_output(),
   name = "structured-output",
   type_variables = { "T" },
   semantic = {
@@ -139,7 +137,6 @@ function M.construct(id, params, emit, deps)
   return boundary.construct(id, provider_params, emit, {
     conversation = deps.conversation,
     name = "structured-output",
-    preview = deps.preview,
     on_turn_start = function(_)
       corrections = 0
       last_output = nefor.json.decode("null")
@@ -176,9 +173,10 @@ function M.construct(id, params, emit, deps)
         return
       end
       local violations = output_violations(validation)
-      state:observe("append", "transcript", { kind = "validation", value = {
-        attempt = corrections + 1, violations = violations,
-      } })
+      if type(deps.diagnostic) == "function" then
+        deps.diagnostic({ kind = "validation", attempt = corrections + 1,
+          violations = violations })
+      end
       if corrections >= params.max_corrections then
         finish_error(state, params.validation_error_type, { violations=violations })
         return

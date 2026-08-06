@@ -64,10 +64,8 @@
 local kinds = require("kinds")
 
 local M = {}
-local preview_components = require("preview-components")
 
 M.declaration = {
-  preview = preview_components.tool_exchange(),
   name = "run-tool",
   semantic = {
     input={kind="named",name="nefor.contracts.ToolCalls",arguments={}},
@@ -98,7 +96,6 @@ M.declaration = {
 function M.construct(id, params, emit, deps)
   params = params or {}
   deps = deps or {}
-  local observe = type(deps.preview) == "function" and deps.preview or function() return false end
 
   -- Per-node gating, threaded to every tool invocation this instance makes.
   -- Read both the authored hyphen key (JSON-lowered `:da-policy`) and an
@@ -163,12 +160,6 @@ function M.construct(id, params, emit, deps)
       output = activation.result,
       error = activation.error,
     }
-    observe("append", "tool_events", {
-      kind = activation.error ~= nil and "error" or "result",
-      value = activation.error ~= nil
-        and { id = ref.call_id, name = ref.name, error = activation.error }
-        or { id = ref.call_id, name = ref.name, output = activation.result },
-    })
     if batch.received >= batch.expected then
       complete_batch(ref.batch, batch)
     end
@@ -198,10 +189,6 @@ function M.construct(id, params, emit, deps)
       -- no name/tool or args/arguments alias fallbacks.
       local call_name = call.name
       local call_args = call.args or {}
-      observe("append", "tool_events", {
-        kind = "call",
-        value = { id = call.id, name = call_name, arguments = call_args },
-      })
       emit(sign({
         kind = "capability.invoke",
         capability = call_name,

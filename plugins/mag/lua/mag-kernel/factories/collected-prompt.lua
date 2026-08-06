@@ -1,7 +1,6 @@
 local M = {}
-local preview_components = require("preview-components")
 M.declaration = {
-  preview = preview_components.input_output(), name="collected-prompt", type_variables={"T"},
+  name="collected-prompt", type_variables={"T"},
   semantic={input={kind="list",item={kind="variable",name="T"}},
     output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
     inputs={{wire="nefor.dynamic.Collected",type={kind="list",item={kind="variable",name="T"}}}},

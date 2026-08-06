@@ -42,6 +42,7 @@
 
 local kinds = require("kinds")
 
+local plain_data = require("plain-data")
 local M = {}
 M.__index = M
 
@@ -89,6 +90,7 @@ function M.new(opts)
       kind = EVENTS.actor_spawned,
       id = record.id,
       factory = record.factory,
+      spec = plain_data.copy(record.spec),
     })
   end)
   return self
@@ -214,7 +216,6 @@ function M:observe(modification, pre, result, opts)
   if #spawned > 0 or #killed > 0 or delivered then
     self.emit_event({
       kind = EVENTS.modification_applied,
-      modification = modification,
       spawned = spawned,
       killed = killed,
     })
@@ -222,7 +223,6 @@ function M:observe(modification, pre, result, opts)
   else
     self.emit_event({
       kind = EVENTS.modification_noop,
-      modification = modification,
       noops = noops,
     })
     self:record(modification, "noop", { noops = noops })

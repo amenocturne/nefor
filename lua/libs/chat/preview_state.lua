@@ -1,9 +1,20 @@
--- Current-session materialization of factory-declared node previews.
--- This module owns observation only: it never emits onto the bus.
+-- TUI-local projection of generic MAG and capability facts.
+-- MAG owns canonical actor/arrival/firing data; this consumer chooses aliases,
+-- transcript groupings, and display-oriented state without emitting anything.
 local common = require("libs.chat.common")
 local shallow_merge = common.shallow_merge
 
 local M = { STALE_MS = 30000 }
+
+local function is_json_null(value)
+  if type(value) ~= "userdata" then return false end
+  if type(nefor) ~= "table" or type(nefor.json) ~= "table"
+      or type(nefor.json.is_null) ~= "function" then return true end
+  local ok, result = pcall(nefor.json.is_null, value)
+  return ok and result == true
+end
+
+local function present(value) return value ~= nil and not is_json_null(value) end
 
 local function copy_map(values)
   local out = {}
@@ -25,6 +36,31 @@ local function put_node(state, run_id, actor_id, fn)
   return shallow_merge(state, { node_previews = all })
 end
 
+local function append_stream(state, run_id, actor_id, binding, value, now_ms)
+  local seq = (state.projection_seq or 0) + 1
+  local next_state = put_node(state, run_id, actor_id, function(prev)
+    local next = copy_map(prev)
+    next.last_activity_ms, next.last_activity_kind = now_ms, binding
+    next.streams = copy_map(prev.streams)
+    local values = copy_array(next.streams[binding])
+    local previous = values[#values]
+    local previous_value = previous and previous.value
+    if type(previous_value) == "table" and type(value) == "table"
+        and previous_value.kind == value.kind
+        and (value.kind == "reasoning" or value.kind == "assistant")
+        and type(previous_value.text) == "string" and type(value.text) == "string" then
+      local joined = copy_map(previous_value)
+      joined.text = previous_value.text .. value.text
+      values[#values] = { value = joined, seq = previous.seq, at_ms = now_ms }
+    else
+      values[#values + 1] = { value = value, seq = seq, at_ms = now_ms }
+    end
+    next.streams[binding] = values
+    return next
+  end)
+  return shallow_merge(next_state, { projection_seq = seq })
+end
+
 function M.set_scope(state, scope, run_id)
   if type(scope) ~= "string" or scope == "" or type(run_id) ~= "string" then return state end
   local scopes = copy_map(state.scope_to_run)
@@ -32,33 +68,24 @@ function M.set_scope(state, scope, run_id)
   return shallow_merge(state, { scope_to_run = scopes })
 end
 
-function M.advertise(state, contracts)
-  if type(contracts) ~= "table" then return state end
-  local registry = copy_map(state.preview_registry)
-  for _, contract in ipairs(contracts) do
-    if type(contract) == "table" and type(contract.preview) == "table" then
-      if type(contract.implementation) == "string" then registry[contract.implementation] = contract end
-      if type(contract.identity) == "string" then registry[contract.identity] = contract end
-    end
-  end
-  return shallow_merge(state, { preview_registry = registry })
-end
-
-function M.spawn(state, run_id, actor_id, factory, now_ms)
+function M.spawn(state, run_id, actor_id, factory, spec, now_ms)
   if type(run_id) ~= "string" or type(actor_id) ~= "string" then return state end
   return put_node(state, run_id, actor_id, function(prev)
     local next = copy_map(prev)
     next.factory, next.status = factory, "pending"
+    next.spec = type(spec) == "table" and spec or {}
+    next.params = next.spec.params or {}
     next.started_at_ms, next.last_activity_ms = now_ms, now_ms
     return next
   end)
 end
 
-function M.lifecycle(state, run_id, actor_id, status, now_ms)
+function M.lifecycle(state, run_id, actor_id, status, now_ms, detail)
   if not (((state.node_previews or {})[run_id] or {})[actor_id]) then return state end
   return put_node(state, run_id, actor_id, function(prev)
     local next = copy_map(prev)
     next.status, next.last_activity_ms = status, now_ms
+    if detail ~= nil then next.lifecycle_detail = detail end
     if status == "working" then next.activation_started_at_ms = now_ms end
     if status == "done" or status == "failed" or status == "killed" then next.finished_at_ms = now_ms end
     return next
@@ -80,102 +107,118 @@ function M.finish_run(state, run_id, status, now_ms)
   return shallow_merge(state, { node_previews = all })
 end
 
-local function binding_kind(state, node, name)
-  local contract = (state.preview_registry or {})[node.factory]
-  return contract and contract.preview_bindings and contract.preview_bindings[name]
-end
-
-local function binding_accepts(declared, kind)
-  return declared and (declared.kind == kind
-    or (type(declared.kinds) == "table" and declared.kinds[kind] == true))
-end
-
-function M.observe(state, msg, now_ms)
-  local run_id, actor_id = msg.run_id, msg.id
-  local node = (((state.node_previews or {})[run_id] or {})[actor_id])
-  if not node or type(msg.binding) ~= "string" then return state end
-  local declared = binding_kind(state, node, msg.binding)
-  if not declared then return state end
-  local op = msg.operation
-  local endpoint = msg.binding_kind
-  if endpoint ~= nil then
-    if op ~= "set" or (endpoint ~= "input" and endpoint ~= "output")
-        or not binding_accepts(declared, endpoint) then return state end
-  elseif (op == "append" and not binding_accepts(declared, "stream")) or
-      ((op == "set" or op == "update") and not binding_accepts(declared, "state")) then return state end
-  return put_node(state, run_id, actor_id, function(prev)
-    local next = copy_map(prev)
-    next.last_activity_ms, next.last_activity_kind = now_ms, "preview." .. tostring(op)
-    if endpoint ~= nil then
-      local values = endpoint == "input" and "inputs" or "outputs"
-      next[values] = copy_map(prev[values])
-      next[values][msg.binding] = msg.value
-    elseif op == "append" then
-      next.streams = copy_map(prev.streams)
-      local values = copy_array(next.streams[msg.binding])
-      local previous = values[#values]
-      local previous_value = previous and previous.value
-      if type(previous_value) == "table" and type(msg.value) == "table"
-          and previous_value.kind == msg.value.kind
-          and (msg.value.kind == "reasoning" or msg.value.kind == "assistant")
-          and type(previous_value.text) == "string" and type(msg.value.text) == "string" then
-        local joined = copy_map(previous_value)
-        joined.text = previous_value.text .. msg.value.text
-        values[#values] = { value = joined, seq = previous.seq,
-          at_ms = msg.at_ms or now_ms, last_seq = msg.observation_seq or previous.seq }
-      else
-        values[#values + 1] = { value = msg.value, seq = msg.observation_seq or math.huge, at_ms = msg.at_ms or now_ms }
-      end
-      next.streams[msg.binding] = values
-    else
-      next.states = copy_map(prev.states)
-      if op == "update" and type(next.states[msg.binding]) == "table" and type(msg.value) == "table" then
-        local merged = copy_map(next.states[msg.binding])
-        for k, v in pairs(msg.value) do merged[k] = v end
-        next.states[msg.binding] = merged
-      else
-        next.states[msg.binding] = msg.value
-      end
-    end
-    return next
+function M.arrival(state, msg, now_ms)
+  local run_id, arrival_id = msg.run_id, msg.arrival_id
+  if type(run_id) ~= "string" or type(arrival_id) ~= "string" then return state end
+  local all = copy_map(state.mag_arrivals)
+  local run = copy_map(all[run_id])
+  run[arrival_id] = msg
+  all[run_id] = run
+  local next = shallow_merge(state, { mag_arrivals = all })
+  local actor_id = msg.from
+  if not (((next.node_previews or {})[run_id] or {})[actor_id]) then return next end
+  return put_node(next, run_id, actor_id, function(prev)
+    local node = copy_map(prev)
+    node.outputs = copy_map(prev.outputs)
+    local binding = type(msg.wire) == "string" and msg.wire or msg.semantic_type_id or "output"
+    node.outputs[binding], node.outputs.last = msg.value, msg.value
+    node.last_activity_ms, node.last_activity_kind = now_ms, "output"
+    return node
   end)
 end
 
-function M.apply_modification(state, msg, now_ms)
-  local run_id = msg.run_id
-  local modification = msg.modification
-  if type(run_id) ~= "string" or type(modification) ~= "table" then return state end
-  local next = state
-  for _, actor in ipairs(modification.actors or {}) do
-    if type(actor) == "table" and type(actor.id) == "string" then
-      next = put_node(next, run_id, actor.id, function(prev)
-        local node = copy_map(prev)
-        node.params = actor.params or node.params or {}
-        node.last_activity_ms = now_ms
-        return node
-      end)
+function M.firing(state, msg, now_ms)
+  local run_id, actor_id = msg.run_id, msg.id
+  local arrivals = (state.mag_arrivals or {})[run_id] or {}
+  if type(run_id) ~= "string" or type(actor_id) ~= "string"
+      or not (((state.node_previews or {})[run_id] or {})[actor_id]) then return state end
+  return put_node(state, run_id, actor_id, function(prev)
+    local node, values = copy_map(prev), {}
+    node.inputs = copy_map(prev.inputs)
+    for _, ref in ipairs(msg.arrivals or {}) do
+      local arrival = arrivals[ref.arrival_id]
+      if arrival then
+        local binding = type(arrival.wire) == "string" and arrival.wire
+          or arrival.semantic_type_id or msg.port or "input"
+        node.inputs[binding] = arrival.value
+        values[#values + 1] = arrival.value
+      end
     end
-  end
-  for _, message in ipairs(modification.messages or {}) do
-    if type(message) == "table" and type(message.to) == "string" then
-      next = put_node(next, run_id, message.to, function(prev)
-        local node = copy_map(prev)
-        node.inputs = copy_map(prev.inputs)
-        node.inputs.last = message.message or message.content or message.value
-        node.last_activity_ms = now_ms
-        return node
-      end)
+    if #values == 1 then node.inputs.last = values[1]
+    elseif #values > 1 then node.inputs.last = values end
+    node.last_activity_ms, node.last_activity_kind = now_ms, "firing"
+    return node
+  end)
+end
+
+function M.diagnostic(state, msg, now_ms)
+  if type(msg.run_id) ~= "string" or type(msg.from) ~= "string"
+      or type(msg.diagnostic) ~= "table" then return state end
+  return append_stream(state, msg.run_id, msg.from, "diagnostic",
+    { kind = "diagnostic", value = msg.diagnostic }, now_ms)
+end
+
+local function owner_from_invocation(state, msg)
+  local invocation = msg.invocation
+  if type(invocation) ~= "table" or type(invocation.run_id) ~= "string"
+      or type(invocation.actor_id) ~= "string" then return nil end
+  if not (((state.node_previews or {})[invocation.run_id] or {})[invocation.actor_id]) then return nil end
+  return { run_id = invocation.run_id, actor_id = invocation.actor_id,
+    name = msg.name or msg.tool }
+end
+
+function M.observe_capability(state, msg, now_ms)
+  local kind = msg.kind or ""
+  local owners = state.capability_owners or {}
+  local owner = owners[msg.request_id or msg.id]
+
+  if kind:match("%.completion%.request$") or kind:match("%.tool%.invoke$")
+      or kind == "tool.invoke" then
+    owner = owner_from_invocation(state, msg)
+    local id = msg.request_id or msg.id
+    if owner and type(id) == "string" then
+      local next_owners = copy_map(owners)
+      next_owners[id] = owner
+      state = shallow_merge(state, { capability_owners = next_owners })
+      if kind:match("%.tool%.invoke$") or kind == "tool.invoke" then
+        state = append_stream(state, owner.run_id, owner.actor_id, "capability",
+          { kind = "tool_call", value = { id = id, name = msg.name or msg.tool,
+            arguments = msg.args or msg.arguments } }, now_ms)
+      end
     end
+    return state
   end
-  return next
+
+  if not owner then return state end
+  if kind:match("%.completion%.event$") then
+    local event = msg.event
+    if event == "text_delta" and type(msg.text) == "string" then
+      return append_stream(state, owner.run_id, owner.actor_id, "provider",
+        { kind = "assistant", text = msg.text }, now_ms)
+    elseif event == "reasoning_delta" and type(msg.text) == "string" then
+      return append_stream(state, owner.run_id, owner.actor_id, "provider",
+        { kind = "reasoning", text = msg.text }, now_ms)
+    elseif event == "tool_call" then
+      return append_stream(state, owner.run_id, owner.actor_id, "provider",
+        { kind = "tool_call", value = { id = msg.id, name = msg.name,
+          arguments = msg.arguments } }, now_ms)
+    end
+  elseif kind == "tool.stream" then
+    return append_stream(state, owner.run_id, owner.actor_id, "capability",
+      { kind = msg.stream or msg.channel or "stdout", text = msg.text or msg.delta or "" }, now_ms)
+  elseif kind == "tool.result" or kind:match("%.tool%.result$") then
+    local failed = present(msg.error)
+    local result = { id = msg.id, name = owner.name }
+    if failed then result.error = msg.error
+    else result.output = present(msg.result) and msg.result or msg.output end
+    return append_stream(state, owner.run_id, owner.actor_id, "capability",
+      { kind = failed and "error" or "tool_result", value = result }, now_ms)
+  end
+  return state
 end
 
 function M.node(state, run_id, actor_id)
   return (((state.node_previews or {})[run_id] or {})[actor_id])
-end
-
-function M.contract(state, node)
-  return node and (state.preview_registry or {})[node.factory] or nil
 end
 
 function M.merged(state, run_id, predicate)
@@ -203,14 +246,21 @@ function M.merged(state, run_id, predicate)
 end
 
 function M.prune(state, runs)
-  local all, changed = {}, false
+  local all, arrivals, changed = {}, {}, false
   for run_id, value in pairs(state.node_previews or {}) do
-    if (runs or {})[run_id] then all[run_id] = value else changed = true end
+    if (runs or {})[run_id] then
+      all[run_id], arrivals[run_id] = value, (state.mag_arrivals or {})[run_id]
+    else changed = true end
   end
   if not changed then return state end
   local scopes = {}
   for scope, run_id in pairs(state.scope_to_run or {}) do if (runs or {})[run_id] then scopes[scope] = run_id end end
-  return shallow_merge(state, { node_previews = all, scope_to_run = scopes })
+  local owners = {}
+  for id, owner in pairs(state.capability_owners or {}) do
+    if (runs or {})[owner.run_id] then owners[id] = owner end
+  end
+  return shallow_merge(state, { node_previews = all, mag_arrivals = arrivals,
+    scope_to_run = scopes, capability_owners = owners })
 end
 
 return M

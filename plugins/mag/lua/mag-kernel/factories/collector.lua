@@ -2,13 +2,11 @@
 -- triple, never from the payload. One value is retained per expected sender.
 local kinds = require("kinds")
 local M = {}
-local preview_components = require("preview-components")
 
 local ITEM = "nefor.dynamic.Item"
 local COLLECTED = "nefor.dynamic.Collected"
 
 M.declaration = {
-  preview = preview_components.input_output(),
   name = "collector",
   type_variables = { "T" },
   semantic = {

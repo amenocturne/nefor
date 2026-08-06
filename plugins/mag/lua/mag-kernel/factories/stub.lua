@@ -9,12 +9,10 @@
 local kinds = require("kinds")
 
 local M = {}
-local preview_components = require("preview-components")
 
 -- Plain, readable declaration data. The kernel and the validator read this;
 -- no behavior is derived from it.
 M.declaration = {
-  preview = preview_components.input_output(),
   name = "stub",
 
   -- params schema — documentation-grade shape of the setup table the

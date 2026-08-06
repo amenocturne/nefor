@@ -79,7 +79,9 @@ const byteLength = (value: unknown): number =>
   Buffer.byteLength(JSON.stringify(value));
 
 const categoryOf = (kind: string): string => {
-  if (kind === "mag.node_preview") return "node previews";
+  if (kind === "mag.arrival") return "MAG canonical values";
+  if (kind === "mag.firing") return "MAG firing references";
+  if (kind === "mag.node_preview") return "legacy node previews";
   if (/^(chat\.history|chat\.message|chat\.input)/.test(kind)) {
     return "conversation projection";
   }

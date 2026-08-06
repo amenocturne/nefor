@@ -33,30 +33,30 @@ nefor.typed_json = {
 }
 
 local function make(schema)
-  local messages, previews = {}, {}
+  local messages, diagnostics = {}, {}
   local instance, err = structured.construct("typed", {
     provider = "provider", schema = schema, max_corrections = 1,
     output_type = "direct-id", error_type = "error-id",
     provider_error_type = "provider-error-id", validation_error_type = "validation-error-id",
   }, function(message) messages[#messages + 1] = message end, {
     conversation = { id = "typed:conversation", turn_id = "typed:turn", emit = function(_) end },
-    preview = function(operation, binding, value)
-      previews[#previews + 1] = { operation = operation, binding = binding, value = value }
+    diagnostic = function(value)
+      diagnostics[#diagnostics + 1] = value
       return true
     end,
   })
   assert_true(instance ~= nil, err)
-  return instance, messages, previews
+  return instance, messages, diagnostics
 end
 
--- A rejected candidate remains in provider history for correction, but preview
--- telemetry exposes diagnostics only. The validated retry result is emitted.
+-- A rejected candidate remains in provider history for correction, but the
+-- generic diagnostic fact exposes validation details only.
 do
   validations = {
     { ok = false, violations = {{ path = "$.content", message = "required" }} },
     { ok = true, value = { content = "validated" } },
   }
-  local instance, messages, previews = make({ root = { kind = "record" } })
+  local instance, messages, diagnostics = make({ root = { kind = "record" } })
   instance.deliver(turn())
   local first = find_last(messages, "capability.invoke")
   local rejected = '{"raw_machine_secret":true}'
@@ -72,10 +72,10 @@ do
   assert_true(history[#history].content:find(rejected, 1, true) == nil,
     "retry prompt does not repeat the rejected candidate")
 
-  assert_eq(#previews, 1, "rejection emits one diagnostic preview item")
-  assert_eq(previews[1].value.kind, "validation", "preview item is validation diagnostics")
-  assert_true(previews[1].value.value.output == nil,
-    "rejected raw candidate is absent from user-visible preview telemetry")
+  assert_eq(#diagnostics, 1, "rejection emits one generic diagnostic fact")
+  assert_eq(diagnostics[1].kind, "validation", "diagnostic identifies validation")
+  assert_true(diagnostics[1].output == nil,
+    "rejected raw candidate is absent from the diagnostic interface")
 
   instance.deliver({ kind = "reply", ref = correction.ref,
     result = { text = '{"content":"validated"}' } })
@@ -85,13 +85,13 @@ do
 end
 
 -- Root unions retain the selected named constructor identity while applying the
--- same validated-only preview rule across a correction attempt.
+-- same validated-only diagnostic rule across a correction attempt.
 do
   validations = {
     { ok = false, violations = {{ path = "$.value", message = "wrong branch" }} },
     { ok = true, value = { type = "named-branch-id", value = { content = "union ok" } } },
   }
-  local instance, messages, previews = make({ root = { kind = "union", items = {} } })
+  local instance, messages, diagnostics = make({ root = { kind = "union", items = {} } })
   instance.deliver(turn())
   local first = find_last(messages, "capability.invoke")
   instance.deliver({ kind = "reply", ref = first.ref,
@@ -100,8 +100,8 @@ do
   instance.deliver({ kind = "reply", ref = correction.ref,
     result = { text = '{"value":{"content":"union ok"}}' } })
 
-  assert_true(previews[1].value.value.output == nil,
-    "union rejection also omits candidate preview data")
+  assert_true(diagnostics[1].output == nil,
+    "union rejection also omits candidate diagnostic data")
   local result = find_last(messages, "nefor.agent.Result")
   assert_eq(result.semantic_type_id, "named-branch-id",
     "named union branch identity remains selected from validated value")

@@ -1,5 +1,4 @@
 local kinds = require("kinds")
-local preview_components = require("preview-components")
 
 local M = {}
 local CONTINUE = "nefor.retry.Continue"
@@ -10,7 +9,6 @@ local function branch(name)
 end
 
 M.declaration = {
-  preview = preview_components.input_output(),
   name = "retry-gate",
   type_variables = { "T" },
   semantic = {
