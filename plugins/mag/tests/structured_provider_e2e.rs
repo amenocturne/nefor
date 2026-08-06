@@ -1,7 +1,11 @@
-//! Structured-output regression through the shipped MAG actor and real provider dispatchers.
+//! Structured-output regression through the shipped MAG actor, conversation-manager boundary,
+//! and real provider dispatchers.
 //!
 //! These tests deliberately route NCP envelopes between separate plugin processes. The MAG
-//! compiler/factory owns schema projection and result decoding; the providers own their HTTP
+//! compiler/factory owns schema projection and result decoding, while its public provider request
+//! stays thin. The harness folds MAG's canonical facts into the manager-owned read context and
+//! privately delivers the expanded native request to the provider process, standing in for the
+//! provider compositor's in-process `engine.deliver` seam. The providers still own their HTTP
 //! request controls. The local servers only inspect the resulting wire request and return a
 //! deterministic structured response.
 
@@ -201,6 +205,200 @@ async fn next_event_of_kind(reader: &mut BufReader<ChildStdout>, kind: &str) -> 
             panic!("MAG failed while expecting {kind}: {body:?}");
         }
     }
+}
+
+fn assert_thin_provider_request(request: &Map<String, Value>, provider: &str) {
+    assert_eq!(
+        request.get("kind").and_then(Value::as_str),
+        Some("conversation.provider.invoke.request")
+    );
+    assert_eq!(
+        request.get("provider").and_then(Value::as_str),
+        Some(provider)
+    );
+    for forbidden in ["messages", "system", "tool_specs", "conversation_context"] {
+        assert!(
+            request.get(forbidden).is_none(),
+            "thin provider request must not carry {forbidden}: {request:?}"
+        );
+    }
+}
+
+async fn next_provider_request_with_facts(
+    reader: &mut BufReader<ChildStdout>,
+    provider: &str,
+) -> (Map<String, Value>, Vec<Value>) {
+    let mut facts = Vec::new();
+    loop {
+        let body = next_event(reader, "conversation.provider.invoke.request").await;
+        match body.get("kind").and_then(Value::as_str) {
+            Some("conversation.fact.append") => {
+                facts.push(body.get("fact").cloned().expect("append carries fact"));
+            }
+            Some("conversation.provider.invoke.request") => {
+                assert_thin_provider_request(&body, provider);
+                return (body, facts);
+            }
+            Some("mag.error" | "mag.run_failed") => {
+                panic!("MAG failed while expecting provider request: {body:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn context_messages(facts: &[Value]) -> Vec<Value> {
+    struct Message {
+        role: String,
+        text: String,
+        structured: Vec<Value>,
+        completed: bool,
+    }
+
+    let mut messages = Vec::<Message>::new();
+    let mut message_indexes = HashMap::<String, usize>::new();
+
+    for fact in facts {
+        let Some(kind) = fact.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "message_started" => {
+                let id = fact["message_id"]
+                    .as_str()
+                    .expect("message_started carries message_id")
+                    .to_owned();
+                let index = messages.len();
+                message_indexes.insert(id, index);
+                messages.push(Message {
+                    role: fact["role"]
+                        .as_str()
+                        .expect("message_started carries role")
+                        .to_owned(),
+                    text: String::new(),
+                    structured: Vec::new(),
+                    completed: false,
+                });
+            }
+            "content_chunk_appended" => {
+                let Some(index) = fact["message_id"]
+                    .as_str()
+                    .and_then(|id| message_indexes.get(id))
+                    .copied()
+                else {
+                    continue;
+                };
+                let chunk = &fact["chunk"];
+                match chunk.get("kind").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(data) = chunk.get("data").and_then(Value::as_str) {
+                            messages[index].text.push_str(data);
+                        }
+                    }
+                    Some("structured") => {
+                        messages[index]
+                            .structured
+                            .push(chunk.get("data").cloned().unwrap_or(Value::Null));
+                    }
+                    _ => {}
+                }
+            }
+            "message_completed" => {
+                let Some(index) = fact["message_id"]
+                    .as_str()
+                    .and_then(|id| message_indexes.get(id))
+                    .copied()
+                else {
+                    continue;
+                };
+                messages[index].completed = true;
+            }
+            _ => {}
+        }
+    }
+
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            if !message.completed {
+                return None;
+            }
+            let content = if !message.text.is_empty() {
+                Value::String(message.text)
+            } else if message.structured.len() == 1 {
+                message.structured.into_iter().next().expect("one chunk")
+            } else {
+                Value::Array(message.structured)
+            };
+            Some(json!({ "role": message.role, "content": content }))
+        })
+        .collect()
+}
+
+fn private_provider_request(
+    kind: ProviderKind,
+    invocation: &Map<String, Value>,
+    facts: &[Value],
+) -> Map<String, Value> {
+    let messages = context_messages(facts);
+    assert!(
+        messages.iter().any(|message| message["role"] == "system"),
+        "canonical context contains the authored system message: {facts:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message["role"] == "user"),
+        "canonical context contains the typed task: {facts:?}"
+    );
+
+    let mut request = Map::new();
+    request.insert(
+        "kind".into(),
+        Value::String(format!("{}.completion.request", kind.name())),
+    );
+    for field in [
+        "request_id",
+        "conversation_id",
+        "model",
+        "reasoning_effort",
+        "tools",
+        "output_schema",
+        "max_corrections",
+        "invocation",
+    ] {
+        if let Some(value) = invocation.get(field) {
+            request.insert(field.into(), value.clone());
+        }
+    }
+    request.insert("messages".into(), Value::Array(messages.clone()));
+    if matches!(kind, ProviderKind::ChatGpt) {
+        request.insert(
+            "conversation_context".into(),
+            json!({
+                "messages": messages,
+                "tail_messages": messages,
+                "history_length": messages.len(),
+                "watermark": invocation.get("watermark").cloned().unwrap_or(Value::Null)
+            }),
+        );
+    }
+    request
+}
+
+fn manager_event(kind: ProviderKind, completion: Map<String, Value>) -> Map<String, Value> {
+    let mut event = completion;
+    event.insert(
+        "kind".into(),
+        Value::String("conversation.provider.event".into()),
+    );
+    event.insert("provider".into(), Value::String(kind.name().into()));
+    event.remove("messages");
+    event.remove("history");
+    event.remove("conversation_context");
+    event.remove("input");
+    event.remove("request");
+    event.remove("system");
+    event.remove("tool_specs");
+    event
 }
 
 async fn read_http_json(stream: &mut TcpStream) -> (String, Value) {
@@ -424,14 +622,14 @@ async fn run_case(kind: ProviderKind) {
     )
     .await;
 
-    let request_kind = format!("{}.completion.request", kind.name());
-    let request = next_event_of_kind(&mut mag_out, &request_kind).await;
-    assert_strict_final_answer_schema(&request["output_schema"]);
-    let request_id = request["request_id"]
+    let (invocation, facts) = next_provider_request_with_facts(&mut mag_out, kind.name()).await;
+    assert_strict_final_answer_schema(&invocation["output_schema"]);
+    let request_id = invocation["request_id"]
         .as_str()
-        .expect("completion request id")
+        .expect("provider request id")
         .to_owned();
-    send_event(&mut provider_in, "mag", request).await;
+    let private_request = private_provider_request(kind, &invocation, &facts);
+    send_event(&mut provider_in, "conversation-manager", private_request).await;
 
     let completion_kind = format!("{}.completion.event", kind.name());
     let completed = loop {
@@ -465,11 +663,13 @@ async fn run_case(kind: ProviderKind) {
             .or_else(|| completed.get("text")),
         Some(&json!(r#"{"content":"done"}"#))
     );
-    assert!(
-        completed.get("chat_id").is_none(),
-        "direct completion preserves request envelope semantics"
-    );
-    send_event(&mut mag_in, kind.name(), completed).await;
+    assert!(completed.get("chat_id").is_none());
+    send_event(
+        &mut mag_in,
+        "conversation-manager",
+        manager_event(kind, completed),
+    )
+    .await;
 
     let result = next_event_of_kind(&mut mag_out, "mag.run_result").await;
     assert_eq!(result["status"], "completed");
