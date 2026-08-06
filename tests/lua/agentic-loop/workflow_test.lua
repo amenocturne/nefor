@@ -316,7 +316,7 @@ local function project_pending_conversation(calls)
     "canonical system message carries ambient MAG context")
   manager_delta({
     kind = "message_completed",
-    message_id = system_completed.message_id,
+    message = { id = system_completed.message_id, role = "system", content = {} },
   })
   return true
 end

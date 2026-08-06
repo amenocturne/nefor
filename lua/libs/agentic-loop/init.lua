@@ -1245,8 +1245,12 @@ local function handle_conversation_projection_delta(body)
   end
 
   local pending_system = state.pending_system_seed
+  local completed_message_id = change.message_id
+  if completed_message_id == nil and type(change.message) == "table" then
+    completed_message_id = change.message.id
+  end
   if change.kind == "message_completed" and type(pending_system) == "table"
-      and change.message_id == pending_system.message_id then
+      and completed_message_id == pending_system.message_id then
     state.pending_system_seed = nil
     flush_pending_user_inputs()
     flush_deferred()

@@ -90,6 +90,25 @@ fn jsonl_excludes_session_control_events() {
         -- projections, and forged records are ephemeral; only its canonical fact persists.
         sessions_test._persist_envelope(entry("lead", { kind = "conversation.fact.append", fact = {} }))
         sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.projection.delta", sequence = 1 }))
+        -- Provider coordination and streaming are runtime-only. Even a
+        -- history-shaped payload on one of these generic protocol events must
+        -- never inflate the durable session or become resume input.
+        sessions_test._persist_envelope(entry("conversation-manager", {
+            kind = "conversation.provider.invoke",
+            request_id = "req-1",
+            messages = { { role = "user", content = string.rep("x", 65536) } },
+        }))
+        sessions_test._persist_envelope(entry("chatgpt", {
+            kind = "conversation.provider.event.reported",
+            request_id = "req-1",
+            event = "output_text.delta",
+            delta = string.rep("y", 65536),
+        }))
+        sessions_test._persist_envelope(entry("conversation-manager", {
+            kind = "conversation.provider.event",
+            request_id = "req-1",
+            event = "completed",
+        }))
         sessions_test._persist_envelope(entry("other", { kind = "conversation.fact.recorded", event = {} }))
         sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.fact.recorded", duplicate = true, event = {} }))
         sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.fact.recorded", event = { sequence = 1 } }))
@@ -136,6 +155,10 @@ fn jsonl_excludes_session_control_events() {
         assert!(
             !line.contains("\"sessions."),
             "sessions.* control event leaked into jsonl: {line}",
+        );
+        assert!(
+            !line.contains("conversation.provider"),
+            "provider runtime event leaked into jsonl: {line}",
         );
     }
 

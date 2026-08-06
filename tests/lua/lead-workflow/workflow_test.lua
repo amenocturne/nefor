@@ -73,6 +73,27 @@ local function fresh()
       conversation = { provenance = { surface = "lead" } },
     },
   }))
+  local system_completed = find_call(decode_calls(), function(call)
+    return call.body.kind == "conversation.fact.append"
+       and type(call.body.fact) == "table"
+       and call.body.fact.kind == "message_completed"
+       and call.body.fact.conversation_id == "lead-workflow-test-conversation"
+  end)
+  if system_completed ~= nil then
+    agentic_loop.receive_msg(make_entry("conversation-manager", {
+      kind = "conversation.projection.delta",
+      conversation_id = "lead-workflow-test-conversation",
+      sequence = 2,
+      change = {
+        kind = "message_completed",
+        message = {
+          id = system_completed.body.fact.message_id,
+          role = "system",
+          content = {},
+        },
+      },
+    }))
+  end
   _test.set_plugins({ "mag", "tool-gate", "nefor-tui" })
   _test.calls_clear()
 end

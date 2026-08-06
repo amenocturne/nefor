@@ -812,6 +812,44 @@ fn conversation_projection_appends_to_transcript_with_terminal_metadata() {
 }
 
 #[test]
+fn canonical_system_messages_remain_context_only_in_chat_projection() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "conversation.active.changed", "conversation_id": "root" }),
+    );
+    for (id, role, text) in [
+        ("system", "system", "SYSTEM_CONTEXT_MUST_STAY_HIDDEN"),
+        ("user", "user", "visible user message"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "conversation.projection.delta",
+                "conversation_id": "root",
+                "change": {
+                    "kind": "message_completed",
+                    "message": { "id": id, "role": role, "text": text },
+                },
+            }),
+        );
+    }
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("visible user message"),
+        "user projection missing: {out:?}"
+    );
+    assert!(
+        !out.contains("SYSTEM_CONTEXT_MUST_STAY_HIDDEN"),
+        "system context leaked into the visible transcript: {out:?}"
+    );
+}
+
+#[test]
 fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
     let mut engine = Engine::new(120, 40).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

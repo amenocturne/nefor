@@ -44,7 +44,7 @@ end
 local function message_completed(state, actions, message)
   record_message(state, message)
   if type(message) ~= "table" then return end
-  if message.role == "user" or message.role == "system" then
+  if message.role == "user" then
     action(actions, "message", {
       role = message.role,
       text = message.text or "",
@@ -128,7 +128,7 @@ local function snapshot_actions(state, projection, actions)
           complete_exchange(exchange)
         end
       end
-    elseif message.role == "user" or message.role == "system" then
+    elseif message.role == "user" then
       action(actions, "message", {
         role = message.role,
         text = message.text or "",

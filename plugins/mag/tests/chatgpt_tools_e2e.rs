@@ -1,9 +1,10 @@
-//! Canonical MAG → ChatGPT Responses tool regression.
+//! Canonical MAG → conversation-manager → tool-gate regression.
 //!
-//! This routes real plugin processes over NCP. The fake HTTP endpoint only scripts the model:
-//! the first response calls the shipped `basic-tools` `read_file` tool, MAG routes that call
-//! through the configured tool gate, and the second response returns the structured final answer
-//! after observing the real file contents.
+//! This routes real MAG, tool-gate, and basic-tools processes over NCP. The
+//! harness plays the provider behind conversation-manager's generic relay: the
+//! first response calls the shipped `read_file` tool and the second returns the
+//! structured final answer after observing the real file contents. Provider
+//! native request/HTTP lowering is covered by the provider-owned suites.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,8 +13,7 @@ use std::time::Duration;
 
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody, Timestamp};
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::time::timeout;
 
@@ -38,11 +38,6 @@ fn built_binary(package: &str, binary: &str) -> PathBuf {
     target_dir
         .join("debug")
         .join(format!("{binary}{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn provider_binary() -> &'static PathBuf {
-    static BINARY: OnceLock<PathBuf> = OnceLock::new();
-    BINARY.get_or_init(|| built_binary("chatgpt-provider", "chatgpt-provider"))
 }
 
 fn tool_gate_binary() -> &'static PathBuf {
@@ -73,21 +68,6 @@ async fn spawn_mag(data_dir: &Path) -> Child {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn MAG")
-}
-
-async fn spawn_provider(base_url: &str, data_dir: &Path) -> Child {
-    tokio::process::Command::new(provider_binary())
-        .arg("--name")
-        .arg(PROVIDER)
-        .arg("--base-url")
-        .arg(base_url)
-        .env("NEFOR_DATA_DIR", data_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn provider")
 }
 
 async fn spawn_tool_gate() -> Child {
@@ -203,116 +183,14 @@ async fn next_kind(reader: &mut BufReader<ChildStdout>, kind: &str) -> Map<Strin
     }
 }
 
-async fn read_http_json(stream: &mut TcpStream) -> (String, Value) {
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let count = stream.read(&mut buffer).await.expect("read request");
-        assert!(count > 0, "request closed before body");
-        bytes.extend_from_slice(&buffer[..count]);
-        let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
-            continue;
-        };
-        let headers = String::from_utf8_lossy(&bytes[..header_end]);
-        let length = headers
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length: ")
-                    .and_then(|v| v.parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        let start = header_end + 4;
-        if bytes.len() >= start + length {
-            return (
-                headers.lines().next().expect("request line").to_owned(),
-                if length == 0 {
-                    Value::Null
-                } else {
-                    serde_json::from_slice(&bytes[start..start + length]).expect("JSON body")
-                },
-            );
-        }
-    }
-}
-
-async fn sse(stream: &mut TcpStream, body: &str) {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .expect("SSE response");
-}
-
-async fn fake_responses(listener: TcpListener) {
-    let mut round = 0;
-    while round < 2 {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        let (line, request) = read_http_json(&mut stream).await;
-        if !line.starts_with("POST /responses ") {
-            let body = if line.contains(" /models") {
-                r#"{"data":[]}"#
-            } else {
-                r#"{}"#
-            };
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("aux response");
-            continue;
-        }
-
-        assert_eq!(request["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(request["tools"][0]["name"], "read_file");
-        assert_eq!(
-            request["tools"][0]["description"],
-            "Read the contents of a file. Returns the file's text content or an error."
-        );
-        assert_eq!(
-            request["tools"][0]["parameters"]["properties"]["path"]["type"],
-            "string"
-        );
-        if round == 0 {
-            sse(&mut stream, "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"fixture.txt\\\"}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"finish_reason\":\"tool_calls\"}}\n\ndata: [DONE]\n\n").await;
-        } else {
-            let input = request["input"].as_array().expect("round-two input");
-            assert!(input
-                .iter()
-                .any(|item| item["type"] == "function_call_output"
-                    && item["call_id"] == "call_1"
-                    && item["output"] == FIXTURE_CONTENT));
-            sse(&mut stream, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"content\\\":\\\"done after read_file\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\"}}\n\ndata: [DONE]\n\n").await;
-        }
-        round += 1;
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let base_url = format!("http://{}", listener.local_addr().expect("address"));
-    let server = tokio::spawn(fake_responses(listener));
 
     let mut mag = spawn_mag(temp.path()).await;
     let mut mag_in = mag.stdin.take().expect("MAG stdin");
     let mut mag_out = BufReader::new(mag.stdout.take().expect("MAG stdout"));
     handshake(&mut mag_out, &mut mag_in).await;
-
-    let mut provider = spawn_provider(&base_url, temp.path()).await;
-    let mut provider_in = provider.stdin.take().expect("provider stdin");
-    let mut provider_out = BufReader::new(provider.stdout.take().expect("provider stdout"));
-    handshake(&mut provider_out, &mut provider_in).await;
-    send(
-        &mut provider_in,
-        "engine",
-        object(json!({"kind": format!("{PROVIDER}.auth.set"), "token": "test-token"})),
-    )
-    .await;
 
     let mut gate = spawn_tool_gate().await;
     let mut gate_in = gate.stdin.take().expect("gate stdin");
@@ -328,7 +206,6 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
     send(&mut gate_in, "basic-tools", advertisement).await;
     let register = next_kind(&mut gate_out, "tool.register").await;
     send(&mut mag_in, "tool-gate", register.clone()).await;
-    send(&mut provider_in, "tool-gate", register).await;
 
     // A disallowed call is rejected by the real gate before policy or source dispatch.
     send(
@@ -388,26 +265,79 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
     }))).await;
 
     for round in 0..2 {
-        let request = next_kind(&mut mag_out, &format!("{PROVIDER}.completion.request")).await;
-        send(&mut provider_in, "mag", request).await;
-        loop {
-            let Body::Event(event) = outgoing(&mut provider_out, "completion event").await.body
-            else {
-                continue;
-            };
-            if event.get("kind").and_then(Value::as_str)
-                != Some(&format!("{PROVIDER}.completion.event"))
-            {
-                continue;
-            }
-            let terminal = matches!(
-                event.get("event").and_then(Value::as_str),
-                Some("completed" | "error")
-            );
-            send(&mut mag_in, PROVIDER, event).await;
-            if terminal {
-                break;
-            }
+        let request = next_kind(&mut mag_out, "conversation.provider.invoke.request").await;
+        assert_eq!(request["provider"], PROVIDER);
+        assert!(
+            request.get("messages").is_none(),
+            "thin invoke has no history"
+        );
+        assert!(
+            request.get("system").is_none(),
+            "thin invoke has no system prompt"
+        );
+        assert!(
+            request.get("tool_specs").is_none(),
+            "tool schemas stay provider-owned"
+        );
+        let request_id = request["request_id"]
+            .as_str()
+            .expect("provider request id")
+            .to_owned();
+        if round == 0 {
+            send(
+                &mut mag_in,
+                "conversation-manager",
+                object(json!({
+                    "kind": "conversation.provider.event",
+                    "provider": PROVIDER,
+                    "request_id": request_id,
+                    "event": "tool_call",
+                    "id": "call_1",
+                    "name": "read_file",
+                    "arguments": {"path": "fixture.txt"}
+                })),
+            )
+            .await;
+            send(
+                &mut mag_in,
+                "conversation-manager",
+                object(json!({
+                    "kind": "conversation.provider.event",
+                    "provider": PROVIDER,
+                    "request_id": request_id,
+                    "event": "completed",
+                    "text": "",
+                    "finish_reason": "tool_calls"
+                })),
+            )
+            .await;
+        } else {
+            let answer = r#"{"content":"done after read_file"}"#;
+            send(
+                &mut mag_in,
+                "conversation-manager",
+                object(json!({
+                    "kind": "conversation.provider.event",
+                    "provider": PROVIDER,
+                    "request_id": request_id,
+                    "event": "text_delta",
+                    "text": answer
+                })),
+            )
+            .await;
+            send(
+                &mut mag_in,
+                "conversation-manager",
+                object(json!({
+                    "kind": "conversation.provider.event",
+                    "provider": PROVIDER,
+                    "request_id": request_id,
+                    "event": "completed",
+                    "text": answer,
+                    "finish_reason": "stop"
+                })),
+            )
+            .await;
         }
         if round == 0 {
             let invoke = next_kind(&mut mag_out, "tool-gate.tool.invoke").await;
@@ -478,9 +408,7 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"]["value"]["content"], "done after read_file");
 
-    server.await.expect("fake server");
     mag.kill().await.ok();
-    provider.kill().await.ok();
     gate.kill().await.ok();
     basic_tools.kill().await.ok();
 }
