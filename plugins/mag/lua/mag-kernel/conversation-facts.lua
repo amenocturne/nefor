@@ -1,14 +1,5 @@
 local M = {}
-
-local function copy(value, seen)
-  if type(value) ~= "table" then return value end
-  seen = seen or {}
-  if seen[value] then return seen[value] end
-  local out = {}
-  seen[value] = out
-  for key, item in pairs(value) do out[copy(key, seen)] = copy(item, seen) end
-  return out
-end
+local copy = require("core.json_data").copy
 
 local function content_chunk(content)
   if content == nil or content == "" then return nil end

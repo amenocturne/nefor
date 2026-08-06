@@ -4,12 +4,7 @@
 local M = {}
 M.__index = M
 
-local function copy(value)
-  if type(value) ~= "table" then return value end
-  local out = {}
-  for key, item in pairs(value) do out[key] = copy(item) end
-  return out
-end
+local copy = require("core.json_data").copy
 
 local function remove_value(list, value)
   for index = #list, 1, -1 do

@@ -41,6 +41,7 @@
 -- and delivers the expanded native request directly to its process.
 
 local M = {}
+local json_data = require("core.json_data")
 
 -- opts.hooks lets downstream callers splice per-envelope logic into the
 -- two translation seams without forking this file. Both hooks are
@@ -115,14 +116,7 @@ function M.spawn_spec(name, command, opts)
     emit_synthetic = emit_synthetic,
   }
 
-  local function clone_table(t)
-    if type(t) ~= "table" then return t end
-    local out = {}
-    for k, v in pairs(t) do
-      out[k] = type(v) == "table" and clone_table(v) or v
-    end
-    return out
-  end
+  local clone_table = json_data.copy
 
   local function read_context(conversation_id)
     local ok, context = pcall(conversations.context, conversations, conversation_id)

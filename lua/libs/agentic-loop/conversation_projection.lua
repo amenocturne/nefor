@@ -1,14 +1,6 @@
 local M = {}
 
-local function copy(value, seen)
-  if type(value) ~= "table" then return value end
-  seen = seen or {}
-  if seen[value] then return seen[value] end
-  local out = {}
-  seen[value] = out
-  for key, item in pairs(value) do out[copy(key, seen)] = copy(item, seen) end
-  return out
-end
+local copy = require("core.json_data").copy
 
 function M.new()
   local conversation_id = nil

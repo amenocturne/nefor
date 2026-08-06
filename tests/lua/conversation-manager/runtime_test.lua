@@ -321,6 +321,12 @@ eq(last_body().kind, "conversation.provider.invoke.rejected")
 eq(last_body().code, "conversation_not_found")
 
 local invoke_watermark = reader:watermark("replayed")
+local empty_tools = json.decode("[]")
+local schema_with_empty_arrays = json.decode([[{
+  "type":"object",
+  "required":[],
+  "properties":{"tags":{"type":"array","prefixItems":[]}}
+}]])
 receive({
   kind = "conversation.provider.invoke.request",
   request_id = "provider-1",
@@ -328,7 +334,8 @@ receive({
   provider = "chatgpt",
   model = "gpt-test",
   reasoning_effort = "high",
-  tools = { "read_file" },
+  tools = empty_tools,
+  output_schema = schema_with_empty_arrays,
   system = "must not leak",
   messages = { { role = "user", content = "must not leak" } },
 })
@@ -340,6 +347,12 @@ eq(invoke.provider, "chatgpt")
 eq(invoke.watermark, invoke_watermark, "invoke captures the folded manager watermark")
 eq(invoke.model, "gpt-test")
 eq(invoke.reasoning_effort, "high")
+assert(json.is_array(invoke.tools) and #invoke.tools == 0,
+  "manager relay preserves an empty tools array")
+assert(json.is_array(invoke.output_schema.required),
+  "manager relay preserves nested empty schema arrays")
+assert(json.is_array(invoke.output_schema.properties.tags.prefixItems),
+  "manager relay preserves deeply nested empty schema arrays")
 eq(invoke.system, nil, "system is canonical conversation content, not invoke payload")
 eq(invoke.messages, nil, "full history never enters the manager/provider protocol")
 eq(actor._internals.active_invocations()["provider-1"].conversation_id, "replayed")

@@ -2,9 +2,10 @@
 -- conversation reconstruction belongs to conversation-manager.
 
 local json = nefor.json
+local json_data = require("core.json_data")
 
 local M = {}
-local clone_table
+local clone_table = json_data.copy
 
 -- Test-only: drop module-level state.
 function M._reset()
@@ -359,15 +360,6 @@ function M.translator(name)
     context_message            = context_message,
     maybe_inject_static_token  = maybe_inject_static_token,
   }
-end
-
-clone_table = function(t)
-  if type(t) ~= "table" then return t end
-  local out = {}
-  for k, v in pairs(t) do
-    out[k] = type(v) == "table" and clone_table(v) or v
-  end
-  return out
 end
 
 return M

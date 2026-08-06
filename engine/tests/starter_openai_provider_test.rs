@@ -25,13 +25,16 @@ fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events(
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     let root = repo_root();
+    let shared_lua = root.join("lua");
     let openai_lua = root.join("plugins/openai-provider/lua");
     let chatgpt_lua = root.join("plugins/chatgpt-provider/lua");
     lua.load(format!(
         r#"
         package.path = table.concat({{
           "{chatgpt}/?.lua", "{chatgpt}/?/init.lua",
-          "{openai}/?.lua", "{openai}/?/init.lua", package.path,
+          "{openai}/?.lua", "{openai}/?/init.lua",
+          "{shared}/?.lua", "{shared}/?/init.lua",
+          package.path,
         }}, ";")
         local t = require("chatgpt-provider").translator("chatgpt-provider")
         local function translate(output)
@@ -77,6 +80,7 @@ fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events(
         "#,
         chatgpt = chatgpt_lua.display(),
         openai = openai_lua.display(),
+        shared = shared_lua.display(),
     ))
     .exec()
     .expect("translate ChatGPT terminals");
@@ -190,6 +194,11 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
     lua.load(
         r#"
         local op = require("libs.compositors.provider")
+        local empty_tools = nefor.json.decode("[]")
+        local schema = nefor.json.decode([[{
+          "type":"object","required":[],
+          "properties":{"tags":{"type":"array","prefixItems":[]}}
+        }]])
         local spec = op.spawn_spec("ollama", { "/bin/true" }, {
           agentic_loop = {},
           conversations = {
@@ -211,7 +220,8 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
           body = {
             kind = "conversation.provider.invoke", provider = "ollama",
             request_id = "request-1", conversation_id = "conversation-1",
-            watermark = 11, model = "qwen", tools = { "read_file" },
+            watermark = 11, model = "qwen", tools = empty_tools,
+            output_schema = schema,
           },
         }})
 
@@ -220,6 +230,11 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
         assert(delivered[1].kind == "ollama.completion.request")
         assert(delivered[1].body.request_id == "request-1")
         assert(delivered[1].body.model == "qwen")
+        assert(nefor.json.is_array(delivered[1].body.tools))
+        assert(#delivered[1].body.tools == 0)
+        assert(nefor.json.is_array(delivered[1].body.output_schema.required))
+        assert(nefor.json.is_array(
+          delivered[1].body.output_schema.properties.tags.prefixItems))
         assert(#delivered[1].body.messages == 2)
         assert(delivered[1].body.messages[1].content == "private system")
         assert(delivered[1].body.messages[2].content == "private history")

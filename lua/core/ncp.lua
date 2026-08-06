@@ -97,6 +97,7 @@
 -- "decide whether to publish" and obscure the replay/persistence path.
 
 local json = nefor.json
+local json_data = require("core.json_data")
 local replay_window = require("core.replay_window")
 
 local M = {}
@@ -164,19 +165,9 @@ end
 local function deep_copy(v, is_root)
   if type(v) ~= "table" then return v end
   if is_root then work_stats.deep_copy_roots = work_stats.deep_copy_roots + 1 end
-  work_stats.deep_copy_tables = work_stats.deep_copy_tables + 1
-  local out = {}
-  for k, vv in pairs(v) do
-    out[k] = deep_copy(vv, false)
-  end
-  -- mlua marks decoded JSON arrays with a private metatable so an empty
-  -- `[]` remains distinguishable from `{}`. Preserve it while isolating
-  -- wrapper mutations; dropping it silently rewrites nested empty arrays.
-  if type(nefor.json.is_array) == "function" and nefor.json.is_array(v)
-      and type(nefor.json.mark_array) == "function" then
-    nefor.json.mark_array(out)
-  end
-  return out
+  return json_data.copy(v, function()
+    work_stats.deep_copy_tables = work_stats.deep_copy_tables + 1
+  end)
 end
 
 local function engine_envelope(body_tbl, kind)

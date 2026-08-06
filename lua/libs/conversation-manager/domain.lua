@@ -1,4 +1,5 @@
 local M = {}
+local json_data = require("core.json_data")
 
 -- Within this domain, the fold is the sole transcript authority: events are
 -- immutable facts, while lookup maps are derived indexes removed from the
@@ -7,15 +8,7 @@ local terminal_conversation = { completed = true, interrupted = true, failed = t
 local chunk_kinds = { text = true, reasoning = true, structured = true, native = true }
 local roles = { system = true, user = true, assistant = true, tool = true }
 
-local function copy(value, seen)
-  if type(value) ~= "table" then return value end
-  seen = seen or {}
-  if seen[value] then return seen[value] end
-  local out = {}
-  seen[value] = out
-  for key, item in pairs(value) do out[copy(key, seen)] = copy(item, seen) end
-  return out
-end
+local copy = json_data.copy
 M.copy = copy
 
 local function equal(a, b, seen)

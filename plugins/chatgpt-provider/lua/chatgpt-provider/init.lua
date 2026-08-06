@@ -1,9 +1,8 @@
 local oa = require("openai-provider")
+local json_data = require("core.json_data")
 
 local function copy(value)
-  local out = {}
-  for key, item in pairs(value or {}) do out[key] = item end
-  return out
+  return json_data.copy(value or {})
 end
 
 local function translator(name)

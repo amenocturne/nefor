@@ -1,5 +1,6 @@
 -- Serializable plain-data ownership for kernel interfaces.
 local M = {}
+local json_data = require("core.json_data")
 
 local function fail(path, message)
   return nil, path .. ": " .. message
@@ -52,25 +53,14 @@ local function validate(value, path, visiting)
   return true
 end
 
-local function copy(value, seen)
-  if type(value) ~= "table" then return value end
-  seen = seen or {}
-  if seen[value] then error("cycle copied after plain-data validation") end
-  seen[value] = true
-  local out = {}
-  for key, child in pairs(value) do out[copy(key, seen)] = copy(child, seen) end
-  seen[value] = nil
-  return out
-end
-
 function M.copy(value)
-  return copy(value)
+  return json_data.copy(value)
 end
 
 function M.owned(value, path)
   local ok, err = validate(value, path or "value")
   if not ok then return nil, err end
-  return copy(value)
+  return json_data.copy(value)
 end
 
 return M

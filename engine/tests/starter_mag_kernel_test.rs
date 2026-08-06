@@ -168,6 +168,12 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
             if table.metatable().is_some_and(|mt| mt.to_pointer() == array_metatable.to_pointer())))
     })?;
     json.set("is_array", is_array)?;
+    let array_metatable = lua.array_metatable();
+    let mark_array = lua.create_function(move |_, table: mlua::Table| {
+        table.set_metatable(Some(array_metatable.clone()));
+        Ok(table)
+    })?;
+    json.set("mark_array", mark_array)?;
     nefor.set("json", json)?;
 
     lua.globals().set("nefor", nefor)?;
@@ -177,15 +183,20 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let kernel_dir = repo_root().join("plugins/mag/lua/mag-kernel");
     let kernel_dir = kernel_dir.display().to_string();
+    let lua_root = repo_root().join("lua");
+    let lua_root = lua_root.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{kernel_dir}/?.lua",
           "{kernel_dir}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
         "#,
         kernel_dir = kernel_dir,
+        lua_root = lua_root,
     );
     lua.load(&script).exec()
 }

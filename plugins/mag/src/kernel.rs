@@ -705,6 +705,12 @@ fn install_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
             if table.metatable().is_some_and(|mt| mt.to_pointer() == array_metatable.to_pointer())))
     })?;
     json.set("is_array", is_array)?;
+    let array_metatable = lua.array_metatable();
+    let mark_array = lua.create_function(move |_, table: Table| {
+        table.set_metatable(Some(array_metatable.clone()));
+        Ok(table)
+    })?;
+    json.set("mark_array", mark_array)?;
 
     nefor_tbl.set("json", json)?;
     Ok(())
