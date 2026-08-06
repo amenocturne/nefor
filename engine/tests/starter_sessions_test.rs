@@ -292,6 +292,16 @@ fn resume_emits_lifecycle_markers_in_order() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_DIR").ok();
     std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+    let target_id = "11111111-2222-4333-8444-555555555555";
+    std::fs::create_dir_all(tempdir.path().join("sessions")).expect("sessions dir");
+    std::fs::write(
+        tempdir
+            .path()
+            .join("sessions")
+            .join(format!("{target_id}.jsonl")),
+        "{\"_session\":true}\n",
+    )
+    .expect("target session");
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -710,68 +720,30 @@ fn resume_to_self_replays_log_so_chat_repaints() {
 }
 
 #[test]
-fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
-    // Resume's contract: the swap always happens (we own the new id)
-    // even if the target file is missing. The bus broadcast carries
-    // `replayed = 0` and a fresh file is created. This is what makes a
-    // hand-typed `/resume <random-uuid>` recoverable rather than wedging
-    // the engine.
+fn failed_resume_retains_current_session() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_DIR").ok();
     std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
-
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
-
-    let target_id = "55555555-2222-4333-8444-555555555555";
-    let resume_call = format!(
+    lua.load(
         r#"
-        _resume_done_payload = nil
-        local original_send = nefor.engine.send
-        local json = nefor.json
-        nefor.engine.send = function(payload, target)
-            local ok, decoded = pcall(json.decode, payload)
-            if ok and decoded and decoded.body
-               and decoded.body.kind == "sessions.resume_done" then
-                _resume_done_payload = payload
-            end
-            return original_send(payload, target)
-        end
         sessions = require("libs.sessions")
-        sessions_test = require("sessions.test")
         sessions.init()
-        sessions.resume("{target_id}")
-        "#
-    );
-    lua.load(&resume_call).exec().expect("resume to fresh");
-
-    let new_id: String = lua
-        .load(r#"return sessions.current_id()"#)
-        .eval()
-        .expect("current_id");
-    assert_eq!(new_id, target_id, "swap must complete to target id");
-
-    let new_path: String = lua
-        .load(r#"return sessions.current_path()"#)
-        .eval()
-        .expect("current_path");
+        _before_id = sessions.current_id()
+        _before_path = sessions.current_path()
+        _result = sessions.resume("55555555-2222-4333-8444-555555555555")
+    "#,
+    )
+    .exec()
+    .expect("failed resume");
+    let unchanged: bool = lua.load("return _result == nil and sessions.current_id() == _before_id and sessions.current_path() == _before_path").eval().unwrap();
     assert!(
-        !std::path::Path::new(&new_path).exists(),
-        "missing resume target must not create an empty file at {new_path}"
+        unchanged,
+        "failed activation must retain the current session"
     );
-
-    let payload: Option<String> = lua
-        .load(r#"return _resume_done_payload"#)
-        .eval()
-        .expect("payload");
-    let payload = payload.expect("resume_done must broadcast");
-    assert!(
-        payload.contains("\"replayed\":0"),
-        "resume_done must report replayed=0 for missing target file: {payload}"
-    );
-
     match prev.as_deref() {
         Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
         None => std::env::remove_var("NEFOR_DATA_DIR"),
@@ -790,6 +762,15 @@ fn init_with_resume_id_cold_starts_without_session_end() {
     set_package_path(&lua).expect("set package.path");
 
     let target_id = "66666666-2222-4333-8444-555555555555";
+    std::fs::create_dir_all(tempdir.path().join("sessions")).expect("sessions dir");
+    std::fs::write(
+        tempdir
+            .path()
+            .join("sessions")
+            .join(format!("{target_id}.jsonl")),
+        "{\"_session\":true}\n",
+    )
+    .expect("target session");
     let script = format!(
         r#"
         _seen = {{}}
@@ -1560,6 +1541,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     // boundary. Focused binding/store tests exercise locking and metadata.
     let fs: Table = nefor.get("fs")?;
     let create_root = data_dir.clone();
+    std::fs::create_dir_all(create_root.join("sessions"))?;
     fs.set(
         "session_create",
         lua.create_function(move |lua, id: String| {
@@ -1577,20 +1559,11 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
             Ok(result)
         })?,
     )?;
-    let record_root = data_dir.clone();
     fs.set(
-        "session_record_resume",
-        lua.create_function(move |lua, id: String| {
+        "session_commit_resume",
+        lua.create_function(|lua, _: Value| {
             let result = lua.create_table()?;
             result.set("ok", true)?;
-            result.set(
-                "path",
-                record_root
-                    .join("sessions")
-                    .join(format!("{id}.jsonl"))
-                    .to_string_lossy()
-                    .into_owned(),
-            )?;
             Ok(result)
         })?,
     )?;

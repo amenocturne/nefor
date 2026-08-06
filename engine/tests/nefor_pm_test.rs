@@ -1027,6 +1027,12 @@ fn sync_checkout_resolves_unpushed_local_commit_and_keeps_authoritative_pin_offl
         "ordinary sync must not move authoritative pin"
     );
 
+    std::fs::remove_dir_all(&checkout).expect("remove managed checkout");
+    let (_, commit, head) =
+        sync(&second, false).expect("fresh checkout reproduces authoritative pin");
+    assert_eq!(commit, first);
+    assert_eq!(head, first);
+
     std::fs::rename(&source, work.path().join("source-offline")).expect("hide source");
     let (_, commit, head) = sync(&second, false).expect("reuse exact checkout offline");
     assert_eq!(commit, first);

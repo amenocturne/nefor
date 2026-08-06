@@ -52,6 +52,10 @@ cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
 nefor
 ```
 
+## Runtime root contract
+
+Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-managed Nefor checkout. The starter and chat runtime load Lua and plugin support only from that root (with copied binaries selected separately through `NEFOR_PLUGIN_DIR`). `NEFOR_DEV_DIR` is the sole live-checkout override and is intended for explicit in-repository development such as `just run`; source-repository registry fields and filesystem proximity are never runtime roots.
+
 ## Customize
 
 - **Add/remove plugins**: edit the `actor.spawn` blocks in `init.lua`.

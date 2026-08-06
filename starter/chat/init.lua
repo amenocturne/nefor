@@ -56,9 +56,9 @@ do
   end
 
   local config_dir = os.getenv("NEFOR_CONFIG_DIR")
-  local dev_dir    = os.getenv("NEFOR_DEV_DIR")
-  local local_dir  = os.getenv("NEFOR_LOCAL_DIR")
-  local data_dir   = os.getenv("NEFOR_DATA_DIR")
+  local dev_dir     = os.getenv("NEFOR_DEV_DIR")
+  local runtime_dir = os.getenv("NEFOR_RUNTIME_ROOT")
+  local data_dir    = os.getenv("NEFOR_DATA_DIR")
   -- Bootstrap clone path (team consumers); mirrors how
   -- nefor.fs.data_root resolves $XDG_DATA_HOME/nefor or
   -- $HOME/.local/share/nefor on a fresh machine.
@@ -73,32 +73,10 @@ do
     pm_root = home .. "/.local/share/nefor/nefor"
   end
 
-  local function detected_local_nefor_root()
-    if not config_dir then return nil end
-    local fh = io.open(config_dir .. "/agentic-kit.json", "r")
-    if fh then
-      local raw = fh:read("*a"); fh:close()
-      local nefor_repo = raw:match('"nefor_repo"%s*:%s*"([^"]+)"')
-      if nefor_repo and path_exists(nefor_repo .. "/lua/nefor-pm/init.lua") then
-        return nefor_repo
-      end
-      local dev_workspace = raw:match('"dev_workspace"%s*:%s*"([^"]+)"')
-      if dev_workspace then
-        local candidate = dev_workspace .. "/personal/nefor"
-        if path_exists(candidate .. "/lua/nefor-pm/init.lua") then return candidate end
-      end
-    end
-    local sibling = config_dir .. "/../../../../nefor"
-    if path_exists(sibling .. "/lua/nefor-pm/init.lua") then return sibling end
-    return nil
-  end
-
-  local detected_dir = detected_local_nefor_root()
 
   local tui_lua_dir = pick_dir("NEFOR_TUI_LUA_DIR", "/init.lua", table.pack(
     dev_dir    and (dev_dir    .. "/plugins/nefor-tui/lua") or nil,
-    local_dir  and (local_dir  .. "/plugins/nefor-tui/lua") or nil,
-    detected_dir and (detected_dir .. "/plugins/nefor-tui/lua") or nil,
+    runtime_dir and (runtime_dir .. "/plugins/nefor-tui/lua") or nil,
     pm_root    and (pm_root    .. "/plugins/nefor-tui/lua") or nil,
     config_dir and (config_dir .. "/../plugins/nefor-tui/lua") or nil,
     "./plugins/nefor-tui/lua",
@@ -116,8 +94,7 @@ do
   -- in-process tests and development launchers.
   local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/update.lua", table.pack(
     dev_dir    and (dev_dir    .. "/starter/chat") or nil,
-    local_dir  and (local_dir  .. "/starter/chat") or nil,
-    detected_dir and (detected_dir .. "/starter/chat") or nil,
+    runtime_dir and (runtime_dir .. "/starter/chat") or nil,
     pm_root    and (pm_root    .. "/starter/chat") or nil,
     "./starter/chat",
     "../starter/chat"
@@ -130,8 +107,7 @@ do
   local config_lua_dir = pick_dir("NEFOR_STARTER_CONFIG_DIR", "/config/init.lua", table.pack(
     config_dir,
     dev_dir    and (dev_dir    .. "/starter") or nil,
-    local_dir  and (local_dir  .. "/starter") or nil,
-    detected_dir and (detected_dir .. "/starter") or nil,
+    runtime_dir and (runtime_dir .. "/starter") or nil,
     chat_parent,
     pm_root    and (pm_root    .. "/starter") or nil,
     "./starter",
@@ -157,8 +133,7 @@ do
   local lua_dir = pick_dir("NEFOR_LUA_DIR", "/core/ncp.lua", table.pack(
     dev_dir      and (dev_dir      .. "/lua") or nil,
     tui_root     and (tui_root     .. "/lua") or nil,
-    local_dir    and (local_dir    .. "/lua") or nil,
-    detected_dir and (detected_dir .. "/lua") or nil,
+    runtime_dir  and (runtime_dir  .. "/lua") or nil,
     pm_root      and (pm_root      .. "/lua") or nil,
     "./lua",
     "../lua"

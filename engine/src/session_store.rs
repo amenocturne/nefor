@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -16,6 +17,8 @@ pub enum SessionStoreError {
     InvalidInstallationId,
     #[error("session '{0}' does not exist")]
     Missing(String),
+    #[error("source and destination session roots must be different")]
+    SameRoot,
     #[error("session '{0}' already exists at the destination")]
     Collision(String),
     #[error("session '{session_id}' has invalid metadata: {reason}")]
@@ -32,12 +35,20 @@ pub struct SessionMetadata {
 
 pub struct SessionLease {
     lock: File,
+    root: PathBuf,
+    session_id: String,
     events_path: PathBuf,
 }
 
 impl SessionLease {
     pub fn events_path(&self) -> &Path {
         &self.events_path
+    }
+
+    pub fn commit_resume(&mut self, installation_id: &str) -> Result<(), SessionStoreError> {
+        validate_installation_id(installation_id)?;
+        append_installation(&self.root, &self.session_id, installation_id)?;
+        Ok(())
     }
 }
 
@@ -160,6 +171,8 @@ pub fn create_session(
     File::open(sessions_dir(root))?.sync_all()?;
     Ok(SessionLease {
         lock,
+        root: root.to_path_buf(),
+        session_id: id.to_owned(),
         events_path: events,
     })
 }
@@ -182,16 +195,6 @@ fn append_installation(
     Ok(events)
 }
 
-pub fn record_resume(
-    root: &Path,
-    id: &str,
-    installation_id: &str,
-) -> Result<PathBuf, SessionStoreError> {
-    validate_component(id)?;
-    validate_installation_id(installation_id)?;
-    append_installation(root, id, installation_id)
-}
-
 pub fn resume_session(
     root: &Path,
     id: &str,
@@ -200,9 +203,16 @@ pub fn resume_session(
     validate_component(id)?;
     validate_installation_id(installation_id)?;
     let lock = acquire_lock(root, id)?;
-    let events = append_installation(root, id, installation_id)?;
+    let dir = session_dir(root, id);
+    let events = events_path(root, id);
+    if !dir.is_dir() || !events.is_file() {
+        return Err(SessionStoreError::Missing(id.to_owned()));
+    }
+    read_metadata(&dir, id)?;
     Ok(SessionLease {
         lock,
+        root: root.to_path_buf(),
+        session_id: id.to_owned(),
         events_path: events,
     })
 }
@@ -211,15 +221,20 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), SessionStoreError>
     if !destination.exists() {
         fs::create_dir(destination)?;
     }
+    fs::set_permissions(destination, fs::symlink_metadata(source)?.permissions())?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
+        let metadata = fs::symlink_metadata(&source_path)?;
+        let file_type = metadata.file_type();
         if file_type.is_dir() {
             copy_tree(&source_path, &destination_path)?;
         } else if file_type.is_file() {
             fs::copy(&source_path, &destination_path)?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+        } else if file_type.is_symlink() {
+            unix_fs::symlink(fs::read_link(&source_path)?, &destination_path)?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -257,6 +272,11 @@ pub fn list_session_ids(root: &Path) -> Result<Vec<String>, SessionStoreError> {
     Ok(ids)
 }
 
+fn normalized_root(root: &Path) -> Result<PathBuf, SessionStoreError> {
+    fs::create_dir_all(root)?;
+    Ok(fs::canonicalize(root)?)
+}
+
 pub fn copy_session(
     source_root: &Path,
     destination_root: &Path,
@@ -265,12 +285,22 @@ pub fn copy_session(
 ) -> Result<(), SessionStoreError> {
     validate_component(id)?;
     validate_installation_id(destination_installation_id)?;
-    let _source_lock = acquire_lock(source_root, id)?;
-    let _destination_lock = acquire_lock(destination_root, id)?;
-    let source_dir = session_dir(source_root, id);
-    let source_events = events_path(source_root, id);
-    let destination_dir = session_dir(destination_root, id);
-    let destination_events = events_path(destination_root, id);
+    let source_root = normalized_root(source_root)?;
+    let destination_root = normalized_root(destination_root)?;
+    if source_root == destination_root {
+        return Err(SessionStoreError::SameRoot);
+    }
+    let (first_root, second_root) = if source_root < destination_root {
+        (&source_root, &destination_root)
+    } else {
+        (&destination_root, &source_root)
+    };
+    let _first_lock = acquire_lock(first_root, id)?;
+    let _second_lock = acquire_lock(second_root, id)?;
+    let source_dir = session_dir(&source_root, id);
+    let source_events = events_path(&source_root, id);
+    let destination_dir = session_dir(&destination_root, id);
+    let destination_events = events_path(&destination_root, id);
     if !source_dir.is_dir() || !source_events.is_file() {
         return Err(SessionStoreError::Missing(id.to_owned()));
     }
@@ -282,14 +312,18 @@ pub fn copy_session(
         .installation_history
         .push(destination_installation_id.to_owned());
 
-    fs::create_dir_all(sessions_dir(destination_root))?;
+    fs::create_dir_all(sessions_dir(&destination_root))?;
     let staging_dir = tempfile::Builder::new()
         .prefix(&format!(".{id}.copying-"))
-        .tempdir_in(sessions_dir(destination_root))?;
+        .tempdir_in(sessions_dir(&destination_root))?;
     copy_tree(&source_dir, staging_dir.path())?;
     atomic_write_json(&staging_dir.path().join(METADATA_FILE), &metadata)?;
-    let mut staging_events = tempfile::NamedTempFile::new_in(sessions_dir(destination_root))?;
-    io::copy(&mut File::open(source_events)?, &mut staging_events)?;
+    let mut staging_events = tempfile::NamedTempFile::new_in(sessions_dir(&destination_root))?;
+    io::copy(&mut File::open(&source_events)?, &mut staging_events)?;
+    fs::set_permissions(
+        staging_events.path(),
+        fs::symlink_metadata(&source_events)?.permissions(),
+    )?;
     staging_events.as_file().sync_all()?;
     staging_events
         .persist(&destination_events)
@@ -298,13 +332,14 @@ pub fn copy_session(
         let _ = fs::remove_file(&destination_events);
         return Err(error.into());
     }
-    File::open(sessions_dir(destination_root))?.sync_all()?;
+    File::open(sessions_dir(&destination_root))?.sync_all()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn copy_preserves_event_bytes_and_extends_provenance() {
@@ -337,7 +372,9 @@ mod tests {
         let lease = create_session(root.path(), "s1", "generation-a").unwrap();
         fs::write(lease.events_path(), b"events\n").unwrap();
         drop(lease);
-        drop(resume_session(root.path(), "s1", "generation-b").unwrap());
+        let mut lease = resume_session(root.path(), "s1", "generation-b").unwrap();
+        lease.commit_resume("generation-b").unwrap();
+        drop(lease);
         assert_eq!(
             read_metadata(&session_dir(root.path(), "s1"), "s1")
                 .unwrap()
@@ -354,5 +391,59 @@ mod tests {
             Err(SessionStoreError::Missing(_))
         ));
         assert!(!session_dir(root.path(), "missing").exists());
+    }
+
+    #[test]
+    fn copy_rejects_same_root_and_preserves_symlinks_and_permissions() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let lease = create_session(source.path(), "s1", "generation-a").unwrap();
+        fs::write(lease.events_path(), b"events\n").unwrap();
+        let tree = session_dir(source.path(), "s1");
+        fs::write(tree.join("opaque"), b"payload").unwrap();
+        fs::set_permissions(tree.join("opaque"), fs::Permissions::from_mode(0o640)).unwrap();
+        unix_fs::symlink("opaque", tree.join("link")).unwrap();
+        drop(lease);
+
+        assert!(matches!(
+            copy_session(source.path(), source.path(), "s1", "generation-b"),
+            Err(SessionStoreError::SameRoot)
+        ));
+        copy_session(source.path(), destination.path(), "s1", "generation-b").unwrap();
+        let copied = session_dir(destination.path(), "s1");
+        assert_eq!(
+            fs::read_link(copied.join("link")).unwrap(),
+            PathBuf::from("opaque")
+        );
+        assert_eq!(
+            fs::symlink_metadata(copied.join("opaque"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn resume_provenance_is_committed_only_after_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = create_session(root.path(), "s1", "generation-a").unwrap();
+        fs::write(lease.events_path(), b"events\n").unwrap();
+        drop(lease);
+        let mut lease = resume_session(root.path(), "s1", "generation-b").unwrap();
+        assert_eq!(
+            read_metadata(&session_dir(root.path(), "s1"), "s1")
+                .unwrap()
+                .installation_history,
+            vec!["generation-a"]
+        );
+        lease.commit_resume("generation-b").unwrap();
+        assert_eq!(
+            read_metadata(&session_dir(root.path(), "s1"), "s1")
+                .unwrap()
+                .installation_history,
+            vec!["generation-a", "generation-b"]
+        );
     }
 }

@@ -482,14 +482,14 @@ local function sync_checkout(opts, update)
       args[#args + 1] = "--filter=blob:none"
       args[#args + 1] = "--sparse"
     end
-    if ref_kind == "branch" or ref_kind == "tag" then
+    if spec.ref_kind == "branch" or spec.ref_kind == "tag" then
       args[#args + 1] = "--branch"
-      args[#args + 1] = ref
+      args[#args + 1] = spec.ref
     end
-    args[#args + 1] = opts.url
+    args[#args + 1] = spec.url
     args[#args + 1] = opts.dir
     git(label, args)
-    if ref_kind == "commit" then
+    if spec.ref_kind == "commit" then
       update_to_ref(label, spec, opts.dir)
     end
   else

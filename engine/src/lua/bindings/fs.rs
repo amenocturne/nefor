@@ -72,19 +72,16 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         })?,
     )?;
 
-    let session_root = data_root.clone();
     fs_tbl.set(
-        "session_record_resume",
-        lua.create_function(move |lua, id: String| {
+        "session_commit_resume",
+        lua.create_function(|lua, lease: AnyUserData| {
             let installation_id = std::env::var("NEFOR_INSTALLATION_ID").map_err(|_| {
                 mlua::Error::runtime("NEFOR_INSTALLATION_ID is required to resume sessions")
             })?;
+            let mut lease = lease.borrow_mut::<LuaSessionLease>()?;
             let table = lua.create_table()?;
-            match session_store::record_resume(&session_root, &id, &installation_id) {
-                Ok(path) => {
-                    table.set("ok", true)?;
-                    table.set("path", path.to_string_lossy().into_owned())?;
-                }
+            match lease.lease.commit_resume(&installation_id) {
+                Ok(()) => table.set("ok", true)?,
                 Err(error) => {
                     table.set("ok", false)?;
                     table.set("error", error.to_string())?;

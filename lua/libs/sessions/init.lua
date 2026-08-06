@@ -405,67 +405,64 @@ end
 ---@param show_loading boolean|nil
 local function do_resume(target_session_id, show_loading)
   if show_loading == nil then show_loading = true end
-  -- Same-id resume is a re-load, not a no-op. Chat.lua's `/resume`
-  -- and picker handlers locally clear the transcript BEFORE emitting
-  -- `sessions.resume_request` (the imminent replay is expected to
-  -- repaint), so an early-return here would leave the user staring
-  -- at an empty chat. Cycling the full lifecycle replays the on-disk
-  -- log against the (already-cleared) chat surface and rebuilds the
-  -- transcript exactly the way a cross-session resume does. close +
-  -- reopen of the same path is safe in append mode; the file's prior
-  -- traffic is what `replay_jsonl` reads, and `should_prune_session`
-  -- stays false when the file has content (so no prune happens).
-  --
+
   local acquired
   if state.current_session_id == target_session_id and state.current_session_lease then
-    acquired = nefor.fs.session_record_resume(target_session_id)
-    if acquired and acquired.ok then acquired.lease = state.current_session_lease end
+    acquired = {
+      ok = true,
+      path = state.current_session_path,
+      lease = state.current_session_lease,
+    }
   else
     acquired = acquire_session("session_resume", target_session_id)
   end
-  if not acquired or not acquired.ok then return nil end
-  cancel_replay()
+  if not acquired then return nil end
 
-  -- 1. Announce end of outgoing session. Cold-start `--session` resume
-  -- has no outgoing session yet.
+  -- Opening is part of activation. Do it while the target lease is held and
+  -- before touching the current session or its lifecycle events.
+  if not session_file_exists(acquired.path) then
+    if nefor.log then nefor.log.error("sessions.resume: session file disappeared before activation", {
+      path = acquired.path,
+    }) end
+    return nil
+  end
+  local fh, err, had_content = open_session_file(acquired.path, target_session_id)
+  if not fh then
+    if nefor.log then nefor.log.error("sessions.resume: failed to open session file", {
+      path = acquired.path, error = err,
+    }) end
+    return nil
+  end
+  local committed = nefor.fs.session_commit_resume(acquired.lease)
+  if not committed or not committed.ok then
+    fh:close()
+    if nefor.log then nefor.log.error("sessions.resume: failed to record provenance", {
+      session_id = target_session_id,
+      error = committed and committed.error or "unknown error",
+    }) end
+    return nil
+  end
+
+  cancel_replay()
   if state.current_session_id then
     send_msg({ kind = "control", event = "sessions.session_end",
                extra = { session_id = state.current_session_id } })
   end
-
-  -- 2. Swap state.
   close_and_prune_if_empty()
-  local new_path = acquired.path
-  state.current_session_id   = target_session_id
-  state.current_session_path = new_path
+  state.current_session_id = target_session_id
+  state.current_session_path = acquired.path
+  state.current_session_file = fh
   state.current_session_lease = acquired.lease
+  state.should_prune_session = not had_content
 
-  if new_path and session_file_exists(new_path) then
-    local fh, err, had_content = open_session_file(new_path, target_session_id)
-    if not fh and nefor.log then
-      nefor.log.error("sessions.resume: failed to open session file", {
-        path = new_path, error = err,
-      })
-    end
-    state.current_session_file = fh
-    state.should_prune_session = not had_content
-  end
-
-  -- 3. Announce start of incoming session BEFORE replay.
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = target_session_id, from_resume = true } })
-
-  -- 4. Replay each bounded chunk in its own start/end frame. This keeps
-  -- replay provenance exact while the broker admits live traffic between
-  -- continuations: unrelated entries can only land between frames.
-  -- Loading starts before the single-pass scan, whose byte total is read
-  -- from the already-open file without walking its contents.
   if show_loading then
     send_msg({ kind = "control", event = "sessions.resume_loading",
                extra = { session_id = target_session_id } })
   end
   local generation = state.replay_generation
-  begin_replay(new_path, target_session_id, show_loading, generation, function(replayed)
+  begin_replay(acquired.path, target_session_id, show_loading, generation, function(replayed)
     if generation ~= state.replay_generation then return end
     state.replay_session_id = nil
     send_msg({ kind = "control", event = "sessions.resume_done",

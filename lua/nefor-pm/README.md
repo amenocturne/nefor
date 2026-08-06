@@ -144,6 +144,7 @@ pm.install({
   reuses it without contacting the source. Without a lockfile, `sync_checkout`
   retains its direct ref-synchronising behavior.
 - Installed runtimes should use only the managed checkout and copied build
-  outputs. Pointing specs at a mutable source tree with `dir` is an explicit
-  development override (normally selected through `NEFOR_DEV_DIR`), not an
-  installed-channel mechanism.
+  outputs, setting `NEFOR_RUNTIME_ROOT` to that immutable checkout. Pointing
+  specs at a mutable source tree with `dir` is an explicit development override
+  (normally selected through `NEFOR_DEV_DIR`), not an installed-channel
+  mechanism.

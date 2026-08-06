@@ -137,10 +137,14 @@ build:
 
 # Build this checkout and copy a channel-neutral runtime without pruning sibling distributions.
 # `expected_commit` lets an installer prove it is building the pm-resolved checkout.
-install-source command="nefor" engine_dir="$HOME/.local/bin" mag_dir="$HOME/.local/bin" plugin_root="$HOME/.local/share/nefor/bin" build_target="target" expected_commit="":
+install-source expected_commit command engine_dir mag_dir plugin_root build_target="target":
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
+    if [ -z "{{expected_commit}}" ]; then echo "expected_commit is required" >&2; exit 1; fi
+    if [ "{{engine_dir}}" = "{{mag_dir}}" ] || [ "{{engine_dir}}" = "{{plugin_root}}" ] || [ "{{mag_dir}}" = "{{plugin_root}}" ]; then
+      echo "engine_dir, mag_dir, and plugin_root must be distinct" >&2; exit 1
+    fi
     if [ -n "{{expected_commit}}" ]; then
       actual_commit="$(git rev-parse --verify 'HEAD^{commit}')"
       expected="$(git rev-parse --verify '{{expected_commit}}^{commit}')"

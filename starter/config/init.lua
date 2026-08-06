@@ -13,21 +13,6 @@ local M = {}
 
 local DEFAULT_REASONING_EFFORT = "xhigh"
 
-local function path_exists(p)
-  local f = io.open(p, "r")
-  if f then f:close(); return true end
-  return false
-end
-
-local function read_nefor_repo()
-  local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
-  local fh = io.open(config_dir .. "/agentic-kit.json", "r")
-  if not fh then return nil end
-  local raw = fh:read("*a")
-  fh:close()
-  return raw:match('"nefor_repo"%s*:%s*"([^"]+)"')
-end
-
 local function env_truthy(name)
   local v = os.getenv(name)
   return v == "1" or v == "true" or v == "TRUE" or v == "yes" or v == "YES"
@@ -49,30 +34,14 @@ end
 -- NEFOR_PLUGIN_DIR before any Lua runs (resolved from the engine's
 -- install layout — see crates/nefor/src/main.rs).
 --
--- Installed configs default to NEFOR_PLUGIN_DIR. A checkout's target/debug
--- can otherwise silently shadow a freshly installed plugin binary and leave
--- live sessions running stale code. Set NEFOR_USE_REPO_PLUGIN_BINS=1 when
--- deliberately testing binaries from agentic-kit.json's nefor_repo checkout.
+-- Installed and development launchers both provide the plugin directory
+-- explicitly. Runtime resolution never probes mutable source checkouts.
 M.bin = function(name)
   local plugin_dir = os.getenv("NEFOR_PLUGIN_DIR")
   if not plugin_dir or plugin_dir == "" then
     error("NEFOR_PLUGIN_DIR is not set; the engine resolves this "
        .. "automatically when started via `nefor`. If you see this "
        .. "from a custom harness, set it explicitly or pass --plugin-dir.")
-  end
-
-  if env_truthy("NEFOR_USE_REPO_PLUGIN_BINS") then
-    local nefor_repo = read_nefor_repo()
-    if nefor_repo then
-      local debug_bin = nefor_repo .. "/target/debug/" .. name
-      if path_exists(debug_bin) then
-        return resolved_bin(name, debug_bin, "agentic-kit.json nefor_repo target/debug")
-      end
-      local release_bin = nefor_repo .. "/target/release/" .. name
-      if path_exists(release_bin) then
-        return resolved_bin(name, release_bin, "agentic-kit.json nefor_repo target/release")
-      end
-    end
   end
 
   return resolved_bin(name, plugin_dir .. "/" .. name, "NEFOR_PLUGIN_DIR")

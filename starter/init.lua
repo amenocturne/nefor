@@ -1,21 +1,13 @@
 -- init.lua — starter composition.
 --
--- Lua libraries are bootstrapped via sparse-clone of the upstream repo
--- into ~/.local/share/nefor/nefor/ (same as end-user install).
---
--- Bootstrap order:
---   1. NEFOR_DEV_DIR set     → in-checkout dev mode; resolve from there.
---   2. NEFOR_LOCAL_DIR set   → local checkout override for installed configs.
---   3. agentic-kit.json nefor_repo → per-install local checkout override.
---   4. sibling checkout      → auto-detected from agentic-kit.json dev workspace.
---   5. STARTER_ROOT/../lua/nefor-pm exists → in-checkout (running via
---                                            `just run`); use ../lua etc.
---   6. otherwise             → sparse-clone amenocturne/nefor at the
---                              pinned ref into <DATA>/nefor/, use that.
+-- Runtime source is selected through one of two explicit contracts:
+--   * NEFOR_DEV_DIR: mutable checkout for intentional in-repo development.
+--   * NEFOR_RUNTIME_ROOT: immutable, installer-managed checkout for installed distributions.
+-- Without either, the starter bootstraps its versioned checkout below the data root.
 
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
-local NEFOR_LOCAL_DIR = os.getenv("NEFOR_LOCAL_DIR")
+local NEFOR_RUNTIME_ROOT = os.getenv("NEFOR_RUNTIME_ROOT")
 
 local UPSTREAM_REF
 do
@@ -26,129 +18,48 @@ do
     UPSTREAM_REF = "main"
   end
 end
-local SPARSE_CONE  = "lua starter plugins"
+local SPARSE_CONE = "lua starter plugins"
 
 local function path_exists(p)
-  if nefor and nefor.fs and nefor.fs.exists then
-    return nefor.fs.exists(p)
-  end
+  if nefor and nefor.fs and nefor.fs.exists then return nefor.fs.exists(p) end
   local f = io.open(p, "r")
   if f then f:close(); return true end
   return false
 end
-
 local function run(cmd)
   local ok = os.execute(cmd)
   return ok == true or ok == 0
 end
-
-local function sh_quote(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
-
-local function valid_nefor_root(root)
-  return root and #root > 0 and path_exists(root .. "/lua/nefor-pm/init.lua")
-end
-
+local function sh_quote(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 local function explicit_nefor_root(env_name, root)
-  if not root or #root == 0 then return nil end
-  if valid_nefor_root(root) then return root end
-  error("nefor bootstrap: " .. env_name .. "=" .. root
-        .. " does not contain lua/nefor-pm/init.lua")
+  if not root or root == "" then return nil end
+  if path_exists(root .. "/lua/nefor-pm/init.lua") then return root end
+  error("nefor bootstrap: " .. env_name .. "=" .. root .. " does not contain lua/nefor-pm/init.lua")
 end
-
-local function read_agentic_kit_path(key)
-  local fh = io.open(STARTER_ROOT .. "/agentic-kit.json", "r")
-  if not fh then return nil end
-  local raw = fh:read("*a")
-  fh:close()
-  local ok, decoded = pcall(nefor.json.decode, raw)
-  if ok and type(decoded) == "table" and type(decoded[key]) == "string" then
-    return decoded[key]
-  end
-  return raw:match('"' .. key .. '"%s*:%s*"([^"]+)"')
-end
-
-local function read_agentic_kit_nefor_repo()
-  return read_agentic_kit_path("nefor_repo")
-end
-
-local function read_agentic_kit_dev_workspace()
-  return read_agentic_kit_path("dev_workspace")
-end
-
-local function detected_local_nefor_root()
-  local dev_workspace = read_agentic_kit_dev_workspace()
-  if dev_workspace then
-    local candidate = dev_workspace .. "/personal/nefor"
-    if valid_nefor_root(candidate) then return candidate end
-  end
-  local sibling = STARTER_ROOT .. "/../../../../nefor"
-  if valid_nefor_root(sibling) then return sibling end
-  return nil
-end
-
 local function ensure_upstream_checkout(pm_root)
-  local root = sh_quote(pm_root)
-  local ref = sh_quote(UPSTREAM_REF)
-  local fetch_ref = ref
-  if UPSTREAM_REF:match("^v%d+%.%d+%.%d+$") then
-    fetch_ref = "tag " .. ref
-  end
-
+  local root, ref = sh_quote(pm_root), sh_quote(UPSTREAM_REF)
+  local fetch_ref = UPSTREAM_REF:match("^v%d+%.%d+%.%d+$") and ("tag " .. ref) or ref
   if not path_exists(pm_root) then
     nefor.fs.mkdir_p(nefor.fs.data_root())
-    local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
-                   .. "--branch " .. ref .. " "
-                   .. "https://github.com/amenocturne/nefor.git " .. root
-    if not run(clone_cmd) then
-      error("nefor bootstrap: git clone failed for ref " .. UPSTREAM_REF
-            .. ". Check git is on PATH, the network is reachable, and the "
-            .. "ref exists on origin.")
+    if not run("git clone --depth 1 --filter=blob:none --sparse --branch " .. ref .. " https://github.com/amenocturne/nefor.git " .. root) then
+      error("nefor bootstrap: git clone failed for ref " .. UPSTREAM_REF)
     end
   elseif not path_exists(pm_root .. "/.git") then
     error("nefor bootstrap: " .. pm_root .. " exists but is not a git checkout")
   else
-    -- A release checkout already at its exact local tag is authoritative and
-    -- needs no network. The shell comparison deliberately resolves annotated
-    -- tags to commits before comparing them with HEAD.
-    local exact_local_pin = UPSTREAM_REF:match("^v%d+%.%d+%.%d+$")
-      and run("test \"$(git -C " .. root .. " rev-parse HEAD)\" = "
-           .. "\"$(git -C " .. root .. " rev-parse " .. ref .. "^{commit})\"")
-    if not exact_local_pin then
-      if not run("git -C " .. root .. " fetch --depth 1 origin " .. fetch_ref) then
-        error("nefor bootstrap: git fetch failed for ref " .. UPSTREAM_REF
-              .. "; no valid exact local pin is available")
-      end
-      if not run("git -C " .. root .. " checkout --force FETCH_HEAD") then
-        error("nefor bootstrap: git checkout failed for ref " .. UPSTREAM_REF)
-      end
+    local exact = UPSTREAM_REF:match("^v%d+%.%d+%.%d+$") and run("test \"$(git -C " .. root .. " rev-parse HEAD)\" = \"$(git -C " .. root .. " rev-parse " .. ref .. "^{commit})\"")
+    if not exact and (not run("git -C " .. root .. " fetch --depth 1 origin " .. fetch_ref) or not run("git -C " .. root .. " checkout --force FETCH_HEAD")) then
+      error("nefor bootstrap: cannot resolve ref " .. UPSTREAM_REF)
     end
   end
-
-  if not run("git -C " .. root .. " sparse-checkout set " .. SPARSE_CONE) then
-    error("nefor bootstrap: git sparse-checkout failed for " .. pm_root)
-  end
+  if not run("git -C " .. root .. " sparse-checkout set " .. SPARSE_CONE) then error("nefor bootstrap: sparse checkout failed") end
 end
 
-local NEFOR_ROOT
-local explicit_root = explicit_nefor_root("NEFOR_DEV_DIR", NEFOR_DEV_DIR)
-                   or explicit_nefor_root("NEFOR_LOCAL_DIR", NEFOR_LOCAL_DIR)
-                   or explicit_nefor_root(
-                     "agentic-kit.json nefor_repo",
-                     read_agentic_kit_nefor_repo())
-local detected_root = detected_local_nefor_root()
-if explicit_root then
-  NEFOR_ROOT = explicit_root
-elseif detected_root then
-  NEFOR_ROOT = detected_root
-elseif path_exists(STARTER_ROOT .. "/../lua/nefor-pm/init.lua") then
-  NEFOR_ROOT = STARTER_ROOT .. "/.."
-else
-  local data_dir = nefor.fs.data_root()
-  local pm_root  = data_dir .. "/nefor"
-  ensure_upstream_checkout(pm_root)
-  NEFOR_ROOT = pm_root
+local NEFOR_ROOT = explicit_nefor_root("NEFOR_DEV_DIR", NEFOR_DEV_DIR)
+  or explicit_nefor_root("NEFOR_RUNTIME_ROOT", NEFOR_RUNTIME_ROOT)
+if not NEFOR_ROOT then
+  NEFOR_ROOT = nefor.fs.data_root() .. "/nefor"
+  ensure_upstream_checkout(NEFOR_ROOT)
 end
 
 local LUA_ROOT = NEFOR_ROOT .. "/lua"
