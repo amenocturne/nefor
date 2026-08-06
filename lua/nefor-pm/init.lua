@@ -330,9 +330,29 @@ local function git_fetch_ref(spec)
 end
 
 local function current_commit(dir)
-  local res = run_cmd({ "git", "-C", dir, "rev-parse", "HEAD" })
+  local res = run_cmd({ "git", "-C", dir, "rev-parse", "--verify", "HEAD^{commit}" })
   if not res.ok then return nil end
   return (res.stdout:gsub("%s+$", ""))
+end
+
+local function resolved_commit(dir, ref)
+  local res = run_cmd({ "git", "-C", dir, "rev-parse", "--verify", ref .. "^{commit}" })
+  if not res.ok then return nil end
+  return (res.stdout:gsub("%s+$", ""))
+end
+
+local function verify_checkout(label, dir, expected_ref)
+  local expected = resolved_commit(dir, expected_ref)
+  local head = current_commit(dir)
+  if not expected then
+    fail(label, "requested revision is unavailable after checkout: " .. expected_ref)
+  end
+  if head ~= expected then
+    fail(label, string.format(
+      "checkout HEAD mismatch: expected %s (%s), got %s",
+      expected_ref, expected, tostring(head)))
+  end
+  return head
 end
 
 -- A successfully cloned plugin's marker — git always creates `.git`. We use
@@ -453,8 +473,9 @@ local function sync_checkout(opts, update)
   end
 
   local head_now = is_cloned(opts.dir) and current_commit(opts.dir) or nil
-  if head_now == spec.ref then
-    -- Exact local pins are complete without network access.
+  local local_target = is_cloned(opts.dir) and resolved_commit(opts.dir, spec.ref) or nil
+  if head_now and local_target and head_now == local_target then
+    -- A locally available exact revision is complete without contacting origin.
   elseif not is_cloned(opts.dir) then
     local args = { "clone", "--depth", "1" }
     if sparse_paths then
@@ -475,8 +496,10 @@ local function sync_checkout(opts, update)
     update_to_ref(label, spec, opts.dir)
   end
 
+  local commit = verify_checkout(label, opts.dir, spec.ref)
+
   if is_string(pin_path) and (not pin or update) then
-    local write = require_fs().write_file(pin_path, (current_commit(opts.dir) or "") .. "\n")
+    local write = require_fs().write_file(pin_path, commit .. "\n")
     if not write.ok then fail(label, "cannot write checkout lock: " .. tostring(write.error)) end
   end
 
@@ -492,7 +515,8 @@ local function sync_checkout(opts, update)
     dir      = opts.dir,
     ref      = ref,
     ref_kind = ref_kind,
-    commit   = current_commit(opts.dir),
+    commit   = commit,
+    head     = commit,
   }
 end
 

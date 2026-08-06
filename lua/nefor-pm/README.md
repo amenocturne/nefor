@@ -135,5 +135,15 @@ pm.install({
   for the engine itself (or build from source via `cargo install`).
 - After `nefor-pm` is loaded, use `pm.sync_checkout({...})` for another managed
   checkout. Pass `lockfile = "/path/to/commit.lock"` to persist and reuse its
-  exact commit; only `pm.update_checkout({...})` moves that pin. Without a
-  lockfile, `sync_checkout` retains its direct ref-synchronising behavior.
+  exact commit; only `pm.update_checkout({...})` moves that pin. The returned
+  record includes `dir`, `commit`, and `head`; `commit` and `head` are the
+  verified checkout `HEAD`, so an installer can build the engine, plugins, and
+  Lua libraries from exactly that directory and identity. A local repository
+  path is a supported `url`, including commits that exist only in its local
+  object database. Once the exact pinned commit is checked out, ordinary sync
+  reuses it without contacting the source. Without a lockfile, `sync_checkout`
+  retains its direct ref-synchronising behavior.
+- Installed runtimes should use only the managed checkout and copied build
+  outputs. Pointing specs at a mutable source tree with `dir` is an explicit
+  development override (normally selected through `NEFOR_DEV_DIR`), not an
+  installed-channel mechanism.

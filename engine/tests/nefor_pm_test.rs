@@ -959,6 +959,90 @@ fn sync_checkout_updates_existing_checkout_to_requested_tag() {
 }
 
 #[test]
+fn sync_checkout_resolves_unpushed_local_commit_and_keeps_authoritative_pin_offline() {
+    let work = tempfile::tempdir().expect("workdir");
+    let source = work.path().join("source");
+    let _url = make_origin_repo(&source);
+    let first = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&source)
+        .output()
+        .expect("read first commit");
+    assert!(first.status.success());
+    let first = String::from_utf8_lossy(&first.stdout).trim().to_owned();
+
+    std::fs::write(source.join("README.md"), "local-only second commit\n").expect("update");
+    run_git(&source, &["add", "README.md"]);
+    run_git(&source, &["commit", "-m", "local only", "--quiet"]);
+    let second = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&source)
+        .output()
+        .expect("read second commit");
+    assert!(second.status.success());
+    let second = String::from_utf8_lossy(&second.stdout).trim().to_owned();
+
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let checkout = data.path().join("managed-nefor");
+    let lockfile = data.path().join("nefor.commit");
+    let lua = lua_with_pm();
+    let sync = |commit: &str, update: bool| {
+        let operation = if update {
+            "update_checkout"
+        } else {
+            "sync_checkout"
+        };
+        lua.load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            local resolved = pm.{operation}({{
+              name = "managed-nefor",
+              dir = "{}",
+              url = "{}",
+              ref = "{commit}",
+              ref_kind = "commit",
+              lockfile = "{}",
+            }})
+            return resolved.dir, resolved.commit, resolved.head
+            "#,
+            checkout.display(),
+            source.display(),
+            lockfile.display(),
+        ))
+        .eval::<(String, String, String)>()
+    };
+
+    let (resolved_dir, commit, head) = sync(&first, false).expect("resolve local commit");
+    assert_eq!(resolved_dir, checkout.to_string_lossy());
+    assert_eq!(commit, first);
+    assert_eq!(
+        head, first,
+        "reported identity must be verified checkout HEAD"
+    );
+
+    let (_, commit, _) = sync(&second, false).expect("ordinary sync keeps pin");
+    assert_eq!(
+        commit, first,
+        "ordinary sync must not move authoritative pin"
+    );
+
+    std::fs::rename(&source, work.path().join("source-offline")).expect("hide source");
+    let (_, commit, head) = sync(&second, false).expect("reuse exact checkout offline");
+    assert_eq!(commit, first);
+    assert_eq!(head, first);
+
+    std::fs::rename(work.path().join("source-offline"), &source).expect("restore source");
+    let (_, commit, head) = sync(&second, true).expect("explicit update moves pin");
+    assert_eq!(commit, second);
+    assert_eq!(head, second);
+    assert_eq!(
+        std::fs::read_to_string(lockfile).expect("read lock").trim(),
+        second
+    );
+}
+
+#[test]
 fn install_sparse_checkout_pulls_only_subtree() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");

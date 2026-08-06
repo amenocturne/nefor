@@ -28,6 +28,10 @@ test-fast:
     cargo test -p tool-gate-plugin
     cargo test -p nefor-tui --test chat_test starter_tool_catalog_replay_freshness_and_atomic_replacement -- --exact --test-threads=1
 
+# Nefor package-manager checkout, locking, local-source, and build behavior.
+test-pm:
+    cargo test -p nefor --test nefor_pm_test
+
 # Starter Lua, session, workflow, role, and bundled tool integration tests.
 test-starter:
     cargo test -p nefor --test starter_tool_gate_test
@@ -130,6 +134,33 @@ fmt:
 # Release build of the whole workspace into target/release/.
 build:
     cargo build --workspace --release
+
+# Build this checkout and copy a channel-neutral runtime without pruning sibling distributions.
+# `expected_commit` lets an installer prove it is building the pm-resolved checkout.
+install-source command="nefor" engine_dir="$HOME/.local/bin" mag_dir="$HOME/.local/bin" plugin_root="$HOME/.local/share/nefor/bin" build_target="target" expected_commit="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}"
+    if [ -n "{{expected_commit}}" ]; then
+      actual_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+      expected="$(git rev-parse --verify '{{expected_commit}}^{commit}')"
+      if [ "$actual_commit" != "$expected" ]; then
+        echo "refusing runtime build: checkout HEAD $actual_commit != expected $expected" >&2
+        exit 1
+      fi
+    fi
+    cargo build --workspace --release --target-dir "{{build_target}}"
+    release_dir="{{build_target}}/release"
+    mkdir -p "{{engine_dir}}" "{{mag_dir}}" "{{plugin_root}}"
+    install -m 0755 "$release_dir/nefor" "{{engine_dir}}/{{command}}"
+    install -m 0755 "$release_dir/mag" "{{mag_dir}}/mag"
+    plugins="$(tools/plugin-binaries.sh)"
+    for name in $plugins; do
+      install -m 0755 "$release_dir/$name" "{{plugin_root}}/$name"
+    done
+    echo "  {{engine_dir}}/{{command}}"
+    echo "  {{mag_dir}}/mag"
+    echo "  plugins -> {{plugin_root}}"
 
 # Opt-in optimized MAG compiler benchmark; writes a metadata-rich JSON report to stdout.
 bench-mag *args:
