@@ -111,6 +111,8 @@ function M.bordered_popup_shell(scroll_key, child, border_style, stick_to, heade
       child = content,
     }
   end
+  -- The body owns virtual-content selection; the shell owns its remaining
+  -- chrome so no painted popup cell can fall through to a selectable underlay.
   local body_bg = tui.fill { char = " " }
   local body_row = tui.row {
     gap = 0,
@@ -121,10 +123,11 @@ function M.bordered_popup_shell(scroll_key, child, border_style, stick_to, heade
           children = {
             body_bg,
             inset(tui.scrollable {
-              key       = scroll_key,
-              scrollbar = "auto",
-              stick_to  = stick_to,
-              child     = child,
+              key        = scroll_key,
+              scrollbar  = "auto",
+              stick_to   = stick_to,
+              selectable = true,
+              child      = child,
             }),
           },
         },
@@ -137,7 +140,12 @@ function M.bordered_popup_shell(scroll_key, child, border_style, stick_to, heade
   children[#children + 1] = tui.expanded { child = body_row }
   if footer ~= nil then children[#children + 1] = inset(footer) end
   children[#children + 1] = rule_row("╰", "╯")
-  return tui.column { gap = 0, children = children }
+  return tui.column {
+    key = scroll_key .. "_surface",
+    selectable = true,
+    gap = 0,
+    children = children,
+  }
 end
 
 return M

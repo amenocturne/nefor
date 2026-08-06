@@ -14,6 +14,7 @@
 //! 5. `tui.scroll_into_view(key)` jumps back to the bottom (v1 minimal
 //!    semantics).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use nefor_tui::engine::Engine;
@@ -35,6 +36,116 @@ fn render_str(engine: &mut Engine) -> String {
         .expect("render")
         .expect("dirty after dispatch");
     String::from_utf8(bytes).expect("ansi is utf-8")
+}
+
+fn popup_selection_scenario() -> String {
+    let plugin_lua = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+    format!(
+        r#"
+        package.path = {plugin_lua:?} .. "/?.lua;"
+          .. {plugin_lua:?} .. "/?/init.lua;" .. package.path
+        package.preload["nefor-tui.util"] = function() return require("util") end
+        local popup = require("widget.popup")
+
+        tui.start {{
+          initial_state = {{}},
+          view = function(_)
+            local underlay = {{}}
+            for _ = 1, 12 do
+              underlay[#underlay + 1] = tui.text {{
+                content = string.rep("UNDERLAY-", 10), wrap = "none"
+              }}
+            end
+            return tui.stack {{ children = {{
+              tui.scrollable {{
+                key = "underlay", selectable = true,
+                child = tui.column {{ gap = 0, children = underlay }},
+              }},
+              popup.view({{
+                open = true, width = "70%", height = "60%",
+                scroll_key = "popup-overlap", title = "popup",
+                child = tui.text {{ content = "POPUP-OWNED-TEXT", wrap = "none" }},
+              }}),
+            }} }}
+          end,
+          update = function(msg, state)
+            if msg.kind == "mouse.selection" then
+              tui.emit {{ kind = "selection.captured", text = msg.text or "" }}
+            end
+            return state, {{}}
+          end,
+        }}
+        "#,
+        plugin_lua = plugin_lua.display().to_string(),
+    )
+}
+
+#[test]
+fn popup_body_owns_selection_over_selectable_underlay() {
+    let mut engine = Engine::new(60, 16).expect("engine");
+    engine
+        .load_scenario(&popup_selection_scenario())
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+
+    let snapshot = engine.snapshot();
+    let row = snapshot
+        .lines()
+        .position(|line| line.contains("POPUP-OWNED-TEXT"))
+        .expect("popup text row");
+    let col = snapshot
+        .lines()
+        .nth(row)
+        .and_then(|line| line.chars().position(|ch| ch == 'P'))
+        .expect("popup text column");
+    let end = col + "POPUP-OWNED-TEXT".len() - 1;
+
+    drag_select(
+        &mut engine,
+        (col as u16, row as u16),
+        &[(end as u16, row as u16)],
+        (end as u16, row as u16),
+    );
+
+    assert_eq!(
+        last_captured_selection(&mut engine).as_deref(),
+        Some("POPUP-OWNED-TEXT"),
+        "the topmost popup must capture its visible text, never the transcript beneath it",
+    );
+}
+
+#[test]
+fn popup_chrome_blocks_selection_from_selectable_underlay() {
+    let mut engine = Engine::new(60, 16).expect("engine");
+    engine
+        .load_scenario(&popup_selection_scenario())
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+
+    let snapshot = engine.snapshot();
+    let row = snapshot
+        .lines()
+        .position(|line| line.contains("popup"))
+        .expect("popup title row");
+    let col = snapshot
+        .lines()
+        .nth(row)
+        .and_then(|line| line.chars().position(|ch| ch == 'p'))
+        .expect("popup title column");
+    let end = col + "popup".len() - 1;
+
+    drag_select(
+        &mut engine,
+        (col as u16, row as u16),
+        &[(end as u16, row as u16)],
+        (end as u16, row as u16),
+    );
+
+    assert_eq!(
+        last_captured_selection(&mut engine).as_deref(),
+        Some("popup"),
+        "popup chrome must occlude selectable content beneath the overlay",
+    );
 }
 
 #[test]
