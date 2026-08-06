@@ -60,3 +60,5 @@ nefor
 - **Switch provider/model**: edit the `providers` list in `config/init.lua`. `mock-plugin` is spawned out of the box and is the default provider for deterministic startup. `chatgpt` and `ollama` are opt-in via `NEFOR_ENABLE_CHATGPT=1` and `NEFOR_ENABLE_OLLAMA=1` (or by editing `config/init.lua`). Pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.
 - **Compact ChatGPT context**: `/compact` asks ChatGPT’s native Responses compaction endpoint to seal the conversation so far. Later turns restore that compacted context into their fresh provider chats; switching provider or model falls back to the full local transcript.
 - **Inspect ChatGPT quota**: `/usage` shows both quota windows and reset times. When the active provider advertises usage support, the footer keeps a compact available-capacity gauge such as `◔ 34% until 14:30`.
+
+Session provenance, the required installed-distribution generation-ID contract, and the non-destructive `copy-sessions` command are documented in [`docs/session-provenance.md`](../docs/session-provenance.md).

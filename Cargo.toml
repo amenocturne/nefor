@@ -12,7 +12,7 @@ repository = "https://github.com/amenocturne/nefor"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 mlua = { version = "0.10", features = ["lua54", "async", "send", "vendored", "serialize"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

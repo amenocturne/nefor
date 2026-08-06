@@ -51,6 +51,7 @@ local state = {
   current_session_path = nil,
   ---@type file*|nil
   current_session_file = nil,
+  current_session_lease = nil,
 
   -- True when the active session has nothing worth keeping; flipped
   -- false when a real user submit is persisted. Startup-only sessions
@@ -158,7 +159,12 @@ local function close_and_prune_if_empty()
   close_session_file()
   if state.should_prune_session and state.current_session_path then
     pcall(os.remove, state.current_session_path)
+    local id = state.current_session_id
+    if id and SESSIONS_DIR then
+      pcall(nefor.fs.remove_dir_all, SESSIONS_DIR .. "/" .. id)
+    end
   end
+  state.current_session_lease = nil
   state.should_prune_session = true
 end
 
@@ -384,6 +390,17 @@ local function begin_replay(path, session_id, report_progress, generation, finis
   nefor.engine.defer(step)
 end
 
+local function acquire_session(action, session_id)
+  local result = nefor.fs[action](session_id)
+  if not result or not result.ok then
+    if nefor.log then nefor.log.error("sessions: failed to acquire session", {
+      session_id = session_id, error = result and result.error or "unknown error",
+    }) end
+    return nil
+  end
+  return result
+end
+
 ---@param target_session_id string
 ---@param show_loading boolean|nil
 local function do_resume(target_session_id, show_loading)
@@ -399,6 +416,14 @@ local function do_resume(target_session_id, show_loading)
   -- traffic is what `replay_jsonl` reads, and `should_prune_session`
   -- stays false when the file has content (so no prune happens).
   --
+  local acquired
+  if state.current_session_id == target_session_id and state.current_session_lease then
+    acquired = nefor.fs.session_record_resume(target_session_id)
+    if acquired and acquired.ok then acquired.lease = state.current_session_lease end
+  else
+    acquired = acquire_session("session_resume", target_session_id)
+  end
+  if not acquired or not acquired.ok then return nil end
   cancel_replay()
 
   -- 1. Announce end of outgoing session. Cold-start `--session` resume
@@ -410,9 +435,10 @@ local function do_resume(target_session_id, show_loading)
 
   -- 2. Swap state.
   close_and_prune_if_empty()
-  local new_path = session_path_for(target_session_id)
+  local new_path = acquired.path
   state.current_session_id   = target_session_id
   state.current_session_path = new_path
+  state.current_session_lease = acquired.lease
 
   if new_path and session_file_exists(new_path) then
     local fh, err, had_content = open_session_file(new_path, target_session_id)
@@ -445,10 +471,23 @@ local function do_resume(target_session_id, show_loading)
     send_msg({ kind = "control", event = "sessions.resume_done",
                extra = { session_id = target_session_id, replayed = replayed } })
   end)
+  return target_session_id
 end
 
 local function do_new()
-  do_resume(uuid_v4())
+  local id = uuid_v4()
+  local acquired = acquire_session("session_create", id)
+  if not acquired then return nil end
+  cancel_replay()
+  if state.current_session_id then
+    send_msg({ kind = "control", event = "sessions.session_end", extra = { session_id = state.current_session_id } })
+  end
+  close_and_prune_if_empty()
+  state.current_session_id = id
+  state.current_session_path = acquired.path
+  state.current_session_lease = acquired.lease
+  send_msg({ kind = "control", event = "sessions.session_start", extra = { session_id = id } })
+  return id
 end
 
 local function do_shutdown()
@@ -473,25 +512,24 @@ local function do_init(resume_id)
   state.initialised = true
 
   if resume_id and resume_id ~= "" then
-    do_resume(resume_id, false)
-    return resume_id
+    local resumed = do_resume(resume_id, false)
+    if not resumed then state.initialised = false end
+    return resumed
   end
 
   local id = uuid_v4()
-  local path = session_path_for(id)
-
-  state.current_session_id   = id
-  state.current_session_path = path
+  local acquired = acquire_session("session_create", id)
+  if not acquired then
+    state.initialised = false
+    return nil
+  end
+  state.current_session_id = id
+  state.current_session_path = acquired.path
+  state.current_session_lease = acquired.lease
   state.current_session_file = nil
   state.should_prune_session = true
-
-  send_msg({ kind = "control", event = "sessions.session_start",
-             extra = { session_id = id } })
-
-  if nefor.log then
-    nefor.log.info("sessions.init: session opened", { session_id = id, path = path })
-  end
-
+  send_msg({ kind = "control", event = "sessions.session_start", extra = { session_id = id } })
+  if nefor.log then nefor.log.info("sessions.init: session opened", { session_id = id, path = acquired.path }) end
   return id
 end
 
@@ -580,6 +618,7 @@ return {
       close_session_file()
       state.current_session_id    = nil
       state.current_session_path  = nil
+      state.current_session_lease = nil
       state.should_prune_session  = true
       state.initialised           = false
       state.in_replay_window      = false

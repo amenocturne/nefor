@@ -1555,7 +1555,63 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let data_dir = std::env::var("NEFOR_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-test-data"));
-    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir))?;
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir.clone()))?;
+    // Most legacy session tests isolate Lua behavior from the Rust provenance
+    // boundary. Focused binding/store tests exercise locking and metadata.
+    let fs: Table = nefor.get("fs")?;
+    let create_root = data_dir.clone();
+    fs.set(
+        "session_create",
+        lua.create_function(move |lua, id: String| {
+            let result = lua.create_table()?;
+            result.set("ok", true)?;
+            result.set(
+                "path",
+                create_root
+                    .join("sessions")
+                    .join(format!("{id}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )?;
+            result.set("lease", true)?;
+            Ok(result)
+        })?,
+    )?;
+    let record_root = data_dir.clone();
+    fs.set(
+        "session_record_resume",
+        lua.create_function(move |lua, id: String| {
+            let result = lua.create_table()?;
+            result.set("ok", true)?;
+            result.set(
+                "path",
+                record_root
+                    .join("sessions")
+                    .join(format!("{id}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )?;
+            Ok(result)
+        })?,
+    )?;
+    let resume_root = data_dir;
+    fs.set(
+        "session_resume",
+        lua.create_function(move |lua, id: String| {
+            let result = lua.create_table()?;
+            result.set("ok", true)?;
+            result.set(
+                "path",
+                resume_root
+                    .join("sessions")
+                    .join(format!("{id}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )?;
+            result.set("lease", true)?;
+            Ok(result)
+        })?,
+    )?;
 
     // log.* — no-op
     let log_tbl = lua.create_table()?;

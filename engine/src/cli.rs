@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", global = true)]
     pub data_dir: Option<PathBuf>,
 
+    /// Full installed-distribution generation ID recorded in session provenance.
+    #[arg(long, value_name = "ID", global = true, env = "NEFOR_INSTALLATION_ID")]
+    pub installation_id: Option<String>,
+
     /// Override the plugin root directory (highest precedence; beats
     /// `NEFOR_PLUGIN_DIR` and the XDG / dev fallbacks).
     #[arg(long, value_name = "DIR", global = true)]
@@ -67,6 +71,19 @@ pub enum Command {
         /// required because every token after `run` belongs to Lua.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Copy session data between isolated distribution roots without rewriting event bytes.
+    CopySessions {
+        /// Source distribution data root.
+        #[arg(long, value_name = "DIR")]
+        source: PathBuf,
+        /// Destination distribution data root.
+        #[arg(long, value_name = "DIR")]
+        destination: PathBuf,
+        /// Session IDs to copy. Omit to copy every provenance-aware source session.
+        #[arg(value_name = "SESSION_ID")]
+        session_ids: Vec<String>,
     },
 
     /// Dispatch to a plugin's `cli` entry point. With no plugin name, lists
@@ -93,6 +110,7 @@ pub fn engine_mode_from_cli(cli: &Cli) -> EngineMode {
     match &cli.command {
         None => EngineMode::Serve,
         Some(Command::Run { .. }) => EngineMode::Serve,
+        Some(Command::CopySessions { .. }) => EngineMode::PluginList,
         Some(Command::Plugin { name: None, .. }) => EngineMode::PluginList,
         Some(Command::Plugin {
             name: Some(name),
