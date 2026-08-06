@@ -722,6 +722,60 @@ fn universal_tool_calls_are_lowered_only_at_provider_boundary() {
 }
 
 #[test]
+fn chatgpt_direct_completion_lowers_manager_history_without_dropping_run_input() {
+    let lua = lua_with_lib();
+    let (kind, input, tail_input, name, arguments): (String, String, String, String, String) = lua
+        .load(
+            r#"
+            local chatgpt = require("chatgpt-provider")
+            local t = chatgpt.translator("chatgpt")
+            local request = t.inbound({
+                type = "event", from = "mag",
+                body = {
+                    kind = "chatgpt.completion.request",
+                    request_id = "request-1",
+                    messages = {
+                        { role = "user", content = "earlier input" },
+                        {
+                            role = "assistant", content = "",
+                            tool_calls = {{
+                                id = "call-1", name = "read_file",
+                                arguments = { path = "x" }, status = "call_completed",
+                            }},
+                        },
+                        { role = "user", content = "current input" },
+                    },
+                    conversation_context = {
+                        messages = {
+                            { role = "user", content = "earlier input" },
+                            {
+                                role = "assistant", content = "",
+                                tool_calls = {{
+                                    id = "call-1", name = "read_file",
+                                    arguments = { path = "x" }, status = "call_completed",
+                                }},
+                            },
+                        },
+                        tail_messages = {},
+                    },
+                },
+            })
+            local call = request.conversation_context.messages[2].tool_calls[1]
+            return request.kind, request.conversation_context.messages[3].content,
+                   request.conversation_context.tail_messages[1].content,
+                   call["function"].name, call["function"].arguments
+            "#,
+        )
+        .eval()
+        .expect("lower direct ChatGPT completion request");
+    assert_eq!(kind, "chatgpt.completion.request");
+    assert_eq!(input, "current input");
+    assert_eq!(tail_input, "current input");
+    assert_eq!(name, "read_file");
+    assert_eq!(arguments, r#"{"path":"x"}"#);
+}
+
+#[test]
 fn chatgpt_compaction_plan_restores_only_its_opaque_checkpoint() {
     let lua = lua_with_lib();
     let (restored, count, first_role): (bool, i64, String) = lua

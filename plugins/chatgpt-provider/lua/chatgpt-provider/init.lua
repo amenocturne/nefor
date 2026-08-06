@@ -27,18 +27,29 @@ local function translator(name)
     assert(type(request.messages) == "table",
       "chatgpt-provider.complete: complete messages/history required")
     local body = copy(request)
+    body.messages = {}
+    for index, message in ipairs(request.messages) do
+      body.messages[index] = t.context_message(message)
+    end
     local context = body.conversation_context
     if type(context) == "table" then
       local lowered_context = copy(context)
       local messages = type(context.messages) == "table" and context.messages or {}
-      body.messages = {}
+      lowered_context.messages = {}
       for index, message in ipairs(messages) do
-        body.messages[index] = t.context_message(message)
+        lowered_context.messages[index] = t.context_message(message)
       end
-      lowered_context.messages = body.messages
       lowered_context.tail_messages = {}
       for index, message in ipairs(context.tail_messages or {}) do
         lowered_context.tail_messages[index] = t.context_message(message)
+      end
+      -- The manager projection is the canonical completed prefix. The
+      -- request-local transcript can already contain the input that triggered
+      -- this turn, before that input has reached the projection. Preserve that
+      -- suffix in both full and compacted contexts.
+      for index = #messages + 1, #body.messages do
+        lowered_context.messages[index] = body.messages[index]
+        lowered_context.tail_messages[#lowered_context.tail_messages + 1] = body.messages[index]
       end
       body.conversation_context = lowered_context
     end
@@ -107,6 +118,9 @@ local function translator(name)
 
   t.inbound = function(env)
     local body = type(env) == "table" and env.body or nil
+    if type(body) == "table" and body.kind == t.kinds.completion_request then
+      return t.complete(body)
+    end
     if type(body) == "table" and body.kind == "ProviderRequest" then
       if body.provider ~= nil and body.provider ~= name then return nil end
       if body.cancel == true then return t.cancel(body.request_id) end
