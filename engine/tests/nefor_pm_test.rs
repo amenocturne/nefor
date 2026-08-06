@@ -405,6 +405,60 @@ fn lockfile_read_missing_returns_empty() {
 }
 
 // ---------------------------------------------------------------------------
+#[test]
+fn immutable_registration_loads_without_mutating_data_root() {
+    let source = tempfile::tempdir().expect("source");
+    let data = tempfile::tempdir().expect("data");
+    let _g = DataDirGuard::new(data.path());
+    let plug_dir = source.path().join("immutable-lib");
+    std::fs::create_dir_all(plug_dir.join("sub")).expect("mkdir");
+    std::fs::write(plug_dir.join("init.lua"), "return { value = 'root' }\n").expect("root");
+    std::fs::write(plug_dir.join("sub/init.lua"), "return { value = 'sub' }\n").expect("sub");
+
+    let lua = lua_with_pm();
+    let values: (String, String) = lua
+        .load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            pm.register({{ {{ name = "immutable-lib", dir = "{}" }} }})
+            return pm.load("immutable-lib").value, pm.load("immutable-lib.sub").value
+            "#,
+            plug_dir.display()
+        ))
+        .eval()
+        .expect("registered modules load");
+    assert_eq!(values, ("root".into(), "sub".into()));
+    assert!(
+        !data.path().join("plugins").exists(),
+        "read-only registration must not create pm state"
+    );
+}
+
+#[test]
+fn immutable_registration_rejects_rebinding() {
+    let first = tempfile::tempdir().expect("first");
+    let second = tempfile::tempdir().expect("second");
+    let data = tempfile::tempdir().expect("data");
+    let _g = DataDirGuard::new(data.path());
+    for dir in [first.path(), second.path()] {
+        std::fs::write(dir.join("init.lua"), "return {}\n").expect("module");
+    }
+    let lua = lua_with_pm();
+    let err = lua
+        .load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            pm.register({{ {{ name = "fixed", dir = "{}" }} }})
+            pm.register({{ {{ name = "fixed", dir = "{}" }} }})
+            "#,
+            first.path().display(),
+            second.path().display()
+        ))
+        .exec()
+        .expect_err("rebind must fail");
+    assert!(err.to_string().contains("different source"), "{err}");
+}
+
 // Sync tests — pm.load via dir override + pm.bin
 // ---------------------------------------------------------------------------
 

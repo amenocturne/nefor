@@ -72,59 +72,18 @@ package.path = table.concat({
   package.path,
 }, ";")
 
--- nefor-pm wires the core primitives, generic libs, and every plugin
--- lib. Every entry's `dir` resolves from NEFOR_ROOT (whichever way
--- the bootstrap above picked it). `tag` matches UPSTREAM_REF so a
--- future pm consistency check or refresh path uses one source of truth.
+-- nefor-pm registers the core primitives, generic libs, and every plugin
+-- lib from the already-selected source root. Registration is read-only: an
+-- installed immutable generation must not create links or lockfiles below its
+-- writable data root merely to make modules require-able.
 local pm = require("nefor-pm")
-pm.install({
-  {
-    "amenocturne/nefor",
-    name = "core",
-    tag  = UPSTREAM_REF,
-    path = "lua/core/",
-    dir  = NEFOR_ROOT .. "/lua/core",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "libs",
-    tag  = UPSTREAM_REF,
-    path = "lua/libs/",
-    dir  = NEFOR_ROOT .. "/lua/libs",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "openai-provider",
-    tag  = UPSTREAM_REF,
-    path = "plugins/openai-provider/lua/openai-provider/",
-    dir  = NEFOR_ROOT .. "/plugins/openai-provider/lua/openai-provider",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "chatgpt-provider",
-    tag  = UPSTREAM_REF,
-    path = "plugins/chatgpt-provider/lua/chatgpt-provider/",
-    dir  = NEFOR_ROOT .. "/plugins/chatgpt-provider/lua/chatgpt-provider",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "tool-gate",
-    tag  = UPSTREAM_REF,
-    path = "plugins/tool-gate/lua/tool-gate/",
-    dir  = NEFOR_ROOT .. "/plugins/tool-gate/lua/tool-gate",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "nefor-tui",
-    tag  = UPSTREAM_REF,
-    path = "plugins/nefor-tui/lua/",
-    dir  = NEFOR_ROOT .. "/plugins/nefor-tui/lua",
-  },
+pm.register({
+  { name = "core", dir = NEFOR_ROOT .. "/lua/core" },
+  { name = "libs", dir = NEFOR_ROOT .. "/lua/libs" },
+  { name = "openai-provider", dir = NEFOR_ROOT .. "/plugins/openai-provider/lua/openai-provider" },
+  { name = "chatgpt-provider", dir = NEFOR_ROOT .. "/plugins/chatgpt-provider/lua/chatgpt-provider" },
+  { name = "tool-gate", dir = NEFOR_ROOT .. "/plugins/tool-gate/lua/tool-gate" },
+  { name = "nefor-tui", dir = NEFOR_ROOT .. "/plugins/nefor-tui/lua" },
 })
 
 local ncp            = require("core.ncp")

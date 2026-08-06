@@ -317,7 +317,12 @@ pub fn copy_session(
         .prefix(&format!(".{id}.copying-"))
         .tempdir_in(sessions_dir(&destination_root))?;
     copy_tree(&source_dir, staging_dir.path())?;
-    atomic_write_json(&staging_dir.path().join(METADATA_FILE), &metadata)?;
+    let staging_metadata = staging_dir.path().join(METADATA_FILE);
+    atomic_write_json(&staging_metadata, &metadata)?;
+    fs::set_permissions(
+        &staging_metadata,
+        fs::symlink_metadata(source_dir.join(METADATA_FILE))?.permissions(),
+    )?;
     let mut staging_events = tempfile::NamedTempFile::new_in(sessions_dir(&destination_root))?;
     io::copy(&mut File::open(&source_events)?, &mut staging_events)?;
     fs::set_permissions(
@@ -340,6 +345,9 @@ pub fn copy_session(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn copy_preserves_event_bytes_and_extends_provenance() {
@@ -422,6 +430,78 @@ mod tests {
                 .mode()
                 & 0o777,
             0o640
+        );
+    }
+
+    #[test]
+    fn copy_preserves_metadata_mode_after_provenance_update() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let lease = create_session(source.path(), "s1", "generation-a").unwrap();
+        fs::write(lease.events_path(), b"events\n").unwrap();
+        let source_metadata = session_dir(source.path(), "s1").join(METADATA_FILE);
+        fs::set_permissions(&source_metadata, fs::Permissions::from_mode(0o640)).unwrap();
+        drop(lease);
+
+        copy_session(source.path(), destination.path(), "s1", "generation-b").unwrap();
+
+        let copied_mode =
+            fs::symlink_metadata(session_dir(destination.path(), "s1").join(METADATA_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+        assert_eq!(copied_mode, 0o640);
+    }
+
+    #[test]
+    fn session_lease_serializes_two_processes() {
+        const CHILD_ENV: &str = "NEFOR_SESSION_LOCK_CHILD";
+        const ROOT_ENV: &str = "NEFOR_SESSION_LOCK_ROOT";
+        const READY_ENV: &str = "NEFOR_SESSION_LOCK_READY";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let ready = PathBuf::from(std::env::var_os(READY_ENV).unwrap());
+            let _lease = resume_session(&root, "s1", "generation-child").unwrap();
+            fs::write(ready, b"locked").unwrap();
+            thread::sleep(Duration::from_millis(500));
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let lease = create_session(root.path(), "s1", "generation-a").unwrap();
+        fs::write(lease.events_path(), b"events\n").unwrap();
+        drop(lease);
+        let ready = root.path().join("child-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_store::tests::session_lease_serializes_two_processes",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(ROOT_ENV, root.path())
+            .env(READY_ENV, &ready)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "child process did not acquire the session lease"
+        );
+
+        let started = Instant::now();
+        let lease = resume_session(root.path(), "s1", "generation-parent").unwrap();
+        let elapsed = started.elapsed();
+        drop(lease);
+        assert!(child.wait().unwrap().success());
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "second process bypassed the session lock after {elapsed:?}"
         );
     }
 

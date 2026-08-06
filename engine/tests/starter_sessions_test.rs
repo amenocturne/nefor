@@ -1522,6 +1522,59 @@ fn resume_progress_is_monotonic_and_bounded() {
     }
 }
 
+#[test]
+fn failed_resume_preserves_current_identity_and_writable_history() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local sessions = require("libs.sessions")
+        local sessions_test = require("sessions.test")
+        sessions.init()
+        local json = nefor.json
+        local function submit(text)
+          sessions_test._persist_envelope({
+            origin = "nefor-tui",
+            payload = json.encode({
+              type = "event", from = "nefor-tui",
+              body = { kind = "chat.input.submit", text = text },
+            }),
+          })
+        end
+        submit("before")
+        _original_id = sessions.current_id()
+        _original_path = sessions.current_path()
+        nefor.fs.session_resume = function(_)
+          return { ok = false, error = "fixture open failure" }
+        end
+        assert(sessions.resume("broken-session") == nil)
+        assert(sessions.current_id() == _original_id)
+        assert(sessions.current_path() == _original_path)
+        submit("after")
+        "#,
+    )
+    .exec()
+    .expect("failed resume flow");
+
+    let path: String = lua.globals().get("_original_path").expect("original path");
+    let jsonl = std::fs::read_to_string(path).expect("active jsonl");
+    assert!(
+        jsonl.contains("before") && jsonl.contains("after"),
+        "{jsonl}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_DIR.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 

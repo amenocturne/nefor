@@ -6,9 +6,10 @@
 --   pm.update(specs)         explicitly resolve refs again and move their pins.
 --                            Both operations are synchronous, so init.lua can
 --                            rely on plugins being present when they return.
+--   pm.register(specs)       register immutable, already-materialized dirs
+--                            without writing links, locks, or checkout state.
 --   pm.load(name)            plain `require(name)`. Resolution is Lua's job —
---                            pm.install has already augmented package.path so
---                            installed plugins' dirs are searched.
+--                            install/register has already added a search path.
 --   pm.bin(name[, binname])  resolve <plugin_dir>/bin/<binname> (default: name).
 --   pm.require(name)         alias of pm.load — never triggers install.
 --   pm.sync_checkout(opts)   ensure a managed git checkout is present at a ref;
@@ -42,6 +43,7 @@ local M = {}
 -- (clone path). Lookups for pm.load / pm.bin go through here.
 --   name → { dir = "/abs/path", source = "dir" | "data" }
 local plugins = {}
+local registered_searcher_installed = false
 
 local function is_string(v) return type(v) == "string" and v ~= "" end
 local function is_table(v) return type(v) == "table" end
@@ -100,6 +102,26 @@ local function ensure_on_path(dir)
       package.path = p .. ";" .. package.path
     end
   end
+end
+
+local function install_registered_searcher()
+  if registered_searcher_installed then return end
+  local searchers = package.searchers or package.loaders
+  table.insert(searchers, 1, function(name)
+    local root_name, suffix = name:match("^([^.]+)%.?(.*)$")
+    local entry = root_name and plugins[root_name] or nil
+    if not entry or entry.source ~= "registered" then return nil end
+    local relative = suffix == "" and "init.lua" or (suffix:gsub("%.", "/") .. ".lua")
+    local path = pjoin(entry.dir, relative)
+    if suffix ~= "" and not require_fs().exists(path) then
+      path = pjoin(entry.dir, suffix:gsub("%.", "/") .. "/init.lua")
+    end
+    if not require_fs().exists(path) then return "\n\tno file " .. path end
+    local chunk, err = loadfile(path)
+    if not chunk then return "\n\t" .. tostring(err) end
+    return chunk, path
+  end)
+  registered_searcher_installed = true
 end
 
 -- Delegates to `nefor.fs.data_root()` — the engine's canonical resolved
@@ -713,6 +735,30 @@ end
 
 function M.update(specs)
   apply_specs(specs, true)
+end
+
+function M.register(specs)
+  if not is_table(specs) then
+    error("nefor-pm.register: specs must be a list of tables", 0)
+  end
+  install_registered_searcher()
+  for index, spec in ipairs(specs) do
+    if not is_table(spec) or not is_string(spec.name) or not is_string(spec.dir) then
+      error(string.format(
+        "nefor-pm.register: spec #%d requires non-empty `name` and `dir` fields", index), 0)
+    end
+    if spec.dir:sub(1, 1) ~= "/" then
+      fail(spec.name, "registered `dir` must be absolute")
+    end
+    local existing = plugins[spec.name]
+    if existing and (existing.dir ~= spec.dir or existing.source ~= "registered") then
+      fail(spec.name, "already registered with a different source")
+    end
+    if not require_fs().exists(pjoin(spec.dir, "init.lua")) then
+      fail(spec.name, "registered dir has no init.lua: " .. spec.dir)
+    end
+    plugins[spec.name] = { dir = spec.dir, source = "registered" }
+  end
 end
 
 -- pm.bin still uses the registry to find a plugin's dir (the binary's

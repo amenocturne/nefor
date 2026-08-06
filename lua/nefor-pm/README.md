@@ -143,6 +143,12 @@ pm.install({
   object database. Once the exact pinned commit is checked out, ordinary sync
   reuses it without contacting the source. Without a lockfile, `sync_checkout`
   retains its direct ref-synchronising behavior.
+- Installed immutable generations should register their already-materialized
+  module directories with `pm.register({ { name = "...", dir = "/absolute/..." } })`.
+  Registration only updates the current Lua VM's resolver: it creates no
+  symlinks, lockfiles, checkouts, or other data-root state, and refuses to
+  rebind a name to another directory. Use `pm.install`/`pm.update` for managed
+  mutable checkout state and `dir` overrides only for development.
 - Installed runtimes should use only the managed checkout and copied build
   outputs, setting `NEFOR_RUNTIME_ROOT` to that immutable checkout. Pointing
   specs at a mutable source tree with `dir` is an explicit development override
