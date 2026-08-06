@@ -1,4 +1,5 @@
 local runtime = require("libs.conversation-manager.runtime")
+local service = require("libs.conversation-manager.service").new()
 local json = nefor.json
 
 local emitted = {}
@@ -8,7 +9,9 @@ local actor = runtime.build({
   now = function() return "2026-08-05T00:00:00Z" end,
   emit = function(payload) emitted[#emitted + 1] = payload end,
   replay_active = function() return replaying end,
+  service = service,
 })
+local reader = service:reader()
 
 local function envelope(body, origin, target)
   return {
@@ -58,6 +61,7 @@ eq(last_body().change.kind, "conversation_created")
 -- The manager sees its own canonical bus echo; applying it is an exact no-op.
 receive(recorded, "conversation-manager")
 eq(actor._internals.get("conversation-1").last_sequence, 1)
+eq(reader:watermark("conversation-1"), 1, "injected reader sees manager writes")
 
 receive({
   kind = "conversation.fact.append",
@@ -122,6 +126,7 @@ eq(last_body().request_id, "targeted-list")
 -- Session transition clears the projection before incoming replay rebuilds it.
 receive({ kind = "sessions.session_end", session_id = "session-1" })
 eq(#actor._internals.list(), 0)
+eq(reader:watermark("conversation-1"), nil, "session reset updates the existing reader")
 receive({ kind = "sessions.session_start", session_id = "session-2" })
 eq(actor._internals.session_id(), "session-2")
 
@@ -141,6 +146,7 @@ receive({
   },
 }, "conversation-manager")
 eq(actor._internals.get("replayed").last_sequence, 1, "recorded facts rebuild during replay")
+eq(reader:watermark("replayed"), 1, "replay rebuilds the shared read service")
 eq(last_body().kind, "conversation.projection.delta")
 eq(last_body().replay, true)
 
@@ -294,3 +300,124 @@ eq(active_changed.conversation_id, "replayed")
 eq(actor._internals.active_conversation_id(), "replayed")
 eq(body_at(#emitted - 1).kind, "conversation.projection.delta")
 eq(body_at(#emitted - 2).kind, "conversation.fact.recorded", "active selection is replay-safe canonical state")
+
+-- Provider invocations are manager-mediated only after their preceding facts
+-- have folded. The public event stays thin; providers obtain history through
+-- the injected reader at the published watermark.
+receive({
+  kind = "conversation.provider.invoke.request",
+  conversation_id = "replayed",
+  provider = "chatgpt",
+})
+eq(last_body().kind, "conversation.provider.invoke.rejected")
+eq(last_body().code, "invalid_provider_invoke_request")
+receive({
+  kind = "conversation.provider.invoke.request",
+  request_id = "provider-missing-conversation",
+  conversation_id = "missing",
+  provider = "chatgpt",
+})
+eq(last_body().kind, "conversation.provider.invoke.rejected")
+eq(last_body().code, "conversation_not_found")
+
+local invoke_watermark = reader:watermark("replayed")
+receive({
+  kind = "conversation.provider.invoke.request",
+  request_id = "provider-1",
+  conversation_id = "replayed",
+  provider = "chatgpt",
+  model = "gpt-test",
+  reasoning_effort = "high",
+  tools = { "read_file" },
+  system = "must not leak",
+  messages = { { role = "user", content = "must not leak" } },
+})
+local invoke = last_body()
+eq(invoke.kind, "conversation.provider.invoke")
+eq(invoke.request_id, "provider-1")
+eq(invoke.conversation_id, "replayed")
+eq(invoke.provider, "chatgpt")
+eq(invoke.watermark, invoke_watermark, "invoke captures the folded manager watermark")
+eq(invoke.model, "gpt-test")
+eq(invoke.reasoning_effort, "high")
+eq(invoke.system, nil, "system is canonical conversation content, not invoke payload")
+eq(invoke.messages, nil, "full history never enters the manager/provider protocol")
+eq(actor._internals.active_invocations()["provider-1"].conversation_id, "replayed")
+
+receive({
+  kind = "conversation.provider.invoke.request",
+  request_id = "provider-1",
+  conversation_id = "replayed",
+  provider = "chatgpt",
+})
+eq(last_body().kind, "conversation.provider.invoke.rejected")
+eq(last_body().code, "provider_request_id_conflict")
+eq(actor._internals.active_invocations()["provider-1"].provider, "chatgpt",
+  "duplicate invoke cannot replace active correlation")
+
+receive({
+  kind = "conversation.provider.event.reported",
+  request_id = "provider-1",
+  provider = "other",
+  event = "text_delta",
+  text = "wrong",
+})
+eq(last_body().kind, "conversation.provider.event.rejected")
+eq(last_body().code, "provider_request_mismatch")
+eq(actor._internals.active_invocations()["provider-1"].provider, "chatgpt",
+  "mismatched events cannot settle correlation")
+
+receive({
+  kind = "conversation.provider.event.reported",
+  request_id = "provider-1",
+  provider = "chatgpt",
+  event = "text_delta",
+  text = "hello",
+  provider_detail = { opaque = true },
+  messages = { { role = "user", content = "must not relay" } },
+})
+local provider_event = last_body()
+eq(provider_event.kind, "conversation.provider.event")
+eq(provider_event.conversation_id, "replayed", "manager restores correlated conversation identity")
+eq(provider_event.text, "hello")
+eq(provider_event.provider_detail.opaque, true, "generic provider event detail is preserved")
+eq(provider_event.messages, nil, "provider event reports cannot smuggle full history")
+eq(actor._internals.active_invocations()["provider-1"].provider, "chatgpt")
+
+receive({
+  kind = "conversation.provider.event.reported",
+  request_id = "provider-1",
+  provider = "chatgpt",
+  event = "completed",
+  result = { text = "hello" },
+})
+eq(last_body().kind, "conversation.provider.event")
+eq(actor._internals.active_invocations()["provider-1"], nil,
+  "terminal provider event releases correlation")
+
+receive({
+  kind = "conversation.provider.invoke.request",
+  request_id = "provider-2",
+  conversation_id = "replayed",
+  provider = "chatgpt",
+})
+eq(last_body().kind, "conversation.provider.invoke")
+receive({
+  kind = "conversation.provider.cancel.request",
+  request_id = "provider-2",
+  provider = "chatgpt",
+})
+eq(last_body().kind, "conversation.provider.cancel")
+eq(last_body().conversation_id, "replayed")
+eq(actor._internals.active_invocations()["provider-2"], nil,
+  "cancel releases correlation")
+
+receive({
+  kind = "conversation.provider.invoke.request",
+  request_id = "provider-3",
+  conversation_id = "replayed",
+  provider = "chatgpt",
+})
+receive({ kind = "sessions.session_end", session_id = "session-2" })
+eq(actor._internals.active_invocations()["provider-3"], nil,
+  "session end releases every active provider correlation")

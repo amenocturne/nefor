@@ -237,7 +237,11 @@ actor.install()
 -- here so module load stays free of bus dependencies.
 replay_window.install()
 actor.spawn(sessions)
-actor.spawn(require("libs.conversation-manager.runtime").build())
+local conversation_service = require("libs.conversation-manager.service").new()
+local conversation_reader = conversation_service:reader()
+actor.spawn(require("libs.conversation-manager.runtime").build({
+  service = conversation_service,
+}))
 actor.spawn(require("libs.state-tracking"))
 
 local startup_args = require("startup")
@@ -306,7 +310,7 @@ for _, p in ipairs(cfg.providers or {}) do
         require("config").bin("mock-plugin"),
         "--script", STARTER_ROOT .. "/" .. p.mock_script,
       },
-      { agentic_loop = agentic_loop }
+      { agentic_loop = agentic_loop, conversations = conversation_reader }
     ))
   elseif p.kind == "openai" then
     local provider_command = {
@@ -324,7 +328,11 @@ for _, p in ipairs(cfg.providers or {}) do
     actor.spawn(provider.spawn_spec(
       p.name,
       provider_command,
-      { static_token = p.static_token, agentic_loop = agentic_loop }
+      {
+        static_token = p.static_token,
+        agentic_loop = agentic_loop,
+        conversations = conversation_reader,
+      }
     ))
   elseif p.kind == "chatgpt" then
     local provider_command = {
@@ -343,7 +351,11 @@ for _, p in ipairs(cfg.providers or {}) do
     actor.spawn(provider.spawn_spec(
       p.name,
       provider_command,
-      { translator_lib = "chatgpt-provider", agentic_loop = agentic_loop }
+      {
+        translator_lib = "chatgpt-provider",
+        agentic_loop = agentic_loop,
+        conversations = conversation_reader,
+      }
     ))
   else
     error("starter/init.lua: unknown provider kind: " .. tostring(p.kind))

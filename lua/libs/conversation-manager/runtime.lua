@@ -1,6 +1,7 @@
 local manager = require("libs.conversation-manager")
 local domain = manager.domain
 local projection = require("libs.conversation-manager.projection")
+local service_lib = require("libs.conversation-manager.service")
 local replay_window = require("core.replay_window")
 
 local M = {}
@@ -15,9 +16,12 @@ function M.build(options)
   local now = options.now or function() return nefor.engine.now() end
   local emit = options.emit or function(payload) nefor.engine.send(payload) end
   local replay_active = options.replay_active or replay_window.active
-  local store = manager.new()
+  local service = options.service or service_lib.new()
+  local store = service:writer()
+  local reader = service:reader()
   local session_id = nil
   local active_conversation_id = nil
+  local active_invocations = {}
 
   local function send(body)
     emit(json.encode({
@@ -50,7 +54,8 @@ function M.build(options)
   end
 
   local function reset(next_session_id)
-    store = manager.new()
+    store:reset()
+    active_invocations = {}
     session_id = next_session_id
     active_conversation_id = nil
   end
@@ -119,7 +124,7 @@ function M.build(options)
       })
       return
     end
-    local conversation = projection.conversation(store:peek(body.conversation_id))
+    local conversation = reader:conversation(body.conversation_id)
     send({
       kind = "conversation.snapshot",
       request_id = body.request_id,
@@ -144,7 +149,7 @@ function M.build(options)
       request_id = body.request_id,
       conversations = (function()
         local out = {}
-        for _, conversation in ipairs(store:list_owned()) do out[#out + 1] = projection.conversation(conversation) end
+        for _, conversation in ipairs(reader:list()) do out[#out + 1] = conversation end
         return out
       end)(),
     })
@@ -156,7 +161,7 @@ function M.build(options)
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_context_request" })
       return
     end
-    local context = projection.context(store:peek(body.conversation_id))
+    local context = reader:context(body.conversation_id)
     send({
       kind = "conversation.context.snapshot",
       request_id = body.request_id,
@@ -172,7 +177,7 @@ function M.build(options)
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_compaction_request" })
       return
     end
-    local conversation = store:peek(body.conversation_id)
+    local conversation = store:owned(body.conversation_id)
     if not conversation then
       reject({ event_id = "compaction:" .. body.request_id .. ":requested", conversation_id = body.conversation_id },
         { code = "conversation_not_found", context = { request_id = body.request_id } })
@@ -210,7 +215,7 @@ function M.build(options)
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_active_request" })
       return
     end
-    if not store:peek(body.conversation_id) then
+    if not store:owned(body.conversation_id) then
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "conversation_not_found" })
       return
     end
@@ -228,6 +233,128 @@ function M.build(options)
         sequence = event.sequence,
       })
     end
+  end
+
+  local function provider_rejection(action, body, code, context)
+    send({
+      kind = "conversation.provider." .. action .. ".rejected",
+      request_id = type(body) == "table" and body.request_id or nil,
+      conversation_id = type(body) == "table" and body.conversation_id or nil,
+      provider = type(body) == "table" and body.provider or nil,
+      code = code,
+      context = domain.copy(context),
+    })
+  end
+
+  local function valid_provider_address(body)
+    return nonempty(body.request_id) and nonempty(body.conversation_id)
+      and nonempty(body.provider)
+  end
+
+  local invocation_fields = {
+    "model", "tools", "reasoning_effort", "output_schema",
+    "max_corrections", "invocation",
+  }
+
+  local function handle_provider_invoke(body)
+    if replay_active() then return end
+    if not valid_provider_address(body) then
+      provider_rejection("invoke", body, "invalid_provider_invoke_request")
+      return
+    end
+    local conversation = store:owned(body.conversation_id)
+    if not conversation then
+      provider_rejection("invoke", body, "conversation_not_found")
+      return
+    end
+    local prior = active_invocations[body.request_id]
+    if prior then
+      provider_rejection("invoke", body, "provider_request_id_conflict", {
+        existing_conversation_id = prior.conversation_id,
+        existing_provider = prior.provider,
+      })
+      return
+    end
+
+    active_invocations[body.request_id] = {
+      conversation_id = body.conversation_id,
+      provider = body.provider,
+    }
+    local invocation = {
+      kind = "conversation.provider.invoke",
+      request_id = body.request_id,
+      conversation_id = body.conversation_id,
+      provider = body.provider,
+      watermark = conversation.last_sequence,
+    }
+    for _, field in ipairs(invocation_fields) do
+      if body[field] ~= nil then invocation[field] = domain.copy(body[field]) end
+    end
+    send(invocation)
+  end
+
+  local function matching_invocation(action, body)
+    if not nonempty(body.request_id) or not nonempty(body.provider) then
+      provider_rejection(action, body, "invalid_provider_" .. action .. "_request")
+      return nil
+    end
+    local active = active_invocations[body.request_id]
+    if not active then
+      provider_rejection(action, body, "provider_request_not_found")
+      return nil
+    end
+    if active.provider ~= body.provider
+        or (body.conversation_id ~= nil and active.conversation_id ~= body.conversation_id) then
+      provider_rejection(action, body, "provider_request_mismatch", {
+        expected_conversation_id = active.conversation_id,
+        expected_provider = active.provider,
+      })
+      return nil
+    end
+    return active
+  end
+
+  local function handle_provider_cancel(body)
+    if replay_active() then return end
+    local active = matching_invocation("cancel", body)
+    if not active then return end
+    active_invocations[body.request_id] = nil
+    send({
+      kind = "conversation.provider.cancel",
+      request_id = body.request_id,
+      conversation_id = active.conversation_id,
+      provider = body.provider,
+    })
+  end
+
+  local terminal_provider_events = { completed = true, failed = true, interrupted = true }
+  local provider_event_reserved = {
+    kind = true, request_id = true, conversation_id = true, provider = true,
+    event = true,
+    messages = true, history = true, conversation_context = true,
+    input = true, request = true, system = true, tool_specs = true,
+  }
+
+  local function handle_provider_event(body)
+    if replay_active() then return end
+    local active = matching_invocation("event", body)
+    if not active then return end
+    if not nonempty(body.event) then
+      provider_rejection("event", body, "invalid_provider_event")
+      return
+    end
+    local event = {
+      kind = "conversation.provider.event",
+      request_id = body.request_id,
+      conversation_id = active.conversation_id,
+      provider = body.provider,
+      event = body.event,
+    }
+    for field, value in pairs(body) do
+      if not provider_event_reserved[field] then event[field] = domain.copy(value) end
+    end
+    send(event)
+    if terminal_provider_events[body.event] then active_invocations[body.request_id] = nil end
   end
 
   local function receive_msg(entry)
@@ -261,6 +388,9 @@ function M.build(options)
     if body.kind == "conversation.context.compact.failed" then
       handle_compaction_terminal(body, "context_compaction_failed"); return
     end
+    if body.kind == "conversation.provider.invoke.request" then handle_provider_invoke(body); return end
+    if body.kind == "conversation.provider.cancel.request" then handle_provider_cancel(body); return end
+    if body.kind == "conversation.provider.event.reported" then handle_provider_event(body); return end
   end
 
   return {
@@ -268,10 +398,12 @@ function M.build(options)
     receive_msg = receive_msg,
     send_msg = function(_) end,
     _internals = {
-      get = function(id) return store:get(id) end,
-      list = function() return store:list() end,
+      get = function(id) return reader:conversation(id) end,
+      list = function() return reader:list() end,
       active_conversation_id = function() return active_conversation_id end,
       stats = function() return store:stats() end,
+      active_invocations = function() return domain.copy(active_invocations) end,
+      reader = function() return reader end,
       session_id = function() return session_id end,
       reset = reset,
     },

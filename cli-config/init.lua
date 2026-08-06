@@ -91,7 +91,11 @@ actor.install()
 require("libs.mag-workspace").configure { library_dir = STARTER_ROOT .. "/mag/lib" }
 
 actor.spawn(sessions)
-actor.spawn(require("libs.conversation-manager.runtime").build())
+local conversation_service = require("libs.conversation-manager.service").new()
+local conversation_reader = conversation_service:reader()
+actor.spawn(require("libs.conversation-manager.runtime").build({
+  service = conversation_service,
+}))
 sessions.init()
 
 local agentic_cli = require("libs.cli")
@@ -146,7 +150,7 @@ if cfg.plugins.spawn_mock then
       require("config").bin("mock-plugin"),
       "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
     },
-    { agentic_loop = agentic_loop }
+    { agentic_loop = agentic_loop, conversations = conversation_reader }
   ))
 else
   local provider_command = {
@@ -164,7 +168,11 @@ else
   actor.spawn(provider.spawn_spec(
     PROVIDER_NAME,
     provider_command,
-    { static_token = cfg.provider.static_token, agentic_loop = agentic_loop }
+    {
+      static_token = cfg.provider.static_token,
+      agentic_loop = agentic_loop,
+      conversations = conversation_reader,
+    }
   ))
 end
 
