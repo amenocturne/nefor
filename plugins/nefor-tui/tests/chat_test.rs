@@ -1867,8 +1867,17 @@ fn mag_run_lifecycle_renders_in_run_panel() {
     );
     let out = render_str(&mut engine);
     assert!(
+        !out.contains('●'),
+        "a constructed but unfired member must not start yellow time: {out:?}"
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "mag-demo-1", "id": "explorer.entry" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
         out.contains('●'),
-        "running glyph (●) missing once a group member is ready: {out:?}"
+        "running glyph (●) missing once a group member is busy: {out:?}"
     );
 
     dispatch_event(
@@ -2251,6 +2260,10 @@ fn mag_two_agent_run_groups_by_namespace() {
     );
     dispatch_event(
         &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "mag-multi-1", "id": "explorer.entry" }),
+    );
+    dispatch_event(
+        &mut engine,
         json!({ "kind": "mag.actor_ready", "run_id": "mag-multi-1", "id": "writer.plan" }),
     );
     // Kill the entire writer subtree.
@@ -2309,6 +2322,10 @@ fn mag_concurrent_runs_key_panel_state_by_run_id() {
         dispatch_event(
             &mut engine,
             json!({ "kind": "mag.actor_ready", "run_id": run_id, "id": "worker.llm" }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_busy", "run_id": run_id, "id": "worker.llm" }),
         );
     }
     let _ = render_str(&mut engine);
@@ -10327,6 +10344,44 @@ fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
     assert!(
         frame.contains("Workflows · focused"),
         "sidebar focus must be restored:\n{frame}"
+    );
+}
+
+#[test]
+fn agent_group_inspector_shows_its_initial_assignment() {
+    let mut engine = Engine::new(120, 32).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "assignment-run", "run_name": "delegated" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "assignment-run",
+            "id": "worker.entry", "factory": "entry", "spec": {}
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "assignment-run",
+            "id": "worker.llm", "factory": "llm",
+            "spec": { "params": { "system": "base instructions\n\n---\n\nImplement the bounded fix." } }
+        }),
+    );
+
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select agent group");
+    engine
+        .handle_key(key("space"))
+        .expect("open group inspector");
+    let snapshot = render_snapshot(&mut engine);
+    assert!(
+        snapshot.contains("Initial assignment") && snapshot.contains("Implement the bounded fix."),
+        "agent inspector must expose the task delegated by its lead:\n{snapshot}"
     );
 }
 

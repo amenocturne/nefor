@@ -8,6 +8,7 @@ local preview_state = require("libs.chat.preview_state")
 local STYLE   = common.STYLE
 local CURSOR_ROW_STYLE = common.CURSOR_ROW_STYLE
 local shallow_merge = common.shallow_merge
+local NIL_SENTINEL = common.NIL_SENTINEL
 
 local M = {}
 
@@ -26,7 +27,7 @@ local GLYPHS = {
   killed  = "⊗",
   failed  = "⊗",
   -- MAG member activity states (mag.actor_busy / mag.actor_idle): `working`
-  -- is a live activation (ticks its CURRENT activation's elapsed), `idle` is
+  -- is a live activation (ticks its current activation's elapsed), `idle` is
   -- constructed-between-activations (renders quietly, no timer). The agent
   -- loop's members visibly take turns instead of all ticking the run's
   -- wall clock.
@@ -142,15 +143,11 @@ function M.any_active(runs, now_ms)
   return false
 end
 
--- Elapsed window for an actor row: live-ticking while working (the
--- CURRENT activation only, resetting each mag.actor_busy), frozen at
--- the finish stamp once terminal. Idle carries no window — a
+-- Elapsed window for an actor row: live-ticking while working (the current
+-- activation only) and frozen across terminal state. Idle carries no window — a
 -- between-activations actor shows no timer.
 local function node_elapsed_ms(node, now_ms)
-  if node.status == "running" then
-    return now_ms - (node.started_at_ms or now_ms)
-  end
-  if node.status == "working" then
+  if node.status == "running" or node.status == "working" then
     return now_ms - (node.activation_started_at_ms or node.started_at_ms or now_ms)
   end
   if TERMINAL_STATUS[node.status] and node.finished_at_ms ~= nil then
@@ -175,6 +172,41 @@ end
 -- members by the same namespace rule the panel groups by.
 M.group_of = group_of
 
+local function active_groups(nodes)
+  local out = {}
+  for id, node in pairs(nodes or {}) do
+    if node.status == "running" or node.status == "working" then
+      out[group_of(id)] = true
+    end
+  end
+  return out
+end
+
+-- Track the union of yellow member intervals for each collapsed logical node.
+-- Summing actor durations would double-count overlapping work; a first→last
+-- window would count idle gaps. This state follows exactly what the group row
+-- paints as active.
+local function advance_group_activity(prev, nodes, now_ms)
+  local current = prev.group_activity or {}
+  local next_activity, groups = {}, active_groups(nodes)
+  for name, value in pairs(current) do
+    next_activity[name] = { active_ms = value.active_ms or 0,
+      active_since_ms = value.active_since_ms }
+    groups[name] = groups[name] or false
+  end
+  for name, is_active in pairs(groups) do
+    local item = next_activity[name] or { active_ms = 0 }
+    if is_active and item.active_since_ms == nil then
+      item.active_since_ms = now_ms
+    elseif not is_active and item.active_since_ms ~= nil then
+      item.active_ms = item.active_ms + now_ms - item.active_since_ms
+      item.active_since_ms = nil
+    end
+    next_activity[name] = item
+  end
+  return next_activity
+end
+
 -- Aggregate actor activity into workflow-node progress. The kernel also calls
 -- a newly constructed (but never fired) actor `idle`; `settled_at_ms`
 -- distinguishes that ready state from an activation that actually completed.
@@ -191,10 +223,10 @@ local function group_status(members, run_completed)
     if m.node.status == "killed" then any_killed = true
     elseif m.node.status == "failed" or m.node.status == "error" then
       any_failed = true
-    elseif LIVE_MEMBER_STATUS[m.node.status]
-        or (m.node.status == "idle" and m.node.settled_at_ms == nil) then
+    elseif LIVE_MEMBER_STATUS[m.node.status] then
       any_running = true
-    elseif m.node.status == "pending" then
+    elseif m.node.status == "pending"
+        or (m.node.status == "idle" and m.node.started_at_ms == nil) then
       any_pending = true
     end
   end
@@ -233,11 +265,17 @@ local function build_groups(run)
       return x.id < y.id
     end)
     b.status = group_status(b.members, run_completed)
+    local activity = (run.group_activity or {})[b.name] or {}
+    b.active_ms = activity.active_ms or 0
+    b.active_since_ms = activity.active_since_ms
     local first_start, last_finish
     for _, m in ipairs(b.members) do
       local s = m.node.started_at_ms
       if s and (first_start == nil or s < first_start) then first_start = s end
-      local f = m.node.finished_at_ms or m.node.settled_at_ms
+      -- A resident actor is finalized with the whole MAG run, often long
+      -- after its own last activation. Prefer that activation boundary so a
+      -- completed workflow node does not keep accumulating downstream time.
+      local f = m.node.settled_at_ms or m.node.finished_at_ms
       if f and (last_finish == nil or f > last_finish) then last_finish = f end
     end
     b.first_start, b.last_finish = first_start, last_finish
@@ -262,9 +300,9 @@ local function group_row_parts(group, now_ms)
   local style = NODE_STYLE[group.status] or STYLE.status_dim
   local elapsed
   if group.status == "running" then
-    elapsed = now_ms - (group.first_start or now_ms)
-  elseif TERMINAL_STATUS[group.status] and group.last_finish then
-    elapsed = group.last_finish - (group.first_start or group.last_finish)
+    elapsed = group.active_ms + now_ms - (group.active_since_ms or now_ms)
+  elseif TERMINAL_STATUS[group.status] and group.first_start then
+    elapsed = group.active_ms
   end
   local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
   local n = #group.members
@@ -553,7 +591,7 @@ function M.actor_spawned(state, run_id, actor_id, factory, now_ms)
     nodes[actor_id] = {
       reasoner = factory or "",
       status = "pending",
-      started_at_ms = now_ms,
+      spawned_at_ms = now_ms,
       finished_at_ms = nil,
       -- First-appearance order for namespace grouping (stable across the
       -- unordered `nodes` map).
@@ -565,8 +603,7 @@ end
 
 -- Shared body for the constructed-and-alive transitions: ready → "idle"
 -- (constructed; the kernel's actor_busy follows immediately when work
--- starts), busy → "working" (stamps the CURRENT activation's start so the
--- row's timer resets per activation). An event without a prior spawn
+-- starts), busy → "working" (stamps the current activation's start). An event without a prior spawn
 -- observation (out-of-order tail) still surfaces as a node rather than
 -- being dropped.
 local function mark_actor(state, run_id, actor_id, now_ms, status, extra)
@@ -574,7 +611,7 @@ local function mark_actor(state, run_id, actor_id, now_ms, status, extra)
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
-    local node = nodes[actor_id] or { reasoner = "", started_at_ms = now_ms }
+    local node = nodes[actor_id] or { reasoner = "", spawned_at_ms = now_ms }
     local actor_seq = prev.actor_seq or 0
     local seq = node.seq
     if seq == nil then
@@ -583,12 +620,12 @@ local function mark_actor(state, run_id, actor_id, now_ms, status, extra)
     end
     local patch = {
       status = status,
-      started_at_ms = node.started_at_ms or now_ms,
       seq = seq,
     }
     for k, v in pairs(extra or {}) do patch[k] = v end
     nodes[actor_id] = shallow_merge(node, patch)
-    return shallow_merge(prev, { nodes = nodes, actor_seq = actor_seq })
+    return shallow_merge(prev, { nodes = nodes, actor_seq = actor_seq,
+      group_activity = advance_group_activity(prev, nodes, now_ms) })
   end)
 end
 
@@ -597,10 +634,14 @@ function M.actor_ready(state, run_id, actor_id, now_ms)
 end
 
 -- `mag.actor_busy` — an activation was delivered; the member ticks its
--- current activation from here.
+-- current activation from here while retaining prior active intervals.
 function M.actor_busy(state, run_id, actor_id, now_ms)
+  local node = ((state.runs or {})[run_id].nodes or {})[actor_id] or {}
   return mark_actor(state, run_id, actor_id, now_ms, "working", {
-    activation_started_at_ms = now_ms,
+    started_at_ms = node.started_at_ms or now_ms,
+    activation_started_at_ms = node.status == "working"
+      and node.activation_started_at_ms or now_ms,
+    settled_at_ms = NIL_SENTINEL,
   })
 end
 
@@ -653,7 +694,8 @@ function M.actor_killed(state, run_id, actor_id, now_ms, reason)
           status = "done", finished_at_ms = now_ms,
         })
       end
-      return shallow_merge(prev, { nodes = nodes })
+      return shallow_merge(prev, { nodes = nodes,
+        group_activity = advance_group_activity(prev, nodes, now_ms) })
     end
     local new_status = (reason == "run_failed") and "failed" or "killed"
     if not TERMINAL_STATUS[node.status] then
@@ -661,7 +703,8 @@ function M.actor_killed(state, run_id, actor_id, now_ms, reason)
         status = new_status, finished_at_ms = now_ms,
       })
     end
-    local patch = { nodes = nodes }
+    local patch = { nodes = nodes,
+      group_activity = advance_group_activity(prev, nodes, now_ms) }
     if RUN_TEARDOWN_REASON[reason] then
       patch.completed_at_ms = prev.completed_at_ms or now_ms
       patch.status = prev.status or new_status
@@ -694,13 +737,18 @@ function M.mag_run_complete(state, run_id, status, now_ms)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do
       if not TERMINAL_STATUS[v.status] then
-        nodes[k] = shallow_merge(v, { status = "done", finished_at_ms = now_ms })
+        nodes[k] = shallow_merge(v, {
+          status = "done", finished_at_ms = now_ms,
+          settled_at_ms = v.settled_at_ms
+            or ((v.status == "working" or v.status == "running") and now_ms or nil),
+        })
       else
         nodes[k] = v
       end
     end
     return shallow_merge(prev, {
       nodes = nodes, completed_at_ms = now_ms, status = status or "success",
+      group_activity = advance_group_activity(prev, nodes, now_ms),
     })
   end)
 end
@@ -718,7 +766,11 @@ function M.mag_run_failed(state, run_id, status, now_ms)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do
       if not TERMINAL_STATUS[v.status] then
-        nodes[k] = shallow_merge(v, { status = "failed", finished_at_ms = now_ms })
+        nodes[k] = shallow_merge(v, {
+          status = "failed", finished_at_ms = now_ms,
+          settled_at_ms = v.settled_at_ms
+            or ((v.status == "working" or v.status == "running") and now_ms or nil),
+        })
       else
         nodes[k] = v
       end
@@ -726,6 +778,7 @@ function M.mag_run_failed(state, run_id, status, now_ms)
     return shallow_merge(prev, {
       nodes = nodes, completed_at_ms = prev.completed_at_ms or now_ms,
       status = status or "failed",
+      group_activity = advance_group_activity(prev, nodes, now_ms),
     })
   end)
 end

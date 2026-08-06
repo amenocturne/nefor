@@ -75,7 +75,8 @@ function M.spawn(state, run_id, actor_id, factory, spec, now_ms)
     next.factory, next.status = factory, "pending"
     next.spec = type(spec) == "table" and spec or {}
     next.params = next.spec.params or {}
-    next.started_at_ms, next.last_activity_ms = now_ms, now_ms
+    next.spawned_at_ms, next.last_activity_ms = now_ms, now_ms
+    next.active_ms = next.active_ms or 0
     return next
   end)
 end
@@ -86,7 +87,17 @@ function M.lifecycle(state, run_id, actor_id, status, now_ms, detail)
     local next = copy_map(prev)
     next.status, next.last_activity_ms = status, now_ms
     if detail ~= nil then next.lifecycle_detail = detail end
-    if status == "working" then next.activation_started_at_ms = now_ms end
+    if status == "working" then
+      next.started_at_ms = prev.started_at_ms or now_ms
+      if prev.status ~= "working" and prev.status ~= "running" then
+        next.activation_started_at_ms = now_ms
+        next.settled_at_ms = nil
+      end
+    elseif status == "idle" and (prev.status == "working" or prev.status == "running") then
+      next.active_ms = (prev.active_ms or 0)
+        + now_ms - (prev.activation_started_at_ms or now_ms)
+      next.settled_at_ms = now_ms
+    end
     if status == "done" or status == "failed" or status == "killed" then next.finished_at_ms = now_ms end
     return next
   end)
@@ -99,6 +110,12 @@ function M.finish_run(state, run_id, status, now_ms)
   local run = {}
   for id, node in pairs(existing) do
     local next = copy_map(node)
+    if (next.status == "working" or next.status == "running")
+        and next.settled_at_ms == nil then
+      next.active_ms = (next.active_ms or 0)
+        + now_ms - (next.activation_started_at_ms or now_ms)
+      next.settled_at_ms = now_ms
+    end
     if next.status ~= "killed" and next.status ~= "failed" then next.status = status end
     next.finished_at_ms = next.finished_at_ms or now_ms
     run[id] = next
@@ -219,6 +236,75 @@ end
 
 function M.node(state, run_id, actor_id)
   return (((state.node_previews or {})[run_id] or {})[actor_id])
+end
+
+function M.active_elapsed_ms(node, now_ms)
+  if type(node) ~= "table" or node.started_at_ms == nil then return nil end
+  local elapsed = node.active_ms or 0
+  if node.status == "working" or node.status == "running" then
+    elapsed = elapsed + now_ms - (node.activation_started_at_ms or now_ms)
+  end
+  return elapsed
+end
+
+local function prompt_from_value(value)
+  if type(value) ~= "table" then return nil end
+  for _, candidate in ipairs(value.messages or {}) do
+    if type(candidate) == "table" and candidate.role == "user" then
+      local content = candidate.content
+      if type(content) == "table" then
+        local nested = content.value
+        if type(nested) == "table" and type(nested.prompt) == "string"
+            and nested.prompt ~= "" then return nested.prompt end
+        if type(content.prompt) == "string" and content.prompt ~= "" then
+          return content.prompt
+        end
+      end
+    end
+  end
+  local nested = value.value
+  if type(nested) == "table" then
+    local content = nested.content
+    if type(content) == "table" and type(content.prompt) == "string"
+        and content.prompt ~= "" then return content.prompt end
+    if type(nested.prompt) == "string" and nested.prompt ~= "" then
+      return nested.prompt
+    end
+  end
+  return nil
+end
+
+local function assignment_from_system(system)
+  if type(system) ~= "string" then return nil end
+  local divider, cursor, boundary = "\n\n---\n\n", 1, nil
+  while true do
+    local found = system:find(divider, cursor, true)
+    if not found then break end
+    boundary, cursor = found, found + #divider
+  end
+  if not boundary then return nil end
+  local assignment = system:sub(boundary + #divider):match("^%s*(.-)%s*$")
+  if assignment == "" or assignment:match("^# Runtime Context") then return nil end
+  return assignment
+end
+
+-- Logical standard-library agents expand into entry/llm/run-tool/tool-result
+-- actors. Return their original delegated task without treating arbitrary MAG
+-- nodes as agents.
+function M.agent_assignment(state, run_id, group)
+  local nodes = (state.node_previews or {})[run_id] or {}
+  local llm = nodes[group .. ".llm"]
+  if not llm then return false, nil end
+  local assignment = assignment_from_system((llm.params or {}).system)
+  if assignment then return true, assignment end
+  local entry = nodes[group .. ".entry"]
+  if entry then
+    for _, value in pairs(entry.outputs or {}) do
+      local prompt = prompt_from_value(value)
+      if prompt then return true, prompt end
+    end
+  end
+  return true, nil
 end
 
 function M.merged(state, run_id, predicate)

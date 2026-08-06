@@ -448,15 +448,23 @@ local function popup_shell(title, header, body, unseen)
   })
 end
 
+local function assignment_widget(state, run_id, group)
+  local is_agent, assignment = preview_state.agent_assignment(state, run_id, group)
+  if not is_agent then return nil end
+  return tui.column { gap = 0, children = {
+    tui.text { content = "Initial assignment", style = STYLE.popup_user, wrap = "none" },
+    tui.text { content = assignment or "Not observed.",
+      style = assignment and STYLE.status or STYLE.status_dim, wrap = "word" },
+  } }
+end
+
 local function node_inspector(state, p, now_ms)
   local run = (state.runs or {})[p.run_id]
   local panel_node = run and run.nodes and run.nodes[p.actor_id]
   local node = preview_state.node(state, p.run_id, p.actor_id)
   local status = (node and node.status) or (panel_node and panel_node.status) or "unavailable"
   local factory = (node and node.factory) or (panel_node and panel_node.reasoner) or "?"
-  local elapsed
-  if node and node.finished_at_ms then elapsed = node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
-  elseif node and (status == "working" or status == "running") then elapsed = now_ms - (node.activation_started_at_ms or node.started_at_ms or now_ms) end
+  local elapsed = preview_state.active_elapsed_ms(node, now_ms)
   local status_line = (run_panel.GLYPHS[status] or "·") .. " " .. status
   if elapsed then status_line = status_line .. " · " .. run_panel.fmt_elapsed_ms(elapsed) end
   local header = tui.column { gap = 0, children = {
@@ -466,8 +474,12 @@ local function node_inspector(state, p, now_ms)
       status == "working", now_ms),
     tui.text { content = string.rep("─", 48), style = STYLE.footer, wrap = "none" },
   } }
+  local group = run_panel.group_of(p.actor_id or "")
+  local assignment = assignment_widget(state, p.run_id, group)
+  local body = preview_view.node(state, p.run_id, p.actor_id)
+  if assignment then body = tui.column { gap = 1, children = { assignment, body } } end
   return popup_shell("── node · " .. tostring(p.actor_id or "?") .. " [read-only] ──",
-    header, preview_view.node(state, p.run_id, p.actor_id), p.unseen)
+    header, body, p.unseen)
 end
 
 local function aggregate_inspector(state, p, now_ms)
@@ -494,6 +506,8 @@ local function aggregate_inspector(state, p, now_ms)
     local node = preview_state.node(state, p.run_id, item.actor_id) or {}
     children[#children + 1] = preview_view.activity(item, state, node, index == #items)
   end
+  local assignment = p.group and assignment_widget(state, p.run_id, p.group) or nil
+  if assignment then table.insert(children, 1, assignment) end
   if #children == 0 then children[1] = tui.text { content = "No observed activity yet.", style = STYLE.status_dim } end
   local header = tui.column { gap = 0, children = {
     tui.text { content = "run " .. run_ident_of(run, p.run_id) .. " · chronological activity", style = STYLE.footer },
