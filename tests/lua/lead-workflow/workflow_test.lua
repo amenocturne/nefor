@@ -1808,14 +1808,13 @@ do
     "graph-status cooldown state is cleared at session_end")
 end
 
--- (mag-eval caller routing and ownership) The gate-facing firing id is an
--- inner correlation; caller_id retains the outer scoped capability identity.
+-- (mag-eval async submission and ownership) Every caller receives a detached
+-- handle; subagent provenance scopes control to the dispatching actor.
 do
-  local mag_eval = require("libs.lead-workflow.mag-eval")
   local artifact = artifact_from_modification(read_only_modification())
 
-  -- Lead caller: classify by caller_id, validate, submit, acknowledge with the
-  -- standard stable handle, and register in the shared active-run table.
+  -- Lead caller: validate, submit, acknowledge with the standard stable handle,
+  -- and register in the shared active-run table.
   fresh()
   agentic_loop._internals.state.current_turn = { scope = "r7" }
   feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-77",
@@ -1846,9 +1845,6 @@ do
   local run_id = exec.body.run_id
   assert_true(lw._internals.state.active_runs[run_id] ~= nil,
     "lead eval is registered in standard active_runs")
-  assert_eq(next(mag_eval._internals.state.attached_runs), nil,
-    "lead eval has no duplicate detached owner")
-
   -- Terminal delivery is later and goes through the standard result renderer,
   -- archive, and completion relay exactly once.
   _test.calls_clear()
@@ -1870,64 +1866,79 @@ do
       and queued:find("run_id=" .. run_id, 1, true) ~= nil,
     "completion prefers the readable name while retaining the opaque handle")
 
-  -- Graph-agent caller: a foreign caller_id remains attached and receives no
-  -- acknowledgment until its terminal result.
+  -- Graph-agent caller: submission detaches immediately under the dispatching
+  -- actor, and await-run carries terminal output back without polling.
   fresh()
-  agentic_loop._internals.state.current_turn = { scope = "r7" }
-  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-88",
-    caller_id = "r9/cap-4", from = "worker.run-tool", name = "mag-eval",
-    args = { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+  local agent_invocation = invocation(sessions.current_id(), "subagent",
+    "r9/cap-4", "worker.run-tool", "parent-run")
+  invoke_tool_with_metadata("gate-88", "mag-eval",
+    { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"pwd\")" },
+    { caller_id = "r9/cap-4", invocation = agent_invocation })
   load = latest_mag_load()
   _test.calls_clear()
   feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
     hash = "sha256:agent", foreign_contracts = foreign_contracts(), artifact = artifact })
   calls = decode_calls()
   exec = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
-  assert_true(exec ~= nil, "graph-agent eval executes after validation")
-  assert_eq(find_call(calls, function(c) return c.body.kind == "tool.result" end), nil,
-    "graph-agent eval stays attached")
-  assert_true(mag_eval._internals.state.attached_runs[exec.body.run_id] ~= nil,
-    "attached run is owned only until terminal capability settlement")
-  assert_eq(lw._internals.state.active_runs[exec.body.run_id], nil,
-    "attached graph-agent eval is not a lead active run")
-  _test.calls_clear()
-  feed("mag", { kind = "mag.run_result", run_id = exec.body.run_id,
-    status = "completed", result = { text = "blocking output" } })
-  local reply = find_call(decode_calls(), function(c)
+  ack = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "gate-88"
   end)
-  assert_true(reply ~= nil, "graph-agent eval settles on terminal result")
-  assert_eq(reply.body.output, "blocking output", "attached result returns terminal output")
+  assert_true(exec ~= nil and ack ~= nil,
+    "graph-agent eval executes and promptly acknowledges")
+  assert_eq(ack.body.output.status, "executing",
+    "graph-agent eval uses the structured executing acknowledgment")
+  assert_eq(ack.body.output.run_id, exec.body.run_id,
+    "graph-agent acknowledgment exposes the stable run handle")
+  assert_true(lw._internals.state.active_runs[exec.body.run_id] ~= nil,
+    "graph-agent eval is registered in the standard active-run registry")
+  assert_eq(lw._internals.run_registry.run_dispatchers[exec.body.run_id],
+    "worker.run-tool", "dispatching graph actor owns the eval run")
 
-  -- Cancel is terminal for an attached eval: ownership is removed before the
-  -- kernel interrupt, and duplicate cancel / late terminal replies stay silent.
+  _test.calls_clear()
+  invoke_tool_with_metadata("gate-88-await", "await-run",
+    { run_id = exec.body.run_id }, { invocation = agent_invocation })
+  assert_eq(lw._internals.run_registry.waiter_runs["gate-88-await"], exec.body.run_id,
+    "graph agent can explicitly await the eval it dispatched")
+  assert_eq(#decode_calls(), 0, "await-run retains the waiter until completion")
+  feed("mag", { kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "completed", result = { text = "async output" } })
+  local reply = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "gate-88-await"
+  end)
+  assert_true(reply ~= nil, "explicit graph-agent waiter settles on terminal result")
+  assert_eq(reply.body.output.result.text, "async output",
+    "await-run returns the canonical eval output")
+  assert_eq(#find_calls(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "gate-88"
+  end), 0, "terminal completion cannot settle the dispatch tool twice")
+
+  -- Canceling the already-acknowledged dispatch uses the standard detached-run
+  -- path and does not emit a second result for the source firing.
   fresh()
-  agentic_loop._internals.state.current_turn = { scope = "r7" }
-  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-attached-cancel",
-    caller_id = "r9/cap-5", from = "worker.run-tool", name = "mag-eval",
-    args = { intent = "Wait forever", expr = "(nefor.shell.command \"x\" \"sleep 10\")" } })
+  agent_invocation = invocation(sessions.current_id(), "subagent",
+    "r9/cap-5", "worker.run-tool", "parent-run")
+  invoke_tool_with_metadata("gate-eval-cancel", "mag-eval",
+    { intent = "Wait forever", expr = "(nefor.shell.command \"x\" \"sleep 10\")" },
+    { caller_id = "r9/cap-5", invocation = agent_invocation })
   load = latest_mag_load()
   _test.calls_clear()
   feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
     hash = "sha256:agent-cancel", foreign_contracts = foreign_contracts(), artifact = artifact })
   exec = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
-  assert_true(exec ~= nil and mag_eval._internals.state.attached_runs[exec.body.run_id] ~= nil,
-    "cancel test starts an attached eval")
+  assert_true(exec ~= nil and lw._internals.state.active_runs[exec.body.run_id] ~= nil,
+    "cancel test starts a detached eval")
   _test.calls_clear()
-  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-attached-cancel" })
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-eval-cancel" })
   calls = decode_calls()
   assert_true(find_call(calls, function(c)
     return c.body.kind == "mag.interrupt_run" and c.body.run_id == exec.body.run_id
        and c.body.terminate == true
-  end) ~= nil, "attached cancel terminates the eval")
-  assert_eq(mag_eval._internals.state.attached_runs[exec.body.run_id], nil,
-    "attached cancel releases source ownership")
-  _test.calls_clear()
-  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-attached-cancel" })
-  feed("mag", { kind = "mag.run_result", run_id = exec.body.run_id,
-    status = "failed", error = "late cancellation result" })
-  assert_eq(#decode_calls(), 0,
-    "duplicate cancel and late attached result cannot emit a second source settlement")
+  end) ~= nil, "dispatch cancel terminates the detached eval")
+  assert_eq(lw._internals.state.active_runs[exec.body.run_id].phase, "terminating",
+    "detached eval remains tracked until canonical terminal confirmation")
+  assert_eq(find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "gate-eval-cancel"
+  end), nil, "cancel cannot emit a second source settlement")
 
   local function dispatch_lead_eval(inner, outer)
     fresh()

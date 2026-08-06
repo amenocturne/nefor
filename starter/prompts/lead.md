@@ -90,12 +90,11 @@ For a pipe in a one-off command:
 ```
 
 `mag-eval` supplies a source, output, and artifact wrapper around that one node.
-Multi-node compositions belong in a `.mag` graph program. Calls from the lead
-detach and return a stable `run_id`.
+Multi-node compositions belong in a `.mag` graph program. Every call detaches
+and returns a stable `run_id`, including calls made inside graph agents.
 Use `await-run` when subsequent work depends on terminal output; this is an
 attached event wait, not polling, and the normal run-completion notification is
-still delivered independently. Inside a graph agent, the output returns as
-the tool result. Run foreground commands without `&` or polling. Use
+still delivered independently. Run foreground commands without `&` or polling. Use
 `nefor.shell.command-with-options` only when a wall-clock bound is required.
 
 ## MAG programs

@@ -184,10 +184,6 @@ local state = {
   -- with the compiler message. One entry per in-flight handshake.
   pending_mag_load = {},
 
-  -- Provenance-bearing graph-agent `mag action=execute` calls stay attached
-  -- to their capability and never enter the detached awaitable registry.
-  attached_mag_runs = {},
-
   -- Kernel runs are concurrent: every kernel lifecycle event
   -- (`mag.actor_spawned` / `mag.actor_ready` / `mag.actor_killed` /
   -- `mag.run_complete`) carries its run_id, and the tracker keys straight
@@ -1094,17 +1090,6 @@ local function handle_mag_run_result(body)
   if body.status == "killed" or body.status == "failed" then
     clear_pending_plan_for_dead_run(run_id)
   end
-  local attached = state.attached_mag_runs[run_id]
-  if attached then
-    state.attached_mag_runs[run_id] = nil
-    if body.status == "completed" then
-      emit_tool_result_ok(attached.firing_id, body)
-    else
-      emit_tool_result_err(attached.firing_id,
-        tostring(body.error or (body.status == "killed" and "run killed" or "mag run failed")))
-    end
-    return
-  end
   local run = state.active_runs[run_id]
   if not run then return end
 
@@ -1194,11 +1179,6 @@ local function interrupt_active_runs()
     run_registry:mark_terminating(run_id, "interrupt-all")
     emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
   end
-  for run_id, pending in pairs(state.attached_mag_runs) do
-    emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
-    state.attached_mag_runs[run_id] = nil
-    emit_tool_result_err(pending.firing_id, "mag: interrupted before the attached run settled")
-  end
   nefor.log.info("lead-workflow: interrupt_all — terminated active dispatched runs", {
     count = #ids,
   })
@@ -1269,18 +1249,6 @@ local function authorize_control_target(context, run_id)
       "an agent cannot control its owning run", run_id)
   end
   return run_registry:authorize(run_id, context.session_id, context.dispatcher_id)
-end
-
-local function interrupt_attached_mag_by_firing(firing_id)
-  if type(firing_id) ~= "string" then return false end
-  for run_id, pending in pairs(state.attached_mag_runs) do
-    if pending.firing_id == firing_id then
-      state.attached_mag_runs[run_id] = nil
-      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
-      return true
-    end
-  end
-  return false
 end
 
 await_run = function(firing_id, args, metadata)
@@ -1460,15 +1428,6 @@ local function terminate_active_graph(session_id)
   state.completed_runs = run_registry.completed_runs
   refresh_active_run_id()
 
-  for run_id, attached in pairs(state.attached_mag_runs) do
-    if attached.session_id == session_id then
-      state.attached_mag_runs[run_id] = nil
-      emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
-      emit_tool_result_err(attached.firing_id,
-        "mag: session ended before the attached run settled")
-    end
-  end
-
   for _, settlement in ipairs(ended.waiter_settlements) do
     emit_await_outcome(settlement.firing_id, settlement.outcome)
   end
@@ -1636,7 +1595,7 @@ end
 -- mag.run_complete) stream on the bus; the terminal mag.run_result (carrying
 -- the sink's output PATH) closes the run and relays a fresh model turn in
 -- receive_msg.
-local function begin_mag_load(firing_id, action, args, ws, session_id, routing, dispatcher_id)
+local function begin_mag_load(firing_id, action, args, ws, session_id, dispatcher_id)
   local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
   local run_id = action == "execute" and run_registry:mint_run_id()
     or ("mag-load-" .. envelope.uuid_lite())
@@ -1649,7 +1608,6 @@ local function begin_mag_load(firing_id, action, args, ws, session_id, routing, 
     run_id     = run_id,
     run_name   = graph_name,
     session_id = session_id,
-    routing    = routing or "lead",
     dispatcher_id = dispatcher_id,
   }
 
@@ -1678,9 +1636,9 @@ invalidate_pending_mag_loads = function(firing_id)
 end
 
 -- Validate and submit one loaded artifact through the standard active-run
--- channel. Both file-based `mag execute` and lead-called `mag-eval` use this
+-- channel. Both file-based `mag execute` and `mag-eval` use this
 -- path, so lifecycle/control/rendering/archival/cleanup have one owner.
-submit_loaded_run = function(pending, body, error_prefix, attached)
+submit_loaded_run = function(pending, body, error_prefix)
   local artifact = body.artifact
   local modification = type(artifact) == "table" and artifact.data or nil
   if type(modification) ~= "table" then
@@ -1717,16 +1675,6 @@ submit_loaded_run = function(pending, body, error_prefix, attached)
     artifact = artifact,
   }
   if next(overlay) ~= nil then exec.params_overlay = overlay end
-  if attached then
-    if pending.action ~= nil then
-      state.attached_mag_runs[pending.run_id] = {
-        firing_id = pending.firing_id,
-        session_id = pending.session_id,
-      }
-    end
-    emit_as(SOURCE_NAME, "mag", exec)
-    return true
-  end
   register_active_run(pending.run_id, actors, terminal_id,
     pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id)
   emit_as(SOURCE_NAME, "mag", exec)
@@ -1782,7 +1730,7 @@ local function resume_pending_load(body)
     return
   end
 
-  submit_loaded_run(pending, body, "mag execute", pending.routing == "attached")
+  submit_loaded_run(pending, body, "mag execute")
 end
 
 -- A `mag.error` reply to an in-flight load: the compiler rejected the
@@ -1863,8 +1811,7 @@ local function mag_handler(firing_id, args, metadata)
   -- the mag.loaded reply resolves them (resume_pending_load).
   -- File-based MAG execution is detached for every caller. Non-root authority
   -- is recorded against the kernel-stamped actor that made this invocation.
-  local routing = "lead"
-  begin_mag_load(firing_id, action, args, ws, session_id, routing, provenance.dispatcher_id)
+  begin_mag_load(firing_id, action, args, ws, session_id, provenance.dispatcher_id)
 end
 
 local TOOL_HANDLERS = {
@@ -1939,13 +1886,12 @@ local function receive_msg(entry)
     if replay_window.active() then return end
     clear_pending_plan(state.active_plan)
     interrupt_active_runs()
-    mag_eval.interrupt_all_runs()
     return
   end
 
   -- Gate-forwarded cancel addresses the source's inner firing id. For evals it
-  -- either removes a pending compile/interrupts an attached run, or matches a
-  -- lead-submitted standard run's dispatch_firing_id.
+  -- either removes a pending compile or matches a submitted standard run's
+  -- dispatch_firing_id.
   if kind == "lead-workflow.tool.cancel" then
     if replay_window.active() then return end
     local plan = state.active_plan
@@ -1955,7 +1901,6 @@ local function receive_msg(entry)
     end
     if run_registry:detach_waiter(body.id) then return end
     mag_eval.cancel(body.id)
-    interrupt_attached_mag_by_firing(body.id)
     invalidate_pending_mag_loads(body.id)
     interrupt_run_by_dispatch_firing(body.id)
     return
@@ -2016,8 +1961,8 @@ local function receive_msg(entry)
   -- loaded artifact.
   if kind == "mag.loaded" then capture_kernel_factories(body) end
 
-  -- mag-eval owns pending compile correlation and attached graph-agent runs.
-  -- Lead-submitted evals join the standard active-run path from its load hook.
+  -- mag-eval owns pending compile correlation. Submitted evals join the
+  -- standard active-run path from its load hook.
   if mag_eval.on_bus(kind, body) then return end
 
   -- MAG kernel path.
@@ -2145,7 +2090,6 @@ local M = {
       state.gate_mode = "safe"
       state.kernel_factories = {}
       state.pending_mag_load = {}
-      state.attached_mag_runs = {}
       dependency_module_roots = {}
       agent_defaults = nil
       mag_eval._internals.reset()
@@ -2187,8 +2131,8 @@ function M.configure(opts)
     dependency_module_roots = copy_roots(roots),
     resolve_invocation = resolve_invocation,
     mint_run_id = function() return run_registry:mint_run_id() end,
-    submit_run = function(pending, body, attached)
-      return submit_loaded_run(pending, body, "mag-eval", attached)
+    submit_run = function(pending, body)
+      return submit_loaded_run(pending, body, "mag-eval")
     end,
   })
 end
@@ -2198,8 +2142,8 @@ end
 mag_eval.configure({
   resolve_invocation = resolve_invocation,
   mint_run_id = function() return run_registry:mint_run_id() end,
-  submit_run = function(pending, body, attached)
-    return submit_loaded_run(pending, body, "mag-eval", attached)
+  submit_run = function(pending, body)
+    return submit_loaded_run(pending, body, "mag-eval")
   end,
 })
 

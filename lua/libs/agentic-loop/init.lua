@@ -1518,10 +1518,8 @@ end
 
 -- Whether a gate correlation id belongs to the lead's ACTIVE turn (ids are
 -- `<scope>/cap-N`; the lead's own tool firings carry its turn scope, a
--- dispatched sub-run's carry that run's scope). Public so a tool can route
--- by caller: mag-eval detaches lead-called runs (their results relay through
--- relay_run_completion) and stays blocking for graph agents, which have no
--- relay channel.
+-- dispatched sub-run's carry that run's scope). Public for consumers that
+-- need to classify a capability correlation against the active lead turn.
 function M.lead_scoped_id(id) return lead_scoped_id(id) end
 
 function M.fire_tool_start_observers(id, name, input) fire_tool_start_observers(id, name, input) end
