@@ -1609,6 +1609,23 @@ fn ctrl_c_latch_resets_after_timeout_and_intervening_action() {
     assert_first_ctrl_c_warns(&mut engine);
     engine.advance_time(Duration::from_millis(601));
     engine.drive_scheduled_dispatches().expect("drive timer");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("Press Ctrl+C again to exit"),
+        "warning must remain visible after the double-press latch expires: {out:?}",
+    );
+    engine.advance_time(Duration::from_millis(2000));
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("Press Ctrl+C again to exit"),
+        "warning must remain visible for about three seconds: {out:?}",
+    );
+    engine.advance_time(Duration::from_millis(500));
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("Press Ctrl+C again to exit"),
+        "warning must disappear after its three-second TTL: {out:?}",
+    );
     press_ctrl_c(&mut engine);
     assert!(
         !engine.exit_requested(),

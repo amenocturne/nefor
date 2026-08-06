@@ -20,6 +20,7 @@ eq(decisions[1].delay_ms, controls.DOUBLE_PRESS_DELAY_MS)
 eq(armed.exit_token, 1)
 eq(armed.last_ctrl_c_ms, 100)
 eq(armed.toasts[1].text, "Press Ctrl+C again to exit")
+eq(armed.toasts[1].ttl_ms, controls.WARNING_TTL_MS)
 
 local exited, exit_decisions = controls.press(armed, 650)
 eq(exit_decisions[1].kind, "exit")
@@ -32,12 +33,19 @@ eq(stale, armed, "stale timeout preserves state identity")
 local timed_out = controls.timeout(armed, 1)
 eq(timed_out.exit_token, nil)
 eq(timed_out.last_ctrl_c_ms, nil)
-eq(#timed_out.toasts, 0)
+eq(#timed_out.toasts, 1, "double-press timeout does not dismiss the longer-lived warning")
+eq(timed_out.toasts[1].ttl_ms, 3000)
 
 local reset = controls.reset(armed)
 eq(reset.exit_token, nil)
 eq(reset.last_ctrl_c_ms, nil)
 eq(#reset.toasts, 0)
+
+local reset_after_timeout = controls.reset(timed_out)
+eq(reset_after_timeout.exit_token, nil)
+eq(reset_after_timeout.last_ctrl_c_ms, nil)
+eq(#reset_after_timeout.toasts, 0,
+  "an intervening action dismisses the warning after the latch expires")
 
 local rearmed, rearm_decisions = controls.press(reset, 200)
 eq(rearm_decisions[1].kind, "schedule_exit_timeout")
