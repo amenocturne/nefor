@@ -23,11 +23,11 @@ use mlua::{AnyUserData, Lua, Table, UserData};
 
 use crate::session_store;
 
-struct LuaSessionLease {
+struct LuaSessionHandle {
     #[allow(dead_code)]
-    lease: session_store::SessionLease,
+    handle: session_store::SessionHandle,
 }
-impl UserData for LuaSessionLease {}
+impl UserData for LuaSessionHandle {}
 
 use crate::paths::DataDir;
 
@@ -58,7 +58,10 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         })?,
     )?;
 
-    let session_root = data_root.clone();
+    let session_root = resolve_session_root(
+        &data_root,
+        std::env::var_os("NEFOR_SESSIONS_DIR").filter(|value| !value.is_empty()),
+    );
     fs_tbl.set(
         "session_create",
         lua.create_function(move |lua, id: String| {
@@ -78,9 +81,9 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
             let installation_id = std::env::var("NEFOR_INSTALLATION_ID").map_err(|_| {
                 mlua::Error::runtime("NEFOR_INSTALLATION_ID is required to resume sessions")
             })?;
-            let mut lease = lease.borrow_mut::<LuaSessionLease>()?;
+            let mut handle = lease.borrow_mut::<LuaSessionHandle>()?;
             let table = lua.create_table()?;
-            match lease.lease.commit_resume(&installation_id) {
+            match handle.handle.commit_resume(&installation_id) {
                 Ok(()) => table.set("ok", true)?,
                 Err(error) => {
                     table.set("ok", false)?;
@@ -91,7 +94,10 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         })?,
     )?;
 
-    let session_root = data_root.clone();
+    let session_root = std::env::var_os("NEFOR_SESSIONS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_root.join("sessions"));
     fs_tbl.set(
         "session_resume",
         lua.create_function(move |lua, id: String| {
@@ -252,6 +258,12 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
     Ok(())
 }
 
+fn resolve_session_root(data_root: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_root.join("sessions"))
+}
+
 fn ok_or_err(lua: &Lua, result: std::io::Result<()>) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     match result {
@@ -268,13 +280,13 @@ fn ok_or_err(lua: &Lua, result: std::io::Result<()>) -> mlua::Result<Table> {
 
 fn session_result(
     lua: &Lua,
-    result: Result<session_store::SessionLease, session_store::SessionStoreError>,
+    result: Result<session_store::SessionHandle, session_store::SessionStoreError>,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     match result {
         Ok(lease) => {
             let path = lease.events_path().to_string_lossy().into_owned();
-            let userdata: AnyUserData = lua.create_userdata(LuaSessionLease { lease })?;
+            let userdata: AnyUserData = lua.create_userdata(LuaSessionHandle { handle: lease })?;
             table.set("ok", true)?;
             table.set("path", path)?;
             table.set("lease", userdata)?;
@@ -308,6 +320,19 @@ mod tests {
         let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
         let got: String = lua.load("return nefor.fs.data_root()").eval().unwrap();
         assert_eq!(got, "/some/explicit/data");
+    }
+
+    #[test]
+    fn session_root_defaults_below_data_root_and_accepts_an_explicit_directory() {
+        let data_root = Path::new("/some/data");
+        assert_eq!(
+            resolve_session_root(data_root, None),
+            PathBuf::from("/some/data/sessions")
+        );
+        assert_eq!(
+            resolve_session_root(data_root, Some("/shared/sessions".into())),
+            PathBuf::from("/shared/sessions")
+        );
     }
 
     #[test]

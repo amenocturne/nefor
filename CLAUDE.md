@@ -42,8 +42,9 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 | `NEFOR_DEV_DIR`    | —              | (unset)                   | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first          |
 | `NEFOR_LOCAL_DIR`  | —              | (unset)                   | installed-config local checkout override — lets pm use an unpushed local repo instead of fetching GitHub |
 | `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua`                                                                                               |
-| `NEFOR_DATA_DIR`   | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | sessions                                                                                                 |
-| `NEFOR_PLUGIN_DIR` | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries                                                                                                 |
+| `NEFOR_DATA_DIR`     | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | writable runtime data other than sessions                                                               |
+| `NEFOR_SESSIONS_DIR` | —              | `$NEFOR_DATA_DIR/sessions` | session event logs, MAG trees, and provenance metadata                                                   |
+| `NEFOR_PLUGIN_DIR`   | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries                                                                                                 |
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 

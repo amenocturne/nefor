@@ -53,27 +53,6 @@ use crate::ncp::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = cli::parse();
-    if let Some(cli::Command::CopySessions {
-        source,
-        destination,
-        session_ids,
-    }) = &args.command
-    {
-        let installation_id = args.installation_id.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("copy-sessions requires --installation-id or NEFOR_INSTALLATION_ID")
-        })?;
-        let ids = if session_ids.is_empty() {
-            session_store::list_session_ids(source)?
-        } else {
-            session_ids.clone()
-        };
-        for id in &ids {
-            session_store::copy_session(source, destination, id, installation_id)
-                .with_context(|| format!("copying session {id:?}"))?;
-        }
-        println!("copied {} session(s)", ids.len());
-        return Ok(());
-    }
     let mode = engine_mode_from_cli(&args);
     let runtime_argv = runtime_argv_from_cli(&args);
     let config_dir = config::resolve_config(&args)

@@ -73,19 +73,6 @@ pub enum Command {
         args: Vec<String>,
     },
 
-    /// Copy session data between isolated distribution roots without rewriting event bytes.
-    CopySessions {
-        /// Source distribution data root.
-        #[arg(long, value_name = "DIR")]
-        source: PathBuf,
-        /// Destination distribution data root.
-        #[arg(long, value_name = "DIR")]
-        destination: PathBuf,
-        /// Session IDs to copy. Omit to copy every provenance-aware source session.
-        #[arg(value_name = "SESSION_ID")]
-        session_ids: Vec<String>,
-    },
-
     /// Dispatch to a plugin's `cli` entry point. With no plugin name, lists
     /// plugins that registered a `cli` field. Trailing args are forwarded
     /// verbatim to the plugin's CLI function.
@@ -110,7 +97,6 @@ pub fn engine_mode_from_cli(cli: &Cli) -> EngineMode {
     match &cli.command {
         None => EngineMode::Serve,
         Some(Command::Run { .. }) => EngineMode::Serve,
-        Some(Command::CopySessions { .. }) => EngineMode::PluginList,
         Some(Command::Plugin { name: None, .. }) => EngineMode::PluginList,
         Some(Command::Plugin {
             name: Some(name),

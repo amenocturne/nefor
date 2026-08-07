@@ -65,4 +65,4 @@ Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-m
 - **Compact ChatGPT context**: `/compact` asks ChatGPT’s native Responses compaction endpoint to seal the conversation so far. Later turns restore that compacted context into their fresh provider chats; switching provider or model falls back to the full local transcript.
 - **Inspect ChatGPT quota**: `/usage` shows both quota windows and reset times. When the active provider advertises usage support, the footer keeps a compact available-capacity gauge such as `◔ 34% until 14:30`.
 
-Session provenance, the required installed-distribution generation-ID contract, and the non-destructive `copy-sessions` command are documented in [`docs/session-provenance.md`](../docs/session-provenance.md).
+Session provenance, the shared-session-root contract, and the required installed-distribution generation ID are documented in [`docs/session-provenance.md`](../docs/session-provenance.md).
