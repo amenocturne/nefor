@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Instant;
 
-const EVALUATION_STEP_LIMIT: u64 = 100_000;
+pub(crate) const EVALUATION_STEP_LIMIT: u64 = 500_000;
 
 pub fn compile(source: &str, source_dir: &Path) -> Result<Artifact, MagError> {
     compile_with_inputs(

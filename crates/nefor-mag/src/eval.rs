@@ -107,7 +107,7 @@ pub mod fuel {
 }
 
 pub fn eval_program(env: &mut Env, exprs: &[Expr]) -> Result<Value, MagError> {
-    let _fuel = fuel::ensure(100_000);
+    let _fuel = fuel::ensure(crate::EVALUATION_STEP_LIMIT);
     let mut result = Value::Unit;
     for expr in exprs {
         result = eval_expr(env, expr)?;
@@ -1763,6 +1763,19 @@ mod tests {
             },
             other => panic!("expected typed Int, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_evaluation_budget_allows_exactly_500_000_steps() {
+        assert_eq!(crate::EVALUATION_STEP_LIMIT, 500_000);
+        let _fuel = fuel::install(crate::EVALUATION_STEP_LIMIT);
+
+        for _ in 0..crate::EVALUATION_STEP_LIMIT {
+            fuel::step().unwrap();
+        }
+
+        assert_eq!(fuel::remaining(), Some(0));
+        assert!(matches!(fuel::step(), Err(MagError::Budget(_))));
     }
 
     #[test]
