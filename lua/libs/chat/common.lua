@@ -38,6 +38,14 @@ function M.data_root()
   return home .. "/.local/share/nefor"
 end
 
+function M.sessions_root()
+  local override = os.getenv("NEFOR_SESSIONS_DIR")
+  if override ~= nil and override ~= "" then return override end
+  local root = M.data_root()
+  if root == nil then return nil end
+  return root .. "/sessions"
+end
+
 -- Drop nil holes from an array so reducer-built children lists stay
 -- dense. Lua's table constructor with conditionally-nil entries leaves
 -- gaps that break `ipairs`; the renderer relies on contiguous indices.

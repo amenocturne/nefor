@@ -62,6 +62,13 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         &data_root,
         std::env::var_os("NEFOR_SESSIONS_DIR").filter(|value| !value.is_empty()),
     );
+    let session_root_string = session_root.to_string_lossy().into_owned();
+    fs_tbl.set(
+        "sessions_root",
+        lua.create_function(move |_, _: ()| Ok(session_root_string.clone()))?,
+    )?;
+
+    let create_session_root = session_root.clone();
     fs_tbl.set(
         "session_create",
         lua.create_function(move |lua, id: String| {
@@ -70,7 +77,7 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
             })?;
             session_result(
                 lua,
-                session_store::create_session(&session_root, &id, &installation_id),
+                session_store::create_session(&create_session_root, &id, &installation_id),
             )
         })?,
     )?;
@@ -94,10 +101,6 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         })?,
     )?;
 
-    let session_root = std::env::var_os("NEFOR_SESSIONS_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_root.join("sessions"));
     fs_tbl.set(
         "session_resume",
         lua.create_function(move |lua, id: String| {
@@ -320,6 +323,13 @@ mod tests {
         let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
         let got: String = lua.load("return nefor.fs.data_root()").eval().unwrap();
         assert_eq!(got, "/some/explicit/data");
+    }
+
+    #[test]
+    fn sessions_root_defaults_below_engine_resolved_data_path() {
+        let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
+        let got: String = lua.load("return nefor.fs.sessions_root()").eval().unwrap();
+        assert_eq!(got, "/some/explicit/data/sessions");
     }
 
     #[test]

@@ -24,18 +24,20 @@ local function sh_quote(value)
   return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
 end
 
-local function data_root()
-  if nefor and nefor.fs and type(nefor.fs.data_root) == "function" then
-    local ok, root = pcall(nefor.fs.data_root)
+local function sessions_root()
+  if nefor and nefor.fs and type(nefor.fs.sessions_root) == "function" then
+    local ok, root = pcall(nefor.fs.sessions_root)
     if ok and type(root) == "string" and root ~= "" then return root end
   end
-  local override = os.getenv("NEFOR_DATA_DIR")
+  local override = os.getenv("NEFOR_SESSIONS_DIR")
   if override ~= nil and override ~= "" then return override end
+  local data_override = os.getenv("NEFOR_DATA_DIR")
+  if data_override ~= nil and data_override ~= "" then return data_override .. "/sessions" end
   local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
+  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor/sessions" end
   local home = os.getenv("HOME") or ""
   if home == "" then return nil end
-  return home .. "/.local/share/nefor"
+  return home .. "/.local/share/nefor/sessions"
 end
 
 local function mkdir_p(path)
@@ -49,9 +51,9 @@ end
 
 -- Get the MAG workspace directory for a session.
 function M.workspace_dir(session_id)
-  local root = data_root()
+  local root = sessions_root()
   if not root then return nil end
-  return root .. "/sessions/" .. session_id .. "/mag"
+  return root .. "/" .. session_id .. "/mag"
 end
 
 -- Initialize workspace: create dir, seed from config library.

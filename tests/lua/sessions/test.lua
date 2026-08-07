@@ -30,7 +30,7 @@ return {
 
   -- Helpers exposed for direct unit-testing.
   _uuid_v4   = i.uuid_v4,
-  -- The data-root resolver delegates to nefor.fs.data_root(); tests
+  -- The sessions-root resolver delegates to nefor.fs.sessions_root(); tests
   -- override the binding to drive different roots.
-  _data_root = i.compute_data_root,
+  _sessions_root = i.compute_sessions_root,
 }

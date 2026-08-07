@@ -12,9 +12,7 @@ local common = require("libs.chat.common")
 local M = {}
 
 function M.session_dir()
-  local root = common.data_root()
-  if root == nil then return nil end
-  return root .. "/sessions"
+  return common.sessions_root()
 end
 
 -- Extract `text` from a session-log JSONL line carrying a

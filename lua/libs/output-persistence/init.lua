@@ -1,7 +1,7 @@
 -- Shared per-node output persistence for MAG graph reasoners.
 --
 -- Writes successful node outputs under the active MAG workspace:
---   <data-root>/sessions/<session-id>/mag/runs/<run-name>/<node-id>.output
+--   <sessions-root>/<session-id>/mag/runs/<run-name>/<node-id>.output
 --
 -- The library is intentionally side-effect free until persist() is called.
 -- Callers own policy: which reasoner completions count as successful and
@@ -22,13 +22,15 @@ local function safe_segment(value, fallback)
   return s
 end
 
-local function data_root()
-  if nefor and nefor.fs and type(nefor.fs.data_root) == "function" then
-    local ok, root = pcall(nefor.fs.data_root)
+local function sessions_root()
+  if nefor and nefor.fs and type(nefor.fs.sessions_root) == "function" then
+    local ok, root = pcall(nefor.fs.sessions_root)
     if ok and type(root) == "string" and root ~= "" then return root end
   end
-  local override = os.getenv("NEFOR_DATA_DIR")
+  local override = os.getenv("NEFOR_SESSIONS_DIR")
   if override ~= nil and override ~= "" then return override end
+  local data_root = os.getenv("NEFOR_DATA_DIR")
+  if data_root ~= nil and data_root ~= "" then return data_root .. "/sessions" end
   return nil
 end
 
@@ -72,7 +74,7 @@ function M.persist(body, output)
   if type(run_id) ~= "string" or run_id == "" then return output end
   if type(node_id) ~= "string" or node_id == "" then return output end
 
-  local root = data_root()
+  local root = sessions_root()
   -- Session id is normally read from the resident sessions actor, but a host
   -- without one (the mag plugin VM) injects it on the body instead.
   local session_id = body.session_id
@@ -84,8 +86,8 @@ function M.persist(body, output)
   local run_segment = safe_segment(body.run_name or run_id, safe_segment(run_id, "run"))
   local node_segment = safe_segment(node_id, "node")
   local relpath = "runs/" .. run_segment .. "/" .. node_segment .. ".output"
-  local dir = root .. "/sessions/" .. session_id .. "/mag/runs/" .. run_segment
-  local path = root .. "/sessions/" .. session_id .. "/mag/" .. relpath
+  local dir = root .. "/" .. session_id .. "/mag/runs/" .. run_segment
+  local path = root .. "/" .. session_id .. "/mag/" .. relpath
 
   if not mkdir_p(dir) then return output end
   local fh = io.open(path, "w")

@@ -118,7 +118,8 @@ impl LuaHost {
 
         let lua = Lua::new();
         let data_root = resolve_data_root();
-        install_nefor(&lua, data_root.clone())?;
+        let sessions_root = resolve_sessions_root(&data_root);
+        install_nefor(&lua, data_root.clone(), sessions_root)?;
         if let Some(dir) = path.parent() {
             set_kernel_path(&lua, dir, lua_root, &data_root)?;
         }
@@ -442,8 +443,7 @@ fn kernel_name(kernel: &Table) -> Option<String> {
 
 /// Resolve the data root the same way the ecosystem does: `NEFOR_DATA_DIR`,
 /// then `XDG_DATA_HOME/nefor`, then `~/.local/share/nefor`. Used for the plugin
-/// VM's `nefor.fs.data_root()` so per-node output persistence lands under the
-/// same session layout the rest of nefor writes to.
+/// VM's `nefor.fs.data_root()` and `nefor.fs.sessions_root()` bindings.
 fn resolve_data_root() -> String {
     if let Some(d) = std::env::var_os("NEFOR_DATA_DIR") {
         if !d.is_empty() {
@@ -459,6 +459,13 @@ fn resolve_data_root() -> String {
         return format!("{}/.local/share/nefor", home.to_string_lossy());
     }
     String::from("/tmp/nefor")
+}
+
+fn resolve_sessions_root(data_root: &str) -> String {
+    std::env::var_os("NEFOR_SESSIONS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("{data_root}/sessions"))
 }
 
 /// Point `package.path` at the kernel file's directory (so the entry chunk can
@@ -524,7 +531,7 @@ fn set_kernel_path(
 
 /// Install the `nefor` global the kernel needs: `log`, `json`, `fs`, a
 /// millisecond clock, and the bus-emit queue.
-fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
+fn install_nefor(lua: &Lua, data_root: String, sessions_root: String) -> Result<(), MagError> {
     let nefor = lua.create_table()?;
 
     let log = lua.create_function(|_, msg: String| {
@@ -536,7 +543,7 @@ fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
     install_json(lua, &nefor)?;
     install_typed_json(lua, &nefor)?;
     install_semantic_type(lua, &nefor)?;
-    install_fs(lua, &nefor, data_root)?;
+    install_fs(lua, &nefor, data_root, sessions_root)?;
 
     let now_ms = lua.create_function(|_, _: ()| {
         let ms = SystemTime::now()
@@ -717,14 +724,23 @@ fn install_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
 }
 
 /// `nefor.fs.*` — the subset the shared `output-persistence` lib needs:
-/// `data_root`, `mkdir_p`, `read_file`, `write_file`, `exists`. Errors return
-/// as data (`{ ok, error }`), matching the engine's `install_fs` convention.
-fn install_fs(lua: &Lua, nefor_tbl: &Table, data_root: String) -> Result<(), MagError> {
+/// `data_root`, `sessions_root`, `mkdir_p`, `read_file`, `write_file`, `exists`.
+/// Errors return as data (`{ ok, error }`), matching the engine's `install_fs` convention.
+fn install_fs(
+    lua: &Lua,
+    nefor_tbl: &Table,
+    data_root: String,
+    sessions_root: String,
+) -> Result<(), MagError> {
     let fs_tbl = lua.create_table()?;
 
     fs_tbl.set(
         "data_root",
         lua.create_function(move |_, _: ()| Ok(data_root.clone()))?,
+    )?;
+    fs_tbl.set(
+        "sessions_root",
+        lua.create_function(move |_, _: ()| Ok(sessions_root.clone()))?,
     )?;
     fs_tbl.set(
         "mkdir_p",

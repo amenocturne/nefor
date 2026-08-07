@@ -36,10 +36,10 @@
 --
 -- ## On-disk path
 --
--- Resolved once at module load from `nefor.fs.data_root()` — the
--- engine's canonical resolved data directory (CLI flag >
--- `NEFOR_DATA_DIR` env var > `XDG_DATA_HOME/nefor`).
--- Path: `<root>/sessions/<id>.jsonl`. Parent dir is created on init.
+-- Resolved once at module load from `nefor.fs.sessions_root()` — the
+-- engine's canonical resolved session directory (`NEFOR_SESSIONS_DIR`,
+-- otherwise `<data-root>/sessions`).
+-- Path: `<sessions-root>/<id>.jsonl`. Parent dir is created on init.
 
 local json = nefor.json
 local replay_window = require("core.replay_window")
@@ -76,12 +76,11 @@ local state = {
 }
 
 ---@return string|nil
-local function compute_data_root()
-  return nefor.fs.data_root()
+local function compute_sessions_root()
+  return nefor.fs.sessions_root()
 end
 
-local DATA_ROOT    = compute_data_root()
-local SESSIONS_DIR = DATA_ROOT and (DATA_ROOT .. "/sessions") or nil
+local SESSIONS_DIR = compute_sessions_root()
 
 ---@param id string
 ---@return string|nil
@@ -610,7 +609,7 @@ return {
     do_new             = do_new,
     do_shutdown        = do_shutdown,
     uuid_v4            = uuid_v4,
-    compute_data_root  = compute_data_root,
+    compute_sessions_root = compute_sessions_root,
     reset_state        = function()
       close_session_file()
       state.current_session_id    = nil
