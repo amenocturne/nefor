@@ -177,6 +177,14 @@ install-source expected_commit command engine_dir mag_dir plugin_root build_targ
     echo "  {{mag_dir}}/mag"
     echo "  plugins -> {{plugin_root}}"
 
+# Measure an explicit ref in a clean detached checkout; always runs cold then immediate warm and writes JSONL.
+bench-build ref="HEAD" component="workspace" profile="dev" output="tmp/build-bench/results.jsonl":
+    tools/bench-build.sh "{{ref}}" "{{component}}" "{{profile}}" "{{output}}"
+
+# Focused version-stamp invalidation coverage for normal and linked Git worktrees.
+test-build-version:
+    tools/test-build-version.sh
+
 # Opt-in optimized MAG compiler benchmark; writes a metadata-rich JSON report to stdout.
 bench-mag *args:
     cargo bench -p nefor-mag --bench mag_compile -- {{args}}

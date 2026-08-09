@@ -29,3 +29,8 @@ futures = "0.3"
 bytes = "1"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known", "macros"] }
 semver = "1"
+
+[profile.dev]
+# Line tables preserve source-level backtraces while avoiding the cost and disk
+# footprint of full local-variable debug information in routine development.
+debug = 1
