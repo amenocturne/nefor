@@ -93,6 +93,22 @@ impl LuaHost {
         engine_ops: Arc<dyn EngineOps>,
         data_dir: crate::paths::DataDir,
     ) -> Result<Self, LuaError> {
+        Self::new_with_sessions_root(
+            bus,
+            plugins,
+            engine_ops,
+            data_dir,
+            std::env::var_os("NEFOR_SESSIONS_DIR").filter(|value| !value.is_empty()),
+        )
+    }
+
+    pub fn new_with_sessions_root(
+        bus: Arc<EventBus>,
+        plugins: SharedPluginRegistry,
+        engine_ops: Arc<dyn EngineOps>,
+        data_dir: crate::paths::DataDir,
+        sessions_root: Option<std::ffi::OsString>,
+    ) -> Result<Self, LuaError> {
         let lua = Lua::new();
         let subscriptions: SharedSubscriptions = Arc::new(Mutex::new(EventSubscriptions::new()));
         let stdin_pump: SharedStdinPump = Arc::new(Mutex::new(StdinPump::empty()));
@@ -106,6 +122,7 @@ impl LuaHost {
             EngineMode::Serve,
             Arc::clone(&stdin_pump),
             data_dir,
+            sessions_root,
             Arc::clone(&cooperative_tasks),
         )
         .map_err(LuaError::VmInit)?;
@@ -546,13 +563,14 @@ fn install_nefor_surface(
     mode: EngineMode,
     stdin_pump: SharedStdinPump,
     data_dir: crate::paths::DataDir,
+    sessions_root: Option<std::ffi::OsString>,
     cooperative_tasks: bindings::CooperativeTasks,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor.set("version", env!("NEFOR_VERSION"))?;
     bindings::install_engine(lua, &nefor, engine_ops, cooperative_tasks)?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
-    bindings::install_fs(lua, &nefor, data_dir)?;
+    bindings::fs::install_fs_with_sessions_root(lua, &nefor, data_dir, sessions_root)?;
     bindings::install_json(lua, &nefor)?;
     bindings::install_log(lua, &nefor)?;
     bindings::install_process(lua, &nefor)?;

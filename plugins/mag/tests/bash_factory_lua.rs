@@ -38,8 +38,9 @@ fn mag_kernel_bash_factory() {
         .set(
             "path",
             format!(
-                "{k}/?.lua;{k}/?/init.lua;{current}",
-                k = kernel_dir.display()
+                "{k}/?.lua;{k}/?/init.lua;{lua}/?.lua;{lua}/?/init.lua;{current}",
+                k = kernel_dir.display(),
+                lua = repo_root().join("lua").display()
             ),
         )
         .expect("set package.path");

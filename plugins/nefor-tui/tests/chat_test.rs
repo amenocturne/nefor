@@ -5705,7 +5705,8 @@ struct ResumeEnv {
     _guard: std::sync::MutexGuard<'static, ()>,
     _tempdir: tempfile::TempDir,
     data_home: PathBuf,
-    prev: Option<String>,
+    prev_data: Option<String>,
+    prev_sessions: Option<String>,
 }
 
 impl ResumeEnv {
@@ -5714,15 +5715,18 @@ impl ResumeEnv {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let data_home = tempdir.path().to_path_buf();
         std::fs::create_dir_all(data_home.join("sessions")).expect("mkdir sessions");
-        let prev = std::env::var("NEFOR_DATA_DIR").ok();
+        let prev_data = std::env::var("NEFOR_DATA_DIR").ok();
+        let prev_sessions = std::env::var("NEFOR_SESSIONS_DIR").ok();
         // Tests serialize via RESUME_ENV_LOCK so concurrent reads/writes
         // don't race. set_var is safe under edition 2021.
         std::env::set_var("NEFOR_DATA_DIR", &data_home);
+        std::env::set_var("NEFOR_SESSIONS_DIR", data_home.join("sessions"));
         ResumeEnv {
             _guard: guard,
             _tempdir: tempdir,
             data_home,
-            prev,
+            prev_data,
+            prev_sessions,
         }
     }
 
@@ -5763,9 +5767,13 @@ impl ResumeEnv {
 impl Drop for ResumeEnv {
     fn drop(&mut self) {
         // Still under RESUME_ENV_LOCK.
-        match self.prev.as_deref() {
+        match self.prev_data.as_deref() {
             Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
             None => std::env::remove_var("NEFOR_DATA_DIR"),
+        }
+        match self.prev_sessions.as_deref() {
+            Some(v) => std::env::set_var("NEFOR_SESSIONS_DIR", v),
+            None => std::env::remove_var("NEFOR_SESSIONS_DIR"),
         }
     }
 }

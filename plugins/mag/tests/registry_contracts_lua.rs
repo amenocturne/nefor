@@ -80,6 +80,15 @@ fn kernel_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel")
 }
 
+fn package_path(root: &std::path::Path, current: &str) -> String {
+    let shared_lua = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lua");
+    format!(
+        "{0}/?.lua;{0}/?/init.lua;{1}/?.lua;{1}/?/init.lua;{current}",
+        root.display(),
+        shared_lua.display()
+    )
+}
+
 #[test]
 fn registry_exposes_qualified_serializable_contracts() {
     let lua = Lua::new();
@@ -87,10 +96,7 @@ fn registry_exposes_qualified_serializable_contracts() {
     let current: String = package.get("path").expect("package.path");
     let root = kernel_dir();
     package
-        .set(
-            "path",
-            format!("{r}/?.lua;{r}/?/init.lua;{current}", r = root.display()),
-        )
+        .set("path", package_path(&root, &current))
         .expect("set package.path");
 
     let assertions: Function = lua
@@ -145,12 +151,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
     let package: mlua::Table = lua.globals().get("package").unwrap();
     let current: String = package.get("path").unwrap();
     let root = kernel_dir();
-    package
-        .set(
-            "path",
-            format!("{r}/?.lua;{r}/?/init.lua;{current}", r = root.display()),
-        )
-        .unwrap();
+    package.set("path", package_path(&root, &current)).unwrap();
     lua.load(r#"
       local Registry = require("registry")
       local reg = Registry.new()

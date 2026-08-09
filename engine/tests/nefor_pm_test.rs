@@ -435,6 +435,34 @@ fn immutable_registration_loads_without_mutating_data_root() {
 }
 
 #[test]
+fn immutable_registration_accepts_namespace_without_root_module() {
+    let source = tempfile::tempdir().expect("source");
+    let data = tempfile::tempdir().expect("data");
+    let _g = DataDirGuard::new(data.path());
+    let namespace = source.path().join("libs");
+    std::fs::create_dir_all(namespace.join("child")).expect("mkdir");
+    std::fs::write(
+        namespace.join("child/init.lua"),
+        "return { value = 'child' }\n",
+    )
+    .expect("child module");
+
+    let lua = lua_with_pm();
+    let value: String = lua
+        .load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            pm.register({{ {{ name = "libs", dir = "{}" }} }})
+            return pm.load("libs.child").value
+            "#,
+            namespace.display()
+        ))
+        .eval()
+        .expect("registered namespace loads children");
+    assert_eq!(value, "child");
+}
+
+#[test]
 fn immutable_registration_rejects_rebinding() {
     let first = tempfile::tempdir().expect("first");
     let second = tempfile::tempdir().expect("second");

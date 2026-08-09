@@ -5,11 +5,17 @@ fn run(script: &str) {
     let lua = Lua::new();
     let package: Table = lua.globals().get("package").unwrap();
     let current: String = package.get("path").unwrap();
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.join("lua/mag-kernel");
+    let shared_lua = manifest.join("../../lua");
     package
         .set(
             "path",
-            format!("{0}/?.lua;{0}/?/init.lua;{current}", root.display()),
+            format!(
+                "{0}/?.lua;{0}/?/init.lua;{1}/?.lua;{1}/?/init.lua;{current}",
+                root.display(),
+                shared_lua.display()
+            ),
         )
         .unwrap();
     lua.load(

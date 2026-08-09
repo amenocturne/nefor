@@ -39,7 +39,17 @@ use crate::paths::DataDir;
 /// at startup — without re-evaluating env vars on the Lua side (which
 /// historically drifted: Lua-side helpers invented a `NEFOR_DATA_HOME`
 /// the Rust resolver doesn't know about).
+#[allow(dead_code)]
 pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Result<()> {
+    install_fs_with_sessions_root(lua, nefor_tbl, data_dir, None)
+}
+
+pub(crate) fn install_fs_with_sessions_root(
+    lua: &Lua,
+    nefor_tbl: &Table,
+    data_dir: DataDir,
+    configured_sessions_root: Option<std::ffi::OsString>,
+) -> mlua::Result<()> {
     let fs_tbl = lua.create_table()?;
 
     let data_root: PathBuf = data_dir.as_path().to_path_buf();
@@ -58,10 +68,7 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         })?,
     )?;
 
-    let session_root = resolve_session_root(
-        &data_root,
-        std::env::var_os("NEFOR_SESSIONS_DIR").filter(|value| !value.is_empty()),
-    );
+    let session_root = resolve_session_root(&data_root, configured_sessions_root);
     let session_root_string = session_root.to_string_lossy().into_owned();
     fs_tbl.set(
         "sessions_root",
@@ -313,7 +320,7 @@ mod tests {
     fn setup_with_data_dir(data_dir: PathBuf) -> Lua {
         let lua = Lua::new();
         let nefor = lua.create_table().unwrap();
-        install_fs(&lua, &nefor, DataDir::new(data_dir)).unwrap();
+        install_fs_with_sessions_root(&lua, &nefor, DataDir::new(data_dir), None).unwrap();
         lua.globals().set("nefor", nefor).unwrap();
         lua
     }

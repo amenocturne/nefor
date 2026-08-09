@@ -75,13 +75,14 @@ fn harness() -> Lua {
     let package: Table = lua.globals().get("package").unwrap();
     let current: String = package.get("path").unwrap();
     let root = lua_root();
+    let shared_lua = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lua");
     package
         .set(
             "path",
             format!(
-                "{}/?.lua;{}/?/init.lua;{current}",
+                "{0}/?.lua;{0}/?/init.lua;{1}/?.lua;{1}/?/init.lua;{current}",
                 root.display(),
-                root.display()
+                shared_lua.display()
             ),
         )
         .unwrap();

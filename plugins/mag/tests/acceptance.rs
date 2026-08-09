@@ -74,6 +74,7 @@ async fn spawn_mag(data_dir: &std::path::Path) -> Child {
         .arg("--tool-gate")
         .arg(GATE)
         .env("NEFOR_DATA_DIR", data_dir)
+        .env("NEFOR_SESSIONS_DIR", data_dir.join("sessions"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -42,9 +42,32 @@ fn lua_string(path: &Path) -> String {
     serde_json::to_string(&path.display().to_string()).expect("path is JSON-encodable")
 }
 
+fn write_session_metadata(sessions_dir: &Path, session_id: &str) {
+    let session_dir = sessions_dir.join(session_id);
+    std::fs::create_dir_all(&session_dir).expect("create session metadata directory");
+    std::fs::write(
+        session_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&json!({
+            "created_with": "fixture-installation",
+            "installation_history": ["fixture-installation"],
+        }))
+        .expect("serialize session metadata"),
+    )
+    .expect("write session metadata");
+}
+
+fn write_empty_session_fixture(data_dir: &Path, session_id: &str) {
+    let sessions_dir = data_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("create sessions fixture directory");
+    write_session_metadata(&sessions_dir, session_id);
+    std::fs::write(sessions_dir.join(format!("{session_id}.jsonl")), "")
+        .expect("write empty session fixture");
+}
+
 fn write_session_fixture(data_dir: &Path) {
     let sessions_dir = data_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("create sessions fixture directory");
+    write_session_metadata(&sessions_dir, SESSION_ID);
     let mut lines = vec![serde_json::to_string(&json!({
         "_session": true,
         "session_id": SESSION_ID,
@@ -265,11 +288,12 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
-    let mut host = LuaHost::new(
+    let mut host = LuaHost::new_with_sessions_root(
         bus,
         plugins,
         ops,
         DataDir::new(data_dir.path().to_path_buf()),
+        None,
     )
     .expect("create real engine LuaHost");
     host.exec_str("cooperative-resume-init.lua", &engine_init_source(&root))
@@ -546,16 +570,18 @@ fn switching_sessions_between_chunks_cancels_the_stale_replay() {
     let root = repo_root();
     let data_dir = TempDir::new().expect("engine data tempdir");
     write_session_fixture(data_dir.path());
+    write_empty_session_fixture(data_dir.path(), "replacement-session");
 
     let shared = Arc::new(Mutex::new(BrokerShared::new()));
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(shared));
-    let host = LuaHost::new(
+    let host = LuaHost::new_with_sessions_root(
         bus,
         plugins,
         ops,
         DataDir::new(data_dir.path().to_path_buf()),
+        None,
     )
     .expect("create real engine LuaHost");
     host.exec_str(

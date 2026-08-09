@@ -754,8 +754,8 @@ function M.register(specs)
     if existing and (existing.dir ~= spec.dir or existing.source ~= "registered") then
       fail(spec.name, "already registered with a different source")
     end
-    if not require_fs().exists(pjoin(spec.dir, "init.lua")) then
-      fail(spec.name, "registered dir has no init.lua: " .. spec.dir)
+    if not require_fs().exists(spec.dir) then
+      fail(spec.name, "registered dir does not exist: " .. spec.dir)
     end
     plugins[spec.name] = { dir = spec.dir, source = "registered" }
   end
