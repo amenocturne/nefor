@@ -38,7 +38,8 @@ local function has_open_tool(entries)
 end
 
 function M.lead_unit_open(state)
-  return state.pending == true
+  return state.active_turn_id ~= nil
+    or state.pending == true
     or state.in_flight ~= nil
     or has_open_tool(state.entries or {})
 end

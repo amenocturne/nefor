@@ -1840,22 +1840,30 @@ local function apply_conversation_action(state, item)
   if item.kind == "turn_interrupted" then
     local terminal = item.terminal or {}
     local next_state = settle_terminal_provider_round(state, terminal)
-    return transcript.push_entry(shallow_merge(next_state, {
+    next_state = transcript.flush_graph_results(shallow_merge(next_state, {
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
-    }), Entry.system(display_value(terminal.reason or "interrupted")))
+    }))
+    return transcript.push_entry(
+      next_state, Entry.system(display_value(terminal.reason or "interrupted")))
   end
   if item.kind == "turn_failed" or item.kind == "conversation_failed" then
     local terminal = item.terminal or {}
     local message = item.message or terminal.error or terminal.message or "The conversation failed."
     local next_state = settle_terminal_provider_round(state, terminal)
-    return transcript.push_entry(shallow_merge(next_state, {
+    next_state = transcript.flush_graph_results(shallow_merge(next_state, {
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
-    }), Entry.error("Conversation failed", display_value(message), true))
+    }))
+    return transcript.push_entry(
+      next_state, Entry.error("Conversation failed", display_value(message), true))
   end
   if item.kind == "conversation_interrupted" then
-    return transcript.close_lead_unit(state)
+    return transcript.flush_graph_results(shallow_merge(
+      transcript.close_lead_unit(state), {
+        active_turn_id = NIL_SENTINEL,
+        active_turn_entry_start = NIL_SENTINEL,
+      }))
   end
   if item.kind == "compaction_pending" then
     local compaction = item.compaction or {}

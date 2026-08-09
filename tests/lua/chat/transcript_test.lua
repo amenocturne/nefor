@@ -77,6 +77,26 @@ open_tool = transcript.attach_tool_end(open_tool, "tool-1", "done", false)
 open_tool = transcript.flush_graph_results_if_stable(open_tool)
 eq(open_tool.entries[2].run_id, "tool-result", "tool completion is a stable boundary")
 
+local between_provider_rounds = transcript.push_entry({
+  entries = {}, active_turn_id = "turn-1", pending = false,
+}, {
+  role = "tool", kind = "tool_call", id = "fast-mag", name = "mag",
+  output = "executing", v = 1,
+})
+between_provider_rounds = transcript.append_graph_result(
+  between_provider_rounds, graph("fast-result"))
+eq(#between_provider_rounds.entries, 1,
+  "a fast result waits while the canonical conversation turn remains open")
+between_provider_rounds = transcript.append_assistant_delta(
+  between_provider_rounds, "I've started it")
+eq(between_provider_rounds.entries[2].text, "I've started it",
+  "provider text keeps its causal position before the deferred result")
+between_provider_rounds = transcript.finalize_assistant(between_provider_rounds)
+between_provider_rounds.active_turn_id = nil
+between_provider_rounds = transcript.flush_graph_results_if_stable(between_provider_rounds)
+eq(between_provider_rounds.entries[3].run_id, "fast-result",
+  "the turn terminal boundary releases the result after prior provider output")
+
 local idle = transcript.append_graph_result({ entries = {}, pending = false }, graph("idle"))
 eq(idle.entries[1].run_id, "idle", "idle results append immediately")
 eq(idle.pending_graph_results, nil)

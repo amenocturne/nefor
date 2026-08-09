@@ -989,6 +989,45 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
 }
 
 #[test]
+fn fast_graph_completion_waits_for_the_open_conversation_turn() {
+    let mut engine = Engine::new(120, 80).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    fixture_tool_started(&mut engine, "fast-mag", "mag", json!({}));
+    fixture_tool_completed(&mut engine, "fast-mag", json!("executing"), false);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "fast-run",
+            "run_name": "fast-finished",
+            "status": "success",
+        }),
+    );
+
+    let raced = render_str(&mut engine);
+    assert!(
+        !raced.contains("fast-finished"),
+        "a result cannot overtake provider output while its conversation turn is open:\n{raced}"
+    );
+
+    fixture_assistant_delta(&mut engine, "STARTED_FAST_WORKFLOW");
+    fixture_assistant_completed(
+        &mut engine,
+        None,
+        json!({ "model": "test", "duration_ms": 1 }),
+    );
+    let out = render_str(&mut engine);
+    let comment = out.find("STARTED_FAST_WORKFLOW").expect("comment");
+    let result = out.find("fast-finished").expect("graph result");
+    assert!(
+        comment < result,
+        "provider output must retain its causal position before the fast result:\n{out}"
+    );
+}
+
+#[test]
 fn chat_reset_closes_the_lead_unit_and_preserves_buffered_graph_results() {
     let mut engine = Engine::new(100, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
