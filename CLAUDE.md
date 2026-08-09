@@ -48,6 +48,10 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 
+## Manifesto
+
+[`docs/manifesto.md`](docs/manifesto.md) governs Nefor development. Check every feature design against it before changing code. If a feature conflicts with the manifesto, redesign or reject the feature; only rarely, when the conflict exposes a fundamental mistake, reconsider the manifesto explicitly before making code changes.
+
 ## Conventions (enforced)
 
 - Errors: `thiserror` for domain errors, `anyhow` only at the top boundary (`main.rs`).

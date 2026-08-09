@@ -1,8 +1,10 @@
 # nefor principles
 
+The [Nefor Manifesto](manifesto.md) governs feature and architectural decisions. This document records supporting design and writing principles within that world; where the two conflict, follow the manifesto.
+
 This document captures the design and writing principles that nefor has committed to. It exists so contributors — including future us — can check their work against a stable reference, instead of having to reconstruct the discipline from scratch every time.
 
-When in doubt while writing code, a spec, a doc, or a commit message: read the relevant section below, then decide.
+When in doubt while writing code, a spec, a doc, or a commit message: read the manifesto and the relevant section below, then decide.
 
 Four sections:
 

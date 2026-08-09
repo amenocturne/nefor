@@ -125,6 +125,7 @@ release-bundle and deterministic TUI daily-path suites.
 
 ## Docs
 
+- [Nefor Manifesto](docs/manifesto.md)
 - [MAG: ground-up visual explanation](docs/mag.html)
 - [Architecture and writing principles](docs/principles.md)
 - [Plugin authoring guide](docs/plugin-authoring.md)
