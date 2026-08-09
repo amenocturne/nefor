@@ -475,8 +475,9 @@ local function node_inspector(state, p, now_ms)
     tui.text { content = string.rep("─", 48), style = STYLE.footer, wrap = "none" },
   } }
   local group = run_panel.group_of(p.actor_id or "")
+  local is_agent = preview_state.agent_assignment(state, p.run_id, group)
   local assignment = assignment_widget(state, p.run_id, group)
-  local body = preview_view.node(state, p.run_id, p.actor_id)
+  local body = preview_view.node(state, p.run_id, p.actor_id, { hide_stdout = is_agent })
   if assignment then body = tui.column { gap = 1, children = { assignment, body } } end
   return popup_shell("── node · " .. tostring(p.actor_id or "?") .. " [read-only] ──",
     header, body, p.unseen)
@@ -497,14 +498,19 @@ local function aggregate_inspector(state, p, now_ms)
     end
   end
   table.sort(member_parts)
+  local is_agent = p.group and preview_state.agent_assignment(state, p.run_id, p.group) or false
   local children, last_actor = {}, nil
   for index, item in ipairs(items) do
-    if item.actor_id ~= last_actor then
-      children[#children + 1] = tui.text { content = "· " .. item.actor_id, style = STYLE.popup_user, wrap = "none" }
-      last_actor = item.actor_id
-    end
     local node = preview_state.node(state, p.run_id, item.actor_id) or {}
-    children[#children + 1] = preview_view.activity(item, state, node, index == #items)
+    local activity = preview_view.activity(item, state, node, index == #items,
+      { hide_stdout = is_agent })
+    if activity then
+      if item.actor_id ~= last_actor then
+        children[#children + 1] = tui.text { content = "· " .. item.actor_id, style = STYLE.popup_user, wrap = "none" }
+        last_actor = item.actor_id
+      end
+      children[#children + 1] = activity
+    end
   end
   local assignment = p.group and assignment_widget(state, p.run_id, p.group) or nil
   if assignment then table.insert(children, 1, assignment) end

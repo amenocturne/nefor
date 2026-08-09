@@ -10386,6 +10386,87 @@ fn agent_group_inspector_shows_its_initial_assignment() {
 }
 
 #[test]
+fn agent_group_inspector_hides_stdout_streams_but_keeps_useful_activity() {
+    let mut engine = Engine::new(120, 36).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "agent-run", "run_name": "delegated" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "agent-run",
+            "id": "worker.llm", "factory": "llm",
+            "spec": { "params": { "system": "base instructions\n\n---\n\nInspect the repository." } }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke", "id": "shell-call", "name": "bash", "args": {},
+            "invocation": { "run_id": "agent-run", "actor_id": "worker.llm" }
+        }),
+    );
+    for (stream, text) in [
+        (
+            "stdout",
+            "/project/src/main.rs\nrefs/heads/worktree-popup-stdout\n",
+        ),
+        ("stderr", "USEFUL WARNING"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "tool.stream", "id": "shell-call", "stream": stream, "text": text }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mock.completion.request", "request_id": "provider-call",
+            "invocation": { "run_id": "agent-run", "actor_id": "worker.llm" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mock.completion.event", "request_id": "provider-call",
+            "event": "text_delta", "text": "Useful agent summary"
+        }),
+    );
+
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select agent group");
+    engine
+        .handle_key(key("space"))
+        .expect("open agent inspector");
+    let snapshot = render_snapshot(&mut engine);
+    for expected in [
+        "Initial assignment",
+        "Inspect the repository.",
+        "USEFUL WARNING",
+        "Useful agent summary",
+    ] {
+        assert!(
+            snapshot.contains(expected),
+            "agent preview lost {expected:?}:\n{snapshot}"
+        );
+    }
+    for hidden in [
+        "stdout",
+        "/project/src/main.rs",
+        "refs/heads/worktree-popup-stdout",
+    ] {
+        assert!(
+            !snapshot.contains(hidden),
+            "agent preview leaked stdout content {hidden:?}:\n{snapshot}"
+        );
+    }
+}
+
+#[test]
 fn compact_duration_formatter_covers_unit_boundaries() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

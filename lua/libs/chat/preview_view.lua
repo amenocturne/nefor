@@ -122,7 +122,7 @@ local function section(title, values)
   return tui.column { gap = 1, children = children }
 end
 
-function M.node(state, run_id, actor_id)
+function M.node(state, run_id, actor_id, options)
   local node = preview_state.node(state, run_id, actor_id)
   if not node then return tui.text { content = "Node is no longer available.", style = STYLE.status_dim } end
   local children = {
@@ -136,18 +136,22 @@ function M.node(state, run_id, actor_id)
     if candidate then children[#children + 1] = candidate end
   end
   local items = preview_state.merged(state, run_id, function(id) return id == actor_id end)
-  if #items > 0 then
+  local activity = {}
+  for index, item in ipairs(items) do
+    local widget = M.activity(item, state, node, index == #items, options)
+    if widget then activity[#activity + 1] = widget end
+  end
+  if #activity > 0 then
     children[#children + 1] = tui.text { content = "Activity", style = STYLE.popup_user, wrap = "none" }
-    for index, item in ipairs(items) do
-      children[#children + 1] = M.activity(item, state, node, index == #items)
-    end
+    for _, widget in ipairs(activity) do children[#children + 1] = widget end
   end
   return tui.column { gap = 1, children = children }
 end
 
-function M.activity(item, state, node, is_last)
+function M.activity(item, state, node, is_last, options)
   local value = item.item and item.item.value
   local kind = type(value) == "table" and value.kind or nil
+  if options and options.hide_stdout and kind == "stdout" then return nil end
   if kind == "reasoning" then
     return tui.text { content = reasoning_value(value.text, {
       state = state, node = node or {}, is_last = is_last,
