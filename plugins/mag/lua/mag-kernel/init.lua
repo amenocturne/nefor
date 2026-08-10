@@ -147,6 +147,7 @@ local function new_run_context(meta)
     principal = meta.principal,
     conversation_id = meta.conversation_id
       or (tostring(meta.session_id or "sessionless") .. "/" .. tostring(meta.run_id)),
+    actor_conversations = {},
     last_output_path = nil,
     run_complete = nil,
     run_complete_taken = false,
@@ -284,6 +285,8 @@ local function new_run_context(meta)
         actor_id = actor_id,
         capability_id = capability_id,
         principal = ctx.principal,
+        conversation_id = ctx.actor_conversations[actor_id],
+        root_conversation_id = ctx.conversation_id,
       }
     end,
     events = emit_event,
@@ -368,6 +371,7 @@ local function new_run_context(meta)
     local actor_conversation_id = explicit_conversation_id
       or tostring(ctx.conversation_id) .. "/turns/" .. tostring(ctx.run_id)
         .. "/actors/" .. tostring(record.id)
+    ctx.actor_conversations[record.id] = actor_conversation_id
     local is_root_conversation = actor_conversation_id == ctx.conversation_id
     local explicit_turn_id = type(actor_params.turn_id) == "string"
         and actor_params.turn_id ~= "" and actor_params.turn_id or nil

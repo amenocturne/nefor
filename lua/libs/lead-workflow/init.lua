@@ -1135,19 +1135,24 @@ local function handle_mag_run_result(body)
   end
 
   if not run_registry:claim_delivery(run_id) then return end
+  local root_owned = run.dispatcher_id == nil
   if failed then
-    emit_mag_result_block(run, "failed", nil, err)
-    -- A TUI termination is already a user decision. Settlement and visibility
-    -- still happen, but feeding the kill back as a task would restart the lead.
-    if run.terminate_reason ~= "user-tui-termination" then
-      relay_kernel_completion(run_id, run.run_name, false, nil, err)
+    if root_owned then
+      emit_mag_result_block(run, "failed", nil, err)
+      -- A TUI termination is already a user decision. Settlement and visibility
+      -- still happen, but feeding the kill back as a task would restart the lead.
+      if run.terminate_reason ~= "user-tui-termination" then
+        relay_kernel_completion(run_id, run.run_name, false, nil, err)
+      end
     end
     return
   end
-  emit_mag_result_block(run, "success", body.output_path, nil)
-  local content = mag_result_text(body.result)
-    or read_output_file(body.output_path)
-  relay_kernel_completion(run_id, run.run_name, true, content, nil)
+  if root_owned then
+    emit_mag_result_block(run, "success", body.output_path, nil)
+    local content = mag_result_text(body.result)
+      or read_output_file(body.output_path)
+    relay_kernel_completion(run_id, run.run_name, true, content, nil)
+  end
 end
 
 -- Double-Esc entry point (`chat.interrupt_all`). The `mag` execute tool is
@@ -1230,6 +1235,7 @@ local function resolve_invocation(metadata, direct_default_principal)
     principal = invocation.principal,
     invocation = invocation,
     dispatcher_id = invocation.principal == "subagent" and invocation.actor_id or nil,
+    conversation_id = invocation.conversation_id,
   }
 end
 
@@ -1471,8 +1477,10 @@ local function lead_workflow_tool_schemas()
         "terminal result. The root lead may address same-session runs globally; a non-root " ..
         "agent may address only runs that exact actor directly dispatched. This attaches to " ..
         "the existing run and does not poll graph-status or cancel it. Use this when your next " ..
-        "step depends on completion. Cancellation detaches only this waiter; use terminate-graph " ..
-        "separately to stop the run.",
+        "step depends on completion. A run reaches terminal state only when its processes exit; " ..
+        "awaiting a persistent foreground server or watcher therefore waits indefinitely. Never " ..
+        "launch such a process as a normal run and await it. Cancellation detaches only this " ..
+        "waiter; use terminate-graph separately to stop the run.",
       parameters  = {
         type = "object",
         properties = {
@@ -1595,7 +1603,7 @@ end
 -- mag.run_complete) stream on the bus; the terminal mag.run_result (carrying
 -- the sink's output PATH) closes the run and relays a fresh model turn in
 -- receive_msg.
-local function begin_mag_load(firing_id, action, args, ws, session_id, dispatcher_id)
+local function begin_mag_load(firing_id, action, args, ws, provenance)
   local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
   local run_id = action == "execute" and run_registry:mint_run_id()
     or ("mag-load-" .. envelope.uuid_lite())
@@ -1607,8 +1615,9 @@ local function begin_mag_load(firing_id, action, args, ws, session_id, dispatche
     file       = args.file,
     run_id     = run_id,
     run_name   = graph_name,
-    session_id = session_id,
-    dispatcher_id = dispatcher_id,
+    session_id = provenance.session_id,
+    dispatcher_id = provenance.dispatcher_id,
+    conversation_id = provenance.conversation_id,
   }
 
   emit_as(SOURCE_NAME, "mag", {
@@ -1672,6 +1681,7 @@ submit_loaded_run = function(pending, body, error_prefix)
     run_name = pending.run_name,
     session_id = pending.session_id,
     principal = "subagent",
+    conversation_id = pending.conversation_id,
     artifact = artifact,
   }
   if next(overlay) ~= nil then exec.params_overlay = overlay end
@@ -1811,7 +1821,7 @@ local function mag_handler(firing_id, args, metadata)
   -- the mag.loaded reply resolves them (resume_pending_load).
   -- File-based MAG execution is detached for every caller. Non-root authority
   -- is recorded against the kernel-stamped actor that made this invocation.
-  begin_mag_load(firing_id, action, args, ws, session_id, provenance.dispatcher_id)
+  begin_mag_load(firing_id, action, args, ws, provenance)
 end
 
 local TOOL_HANDLERS = {

@@ -121,6 +121,11 @@ do
   assert_eq(await_schema.display.primary.arg, "run_id", "await-run displays its stable handle")
   assert_eq(mag_eval_schema.display.label, "mag-eval", "mag-eval display keeps stable tool identity")
   assert_eq(mag_eval_schema.display.primary.arg, "intent", "mag-eval display uses exact intent")
+  assert_true(mag_eval_schema.description:find("Commands run until process exit", 1, true) ~= nil
+      and mag_eval_schema.description:find("Never launch a server as a normal run", 1, true) ~= nil,
+    "mag-eval canonically warns that persistent commands cannot be awaited to completion")
+  assert_true(await_schema.description:find("waits indefinitely", 1, true) ~= nil,
+    "await-run canonically warns about persistent foreground processes")
   assert_true(string.find(mag_schema.description, "lib/patterns.md", 1, true) ~= nil,
     "the MAG schema points to the injected canonical patterns")
   assert_true(string.find(mag_schema.description, "lib/nefor/*.mag", 1, true) == nil,
@@ -442,6 +447,8 @@ local function invocation(session_id, principal, capability_id, actor_id, run_id
     actor_id = actor_id or (principal == "lead" and "lead.run-tool" or "worker.run-tool"),
     capability_id = capability_id,
     principal = principal,
+    conversation_id = (actor_id or (principal == "lead" and "lead.run-tool" or "worker.run-tool"))
+      .. ":conversation",
   }
 end
 
@@ -1889,6 +1896,8 @@ do
     "graph-agent eval uses the structured executing acknowledgment")
   assert_eq(ack.body.output.run_id, exec.body.run_id,
     "graph-agent acknowledgment exposes the stable run handle")
+  assert_eq(exec.body.conversation_id, "worker.run-tool:conversation",
+    "nested eval preserves the dispatching worker conversation")
   assert_true(lw._internals.state.active_runs[exec.body.run_id] ~= nil,
     "graph-agent eval is registered in the standard active-run registry")
   assert_eq(lw._internals.run_registry.run_dispatchers[exec.body.run_id],
@@ -1911,6 +1920,11 @@ do
   assert_eq(#find_calls(decode_calls(), function(c)
     return c.body.kind == "tool.result" and c.body.id == "gate-88"
   end), 0, "terminal completion cannot settle the dispatch tool twice")
+  assert_eq(#find_calls(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.run_id == exec.body.run_id
+  end), 0, "worker-owned completion stays out of the root transcript")
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0,
+    "worker-owned completion is not relayed into the root lead conversation")
 
   -- Canceling the already-acknowledged dispatch uses the standard detached-run
   -- path and does not emit a second result for the source firing.

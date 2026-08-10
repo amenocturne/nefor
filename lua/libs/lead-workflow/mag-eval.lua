@@ -102,14 +102,16 @@ M.schema = {
   description =
     "Evaluate one MAG node expression on the actor kernel. " ..
     "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
-    "compose multi-node work in a .mag graph. Commands run " ..
-    "until they exit — long-running " ..
-    "work (servers, review UIs, watch loops) needs no backgrounding, no " ..
-    "`&`, no polling; run it in the foreground. " ..
+    "compose multi-node work in a .mag graph. Commands run until process exit, " ..
+    "so awaiting a persistent foreground process such as an HTTP server waits " ..
+    "indefinitely. Long-lived servers and watchers must use an appropriate retained " ..
+    "or background lifecycle facility when available, or one bounded command that " ..
+    "starts the process, waits for readiness, performs the dependent work, and tears " ..
+    "it down. Never launch a server as a normal run and await its completion. " ..
     "nefor.shell.command-with-options opts into a wall-clock bound. " ..
     "The call acknowledges immediately with a stable run_id; " ..
     "call await-run with that handle when your next step depends on terminal " ..
-    "output. The normal run-completion notification remains independent. " ..
+    "output. The normal owner-scoped run-completion notification remains independent. " ..
     "Multi-step or multi-file work runs as a .mag program via the " ..
     "mag tool instead.",
   parameters  = {
@@ -223,6 +225,7 @@ function M.handle(firing_id, args, metadata)
     run_name   = run_name,
     session_id = session_id,
     dispatcher_id = provenance.dispatcher_id,
+    conversation_id = provenance.conversation_id,
   }
   emit_as(SOURCE_NAME, "mag", {
     kind       = "mag.load",

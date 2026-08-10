@@ -10,6 +10,8 @@ local REQUIRED = {
   "session_id", "run_id", "run_scope", "actor_id", "capability_id", "principal",
 }
 
+local OWNERSHIP = { "conversation_id" }
+
 local function nonempty_string(value)
   return type(value) == "string" and value ~= ""
 end
@@ -30,6 +32,14 @@ local function validate(invocation)
   end
   local copy = {}
   for _, field in ipairs(REQUIRED) do copy[field] = invocation[field] end
+  for _, field in ipairs(OWNERSHIP) do
+    if invocation[field] ~= nil then
+      if not nonempty_string(invocation[field]) then
+        return nil, "invalid invocation provenance field " .. field
+      end
+      copy[field] = invocation[field]
+    end
+  end
   return copy, nil
 end
 

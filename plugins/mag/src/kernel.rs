@@ -1075,6 +1075,10 @@ mod tests {
         assert_eq!(provenance["principal"], "subagent");
         assert_eq!(provenance["actor_id"], invoke["from"]);
         assert_eq!(provenance["capability_id"], invoke["id"]);
+        assert_eq!(provenance["root_conversation_id"], "conversation-1");
+        assert!(provenance["conversation_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("conversation-1/turns/provenance-run/actors/")));
         assert!(provenance["run_scope"]
             .as_str()
             .is_some_and(|scope| scope.starts_with('r')));
