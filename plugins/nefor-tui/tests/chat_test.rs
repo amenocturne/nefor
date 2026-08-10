@@ -9239,42 +9239,47 @@ fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
 
 #[test]
 fn tool_path_summary_keeps_tail_collapsed_and_wraps_full_path_expanded() {
-    let mut engine = Engine::new(80, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "tool.register", "tools": [{
-            "name": "read_file",
-            "display": {
-                "label": "Read file",
-                "primary": { "arg": "path" },
-                "result": { "kind": "receipt", "text": "content loaded" }
-            }
-        }] }),
-    );
-    let path = "/home/user/projects/nefor/src/rendering/deep/components/useful_file.rs";
-    fixture_tool_started(
-        &mut engine,
-        "path-display",
-        "read_file",
-        json!({ "path": path }),
-    );
+    for (name, arg, label) in [("read_file", "path", "Read file"), ("mag", "file", "MAG")] {
+        let mut engine = Engine::new(80, 30).expect("engine");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "tool.register", "tools": [{
+                "name": name,
+                "display": {
+                    "label": label,
+                    "primary": { "arg": arg },
+                    "result": { "kind": "receipt", "text": "content loaded" }
+                }
+            }] }),
+        );
+        let path = "/home/user/projects/nefor/src/rendering/deep/components/useful_file.rs";
+        fixture_tool_started(
+            &mut engine,
+            &format!("{name}-path-display"),
+            name,
+            json!({ arg: path }),
+        );
 
-    let collapsed = render_snapshot(&mut engine);
-    assert!(collapsed.contains("useful_file.rs"), "{collapsed}");
-    assert!(!collapsed.contains("/home/user/projects"), "{collapsed}");
+        let collapsed = render_snapshot(&mut engine);
+        assert!(collapsed.contains("useful_file.rs"), "{name}: {collapsed}");
+        assert!(
+            !collapsed.contains("/home/user/projects"),
+            "{name}: {collapsed}"
+        );
 
-    engine.handle_key(key("ctrl_o")).expect("expand");
-    let expanded = render_snapshot(&mut engine);
-    let compact: String = expanded
-        .lines()
-        .map(|line| line.split('│').next().unwrap_or(line).trim())
-        .collect();
-    assert!(
-        compact.contains(path),
-        "expanded path was not preserved across wrapped lines:\n{expanded}"
-    );
+        engine.handle_key(key("ctrl_o")).expect("expand");
+        let expanded = render_snapshot(&mut engine);
+        let compact: String = expanded
+            .lines()
+            .map(|line| line.split('│').next().unwrap_or(line).trim())
+            .collect();
+        assert!(
+            compact.contains(path),
+            "{name}: expanded path was not preserved across wrapped lines:\n{expanded}"
+        );
+    }
 }
 
 #[test]

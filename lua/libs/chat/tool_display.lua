@@ -163,6 +163,11 @@ local function pick(selector_value, args)
   return rendered
 end
 
+local function selector_is_path(selector_value)
+  return type(selector_value) == "table"
+    and (selector_value.arg == "path" or selector_value.arg == "file")
+end
+
 local function byte_count(value)
   if value == nil then return 0 end
   if type(value) == "string" then return #value end
@@ -217,7 +222,7 @@ function M.project(c, args, output, is_error, name)
     projection = {
       label = pick(c.label, args),
       primary = pick(c.primary, args),
-      primary_is_path = type(c.primary) == "table" and c.primary.arg == "path",
+      primary_is_path = selector_is_path(c.primary),
       arguments = {},
     }
     if not nonempty(projection.label) then
