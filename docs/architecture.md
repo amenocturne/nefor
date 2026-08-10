@@ -1,13 +1,15 @@
 # Architecture
 
+> **Current architecture authority.** This document describes the shipped runtime at the current tree. Contributor ownership and placement guidance lives in [`contributing/architecture.md`](contributing/architecture.md). Historical design records are not authoritative when they disagree with this document, code, or tests.
+
 nefor runs as a small engine plus user-owned Lua composition. The shipped starter layers MAG, providers, tools, approvals, sessions, and interfaces on top of that substrate; those choices are replaceable composition, not engine behavior.
 
-| Layer                         | What it owns                                                                                                                                                       | What it avoids                                                                                                  |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| Engine / bus                  | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp. | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals.         |
-| Plugins                       | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors.                                                        | Cross-plugin policy or hard-coded knowledge of how another plugin is used.                                      |
-| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces.                         | Heavy provider/tool implementation that belongs in a process plugin.                                            |
-| MAG                           | Pure namespaced evaluation; libraries define typed graph data, foreign capabilities, validation, and lowering into a generic `Artifact`.                          | Knowing actors, factories, shell, sinks, or Nefor wire types; those live in libraries and runtime contracts.    |
+| Layer                         | What it owns                                                                                                                                                       | What it avoids                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| Engine / bus                  | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp. | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals.      |
+| Plugins                       | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors.                                                        | Cross-plugin policy or hard-coded knowledge of how another plugin is used.                                   |
+| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces.                         | Heavy provider/tool implementation that belongs in a process plugin.                                         |
+| MAG                           | Pure namespaced evaluation; libraries define typed graph data, foreign capabilities, validation, and lowering into a generic `Artifact`.                           | Knowing actors, factories, shell, sinks, or Nefor wire types; those live in libraries and runtime contracts. |
 
 ## The decoupling rule
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+Changes after v0.4.0:
+
+- Replaced provider-owned replay/history paths with a canonical conversation manager and consumer-owned projections across the lead, MAG, CLI, and TUI surfaces.
+- Strengthened typed MAG boundaries, structured-output validation, terminal integrity, runtime value preservation, and provider stream identity/finalization.
+- Added detached and explicitly awaitable MAG runs, scoped run control, nested-run ownership, and more truthful actor/tool activity previews.
+- Made session provenance and shared session roots explicit across installed and development runtimes; made replay cooperative and added progress UI and hermetic resume/provenance tests.
+- Added deterministic daily-path integration gates, release-bundle validation, build-version invalidation coverage, MAG profiling/benchmarks, and a local session anatomy inspector.
+- Added queued steering and shared workflow termination controls, including double-Ctrl-C exit protection and triple-Escape global workflow termination.
+- Added TUI quality fixes including sidebar overflow navigation, popup layering, semantic tool previews, hidden raw streams in agent previews, and opening Markdown links.
+- Adopted `docs/manifesto.md` as the product-design constraint.
+
+## v0.4.0
+
+- Replaced the reasoner-graph execution path with the run-scoped MAG actor kernel and made MAG the only workflow execution path.
+- Made MAG a domain-neutral, typed, namespaced language that lowers library-defined programs to generic artifacts.
+- Moved reusable Lua mechanisms out of starter composition into `lua/libs`, leaving starter-owned policy, prompts, and wiring behind explicit extension seams.
+- Added MAG shell/tool/provider factories, lifecycle and run observability, output persistence, human injection, cancellation, and a standalone `mag` compiler CLI.
+- Added mag-first lead tools and migrated the starter CLI/TUI workflows and deterministic mocks to the kernel contract.
+- Added pre-public compatibility/versioning policy and automatic stable tagging from the committed workspace version.
+
+## v0.3.0
+
+- Introduced autonomous permission modes and buffered follow-up input while the chat workflow is busy.
+- Added workflow cycles and decoupled bash command reasoning from the scheduler.
+- Required builder commits before finalization and avoided creating empty session logs.
+- Fixed mock-provider spawn graphs and preserved built-in combinators during the transition.
+
+## v0.2.4
+
+- Preserved system prompts when provider chats are created.
+
+## v0.2.3
+
+- Added native chat compaction, including pending-state UI and preservation of summary items and lead chat identity.
+
+## v0.2.2
+
+- Added reasoning-effort selection.
+
+## v0.2.1
+
+- Removed the fixed timeout from live SSE response bodies.
+
+## v0.2.0
+
+- Added image-aware tools and chat input, exact file edits, bounded/compact read-only tool output, and shared SSE parsing.
+- Hardened session replay, event boundaries, interrupted workflows, provider tool-result history, and TUI replay/layout behavior.
+- Split local test entry points, added pre-commit/pre-push hooks and the pre-public semantic-version policy, and made chat integration tests deterministic under shared environment state.
+- Added Nix flake and Home Manager packaging and version-aware package-manager installation.
+
 ## v0.1.3
 
 - **`openai-provider --auth-header NAME`**: send the API key under a non-standard header instead of `Authorization: Bearer …`. Useful for gateways that gate on a custom header (proxies, internal LLM routers). Defaults to `Authorization` so existing setups stay byte-identical.

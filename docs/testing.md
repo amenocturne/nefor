@@ -1,5 +1,7 @@
 # Testing nefor
 
+> **Historical/internal test note.** This document captures an older CLI-plugin-era testing inventory and contains stale commands, counts, paths, and behavior. It is retained as design history, not as current contributor guidance. Use [`contributing/testing.md`](contributing/testing.md) and `just --list`; current recipes and tests are authoritative.
+
 How to verify a working build, run the test suite, and exercise each surface (CLI, TUI, mock e2e). Written against the post-CLI-plugin-epic main (May 2026 onward); the workspace ships ~1600 tests and the mock-driven CLI e2e suite as the default health check.
 
 ## TL;DR — 30-second smoke
@@ -18,7 +20,7 @@ If those three pass, the substrate is healthy.
 | ------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------ |
 | Workspace unit tests            | `cargo test --workspace`                        | Per-crate unit tests across engine + all plugins                                                           | Few seconds, mostly in-process |
 | `agentic_cli_mock_e2e`          | `engine/tests/agentic_cli_mock_e2e.rs`          | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default e2e health check.** | ~2.5s wall                     |
-| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP behavior in Lua                                                                                   | <1s                            |
+| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP behavior in Lua                                                                                        | <1s                            |
 | `starter_sessions_test`         | `engine/tests/starter_sessions_test.rs`         | Session persistence + resume                                                                               | <1s                            |
 | `starter_agentic_workflow_test` | `engine/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                            | <1s                            |
 | Plugin unit tests               | `cargo test -p <plugin>`                        | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)        | Sub-second per plugin          |

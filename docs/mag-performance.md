@@ -1,5 +1,7 @@
 # MAG compiler profiling and performance
 
+> **Internal design record.** This material records the reasoning and implementation shape of the MAG work at the time it was written. It is not an end-user contract. Current authority is `just bench-mag`, the benchmark implementation, and current compiler tests; where they differ, code and current tests win.
+
 The MAG compiler has two opt-in observability paths. Normal library calls and
 the ordinary CLI envelope remain unchanged and do not allocate a profiler.
 

@@ -1,5 +1,7 @@
 # MAG Language Refactor
 
+> **Internal design record.** This material records the reasoning and implementation shape of the MAG work at the time it was written. It is not an end-user contract. Current authority is `crates/nefor-mag`, `plugins/mag/docs`, the shipped MAG libraries, and their tests; where they differ, code and current tests win.
+
 MAG is a pure, namespaced data-construction language. Runtime concepts are
 provided by libraries and foreign declarations; the compiler does not know
 about graphs, actors, factories, sinks, tasks, providers, tools, or shell.
