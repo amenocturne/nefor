@@ -562,6 +562,28 @@ do
 end
 
 do
+  local instance, msgs, facts = make("observed-usage.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  instance.handle_observation({ binding = "conversation", value = {
+    kind = "usage", prompt_tokens = 80, completion_tokens = 7,
+    model = "observed-model", duration_ms = 50,
+  } })
+  instance.deliver({
+    kind = "reply",
+    ref = find_kind(msgs, "capability.invoke").ref,
+    result = { text = "done" },
+  })
+
+  local terminal = facts[#facts]
+  assert_eq(terminal.kind, "turn_completed", "observed usage reaches the terminal fact")
+  assert_eq(terminal.detail.usage.input_tokens, 80,
+    "provider prompt usage is normalized for the context-used projection")
+  assert_eq(terminal.detail.usage.output_tokens, 7,
+    "provider completion usage is normalized with the input count")
+  assert_eq(terminal.detail.model, "observed-model", "usage observation preserves the model")
+end
+
+do
   local instance, msgs, facts = make("structured-tool.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
   instance.deliver({ kind = "reply", ref = find_kind(msgs, "capability.invoke").ref,

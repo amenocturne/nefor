@@ -88,7 +88,7 @@ local function build_segments(state)
 
   local s = state.stats or {}
   local current_ctx = state.current_context_tokens
-  if current_ctx or state.max_tokens then
+  if current_ctx ~= nil then
     local cb = ctx_bar(current_ctx, state.max_tokens)
     if cb then segs[#segs + 1] = cb end
   end

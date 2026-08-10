@@ -138,6 +138,18 @@ function M.construct(id, params, emit, options)
         if merged[key] == nil then merged[key] = result[key] end
       end
     end
+    local usage = merged.usage
+    if type(usage) ~= "table" and type(merged.prompt_tokens) == "number" then
+      usage = {
+        prompt_tokens = merged.prompt_tokens,
+        completion_tokens = merged.completion_tokens,
+      }
+    end
+    if type(usage) == "table" then
+      if usage.input_tokens == nil then usage.input_tokens = usage.prompt_tokens end
+      if usage.output_tokens == nil then usage.output_tokens = usage.completion_tokens end
+      merged.usage = usage
+    end
     return merged
   end
 
@@ -355,7 +367,7 @@ function M.construct(id, params, emit, options)
       if value.kind == "retry" then
         facts:retry(value.error or value.message or "provider_retry", value)
       elseif value.kind == "usage" then
-        terminal_metadata.usage = value.usage or value.result
+        terminal_metadata.usage = value.usage or value.result or value
         terminal_metadata.model = value.model or terminal_metadata.model
         terminal_metadata.duration_ms = value.duration_ms or terminal_metadata.duration_ms
       elseif value.kind == "interrupted" then

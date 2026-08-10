@@ -504,7 +504,7 @@ fn chat_lua_loads_and_renders_initial_frame() {
 }
 
 #[test]
-fn initial_statusline_adds_context_window_from_model_list() {
+fn model_list_keeps_context_widget_hidden_until_usage_is_known() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
 
@@ -524,8 +524,38 @@ fn initial_statusline_adds_context_window_from_model_list() {
         "initial statusline should keep configured model: {out:?}"
     );
     assert!(
-        out.contains("ctx 128k"),
-        "initial statusline should show known model context window: {out:?}"
+        !out.contains("ctx "),
+        "context capacity alone must not masquerade as context used: {out:?}"
+    );
+}
+
+#[test]
+fn completed_turn_restores_context_used_widget() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "mock-plugin",
+            "models": ["mock-model"],
+            "context_windows": { "mock-model": 128000 },
+        }),
+    );
+
+    fixture_assistant_completed(
+        &mut engine,
+        Some("answer".into()),
+        json!({
+            "model": "mock-model",
+            "usage": { "input_tokens": 80_000, "output_tokens": 7 }
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("ctx 80k/128k") && out.contains("63%"),
+        "completed-turn input usage should render the context-used widget: {out:?}"
     );
 }
 
