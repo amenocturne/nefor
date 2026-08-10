@@ -253,6 +253,7 @@ fn blank_run(buf: &mut FrameBuffer, row: u16, col_start: u16, width: u16, style:
         line.cells[col] = Cell {
             text: " ".to_string(),
             style: *style,
+            link: None,
         };
     }
 }
@@ -392,7 +393,13 @@ fn sampled_animation_chars(inst: &mut WidgetInstance) -> Vec<StyledChar> {
 
 /// Convert a plain string + style into styled chars.
 pub(crate) fn styled_chars_from_str(s: &str, style: Style) -> Vec<StyledChar> {
-    s.chars().map(|ch| StyledChar { ch, style }).collect()
+    s.chars()
+        .map(|ch| StyledChar {
+            ch,
+            style,
+            link: None,
+        })
+        .collect()
 }
 
 // ── Column ───────────────────────────────────────────────────────────────
@@ -1868,6 +1875,7 @@ fn cross_of(axis: Axis, width: u16, height: u16) -> u16 {
 pub struct StyledChar {
     pub ch: char,
     pub style: Style,
+    pub link: Option<crate::link::LinkTarget>,
 }
 
 /// Concatenate every span's chars into a single styled-char run.
@@ -1879,6 +1887,7 @@ pub fn styled_chars_from_spans(spans: &[Span]) -> Vec<StyledChar> {
             out.push(StyledChar {
                 ch,
                 style: span.style,
+                link: None,
             });
         }
     }
@@ -2085,6 +2094,7 @@ fn write_styled_row(
         line_buf.cells[col] = Cell {
             text: s,
             style: sc.style,
+            link: sc.link.clone(),
         };
         col += 1;
         // Wide-char spillover (East-Asian Wide / Fullwidth / most
@@ -2261,6 +2271,7 @@ fn write_run(buf: &mut FrameBuffer, row: u16, col_start: u16, text: &str, style:
         line.cells[col] = Cell {
             text: s,
             style: *style,
+            link: None,
         };
         col += 1;
         // Wide chars (East-Asian Wide / Fullwidth / most emoji): the

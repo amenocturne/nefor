@@ -50,8 +50,16 @@ fn install_render_time_ms(now_ms: u64) {
     RENDER_TIME_MS.with(|c| c.set(now_ms));
 }
 
+type LinkOpener = fn(&str) -> Result<(), String>;
+
+fn open_system_link(target: &str) -> Result<(), String> {
+    webbrowser::open(target).map_err(|error| error.to_string())
+}
+
 pub struct Engine {
     lua: LuaHost,
+    link_opener: LinkOpener,
+    pending_link: Option<crate::link::LinkTarget>,
     reconciler: Reconciler,
     renderer: Renderer,
     needs_render: bool,
@@ -159,6 +167,8 @@ impl Engine {
         lua.set_dimensions(width, height);
         Ok(Engine {
             lua,
+            link_opener: open_system_link,
+            pending_link: None,
             reconciler: Reconciler::new(),
             renderer: Renderer::new(width, height),
             needs_render: true,
@@ -602,6 +612,29 @@ impl Engine {
     ///   plain-text from the framebuffer, dispatch `mouse.selection` to
     ///   Lua, clear the range. Does not bubble as a separate click.
     pub fn handle_mouse(&mut self, evt: MouseMessage) -> Result<(), TuiError> {
+        // A link is activated on release at the same target, not on
+        // button-down. This leaves drag-to-select intact when a selection
+        // starts over linked text and mirrors ordinary desktop link UX.
+        if matches!(evt.kind, MouseKind::Click) && evt.button == Some("left") && evt.mods.is_empty()
+        {
+            self.pending_link = self.renderer.link_at(evt.x, evt.y);
+        }
+        if matches!(evt.kind, MouseKind::Drag) {
+            self.pending_link = None;
+        }
+        if matches!(evt.kind, MouseKind::Up) {
+            if let Some(target) = self.pending_link.take() {
+                let activate = self.renderer.link_at(evt.x, evt.y).as_ref() == Some(&target);
+                self.finalise_selection(evt.x, evt.y)?;
+                if activate {
+                    if let Err(error) = (self.link_opener)(target.as_str()) {
+                        tracing::warn!(target = target.as_str(), error = %error, "failed to open markdown link");
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         // Wheel auto-scroll: try to absorb the event by mutating a
         // scrollable's state. If none is under the cursor, fall through
         // to the bubble path so Lua sees the wheel event verbatim.
@@ -1843,6 +1876,80 @@ mod tests {
         engine.advance_time(Duration::from_millis(50));
         let r = engine.render_if_dirty().expect("third");
         assert!(r.is_some(), "advance_time should mark dirty");
+    }
+
+    fn record_link_open(target: &str) -> Result<(), String> {
+        assert_eq!(target, "https://example.com/docs");
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_link_click_uses_opener_and_preserves_click_dispatch() {
+        const LINK_SCENARIO: &str = r#"
+            tui.start {
+              initial_state = { clicks = 0 },
+              view = function(s)
+                return tui.markdown {
+                  key = "message",
+                  source = "[docs](https://example.com/docs) plain",
+                }
+              end,
+              update = function(msg, s)
+                if msg.kind == "mouse.click" then return { clicks = s.clicks + 1 }, {} end
+                return s, {}
+              end,
+            }
+        "#;
+        let mut engine = Engine::new(30, 3).expect("engine");
+        engine.link_opener = record_link_open;
+        engine.load_scenario(LINK_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 1,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("link down");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Up,
+                x: 1,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("link up");
+        assert_eq!(
+            engine
+                .state_table()
+                .expect("state")
+                .get::<u64>("clicks")
+                .expect("clicks"),
+            1,
+            "link press still follows the ordinary click path"
+        );
+
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 6,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("plain click");
+        assert_eq!(
+            engine
+                .state_table()
+                .expect("state")
+                .get::<u64>("clicks")
+                .expect("clicks"),
+            2
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub struct Cell {
     /// One grapheme cluster's text. `" "` for blanks.
     pub text: String,
     pub style: Style,
+    pub link: Option<crate::link::LinkTarget>,
 }
 
 impl Cell {
@@ -60,6 +61,7 @@ impl Cell {
         Cell {
             text: " ".into(),
             style: Style::default(),
+            link: None,
         }
     }
 }
@@ -184,6 +186,16 @@ impl Renderer {
     /// configured size.
     pub fn last_frame(&self) -> &FrameBuffer {
         &self.prev
+    }
+
+    pub fn link_at(&self, x: u16, y: u16) -> Option<crate::link::LinkTarget> {
+        self.prev
+            .lines
+            .get(y as usize)?
+            .cells
+            .get(x as usize)?
+            .link
+            .clone()
     }
 
     /// Render `root` and return the ANSI byte stream that brings the

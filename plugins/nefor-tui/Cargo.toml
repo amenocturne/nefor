@@ -37,3 +37,5 @@ unicode-width = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+url = "2"
+webbrowser = "1"

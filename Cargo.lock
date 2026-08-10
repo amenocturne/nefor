@@ -1670,6 +1670,8 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "unicode-width",
+ "url",
+ "webbrowser",
 ]
 
 [[package]]

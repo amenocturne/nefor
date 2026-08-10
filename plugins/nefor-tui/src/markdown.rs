@@ -46,7 +46,7 @@ struct InlineStyleStack {
     bold: u32,
     italic: u32,
     code: u32,
-    link: u32,
+    links: Vec<Option<crate::link::LinkTarget>>,
     strikethrough: u32,
 }
 
@@ -273,7 +273,10 @@ impl<'a> Walker<'a> {
             Tag::Strong => self.inline.bold += 1,
             Tag::Emphasis => self.inline.italic += 1,
             Tag::Strikethrough => self.inline.strikethrough += 1,
-            Tag::Link { .. } => self.inline.link += 1,
+            Tag::Link { dest_url, .. } => self
+                .inline
+                .links
+                .push(crate::link::LinkTarget::parse(&dest_url)),
             Tag::Image { .. } => { /* skip image alt; inline-text events still fire */ }
             // GFM tables: accumulate cell content into a per-table grid,
             // then render the whole table at TagEnd::Table with padded
@@ -349,7 +352,9 @@ impl<'a> Walker<'a> {
             TagEnd::Strikethrough => {
                 self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1)
             }
-            TagEnd::Link => self.inline.link = self.inline.link.saturating_sub(1),
+            TagEnd::Link => {
+                self.inline.links.pop();
+            }
             TagEnd::TableCell => {
                 if let Some(t) = self.table.as_mut() {
                     if let Some(cell) = t.current_cell.take() {
@@ -404,7 +409,7 @@ impl<'a> Walker<'a> {
                 style = merge_style(style, s);
             }
         }
-        if self.inline.link > 0 {
+        if !self.inline.links.is_empty() {
             if let Some(s) = self.theme.and_then(|t| t.link) {
                 style = merge_style(style, s);
             }
@@ -463,12 +468,20 @@ impl<'a> Walker<'a> {
             // any width-2 glyph.
             let mut w = 0usize;
             for ch in line.chars() {
-                self.out.push(StyledChar { ch, style });
+                self.out.push(StyledChar {
+                    ch,
+                    style,
+                    link: None,
+                });
                 w += UnicodeWidthChar::width(ch).unwrap_or(0);
             }
             if w < budget {
                 for _ in 0..(budget - w) {
-                    self.out.push(StyledChar { ch: ' ', style });
+                    self.out.push(StyledChar {
+                        ch: ' ',
+                        style,
+                        link: None,
+                    });
                 }
             }
             // Emit a `\n` between lines; pulldown_cmark closes the
@@ -478,6 +491,7 @@ impl<'a> Walker<'a> {
                 self.out.push(StyledChar {
                     ch: '\n',
                     style: Style::default(),
+                    link: None,
                 });
                 self.at_line_start = true;
             } else {
@@ -496,12 +510,21 @@ impl<'a> Walker<'a> {
         // newline-tracking flags don't need to follow.
         if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
             for ch in s.chars() {
-                cell.push(StyledChar { ch, style });
+                cell.push(StyledChar {
+                    ch,
+                    style,
+                    link: self.inline.links.last().cloned().flatten(),
+                });
             }
             return;
         }
+        let link = self.inline.links.last().cloned().flatten();
         for ch in s.chars() {
-            self.out.push(StyledChar { ch, style });
+            self.out.push(StyledChar {
+                ch,
+                style,
+                link: link.clone(),
+            });
             self.at_line_start = ch == '\n';
         }
     }
@@ -899,6 +922,7 @@ mod tests {
             .map(|ch| StyledChar {
                 ch,
                 style: Style::default(),
+                link: None,
             })
             .collect()
     }
@@ -1155,6 +1179,30 @@ mod tests {
         assert!(s.contains("▎ "));
         let rail = r.iter().find(|c| c.ch == '▎').expect("rail glyph present");
         assert!(rail.style.italic);
+    }
+
+    #[test]
+    fn link_targets_follow_rendered_text_through_wrapping() {
+        let chars =
+            render_to_styled_chars("before [click here](https://example.com/path) after", None);
+        let rows = crate::layout::wrap_styled(&chars, 10, crate::desc::WrapMode::Word);
+        let linked: String = rows
+            .iter()
+            .flatten()
+            .filter(|c| c.link.is_some())
+            .map(|c| c.ch)
+            .collect();
+        assert_eq!(linked, "click here");
+        assert!(rows.iter().flatten().filter(|c| c.link.is_some()).all(|c| {
+            c.link.as_ref().map(|target| target.as_str()) == Some("https://example.com/path")
+        }));
+    }
+
+    #[test]
+    fn unsupported_link_targets_render_without_activation() {
+        let chars = render_to_styled_chars("[local](docs/readme.md)", None);
+        assert_eq!(chars.iter().map(|c| c.ch).collect::<String>(), "local\n");
+        assert!(chars.iter().all(|c| c.link.is_none()));
     }
 
     #[test]
