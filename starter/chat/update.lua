@@ -1046,6 +1046,13 @@ local function handle_instruction_notice(msg, state)
     Entry.agents_md(msg.path, msg.dir or msg.path, msg.text, notice_id)), {}
 end
 
+local function handle_chat_submit(msg, state)
+  if msg._event_source ~= "startup" then return state, {} end
+  local text = msg.text or ""
+  if #text == 0 then return state, {} end
+  return queued_input.observe_external_submit(state, text), {}
+end
+
 local function handle_message(msg, state)
   local text = msg.text or ""
   if #text == 0 then return state, {} end
@@ -1938,6 +1945,7 @@ local handlers = {
   ["chat.error.append"]           = handle_error_append,
   ["chat.queue.steered"]          = handle_queue_steered,
   ["chat.instruction.notice"]     = handle_instruction_notice,
+  ["chat.input.submit"]           = handle_chat_submit,
   ["conversation.active.changed"] = handle_conversation_event,
   ["conversation.projection.delta"] = handle_conversation_event,
   ["conversation.snapshot"]       = handle_conversation_event,

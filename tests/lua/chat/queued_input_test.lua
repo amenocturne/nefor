@@ -13,6 +13,13 @@ eq(#direct.entries, 1)
 eq(direct.pending_user_echo, "first")
 eq(direct.pending_user_echo_idx, 1)
 
+local observed_cli = queued_input.observe_external_submit(initial, "from cli")
+eq(#observed_cli.entries, 1, "bus submit becomes visible before durable projection")
+eq(observed_cli.entries[1].text, "from cli")
+eq(observed_cli.pending_user_echo, "from cli")
+local observed_interactive = queued_input.observe_external_submit(direct, "first")
+eq(#observed_interactive.entries, 1, "interactive optimistic entry is not duplicated")
+
 local interleaved = {
   entries = { direct.entries[1], { role = "system", text = "result" } },
   pending_user_echo = direct.pending_user_echo,

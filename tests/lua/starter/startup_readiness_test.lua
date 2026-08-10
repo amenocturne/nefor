@@ -7,7 +7,7 @@ local function assert_eq(actual, expected, message)
   end
 end
 
-local required_plugins = { "provider", "mag", "tool-gate", "basic-tools" }
+local required_plugins = { "provider", "mag", "tool-gate", "basic-tools", "chat-surface" }
 local required_tools = { "read_file", "bash", "mag" }
 local sources = {
   ["basic-tools"] = { "read_file", "bash" },
@@ -32,7 +32,9 @@ do
   assert_eq(ready, 0, "catalog alone cannot release prompt")
   barrier.observe({ kind = "provider.hello" }, "provider")
   barrier.observe({ kind = "mag.hello" }, "mag")
-  assert_eq(ready, 1, "last required hello releases prompt")
+  assert_eq(ready, 0, "backend readiness cannot release prompt before the TUI composition")
+  barrier.observe({ kind = "chat.surface.ready" }, "nefor-tui")
+  assert_eq(ready, 1, "TUI composition readiness releases prompt")
   barrier.observe({ kind = "mag.hello" }, "mag")
   assert_eq(ready, 1, "readiness fires once")
 end

@@ -71,6 +71,16 @@ function M.accept_steered(state)
   return next_state, true
 end
 
+function M.observe_external_submit(state, text)
+  if state.pending_user_echo ~= nil and state.pending_user_echo == text then
+    return state, true
+  end
+  local next_state = push_entry(state, Entry.user(text))
+  next_state.pending_user_echo = text
+  next_state.pending_user_echo_idx = #next_state.entries
+  return next_state, true
+end
+
 function M.reconcile_echo(state, text)
   if state.pending_user_echo == nil or state.pending_user_echo ~= text then
     return state, false

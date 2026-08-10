@@ -223,7 +223,13 @@ impl Engine {
 
     /// Load and execute a Lua source that calls `tui.start { ... }`.
     pub fn load_scenario(&mut self, lua_source: &str) -> Result<(), TuiError> {
-        self.lua.load_source("scenario", lua_source)
+        self.lua.load_source("scenario", lua_source)?;
+        for effect in self.lua.take_emit_queue() {
+            if let SideEffect::Emit { target_hint, body } = effect {
+                self.pending_emits.push((target_hint, body));
+            }
+        }
+        Ok(())
     }
 
     /// Direct access to the Lua VM, e.g. for tests that build a message
@@ -1744,6 +1750,30 @@ mod tests {
           end,
         }
     "#;
+
+    #[test]
+    fn scenario_load_preserves_imperative_emits() {
+        let mut engine = Engine::new(40, 5).expect("engine");
+        engine
+            .load_scenario(
+                r#"
+                tui.start {
+                  initial_state = {},
+                  view = function(_) return tui.text { content = "ready" } end,
+                  update = function(_, state) return state, {} end,
+                }
+                tui.emit { kind = "surface.ready" }
+                "#,
+            )
+            .expect("load");
+
+        let emits = engine.take_emit_queue();
+        assert_eq!(emits.len(), 1);
+        assert_eq!(
+            emits[0].1.get("kind").and_then(JsonValue::as_str),
+            Some("surface.ready")
+        );
+    }
 
     #[test]
     fn first_render_emits_full_frame() {

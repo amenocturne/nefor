@@ -84,6 +84,7 @@ test-tui-scenarios:
     rm -rf "{{ justfile_directory() }}/tmp/tui-driver-artifacts"
     cargo build --workspace --locked
     scenarios=(
+      tests/tui/starter-initial-prompt.json
       tests/tui/starter-mock-smoke.json
       tests/tui/starter-mock-multi-turn.json
       tests/tui/starter-mode-commands.json

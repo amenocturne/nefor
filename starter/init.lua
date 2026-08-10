@@ -308,7 +308,7 @@ actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
 if startup.prompt ~= nil then
   require("libs.startup-readiness").wait {
     required_plugins = {
-      cfg.default_provider, "mag", "tool-gate", "git-worktree", "basic-tools",
+      cfg.default_provider, "mag", "tool-gate", "git-worktree", "basic-tools", "chat-surface",
     },
     required_tools = {
       "read_file", "read_image", "write_file", "edit_file", "bash", "search_text",

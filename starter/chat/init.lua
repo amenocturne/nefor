@@ -291,3 +291,7 @@ tui.start {
   view          = view.render,
   update        = update.update,
 }
+
+-- Startup prompts must wait until this process has loaded the composition;
+-- the NCP ready handshake only establishes transport readiness.
+tui.emit { kind = "chat.surface.ready" }

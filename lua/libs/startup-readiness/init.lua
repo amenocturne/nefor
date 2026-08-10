@@ -86,6 +86,9 @@ local function new_barrier(opts)
 
     local plugin = kind:match("^(.+)%.hello$")
     if plugin and required_plugins[plugin] then live_plugins[plugin] = true end
+    if kind == "chat.surface.ready" and required_plugins["chat-surface"] then
+      live_plugins["chat-surface"] = true
+    end
     -- Provider compositors intentionally translate private `<name>.hello`
     -- into the public model acknowledgement. Its provider field remains the
     -- stable liveness identity for both real and scripted providers.
