@@ -28,6 +28,12 @@
      :messages (get fragment "messages")
      :kills []})))
 
+(def task-source (fn [[id String] [prompt String]]
+  -> (nefor.graph.Node Unit nefor.contracts.Task)
+  (nefor.graph.source id
+    (type-tag nefor.contracts.Task)
+    (as nefor.contracts.Task {:prompt prompt}))))
+
 ;; Every agent has one public result port with semantic type `O | AgentError`.
 ;; The stable result wire carries the selected constructor identity. Ordinary
 ;; edges route compatible arms directly; `result-arm` creates a typed resident

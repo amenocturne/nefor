@@ -40,9 +40,7 @@ graph retrieval or hot graph mutation in this API.
 (require "nefor.graph")
 
 (let [start
-      (nefor.graph.source "task"
-        (type-tag nefor.contracts.Task)
-        (as nefor.contracts.Task {:prompt "Inspect the repository."}))
+      (nefor.actors.task-source "task" "Inspect the repository.")
       worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "worker"

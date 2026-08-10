@@ -341,6 +341,10 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         .and_then(|(_, rest)| rest.split_once("\n```").map(|(source, _)| source))
         .expect("patterns.md contains a complete canonical Lisp fence");
     assert!(
+        canonical.contains("(nefor.actors.task-source \"task\" \"Inspect the repository.\")"),
+        "the canonical example must use the public Task source helper"
+    );
+    assert!(
         canonical.contains("(nefor.actors.agent"),
         "the first Lisp fence must remain the canonical minimal agent program"
     );
@@ -367,6 +371,65 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         canonical_result.get("kind").and_then(Value::as_str),
         Some("mag.loaded"),
         "the exact canonical patterns.md agent must compile against runtime contracts: {canonical_result:#?}"
+    );
+
+    fs::write(
+        temp_root.join("task-source.mag"),
+        r#"(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(let [start (nefor.actors.task-source "task-input" "preserve this prompt")
+      result (nefor.graph.output "result" (type-tag nefor.contracts.Task))]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph [(nefor.graph.edge start result)]))))"#,
+    )
+    .expect("write task source regression");
+    let task_source = load(
+        &mut reader,
+        &mut stdin,
+        "task-source",
+        &temp_root,
+        Path::new("task-source.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        task_source.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "the public Task source helper must compile: {task_source:#?}"
+    );
+    let task_artifact = task_source.get("artifact").expect("task source artifact");
+    let task_actor = task_artifact
+        .pointer("/data/actors")
+        .and_then(Value::as_array)
+        .and_then(|actors| {
+            actors
+                .iter()
+                .find(|actor| actor.get("id").and_then(Value::as_str) == Some("task-input"))
+        })
+        .expect("task source actor");
+    assert_eq!(
+        task_actor.get("foreign").and_then(Value::as_str),
+        Some("nefor.factory.source")
+    );
+    assert_eq!(
+        task_actor
+            .pointer("/params/value/prompt")
+            .and_then(Value::as_str),
+        Some("preserve this prompt")
+    );
+    assert_eq!(
+        task_actor.pointer("/params/value_type"),
+        task_actor.pointer("/outputs/0/type_id"),
+        "the source value type id must match its Task output"
+    );
+    assert_eq!(
+        task_actor
+            .pointer("/outputs/0/type/name")
+            .and_then(Value::as_str),
+        Some("nefor.contracts.Task")
     );
 
     fs::write(

@@ -7,9 +7,7 @@
 (require "nefor.contracts")
 (require "nefor.graph")
 
-(let [start (nefor.graph.source "lead-task"
-              (type-tag nefor.contracts.Task)
-              (as nefor.contracts.Task {:prompt "<initial task text>"}))
+(let [start (nefor.actors.task-source "lead-task" "<initial task text>")
       lead
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "lead"

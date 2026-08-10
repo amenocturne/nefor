@@ -910,6 +910,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_source_preserves_task_type_and_value_at_runtime() {
+        let host = shipped_host();
+        let source = r#"
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(let [start (nefor.actors.task-source "task-input" "runtime prompt")
+      result (nefor.graph.output "result" (type-tag nefor.contracts.Task))]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph [(nefor.graph.edge start result)]))))
+"#;
+        let modification = compile_mag_source(&host, "task-source-runtime", source);
+        let begun = host
+            .begin_run("task-source-runtime", "task-source-runtime", None)
+            .expect("begin Task source run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host
+            .start("task-source-runtime", &modification)
+            .expect("start Task source run");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let completion = host
+            .take_run_complete("task-source-runtime")
+            .expect("take Task source completion")
+            .expect("Task source run completed");
+        assert_eq!(
+            completion
+                .result
+                .as_ref()
+                .and_then(|result| result.get("value")),
+            Some(&serde_json::json!({"prompt": "runtime prompt"}))
+        );
+        assert_eq!(
+            completion
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/semantic_type/name"))
+                .and_then(JsonValue::as_str),
+            Some("nefor.contracts.Task")
+        );
+    }
+
     fn documented_shell_expression(needle: &str) -> String {
         let patterns = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

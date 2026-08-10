@@ -115,9 +115,7 @@ There are no compiler forms named `agent`, `bash`, `graph`, `subgraph`, or
 (require "nefor.graph")
 
 (let [start
-      (nefor.graph.source "task"
-        (type-tag nefor.contracts.Task)
-        (as nefor.contracts.Task {:prompt "<initial task text>"}))
+      (nefor.actors.task-source "task" "<initial task text>")
       worker
       (nefor.actors.agent
         (as nefor.actors.AgentConfig {:id "worker"
