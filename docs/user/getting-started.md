@@ -84,9 +84,13 @@ to select among enabled providers and models.
 
 ## Next steps
 
-- Use [Installation](installation.md) to choose a stable or nightly channel and
-  understand runtime paths.
-- Use [Troubleshooting](troubleshooting.md) when startup or a plugin fails.
-- Read the [starter reference](../../starter/README.md) before changing its
-  composition.
-- Read [Plugin authoring](../plugin-authoring.md) to add a process plugin.
+1. Learn the [TUI](tui.md) and its [commands and keys](commands-and-keys.md).
+2. Enable a real model through [Providers](providers.md).
+3. Understand [workflows and tools](workflows-and-tools.md), then how
+   [sessions and context](sessions-and-context.md) persist and compact work.
+4. Read [Permissions](permissions.md) before relaxing safe mode.
+
+For setup details, use [Installation](installation.md); for failures, start with
+[Troubleshooting](troubleshooting.md). Read the
+[starter reference](../../starter/README.md) before changing its composition,
+or [Plugin authoring](../plugin-authoring.md) to add a process plugin.

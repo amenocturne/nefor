@@ -6,7 +6,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 ## Layout
 
-- `engine/` — engine binary. Reads plugin stdin, stamps `{origin, ts}`, persists to session log, invokes a required Lua `dispatch` hook, routes the hook's `nefor.engine.send` calls. All NCP semantics live in Lua.
+- `engine/` — engine binary. Reads plugin stdin, stamps `{origin, ts}`, appends to its in-memory event log, invokes a required Lua `dispatch` hook, routes the hook's `nefor.engine.send` calls. All NCP semantics live in Lua.
 - `crates/nefor-protocol/` — NCP envelope + system-body types. Used by plugins; engine no longer imports it (engine is pure string-bus).
 - `plugins/nefor-tui/` — declarative TUI plugin (Rust): reconciler + line-diff renderer + Lua VM + 15 layout primitives. Hosts the chat surface as a Lua composition (`starter/chat/init.lua`).
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs owning canonical types (`ProviderRequest`, `ProviderInput`, `ChatHistory`, `ToolCalls`, `ToolResults`, …). Concrete providers/tools declare `Into`/`From` against these so graphs are provider-agnostic.
@@ -37,14 +37,14 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 `nefor` resolves directories via XDG-style env vars, with CLI flags taking highest precedence:
 
-| Env var            | CLI flag       | Default                   | Holds                                                                                                    |
-| ------------------ | -------------- | ------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `NEFOR_DEV_DIR`    | —              | (unset)                   | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first          |
-| `NEFOR_LOCAL_DIR`  | —              | (unset)                   | installed-config local checkout override — lets pm use an unpushed local repo instead of fetching GitHub |
-| `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua`                                                                                               |
-| `NEFOR_DATA_DIR`     | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | writable runtime data other than sessions                                                               |
+| Env var              | CLI flag       | Default                    | Holds                                                                                                    |
+| -------------------- | -------------- | -------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `NEFOR_DEV_DIR`      | —              | (unset)                    | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first          |
+| `NEFOR_LOCAL_DIR`    | —              | (unset)                    | installed-config local checkout override — lets pm use an unpushed local repo instead of fetching GitHub |
+| `NEFOR_CONFIG_DIR`   | `--config`     | `$XDG_CONFIG_HOME/nefor`   | `init.lua`                                                                                               |
+| `NEFOR_DATA_DIR`     | `--data-dir`   | `$XDG_DATA_HOME/nefor`     | writable runtime data other than sessions                                                                |
 | `NEFOR_SESSIONS_DIR` | —              | `$NEFOR_DATA_DIR/sessions` | session event logs, MAG trees, and provenance metadata                                                   |
-| `NEFOR_PLUGIN_DIR`   | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries                                                                                                 |
+| `NEFOR_PLUGIN_DIR`   | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins`  | binaries                                                                                                 |
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 
@@ -83,11 +83,11 @@ Daily-decision substrate for "where does this code live" and "is this a plugin o
 
 ### Three layers, decreasing opinion budget
 
-| Layer                                       | Opinion budget        | What it does                                                                                                |
-| ------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Engine (`engine/`, `crates/nefor-protocol`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, session log, dispatch via `step`. No NCP body parsing. |
-| Plugins (`plugins/*`)                       | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.       |
-| Starter (`starter/*.lua`)                   | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                       |
+| Layer                                       | Opinion budget        | What it does                                                                                                        |
+| ------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Engine (`engine/`, `crates/nefor-protocol`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, in-memory event log, dispatch via `step`. No NCP body parsing. |
+| Plugins (`plugins/*`)                       | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.               |
+| Starter (`starter/*.lua`)                   | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                               |
 
 Mismatch is the most common architectural bug. Every file gets one layer assignment.
 

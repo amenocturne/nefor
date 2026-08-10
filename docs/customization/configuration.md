@@ -136,4 +136,3 @@ These are convenience builders for the shipped distribution, not generic adapter
 Do not build external configs against underscored actor fields, test reset hooks, broker dispatch helpers, or MAG kernel factories/registry tables. In particular, the MAG factory registry, run context, inventory, and router are implementation APIs. Author MAG programs through the language and artifact contracts documented by the MAG plugin; do not inject Lua factories into its embedded kernel.
 
 For the process boundary, use [NCP](../reference/ncp.md). For distribution replacement, see [Distribution](distribution.md).
-tribution.md).

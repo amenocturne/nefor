@@ -1,6 +1,6 @@
 # Workflows and tools
 
-> Starter behavior, Unreleased after v0.4.0 (HEAD `505a764`). MAG/kernel lifecycle and capability enforcement are runtime mechanisms; their presentation and keyboard controls here belong to the starter chat composition.
+> Starter behavior, **Unreleased after v0.4.0**. Current code and tests are authoritative.
 
 ## Queueing and steering
 

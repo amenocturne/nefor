@@ -1,6 +1,6 @@
 # MAG errors and recovery
 
-> **Unreleased after v0.4.0** — documents the public MAG surface at `505a764`.
+> **Unreleased after v0.4.0.**
 
 MAG failures occur at different boundaries. Diagnose the boundary first; changing prompts cannot repair a malformed graph, and recompiling cannot make a hung process exit.
 

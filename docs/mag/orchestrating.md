@@ -1,6 +1,6 @@
 # Orchestrating MAG
 
-> **Unreleased after v0.4.0** — documents the public MAG surface at `505a764`.
+> **Unreleased after v0.4.0.**
 
 MAG is Nefor's typed workflow language. Use it when a task needs several agents or commands, parallel work, an approval boundary, review, or a result-dependent stage. For one bounded shell operation, use `mag-eval` instead.
 

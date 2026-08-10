@@ -1,6 +1,6 @@
 # MAG patterns
 
-> **Unreleased after v0.4.0** — documents the public MAG surface at `505a764`.
+> **Unreleased after v0.4.0.**
 
 These patterns keep workflow meaning visible to MAG's type and graph validation. Start with the complete program in [Authoring reference](authoring-reference.md#a-complete-graph), then compose the shapes below. The session workspace also contains the current canonical cookbook at `lib/patterns.md`.
 

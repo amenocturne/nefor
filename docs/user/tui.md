@@ -1,6 +1,6 @@
 # Starter TUI
 
-> **Version:** Unreleased after v0.4.0 (HEAD `505a764`).
+> **Unreleased after v0.4.0.**
 
 This guide describes the chat interface shipped in `starter/`. It is not a contract for every Nefor configuration: the TUI engine supplies widgets, input, rendering, selection, clipboard-image handling, and link activation, while the starter Lua composition chooses the commands, keys, workflow controls, session behavior, and permission policy documented here.
 

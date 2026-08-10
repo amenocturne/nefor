@@ -58,22 +58,22 @@ platform support, paths, and safe config handling.
 
 ## Documentation
 
-Start with the [documentation index](docs/index.md):
+Start with the [documentation index](docs/index.md). Its main paths are:
 
-- [Getting started](docs/user/getting-started.md)
-- [Installation](docs/user/installation.md)
-- [Troubleshooting](docs/user/troubleshooting.md)
-- [Architecture](docs/architecture.md)
-- [Plugin authoring](docs/plugin-authoring.md)
-- [Protocol](docs/protocol.md)
+- [Use the starter](docs/user/getting-started.md)
+- [Customize a distribution](docs/customization/configuration.md)
+- [Author MAG workflows](docs/mag/orchestrating.md)
+- [CLI and protocol reference](docs/reference/cli.md)
+- [Contribute](docs/contributing/development.md)
 
-The [manifesto](docs/manifesto.md) states the project's design commitments.
+The [architecture](docs/architecture.md) explains the execution layers, and the
+[manifesto](docs/manifesto.md) states the project's design commitments.
 
 ## Development
 
 Run `just` to discover the repository's command surface. The usual local checks
-are `just check`; broader test groups are documented in
-[docs/testing.md](docs/testing.md).
+are `just check`; broader test groups are documented in the
+[contributor testing guide](docs/contributing/testing.md).
 
 ## License
 

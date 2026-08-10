@@ -1,6 +1,6 @@
 # Providers
 
-> **Unreleased** — documents `505a764`, after `v0.4.0`.
+> **Unreleased after v0.4.0.**
 
 Nefor's [starter composition](../../starter/config/init.lua) is usable without credentials or a running model server: it starts the deterministic mock provider by default. Real providers are opt-in. The same composition can run several providers at once, and the chat surface discovers their models through `/model`.
 

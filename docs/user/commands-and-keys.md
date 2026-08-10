@@ -1,6 +1,6 @@
 # Commands and keys
 
-> Starter behavior, Unreleased after v0.4.0 (HEAD `505a764`). Commands may be extended or replaced by another configuration.
+> Starter behavior, **Unreleased after v0.4.0**. Current code and tests are authoritative.
 
 ## Slash commands
 

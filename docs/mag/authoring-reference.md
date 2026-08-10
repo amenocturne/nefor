@@ -1,6 +1,6 @@
 # MAG authoring reference
 
-> **Unreleased after v0.4.0** — documents the public MAG surface at `505a764`.
+> **Unreleased after v0.4.0.**
 
 MAG is a small, typed, expression-oriented language. Programs compose immutable graph values from namespaced libraries. This reference covers the supported author-facing layer; runtime implementation structures are intentionally not public API.
 

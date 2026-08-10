@@ -1,6 +1,6 @@
 # Sessions and context
 
-> Starter behavior, Unreleased after v0.4.0 (HEAD `505a764`). The engine provides the event log and filesystem bindings; the starter sessions actor decides what is persisted and how replay drives the chat surface.
+> Starter behavior, **Unreleased after v0.4.0**. Current code and tests are authoritative.
 
 ## What a session is
 
