@@ -638,7 +638,7 @@ async fn handle_load(
                 }
             };
             if let Err(error) = nefor_mag::validate_loaded_rules(&loaded) {
-                return send_event(out_tx, error_body(in_reply_to, &error.to_string())).await;
+                return send_event(out_tx, mag_error_body(in_reply_to, &error)).await;
             }
             // The registry's factory names ride along so the control plane can
             // validate reasoner/factory types against the kernel's source of
@@ -651,7 +651,7 @@ async fn handle_load(
             *program = Some(Arc::new(loaded));
             send_event(out_tx, reply).await
         }
-        Err(e) => send_event(out_tx, error_body(in_reply_to, &e.to_string())).await,
+        Err(e) => send_event(out_tx, mag_error_body(in_reply_to, &e)).await,
     }
 }
 
@@ -1555,6 +1555,19 @@ fn artifact_body(in_reply_to: Option<&str>, artifact: Value) -> Map<String, Valu
     }
     m.insert("artifact".into(), artifact);
     m
+}
+
+fn mag_error_body(
+    in_reply_to: Option<&str>,
+    error: &nefor_mag::error::MagError,
+) -> Map<String, Value> {
+    let mut body = error_body(in_reply_to, &error.to_string());
+    if let nefor_mag::error::MagError::Syntax(diagnostic) = error {
+        if let Ok(value) = serde_json::to_value(diagnostic) {
+            body.insert("diagnostic".into(), value);
+        }
+    }
+    body
 }
 
 fn error_body(in_reply_to: Option<&str>, message: &str) -> Map<String, Value> {

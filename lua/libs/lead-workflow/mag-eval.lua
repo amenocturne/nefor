@@ -152,6 +152,75 @@ local function mkdir_p(path)
   return ok == true or ok == 0
 end
 
+local function build_source(expr)
+  local prefix = table.concat({
+    '(require "nefor.artifact")\n',
+    '(require "nefor.graph")\n',
+    '(require "nefor.shell")\n',
+    '(let [start (nefor.graph.source "eval-input" (type-tag Unit) nil)\n',
+    '      operation ',
+  })
+  local suffix = table.concat({
+    '\n      result (nefor.graph.output-for "eval-output" operation)\n',
+    '      topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph\n',
+    '                 (nefor.graph.add-edges graph ',
+    '                   [(nefor.graph.edge start operation) ',
+    '                    (nefor.graph.edge operation result)]))]\n',
+    '  (nefor.artifact.compile topology))\n',
+  })
+  return prefix .. expr .. suffix, { source = expr, start = #prefix, finish = #prefix + #expr }
+end
+
+local function span_inside(span, provenance)
+  return type(span) == "table" and type(span.start) == "number" and type(span["end"]) == "number"
+    and span.start >= provenance.start and span["end"] <= provenance.finish
+end
+
+local function locate(source, byte)
+  local before = source:sub(1, byte)
+  local line, line_start = 1, 1
+  for index in before:gmatch("()\n") do line, line_start = line + 1, index + 1 end
+  local column, display = 1, 1
+  for _, codepoint in utf8.codes(source:sub(line_start, byte)) do
+    column = column + 1
+    if codepoint == 9 then display = math.floor((display - 1) / 4 + 1) * 4 + 1
+    else display = display + 1 end
+  end
+  return { byte = byte, line = line, column = column, display_column = display }
+end
+
+local function relocate(span, provenance)
+  local remapped = { start = span.start - provenance.start, ["end"] = span["end"] - provenance.start }
+  return remapped, { start = locate(provenance.source, remapped.start), ["end"] = locate(provenance.source, remapped["end"]) }
+end
+
+local function render_diagnostic(diagnostic)
+  return string.format("%s\n --> %s:%d:%d\n  |\n%2d | %s\n  | %s",
+    diagnostic.message, diagnostic.source_name, diagnostic.location.start.line,
+    diagnostic.location.start.display_column, diagnostic.location.start.line,
+    diagnostic.excerpt, diagnostic.caret)
+end
+
+local function remap_diagnostic(diagnostic, provenance)
+  if type(diagnostic) ~= "table" or not span_inside(diagnostic.span, provenance) then return diagnostic end
+  local span, location = relocate(diagnostic.span, provenance)
+  diagnostic.source_name, diagnostic.path, diagnostic.source = "<mag-eval>", nil, provenance.source
+  diagnostic.span, diagnostic.location = span, location
+  local line_start = provenance.source:sub(1, span.start):match(".*\n()") or 1
+  local tail = provenance.source:sub(span.start + 1)
+  local newline = tail:find("\n", 1, true)
+  local line_end = newline and span.start + newline - 1 or #provenance.source
+  diagnostic.excerpt = provenance.source:sub(line_start, line_end):gsub("\r$", ""):gsub("\t", "    ")
+  local width = math.max(1, location["end"].display_column - location.start.display_column)
+  diagnostic.caret = string.rep(" ", location.start.display_column - 1) .. string.rep("^", width)
+  if type(diagnostic.related) == "table" and span_inside(diagnostic.related.span, provenance) then
+    diagnostic.related.span, diagnostic.related.location = relocate(diagnostic.related.span, provenance)
+  else
+    diagnostic.related = nil
+  end
+  return diagnostic
+end
+
 -- Tool handler: persist the expression and start the compile handshake. The
 -- firing stays open only through validation and submission.
 function M.handle(firing_id, args, metadata)
@@ -197,19 +266,7 @@ function M.handle(firing_id, args, metadata)
     tool_err(firing_id, "mag-eval: cannot write " .. rel .. ": " .. tostring(open_err))
     return
   end
-  local source = table.concat({
-    '(require "nefor.artifact")\n',
-    '(require "nefor.graph")\n',
-    '(require "nefor.shell")\n',
-    '(let [start (nefor.graph.source "eval-input" (type-tag Unit) nil)\n',
-    '      operation ', expr, '\n',
-    '      result (nefor.graph.output-for "eval-output" operation)\n',
-    '      topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph\n',
-    '                 (nefor.graph.add-edges graph ',
-    '                   [(nefor.graph.edge start operation) ',
-    '                    (nefor.graph.edge operation result)]))]\n',
-    '  (nefor.artifact.compile topology))\n',
-  })
+  local source, wrapper = build_source(expr)
   fh:write(source)
   fh:close()
 
@@ -226,6 +283,7 @@ function M.handle(firing_id, args, metadata)
     session_id = session_id,
     dispatcher_id = provenance.dispatcher_id,
     conversation_id = provenance.conversation_id,
+    wrapper = wrapper,
   }
   emit_as(SOURCE_NAME, "mag", {
     kind       = "mag.load",
@@ -264,7 +322,9 @@ end
 local function on_error(body)
   local pending = take(state.pending_loads, body.in_reply_to)
   if not pending then return false end
-  tool_err(pending.firing_id, "mag-eval: compilation failed:\n" .. tostring(body.message))
+  local diagnostic = remap_diagnostic(body.diagnostic, pending.wrapper)
+  local message = diagnostic and render_diagnostic(diagnostic) or tostring(body.message)
+  tool_err(pending.firing_id, "mag-eval: compilation failed:\n" .. message)
   return true
 end
 
@@ -314,6 +374,8 @@ M._internals = {
     state.seq = 0
     state.pending_loads = {}
   end,
+  build_source = build_source,
+  remap_diagnostic = remap_diagnostic,
 }
 
 return M

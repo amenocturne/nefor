@@ -1,5 +1,6 @@
 pub mod ast;
 mod checker;
+pub mod diagnostic;
 pub mod env;
 pub mod error;
 pub mod eval;
@@ -72,10 +73,11 @@ fn compile_impl(
     );
     env.define("inputs", Value::HostInputs(inputs));
     let started = phase_started(profiler);
-    let tokens = lexer::tokenize(source)?;
+    let source_snapshot = diagnostic::SourceSnapshot::named("<memory>", source);
+    let tokens = lexer::tokenize_source(&source_snapshot)?;
     record_phase(profiler, Phase::EntryLex, started);
     let started = phase_started(profiler);
-    let exprs = parser::parse(&tokens)?;
+    let exprs = parser::parse_source(&tokens, &source_snapshot)?;
     record_phase(profiler, Phase::EntryParse, started);
     let started = phase_started(profiler);
     let value = eval::eval_program(&mut env, &exprs)?;
@@ -159,10 +161,11 @@ fn load_impl(
     );
     env.define("inputs", Value::HostInputs(inputs));
     let started = phase_started(profiler);
-    let tokens = lexer::tokenize(&source)?;
+    let source_snapshot = diagnostic::SourceSnapshot::file(&path, &source);
+    let tokens = lexer::tokenize_source(&source_snapshot)?;
     record_phase(profiler, Phase::EntryLex, started);
     let started = phase_started(profiler);
-    let exprs = parser::parse(&tokens)?;
+    let exprs = parser::parse_source(&tokens, &source_snapshot)?;
     record_phase(profiler, Phase::EntryParse, started);
     let started = phase_started(profiler);
     let value = eval::eval_program(&mut env, &exprs)?;

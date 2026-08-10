@@ -74,6 +74,8 @@ struct Diagnostic {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<nefor_mag::diagnostic::SyntaxDiagnostic>,
 }
 
 fn main() {
@@ -226,9 +228,19 @@ fn load_registries(paths: &[PathBuf]) -> Result<Vec<Value>, Diagnostic> {
 }
 
 fn mag_diagnostic(error: MagError) -> Diagnostic {
+    if let MagError::Syntax(syntax) = error {
+        return Diagnostic {
+            code: syntax.code,
+            stage: syntax.stage,
+            message: syntax.message.clone(),
+            path: syntax.path.clone(),
+            diagnostic: Some(syntax),
+        };
+    }
     let (code, stage) = match error {
         MagError::Lex(_) => ("syntax_lex", "lex"),
         MagError::Parse(_) => ("syntax_parse", "parse"),
+        MagError::Syntax(_) => unreachable!("handled above"),
         MagError::Type(_) | MagError::Unresolved(_) | MagError::Arity { .. } => {
             ("type_error", "typecheck")
         }
@@ -240,6 +252,7 @@ fn mag_diagnostic(error: MagError) -> Diagnostic {
         stage,
         message: error.to_string(),
         path: None,
+        diagnostic: None,
     }
 }
 
@@ -249,6 +262,7 @@ fn path_diagnostic(code: &'static str, path: &Path, message: String) -> Diagnost
         stage: "input",
         message,
         path: Some(path.display().to_string()),
+        diagnostic: None,
     }
 }
 

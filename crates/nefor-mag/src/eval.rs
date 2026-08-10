@@ -1678,10 +1678,11 @@ fn eval_require(env: &mut Env, name: &str) -> Result<Value, MagError> {
         .map_err(|e| MagError::Eval(format!("cannot read module {name}: {e}")))?;
     env.profile_elapsed(Phase::ModuleRead, read_started);
     let lex_started = env.profile_started();
-    let tokens = crate::lexer::tokenize(&content)?;
+    let source_snapshot = crate::diagnostic::SourceSnapshot::file(&path, &content);
+    let tokens = crate::lexer::tokenize_source(&source_snapshot)?;
     env.profile_elapsed(Phase::ModuleLex, lex_started);
     let parse_started = env.profile_started();
-    let exprs = crate::parser::parse(&tokens)?;
+    let exprs = crate::parser::parse_source(&tokens, &source_snapshot)?;
     env.profile_elapsed(Phase::ModuleParse, parse_started);
     let mut module = env.module_env(name);
     let eval_started = env.profile_started();

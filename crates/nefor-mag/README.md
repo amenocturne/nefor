@@ -152,8 +152,15 @@ Stdout is exactly one compact JSON document. Both outcomes use envelope version
 
 Compilation failures exit `1`; argument/help handling uses clap's normal exit
 codes. Human-readable failure context goes to stderr, so subprocess consumers
-can parse stdout without filtering logs. The command only compiles and validates
-an artifact: there is deliberately no `run` or `execute` subcommand.
+can parse stdout without filtering logs. Syntax failures additionally carry the
+immutable source snapshot, its display identity/path, canonical half-open UTF-8
+byte spans, 1-based Unicode and display columns, excerpt/caret, and an optional
+related opener. Tabs advance to four-column stops for display; CRLF is one line
+break; EOF is a zero-width span at `source.len()`. Paths use Rust's lossless-when-
+possible `Path::display()` policy. Required-module diagnostics identify the
+resolved module path and snapshot that module rather than the entry file. The
+command only compiles and validates an artifact: there is deliberately no `run`
+or `execute` subcommand.
 
 Compiler profiling is exposed by `mag compile --profile`; run `just bench-mag`
 for the opt-in optimized benchmark and inspect `benches/mag_compile.rs` for the

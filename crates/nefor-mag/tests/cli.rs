@@ -152,7 +152,39 @@ fn syntax_type_and_graph_failures_are_structured() {
         assert_eq!(body["error"]["code"], code);
         assert_eq!(body["error"]["stage"], stage);
         assert!(body["error"]["message"].is_string());
+        if name == "syntax" {
+            assert_eq!(
+                body["error"]["diagnostic"]["path"],
+                fixture.root.join("main.mag").display().to_string()
+            );
+            assert_eq!(body["error"]["diagnostic"]["source"], source);
+            assert_eq!(body["error"]["diagnostic"]["span"]["start"], source.len());
+            assert_eq!(body["error"]["diagnostic"]["span"]["end"], source.len());
+            assert_eq!(body["error"]["diagnostic"]["related"]["span"]["start"], 0);
+        }
     }
+}
+
+#[test]
+fn required_module_syntax_diagnostic_owns_its_snapshot() {
+    let fixture = Fixture::new("module-diagnostic");
+    let module = fixture.write("bad.mag", "[λ]");
+    fixture.write("main.mag", "(require \"bad\")\n(artifact \"test/v1\" {})");
+    let output = run(&compile_args(&fixture.root, &[]));
+    assert!(!output.status.success());
+    let body = json_stdout(&output);
+    assert_eq!(body["error"]["code"], "syntax_lex");
+    assert_eq!(
+        body["error"]["diagnostic"]["path"],
+        module
+            .canonicalize()
+            .expect("canonical module")
+            .display()
+            .to_string()
+    );
+    assert_eq!(body["error"]["diagnostic"]["source"], "[λ]");
+    assert_eq!(body["error"]["diagnostic"]["span"]["start"], 1);
+    assert_eq!(body["error"]["diagnostic"]["span"]["end"], 3);
 }
 
 #[test]

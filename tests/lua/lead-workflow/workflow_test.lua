@@ -2107,6 +2107,49 @@ end
 do
   fresh()
   agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-remap-error",
+    caller_id = "r7/cap-remap", name = "mag-eval",
+    args = { intent = "Remap expression", expr = "(broken" } })
+  local load = latest_mag_load()
+  local mag_eval = require("libs.lead-workflow.mag-eval")
+  local pending = mag_eval._internals.state.pending_loads[load.body.id]
+  local offset = pending.wrapper.start
+  _test.calls_clear()
+  feed("mag", { kind = "mag.error", in_reply_to = load.body.id, message = "generated message",
+    diagnostic = {
+      code = "syntax_parse", stage = "parse", message = "parse: unclosed '('",
+      source_name = load.body.entry, path = "/generated/" .. load.body.entry,
+      source = "generated source", span = { start = offset + 7, ["end"] = offset + 7 },
+      location = { start = { byte = offset + 7, line = 5, column = 1, display_column = 1 },
+                   ["end"] = { byte = offset + 7, line = 5, column = 1, display_column = 1 } },
+      excerpt = "generated", caret = "^",
+      related = { message = "opened", span = { start = offset, ["end"] = offset + 1 },
+                  location = { start = {}, ["end"] = {} } },
+    },
+  })
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "gate-remap-error"
+  end)
+  assert_true(err.body.error:find("<mag-eval>:1:8", 1, true) ~= nil,
+    "embedded diagnostic is remapped to expression coordinates")
+  assert_true(err.body.error:find("(broken", 1, true) ~= nil,
+    "embedded diagnostic renders expression snapshot")
+end
+
+-- Wrapper-owned failures retain generated-source attribution.
+do
+  local mag_eval = require("libs.lead-workflow.mag-eval")
+  local source, provenance = mag_eval._internals.build_source("x")
+  local diagnostic = { source_name = "eval/eval-1.mag", path = "/generated/eval-1.mag",
+    source = source, span = { start = 0, ["end"] = 1 } }
+  local mapped = mag_eval._internals.remap_diagnostic(diagnostic, provenance)
+  assert_eq(mapped.source_name, "eval/eval-1.mag", "wrapper failure keeps generated identity")
+  assert_eq(mapped.path, "/generated/eval-1.mag", "wrapper failure keeps generated path")
+end
+
+do
+  fresh()
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
   feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-compile-error",
     caller_id = "r7/cap-10", name = "mag-eval",
     args = { intent = "Compile expression", expr = "(broken" } })

@@ -1,5 +1,9 @@
+use crate::diagnostic::SyntaxDiagnostic;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MagError {
+    #[error("{0}")]
+    Syntax(SyntaxDiagnostic),
     #[error("lexer: {0}")]
     Lex(String),
     #[error("parse: {0}")]
