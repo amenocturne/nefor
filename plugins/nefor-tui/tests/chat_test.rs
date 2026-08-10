@@ -10433,7 +10433,7 @@ fn agent_group_inspector_shows_its_initial_assignment() {
 }
 
 #[test]
-fn agent_group_inspector_hides_stdout_streams_but_keeps_useful_activity() {
+fn agent_previews_hide_tool_streams_but_keep_conversation_activity() {
     let mut engine = Engine::new(120, 36).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -10461,7 +10461,7 @@ fn agent_group_inspector_hides_stdout_streams_but_keeps_useful_activity() {
             "stdout",
             "/project/src/main.rs\nrefs/heads/worktree-popup-stdout\n",
         ),
-        ("stderr", "USEFUL WARNING"),
+        ("stderr", "agent-preview-stderr-must-stay-hidden"),
     ] {
         dispatch_event(
             &mut engine,
@@ -10493,22 +10493,48 @@ fn agent_group_inspector_hides_stdout_streams_but_keeps_useful_activity() {
     for expected in [
         "Initial assignment",
         "Inspect the repository.",
-        "USEFUL WARNING",
         "Useful agent summary",
     ] {
         assert!(
             snapshot.contains(expected),
-            "agent preview lost {expected:?}:\n{snapshot}"
+            "agent group preview lost {expected:?}:\n{snapshot}"
         );
     }
     for hidden in [
         "stdout",
         "/project/src/main.rs",
         "refs/heads/worktree-popup-stdout",
+        "stderr",
+        "agent-preview-stderr-must-stay-hidden",
     ] {
         assert!(
             !snapshot.contains(hidden),
-            "agent preview leaked stdout content {hidden:?}:\n{snapshot}"
+            "agent group preview leaked tool stream content {hidden:?}:\n{snapshot}"
+        );
+    }
+
+    engine
+        .handle_key(key("escape"))
+        .expect("close group inspector");
+    engine.handle_key(key("enter")).expect("unfold agent group");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select agent node");
+    engine
+        .handle_key(key("space"))
+        .expect("open agent node inspector");
+    let node_snapshot = render_snapshot(&mut engine);
+    assert!(
+        node_snapshot.contains("Useful agent summary"),
+        "agent node preview lost conversation activity:\n{node_snapshot}"
+    );
+    for hidden in [
+        "/project/src/main.rs",
+        "refs/heads/worktree-popup-stdout",
+        "agent-preview-stderr-must-stay-hidden",
+    ] {
+        assert!(
+            !node_snapshot.contains(hidden),
+            "agent node preview leaked tool stream content {hidden:?}:\n{node_snapshot}"
         );
     }
 }

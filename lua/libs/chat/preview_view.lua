@@ -151,7 +151,8 @@ end
 function M.activity(item, state, node, is_last, options)
   local value = item.item and item.item.value
   local kind = type(value) == "table" and value.kind or nil
-  if options and options.hide_stdout and kind == "stdout" then return nil end
+  if options and options.hide_tool_streams
+      and (kind == "stdout" or kind == "stderr") then return nil end
   if kind == "reasoning" then
     return tui.text { content = reasoning_value(value.text, {
       state = state, node = node or {}, is_last = is_last,

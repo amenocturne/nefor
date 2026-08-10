@@ -477,7 +477,7 @@ local function node_inspector(state, p, now_ms)
   local group = run_panel.group_of(p.actor_id or "")
   local is_agent = preview_state.agent_assignment(state, p.run_id, group)
   local assignment = assignment_widget(state, p.run_id, group)
-  local body = preview_view.node(state, p.run_id, p.actor_id, { hide_stdout = is_agent })
+  local body = preview_view.node(state, p.run_id, p.actor_id, { hide_tool_streams = is_agent })
   if assignment then body = tui.column { gap = 1, children = { assignment, body } } end
   return popup_shell("── node · " .. tostring(p.actor_id or "?") .. " [read-only] ──",
     header, body, p.unseen)
@@ -503,7 +503,7 @@ local function aggregate_inspector(state, p, now_ms)
   for index, item in ipairs(items) do
     local node = preview_state.node(state, p.run_id, item.actor_id) or {}
     local activity = preview_view.activity(item, state, node, index == #items,
-      { hide_stdout = is_agent })
+      { hide_tool_streams = is_agent })
     if activity then
       if item.actor_id ~= last_actor then
         children[#children + 1] = tui.text { content = "· " .. item.actor_id, style = STYLE.popup_user, wrap = "none" }
