@@ -1,7 +1,5 @@
 # Architecture
 
-> **Current architecture authority.** This document describes the shipped runtime at the current tree. Contributor ownership and placement guidance lives in [`contributing/architecture.md`](contributing/architecture.md). Historical design records are not authoritative when they disagree with this document, code, or tests.
-
 nefor runs as a small engine plus user-owned Lua composition. The shipped starter layers MAG, providers, tools, approvals, sessions, and interfaces on top of that substrate; those choices are replaceable composition, not engine behavior.
 
 | Layer                         | What it owns                                                                                                                                                       | What it avoids                                                                                               |

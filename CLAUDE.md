@@ -79,40 +79,7 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 
 ## Architecture
 
-Daily-decision substrate for "where does this code live" and "is this a plugin or a Lua lib" questions.
-
-### Three layers, decreasing opinion budget
-
-| Layer                                       | Opinion budget        | What it does                                                                                                        |
-| ------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Engine (`engine/`, `crates/nefor-protocol`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, in-memory event log, dispatch via `step`. No NCP body parsing. |
-| Plugins (`plugins/*`)                       | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.               |
-| Starter (`starter/*.lua`)                   | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                               |
-
-Mismatch is the most common architectural bug. Every file gets one layer assignment.
-
-### "Where does this code live?" — procedure
-
-1. **List what the code does.** Multiple responsibilities are a _signal_, not a verdict. Check whether they decouple cleanly. Clean split → separate units. Splitting would create back-references, shared state across the boundary, or duplicated work that doesn't pull its weight → keep together; the coupling IS the substrate.
-2. **For each unit, ask: pure transform or opinionated?**
-   - Pure (no bus access, no envelope emission, no plugin-name in `require`) → primitive.
-     - Engine-level (every actor uses it: uuid, ncp, envelope, replay-window) → `lua/core/`.
-     - Multi-plugin contract (type tags multiple plugins agree on) → `lua/libs/`.
-     - Specific to plugin X's domain → `plugins/X/lua/X/`.
-   - Has an opinion (wiring, emission, policy, names another plugin) → composition → `starter/`.
-3. **Smells of misplacement:**
-   - `require("other-plugin")` inside a plugin lib → cross-plugin knowledge in the wrong layer.
-   - Plugin holding `current_X` state when what's "current" is decided outside the plugin. Per-key state (chat_id → ..., run_id → ...) is fine; singletons whose meaning depends on another actor's coordination aren't.
-   - Forking a file from another repo to change behavior → the interface is wrong; surface the change point as a parameter.
-   - Engine binding for "convenience" → engine bindings are primitives of grade comparable to `now` / `json.encode`. Convenience helpers go in Lua libs.
-
-### Bash-tool test (for plugin candidates)
-
-_Could this be a self-contained composable unit with standard inputs/outputs, like `ls` / `grep` / `cat`?_
-
-- Heaviness is fine. `nefor-tui` runs ratatui + attached terminal and qualifies — clear NCP-shaped I/O, composes through the bus.
-- Cross-plugin knowledge disqualifies. A plugin that names another plugin's wire kind in code isn't a bash tool, it's glue. Glue goes in Lua.
-- Type registries / interface hubs (`generic-provider`, `generic-tool`) fail the test by definition — they exist to be consumed, not to do work. Lua libs.
+[`docs/architecture.md`](docs/architecture.md) is the canonical current architecture and ownership guide, including the engine, plugins, Lua composition and libraries, and MAG layers. Keep placement guidance there rather than duplicating it here.
 
 ## Compatibility policy (pre-public)
 

@@ -1,18 +1,5 @@
 # Changelog
 
-## Unreleased
-
-Changes after v0.4.0:
-
-- Replaced provider-owned replay/history paths with a canonical conversation manager and consumer-owned projections across the lead, MAG, CLI, and TUI surfaces.
-- Strengthened typed MAG boundaries, structured-output validation, terminal integrity, runtime value preservation, and provider stream identity/finalization.
-- Added detached and explicitly awaitable MAG runs, scoped run control, nested-run ownership, and more truthful actor/tool activity previews.
-- Made session provenance and shared session roots explicit across installed and development runtimes; made replay cooperative and added progress UI and hermetic resume/provenance tests.
-- Added deterministic daily-path integration gates, release-bundle validation, build-version invalidation coverage, MAG profiling/benchmarks, and a local session anatomy inspector.
-- Added queued steering and shared workflow termination controls, including double-Ctrl-C exit protection and triple-Escape global workflow termination.
-- Added TUI quality fixes including sidebar overflow navigation, popup layering, semantic tool previews, hidden raw streams in agent previews, and opening Markdown links.
-- Adopted `docs/manifesto.md` as the product-design constraint.
-
 ## v0.4.0
 
 - Replaced the reasoner-graph execution path with the run-scoped MAG actor kernel and made MAG the only workflow execution path.

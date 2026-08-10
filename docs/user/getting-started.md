@@ -56,8 +56,7 @@ nefor run --yolo
 nefor run --prompt "Inspect this repository"
 ```
 
-`--yolo` is shorthand for `--mode yolo`. Read the [approval model](../approval-model.md)
-before relaxing permissions.
+`--yolo` is shorthand for `--mode yolo`. Read the [permissions guide](permissions.md) before relaxing permissions.
 
 ## 4. Customize the copied composition
 

@@ -1,80 +1,139 @@
-<h1 align="center">Nefor</h1>
+<h1 align="center">nefor</h1>
 
-<p align="center"><i>A hyperextensible runtime for composing tools, plugins, reasoners, and interfaces in Lua.</i></p>
+<p align="center"><i>Hyperextensible runtime for composing tools, plugins, and interfaces in Lua.</i></p>
 
 Small core. User-owned config. Replaceable everything else.
 
-Nefor is closer to Neovim than to a fixed agent application: the engine runs
-process plugins, routes their messages, hosts Lua, and stamps identity. A Lua
-`init.lua` chooses the providers, tools, policies, persistence, orchestration,
-and interface that make up a distribution.
+Think Neovim as a runtime: a programmable core, process plugins, and a Lua
+config you own. The engine spawns processes, routes lines, hosts Lua, and stamps
+identity. Your `init.lua` decides what exists, how it talks, what gets
+persisted, and which interface sits on top.
 
-The engine does not require an LLM. Models, scripts, tools, agents,
-orchestrators, and plain interfaces are all units you can compose. The bundled
-starter is a working agentic TUI and a reference distribution, not the product
-boundary.
+Nefor does not require LLMs. Models, scripts, tools, agents, orchestrators, and
+plain interfaces are composable units when you wire them in. The bundled starter
+is one distribution, not the product boundary.
 
-## Why Nefor
+## Why
 
-Most tools expose selected extension points and eventually leave an important
-part fixed. Nefor puts the integration layer in user-owned Lua instead. Plugins
-are separate processes over a line-oriented protocol, interfaces are ordinary
-composition, and policy remains readable and replaceable.
+Most tools expose selected extension points. Eventually you hit the wall: this
+part is configurable, that part is not.
 
-The starter demonstrates that shape with a chat surface, sessions, permission
-gates, providers, tools, and MAG workflows. Keep it, alter it, or replace it.
+Nefor moves the wall into Lua. Plugins are independent OS processes. Interfaces
+are another composition. Routing, persistence, orchestration, approvals, and
+protocol semantics live where you can read and rewrite them.
 
-## Quick start
+The starter proves the shape with a chat surface, providers, tool gates,
+sessions, and a MAG-based agentic loop. MAG itself is a pure, namespaced typed
+language; shipped libraries declare foreign capabilities, validate graph data,
+and lower it to a generic runtime artifact. The lead composes work by writing
+tiny MAG programs the runtime folds into live actor constellations. Keep it, strip
+it down, or use it as a reference for your own distribution.
 
-The credential-free path builds Nefor and installs a copy of the starter:
+## What You Can Compose
+
+- **Tools:** spawn them as plugins, gate them, wrap them, translate them, or
+  replace them.
+- **Plugins:** run independent binaries over stdio. Rust is common here; the
+  boundary is process + lines.
+- **Interfaces:** put a TUI, CLI, bridge, or custom surface on the same runtime.
+- **Reasoners:** compose LLM calls, scripts, tool calls, agents, orchestrators,
+  or any unit that reads context and produces work.
+- **Policies:** own approval, routing, persistence, replay, provider choice, and
+  dispatch behavior in Lua.
+- **Distributions:** ship a complete `init.lua` with plugins and defaults, or
+  keep a private config that only fits your machine.
+
+## Install
+
+From source:
 
 ```sh
-git clone https://github.com/amenocturne/nefor.git
+git clone https://github.com/amenocturne/nefor
 cd nefor
 just install
+```
+
+`just install` builds the engine and plugin binaries, then copies the starter
+composition to `~/.config/nefor`. Use lower-level targets when needed:
+
+```sh
+just install-nefor source     # source | latest | nightly
+just install-starter safe     # safe | force
+```
+
+`install-starter` refuses to overwrite an existing config unless you pass
+`force`.
+
+Or install the engine with brew:
+
+```sh
+brew install amenocturne/tap/nefor
+mkdir -p ~/.config/nefor
+cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
+```
+
+The starter ships with a deterministic offline mock provider, plus
+`openai-provider` for OpenAI-compatible APIs and `chatgpt-provider` for the
+ChatGPT Responses API.
+
+The starter's permission modes are documented in
+[`docs/user/permissions.md`](docs/user/permissions.md).
+
+## Quick Start
+
+Run the starter:
+
+```sh
 nefor
 ```
 
-The starter defaults to the deterministic `mock-plugin` / `mock-model`. No API
-key or provider login is needed. Type a message in the TUI to exercise the full
-local workflow.
+The starter defaults to the deterministic `mock-plugin` / `mock-model`, so no
+credentials are needed. Edit the copied config to use a real provider, different
+tools, or different wiring:
 
-`just install` does not overwrite an existing `~/.config/nefor`. See the
-[installation guide](docs/user/installation.md) for release channels, Homebrew,
-platform support, paths, and safe config handling.
+```sh
+$EDITOR ~/.config/nefor/config/init.lua
+$EDITOR ~/.config/nefor/init.lua
+```
 
-## What you can compose
+A Nefor composition is an `init.lua`. Use the starter as the concrete reference
+for provider setup, tool gating, session replay, workflow actors, and TUI
+wiring.
 
-- **Tools and plugins** — run independent binaries over stdio, then gate, wrap,
-  translate, or replace them.
-- **Interfaces** — put a TUI, CLI, bridge, or custom surface over the same
-  runtime.
-- **Reasoners and workflows** — combine model calls, scripts, tools, agents, or
-  orchestrators; the starter uses typed MAG programs.
-- **Policy** — own approvals, routing, persistence, replay, and provider choice
-  in Lua.
-- **Distributions** — ship a complete composition or maintain a private config
-  that fits one environment.
+## Architecture
 
-## Documentation
+The engine spawns processes and routes lines through Lua. Everything else is
+composition.
 
-Start with the [documentation index](docs/index.md). Its main paths are:
+| Layer                                             | What it owns                                                                                                           |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Engine / bus**                                  | Process spawning, line routing, Lua hosting, and identity stamping (`origin`, `ts`). It does not parse message bodies. |
+| **Plugins** (`plugins/`)                          | Self-contained work over stdio. Each plugin owns one scoped task.                                                      |
+| **Lua config / starter** (`init.lua`, `starter/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces.                           |
+| **Interfaces**                                    | User surfaces composed over the same bus. The starter uses `nefor-tui`; you can wire another.                          |
 
-- [Use the starter](docs/user/getting-started.md)
-- [Customize a distribution](docs/customization/configuration.md)
-- [Author MAG workflows](docs/mag/orchestrating.md)
-- [CLI and protocol reference](docs/reference/cli.md)
-- [Contribute](docs/contributing/development.md)
-
-The [architecture](docs/architecture.md) explains the execution layers, and the
-[manifesto](docs/manifesto.md) states the project's design commitments.
+Bash-tool test: a plugin should feel like a self-contained utility you could run
+from a shell, then compose elsewhere. Plugins should not know their neighbors;
+composition belongs in Lua.
 
 ## Development
 
-Run `just` to discover the repository's command surface. The usual local checks
-are `just check`; broader test groups are documented in the
-[contributor testing guide](docs/contributing/testing.md).
+All commands live in the [`justfile`](justfile). Run `just` to see the full list.
+Use `just test` for the fast default checks and `just test-integration` for the
+release-bundle and deterministic TUI daily-path suites.
+
+## Docs
+
+- [Nefor Manifesto](docs/manifesto.md)
+- [Architecture and writing principles](docs/principles.md)
+- [Plugin authoring guide](docs/plugin-authoring.md)
+- [Documentation index](docs/index.md)
+- [Glossary](docs/glossary.md)
+- [Current protocol](docs/protocol.md)
+- [Plugins](plugins/README.md)
+- [Starter composition](starter/README.md)
+- [Lua core](lua/core/README.md)
 
 ## License
 
-[MIT](LICENSE)
+Do whatever you want, i.e. [MIT](./LICENSE).

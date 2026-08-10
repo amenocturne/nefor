@@ -306,7 +306,6 @@ local function build(opts)
         -- Forbidden is a risk classification, not a runtime verdict: in
         -- safe mode the human accepts or rejects the risk via the popup;
         -- auto denies (no human in the loop); yolo approved above.
-        -- (docs/approval-model.md decision matrix, forbidden row.)
         defer_or_deny(body)
         return
       end

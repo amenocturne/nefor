@@ -85,7 +85,7 @@ Policy precedence is:
 
 Malformed or excluding capability data fails closed even in `yolo`. A missing allowlist retains legacy unrestricted behavior. `auto_approve_tools` is unconditional after capability validation, so use it only for schemas whose complete input space is safe. `bash_fastpaths` are trusted policy predicates and run before `da`.
 
-`edit_file` is available only to write-capable agents. `write_file` additionally requires an active approved lead-workflow plan except in `yolo`. Non-read-only `bash` uses `da`; a missing classifier is an installation error, not a prompt fallback. See the full [approval model](../approval-model.md).
+`edit_file` is available only to write-capable agents. `write_file` additionally requires an active approved lead-workflow plan except in `yolo`. Non-read-only `bash` uses `da`; a missing classifier is an installation error, not a prompt fallback. See the user-facing [permissions guide](../user/permissions.md).
 
 The starter currently derives `read_only_tools` from `mag/lib/nefor/toolsets.json`. Custom `auto_approve_tools` and fast paths are source-exposed composition seams, but have less focused regression coverage than the base mode behavior.
 

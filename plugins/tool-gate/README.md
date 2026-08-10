@@ -34,8 +34,8 @@ Per-tool policy via CLI flags:
 - `--deny <name>` -- reject immediately
 - `--default <auto|prompt|deny>` -- fallback for unlisted tools (default: `prompt`)
 
-Runtime modes are `safe`, `auto`, and `yolo`. The starter's full mode × action
-class table lives in [`docs/approval-model.md`](../../docs/approval-model.md).
+Runtime modes are `safe`, `auto`, and `yolo`. The starter's user-facing mode
+behavior is documented in [`docs/user/permissions.md`](../../docs/user/permissions.md).
 At the transport layer, `yolo` overrides all policies to auto-approve.
 
 ## Runtime events
