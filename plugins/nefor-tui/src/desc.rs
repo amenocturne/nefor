@@ -353,6 +353,7 @@ pub enum WrapMode {
     Word,
     Char,
     None,
+    Tail,
 }
 
 /// One styled run inside a `tui.spans`. The markdown walker (phase 5b)
@@ -1490,8 +1491,9 @@ fn parse_wrap(t: &Table) -> Result<WrapMode, TuiError> {
             "word" => Ok(WrapMode::Word),
             "char" => Ok(WrapMode::Char),
             "none" => Ok(WrapMode::None),
+            "tail" => Ok(WrapMode::Tail),
             other => Err(TuiError::InvalidDesc(format!(
-                "tui.text: `wrap` must be one of word|char|none (got `{other}`)"
+                "tui.text: `wrap` must be one of word|char|none|tail (got `{other}`)"
             ))),
         },
         other => Err(TuiError::InvalidDesc(format!(
@@ -1707,6 +1709,7 @@ mod tests {
             ("word", WrapMode::Word),
             ("char", WrapMode::Char),
             ("none", WrapMode::None),
+            ("tail", WrapMode::Tail),
         ] {
             let src = format!(r#"return {{ _tui_kind = "text", content = "x", wrap = "{s}" }}"#);
             let t = eval_table(&l, &src);

@@ -217,6 +217,7 @@ function M.project(c, args, output, is_error, name)
     projection = {
       label = pick(c.label, args),
       primary = pick(c.primary, args),
+      primary_is_path = type(c.primary) == "table" and c.primary.arg == "path",
       arguments = {},
     }
     if not nonempty(projection.label) then

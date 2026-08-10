@@ -1929,6 +1929,7 @@ pub fn wrap_styled(chars: &[StyledChar], width: u16, wrap: WrapMode) -> Vec<Vec<
         }
         match wrap {
             WrapMode::None => wrapped.push(take_styled_columns(&raw, limit)),
+            WrapMode::Tail => wrapped.push(take_styled_tail_columns(&raw, limit)),
             WrapMode::Char => wrapped.extend(wrap_styled_char(&raw, limit)),
             WrapMode::Word => wrapped.extend(wrap_styled_word(&raw, limit)),
         }
@@ -1948,6 +1949,20 @@ fn take_styled_columns(line: &[StyledChar], limit: usize) -> Vec<StyledChar> {
         taken += w;
     }
     out
+}
+
+fn take_styled_tail_columns(line: &[StyledChar], limit: usize) -> Vec<StyledChar> {
+    let mut taken = 0usize;
+    let mut start = line.len();
+    for (index, c) in line.iter().enumerate().rev() {
+        let width = char_width(c.ch);
+        if taken + width > limit {
+            break;
+        }
+        start = index;
+        taken += width;
+    }
+    line[start..].to_vec()
 }
 
 fn wrap_styled_char(line: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
@@ -2125,6 +2140,7 @@ pub fn wrap_text(content: &str, width: u16, wrap: WrapMode) -> Vec<String> {
                 let truncated: String = take_columns(raw_line, width);
                 out.push(truncated);
             }
+            WrapMode::Tail => out.push(take_tail_columns(raw_line, width)),
             WrapMode::Char => out.extend(wrap_char(raw_line, width)),
             WrapMode::Word => out.extend(wrap_word(raw_line, width)),
         }
@@ -2145,6 +2161,21 @@ fn take_columns(s: &str, width: u16) -> String {
         taken += w;
     }
     out
+}
+
+fn take_tail_columns(s: &str, width: u16) -> String {
+    let limit = width as usize;
+    let mut taken = 0usize;
+    let mut start = s.len();
+    for (index, ch) in s.char_indices().rev() {
+        let char_width = char_width(ch);
+        if taken + char_width > limit {
+            break;
+        }
+        start = index;
+        taken += char_width;
+    }
+    s[start..].to_owned()
 }
 
 fn wrap_char(line: &str, width: u16) -> Vec<String> {
@@ -2338,6 +2369,18 @@ mod tests {
         let root = rec.root.as_mut().unwrap();
         layout_and_paint(root, w, h, &mut buf);
         buf
+    }
+
+    #[test]
+    fn tail_wrap_preserves_the_end_with_display_width_accounting() {
+        assert_eq!(
+            wrap_text("prefix/useful/file.rs", 14, WrapMode::Tail),
+            vec!["useful/file.rs"]
+        );
+        assert_eq!(
+            wrap_text("你你/useful.rs", 11, WrapMode::Tail),
+            vec!["/useful.rs"]
+        );
     }
 
     #[test]

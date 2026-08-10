@@ -159,7 +159,9 @@ local function collapsed_tool_header(entry)
   return header
 end
 local function tool_collapsed(entry)
-  local rows = { tui.text { content = collapsed_tool_header(entry), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
+  local projection = semantic_projection(entry)
+  local wrap = projection and projection.primary_is_path and "tail" or "none"
+  local rows = { tui.text { content = collapsed_tool_header(entry), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = wrap } }
   if entry.error then
     rows[#rows + 1] = tui.text { content = "  error:", style = STYLE.status_danger, wrap = "none" }
     local output_text
@@ -182,7 +184,7 @@ local function tool_expanded(entry, raw)
         or { kind = entry.output == nil and "running" or "receipt", text = "completed" },
     }
   end
-  local rows = { tui.text { content = tool_header(entry, "▼ "), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
+  local rows = { tui.text { content = tool_header(entry, "▼ "), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = p.primary_is_path and "char" or "word" } }
   for _, field in ipairs(p.arguments) do
     rows[#rows + 1] = tui.text { content = "  " .. field.label .. ": " .. field.value, style = STYLE.footer, wrap = "word" }
   end

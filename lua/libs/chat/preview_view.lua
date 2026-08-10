@@ -87,7 +87,8 @@ local function tool_value(value, result, ctx)
     for _, field in ipairs((projection and projection.arguments) or {}) do
       fields[#fields + 1] = field.label .. ": " .. field.value
     end
-    return #fields > 0 and (label .. " · " .. table.concat(fields, " · ")) or label
+    return (#fields > 0 and (label .. " · " .. table.concat(fields, " · ")) or label),
+      projection and projection.primary_is_path == true
   end
   return "▼ " .. tostring(name or "tool") .. (id and (" · " .. tostring(id)) or "")
     .. "\n" .. encode(args ~= nil and args or original)
@@ -160,10 +161,12 @@ function M.activity(item, state, node, is_last, options)
   elseif kind == "tool_call" or kind == "call"
       or kind == "tool_result" or kind == "result" or kind == "error" then
     local result = kind == "tool_result" or kind == "result" or kind == "error"
-    return tui.text { content = tool_value(value.value, result, {
+    local content, primary_is_path = tool_value(value.value, result, {
       state = state, node = node or {},
-    }), style = result and (kind == "error" and STYLE.tool_error or STYLE.status_ok)
-      or STYLE.system, wrap = "word" }
+    })
+    return tui.text { content = content, style = result and (kind == "error" and STYLE.tool_error or STYLE.status_ok)
+      or STYLE.system, wrap = (not result and primary_is_path)
+        and (state.expanded_details == true and "char" or "tail") or "word" }
   elseif kind == "diagnostic" and type(value.value) == "table" then
     local diagnostic = value.value
     if diagnostic.kind == "validation" then
