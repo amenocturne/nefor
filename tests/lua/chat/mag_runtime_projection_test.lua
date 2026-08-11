@@ -106,4 +106,79 @@ is_agent, assignment = preview_state.agent_assignment(source, "run", "plain")
 eq(is_agent, false, "arbitrary MAG nodes do not get an agent assignment section")
 eq(assignment, nil)
 
+local function capability_values(projected)
+  return preview_state.node(projected, "run", "worker.run-tool").streams.capability or {}
+end
+
+local function invocation(capability_id)
+  return {
+    run_id = "run", actor_id = "worker.run-tool", run_scope = "scope",
+    capability_id = capability_id, principal = "subagent",
+  }
+end
+
+local capabilities = {
+  node_previews = {}, mag_arrivals = {}, scope_to_run = {}, capability_owners = {},
+  capability_phases = {},
+}
+capabilities = preview_state.spawn(capabilities, "run", "worker.run-tool", "tool", {}, 0)
+local public_process = {
+  kind = "tool-gate.tool.invoke", id = "scope/process-1", name = "process.exec",
+  args = { command = { "printf", "same" } }, invocation = invocation("scope/process-1"),
+}
+capabilities = preview_state.observe_capability(capabilities, public_process, 1)
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "basic-tools.tool.invoke", id = "private-forward-1", name = "process.exec",
+  args = public_process.args, invocation = invocation("scope/process-1"),
+}, 2)
+eq(#capability_values(capabilities), 1,
+  "public and Rust-backed forwarded envelopes project one causal start")
+eq(capabilities.capability_owners["private-forward-1"], nil,
+  "private forwarding IDs never become owner aliases")
+
+capabilities = preview_state.observe_capability(capabilities, public_process, 3)
+eq(#capability_values(capabilities), 1, "repeated canonical starts are idempotent")
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool.result", id = "scope/process-1", result = "same",
+  invocation = invocation("scope/process-1"),
+}, 4)
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool-gate.tool.result", id = "private-result-1", result = "same",
+  invocation = invocation("scope/process-1"),
+}, 5)
+eq(#capability_values(capabilities), 2,
+  "mirrored terminal envelopes project one causal result")
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool.result", id = "scope/process-1", result = "same",
+  invocation = invocation("scope/process-1"),
+}, 6)
+eq(#capability_values(capabilities), 2, "repeated canonical terminals are idempotent")
+
+local public_read = {
+  kind = "tool-gate.tool.invoke", id = "scope/read-1", name = "read_file",
+  args = { path = "same" }, invocation = invocation("scope/read-1"),
+}
+capabilities = preview_state.observe_capability(capabilities, public_read, 7)
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "read-only-tools.tool.invoke", id = "private-forward-2", name = "read_file",
+  args = public_read.args, invocation = invocation("scope/read-1"),
+}, 8)
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool-gate.tool.invoke", id = "scope/read-2", name = "read_file",
+  args = { path = "same" }, invocation = invocation("scope/read-2"),
+}, 9)
+eq(#capability_values(capabilities), 4,
+  "Lua-backed forwarding is hidden while distinct identical-looking calls remain visible")
+
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool.stream", id = "scope/read-2", stream = "stdout", text = "same",
+}, 10)
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool.stream", id = "scope/read-2", stream = "stdout", text = "same",
+}, 11)
+eq(#capability_values(capabilities), 6,
+  "intentionally identical adjacent stream chunks remain distinct")
+eq(capability_values(capabilities)[5].value.text, "same")
+eq(capability_values(capabilities)[6].value.text, "same")
+
 print("mag_runtime_projection_test: all assertions passed")

@@ -2334,7 +2334,10 @@ function M.update(msg, state)
     local observed = state.replay_mode and state
       or preview_state.observe_capability(state, msg, tui.now_ms())
     if observed ~= state then
-      local owner = (observed.capability_owners or {})[msg.request_id or msg.id]
+      local invocation = msg.invocation
+      local correlation = type(invocation) == "table" and invocation.capability_id
+        or msg.request_id or msg.id
+      local owner = (observed.capability_owners or {})[correlation]
       if owner then
         next_state, effects = finish_projection_update(state, observed,
           { run_id = owner.run_id, id = owner.actor_id })

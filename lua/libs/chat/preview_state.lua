@@ -184,16 +184,42 @@ local function owner_from_invocation(state, msg)
     name = msg.name or msg.tool }
 end
 
+local function causal_capability_id(msg)
+  local invocation = msg.invocation
+  if type(invocation) == "table" and type(invocation.capability_id) == "string"
+      and invocation.capability_id ~= "" then return invocation.capability_id end
+  return msg.request_id or msg.id
+end
+
+local function mark_capability_phase(state, id, phase)
+  local phases = copy_map(state.capability_phases)
+  local capability = copy_map(phases[id])
+  if capability[phase] then return state, false end
+  capability[phase] = true
+  phases[id] = capability
+  return shallow_merge(state, { capability_phases = phases }), true
+end
+
 function M.observe_capability(state, msg, now_ms)
   local kind = msg.kind or ""
+  local id = causal_capability_id(msg)
   local owners = state.capability_owners or {}
-  local owner = owners[msg.request_id or msg.id]
+  local owner = owners[id]
 
   if kind:match("%.completion%.request$") or kind:match("%.tool%.invoke$")
       or kind == "tool.invoke" then
+    local envelope_id = msg.request_id or msg.id
+    -- A gate-private transport envelope keeps the public capability ID in its
+    -- provenance but substitutes its own message ID. Project only the public
+    -- envelope; transport correlation is not another user-visible call.
+    if type(id) ~= "string" or (type(msg.invocation) == "table"
+        and type(msg.invocation.capability_id) == "string"
+        and envelope_id ~= id) then return state end
     owner = owner_from_invocation(state, msg)
-    local id = msg.request_id or msg.id
-    if owner and type(id) == "string" then
+    if owner then
+      local admitted
+      state, admitted = mark_capability_phase(state, id, "start")
+      if not admitted then return state end
       local next_owners = copy_map(owners)
       next_owners[id] = owner
       state = shallow_merge(state, { capability_owners = next_owners })
@@ -224,8 +250,11 @@ function M.observe_capability(state, msg, now_ms)
     return append_stream(state, owner.run_id, owner.actor_id, "capability",
       { kind = msg.stream or msg.channel or "stdout", text = msg.text or msg.delta or "" }, now_ms)
   elseif kind == "tool.result" or kind:match("%.tool%.result$") then
+    local admitted
+    state, admitted = mark_capability_phase(state, id, "terminal")
+    if not admitted then return state end
     local failed = present(msg.error)
-    local result = { id = msg.id, name = owner.name }
+    local result = { id = id, name = owner.name }
     if failed then result.error = msg.error
     else result.output = present(msg.result) and msg.result or msg.output end
     return append_stream(state, owner.run_id, owner.actor_id, "capability",
@@ -345,8 +374,12 @@ function M.prune(state, runs)
   for id, owner in pairs(state.capability_owners or {}) do
     if (runs or {})[owner.run_id] then owners[id] = owner end
   end
+  local phases = {}
+  for id, value in pairs(state.capability_phases or {}) do
+    if owners[id] then phases[id] = value end
+  end
   return shallow_merge(state, { node_previews = all, mag_arrivals = arrivals,
-    scope_to_run = scopes, capability_owners = owners })
+    scope_to_run = scopes, capability_owners = owners, capability_phases = phases })
 end
 
 return M
