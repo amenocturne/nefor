@@ -150,6 +150,23 @@ fn canonical_chat_lua_source_for_config(config_dir: &std::path::Path) -> String 
     )
 }
 
+fn load_chat_scenario(engine: &mut Engine) {
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "chat startup should emit readiness exactly once"
+    );
+    let (target_hint, body) = &emits[0];
+    assert_eq!(target_hint, &None, "chat readiness is broadcast");
+    assert_eq!(
+        body.get("kind").and_then(JsonValue::as_str),
+        Some("chat.surface.ready"),
+        "chat startup should emit only its readiness signal"
+    );
+}
+
 fn render_str(engine: &mut Engine) -> String {
     match engine.render_if_dirty().expect("render") {
         Some(bytes) => String::from_utf8(bytes).expect("ansi is utf-8"),
@@ -489,7 +506,7 @@ fn key(name: &str) -> KeyMessage {
 #[test]
 fn chat_lua_loads_and_renders_initial_frame() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let out = render_str(&mut engine);
     assert!(
         out.contains("mock-model"),
@@ -508,14 +525,13 @@ fn chat_lua_loads_and_renders_initial_frame() {
             "input placeholder should be empty, found {needle:?} in: {out:?}"
         );
     }
-    // Drain — the script doesn't emit anything at boot.
-    assert!(engine.take_emit_queue().is_empty());
+    // Startup readiness was asserted and drained by `load_chat_scenario`.
 }
 
 #[test]
 fn model_list_keeps_context_widget_hidden_until_usage_is_known() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
 
     dispatch_event(
         &mut engine,
@@ -541,7 +557,7 @@ fn model_list_keeps_context_widget_hidden_until_usage_is_known() {
 #[test]
 fn completed_turn_restores_context_used_widget() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     dispatch_event(
         &mut engine,
         json!({
@@ -571,7 +587,7 @@ fn completed_turn_restores_context_used_widget() {
 #[test]
 fn slash_new_clears_session_owned_context_usage() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     dispatch_event(
         &mut engine,
         json!({
@@ -605,7 +621,7 @@ fn slash_new_clears_session_owned_context_usage() {
 #[test]
 fn slash_new_during_cooperative_resume_clears_loading_state() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     dispatch_event(
         &mut engine,
         json!({ "kind": "sessions.resume_loading", "session_id": "resume-1" }),
@@ -671,7 +687,7 @@ fn input_field_has_no_default_placeholder() {
 #[test]
 fn batched_stream_deltas_render_in_a_single_pass() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Push 200 deltas back-to-back without rendering between them.
@@ -714,7 +730,7 @@ fn batched_stream_deltas_render_in_a_single_pass() {
 #[test]
 fn resume_loading_is_immediate_monotonic_and_clears_only_when_done() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -815,7 +831,7 @@ fn resume_loading_formats_byte_boundaries_and_clamps_progress() {
 
     for (replayed, total, expected) in cases {
         let mut engine = Engine::new(100, 24).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
         dispatch_event(
             &mut engine,
@@ -841,7 +857,7 @@ fn resume_loading_formats_byte_boundaries_and_clamps_progress() {
 #[test]
 fn conversation_projection_appends_to_transcript_with_terminal_metadata() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -931,7 +947,7 @@ fn conversation_projection_appends_to_transcript_with_terminal_metadata() {
 #[test]
 fn canonical_system_messages_remain_context_only_in_chat_projection() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -969,7 +985,7 @@ fn canonical_system_messages_remain_context_only_in_chat_projection() {
 #[test]
 fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
     let mut engine = Engine::new(120, 40).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for (answer, duration_ms, output_tokens) in [
@@ -1028,7 +1044,7 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
 #[test]
 fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
     let mut engine = Engine::new(120, 80).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_assistant_delta(&mut engine, "lead answer");
@@ -1090,7 +1106,7 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
 #[test]
 fn fast_graph_completion_waits_for_the_open_conversation_turn() {
     let mut engine = Engine::new(120, 80).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_tool_started(&mut engine, "fast-mag", "mag", json!({}));
@@ -1129,7 +1145,7 @@ fn fast_graph_completion_waits_for_the_open_conversation_turn() {
 #[test]
 fn chat_reset_closes_the_lead_unit_and_preserves_buffered_graph_results() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_assistant_delta(&mut engine, "unfinished");
@@ -1154,7 +1170,7 @@ fn chat_reset_closes_the_lead_unit_and_preserves_buffered_graph_results() {
 #[test]
 fn replayed_reset_preserves_results_but_new_session_selects_a_fresh_conversation() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
@@ -1215,7 +1231,7 @@ fn replayed_reset_preserves_results_but_new_session_selects_a_fresh_conversation
 #[test]
 fn structured_answer_keeps_footer_across_interleaved_steered_user_append() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
@@ -1245,7 +1261,7 @@ fn structured_answer_keeps_footer_across_interleaved_steered_user_append() {
 #[test]
 fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
@@ -1285,7 +1301,7 @@ fn structured_answer_keeps_footer_across_graceful_interrupt_notice() {
 #[test]
 fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
@@ -1323,7 +1339,7 @@ fn lead_failure_closes_empty_provider_round_before_later_assistant_projection() 
 #[test]
 fn structured_chat_error_is_readable_and_closes_the_provider_round() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
@@ -1359,7 +1375,7 @@ fn structured_chat_error_is_readable_and_closes_the_provider_round() {
 #[test]
 fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_assistant_completed(
@@ -1387,7 +1403,7 @@ fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
 #[test]
 fn foreign_chat_stream_delta_stays_out_of_transcript() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
@@ -1421,7 +1437,7 @@ fn foreign_chat_stream_delta_stays_out_of_transcript() {
 #[test]
 fn typing_and_enter_emits_chat_input_submit() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Type "hi" — the text_input is focused by default.
@@ -1456,7 +1472,7 @@ fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
     // "queued follow-up widget" contract, whose text stayed out of the
     // transcript until stream end promoted it.)
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first");
@@ -1509,7 +1525,7 @@ fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
 #[test]
 fn double_escape_stops_lead_and_moves_queue_before_existing_prompt_text() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first");
@@ -1552,7 +1568,7 @@ fn double_escape_stops_lead_and_moves_queue_before_existing_prompt_text() {
 #[test]
 fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first");
@@ -1589,7 +1605,7 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
 #[test]
 fn accepted_steering_reconciles_indexed_entry_after_non_tail_interleaving() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first");
@@ -1617,7 +1633,7 @@ fn accepted_steering_reconciles_indexed_entry_after_non_tail_interleaving() {
 #[test]
 fn accepted_steering_preserves_repeated_equal_user_text() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first");
@@ -1641,7 +1657,7 @@ fn accepted_steering_preserves_repeated_equal_user_text() {
 #[test]
 fn single_escape_without_queue_expires_as_noop() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     submit_text(&mut engine, "first");
     let _ = engine.take_emit_queue();
@@ -1655,7 +1671,7 @@ fn single_escape_without_queue_expires_as_noop() {
 #[test]
 fn absolute_path_submit_is_plain_chat_not_slash_command() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let path = "/home/example/.local/share/nefor/clipboard-images/paste.png";
@@ -1685,7 +1701,7 @@ fn input_field_renders_full_width_rounded_border() {
     // HL_USER. The bordered_box helper composes corners + tui.fill for
     // the rules + side bars around the text_input.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let out = render_str(&mut engine);
     for glyph in ['╭', '╮', '╰', '╯', '─'] {
         assert!(
@@ -1699,7 +1715,7 @@ fn input_field_renders_full_width_rounded_border() {
 fn user_message_renders_full_width_rounded_border() {
     // User entries also use `╭─╮ │ ╰─╯` per spec section 5.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     fixture_message(&mut engine, "user", "hello");
     let out = render_str(&mut engine);
@@ -1719,7 +1735,7 @@ fn user_message_renders_full_width_rounded_border() {
 #[test]
 fn slash_quit_requests_exit() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/quit".chars() {
@@ -1757,7 +1773,7 @@ fn assert_first_ctrl_c_warns(engine: &mut Engine) {
 fn double_ctrl_c_exits_consistently_across_chat_contexts() {
     for setup in ["idle", "active", "focused-input", "popup"] {
         let mut engine = Engine::new(80, 24).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
 
         match setup {
@@ -1794,7 +1810,7 @@ fn double_ctrl_c_exits_consistently_across_chat_contexts() {
 #[test]
 fn ctrl_c_latch_resets_after_timeout_and_intervening_action() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     assert_first_ctrl_c_warns(&mut engine);
@@ -1839,7 +1855,7 @@ fn ctrl_c_latch_resets_after_timeout_and_intervening_action() {
 #[test]
 fn ctrl_d_exits() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Ctrl+D bubbles unconditionally (the editing-key classifier never
@@ -1863,7 +1879,7 @@ fn ctrl_d_exits() {
 #[test]
 fn slash_new_clears_transcript_and_mints_new_session() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Seed a couple of entries first.
@@ -1965,7 +1981,7 @@ fn failed_new_retains_transcript_and_ignores_late_acknowledgements() {
 #[test]
 fn slash_new_clears_panel_runs() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Seed an active kernel run.
@@ -2008,7 +2024,7 @@ fn slash_new_clears_panel_runs() {
 #[test]
 fn mag_run_lifecycle_renders_in_run_panel() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2092,7 +2108,7 @@ fn mag_run_lifecycle_renders_in_run_panel() {
 #[test]
 fn mag_killed_actor_renders_distinct_glyph() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2135,7 +2151,7 @@ fn mag_killed_actor_renders_distinct_glyph() {
 #[test]
 fn mag_post_complete_teardown_keeps_done_glyphs() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2209,7 +2225,7 @@ fn mag_post_complete_teardown_keeps_done_glyphs() {
 #[test]
 fn mag_run_failed_prunes_after_linger() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2262,7 +2278,7 @@ fn mag_run_failed_prunes_after_linger() {
 #[test]
 fn mag_killed_run_prunes_after_linger() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2304,7 +2320,7 @@ fn mag_killed_run_prunes_after_linger() {
 #[test]
 fn mag_modification_kill_keeps_run_live() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2345,7 +2361,7 @@ fn mag_modification_kill_keeps_run_live() {
 #[test]
 fn mag_failed_run_member_row_reads_failed() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2398,7 +2414,7 @@ fn mag_failed_run_member_row_reads_failed() {
 #[test]
 fn mag_two_agent_run_groups_by_namespace() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Sum of the four group-status glyphs == one per rendered group row.
@@ -2493,7 +2509,7 @@ fn mag_two_agent_run_groups_by_namespace() {
 #[test]
 fn mag_concurrent_runs_key_panel_state_by_run_id() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2564,7 +2580,7 @@ fn mag_concurrent_runs_key_panel_state_by_run_id() {
 #[test]
 fn active_conversation_switch_filters_old_and_foreign_projections() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     activate_conversation(&mut engine, "root");
@@ -2625,7 +2641,7 @@ fn active_conversation_switch_filters_old_and_foreign_projections() {
 #[test]
 fn first_canonical_activation_preserves_optimistic_user_message() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "visible prompt".chars() {
@@ -2709,7 +2725,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     // wallclock_tick re-renders surface the empty panel without
     // needing a synthetic event.
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -2759,7 +2775,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
 #[test]
 fn graph_run_complete_removes_run_after_linger_window() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Stand up a completed run: started, spawned, ready, complete.
@@ -2812,7 +2828,7 @@ fn graph_run_complete_removes_run_after_linger_window() {
 #[test]
 fn canonical_turn_stats_update_statusline_and_turn_footer() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_assistant_completed(
@@ -2853,7 +2869,7 @@ fn canonical_turn_stats_update_statusline_and_turn_footer() {
 #[test]
 fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Live: user is on `qwen-test`. The ack rides the active provider
@@ -2900,7 +2916,7 @@ fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
 #[test]
 fn replayed_notifications_do_not_surface_as_popups_or_toasts() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
@@ -2937,7 +2953,7 @@ fn replayed_notifications_do_not_surface_as_popups_or_toasts() {
 #[test]
 fn statusline_shows_model_with_reasoning_effort() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Provider matches the harness-pinned active provider: a
@@ -2970,7 +2986,7 @@ fn statusline_shows_model_with_reasoning_effort() {
 #[test]
 fn ctrl_o_toggles_expanded_details() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -3047,7 +3063,7 @@ fn ctrl_o_toggles_expanded_details() {
 
 fn collapsed_read_file_snapshot(width: u16, running: bool) -> String {
     let mut engine = Engine::new(width, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     engine.handle_key(key("ctrl_b")).expect("hide sidebar");
     let _ = render_str(&mut engine);
@@ -3121,7 +3137,7 @@ fn collapsed_path_with_one_display_column_shows_only_clipping_indicator() {
 #[test]
 fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_header() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -3178,7 +3194,7 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
 #[test]
 fn denied_tool_call_renders_error_state_not_empty_output() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_tool_started(
@@ -3238,7 +3254,7 @@ fn ctrl_b_uppercase_letter_still_toggles() {
     // in input.rs preserves the casing of the underlying char, so this
     // test pins the chat surface against that asymmetry.
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let out = render_str(&mut engine);
     assert!(
         out.contains("(no active runs)"),
@@ -3267,7 +3283,7 @@ fn ctrl_b_single_press_toggles_sidebar() {
     // would surface here. Test at 80 cols (typical default) to match
     // the user's reported environment.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let out = render_str(&mut engine);
     assert!(
         out.contains("(no active runs)"),
@@ -3312,7 +3328,7 @@ fn ctrl_b_single_press_toggles_sidebar() {
 #[test]
 fn arrow_up_on_empty_input_recalls_last_prompt() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Submit a first prompt so prompt_history has one entry.
@@ -3341,7 +3357,7 @@ fn arrow_up_on_empty_input_recalls_last_prompt() {
 #[test]
 fn arrow_up_cycles_through_older_prompts() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Submit two prompts. Newest at index 1.
@@ -3382,7 +3398,7 @@ fn arrow_up_cycles_through_older_prompts() {
 #[test]
 fn arrow_down_after_recall_clears_input() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "draft".chars() {
@@ -3416,7 +3432,7 @@ fn arrow_up_on_non_empty_input_does_not_overwrite() {
     // user is mid-edit and we won't yank their draft. Routes to scroll
     // instead via the existing fallback.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "old".chars() {
@@ -3463,7 +3479,7 @@ fn ctrl_b_after_typing_still_single_press_toggles() {
     // (modifier-prefixed) must bubble to Lua and toggle on the first
     // press — not require a second press.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "hello".chars() {
@@ -3487,7 +3503,7 @@ fn ctrl_b_after_typing_still_single_press_toggles() {
 #[test]
 fn tool_expanded_pretty_prints_input_object() {
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Seed a tool call whose `input` is a JSON object (the wire shape
@@ -3516,7 +3532,7 @@ fn tool_expanded_pretty_prints_input_object() {
 #[test]
 fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Submit a prompt → state.pending becomes true, turn_started_at set.
@@ -3563,7 +3579,7 @@ fn thinking_indicator_has_no_braille_spinner() {
     // pins the minimalist behavior so a future refactor can't sneak
     // the spinner back in.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "hi".chars() {
@@ -3587,7 +3603,7 @@ fn thinking_indicator_has_no_braille_spinner() {
 #[test]
 fn double_escape_stops_only_the_lead() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -3631,7 +3647,7 @@ fn double_escape_stops_only_the_lead() {
 #[test]
 fn triple_escape_immediately_kills_every_workflow_including_lead() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first");
@@ -3685,7 +3701,7 @@ fn triple_escape_immediately_kills_every_workflow_including_lead() {
 #[test]
 fn selected_workflow_termination_emits_classification_before_kill() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -3726,7 +3742,7 @@ fn selected_workflow_termination_emits_classification_before_kill() {
 #[test]
 fn x_on_selected_lead_restores_queue_and_hard_stops_it() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     submit_text(&mut engine, "first");
     let _ = engine.take_emit_queue();
@@ -3760,7 +3776,7 @@ fn x_on_selected_lead_restores_queue_and_hard_stops_it() {
 #[test]
 fn uppercase_x_terminates_all_runs_including_lead() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     for (run_id, principal) in [("lead-run", "lead"), ("sub-run", "subagent")] {
         dispatch_event(
@@ -3799,7 +3815,7 @@ fn uppercase_x_terminates_all_runs_including_lead() {
 #[test]
 fn slash_help_opens_help_popup() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     for ch in "/help".chars() {
         engine.handle_key(key(&ch.to_string())).expect("type");
@@ -3842,7 +3858,7 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
     // PLUS that the popup is fully enclosed (top + bottom rules at the
     // same column span).
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     for ch in "/help".chars() {
         engine.handle_key(key(&ch.to_string())).expect("type");
@@ -3917,7 +3933,7 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
 fn slash_permission_modes_emit_tool_gate_set_mode() {
     for mode in ["safe", "auto", "yolo"] {
         let mut engine = Engine::new(80, 24).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
 
         for ch in format!("/{mode}").chars() {
@@ -3939,7 +3955,7 @@ fn slash_permission_modes_emit_tool_gate_set_mode() {
 fn statusline_shows_current_permission_mode() {
     for (mode, label) in [("safe", "SAFE"), ("auto", "AUTO"), ("yolo", "YOLO")] {
         let mut engine = Engine::new(80, 24).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
 
         dispatch_event(
@@ -3961,7 +3977,7 @@ fn statusline_shows_current_permission_mode() {
 #[test]
 fn mag_human_approval_is_run_addressed_and_cancel_safe() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -4026,7 +4042,7 @@ fn mag_human_approval_is_run_addressed_and_cancel_safe() {
 #[test]
 fn mag_approval_cancel_only_retracts_its_correlated_popup() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for (run, gate, correlation, prompt) in [
@@ -4071,7 +4087,7 @@ fn mag_approval_cancel_only_retracts_its_correlated_popup() {
 #[test]
 fn canonical_turn_completion_reconciles_pending_before_mag_result() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first turn");
@@ -4123,7 +4139,7 @@ fn canonical_turn_completion_reconciles_pending_before_mag_result() {
 #[test]
 fn mag_result_before_canonical_completion_does_not_duplicate_assistant() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "first turn");
@@ -4162,7 +4178,7 @@ fn mag_result_before_canonical_completion_does_not_duplicate_assistant() {
 #[test]
 fn abnormal_lead_close_settles_partial_reasoning_and_text() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "reasoning turn");
@@ -4228,7 +4244,7 @@ fn abnormal_lead_close_settles_partial_reasoning_and_text() {
 #[test]
 fn mag_terminal_results_do_not_close_the_lead_placeholder() {
     let mut engine = Engine::new(100, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "lead turn");
@@ -4258,7 +4274,7 @@ fn mag_terminal_results_do_not_close_the_lead_placeholder() {
 #[test]
 fn terminal_run_and_session_cleanup_retract_mag_approvals() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -4296,7 +4312,7 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     // `chat.tool.permission_request` goes to the validator; only the
     // validator's popup_request reaches the chat surface.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -4447,7 +4463,7 @@ fn chat_popup_info_warning_error_all_render_with_borders() {
     // snapshot drops style by design).
     for level in &["info", "warning", "error"] {
         let mut engine = Engine::new(80, 24).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
         dispatch_event(
             &mut engine,
@@ -4474,7 +4490,7 @@ fn chat_popup_info_warning_error_all_render_with_borders() {
 #[test]
 fn slash_autocomplete_opens_when_typing_slash() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     engine.handle_key(key("/")).expect("/");
@@ -4497,7 +4513,7 @@ fn autocomplete_open_enter_runs_highlighted_command() {
     // section 8/12) — not bottom-fall-through to a generic `chat.command`
     // named "mo".
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Seed two connected providers so /model has someone to fan out to.
@@ -4551,7 +4567,7 @@ fn autocomplete_open_tab_completes_without_submitting() {
     // belt-and-braces the Tab path so the Enter path's new behaviour
     // doesn't subsume Tab.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Seed a connected provider so /model has fan-out targets.
@@ -4599,7 +4615,7 @@ fn slash_quit_emits_exit_side_effect() {
     // above (which exercises the same code path under a different name)
     // because the spec's bug-list explicitly names this scenario.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/quit".chars() {
@@ -4616,7 +4632,7 @@ fn slash_quit_emits_exit_side_effect() {
 #[test]
 fn slash_think_emits_reasoning_effort_set() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     type_text(&mut engine, "/think high");
@@ -4637,7 +4653,7 @@ fn slash_think_emits_reasoning_effort_set() {
 #[test]
 fn slash_compact_renders_pending_entry_until_commit() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -4704,7 +4720,7 @@ fn slash_compact_renders_pending_entry_until_commit() {
         "completed compaction label should share a full-width separator row: {separator_row:?}"
     );
     assert!(
-        out.contains("ctx 128k") && !out.contains("ctx 80k/128k"),
+        !engine.snapshot().contains("ctx 80k/128k"),
         "commit should clear the stale current-context count immediately: {out:?}"
     );
     assert!(
@@ -4720,7 +4736,7 @@ fn slash_compact_renders_pending_entry_until_commit() {
 #[test]
 fn slash_compact_replaces_pending_entry_with_failure() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "/compact");
@@ -4770,7 +4786,7 @@ fn typing_slash_keeps_cursor_after_slash() {
     // doesn't match `/quit` so no exit fires; we surface the bug via
     // `exit_requested`.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     engine.handle_key(key("/")).expect("/");
@@ -4849,7 +4865,7 @@ fn at_path_autocomplete_opens_when_typing_at_sign() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     engine.handle_key(key("@")).expect("@");
@@ -4876,7 +4892,7 @@ fn at_path_autocomplete_does_not_break_slash_popup() {
     // Belt-and-braces: typing `/` from empty input still opens the
     // slash popup; the @-popup wiring must not interfere.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     engine.handle_key(key("/")).expect("/");
@@ -4902,7 +4918,7 @@ fn at_path_autocomplete_filters_by_leaf_prefix_in_subdir() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "@src/m".chars() {
@@ -4932,7 +4948,7 @@ fn at_path_autocomplete_navigation_into_subdir_shows_subdir_contents() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "@src/".chars() {
@@ -4972,7 +4988,7 @@ fn at_path_autocomplete_tab_inserts_selected_match_into_input() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Type `@READ`, popup highlights README.md (the only match).
@@ -5022,7 +5038,7 @@ fn at_path_autocomplete_escape_closes_popup() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     engine.handle_key(key("@")).expect("@");
@@ -5045,7 +5061,7 @@ fn at_path_autocomplete_triggers_mid_message_not_only_at_start() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "summarize @".chars() {
@@ -5066,7 +5082,7 @@ fn at_path_autocomplete_arrow_keys_move_cursor() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // `@src/` lists src/ contents alphabetically with dirs-first.
@@ -5108,7 +5124,7 @@ fn nefor_fs_list_dir_binding_is_available_in_chat_lua_vm() {
     let _cwd = CwdSwitch::to(fixture.path());
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
 
     let lua = engine.lua();
     let (has_readme, has_src_dir, missing_path_is_nil): (bool, bool, bool) = lua
@@ -5146,7 +5162,7 @@ fn popup_open_routes_pgdn_to_popup_not_transcript() {
     // With a popup open, scroll keys (PgUp/PgDn/Home/End) target the
     // popup's scrollable. The transcript's scroll offset must not move.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Pump enough transcript content that PgDn would have something to
@@ -5218,7 +5234,7 @@ fn arrow_up_scrolls_transcript_when_input_focused_at_top_line() {
     // scroll. Issue #39 added the disk-load on init.
     let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Pump enough transcript content that there's something to scroll up
@@ -5281,7 +5297,7 @@ fn arrow_up_scrolls_transcript_when_input_empty() {
     // of scroll.
     let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for _ in 0..40 {
@@ -5330,7 +5346,7 @@ fn mouse_wheel_up_scrolls_transcript() {
     // "not scrollable". The fix updates `was_at_*` inside `scroll_by_signed`
     // so wheel and `tui.scroll_by` stay symmetric.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for _ in 0..40 {
@@ -5389,7 +5405,7 @@ fn arrow_up_scrolls_popup_when_popup_open() {
     // scrollable. Up/Down arrows must follow PgUp/PgDn's modal-focus
     // routing — the transcript stays pinned, popup body scrolls.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Open the help popup (HELP_BODY is multi-line so it has content to
@@ -5451,7 +5467,7 @@ fn statusline_renders_below_input_row() {
     // by rendering and walking rows: the input box's bottom-right
     // corner `╯` lies above the statusline, not below it.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     fixture_assistant_completed(
         &mut engine,
         Some("answer".into()),
@@ -5483,7 +5499,7 @@ fn statusline_omits_scroll_segment_when_transcript_fits_viewport() {
     // hidden entirely ( section 4: "Only rendered when total
     // > transcript_rows").
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
@@ -5501,7 +5517,7 @@ fn statusline_omits_scroll_marker_when_transcript_overflows() {
     // The scrollbar is the sole scroll-position indicator; duplicating
     // it as footer text adds noise even when the transcript overflows.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     for i in 0..30 {
         fixture_message(&mut engine, "user", format!("line-{i}"));
@@ -5517,7 +5533,7 @@ fn statusline_omits_scroll_marker_when_transcript_overflows() {
 #[test]
 fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
     let mut engine = Engine::new(120, 28).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -5595,7 +5611,7 @@ fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
 #[test]
 fn completed_turn_footer_absorbs_canonical_token_speed() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     fixture_assistant_delta(&mut engine, "done");
     fixture_assistant_completed(
@@ -5621,7 +5637,7 @@ fn statusline_omits_loaded_providers_list() {
     // the active model just adds visual noise. The active model itself
     // from the canonical turn terminal stays visible.
     let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     // Seed three auth statuses so the redundant `auth_segment` would have
     // emitted `ollama:✓ anthropic:? openai:!` into the statusline.
     for (provider, status) in [
@@ -5684,7 +5700,7 @@ fn left_column_lifts_input_and_statusline_off_terminal_edges() {
     // whole row is blank — the sidebar runs flush with the terminal
     // top and bottom, which is the visual the user wants.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     let rows: Vec<&str> = snap.lines().collect();
@@ -5718,7 +5734,7 @@ fn slash_model_no_args_fans_out_per_known_provider_and_opens_popup() {
     // respond with an empty list but their section still renders so the
     // user sees what's available behind a login.
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Two connected providers + one login_required.
@@ -5774,7 +5790,7 @@ fn slash_model_no_args_fans_out_per_known_provider_and_opens_popup() {
 #[test]
 fn model_picker_shows_pending_hint_while_login_is_in_progress() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -5808,7 +5824,7 @@ fn chat_models_listed_appends_into_open_picker_and_clears_awaiting() {
     // models, dedups, sorts, and removes the answering provider from
     // the awaiting set.
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -5845,7 +5861,7 @@ fn model_picker_enter_emits_chat_model_set_with_provider() {
     // Up/Down moves the cursor; Enter emits chat.model.set carrying the
     // selected (provider, model) pair, then closes the popup.
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -5902,7 +5918,7 @@ fn model_picker_typing_filters_query() {
     // Printable chars while the picker is open append to the filter
     // query, narrowing the visible list.
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -6053,7 +6069,7 @@ fn slash_resume_opens_session_picker_popup() {
     );
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/resume".chars() {
@@ -6077,7 +6093,7 @@ fn session_picker_lists_recent_sessions_with_preview() {
     );
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/resume".chars() {
@@ -6116,7 +6132,7 @@ fn session_picker_skips_empty_recent_sessions_until_it_finds_resumable_ones() {
     }
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/resume".chars() {
@@ -6141,7 +6157,7 @@ fn resume_keeps_tui_alive() {
     env.write_session(session_id, "2026-05-01T10:00:00.000Z", Some("anything"));
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/resume".chars() {
@@ -6183,7 +6199,7 @@ fn session_picker_escape_cancels_without_emitting() {
     );
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/resume".chars() {
@@ -6213,7 +6229,7 @@ fn slash_resume_with_arg_emits_resume_request() {
     let session_id = "feedface-0000-0000-0000-000000000000";
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let cmd = format!("/resume {session_id}");
@@ -6256,7 +6272,7 @@ fn slash_resume_with_arg_emits_resume_request() {
 #[ignore = "needs GUI clipboard; arboard suppresses toast on headless CI"]
 fn mouse_drag_copies_selection_and_shows_toast() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     // Stream a known message into the transcript so the drag covers
     // identifiable text.
     fixture_assistant_delta(&mut engine, "selectable-token");
@@ -6346,7 +6362,7 @@ fn mouse_drag_copies_selection_and_shows_toast() {
 #[ignore = "needs GUI clipboard; arboard suppresses toast on headless CI"]
 fn mouse_drag_toast_overlays_input_and_statusline() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     // Stream a known message into the transcript so the drag covers
     // identifiable text.
     fixture_assistant_delta(&mut engine, "selectable-token");
@@ -6447,7 +6463,7 @@ fn mouse_drag_toast_overlays_input_and_statusline() {
 #[test]
 fn chat_toast_slides_horizontally_during_enter() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     // 60-second TTL — plenty of headroom for slow test runs.
     dispatch_event(
@@ -6535,7 +6551,7 @@ fn chat_toast_slides_horizontally_during_enter() {
 #[test]
 fn slash_new_then_submit_shows_user_message_after_lifecycle_round_trip() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // `/new` + Enter — locally clears state, emits chat.interrupt_all +
@@ -6589,7 +6605,7 @@ fn slash_new_then_submit_shows_user_message_after_lifecycle_round_trip() {
 #[test]
 fn live_submit_dedups_orchestrator_echo() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "abc".chars() {
@@ -6621,7 +6637,7 @@ fn live_submit_dedups_orchestrator_echo() {
 #[test]
 fn replay_paints_transcript_between_session_start_and_resume_done() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Open the resume cycle.
@@ -6658,7 +6674,7 @@ fn replay_paints_transcript_between_session_start_and_resume_done() {
 #[test]
 fn height_cache_tolerates_unversioned_replay_entries() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
 
     let measured: i64 = engine
         .lua()
@@ -6690,7 +6706,7 @@ fn height_cache_tolerates_unversioned_replay_entries() {
 #[test]
 fn session_end_does_not_wipe_entries() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     fixture_message(&mut engine, "user", "user-typed-quickly");
@@ -6722,7 +6738,7 @@ fn picker_enter_locally_clears_transcript_before_resume() {
     env.write_session(target, "2026-05-04T12:00:00.000Z", Some("seed"));
 
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Old content from the current session.
@@ -6760,7 +6776,7 @@ fn picker_enter_locally_clears_transcript_before_resume() {
 #[test]
 fn slash_new_clears_pending_user_echo_so_repeated_text_is_not_swallowed() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // First submit — sets pending_user_echo to "abc".
@@ -6823,7 +6839,7 @@ fn slash_new_clears_pending_user_echo_so_repeated_text_is_not_swallowed() {
 #[test]
 fn slash_new_does_not_emit_resume_request() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/new".chars() {
@@ -6854,7 +6870,7 @@ fn slash_new_does_not_emit_resume_request() {
 #[test]
 fn realistic_new_flow_with_prior_content_displays_first_message() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Prior session content.
@@ -6926,7 +6942,7 @@ fn realistic_new_flow_with_prior_content_displays_first_message() {
 #[test]
 fn boot_session_start_after_local_submit_keeps_user_message_visible() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // User types FIRST, before the boot session_start arrives.
@@ -6987,7 +7003,7 @@ fn boot_session_start_after_local_submit_keeps_user_message_visible() {
 #[test]
 fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // User submits — local push goes into entries, pending_user_echo set.
@@ -7039,7 +7055,7 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
 #[test]
 fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Step 1: first session, first submit.
@@ -7144,7 +7160,7 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
 #[test]
 fn popup_paints_opaque_background_over_transcript() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Seed transcript with a known marker that sits in the area the
@@ -7240,7 +7256,7 @@ fn submit_re_pins_transcript_to_bottom_after_user_scrolled_up() {
     // history-recall instead of scroll.
     let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Pump enough content that the transcript has somewhere to scroll
@@ -7343,7 +7359,7 @@ fn streaming_deltas_do_not_yank_user_back_to_bottom_when_scrolled_up() {
     // history-recall instead of scroll.
     let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Pre-fill enough content that there's somewhere to scroll up.
@@ -7468,7 +7484,7 @@ fn streaming_deltas_do_not_yank_user_back_to_bottom_when_scrolled_up() {
 #[test]
 fn slash_clear_is_alias_for_slash_new() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for ch in "/clear".chars() {
@@ -7515,7 +7531,7 @@ fn submit_persists_input_history_to_disk_for_next_session() {
     // to `<data_home>/input-history`, newest at line 1.
     {
         let mut engine = Engine::new(80, 24).expect("engine A");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
 
         for ch in "hello".chars() {
@@ -7580,7 +7596,7 @@ fn submit_caps_input_history_at_max_and_rolls_oldest() {
     let env = ResumeEnv::new();
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     for i in 1..=51 {
@@ -7629,7 +7645,7 @@ fn input_history_round_trips_multiline_payload_through_disk() {
     // a real paste would.
     {
         let mut engine = Engine::new(80, 24).expect("engine A");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
 
         let payload = "line1\nline2\nline3";
@@ -7697,7 +7713,7 @@ fn at_path_inlines_existing_file_into_wire_envelope() {
     std::fs::write(&path, "print('hi from fixture')\n").expect("write fixture");
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Absolute paths sidestep CWD assumptions — the io.open fallback
@@ -7747,7 +7763,7 @@ fn at_path_inlines_existing_file_into_wire_envelope() {
 #[test]
 fn at_path_missing_file_leaves_token_untouched_no_error() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Absolute path that does not exist — chat.lua MUST leave the
@@ -7788,7 +7804,7 @@ fn at_path_truncates_files_over_inline_budget() {
     std::fs::write(&path, &payload).expect("write big fixture");
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let prompt = format!("summarize @{}", path.display());
@@ -7825,7 +7841,7 @@ fn at_path_expands_multiple_references_in_one_message() {
     std::fs::write(&b, "BETA_CONTENTS\n").expect("write beta");
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let prompt = format!("compare @{} and @{}", a.display(), b.display());
@@ -7865,7 +7881,7 @@ fn at_path_strips_trailing_punctuation_when_resolving() {
     std::fs::write(&path, "PUNCT_FIXTURE\n").expect("write ref");
 
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Period after the path; the model still gets the file inlined.
@@ -7908,7 +7924,7 @@ const PLAN_YELLOW_SGR: &str = "38;2;255;215;95";
 #[test]
 fn chat_plan_append_renders_yellow_bordered_plan_entry() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -7973,7 +7989,7 @@ fn chat_plan_append_renders_yellow_bordered_plan_entry() {
 #[test]
 fn lead_workflow_plan_approved_updates_status() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8021,7 +8037,7 @@ fn lead_workflow_plan_approved_updates_status() {
 #[test]
 fn plan_approval_before_append_marks_matching_plan() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8071,7 +8087,7 @@ fn plan_approval_before_append_marks_matching_plan() {
 #[test]
 fn lead_workflow_plan_rejected_marks_entry() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8112,7 +8128,7 @@ fn approval_targets_the_latest_pending_plan() {
     // transcript and applies an approval envelope to the most recent
     // pending entry. Older decided entries keep their status.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8173,7 +8189,7 @@ fn approval_with_no_pending_plan_is_dropped() {
     // sloppy reducer that pushed an entry on approval would surface a
     // phantom row here.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8209,7 +8225,7 @@ fn chat_plan_append_does_not_emit_chat_message_append_or_input_submit() {
     // provider's history never sees it — preventing the duplication
     // the user flagged on the spec.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
 
@@ -8265,7 +8281,7 @@ fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
     // text field. Pre-fix a naive reducer that built `text` by
     // concatenating recent entries would leak the plan here.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8295,7 +8311,7 @@ fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
 #[test]
 fn plan_review_reply_emits_review_response_not_chat_input_submit() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8334,7 +8350,7 @@ fn chat_plan_append_is_idempotent_on_submitted_at() {
     // Plan identity is the submission timestamp. Even if a duplicate
     // chat.plan.append arrives, the chat surface must render one block.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let envelope = json!({
@@ -8359,7 +8375,7 @@ fn chat_plan_append_dedup_preserves_approved_status() {
     // same submitted_at must NOT regress the entry's status back to
     // "pending". The dedup branch returns the existing entry untouched.
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8435,7 +8451,7 @@ fn cursor_styled_text(out: &str) -> String {
 /// activation-delivery order). Shared setup for the capture/view tests.
 fn engine_with_scoped_worker() -> Engine {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -8472,7 +8488,7 @@ fn focus_worker_leaf(engine: &mut Engine) -> String {
 #[test]
 fn groups_default_collapsed_and_enter_toggles_fold() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8544,7 +8560,7 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
 #[test]
 fn shift_tab_also_cycles_focus() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -8574,7 +8590,7 @@ fn shift_tab_also_cycles_focus() {
 #[test]
 fn tab_is_noop_while_a_popup_owns_the_keyboard() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -8611,7 +8627,7 @@ fn tab_is_noop_while_a_popup_owns_the_keyboard() {
 #[test]
 fn tab_with_completion_open_completes_instead_of_switching_focus() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -8718,7 +8734,7 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
 /// activity-ticking tests.
 fn engine_with_cycling_group() -> Engine {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -8744,7 +8760,7 @@ fn engine_with_cycling_group() -> Engine {
 #[test]
 fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -8940,7 +8956,7 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
 #[test]
 fn empty_sidebar_tab_warns_and_keeps_prompt_focus() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // No runs → the sidebar has no navigable rows. The toast slides in
@@ -8977,7 +8993,7 @@ fn empty_sidebar_tab_warns_and_keeps_prompt_focus() {
 #[test]
 fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -9016,7 +9032,7 @@ fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
 #[test]
 fn overflowing_sidebar_navigation_reveals_top_middle_and_bottom() {
     let mut engine = Engine::new(120, 14).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -9141,7 +9157,7 @@ fn overflowing_sidebar_navigation_reveals_top_middle_and_bottom() {
 #[test]
 fn short_sidebar_has_no_scroll_extent_and_keeps_content_width() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -9173,7 +9189,7 @@ fn short_sidebar_has_no_scroll_extent_and_keeps_content_width() {
 #[test]
 fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -9226,7 +9242,7 @@ fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
 #[test]
 fn graph_result_failed_collapsed_reads_failed() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     dispatch_event(
@@ -9255,7 +9271,7 @@ fn graph_result_failed_collapsed_reads_failed() {
 #[test]
 fn graph_result_long_output_path_wraps_fully() {
     let mut engine = Engine::new(80, 40).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let path = "/Users/skril/Vault/Projects/personal/nefor/very/deeply/nested/directory/structure/that/keeps/going/output-artifact-final-result.md";
@@ -9299,7 +9315,7 @@ fn graph_result_long_output_path_wraps_fully() {
 #[test]
 fn tool_result_long_single_line_wraps_fully() {
     let mut engine = Engine::new(80, 40).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let long = format!("https://example.com/api/v1/resource/{}", "x".repeat(160));
@@ -9335,7 +9351,7 @@ fn tool_result_long_single_line_wraps_fully() {
 #[test]
 fn tool_input_long_single_line_wraps_fully() {
     let mut engine = Engine::new(80, 40).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let expr = format!("(pipeline{})", "-step".repeat(40));
@@ -9375,7 +9391,7 @@ fn tool_input_long_single_line_wraps_fully() {
 #[test]
 fn slash_new_collapses_stale_scroll_region() {
     let mut engine = Engine::new(60, 12).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     // Overflow the viewport so the virtual-scroll cache has real extent.
@@ -9428,7 +9444,7 @@ fn slash_new_collapses_stale_scroll_region() {
 #[test]
 fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -9474,7 +9490,7 @@ fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
 fn tool_path_summary_keeps_tail_collapsed_and_wraps_full_path_expanded() {
     for (name, arg, label) in [("read_file", "path", "Read file"), ("mag", "file", "MAG")] {
         let mut engine = Engine::new(80, 30).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
         dispatch_event(
             &mut engine,
@@ -9518,7 +9534,7 @@ fn tool_path_summary_keeps_tail_collapsed_and_wraps_full_path_expanded() {
 #[test]
 fn tool_display_projection_preserves_entry_payload_identity() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -10053,7 +10069,7 @@ fn config_chat_extension_coexists_with_canonical_conversation_projection() {
 #[test]
 fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     let mut engine = Engine::new(100, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
 
     let label = |engine: &Engine, name: &str| -> Option<String> {
@@ -10158,7 +10174,7 @@ fn open_single_node(engine: &mut Engine, factory: &str, actor: &str) {
 #[test]
 fn tui_projects_generic_diagnostics_without_factory_specific_renderer() {
     let mut engine = Engine::new(120, 32).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "third-party", "custom.node");
     let initial = render_snapshot(&mut engine);
     assert!(
@@ -10203,7 +10219,7 @@ fn tui_projects_generic_diagnostics_without_factory_specific_renderer() {
 #[test]
 fn generic_arrivals_and_firings_materialize_tui_inputs_and_outputs() {
     let mut engine = Engine::new(100, 26).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "endpoints", "endpoint.node");
     dispatch_event(
         &mut engine,
@@ -10240,7 +10256,7 @@ fn generic_arrivals_and_firings_materialize_tui_inputs_and_outputs() {
 #[test]
 fn completed_local_projection_remains_inspectable_and_bounded_to_latest_run() {
     let mut engine = Engine::new(110, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "retained", "retained.node");
     dispatch_event(
         &mut engine,
@@ -10324,7 +10340,7 @@ fn completed_local_projection_remains_inspectable_and_bounded_to_latest_run() {
 #[test]
 fn consumer_projection_keeps_raw_tool_payloads_behind_details() {
     let mut engine = Engine::new(110, 72).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
@@ -10488,7 +10504,7 @@ fn consumer_projection_keeps_raw_tool_payloads_behind_details() {
 #[test]
 fn generic_validation_diagnostic_never_renders_rejected_candidate_json() {
     let mut engine = Engine::new(110, 32).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "structured-output", "typed.node");
     dispatch_event(
         &mut engine,
@@ -10528,7 +10544,7 @@ fn generic_validation_diagnostic_never_renders_rejected_candidate_json() {
 fn tui_terminal_projection_preserves_exact_large_multiline_tool_streams() {
     for width in [58, 150] {
         let mut engine = Engine::new(width, 40).expect("engine");
-        engine.load_scenario(&chat_lua_source()).expect("load");
+        load_chat_scenario(&mut engine);
         dispatch_event(
             &mut engine,
             json!({
@@ -10595,7 +10611,7 @@ fn tui_terminal_projection_preserves_exact_large_multiline_tool_streams() {
 #[test]
 fn appended_consumer_projection_does_not_steal_manual_scroll_position() {
     let mut engine = Engine::new(100, 26).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "scrolling", "scroll.node");
     dispatch_event(
         &mut engine,
@@ -10650,7 +10666,7 @@ fn appended_consumer_projection_does_not_steal_manual_scroll_position() {
 #[test]
 fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
     let mut engine = Engine::new(100, 26).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "readonly", "readonly.node");
     let _ = render_str(&mut engine);
     let before = engine.take_emit_queue();
@@ -10680,7 +10696,7 @@ fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
 #[test]
 fn agent_group_inspector_shows_its_initial_assignment() {
     let mut engine = Engine::new(120, 32).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -10718,7 +10734,7 @@ fn agent_group_inspector_shows_its_initial_assignment() {
 #[test]
 fn agent_previews_hide_tool_streams_but_keep_conversation_activity() {
     let mut engine = Engine::new(120, 36).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -10825,7 +10841,7 @@ fn agent_previews_hide_tool_streams_but_keep_conversation_activity() {
 #[test]
 fn compact_duration_formatter_covers_unit_boundaries() {
     let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
 
     for (milliseconds, expected) in [
         (0_u64, "0ms"),
@@ -10853,7 +10869,7 @@ fn compact_duration_formatter_covers_unit_boundaries() {
 #[test]
 fn running_and_completed_workflow_rows_use_compact_durations() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -10895,7 +10911,7 @@ fn running_and_completed_workflow_rows_use_compact_durations() {
 #[test]
 fn assistant_and_workflow_result_footers_share_compact_durations() {
     let mut engine = Engine::new(120, 30).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
+    load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     fixture_assistant_completed(
         &mut engine,

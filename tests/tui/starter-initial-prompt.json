@@ -1,7 +1,7 @@
 {
   "name": "starter-initial-prompt-is-visible",
   "command": {
-    "argv": ["bash", "-c", "export NEFOR_INSTALLATION_ID=development-test NEFOR_DEV_DIR=$PWD NEFOR_CONFIG_DIR=$PWD/starter NEFOR_PLUGIN_DIR=$PWD/target/debug; target/debug/nefor run --yolo --prompt 'the secret key is CLI_INITIAL_PROMPT_MARKER'; status=$?; printf '\\nNEFOR_EXIT_CODE=%s\\n' \"$status\"; exit \"$status\""],
+    "argv": ["bash", "-c", "export NEFOR_INSTALLATION_ID=development-test NEFOR_DEV_DIR=$PWD NEFOR_CONFIG_DIR=$PWD/examples/nefor-agent NEFOR_PLUGIN_DIR=$PWD/target/debug; target/debug/nefor run --yolo --prompt 'the secret key is CLI_INITIAL_PROMPT_MARKER'; status=$?; printf '\\nNEFOR_EXIT_CODE=%s\\n' \"$status\"; exit \"$status\""],
     "cwd": ".",
     "cols": 120,
     "rows": 36
