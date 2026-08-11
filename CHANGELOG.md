@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.0
+
+- Made the conversation manager the canonical owner of durable transcript and model-context state, with causal projection ordering and provider-scoped native compaction.
+- Added installation-aware session provenance, cooperative resume progress, and an explicit shared session root for isolated runtime distributions.
+- Expanded MAG's typed language and runtime boundaries, added structured agent outputs and explicit Git worktree create/open capabilities, and exposed standalone compile, run inspection, awaiting, and termination controls.
+- Added queued-input steering and workflow termination gestures, semantic tool receipts, safe Markdown link activation, path-aware compact rows, initial CLI prompt projection, and context-usage status to the TUI.
+- Added supported chat-extension and config-compositor seams while moving the bundled agent into a documented example with clearer customization, provider, session, workflow, and distribution contracts.
+- Hardened source, stable, and nightly installation with immutable runtime generations, release-bundle validation, and stricter plugin registration and cleanup.
+- Hardened ChatGPT authentication, routing, usage/quota refresh, model discovery, compaction restore, structured output, tool calls, and image handling.
+- Fixed overlapping MAG run ownership and preview attribution, failed-run cleanup, cooperative resume isolation, compact path rendering, and the public MAG Task source helper.
+
 ## v0.4.0
 
 - Replaced the reasoner-graph execution path with the run-scoped MAG actor kernel and made MAG the only workflow execution path.
