@@ -1535,8 +1535,13 @@ local function lead_workflow_tool_schemas()
         "Write, compile, and execute MAG programs on the actor kernel. " ..
         "Use action='write' to create/update a .mag file in the workspace. " ..
         "Use action='compile' (default) to compile and preview the actor " ..
-        "modification. Use action='execute' to compile, validate, and run. " ..
-        "Graph and agent semantics live in namespaced MAG libraries. " ..
+        "modification. Use action='execute' to compile, validate, and submit an " ..
+        "asynchronous run; the tool returns a stable run_id without waiting for " ..
+        "terminal output. MAG already owns the run lifecycle, so commands inside " ..
+        "the graph should normally stay in the foreground rather than using shell " ..
+        "backgrounding. Background only when a process intentionally needs a " ..
+        "separately retained lifecycle. Graph and agent semantics live in " ..
+        "namespaced MAG libraries. " ..
         "A program requires nefor.actors, nefor.graph, nefor.contracts, and " ..
         "nefor.artifact; construct source, agent, and output nodes, connect " ..
         "them through one flat edge list in a Graph -> Graph function, then " ..

@@ -3,7 +3,7 @@ use crate::diagnostic::SyntaxDiagnostic;
 #[derive(Debug, thiserror::Error)]
 pub enum MagError {
     #[error("{0}")]
-    Syntax(SyntaxDiagnostic),
+    Syntax(Box<SyntaxDiagnostic>),
     #[error("lexer: {0}")]
     Lex(String),
     #[error("parse: {0}")]

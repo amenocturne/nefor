@@ -127,14 +127,14 @@ pub fn tokenize_source(source: &SourceSnapshot) -> Result<Vec<Token>, MagError> 
             }
             other => {
                 let message = format!("unexpected character: '{other}'");
-                return Err(MagError::Syntax(SyntaxDiagnostic::new(
+                return Err(MagError::Syntax(Box::new(SyntaxDiagnostic::new(
                     "syntax_lex",
                     "lex",
                     format!("lexer: {message}"),
                     source,
                     ByteSpan::new(pos, pos + width),
                     None,
-                )));
+                ))));
             }
         }
     }
@@ -203,7 +203,7 @@ fn read_string(
     loop {
         let Some(c) = next_char(input, *pos) else {
             let message = "unterminated string";
-            return Err(MagError::Syntax(SyntaxDiagnostic::new(
+            return Err(MagError::Syntax(Box::new(SyntaxDiagnostic::new(
                 "syntax_lex",
                 "lex",
                 format!("lexer: {message}"),
@@ -213,7 +213,7 @@ fn read_string(
                     "string opened here".into(),
                     ByteSpan::new(opener, opener + 1),
                 )),
-            )));
+            ))));
         };
         let at = *pos;
         *pos += c.len_utf8();
@@ -221,7 +221,7 @@ fn read_string(
             '"' => return Ok(value),
             '\\' => {
                 let Some(escaped) = next_char(input, *pos) else {
-                    return Err(MagError::Syntax(SyntaxDiagnostic::new(
+                    return Err(MagError::Syntax(Box::new(SyntaxDiagnostic::new(
                         "syntax_lex",
                         "lex",
                         "lexer: unterminated escape in string".into(),
@@ -231,7 +231,7 @@ fn read_string(
                             "string opened here".into(),
                             ByteSpan::new(opener, opener + 1),
                         )),
-                    )));
+                    ))));
                 };
                 let escape_at = *pos;
                 *pos += escaped.len_utf8();
@@ -244,7 +244,7 @@ fn read_string(
                         let message = format!(
                             "unknown string escape \\{other}; use \\\\ for a literal backslash"
                         );
-                        return Err(MagError::Syntax(SyntaxDiagnostic::new(
+                        return Err(MagError::Syntax(Box::new(SyntaxDiagnostic::new(
                             "syntax_lex",
                             "lex",
                             format!("lexer: {message}"),
@@ -254,7 +254,7 @@ fn read_string(
                                 "string opened here".into(),
                                 ByteSpan::new(opener, opener + 1),
                             )),
-                        )));
+                        ))));
                     }
                 }
             }

@@ -75,7 +75,7 @@ struct Diagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    diagnostic: Option<nefor_mag::diagnostic::SyntaxDiagnostic>,
+    diagnostic: Option<Box<nefor_mag::diagnostic::SyntaxDiagnostic>>,
 }
 
 fn main() {

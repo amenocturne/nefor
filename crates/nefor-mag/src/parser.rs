@@ -205,14 +205,14 @@ fn syntax(
     span: ByteSpan,
     related: Option<(String, ByteSpan)>,
 ) -> MagError {
-    MagError::Syntax(SyntaxDiagnostic::new(
+    MagError::Syntax(Box::new(SyntaxDiagnostic::new(
         "syntax_parse",
         "parse",
         message,
         source,
         span,
         related,
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -225,7 +225,7 @@ mod tests {
         let MagError::Syntax(d) = parse_source(&tokens, &source).unwrap_err() else {
             panic!("syntax")
         };
-        d
+        *d
     }
     #[test]
     fn distinguishes_closer_failures() {

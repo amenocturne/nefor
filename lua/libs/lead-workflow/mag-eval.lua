@@ -100,7 +100,11 @@ M.schema = {
   name        = "mag-eval",
   display = { label = "mag-eval", primary = { arg = "intent" }, result = { kind = "content" } },
   description =
-    "Evaluate one MAG node expression on the actor kernel. " ..
+    "Evaluate one MAG node expression on the actor kernel. The tool submits an " ..
+    "asynchronous run and acknowledges immediately with a stable run_id, so commands " ..
+    "inside the expression should normally stay in the foreground rather than using " ..
+    "shell backgrounding. Background only when a process intentionally needs a " ..
+    "separately retained lifecycle. " ..
     "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
     "compose multi-node work in a .mag graph. Commands run until process exit, " ..
     "so awaiting a persistent foreground process such as an HTTP server waits " ..
