@@ -1930,6 +1930,9 @@ pub fn wrap_styled(chars: &[StyledChar], width: u16, wrap: WrapMode) -> Vec<Vec<
         match wrap {
             WrapMode::None => wrapped.push(take_styled_columns(&raw, limit)),
             WrapMode::Tail => wrapped.push(take_styled_tail_columns(&raw, limit)),
+            WrapMode::TailEllipsis => {
+                wrapped.push(take_styled_tail_columns_with_ellipsis(&raw, limit))
+            }
             WrapMode::Char => wrapped.extend(wrap_styled_char(&raw, limit)),
             WrapMode::Word => wrapped.extend(wrap_styled_word(&raw, limit)),
         }
@@ -1963,6 +1966,24 @@ fn take_styled_tail_columns(line: &[StyledChar], limit: usize) -> Vec<StyledChar
         taken += width;
     }
     line[start..].to_vec()
+}
+
+fn take_styled_tail_columns_with_ellipsis(line: &[StyledChar], limit: usize) -> Vec<StyledChar> {
+    let content_width: usize = line.iter().map(|c| char_width(c.ch)).sum();
+    if content_width <= limit {
+        return line.to_vec();
+    }
+    let ellipsis_width = char_width('…');
+    if ellipsis_width > limit {
+        return Vec::new();
+    }
+    let mut out = vec![StyledChar {
+        ch: '…',
+        style: line.first().map(|c| c.style).unwrap_or_default(),
+        link: line.first().and_then(|c| c.link.clone()),
+    }];
+    out.extend(take_styled_tail_columns(line, limit - ellipsis_width));
+    out
 }
 
 fn wrap_styled_char(line: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
@@ -2141,6 +2162,7 @@ pub fn wrap_text(content: &str, width: u16, wrap: WrapMode) -> Vec<String> {
                 out.push(truncated);
             }
             WrapMode::Tail => out.push(take_tail_columns(raw_line, width)),
+            WrapMode::TailEllipsis => out.push(take_tail_columns_with_ellipsis(raw_line, width)),
             WrapMode::Char => out.extend(wrap_char(raw_line, width)),
             WrapMode::Word => out.extend(wrap_word(raw_line, width)),
         }
@@ -2176,6 +2198,20 @@ fn take_tail_columns(s: &str, width: u16) -> String {
         taken += char_width;
     }
     s[start..].to_owned()
+}
+
+fn take_tail_columns_with_ellipsis(s: &str, width: u16) -> String {
+    let limit = width as usize;
+    if string_width(s) <= limit {
+        return s.to_owned();
+    }
+    let ellipsis_width = char_width('…');
+    if ellipsis_width > limit {
+        return String::new();
+    }
+    let mut out = String::from('…');
+    out.push_str(&take_tail_columns(s, (limit - ellipsis_width) as u16));
+    out
 }
 
 fn wrap_char(line: &str, width: u16) -> Vec<String> {
@@ -2380,6 +2416,26 @@ mod tests {
         assert_eq!(
             wrap_text("你你/useful.rs", 11, WrapMode::Tail),
             vec!["/useful.rs"]
+        );
+    }
+
+    #[test]
+    fn tail_ellipsis_marks_only_overflow_and_uses_its_allocation() {
+        assert_eq!(
+            wrap_text("prefix/useful/file.rs", 15, WrapMode::TailEllipsis),
+            vec!["…useful/file.rs"]
+        );
+        assert_eq!(
+            wrap_text("prefix/useful/file.rs", 21, WrapMode::TailEllipsis),
+            vec!["prefix/useful/file.rs"]
+        );
+        assert_eq!(
+            wrap_text("你/file.rs", 1, WrapMode::TailEllipsis),
+            vec!["…"]
+        );
+        assert_eq!(
+            wrap_text("你你/useful.rs", 12, WrapMode::TailEllipsis),
+            vec!["…/useful.rs"]
         );
     }
 

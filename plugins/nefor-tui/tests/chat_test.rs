@@ -3021,38 +3021,48 @@ fn collapsed_read_file_snapshot(width: u16, running: bool) -> String {
     render_snapshot(&mut engine)
 }
 
-#[test]
-fn collapsed_completed_path_tool_keeps_prefix_and_path_tail() {
-    for width in [80, 48] {
-        let snapshot = collapsed_read_file_snapshot(width, false);
-        assert!(
-            snapshot.contains("▸ read_file · "),
-            "tool prefix must survive at width {width}: {snapshot:?}"
-        );
-        assert!(
-            snapshot.contains("important.lua"),
-            "path tail must survive at width {width}: {snapshot:?}"
-        );
-    }
+fn collapsed_read_file_header(width: u16, running: bool) -> String {
+    let snapshot = collapsed_read_file_snapshot(width, running);
+    snapshot
+        .lines()
+        .find(|line| line.contains("▸ read_file · "))
+        .unwrap_or_else(|| panic!("tool prefix must survive at width {width}: {snapshot:?}"))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
-fn collapsed_running_path_tool_reserves_marker_after_path_tail() {
-    for width in [80, 48] {
-        let snapshot = collapsed_read_file_snapshot(width, true);
-        let header = snapshot
-            .lines()
-            .find(|line| line.contains("▸ read_file · "))
-            .unwrap_or_else(|| panic!("tool prefix must survive at width {width}: {snapshot:?}"));
-        assert!(
-            header.contains("important.lua"),
-            "path tail must survive at width {width}: {header:?}"
-        );
-        assert!(
-            header.trim_end().ends_with('…'),
-            "running marker must remain reserved at the row tail at width {width}: {header:?}"
-        );
-    }
+fn collapsed_completed_path_marks_only_actual_clipping() {
+    let full = collapsed_read_file_header(80, false);
+    assert_eq!(
+        full,
+        "▸ read_file · /workspace/very/long/component/src/important.lua"
+    );
+
+    let clipped = collapsed_read_file_header(49, false);
+    assert_eq!(clipped, "▸ read_file · …/long/component/src/important.lua");
+}
+
+#[test]
+fn collapsed_running_path_marks_clipping_before_reserved_marker() {
+    let full = collapsed_read_file_header(80, true);
+    assert_eq!(
+        full,
+        "▸ read_file · /workspace/very/long/component/src/important.lua …"
+    );
+
+    let clipped = collapsed_read_file_header(51, true);
+    assert_eq!(
+        clipped,
+        "▸ read_file · …/long/component/src/important.lua …"
+    );
+}
+
+#[test]
+fn collapsed_path_with_one_display_column_shows_only_clipping_indicator() {
+    let header = collapsed_read_file_header(16, false);
+    assert_eq!(header, "▸ read_file · …");
 }
 
 #[test]

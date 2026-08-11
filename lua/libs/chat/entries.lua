@@ -166,7 +166,7 @@ local function collapsed_path_tool_header(entry, projection)
     tui.expanded { child = tui.text {
       content = projection.primary,
       style = style,
-      wrap = "tail",
+      wrap = "tail-ellipsis",
     } },
   }
   if entry.output == nil and not entry.error then
