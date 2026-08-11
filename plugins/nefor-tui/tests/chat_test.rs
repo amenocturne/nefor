@@ -3010,14 +3010,17 @@ fn ctrl_o_toggles_expanded_details() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains('▸') && out.contains("bash · ls -la /tmp"),
+        out.contains('▸') && out.contains("shell.script · ls -la /tmp"),
         "collapsed tool header missing: {out:?}"
     );
     assert!(!out.contains("SECRET RAW OUTPUT"), "{out:?}");
 
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
     let semantic = render_str(&mut engine);
-    assert!(semantic.contains("▼ bash · ls -la /tmp"), "{semantic:?}");
+    assert!(
+        semantic.contains("▼ shell.script · ls -la /tmp"),
+        "{semantic:?}"
+    );
     assert!(
         semantic.contains("completed") && semantic.contains("hidden"),
         "{semantic:?}"
