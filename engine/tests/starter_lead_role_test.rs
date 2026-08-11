@@ -1,4 +1,4 @@
-//! Smoke tests for `starter/lead_role.lua`. The loader has no bus
+//! Smoke tests for `examples/nefor-agent/lead_role.lua`. The loader has no bus
 //! dependency — it just reads `prompts/<role>.md` files off disk and
 //! exposes the contents through three module-level tables. The Rust
 //! side here only needs to set `package.path` and run the Lua test
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use mlua::Lua;
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {

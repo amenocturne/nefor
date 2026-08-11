@@ -16,7 +16,7 @@
 //! still falls back to `OPENAI_PROVIDER_API_KEY` so users can keep
 //! secrets out of init.lua.
 //!
-//! See `starter/openai-providers-example.lua` for the multi-instance
+//! See `examples/nefor-agent/openai-providers-example.lua` for the multi-instance
 //! recipe.
 //!
 //! # Example

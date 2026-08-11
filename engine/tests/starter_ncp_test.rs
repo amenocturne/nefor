@@ -1,6 +1,6 @@
-//! Unit tests for `starter/ncp.lua` driven from Rust.
+//! Unit tests for `examples/nefor-agent/ncp.lua` driven from Rust.
 //!
-//! The Lua module under test (`starter/ncp.lua`) depends only on the
+//! The Lua module under test (`examples/nefor-agent/ncp.lua`) depends only on the
 //! `nefor.engine` surface — specifically `nefor.engine.send` and
 //! `nefor.engine.plugins`. This harness installs a mock `nefor.engine` that
 //! records calls + returns a caller-controlled plugin list, plus a `_test`
@@ -19,10 +19,10 @@ use std::sync::Mutex;
 
 use mlua::{Lua, Value};
 
-/// Resolve `<repo-root>/starter/`. `CARGO_MANIFEST_DIR` points at the
+/// Resolve `<repo-root>/examples/nefor-agent/`. `CARGO_MANIFEST_DIR` points at the
 /// engine crate (`engine/`), so we walk up one level.
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {

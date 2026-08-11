@@ -6,7 +6,7 @@ This page distinguishes arguments parsed by the engine, arguments forwarded to t
 
 ```text
 nefor [GLOBAL_OPTIONS]
-nefor [GLOBAL_OPTIONS] run [STARTER_ARG ...]
+nefor [GLOBAL_OPTIONS] run [CONFIG_ARG ...]
 nefor [GLOBAL_OPTIONS] plugin
 nefor [GLOBAL_OPTIONS] plugin <NAME> [PLUGIN_ARG ...]
 ```
@@ -30,16 +30,9 @@ nefor --config ./my-config run --session abc --mode safe
 
 `nefor --session abc` is invalid because `--session` is not an engine option.
 
-## Shipped starter arguments
+## Forwarded composition arguments
 
-The current starter accepts:
-
-```text
-nefor run [--session <ID>] [--prompt <TEXT>]
-          [--mode safe|auto|yolo] [--yolo]
-```
-
-Arguments can be reordered. `--yolo` aliases `--mode yolo`. Unknown arguments, missing values, and invalid modes are Lua startup errors. This grammar belongs to the starter distribution; another `init.lua` can interpret forwarded arguments differently.
+Arguments after `run` are opaque strings owned by the selected `init.lua`. The engine imposes no syntax or meaning on them.
 
 ## Virtual plugin CLIs
 
@@ -80,5 +73,3 @@ Plugin executable root:
 The engine exports resolved `NEFOR_CONFIG_DIR`, `NEFOR_DATA_DIR`, and `NEFOR_PLUGIN_DIR` before Lua composition and subprocess spawn.
 
 ## Version output
-
-Source-aware builds use `git describe --tags --always --dirty`; builds without Git context fall back to the Cargo package version. Documentation for an unreleased checkout should therefore say **Unreleased after v0.4.0**, rather than claiming the checkout is a tagged release.

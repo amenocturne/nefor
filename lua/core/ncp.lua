@@ -1,4 +1,4 @@
--- starter/ncp.lua — NCP v0.1 protocol implementation (Lua).
+-- examples/nefor-agent/ncp.lua — NCP v0.1 protocol implementation (Lua).
 --
 -- ## Public API
 --

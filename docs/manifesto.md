@@ -123,4 +123,3 @@ A proposed Nefor feature should have clear answers to these questions:
 9. What can be removed, and does replacement leave one clear active design?
 
 If these answers are unclear, the feature is not ready. If the answers contradict this manifesto, redesign or reject it rather than widening Nefor around the feature.
-

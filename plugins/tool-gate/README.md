@@ -35,7 +35,7 @@ Per-tool policy via CLI flags:
 - `--default <auto|prompt|deny>` -- fallback for unlisted tools (default: `prompt`)
 
 Runtime modes are `safe`, `auto`, and `yolo`. The starter's user-facing mode
-behavior is documented in [`docs/user/permissions.md`](../../docs/user/permissions.md).
+behavior is documented in [the agent example permission guide](../../examples/nefor-agent/docs/permissions.md).
 At the transport layer, `yolo` overrides all policies to auto-approve.
 
 ## Runtime events

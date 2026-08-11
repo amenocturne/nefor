@@ -142,7 +142,7 @@ fn install_mocks(lua: &Lua, shared: std::sync::Arc<Shared>) -> mlua::Result<()> 
 ///     `<staging>/?/init.lua` + `<staging>/?.lua` onto package.path —
 ///     same shape pm.install lays out at runtime for dir overrides)
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn set_package_path(lua: &Lua, plugin: &str) -> mlua::Result<()> {

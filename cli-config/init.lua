@@ -1,6 +1,6 @@
 -- cli-config/init.lua — engine composition for the agentic-cli plugin.
 --
--- Mirrors `starter/init.lua` post-Phase-3a but:
+-- Mirrors `examples/nefor-agent/init.lua` post-Phase-3a but:
 --   * No nefor-tui (the CLI surface IS stdout).
 --   * Registers a virtual `agentic-cli` plugin via nefor.plugins.spawn
 --     directly (the engine dispatches to it via
@@ -12,10 +12,10 @@
 
 local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
 
--- Reuse the modules that live in starter/. Add starter/ to the
+-- Reuse the modules that live in examples/nefor-agent/. Add examples/nefor-agent/ to the
 -- package path so require() resolves there.
 local PROJECT_ROOT = CONFIG_ROOT:match("^(.*)/[^/]+$") or "."
-local STARTER_ROOT = PROJECT_ROOT .. "/starter"
+local STARTER_ROOT = PROJECT_ROOT .. "/examples/nefor-agent"
 local LUA_ROOT = PROJECT_ROOT .. "/lua"
 
 package.path = table.concat({
@@ -115,7 +115,7 @@ agentic_cli.configure {
 }
 
 -- ------------------------------------------------------------------
--- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
+-- Plugin spawn order (mirrors examples/nefor-agent/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
 
 require("libs.generic-provider").declare()
@@ -128,7 +128,7 @@ agentic_loop.configure {
   system   = [[
 You are a helpful assistant. For decomposition tasks (multiple independent sub-questions whose answers roll up into one), use the `mag` tool: write a MAG program to the workspace with action='write', then run it with action='execute'. The run's result arrives automatically as a follow-up turn — after executing, stop and wait for it. For simple chat turns, just answer directly.
 ]],
-  -- The lead's turn-program ships in starter/ (the CLI config reuses the
+  -- The lead's turn-program ships in examples/nefor-agent/ (the CLI config reuses the
   -- starter modules; the program lives beside them).
   lead_program = {
     source_dir = STARTER_ROOT,
@@ -198,7 +198,7 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 -- lead-workflow owns the lead's kernel-dispatch tool surface (mag /
 -- mag-eval / graph-status / terminate-graph / write-review) and relays
 -- kernel-run completions back into agentic-loop's deferred queue.
--- Mirrors starter/init.lua: registered BEFORE tool-gate's spawn so its
+-- Mirrors examples/nefor-agent/init.lua: registered BEFORE tool-gate's spawn so its
 -- bus subscription is live when tool-gate.hello arrives — otherwise
 -- the advertise is missed and the lead gets "no such tool" at runtime.
 actor.spawn(require("libs.lead-workflow"))

@@ -473,14 +473,14 @@ fn resolve_sessions_root(data_root: &str) -> String {
 /// `lua/libs/` trees (so `output-persistence` resolves). Lua trees, highest
 /// precedence first:
 ///
-/// 1. `lua_root` — the composition-owned `--lua-root` (starter/init.lua
+/// 1. `lua_root` — the composition-owned `--lua-root` (examples/nefor-agent/init.lua
 ///    threads its resolved `NEFOR_ROOT/lua` here).
 /// 2. `NEFOR_DEV_DIR/lua` — in-checkout dev mode.
 /// 3. the repo root's `lua/`, four levels above the kernel dir
 ///    (`.../plugins/mag/lua/mag-kernel` → root) — covers a bare `--kernel`
 ///    pointing into a checkout.
 /// 4. `<data_root>/nefor/lua` — the pm-managed sparse-clone every installed
-///    config bootstraps (starter/init.lua), so an installed kernel whose
+///    config bootstraps (examples/nefor-agent/init.lua), so an installed kernel whose
 ///    config dir carries no `lua/` tree still resolves the shared libs.
 fn set_kernel_path(
     lua: &Lua,
@@ -823,7 +823,7 @@ mod tests {
             &source_dir,
             "main.mag",
             serde_json::json!({"foreign_contracts": contracts}),
-            &[manifest.join("../../starter/mag/lib")],
+            &[manifest.join("../../examples/nefor-agent/mag/lib")],
         )
         .expect("compile MAG test program");
         let artifact = serde_json::to_value(loaded.artifact).expect("serialize shell artifact");
@@ -912,7 +912,8 @@ mod tests {
 
     fn documented_shell_expression(needle: &str) -> String {
         let patterns = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib/patterns.md"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/nefor-agent/mag/lib/patterns.md"),
         )
         .expect("read starter MAG patterns");
         patterns

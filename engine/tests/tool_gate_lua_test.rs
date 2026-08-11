@@ -1,5 +1,5 @@
 //! Unit tests for `plugins/tool-gate/lua/tool-gate/init.lua` — the
-//! pure-primitive plugin lib extracted from `starter/tool-gate/init.lua`.
+//! pure-primitive plugin lib extracted from `examples/nefor-agent/tool-gate/init.lua`.
 //!
 //! These tests drive each exported primitive directly under a stubbed
 //! `nefor.*` surface. The lib never reaches into `agentic-loop` (the

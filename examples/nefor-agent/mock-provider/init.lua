@@ -1,7 +1,7 @@
--- starter/mock-provider/init.lua — script for mock-plugin to
+-- examples/nefor-agent/mock-provider/init.lua — script for mock-plugin to
 -- impersonate an openai-provider for deterministic smoke testing of
 -- the mag kernel-dispatch pipeline AND a self-documenting interactive test
--- machine for developers who launch `nefor --config ./starter`. Spawns
+-- machine for developers who launch `nefor --config ./examples/nefor-agent`. Spawns
 -- alongside the openai-provider/ollama instance unconditionally; both
 -- register on the bus and show up in the /model picker.
 --
@@ -144,7 +144,7 @@ local MOCK_PROVIDER_BANNER =
 -- surface's renderer should handle — headings, emphasis variants,
 -- inline code, fenced code, lists, blockquote, table, link, hr,
 -- emojis, and a CJK example. Broken rendering surfaces visually here
--- so a developer launching `nefor --config ./starter` sees what
+-- so a developer launching `nefor --config ./examples/nefor-agent` sees what
 -- works and what doesn't on the first turn.
 local HELP_BODY = table.concat({
   "",

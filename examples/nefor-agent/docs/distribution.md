@@ -46,7 +46,7 @@ bin/nefor
 bin/mag
 share/nefor/plugins/<runtime binaries>
 share/nefor/plugins.manifest
-share/nefor/starter/**
+share/nefor/examples/nefor-agent/**
 share/nefor/LICENSE
 share/nefor/README.md
 share/nefor/CHANGELOG.md       # when present
@@ -58,10 +58,10 @@ Nix exposes `nefor`, `nefor-engine`, `nefor-starter`, and a Home Manager module 
 
 ## Virtual CLIs
 
-A distribution can register Lua `cli` entries and expose them as `nefor plugin <name> ...`. These boot the selected config, so they are part of that distribution. The repository's `agentic-cli` is registered only by `cli-config/` for development and tests; it is not included in the starter or release bundle. See [CLI reference](../reference/cli.md).
+A distribution can register Lua `cli` entries and expose them as `nefor plugin <name> ...`. These boot the selected config, so they are part of that distribution. The repository's `agentic-cli` is registered only by `cli-config/` for development and tests; it is not included in the starter or release bundle. See [CLI reference](../../../docs/reference/cli.md).
 
 ## Compatibility
 
 Before a public stability commitment, compatibility is guaranteed only within a minor `0.y.x` line. A new minor line may break configuration, protocol, session, or module contracts rather than carrying compatibility shims. A distribution that pins/repackages Nefor must choose and document its own upgrade policy.
 
-For package resolution and immutable registration, see [`nefor-pm`](../reference/nefor-pm.md).
+For package resolution and immutable registration, see [`nefor-pm`[`nefor-pm`](../../../lua/nefor-pm/README.md).

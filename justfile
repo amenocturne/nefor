@@ -12,7 +12,7 @@ run:
     export NEFOR_INSTALLATION_ID="development:$(git -C '{{justfile_directory()}}' rev-parse --verify 'HEAD^{commit}')$dirty"
     export RUST_LOG=debug
     export NEFOR_DEV_DIR="{{justfile_directory()}}"
-    export NEFOR_CONFIG_DIR="{{justfile_directory()}}/starter"
+    export NEFOR_CONFIG_DIR="{{justfile_directory()}}/examples/nefor-agent"
     export NEFOR_PLUGIN_DIR="{{justfile_directory()}}/target/debug"
     cargo run --bin nefor
 
@@ -30,7 +30,7 @@ check: fmt-check test-fast
 fmt-check:
     cargo fmt --all --check
 
-# Core confidence set for engine, starter Lua, and tool plumbing changes.
+# Core confidence set for engine, example Lua, and tool plumbing changes.
 test-fast:
     cargo test -p nefor --lib
     cargo test -p nefor --test conversation_manager_test
@@ -44,7 +44,7 @@ test-pm:
     cargo test -p nefor --test nefor_pm_test
 
 # Starter Lua, session, workflow, role, and bundled tool integration tests.
-test-starter:
+test-example:
     cargo test -p nefor --test starter_tool_gate_test
     cargo test -p nefor --test starter_sessions_test
     cargo test -p nefor --test starter_startup_test
@@ -70,7 +70,7 @@ test-provider:
 test-tui:
     cargo test -p nefor-tui --lib
 
-# Drive the real starter through the environment-managed tui-driver.
+# Drive the real agent example through the environment-managed tui-driver.
 test-tui-scenarios:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -113,7 +113,7 @@ test-tui-scenarios:
 # Backwards-compatible name for the full deterministic TUI scenario pack.
 test-tui-smoke: test-tui-scenarios
 
-# All local TUI confidence: renderer/unit coverage plus the real starter scenarios.
+# All local TUI confidence: renderer/unit coverage plus the real agent example scenarios.
 test-tui-all: test-tui test-tui-scenarios
 
 # TUI chat workflow, replay, autocomplete, and input integration tests.
@@ -204,8 +204,8 @@ test-session-inspector:
 version:
     @cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="nefor") | .version'
 
-# Composite: install-nefor + install-starter. End-to-end first-time setup. `channel` (source|latest|nightly) forwards to install-nefor; `mode` (safe|force) forwards to install-starter.
-install channel="source" mode="safe": (install-nefor channel) (install-starter mode)
+# Composite: install-nefor + install-example. End-to-end first-time setup. `channel` (source|latest|nightly) forwards to install-nefor; `mode` (safe|force) forwards to install-example.
+install channel="source" mode="safe": (install-nefor channel) (install-example mode)
     @echo
     @echo "Installed -> ~/.local/share/nefor/bin (plugins), ${PREFIX:-$HOME/.local}/bin/nefor (CLI entry)"
     @echo "Make sure your shell has:"
@@ -237,7 +237,7 @@ install-nefor channel="source":
 
     # $@ = the bins this install just wrote. Anything else in $LIBEXEC_BIN
     # is from an older nefor (renamed/removed plugins); `da` is managed by
-    # install-starter and kept.
+    # install-example and kept.
     prune_libexec_bin() {
       local keep=" $* da " f name
       for f in "$LIBEXEC_BIN"/*; do
@@ -330,8 +330,8 @@ install-nefor channel="source":
         ;;
     esac
 
-# Copy starter/ to ~/.config/nefor and install its external dependencies (da). Refuses if the dir exists; pass `force` to wipe and re-copy.
-install-starter mode="safe":
+# Copy examples/nefor-agent/ to ~/.config/nefor and install its external dependencies (da). Refuses if the dir exists; pass `force` to wipe and re-copy.
+install-example mode="safe":
     #!/usr/bin/env bash
     set -eu
     DEST=~/.config/nefor
@@ -344,15 +344,15 @@ install-starter mode="safe":
         echo "  removed $DEST (force)"
       else
         echo "  $DEST already exists; leaving it alone."
-        echo "  (To wipe and re-copy: just install-starter force)"
+        echo "  (To wipe and re-copy: just install-example force)"
         exit 0
       fi
     fi
     mkdir -p "$DEST"
-    cp -R "{{justfile_directory()}}/starter/." "$DEST/"
-    echo "  $DEST (copied from {{justfile_directory()}}/starter)"
+    cp -R "{{justfile_directory()}}/examples/nefor-agent/." "$DEST/"
+    echo "  $DEST (copied from {{justfile_directory()}}/examples/nefor-agent)"
 
-    # da — bash-command classifier used by starter's tool-validator.
+    # da — bash-command classifier used by example's tool-validator.
     mkdir -p "$LIBEXEC_BIN"
     if [ -x "$LIBEXEC_BIN/da" ]; then
       echo "  da (already installed) -> $LIBEXEC_BIN/da"

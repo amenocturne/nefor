@@ -1,10 +1,8 @@
 # MAG authoring reference
 
-> **Unreleased after v0.4.0.**
-
 MAG is a small, typed, expression-oriented language. Programs compose immutable graph values from namespaced libraries. This reference covers the supported author-facing layer; runtime implementation structures are intentionally not public API.
 
-See [Orchestrating MAG](orchestrating.md) for lead tools, [Patterns](patterns.md) for common topologies, and [Errors](errors.md) for diagnostics.
+See [Orchestrating MAG](orchestrating.md) for lead tools, [Patterns](../../../plugins/mag/docs/patterns.md) for common topologies, and [Errors](errors.md) for diagnostics.
 
 ## Modules and data
 
@@ -16,8 +14,6 @@ Load modules only with literal requires:
 (require "nefor.contracts")
 (require "nefor.graph")
 ```
-
-Do not use historical `import` forms or unqualified helper names. Vectors are list literals, records use maps, and collection functions use prefix form: `(map f values)`, `(concat left right)`, `(fold f initial values)`.
 
 Declare nominal records and algebraic types with `type`:
 
@@ -142,7 +138,7 @@ Most workflows should be fully static. When a runtime result determines how many
 (nefor.artifact.compile-program topology rules)
 ```
 
-A rule subscribes to a typed port created with `nefor.graph.rule`; its named pure MAG function returns a delta artifact. Use public helpers in `nefor.dynamic` for typed worker collection and the empty-list branch. Rules are program metadata, not graph edges, and do not give agents authority to alter the graph. See [Dynamic planner expansion](patterns.md#dynamic-planner-expansion).
+A rule subscribes to a typed port created with `nefor.graph.rule`; its named pure MAG function returns a delta artifact. Use public helpers in `nefor.dynamic` for typed worker collection and the empty-list branch. Rules are program metadata, not graph edges, and do not give agents authority to alter the graph. See [Dynamic planner expansion](../../../plugins/mag/docs/patterns.md#dynamic-planner-expansion).
 
 ## Worktrees
 

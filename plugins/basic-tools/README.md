@@ -19,7 +19,7 @@ Quick reference:
 | `tool.result`               | basic-tools → bus    | broadcast (caller correlates by `id`) |
 
 `tool.invoke`'s kind is prefixed with `basic-tools` so the engine's
-`<peer>.<rest>` routing in `starter/ncp.lua` delivers it directly to us.
+`<peer>.<rest>` routing in `examples/nefor-agent/ncp.lua` delivers it directly to us.
 `tool.register` and `tool.result` are unprefixed because consumers — the
 provider's tool-call loop, debug listeners — need to see them.
 

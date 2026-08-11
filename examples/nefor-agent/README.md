@@ -1,4 +1,4 @@
-# starter/
+# examples/nefor-agent/
 
 Reference config for the nefor engine. NCP v0.1 protocol semantics live here in Lua — the Rust engine is a pure string-bus.
 
@@ -40,7 +40,7 @@ Equivalent to:
 
 ```sh
 cargo build --workspace
-NEFOR_CONFIG_DIR=$PWD/starter NEFOR_PLUGIN_DIR=$PWD/target/debug \
+NEFOR_CONFIG_DIR=/examples/nefor-agent NEFOR_PLUGIN_DIR=$PWD/target/debug \
   RUST_LOG=debug cargo run --bin nefor
 ```
 
@@ -48,7 +48,7 @@ Installed (after `brew install amenocturne/tap/nefor`):
 
 ```sh
 mkdir -p ~/.config/nefor
-cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
+cp -r $(brew --prefix)/share/nefor/examples/nefor-agent/* ~/.config/nefor/
 nefor
 ```
 
@@ -59,10 +59,23 @@ Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-m
 ## Customize
 
 - **Add/remove plugins**: edit the `actor.spawn` blocks in `init.lua`.
-- **Extend chat commands/presentation**: launch `nefor-tui --script <nefor-root>/starter/chat/init.lua`, set `chat_extension = "my-chat-extension"` in the foreign config's `config.active`, and return a module with optional `commands`, `initial_state`, `status_segments`, and `input_border_style` fields. `nefor-tui` binds `chat.update`, `chat.slash`, and `chat.statusline` to that canonical script directory; `$NEFOR_CONFIG_DIR/chat` cannot shadow them. Command handlers receive `(args, read_only_state, api)` and either return `nil` to defer to the canonical command or return `next_state, effects`. Use `api.finish(patch)` for an ordinary completed command, `api.patch(patch)` when preserving input chrome, and `api.new_session(patch)` for provider/mode switches that need the canonical session reset. A command sharing a canonical name must set `extend = true`; its argument completions are merged while its handler may selectively defer. Extensions never receive mutable canonical state and must not reduce provider or conversation events.
+- **Extend chat commands/presentation**: launch `nefor-tui --script <nefor-root>/examples/nefor-agent/chat/init.lua`, set `chat_extension = "my-chat-extension"` in the foreign config's `config.active`, and return a module with optional `commands`, `initial_state`, `status_segments`, and `input_border_style` fields. `nefor-tui` binds `chat.update`, `chat.slash`, and `chat.statusline` to that canonical script directory; `$NEFOR_CONFIG_DIR/chat` cannot shadow them. Command handlers receive `(args, read_only_state, api)` and either return `nil` to defer to the canonical command or return `next_state, effects`. Use `api.finish(patch)` for an ordinary completed command, `api.patch(patch)` when preserving input chrome, and `api.new_session(patch)` for provider/mode switches that need the canonical session reset. A command sharing a canonical name must set `extend = true`; its argument completions are merged while its handler may selectively defer. Extensions never receive mutable canonical state and must not reduce provider or conversation events.
 - **Resume a prior session**: emit `sessions.resume_request { session_id = "<uuid>" }` on the bus (the chat slash-command surface does this for you).
 - **Switch provider/model**: edit the `providers` list in `config/init.lua`. `mock-plugin` is spawned out of the box and is the default provider for deterministic startup. `chatgpt` and `ollama` are opt-in via `NEFOR_ENABLE_CHATGPT=1` and `NEFOR_ENABLE_OLLAMA=1` (or by editing `config/init.lua`). Pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.
 - **Compact ChatGPT context**: `/compact` asks ChatGPT’s native Responses compaction endpoint to seal the conversation so far. Later turns restore that compacted context into their fresh provider chats; switching provider or model falls back to the full local transcript.
 - **Inspect ChatGPT quota**: `/usage` shows both quota windows and reset times. When the active provider advertises usage support, the footer keeps a compact available-capacity gauge such as `◔ 34% until 14:30`.
 
-Session provenance, the shared-session-root contract, and the required installed-distribution generation ID are documented in [`docs/session-provenance.md`](../docs/session-provenance.md).
+Session provenance, the shared-session-root contract, and the required installed-distribution generation ID are documented in [`docs/session-provenance.md`](../../docs/session-provenance.md).
+
+## Example guides
+
+The composition and `/help` are authoritative for commands and keys. Supporting
+workflows that are not evident from the declarative Lua live here:
+
+- [Getting started](docs/getting-started.md) and [installation](docs/installation.md)
+- [Customization](docs/customization.md), [providers and tools](docs/providers-and-tools.md), and [distribution](docs/distribution.md)
+- [Permissions](docs/permissions.md), [sessions](docs/sessions.md), and [workflows](docs/workflows.md)
+- [Chat extension seam](docs/chat-extensions.md) and [troubleshooting](docs/troubleshooting.md)
+
+Provider wire/API details belong to each provider plugin README; generic TUI
+capabilities belong to [`plugins/nefor-tui`](../../plugins/nefor-tui/README.md).

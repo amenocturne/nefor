@@ -1,6 +1,6 @@
 # Current protocol
 
-This document describes the protocol behavior shipped by the current nefor engine and starter. It is not a frozen conformance spec.
+This document describes the protocol behavior shipped by the current Nefor Lua/plugin convention. It is not a frozen conformance spec.
 
 ## Boundary
 

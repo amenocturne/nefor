@@ -1,10 +1,8 @@
 # MAG errors and recovery
 
-> **Unreleased after v0.4.0.**
-
 MAG failures occur at different boundaries. Diagnose the boundary first; changing prompts cannot repair a malformed graph, and recompiling cannot make a hung process exit.
 
-See [Authoring reference](authoring-reference.md) for valid forms and [Orchestrating MAG](orchestrating.md) for run control.
+See [Authoring reference](language.md) for valid forms and [Orchestrating MAG](orchestrating.md) for run control.
 
 ## Compile-time language errors
 

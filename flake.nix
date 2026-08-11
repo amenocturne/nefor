@@ -129,15 +129,15 @@
             )}
           '';
 
-          nefor-starter = pkgs.runCommandLocal "nefor-starter" { } ''
-            cp -r ${./starter} $out
+          nefor-agent = pkgs.runCommandLocal "nefor-agent" { } ''
+            cp -r ${./examples/nefor-agent} $out
           '';
         in
         {
           inherit
             nefor
             nefor-engine
-            nefor-starter
+            nefor-agent
             craneLib
             darwinDeps
             linuxDeps
@@ -155,7 +155,7 @@
           default = n.nefor;
           nefor = n.nefor;
           nefor-engine = n.nefor-engine;
-          nefor-starter = n.nefor-starter;
+          nefor-agent = n.nefor-agent;
         }
       );
 

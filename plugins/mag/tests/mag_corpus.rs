@@ -175,11 +175,14 @@ async fn shutdown(mut stdin: ChildStdin, mut child: Child) {
 #[test]
 fn active_starter_prompts_and_mock_do_not_use_removed_mag_teaching_forms() {
     let root = repo_root();
-    let mut paths = source_files(&root.join("starter/prompts"), "md");
-    paths.extend(source_files(&root.join("starter/mag/lib/prompts"), "md"));
-    paths.push(root.join("starter/mag/lib/patterns.md"));
+    let mut paths = source_files(&root.join("examples/nefor-agent/prompts"), "md");
+    paths.extend(source_files(
+        &root.join("examples/nefor-agent/mag/lib/prompts"),
+        "md",
+    ));
+    paths.push(root.join("examples/nefor-agent/mag/lib/patterns.md"));
     let guidance_paths = paths.clone();
-    paths.push(root.join("starter/mock-provider/init.lua"));
+    paths.push(root.join("examples/nefor-agent/mock-provider/init.lua"));
     let removed = [
         "(agent ",
         "(node ",
@@ -234,7 +237,7 @@ fn active_starter_prompts_and_mock_do_not_use_removed_mag_teaching_forms() {
 #[tokio::test]
 async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
     let root = repo_root();
-    let starter = root.join("starter");
+    let starter = root.join("examples/nefor-agent");
     let lib_root = starter.join("mag/lib");
     let fixture_root = starter.join("mag/tests");
     let all_mag = mag_files(&root);

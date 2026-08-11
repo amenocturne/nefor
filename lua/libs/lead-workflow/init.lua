@@ -950,7 +950,7 @@ end
 -- `mag.run_complete` (the sink's terminal signal, ahead of the terminal
 -- mag.run_result): the kernel emits no per-actor "done", so every actor still
 -- pending/running flips to done here; killed actors keep their terminal
--- state. Mirrors the chat surface's run panel (starter/chat/run_panel.lua).
+-- state. Mirrors the chat surface's run panel (examples/nefor-agent/chat/run_panel.lua).
 local function mark_mag_run_complete(body)
   local run = mag_event_run(body)
   if not run then return end

@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Declarative TUI plugin for nefor — engine + reconciler + Lua-driven primitives. Chat is composed in starter/chat/."
+description = "Declarative TUI plugin for nefor — engine + reconciler + Lua-driven primitives. Chat is composed in examples/nefor-agent/chat/."
 
 [lib]
 name = "nefor_tui"

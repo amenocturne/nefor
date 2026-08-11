@@ -41,9 +41,16 @@ MAG programs return a generic artifact rather than a bare modification:
   "format": "nefor.graph-modification/v1",
   "data": {
     "actors": [
-      { "id": "answer", "foreign": "nefor.factory.llm", "params": {}, "routes": {} }
+      {
+        "id": "answer",
+        "foreign": "nefor.factory.llm",
+        "params": {},
+        "routes": {}
+      }
     ],
-    "messages": [], "kills": [], "rules": []
+    "messages": [],
+    "kills": [],
+    "rules": []
   }
 }
 ```
@@ -85,7 +92,13 @@ logic primitives — logic lives in MAG, reached through the evaluator.
   "actors": [{ "id": "...", "factory": "...", "params": {}, "routes": {} }],
   "messages": [{ "to": "...", "semantic_type": {}, "content": {} }],
   "kills": ["..."],
-  "rules": [{ "id": "expand", "on": { "actor": "planner", "wire": "tasks.Valid" }, "fn": "expand" }]
+  "rules": [
+    {
+      "id": "expand",
+      "on": { "actor": "planner", "wire": "tasks.Valid" },
+      "fn": "expand"
+    }
+  ]
 }
 ```
 
@@ -296,7 +309,6 @@ compiler special case.
   prefix of the fold; replay is deterministic even though arrival order was
   not. Debugging is diffing prefixes.
 
-
 ## Modification rejection events
 
 Initial execution and mid-run apply use the same validator but have different
@@ -305,7 +317,7 @@ control-plane results:
 - Invalid `mag.execute`: the kernel creates the run context, flushes queued
   lifecycle events such as `mag.run_started` and `mag.modification_rejected`,
   then replies with a terminal `mag.run_result { status = "failed", error = ...
-  }` and tears the context down. The run does not remain available for later
+}` and tears the context down. The run does not remain available for later
   applies.
 - Invalid mid-run `mag.apply`: the kernel emits and flushes
   `mag.modification_rejected`, replies to the caller with

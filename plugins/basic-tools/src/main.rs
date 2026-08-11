@@ -16,7 +16,7 @@
 //!       applies its policy and forwards back to us.
 //! - Listen for `basic-tools.tool.invoke { id, name, args }` (kind is
 //!   prefixed with our plugin name so the engine's `<peer>.<rest>` routing
-//!   delivers it directly to us — see `starter/ncp.lua` `handle_event`).
+//!   delivers it directly to us — see `examples/nefor-agent/ncp.lua` `handle_event`).
 //! - Reply with a broadcast `tool.result { id, output }` on success or
 //!   `tool.result { id, error }` on failure. Caller correlates by `id`.
 

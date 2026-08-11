@@ -107,7 +107,7 @@ Mutating custom callbacks receive isolated decoded values. `to_plugin_readonly =
 
 Default routing skips self, honors an explicit `send` target, applies the legacy ready-peer kind-prefix rule, then broadcasts. Wrappers can transform or drop what they are offered.
 
-Use [`lua/libs/compositors/provider.lua`](../lua/libs/compositors/provider.lua) as the production example for provider translation and [`customization/configuration.md`](customization/configuration.md) for supported compositor seams. Broker invocation helpers, `dispatch`, reset/test hooks, underscored actor fields, and MAG kernel factories are internal APIs.
+Use [`lua/libs/compositors/provider.lua`](../lua/libs/compositors/provider.lua) as the production example for provider translation and [agent example customization](../examples/nefor-agent/docs/customization.md) for supported compositor seams. Broker invocation helpers, `dispatch`, reset/test hooks, underscored actor fields, and MAG kernel factories are internal APIs.
 
 ## Rust helpers
 
@@ -131,4 +131,4 @@ ncp.spawn {
 
 For secrets or environment setup, prefer a narrowly scoped launcher script that exports the values and `exec`s the real plugin. On Windows, invoke `cmd.exe /c` or PowerShell explicitly. Nefor itself makes no implicit shell choice.
 
-For tool-specific integration, continue with [Providers, tools, and permission policy](customization/providers-and-tools.md).
+For tool-specific integration, continue with [the example provider and tool guide](../examples/nefor-agent/docs/providers-and-tools.md).

@@ -6,7 +6,7 @@
 -- fields) but with `env.replay` envelopes preserved so chat/init.lua
 -- can rebuild its transcript on resume.
 --
--- The companion UI script lives at `starter/chat/init.lua` and is
+-- The companion UI script lives at `examples/nefor-agent/chat/init.lua` and is
 -- loaded by the nefor-tui binary itself; the two run in different
 -- processes and share no Lua state.
 

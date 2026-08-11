@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {
@@ -336,7 +336,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 
     // bus.on_event — accept handler registrations as a no-op. The
     // replay_window module no longer self-subscribes at require-time
-    // (now wired explicitly by starter/init.lua via
+    // (now wired explicitly by examples/nefor-agent/init.lua via
     // replay_window.install()); these tests drive the replay-window
     // flag via the module's public set() helper instead.
     let bus_tbl = lua.create_table()?;
@@ -517,7 +517,7 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
           "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
-        -- starter/provider.lua reaches the plugin lib via
+        -- examples/nefor-agent/provider.lua reaches the plugin lib via
         -- `require("openai-provider")`. The plugin's `lua/` parent is on
         -- package.path above so that resolves to
         -- plugins/openai-provider/lua/openai-provider/init.lua.

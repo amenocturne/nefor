@@ -1,4 +1,4 @@
-//! Unit tests for `starter/tool-validator/init.lua` permission modes.
+//! Unit tests for `examples/nefor-agent/tool-validator/init.lua` permission modes.
 
 use std::path::PathBuf;
 
@@ -120,7 +120,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let root = repo_root();
-    let starter = root.join("starter").display().to_string();
+    let starter = root.join("examples/nefor-agent").display().to_string();
     let lua_root = root.join("lua").display().to_string();
     let script = format!(
         r#"

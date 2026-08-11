@@ -22,7 +22,7 @@
 -- ir.rs initial_activation_content -> `{ kind = "task", prompt = ... }`),
 -- `generic-provider.FinalAnswer` is what an upstream agent routes in
 -- (docs-explorer.llm -> code-writer.entry), and `human.Rejected` is the gate
--- template's revise leg (starter/mag/lib/templates.mag: the rejection reason
+-- template's revise leg (examples/nefor-agent/mag/lib/templates.mag: the rejection reason
 -- re-enters the producing llm as its next turn — the llm's owned transcript
 -- already carries the rejected draft, so the reason alone is the feedback).
 -- Firing "on any" (shape.lua) means whichever arrives activates alone — no

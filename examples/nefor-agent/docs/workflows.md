@@ -1,12 +1,10 @@
 # Workflows and tools
 
-> Starter behavior, **Unreleased after v0.4.0**. Current code and tests are authoritative.
-
 ## Queueing and steering
 
 The lead turn is a short-lived MAG program. If you submit while it is active, the starter keeps one optimistic queued entry; later submissions coalesce into it. A single `Esc`, after its 600 ms gesture window expires, claims that queue and sends `chat.steer`. The agentic loop injects it at the lead LLM's next provider boundary, after the current exchange.
 
-Double `Esc` hard-stops the active lead, drops the engine-side queue, and restores the queued text to the prompt so it is not silently lost. Triple `Esc` additionally requests termination of every MAG workflow. See [Escape precedence](commands-and-keys.md#escape-precedence): a popup, completion, history recall, or focused sidebar consumes Esc first.
+Double `Esc` hard-stops the active lead, drops the engine-side queue, and restores the queued text to the prompt so it is not silently lost. Triple `Esc` additionally requests termination of every MAG workflow. See [Escape precedence](../chat/slash.lua#escape-precedence): a popup, completion, history recall, or focused sidebar consumes Esc first.
 
 ## Sidebar and run inspection
 

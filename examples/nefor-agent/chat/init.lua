@@ -1,4 +1,4 @@
--- starter/chat.lua — chat surface as a Lua composition over tui.* primitives.
+-- examples/nefor-agent/chat.lua — chat surface as a Lua composition over tui.* primitives.
 --
 -- The engine ships zero opinion. Every color, every layout, every
 -- glyph below is editable — this composition IS the chat surface's
@@ -83,7 +83,7 @@ do
     "../plugins/nefor-tui/lua"
   ))
   if tui_lua_dir == nil then
-    error("starter/chat.lua: could not locate plugins/nefor-tui/lua/init.lua")
+    error("examples/nefor-agent/chat.lua: could not locate plugins/nefor-tui/lua/init.lua")
   end
 
   -- The entry script and its sibling modules are one canonical consumer.
@@ -93,25 +93,25 @@ do
   -- parent as NEFOR_STARTER_CHAT_DIR; explicit overrides remain available to
   -- in-process tests and development launchers.
   local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/update.lua", table.pack(
-    dev_dir    and (dev_dir    .. "/starter/chat") or nil,
-    runtime_dir and (runtime_dir .. "/starter/chat") or nil,
-    pm_root    and (pm_root    .. "/starter/chat") or nil,
-    "./starter/chat",
-    "../starter/chat"
+    dev_dir    and (dev_dir    .. "/examples/nefor-agent/chat") or nil,
+    runtime_dir and (runtime_dir .. "/examples/nefor-agent/chat") or nil,
+    pm_root    and (pm_root    .. "/examples/nefor-agent/chat") or nil,
+    "./examples/nefor-agent/chat",
+    "../examples/nefor-agent/chat"
   ))
   if chat_dir == nil then
-    error("starter/chat.lua: could not locate starter/chat submodules")
+    error("examples/nefor-agent/chat.lua: could not locate examples/nefor-agent/chat submodules")
   end
 
   local chat_parent = chat_dir:match("^(.*)/chat$")
   local config_lua_dir = pick_dir("NEFOR_STARTER_CONFIG_DIR", "/config/init.lua", table.pack(
     config_dir,
-    dev_dir    and (dev_dir    .. "/starter") or nil,
-    runtime_dir and (runtime_dir .. "/starter") or nil,
+    dev_dir    and (dev_dir    .. "/examples/nefor-agent") or nil,
+    runtime_dir and (runtime_dir .. "/examples/nefor-agent") or nil,
     chat_parent,
-    pm_root    and (pm_root    .. "/starter") or nil,
-    "./starter",
-    "../starter"
+    pm_root    and (pm_root    .. "/examples/nefor-agent") or nil,
+    "./examples/nefor-agent",
+    "../examples/nefor-agent"
   ))
   if config_lua_dir ~= nil then
     package.path = table.concat({
@@ -139,7 +139,7 @@ do
     "../lua"
   ))
   if lua_dir == nil then
-    error("starter/chat.lua: could not locate the shared lua/ tree (libs.chat.*)")
+    error("examples/nefor-agent/chat.lua: could not locate the shared lua/ tree (libs.chat.*)")
   end
   package.path = table.concat({
     lua_dir .. "/?.lua",

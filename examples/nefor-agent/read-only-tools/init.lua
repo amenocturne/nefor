@@ -1,4 +1,4 @@
--- starter/read-only-tools — config composition for the read-only tool set.
+-- examples/nefor-agent/read-only-tools — config composition for the read-only tool set.
 --
 -- The mechanism (list_dir / optional search_text / python-read / instructions /
 -- discover_instruction_files handlers plus the advertise/dispatch

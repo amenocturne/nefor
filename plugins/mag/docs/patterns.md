@@ -10,7 +10,7 @@ worker-to-collector routes, and the collector route to a summarizer already in
 the initial graph. The error rule routes the complete `AgentError` to the
 static outcome and spawns nothing. For `[]`, `nefor.dynamic.empty-to` targets the summarizer's
 typed `Port<List<T>>`; a zero-input collector would never fire. The shipped
-program is `starter/agentic-loop/dynamic-tasks.mag` and its real provider E2Es
+program is `examples/nefor-agent/agentic-loop/dynamic-tasks.mag` and its real provider E2Es
 cover zero, invalid, and reverse worker completion.
 
 Every shipped pattern here has a clean expression in routes or input contracts.

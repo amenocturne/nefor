@@ -228,7 +228,7 @@ for _, p in ipairs(cfg.providers or {}) do
       }
     ))
   else
-    error("starter/init.lua: unknown provider kind: " .. tostring(p.kind))
+    error("examples/nefor-agent/init.lua: unknown provider kind: " .. tostring(p.kind))
   end
 end
 

@@ -36,7 +36,7 @@ const PROTOCOL_VERSION: &str = "0.1";
 /// Default scenario when no `--script` flag is supplied. Useful for
 /// `cargo run -p nefor-tui` smoke runs and `cargo install` users who
 /// haven't picked a chat composition yet. The real chat surface lives
-/// at `starter/chat/init.lua` and gets loaded via `--script <path>`.
+/// at `examples/nefor-agent/chat/init.lua` and gets loaded via `--script <path>`.
 const PLACEHOLDER_SCENARIO: &str = r#"
     tui.start {
       initial_state = { count = 0 },
@@ -97,7 +97,7 @@ fn parse_flags() -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
 }
 
 /// Export `--lua-root` to the script via the env vars the composition
-/// already honors (`pick_dir` in starter/chat/init.lua). Spawn specs carry
+/// already honors (`pick_dir` in examples/nefor-agent/chat/init.lua). Spawn specs carry
 /// no env map, so a composition resolving its lua tree from a non-env
 /// source (e.g. nefor-team reading NEFOR_DEV_DIR from .env.local) has no
 /// other way to thread the tree into this process. Pre-set env wins —
@@ -521,7 +521,7 @@ fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) -> 
 /// Drain accumulated Lua egress and forward each entry as a
 /// `PluginOutgoing::event(body)` line. `target_hint` is logged but not
 /// used for routing — the engine broadcasts; per-peer delivery happens
-/// via the bus (prefix-targeting in `starter/ncp.lua`).
+/// via the bus (prefix-targeting in `examples/nefor-agent/ncp.lua`).
 async fn drain_emits_to_writer(
     engine: &mut Engine,
     out_tx: &mpsc::Sender<PluginOutgoing>,

@@ -1,4 +1,4 @@
--- starter/lib/ids.lua — id-shape helpers shared across the orchestrator.
+-- examples/nefor-agent/lib/ids.lua — id-shape helpers shared across the orchestrator.
 --
 -- The id_seq counter mint_chat_run_id() folds in for collision
 -- resistance lives in envelope.lua so uuid_lite() and

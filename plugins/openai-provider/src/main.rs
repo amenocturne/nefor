@@ -2795,7 +2795,7 @@ fn chat_tool_end_body(id: &str, output: &str, error: bool) -> Map<String, Value>
 
 /// Build a `<plugin>.tool.invoke` body. The kind is prefix-routed by
 /// the engine to deliver only to the named plugin (see
-/// `starter/ncp.lua` `handle_event`).
+/// `examples/nefor-agent/ncp.lua` `handle_event`).
 fn tool_invoke_body(plugin: &str, id: &str, name: &str, args: Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(

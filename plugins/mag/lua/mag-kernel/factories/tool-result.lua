@@ -2,7 +2,7 @@
 -- boundary.
 --
 -- The contract-declared replacement for the shape-sniffing `adapter` handler
--- (starter/reasoners/init.lua, `adapter_run_node`): it turns aggregated tool
+-- (examples/nefor-agent/reasoners/init.lua, `adapter_run_node`): it turns aggregated tool
 -- results into the provider input for the next llm turn. The baseline scanned
 -- its inputs for a `.tool_results` field to decide what it had received; here
 -- the declared input contract states it — nothing sniffs a runtime shape

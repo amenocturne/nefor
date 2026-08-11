@@ -1,4 +1,4 @@
--- starter/lib/contracts/provider.lua — provider wire-protocol contract.
+-- examples/nefor-agent/lib/contracts/provider.lua — provider wire-protocol contract.
 --
 -- Owns the canonical type tags every provider-shaped reasoner ecosystem
 -- agrees on. Replaces the `generic-provider` Rust binary's role as a

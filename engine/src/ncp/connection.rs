@@ -199,7 +199,7 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
 /// ordinary [`ConnectionOutbound::Send`] traffic. When that live queue is
 /// full, the oldest lossy line is dropped and a warning is logged — the
 /// broker no longer emits a protocol-level `QueueOverflow` system message
-/// (that was a starter/init.lua concern in the new model).
+/// (that was a examples/nefor-agent/init.lua concern in the new model).
 ///
 /// Finite [`ConnectionOutbound::SendLosslessBatch`] chunks are protected
 /// from that policy and retain their position relative to preceding sends,

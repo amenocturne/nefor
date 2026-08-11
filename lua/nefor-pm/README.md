@@ -1,156 +1,99 @@
-# External config bootstrap
+# `nefor-pm` reference
 
-This page is for **external** consumer configs (anything outside the
-upstream `nefor` repo — e.g. `nefor-team`, personal customisation
-configs) that want to depend on the upstream's plugin libraries and
-Rust binaries via `nefor-pm`.
+`nefor-pm` is the synchronous Lua package/source manager used during configuration bootstrap. It manages Lua module roots and source checkouts; it is not an engine subcommand.
 
-In-tree development inside this repo uses `dir`-overrides on every
-`pm.install` spec and never hits the fetch path, so the bootstrap is
-only relevant to configs that _don't_ sit next to the upstream tree.
-
-## The chicken-and-egg problem
-
-`nefor-pm` is itself shipped in the upstream repo at
-`lua/nefor-pm/init.lua`. An external config needs to call
-`require("nefor-pm")` before it can declare any plugin specs — so the
-pm has to already be on disk and on `package.path` before the
-consumer's `init.lua` runs `pm.install({...})`.
-
-The solution is the same shape lazy.nvim uses: a small bootstrap
-snippet at the very top of the consumer's `init.lua` that ensures a
-sparse subtree of the upstream repo exists at the ref implied by the
-engine version, then puts the pm dir on `package.path`. After that the
-rest of `init.lua` is plain composition.
-
-## The snippet
+## API
 
 ```lua
--- Bootstrap nefor-pm. A release binary (nefor.version = "X.Y.Z") always
--- runs against upstream tag vX.Y.Z; dev/nightly builds use main.
-local function bootstrap_pm()
-  local data_dir = os.getenv("NEFOR_DATA_DIR")
-                or (os.getenv("XDG_DATA_HOME") or (os.getenv("HOME") .. "/.local/share"))
-                   .. "/nefor"
-  local pm_root  = data_dir .. "/nefor"
-  local pm_init  = pm_root .. "/lua/nefor-pm/init.lua"
-  local upstream_ref = (nefor and nefor.version and nefor.version:match("^%d+%.%d+%.%d+$"))
-                    and ("v" .. nefor.version)
-                    or "main"
-
-  -- Lua 5.2+ returns (true|nil, "exit"|"signal", code); 5.1 returns
-  -- the raw exit code. Capture once — re-checking by re-calling
-  -- os.execute would re-run the command and `git clone` would then
-  -- blow up on "already exists" right after a successful first run.
-  local function run(cmd)
-    local ok = os.execute(cmd)
-    return ok == true or ok == 0
-  end
-  local function sh_quote(s)
-    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-  end
-  local function fetch_ref()
-    if upstream_ref:match("^v%d+%.%d+%.%d+$") then
-      return "tag " .. sh_quote(upstream_ref)
-    end
-    return sh_quote(upstream_ref)
-  end
-
-  local f = io.open(pm_init, "r")
-  if f then
-    f:close()
-  else
-    os.execute("mkdir -p '" .. data_dir .. "'")
-    local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
-                   .. "--branch " .. sh_quote(upstream_ref) .. " "
-                   .. "https://github.com/amenocturne/nefor.git " .. sh_quote(pm_root)
-    if not run(clone_cmd) then
-      error("nefor bootstrap: git clone failed; check network + git availability")
-    end
-  end
-  if not run("git -C " .. sh_quote(pm_root) .. " fetch --depth 1 origin " .. fetch_ref()) then
-    error("nefor bootstrap: git fetch failed for " .. upstream_ref)
-  end
-  if not run("git -C " .. sh_quote(pm_root) .. " checkout --force FETCH_HEAD") then
-    error("nefor bootstrap: git checkout failed for " .. upstream_ref)
-  end
-  if not run("git -C " .. sh_quote(pm_root) .. " sparse-checkout set lua/nefor-pm") then
-    error("nefor bootstrap: git sparse-checkout set failed")
-  end
-
-  package.path = table.concat({
-    pm_root .. "/lua/?.lua",
-    pm_root .. "/lua/?/init.lua",
-    package.path,
-  }, ";")
-end
-
-bootstrap_pm()
-
-local pm = require("nefor-pm")
-
-pm.install({
-  { "amenocturne/nefor", name = "core",
-    tag = "v0.1.5", path = "lua/core/" },
-
-  { "amenocturne/nefor", name = "libs",
-    tag = "v0.1.5", path = "lua/libs/" },
-
-  { "amenocturne/nefor", name = "openai-provider",
-    tag = "v0.1.5", path = "plugins/openai-provider/lua/openai-provider/" },
-
-  { "amenocturne/nefor", name = "tool-gate",
-    tag = "v0.1.5", path = "plugins/tool-gate/lua/tool-gate/" },
-
-  -- ... your other plugin specs, including Rust-binary specs with a
-  -- `build = function(plugin) ... end` callback if you need to compile
-  -- binaries from source on the consumer machine.
-})
-
--- After pm.install returns, plugin libs are on package.path so plain
--- `require("openai-provider")` resolves to the upstream plugin lib.
--- Compose your config below as plain Lua.
+pm.install(specs)
+pm.update(specs)
+pm.register(specs)
+pm.load(name)
+pm.require(name)                 -- alias of load
+pm.bin(name [, binary_name])
+pm.sync_checkout(opts)
+pm.update_checkout(opts)
+pm.engine_ref()
 ```
 
-## Notes
+## Managed plugin specs
 
-- `os.execute` is fine for the bootstrap step because it runs once,
-  before `nefor.process.spawn` is reachable through the (not-yet-loaded)
-  pm. Subsequent fetches inside `pm.install` use the Rust-backed
-  synchronous `nefor.process.run({ cmd, args, cwd, env })` binding and do not
-  shell out.
-- The bootstrap path uses `git` directly — same cross-platform constraint
-  the rest of the pm honours (`git` is the only binary the bootstrap
-  invokes, and it's available on every developer machine).
-- The lockfile is authoritative. `pm.install` reproduces its exact commits and
-  does not move a valid local pin or fetch unnecessarily. With no lock entry,
-  the first install resolves the requested ref and records the resulting commit.
-  Use `pm.update(specs)` explicitly to resolve refs again and move pins; restoring
-  an older lockfile rolls the next install back to those commits.
-- Managed bootstrap checkouts likewise validate an exact release tag locally
-  before using the network. Missing or mismatched state fails rather than
-  silently running a different revision.
-- The engine binary must be installed separately — this bootstrap only
-  fetches the _Lua_ side of nefor. Use your platform's package manager
-  for the engine itself (or build from source via `cargo install`).
-- After `nefor-pm` is loaded, use `pm.sync_checkout({...})` for another managed
-  checkout. Pass `lockfile = "/path/to/commit.lock"` to persist and reuse its
-  exact commit; only `pm.update_checkout({...})` moves that pin. The returned
-  record includes `dir`, `commit`, and `head`; `commit` and `head` are the
-  verified checkout `HEAD`, so an installer can build the engine, plugins, and
-  Lua libraries from exactly that directory and identity. A local repository
-  path is a supported `url`, including commits that exist only in its local
-  object database. Once the exact pinned commit is checked out, ordinary sync
-  reuses it without contacting the source. Without a lockfile, `sync_checkout`
-  retains its direct ref-synchronising behavior.
-- Installed immutable generations should register their already-materialized
-  module directories with `pm.register({ { name = "...", dir = "/absolute/..." } })`.
-  Registration only updates the current Lua VM's resolver: it creates no
-  symlinks, lockfiles, checkouts, or other data-root state, and refuses to
-  rebind a name to another directory. Use `pm.install`/`pm.update` for managed
-  mutable checkout state and `dir` overrides only for development.
-- Installed runtimes should use only the managed checkout and copied build
-  outputs, setting `NEFOR_RUNTIME_ROOT` to that immutable checkout. Pointing
-  specs at a mutable source tree with `dir` is an explicit development override
-  (normally selected through `NEFOR_DEV_DIR`), not an installed-channel
-  mechanism.
+```lua
+local pm = require("nefor-pm")
+
+pm.install {
+  {
+    "owner/repository",
+    name = "my-plugin",
+    tag = "v0.4.0",              -- choose only one of tag/branch/commit
+    -- branch = "main",
+    -- commit = "full-or-resolvable-sha",
+    -- url = "/alternate/git/source",
+    path = "plugins/my-plugin/lua/my-plugin/",
+    build = function(plugin)
+      -- Build from plugin.dir and place executables in plugin.bin_dir.
+    end,
+  },
+}
+
+local lib = pm.load("my-plugin")
+local executable = pm.bin("my-plugin", "my-plugin")
+```
+
+`path` uses sparse checkout and flattens the selected subtree into the managed package directory. Build callbacks must populate the package's `bin` directory. They rerun when checkout/pin/spec build metadata requires it; changing only the Lua function body is not detected by the current hash, so explicitly update/rebuild after such a change.
+
+The plugin lock lives at `<data-root>/plugins/nefor-pm.lock.json`. `install` reproduces an existing exact pin and does not move it. `update` resolves again and moves the selected pins. Partial operations preserve unrelated lock entries.
+
+### Source modes
+
+- **Managed:** repository/ref fields create a manager-owned checkout and lock entry.
+- **Development override:** `dir = "/absolute/local/path"` creates a symlink to mutable source, performs no clone, and writes no lock entry. It refuses to replace a non-symlink.
+- **Immutable registration:** `pm.register { { name = "x", dir = "/absolute/materialized/x" } }` changes only the current Lua resolver. It creates no checkout, symlink, or lock and refuses to rebind a name to another directory.
+
+Use `register` for packaged immutable generations, managed install/update for package-manager state, and `dir` only for deliberate development overrides.
+
+`pm.load`/`pm.require` call Lua `require`; they never install. `pm.bin` fails if the expected executable is absent.
+
+## Version-derived refs
+
+`pm.engine_ref()` maps an exact engine semantic version to `v<version>`. Development, nightly, dirty, and described builds map to `main`. An external distribution can override this policy by supplying an explicit ref/pin and owning compatibility.
+
+## Managed source checkouts
+
+Use this API when a distribution needs an exact source generation rather than a flattened plugin package:
+
+```lua
+local checkout = pm.sync_checkout {
+  name = "nefor-runtime",
+  dir = data_root .. "/runtime/nefor",
+  url = "https://github.com/amenocturne/nefor.git",
+  ref = pm.engine_ref().ref,
+  ref_kind = pm.engine_ref().ref_kind,
+  lockfile = data_root .. "/runtime/nefor.commit",
+  sparse = { "lua", "examples/nefor-agent" },
+}
+
+print(checkout.commit)
+```
+
+Options:
+
+- `name`: diagnostic label;
+- `dir`: checkout destination;
+- `url`: Git URL or local repository path;
+- `ref`: branch, tag, or commit (defaults from `engine_ref`);
+- `ref_kind`: `branch`, `tag`, or `commit`;
+- `lockfile`: one-commit text lock;
+- `sparse`: one path or an array of paths.
+
+With a lockfile, `sync_checkout` treats the pinned commit as authoritative and verifies the checkout. `update_checkout` is the operation that resolves the ref again and moves the lock. The returned record includes the requested ref/ref kind and verified `commit`/`head`. Local Git sources and unpublished local commits are supported.
+
+## Runtime bootstrap
+
+The installable agent example demonstrates a complete bootstrap in [`examples/nefor-agent/init.lua`](../../examples/nefor-agent/init.lua): it selects an explicit development or immutable runtime root, establishes `package.path`, and registers materialized module directories. External compositions should own their bootstrap policy and use the APIs above rather than copying version-specific snippets.
+
+## Failure and trust model
+
+Package refs and locks select code that runs inside the engine's Lua process and may build executables. Pin trusted sources. A build callback is arbitrary config code, not a sandbox. Network/Git/build failures are synchronous startup failures rather than silently falling back to another revision.
+
+Implementation and exhaustive edge-case tests live in [`lua/nefor-pm/init.lua`](init.lua) and `engine/tests/nefor_pm_test.rs`.

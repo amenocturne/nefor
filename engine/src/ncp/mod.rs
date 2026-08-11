@@ -10,7 +10,7 @@
 //!   session log, invokes the Lua `step` function, and routes step's
 //!   outbound sends to connection writers. No envelope parsing, no
 //!   system-message dispatch, no replay-on-attach. All NCP protocol
-//!   handling lives in `starter/init.lua`.
+//!   handling lives in `examples/nefor-agent/init.lua`.
 //!
 //! # Submodules
 //!

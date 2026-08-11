@@ -1,4 +1,4 @@
--- starter/lead_role_test.lua — smoke tests for the lead-workflow role
+-- examples/nefor-agent/lead_role_test.lua — smoke tests for the lead-workflow role
 -- loader. Driven from
 -- `crates/nefor/tests/starter_lead_role_test.rs`.
 --

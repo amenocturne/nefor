@@ -22,7 +22,7 @@ fi
 
 plugin_dir="$dist_dir/share/nefor/plugins"
 manifest="$dist_dir/share/nefor/plugins.manifest"
-mkdir -p "$dist_dir/bin" "$plugin_dir" "$dist_dir/share/nefor/starter"
+mkdir -p "$dist_dir/bin" "$plugin_dir" "$dist_dir/share/nefor/examples/nefor-agent"
 cp "$target_bin/nefor" "$dist_dir/bin/nefor"
 if [ ! -x "$target_bin/mag" ]; then
   echo "missing compiler binary: $target_bin/mag" >&2
@@ -45,7 +45,7 @@ if [ ! -s "$manifest" ]; then
   exit 1
 fi
 
-cp -R "$repo_root/starter/." "$dist_dir/share/nefor/starter/"
+cp -R "$repo_root/examples/nefor-agent/." "$dist_dir/share/nefor/examples/nefor-agent/"
 cp "$repo_root/LICENSE" "$repo_root/README.md" "$dist_dir/share/nefor/"
 if [ -f "$repo_root/CHANGELOG.md" ]; then
   cp "$repo_root/CHANGELOG.md" "$dist_dir/share/nefor/"

@@ -220,7 +220,7 @@ async fn run_serve(
 
     if specs.is_empty() {
         tracing::info!(
-            "no plugins registered; exiting. See starter/init.lua for an example config."
+            "no plugins registered; exiting. See examples/nefor-agent/init.lua for an example config."
         );
         drop(host);
         return Ok(());

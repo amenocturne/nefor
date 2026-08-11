@@ -108,7 +108,7 @@ pub trait EngineOps: Send + Sync {
 
     /// Snapshot the names of plugins currently connected to the engine.
     ///
-    /// Used by `starter/ncp.lua` to implement broadcast-minus-sender: NCP
+    /// Used by `examples/nefor-agent/ncp.lua` to implement broadcast-minus-sender: NCP
     /// broadcast excludes the sender, while `nefor.engine.send` broadcast
     /// reaches every plugin. Lua enumerates the set and issues N-1 targeted
     /// sends instead.

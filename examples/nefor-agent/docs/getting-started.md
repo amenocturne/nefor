@@ -83,13 +83,13 @@ to select among enabled providers and models.
 
 ## Next steps
 
-1. Learn the [TUI](tui.md) and its [commands and keys](commands-and-keys.md).
-2. Enable a real model through [Providers](providers.md).
-3. Understand [workflows and tools](workflows-and-tools.md), then how
-   [sessions and context](sessions-and-context.md) persist and compact work.
+1. Learn the [TUI](../../../plugins/nefor-tui/README.md) and its [commands and keys](../chat/slash.lua).
+2. Enable a real model through [Providers](providers-and-tools.md).
+3. Understand [workflows and tools](workflows.md), then how
+   [sessions and context](sessions.md) persist and compact work.
 4. Read [Permissions](permissions.md) before relaxing safe mode.
 
 For setup details, use [Installation](installation.md); for failures, start with
 [Troubleshooting](troubleshooting.md). Read the
-[starter reference](../../starter/README.md) before changing its composition,
-or [Plugin authoring](../plugin-authoring.md) to add a process plugin.
+[starter reference](../README.md) before changing its composition,
+or [Plugin authoring](../../../docs/plugin-authoring.md) to add a process plugin.

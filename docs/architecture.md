@@ -20,13 +20,13 @@ Bash-tool test: a plugin should feel like a self-contained utility you could run
 Lua owns behavior that is composition-specific or bus-aware:
 
 - NCP handshake and default routing (`lua/core/ncp.lua`).
-- Actor spawning and dispatch wiring (`starter/init.lua`, `lua/core/actor.lua`).
+- Actor spawning and dispatch wiring (`examples/nefor-agent/init.lua`, `lua/core/actor.lua`).
 - Session persistence and resume (`lua/libs/sessions`).
 - Approval and tool validation policy (`lua/libs/tool-validator`, `lua/libs/lead-workflow`).
 - Provider/tool adapters and interface reducers.
 - MAG submission/control and workspace management.
 
-Pure reusable mechanisms live under `lua/core` or `lua/libs`; starter opinions and concrete wiring live under `starter`.
+Pure reusable mechanisms live under `lua/core` or `lua/libs`; starter opinions and concrete wiring live under `examples/nefor-agent`.
 
 ## Control plane
 

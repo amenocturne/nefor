@@ -156,7 +156,7 @@ const TOOL_RESULT_KIND: &str = "tool.result";
 const BASH_STREAM_KIND: &str = "tool.stream";
 
 /// Fallback tool-gate bus name when the spawn config passes no `--tool-gate`.
-/// The gate's name is composition-owned (starter/init.lua names the gate when
+/// The gate's name is composition-owned (examples/nefor-agent/init.lua names the gate when
 /// spawning it and threads the same name here); this default only keeps a bare
 /// `mag-plugin` spawn functional against the shipped starter composition.
 const DEFAULT_GATE_TARGET: &str = "tool-gate";
@@ -1934,7 +1934,8 @@ mod tests {
             "#,
         )
         .expect("program");
-        let module_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib");
+        let module_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/nefor-agent/mag/lib");
         let program = nefor_mag::load_with_inputs_and_module_roots(
             &root,
             "main.mag",

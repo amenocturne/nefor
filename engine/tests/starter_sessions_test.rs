@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {

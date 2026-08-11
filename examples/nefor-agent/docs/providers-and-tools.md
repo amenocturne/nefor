@@ -10,7 +10,7 @@ The starter supports three provider descriptor kinds:
 - `openai` for an OpenAI-compatible endpoint;
 - `chatgpt` for the bundled ChatGPT provider.
 
-Configure those through [`config.active.providers`](configuration.md#starter-settings). A new provider kind requires composition code. Prefer `libs.compositors.provider.spawn_spec` when the provider can satisfy the canonical translator interface; see [Configuration and composition](configuration.md#providers).
+Configure those through [`config.active.providers`](customization.md#starter-settings). A new provider kind requires composition code. Prefer `libs.compositors.provider.spawn_spec` when the provider can satisfy the canonical translator interface; see [Configuration and composition](customization.md#providers).
 
 A provider subprocess speaks NCP, but provider request/history/stream types are a higher-level contract. `generic-provider` owns canonical type declarations and concrete providers translate to them. Do not treat those event kinds as NCP itself.
 
@@ -85,12 +85,12 @@ Policy precedence is:
 
 Malformed or excluding capability data fails closed even in `yolo`. A missing allowlist retains legacy unrestricted behavior. `auto_approve_tools` is unconditional after capability validation, so use it only for schemas whose complete input space is safe. `bash_fastpaths` are trusted policy predicates and run before `da`.
 
-`edit_file` is available only to write-capable agents. `write_file` additionally requires an active approved lead-workflow plan except in `yolo`. Non-read-only `bash` uses `da`; a missing classifier is an installation error, not a prompt fallback. See the user-facing [permissions guide](../user/permissions.md).
+`edit_file` is available only to write-capable agents. `write_file` additionally requires an active approved lead-workflow plan except in `yolo`. Non-read-only `bash` uses `da`; a missing classifier is an installation error, not a prompt fallback. See the user-facing [permissions guide](permissions.md).
 
 The starter currently derives `read_only_tools` from `mag/lib/nefor/toolsets.json`. Custom `auto_approve_tools` and fast paths are source-exposed composition seams, but have less focused regression coverage than the base mode behavior.
 
 ## Tool plugins
 
-For tools that need a separate process, author an NCP plugin and advertise to `tool-gate`. The gate forwards invocations to the advertising source and correlates `tool.result`. Use [Plugin authoring](../plugin-authoring.md) for transport and lifecycle, and inspect the bundled `basic-tools` and `git-worktree` plugins for current higher-level event shapes.
+For tools that need a separate process, author an NCP plugin and advertise to `tool-gate`. The gate forwards invocations to the advertising source and correlates `tool.result`. Use [Plugin authoring](../../../docs/plugin-authoring.md) for transport and lifecycle, and inspect the bundled `basic-tools` and `git-worktree` plugins for current higher-level event shapes.
 
 Tool advertisement, invocation, and approval are ecosystem protocols layered over NCP. Replacing `tool-gate` means owning their routing, provenance, permission, replay, and instruction-file integration.

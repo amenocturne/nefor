@@ -31,4 +31,4 @@ if grep -qx 'mag' "$expected"; then
 fi
 test -x "$dist_dir/bin/nefor"
 test -x "$dist_dir/bin/mag"
-test -f "$dist_dir/share/nefor/starter/init.lua"
+test -f "$dist_dir/share/nefor/examples/nefor-agent/init.lua"

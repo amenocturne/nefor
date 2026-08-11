@@ -1,4 +1,4 @@
-//! Unit tests for `starter/agentic_cli.lua`'s argv parser, driven from
+//! Unit tests for `examples/nefor-agent/agentic_cli.lua`'s argv parser, driven from
 //! Rust.
 //!
 //! The full module is heavy (it depends on agentic_workflow, which
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {

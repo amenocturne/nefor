@@ -291,7 +291,7 @@ jobs:
                   '\n  def install\n'
                   '    bin.install "bin/nefor"\n'
                   '    (share/"nefor/plugins").install Dir["share/nefor/plugins/*"]\n'
-                  '    (share/"nefor/starter").install Dir["share/nefor/starter/*"]\n'
+                  '    (share/"nefor/examples/nefor-agent").install Dir["share/nefor/examples/nefor-agent/*"]\n'
                   '    share.install "share/nefor/LICENSE", "share/nefor/README.md"\n'
                   '    share.install "share/nefor/CHANGELOG.md" if File.exist?("share/nefor/CHANGELOG.md")\n'
                   '  end\n'
@@ -310,7 +310,7 @@ jobs:
                   '\n'
                   '      To scaffold a config for this version:\n'
                   '        mkdir -p ~/.config/nefor\n'
-                  '        cp -R #{share}/nefor/starter/. ~/.config/nefor/\n'
+                  '        cp -R #{share}/nefor/examples/nefor-agent/. ~/.config/nefor/\n'
                   '    EOS\n'
                   '  end\n'
               ),

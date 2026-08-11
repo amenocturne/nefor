@@ -1,6 +1,6 @@
 //! Lead turn-program integration tests against the REAL shipped program
-//! (`starter/agentic-loop/lead-turn.mag`), driven the way the turn spawner
-//! (starter/agentic-loop) drives it:
+//! (`examples/nefor-agent/agentic-loop/lead-turn.mag`), driven the way the turn spawner
+//! (examples/nefor-agent/agentic-loop) drives it:
 //!
 //!   * `mag.load` the shipped program from the starter tree, take the
 //!     compiled artifact off `mag.loaded`;
@@ -39,7 +39,7 @@ const CONVERSATION_ID: &str = "lead-conversation";
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The turn spawner appends a `## MAG workspace` block to the system
-/// overlay (starter/agentic-loop): the session workspace dir plus the
+/// overlay (examples/nefor-agent/agentic-loop): the session workspace dir plus the
 /// inlined canonical patterns document. Here we build a representative overlay the
 /// same way and assert it is recorded once as canonical conversation facts.
 const LEAD_SYSTEM: &str = "you are the lead\n\n\
@@ -52,7 +52,7 @@ fn binary_path() -> PathBuf {
 }
 
 fn starter_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/nefor-agent")
 }
 
 fn kernel_path() -> PathBuf {

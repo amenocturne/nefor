@@ -1,14 +1,14 @@
-//! Unit tests for `starter/lead-workflow/init.lua`. Mirrors the harness
+//! Unit tests for `examples/nefor-agent/lead-workflow/init.lua`. Mirrors the harness
 //! pattern in `starter_agentic_workflow_test.rs` /
 //! `starter_agent_reasoner_test.rs`: install a stub `nefor.*` surface,
-//! then load the Lua test driver at `starter/lead_workflow_test.lua`.
+//! then load the Lua test driver at `examples/nefor-agent/lead_workflow_test.lua`.
 
 use std::path::PathBuf;
 
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {

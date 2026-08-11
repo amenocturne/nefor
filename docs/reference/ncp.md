@@ -1,6 +1,6 @@
 # Nefor Composition Protocol reference
 
-NCP is the current process/composition protocol implemented by the engine transport and [`lua/core/ncp.lua`](../../lua/core/ncp.lua). It is version-specific behavior, not yet a frozen external standard. Runtime code and focused tests are authoritative; [`docs/protocol.md`](../protocol.md) remains the detailed live behavior document.
+NCP is a convention implemented by configs, plugins, and the shipped [`lua/core/ncp.lua`](../../lua/core/ncp.lua). The engine is a pure string bus and is unaware of NCP envelopes or semantics. It is version-specific behavior, not yet a frozen external standard. Runtime code and focused tests are authoritative; [`docs/protocol.md`](../protocol.md) remains the detailed live behavior document.
 
 NCP connects subprocesses. Lua actors and MAG actors are different in-process abstractions and do not perform the NCP handshake.
 
@@ -91,18 +91,7 @@ ncp.spawn {
 
 Custom mutating callbacks receive isolated decoded values by default. `to_plugin_readonly = true` is an explicit no-mutation promise that allows sharing. Treat broker invocation helpers, `dispatch`, reset/test fields, and underscored actor fields as internal APIs.
 
-## Ecosystem conventions
-
-The following are useful conventions, not protocol-recognized primitives:
-
-- plugin-prefixed event `kind` values;
-- `<name>.hello`, `.goodbye`, `.heartbeat`, and `.manifest` events;
-- request `request_id` and response `in_reply_to` fields;
-- advisory `body.to`.
-
-`body.to` is only data. Actual delivery may already have been narrowed by target, self-skip, peer-prefix routing, or wrappers.
-
-Provider, tool, approval, session, and MAG message shapes are layered protocols. Keep them out of an independent NCP implementation unless that plugin participates in the corresponding subsystem.
+Higher-level naming and request/response conventions belong to the [plugin authoring guide](../plugin-authoring.md).
 
 ## Rust helpers
 

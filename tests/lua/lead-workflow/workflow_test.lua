@@ -1,4 +1,4 @@
--- starter/lead_workflow_test.lua — unit tests for the lead-workflow
+-- examples/nefor-agent/lead_workflow_test.lua — unit tests for the lead-workflow
 -- actor. Driven from
 -- `crates/nefor/tests/starter_lead_workflow_test.rs`. Mirrors the
 -- harness pattern in `starter_agentic_workflow_test.rs`.

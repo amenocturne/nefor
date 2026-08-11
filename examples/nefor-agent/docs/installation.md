@@ -71,7 +71,7 @@ Scaffold it explicitly:
 
 ```sh
 mkdir -p ~/.config/nefor
-cp -R "$(brew --prefix)/share/nefor/starter/." ~/.config/nefor/
+cp -R "$(brew --prefix)/share/nefor/examples/nefor-agent/." ~/.config/nefor/
 ```
 
 Do not copy over an edited config unless replacement is intentional.
@@ -120,7 +120,7 @@ resolved data directory.
   `just install-nefor nightly` from a checkout containing the installer.
 
 Starter updates are intentionally separate. Compare your config with the new
-checkout's `starter/`, or use `just install-starter force` only when deleting
+checkout's `examples/nefor-agent/`, or use `just install-example force` only when deleting
 and recopying the whole config is acceptable.
 
 Homebrew installations can be removed with `brew uninstall nefor`. The source

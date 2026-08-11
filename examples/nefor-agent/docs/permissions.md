@@ -1,7 +1,5 @@
 # Permissions
 
-> Starter behavior, **Unreleased after v0.4.0**. Current code and tests are authoritative.
-
 Permission mode and approval kind are separate. The starter has **three
 user-facing approval systems**:
 
@@ -121,5 +119,5 @@ invocation/result state; it is not a transaction log.
 
 Mode and verdict authority should not be inferred across process restarts,
 session switches, or unsupported cross-minor resumes. See
-[sessions and context](sessions-and-context.md) and
-[workflow termination](workflows-and-tools.md#sidebar-and-run-inspection).
+[sessions and context](sessions.md) and
+[workflow termination](workflows.md#sidebar-and-run-inspection).

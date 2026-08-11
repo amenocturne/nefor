@@ -1,7 +1,7 @@
 -- plugins/mag/lua/mag-kernel/factories/run-tool.lua — the tool-invocation boundary.
 --
 -- The contract-declared replacement for the shape-sniffing `tool-executor`
--- handler (starter/reasoners/init.lua): given the model's tool calls, invoke
+-- handler (examples/nefor-agent/reasoners/init.lua): given the model's tool calls, invoke
 -- each through the gated tool surface and hand the aggregated results to the
 -- next node. Nothing here inspects an input's runtime shape to decide what it
 -- received — the declared input contract does that (docs/ir.md, Firing).

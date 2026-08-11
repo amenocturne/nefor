@@ -11,7 +11,7 @@ The engine resolved a config directory that does not contain `init.lua`.
    somewhere unexpected.
 2. For a Homebrew install, scaffold the starter as shown in
    [Installation](installation.md#homebrew).
-3. For a checkout install, rerun `just install-starter safe`. It preserves an
+3. For a checkout install, rerun `just install-example safe`. It preserves an
    existing config directory; if that directory is incomplete, inspect it
    before choosing the destructive `force` mode.
 
@@ -58,7 +58,7 @@ variables override it.
 1. Inspect `~/.config/nefor/config/init.lua` (or your resolved config path).
 2. Check `NEFOR_DEFAULT_PROVIDER`, `NEFOR_DEFAULT_MODEL`,
    `NEFOR_ENABLE_CHATGPT`, and `NEFOR_ENABLE_OLLAMA`.
-3. Compare the config with the `starter/` directory from the same Nefor
+3. Compare the config with the `examples/nefor-agent/` directory from the same Nefor
    version. Do not force-replace it until you have saved local changes.
 
 ## The TUI starts, but the mock response is not useful
@@ -112,8 +112,8 @@ directory.
 
 Runtime and config updates are intentionally independent. `brew upgrade` and
 `just install-nefor ...` update binaries but preserve `~/.config/nefor`.
-Compare your config with the new release's `starter/`. The only built-in full
-replacement is `just install-starter force`, which deletes the existing config
+Compare your config with the new release's `examples/nefor-agent/`. The only built-in full
+replacement is `just install-example force`, which deletes the existing config
 before copying the new starter.
 
 ## A session does not resume across versions
@@ -122,7 +122,7 @@ Before the project has public compatibility guarantees, compatibility is only
 promised within one minor line: `0.y.x` remains compatible with `0.y.0`.
 Cross-minor config, wire-format, and old-session compatibility is not promised.
 Keep the originating distribution available when an old session matters; see
-[session provenance](../session-provenance.md).
+[session provenance](../../../docs/session-provenance.md).
 
 ## Nix or Home Manager behaves differently
 

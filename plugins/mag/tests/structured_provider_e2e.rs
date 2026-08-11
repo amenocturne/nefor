@@ -97,7 +97,7 @@ fn kernel_path() -> PathBuf {
 }
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 async fn spawn_mag(data_dir: &Path) -> Child {

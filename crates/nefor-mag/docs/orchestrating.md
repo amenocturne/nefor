@@ -1,10 +1,8 @@
 # Orchestrating MAG
 
-> **Unreleased after v0.4.0.**
-
 MAG is Nefor's typed workflow language. Use it when a task needs several agents or commands, parallel work, an approval boundary, review, or a result-dependent stage. For one bounded shell operation, use `mag-eval` instead.
 
-This guide describes the lead-facing workflow. See [Authoring reference](authoring-reference.md) for the language and libraries, [Patterns](patterns.md) for graph shapes, and [Errors](errors.md) for diagnosis.
+This guide describes the lead-facing workflow. See [Authoring reference](language.md) for the language and libraries, [Patterns](../../../plugins/mag/docs/patterns.md) for graph shapes, and [Errors](errors.md) for diagnosis.
 
 ## Choose the smallest surface
 

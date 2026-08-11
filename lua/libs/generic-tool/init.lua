@@ -1,4 +1,4 @@
--- starter/lib/contracts/tool.lua — tool wire-protocol contract.
+-- examples/nefor-agent/lib/contracts/tool.lua — tool wire-protocol contract.
 --
 -- Owns the canonical type tags every tool-shaped reasoner ecosystem
 -- agrees on. Replaces the `generic-tool` Rust binary's role as a

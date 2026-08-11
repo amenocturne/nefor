@@ -1,6 +1,6 @@
 //! Unit + wrapper-integration tests for the tool-output dump-to-file
-//! layer (`starter/lib/tool_output_dump.lua`) and its hook in
-//! `starter/tool-gate/init.lua`.
+//! layer (`examples/nefor-agent/lib/tool_output_dump.lua`) and its hook in
+//! `examples/nefor-agent/tool-gate/init.lua`.
 //!
 //! Spec context: lead-workflow-spec §5 — when a tool call returns
 //! output past a threshold (large `read_file`, big `grep`, deep
@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {
@@ -348,7 +348,7 @@ fn table_output_is_json_encoded_for_disk_write() {
 
 #[test]
 fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
-    // The wrapper hook in starter/tool-gate/init.lua: when an inbound
+    // The wrapper hook in examples/nefor-agent/tool-gate/init.lua: when an inbound
     // `tool.result` envelope carries an `output` past the budget, the
     // wrapper writes the full payload to disk and replaces
     // `body.output` with the summary string before republishing. The
@@ -871,7 +871,7 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
 }
 
 // ----------------------------------------------------------------
-// starter/read-only-tools.lua — canonical inventory
+// examples/nefor-agent/read-only-tools.lua — canonical inventory
 // ----------------------------------------------------------------
 
 #[test]
@@ -1038,7 +1038,7 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
           "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
-        -- starter/tools.lua reaches the plugin lib via
+        -- examples/nefor-agent/tools.lua reaches the plugin lib via
         -- `require("tool-gate")`. The plugin's `lua/` parent is on
         -- package.path above so that resolves to
         -- plugins/tool-gate/lua/tool-gate/init.lua.

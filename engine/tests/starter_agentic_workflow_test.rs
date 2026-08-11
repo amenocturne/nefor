@@ -1,4 +1,4 @@
-//! Unit tests for `starter/agentic_workflow.lua`'s for_chat adapter,
+//! Unit tests for `examples/nefor-agent/agentic_workflow.lua`'s for_chat adapter,
 //! driven from Rust. Mirrors `starter_ncp_test.rs`'s harness pattern.
 //!
 //! The module under test depends on the same `nefor.*` surface as the
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
-    repo_root().join("starter")
+    repo_root().join("examples/nefor-agent")
 }
 
 fn lua_dir() -> PathBuf {

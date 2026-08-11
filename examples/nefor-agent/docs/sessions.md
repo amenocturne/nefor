@@ -1,7 +1,5 @@
 # Sessions and context
 
-> Starter behavior, **Unreleased after v0.4.0**. Current code and tests are authoritative.
-
 ## What a session is
 
 The starter opens a session at startup. It delays creating a JSONL file until the first real user submission, and empty startup-only sessions are omitted/pruned. The resolved session root is:
@@ -66,4 +64,4 @@ Therefore:
 - the opaque artifact is not promised to migrate between providers/models or minor versions;
 - a failed compaction leaves the full transcript as the usable basis rather than establishing a new compacted context.
 
-See [commands and keys](commands-and-keys.md) for `/compact` and `/resume`, and [permissions](permissions.md) for why approvals do not survive session boundaries.
+See [commands and keys](../chat/slash.lua) for `/compact` and `/resume`, and [permissions](permissions.md) for why approvals do not survive session boundaries.

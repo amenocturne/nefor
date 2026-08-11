@@ -23,7 +23,7 @@ nefor has four practical layers:
 
 1. **Engine / bus** — least opinion. Spawns processes, bridges stdio, hosts Lua, and routes raw lines through the Lua dispatch hook. It owns no workflows and no sessions.
 2. **Plugins** — isolated capability processes. Providers, tools, interfaces, registries, and MAG run outside the engine and communicate through lines.
-3. **Lua composition and libraries** — bus-aware policy and wiring. NCP semantics, sessions, approval policy, provider/tool adaptation, actor spawning, UI reducers, and starter defaults live here.
+3. **Lua composition and libraries** — bus-aware policy and wiring. NCP semantics, sessions, approval policy, provider/tool adaptation, actor spawning, UI reducers, and example defaults live here.
 4. **MAG programs/kernel** — graph execution used by the starter lead workflow. MAG is a shipped capability, not the only place workflow logic exists.
 
 Every file gets one layer assignment. Mismatch is the most common architectural bug.

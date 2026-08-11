@@ -1,4 +1,4 @@
--- starter/actor.lua — Lua-side actor runtime.
+-- examples/nefor-agent/actor.lua — Lua-side actor runtime.
 --
 -- ## What this is
 --

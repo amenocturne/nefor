@@ -1,6 +1,6 @@
 # Configuration and composition
 
-Nefor has no engine-owned configuration schema. A configuration is a Lua program whose `init.lua` composes subprocess plugins and in-process actors. The shipped [`starter/`](../../starter/) is a complete distribution, not a set of defaults the engine secretly applies.
+Nefor has no engine-owned configuration schema. A configuration is a Lua program whose `init.lua` composes subprocess plugins and in-process actors. The shipped [`examples/nefor-agent/`](../) is a complete distribution, not a set of defaults the engine secretly applies.
 
 Use these extension levels in order:
 
@@ -19,7 +19,7 @@ nefor --config /path/to/config
 NEFOR_CONFIG_DIR=/path/to/config nefor
 ```
 
-`--config` wins over `NEFOR_CONFIG_DIR`, which wins over the XDG default. See the [CLI reference](../reference/cli.md).
+`--config` wins over `NEFOR_CONFIG_DIR`, which wins over the XDG default. See the [CLI reference](../../../docs/reference/cli.md).
 
 A config-local module takes precedence over shared runtime Lua because the starter adds its own directory to `package.path` first. This is useful for config-owned modules, but the canonical chat mechanism deliberately loads fixed shared modules; use the [chat extension API](chat-extensions.md) rather than shadowing them.
 
@@ -75,7 +75,7 @@ return M
 
 ## Composition root
 
-[`starter/init.lua`](../../starter/init.lua) is the executable example. Its load order is significant:
+[`examples/nefor-agent/init.lua`](../init.lua) is the executable example. Its load order is significant:
 
 1. resolve a mutable development tree, immutable runtime generation, or managed checkout;
 2. register module roots with `nefor-pm` and establish `package.path`;
@@ -115,7 +115,7 @@ local spec = provider.spawn_spec("local", {
 })
 ```
 
-The provider compositor is intentionally coupled to Nefor's canonical provider/conversation contract. The translator must implement the full interface consumed by [`provider.lua`](../../lua/libs/compositors/provider.lua); `agentic_loop` and `conversations` are required, replay is handled at the boundary, and conversation history remains manager-owned. Starter provider descriptors do not expose custom hooks or translator modules, so using those seams requires editing composition.
+The provider compositor is intentionally coupled to Nefor's canonical provider/conversation contract. The translator must implement the full interface consumed by [`provider.lua`](../../../lua/libs/compositors/provider.lua); `agentic_loop` and `conversations` are required, replay is handled at the boundary, and conversation history remains manager-owned. Starter provider descriptors do not expose custom hooks or translator modules, so using those seams requires editing composition.
 
 ### Tools and chat bridge
 
@@ -135,4 +135,4 @@ These are convenience builders for the shipped distribution, not generic adapter
 
 Do not build external configs against underscored actor fields, test reset hooks, broker dispatch helpers, or MAG kernel factories/registry tables. In particular, the MAG factory registry, run context, inventory, and router are implementation APIs. Author MAG programs through the language and artifact contracts documented by the MAG plugin; do not inject Lua factories into its embedded kernel.
 
-For the process boundary, use [NCP](../reference/ncp.md). For distribution replacement, see [Distribution](distribution.md).
+For the process boundary, use [NCP](../../../docs/reference/ncp.md). For distribution replacement, see [Distribution](distribution.md).

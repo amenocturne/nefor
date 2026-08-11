@@ -1,6 +1,6 @@
 # Chat extensions
 
-A chat extension adds slash commands and small presentation hooks without forking the starter's reducer or view. Keep [`starter/chat/init.lua`](../../starter/chat/init.lua) as the chat composition and set `config.active.chat_extension` to either a module name or an extension table.
+A chat extension adds slash commands and small presentation hooks without forking the starter's reducer or view. Keep [`examples/nefor-agent/chat/init.lua`](../chat/init.lua) as the chat composition and set `config.active.chat_extension` to either a module name or an extension table.
 
 ```lua
 -- config/init.lua
@@ -83,4 +83,4 @@ Only argument completions merge. The canonical label, aliases, and handler stay 
 
 Extensions do not own provider events, conversation projection, queue reconciliation, sessions, or the canonical reducer. If the desired behavior changes those responsibilities, it is a distribution-level chat replacement rather than an extension.
 
-Canonical implementation: [`lua/libs/chat/extensions.lua`](../../lua/libs/chat/extensions.lua). Executable extension and shadowing coverage lives in `plugins/nefor-tui/tests/chat_test.rs`.
+Canonical implementation: [`lua/libs/chat/extensions.lua`](../../../lua/libs/chat/extensions.lua). Executable extension and shadowing coverage lives in `plugins/nefor-tui/tests/chat_test.rs`.

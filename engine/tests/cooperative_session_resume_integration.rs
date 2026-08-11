@@ -197,7 +197,7 @@ fn engine_init_source(root: &Path) -> String {
 }
 
 fn tui_source(root: &Path, data_dir: &Path) -> String {
-    let source = std::fs::read_to_string(root.join("starter/chat/init.lua"))
+    let source = std::fs::read_to_string(root.join("examples/nefor-agent/chat/init.lua"))
         .expect("read starter chat composition");
     let overrides = format!(
         r#"{{
@@ -210,9 +210,9 @@ fn tui_source(root: &Path, data_dir: &Path) -> String {
           NEFOR_DEFAULT_PROVIDER = "mock-plugin",
           NEFOR_DEFAULT_MODEL = "mock-model",
         }}"#,
-        lua_string(&root.join("starter")),
-        lua_string(&root.join("starter")),
-        lua_string(&root.join("starter/chat")),
+        lua_string(&root.join("examples/nefor-agent")),
+        lua_string(&root.join("examples/nefor-agent")),
+        lua_string(&root.join("examples/nefor-agent/chat")),
         lua_string(&root.join("plugins/nefor-tui/lua")),
         lua_string(&root.join("lua")),
         lua_string(data_dir),
@@ -319,7 +319,7 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
 
     let mut tui = TuiEngine::new(80, 24).expect("create real TUI engine");
     tui.load_scenario(&tui_source(&root, tui_data_dir.path()))
-        .expect("load starter/chat/init.lua");
+        .expect("load examples/nefor-agent/chat/init.lua");
     let _ = tui.render_if_dirty().expect("render initial frame");
 
     send_line(

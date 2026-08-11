@@ -1,4 +1,4 @@
--- @path preprocessor. Inlines file references like `@starter/chat.lua`
+-- @path preprocessor. Inlines file references like `@examples/nefor-agent/chat.lua`
 -- into the user's submitted text BEFORE it reaches the provider. The
 -- orchestrator's first turn sees the file contents already inlined;
 -- large files truncate with a marker pointing at the existing

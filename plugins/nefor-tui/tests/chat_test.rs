@@ -1,6 +1,6 @@
 //! Phase-6 integration test for the chat surface as a Lua composition.
 //!
-//! Loads `starter/chat.lua` into the in-process engine and verifies the
+//! Loads `examples/nefor-agent/chat.lua` into the in-process engine and verifies the
 //! must-have wire path: a conversation-manager projection from a peer lands in the
 //! transcript, an `input.submit` produces a `chat.input.submit` egress
 //! envelope, and `/quit` exits.
@@ -67,14 +67,17 @@ fn chat_lua_source() -> String {
     // hermetic: NEFOR_STARTER_CONFIG_DIR beats a NEFOR_CONFIG_DIR /
     // NEFOR_DEV_DIR exported in the developer's shell (which would
     // leak the real installed config in), and NEFOR_DEFAULT_* beat
-    // starter/config's developer-facing chatgpt/gpt-5.5 defaults.
+    // examples/nefor-agent/config's developer-facing chatgpt/gpt-5.5 defaults.
     // Every initial-statusline assertion keys on these values.
     // Unconditional set_var (unlike the only-if-unset pins below):
     // an inherited value IS the leak being defended against. Once so
     // parallel test threads don't race the process-global env.
     static PIN_CONFIG_ENV: OnceLock<()> = OnceLock::new();
     PIN_CONFIG_ENV.get_or_init(|| {
-        std::env::set_var("NEFOR_STARTER_CONFIG_DIR", repo_root.join("starter"));
+        std::env::set_var(
+            "NEFOR_STARTER_CONFIG_DIR",
+            repo_root.join("examples/nefor-agent"),
+        );
         std::env::set_var("NEFOR_DEFAULT_PROVIDER", "mock-plugin");
         std::env::set_var("NEFOR_DEFAULT_MODEL", "mock-model");
     });
@@ -91,11 +94,14 @@ fn chat_lua_source() -> String {
     // dir lives. Same rationale as NEFOR_TUI_LUA_DIR above — tests
     // load chat.lua directly into the engine VM with no NEFOR_CONFIG_DIR
     // (which is how the binary normally seeds this path).
-    let chat_subdir = repo_root.join("starter").join("chat");
+    let chat_subdir = repo_root.join("examples/nefor-agent").join("chat");
     if std::env::var_os("NEFOR_STARTER_CHAT_DIR").is_none() {
         std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
     }
-    let chat_path = repo_root.join("starter").join("chat").join("init.lua");
+    let chat_path = repo_root
+        .join("examples/nefor-agent")
+        .join("chat")
+        .join("init.lua");
     std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
@@ -106,7 +112,7 @@ fn canonical_chat_lua_source_for_config(config_dir: &std::path::Path) -> String 
         .and_then(|path| path.parent())
         .expect("repo root")
         .to_path_buf();
-    let source = std::fs::read_to_string(repo_root.join("starter/chat/init.lua"))
+    let source = std::fs::read_to_string(repo_root.join("examples/nefor-agent/chat/init.lua"))
         .expect("read canonical chat entry");
     format!(
         r#"
@@ -131,7 +137,10 @@ fn canonical_chat_lua_source_for_config(config_dir: &std::path::Path) -> String 
         assert(config_ok, tostring(config_error))
         "#,
         config = config_dir.display().to_string(),
-        chat = repo_root.join("starter/chat").display().to_string(),
+        chat = repo_root
+            .join("examples/nefor-agent/chat")
+            .display()
+            .to_string(),
         repo = repo_root.display().to_string(),
         tui = repo_root
             .join("plugins/nefor-tui/lua")
@@ -570,7 +579,7 @@ fn input_field_has_no_default_placeholder() {
     let src = chat_lua_source();
     assert!(
         !src.contains("placeholder ="),
-        "starter/chat.lua should not set a placeholder on the input"
+        "examples/nefor-agent/chat.lua should not set a placeholder on the input"
     );
 
     let mut engine = Engine::new(80, 24).expect("engine");
@@ -4096,7 +4105,7 @@ fn terminal_run_and_session_cleanup_retract_mag_approvals() {
 #[test]
 fn tool_permission_request_opens_popup_with_approve_deny() {
     // Wire-shape contract: the event the popup listens for is
-    // `chat.tool.popup_request` — emitted by starter/tool-validator
+    // `chat.tool.popup_request` — emitted by examples/nefor-agent/tool-validator
     // after it has chosen NOT to auto-approve or auto-deny. tool-gate's
     // `chat.tool.permission_request` goes to the validator; only the
     // validator's popup_request reaches the chat surface.

@@ -26,7 +26,7 @@
 -- dir holding `init.lua` — NOT from this file's own location. So the loader
 -- runs unchanged from the shared lua tree while every config keeps its own
 -- persona prompt. Downstream configs `require("libs.lead-workflow.role")`;
--- the starter keeps a re-export shim only because starter/init.lua still
+-- the starter keeps a re-export shim only because examples/nefor-agent/init.lua still
 -- loads `libs.lead-workflow.role` directly.
 
 local M = {}

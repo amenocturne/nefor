@@ -10,7 +10,7 @@ description = "NCP v0.1 plugin: MAG actor-kernel runtime. Hosts a Lua VM that lo
 # Binary is `mag-plugin`, not `mag`: the `nefor-mag` crate already owns a
 # `mag` binary (the compiler CLI), so the plugin gets a distinct name to
 # avoid a workspace output-filename collision. Bus identity stays `mag`
-# (assigned in starter/init.lua).
+# (assigned in examples/nefor-agent/init.lua).
 [[bin]]
 name = "mag-plugin"
 path = "src/main.rs"

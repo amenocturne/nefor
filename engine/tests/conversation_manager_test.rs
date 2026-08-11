@@ -94,7 +94,8 @@ fn conversation_manager_runtime_contract() {
         .exec()
         .unwrap_or_else(|error| panic!("runtime_test.lua failed:\n{error}"));
 
-    let init = std::fs::read_to_string(root.join("starter/init.lua")).expect("read starter init");
+    let init = std::fs::read_to_string(root.join("examples/nefor-agent/init.lua"))
+        .expect("read starter init");
     let sessions_spawn = init
         .find("actor.spawn(sessions)")
         .expect("sessions actor spawn");

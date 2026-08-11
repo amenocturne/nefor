@@ -331,7 +331,7 @@ impl LuaHost {
             self.invoke_from_plugin = Some(self.lua.create_registry_value(f)?);
         }
         // Optional: cache `invoke_from_plugin_batch` for the broker's
-        // batched dispatch path. Production `starter/ncp.lua` exposes it;
+        // batched dispatch path. Production `examples/nefor-agent/ncp.lua` exposes it;
         // if missing, the broker falls back to N per-payload calls on
         // `invoke_from_plugin`.
         if let Ok(mlua::Value::Function(f)) = globals.get::<mlua::Value>("invoke_from_plugin_batch")

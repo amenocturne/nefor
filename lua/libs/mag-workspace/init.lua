@@ -9,7 +9,7 @@
 --
 -- Compilation itself lives in the mag plugin: the lead emits `mag.load`
 -- and reads the modification off the `mag.loaded` reply
--- (starter/lead-workflow/init.lua). The `mag` CLI binary remains a dev
+-- (examples/nefor-agent/lead-workflow/init.lua). The `mag` CLI binary remains a dev
 -- tool for humans; nothing here shells out to it.
 
 local M = {}

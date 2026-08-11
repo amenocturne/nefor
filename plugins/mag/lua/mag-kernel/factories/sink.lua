@@ -20,7 +20,7 @@
 -- (union) — the fixture's `code-writer.llm -> sink` edge, the shell chain's
 -- implicit terminal edge (`bash -> sink`, docs/lowering.md "The program
 -- sink"), and the gate template's approval exit (an approval-terminated
--- program ends in `human.Approved` — starter/mag/lib/templates.mag). No
+-- program ends in `human.Approved` — examples/nefor-agent/mag/lib/templates.mag). No
 -- signal handlers: the sink persists synchronously on activation, holding no
 -- pending work to drain or abort.
 

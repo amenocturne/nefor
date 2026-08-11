@@ -1,4 +1,4 @@
--- starter/agentic_cli_test.lua — unit tests for agentic_cli's argv parser.
+-- examples/nefor-agent/agentic_cli_test.lua — unit tests for agentic_cli's argv parser.
 --
 -- Loaded by `crates/nefor/tests/starter_agentic_cli_test.rs`. The Rust
 -- harness installs a stub `nefor` surface (json + bus.on_event +

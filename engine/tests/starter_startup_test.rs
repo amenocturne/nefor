@@ -24,7 +24,7 @@ fn run_lua_test(lua: &Lua, path: &std::path::Path) {
 fn starter_startup_parser_and_mode_application() {
     let lua = Lua::new();
     let root = repo_root();
-    let starter = root.join("starter").display().to_string();
+    let starter = root.join("examples/nefor-agent").display().to_string();
     let lua_root = root.join("lua").display().to_string();
     let script = format!(
         r#"package.path = table.concat({{
@@ -37,13 +37,14 @@ fn starter_startup_parser_and_mode_application() {
     );
     lua.load(&script).exec().expect("set package.path");
 
-    run_lua_test(&lua, &root.join("tests/lua/starter/startup_test.lua"));
+    run_lua_test(&lua, &root.join("tests/lua/nefor-agent/startup_test.lua"));
     run_lua_test(
         &lua,
-        &root.join("tests/lua/starter/startup_readiness_test.lua"),
+        &root.join("tests/lua/nefor-agent/startup_readiness_test.lua"),
     );
 
-    let init = std::fs::read_to_string(root.join("starter/init.lua")).expect("read starter init");
+    let init = std::fs::read_to_string(root.join("examples/nefor-agent/init.lua"))
+        .expect("read starter init");
     let gate = init
         .find(r#"actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))"#)
         .expect("tool gate registration");

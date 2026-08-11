@@ -75,7 +75,7 @@ pub enum SideEffect {
     /// it as a `PluginOutgoing::event(body)` and writes it to stdout.
     /// `target_hint` is documentation-only at the plugin layer — actual
     /// per-peer delivery is the engine's broker / Lua-side starter
-    /// transforms job (see `starter/ncp.lua`'s prefix-targeting).
+    /// transforms job (see `examples/nefor-agent/ncp.lua`'s prefix-targeting).
     Emit {
         target_hint: Option<String>,
         body: JsonMap<String, JsonValue>,

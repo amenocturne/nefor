@@ -172,3 +172,14 @@ an explicit module search path with `load_with_inputs_and_module_roots`; module
 identity remains relative to the matched root (`core/types.mag` is always
 `core.types`). If the same identity exists in multiple roots, loading fails as
 ambiguous instead of selecting one by search order.
+
+## Language documentation
+
+- [Language and authoring reference](docs/language.md)
+- [Compiler errors and recovery](docs/errors.md)
+- [Compilation and orchestration](docs/orchestrating.md)
+
+Runtime actor semantics and the concise canonical cookbook belong to the
+[`mag` plugin](../../plugins/mag/README.md). Seeded capabilities are best read
+from the MAG library source in the active composition, for example
+[`examples/nefor-agent/mag/lib`](../../examples/nefor-agent/mag/lib/).

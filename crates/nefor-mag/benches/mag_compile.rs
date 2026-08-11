@@ -228,16 +228,16 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
         None,
     ));
 
-    let lead = root.join("starter/agentic-loop/lead-turn.mag");
+    let lead = root.join("examples/nefor-agent/agentic-loop/lead-turn.mag");
     let contracts = nefor_mag::registry::load_registry_contracts(
         &root.join("plugins/mag/lua/mag-kernel/init.lua"),
     )
     .expect("load shipped MAG registry contracts");
     cases.push(Case {
         name: "shipped-lead-turn".into(),
-        source_dir: root.join("starter"),
+        source_dir: root.join("examples/nefor-agent"),
         entry: "agentic-loop/lead-turn.mag".into(),
-        module_roots: vec![root.join("starter/mag/lib")],
+        module_roots: vec![root.join("examples/nefor-agent/mag/lib")],
         inputs: json!({"foreign_contracts": contracts.clone()}),
         input_bytes: fs::metadata(lead).map(|m| m.len() as usize).unwrap_or(0),
         expected_error: None,
@@ -249,7 +249,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
             scratch,
             &format!("linear-{size}"),
             &source,
-            vec![scratch.into(), root.join("starter/mag/lib")],
+            vec![scratch.into(), root.join("examples/nefor-agent/mag/lib")],
             json!({"foreign_contracts": contracts.clone()}),
             None,
         ));
@@ -260,7 +260,7 @@ fn cases(root: &Path, scratch: &Path) -> Vec<Case> {
             scratch,
             &format!("product-fan-in-{size}"),
             &source,
-            vec![scratch.into(), root.join("starter/mag/lib")],
+            vec![scratch.into(), root.join("examples/nefor-agent/mag/lib")],
             json!({"foreign_contracts": contracts.clone()}),
             None,
         ));

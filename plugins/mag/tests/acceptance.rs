@@ -61,7 +61,7 @@ fn kernel_path() -> PathBuf {
 /// The provider capability name targeted by the `llm` actors.
 const PROVIDER: &str = "chatgpt-provider";
 /// The gate bus name threaded via `--tool-gate`, mirroring the starter
-/// composition (starter/init.lua). Tool invocations must reach the wire as
+/// composition (examples/nefor-agent/init.lua). Tool invocations must reach the wire as
 /// `<GATE>.tool.invoke`, never a bare `tool.invoke`.
 const GATE: &str = "tool-gate";
 const SESSION_ID: &str = "acceptance-session";
@@ -698,7 +698,8 @@ async fn load_worktree_program<R: AsyncBufReadExt + Unpin>(
     source_dir: &std::path::Path,
     entry: &str,
 ) -> Value {
-    let lib_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib");
+    let lib_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/nefor-agent/mag/lib");
     send_event(
         stdin,
         json!({

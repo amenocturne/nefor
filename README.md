@@ -10,7 +10,7 @@ identity. Your `init.lua` decides what exists, how it talks, what gets
 persisted, and which interface sits on top.
 
 Nefor does not require LLMs. Models, scripts, tools, agents, orchestrators, and
-plain interfaces are composable units when you wire them in. The bundled starter
+plain interfaces are composable units when you wire them in. The bundled agent example
 is one distribution, not the product boundary.
 
 ## Why
@@ -22,7 +22,7 @@ Nefor moves the wall into Lua. Plugins are independent OS processes. Interfaces
 are another composition. Routing, persistence, orchestration, approvals, and
 protocol semantics live where you can read and rewrite them.
 
-The starter proves the shape with a chat surface, providers, tool gates,
+The example proves the shape with a chat surface, providers, tool gates,
 sessions, and a MAG-based agentic loop. MAG itself is a pure, namespaced typed
 language; shipped libraries declare foreign capabilities, validate graph data,
 and lower it to a generic runtime artifact. The lead composes work by writing
@@ -58,10 +58,10 @@ composition to `~/.config/nefor`. Use lower-level targets when needed:
 
 ```sh
 just install-nefor source     # source | latest | nightly
-just install-starter safe     # safe | force
+just install-example safe     # safe | force
 ```
 
-`install-starter` refuses to overwrite an existing config unless you pass
+`install-example` refuses to overwrite an existing config unless you pass
 `force`.
 
 Or install the engine with brew:
@@ -69,25 +69,25 @@ Or install the engine with brew:
 ```sh
 brew install amenocturne/tap/nefor
 mkdir -p ~/.config/nefor
-cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
+cp -r $(brew --prefix)/share/nefor/examples/nefor-agent/* ~/.config/nefor/
 ```
 
-The starter ships with a deterministic offline mock provider, plus
+The example ships with a deterministic offline mock provider, plus
 `openai-provider` for OpenAI-compatible APIs and `chatgpt-provider` for the
 ChatGPT Responses API.
 
 The starter's permission modes are documented in
-[`docs/user/permissions.md`](docs/user/permissions.md).
+[`examples/nefor-agent/docs/permissions.md`](examples/nefor-agent/docs/permissions.md).
 
 ## Quick Start
 
-Run the starter:
+Run the example:
 
 ```sh
 nefor
 ```
 
-The starter defaults to the deterministic `mock-plugin` / `mock-model`, so no
+The example defaults to the deterministic `mock-plugin` / `mock-model`, so no
 credentials are needed. Edit the copied config to use a real provider, different
 tools, or different wiring:
 
@@ -96,7 +96,7 @@ $EDITOR ~/.config/nefor/config/init.lua
 $EDITOR ~/.config/nefor/init.lua
 ```
 
-A Nefor composition is an `init.lua`. Use the starter as the concrete reference
+A Nefor composition is an `init.lua`. Use the example as the concrete reference
 for provider setup, tool gating, session replay, workflow actors, and TUI
 wiring.
 
@@ -105,12 +105,12 @@ wiring.
 The engine spawns processes and routes lines through Lua. Everything else is
 composition.
 
-| Layer                                             | What it owns                                                                                                           |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **Engine / bus**                                  | Process spawning, line routing, Lua hosting, and identity stamping (`origin`, `ts`). It does not parse message bodies. |
-| **Plugins** (`plugins/`)                          | Self-contained work over stdio. Each plugin owns one scoped task.                                                      |
-| **Lua config / starter** (`init.lua`, `starter/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces.                           |
-| **Interfaces**                                    | User surfaces composed over the same bus. The starter uses `nefor-tui`; you can wire another.                          |
+| Layer                                                          | What it owns                                                                                                           |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Engine / bus**                                               | Process spawning, line routing, Lua hosting, and identity stamping (`origin`, `ts`). It does not parse message bodies. |
+| **Plugins** (`plugins/`)                                       | Self-contained work over stdio. Each plugin owns one scoped task.                                                      |
+| **Lua config / example** (`init.lua`, `examples/nefor-agent/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces.                           |
+| **Interfaces**                                                 | User surfaces composed over the same bus. The example uses `nefor-tui`; you can wire another.                          |
 
 Bash-tool test: a plugin should feel like a self-contained utility you could run
 from a shell, then compose elsewhere. Plugins should not know their neighbors;
@@ -131,7 +131,7 @@ release-bundle and deterministic TUI daily-path suites.
 - [Glossary](docs/glossary.md)
 - [Current protocol](docs/protocol.md)
 - [Plugins](plugins/README.md)
-- [Starter composition](starter/README.md)
+- [Starter composition](examples/nefor-agent/README.md)
 - [Lua core](lua/core/README.md)
 
 ## License

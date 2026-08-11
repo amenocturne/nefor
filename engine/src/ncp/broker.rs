@@ -22,7 +22,7 @@
 //!
 //! All NCP protocol handling (ready handshake, replay-on-attach, system
 //! message dispatch, error-code classification) has moved to the user's
-//! `starter/init.lua`. The broker does not parse the body of an inbound
+//! `examples/nefor-agent/init.lua`. The broker does not parse the body of an inbound
 //! line — raw bytes in, raw bytes out. The broker is session-blind: it
 //! does not own any session id, does not write any jsonl file, and does
 //! not know what a "session" is. Cross-run resumption / log persistence

@@ -10,7 +10,7 @@ local W       = tui_lib.widget
 local common      = require("libs.chat.common")
 local entries_mod = require("libs.chat.entries")
 -- statusline/slash are config-owned opinion files (they stay in
--- starter/chat, resolved via the `chat` searcher). This view assembles
+-- examples/nefor-agent/chat, resolved via the `chat` searcher). This view assembles
 -- them by fixed module name — an implicit interface a later wave should
 -- parameterize (pass the statusline/slash renderers in as deps).
 local statusline  = require("chat.statusline")
