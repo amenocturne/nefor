@@ -14,8 +14,9 @@
 -- Six control events. None are persisted (anything whose body.kind
 -- starts with `sessions.` is dropped from disk).
 --
---   sessions.session_start { session_id, from_resume? }
+--   sessions.session_start { session_id, from_resume?, request_id? }
 --   sessions.session_end   { session_id }
+--   sessions.transition_failed { operation, request_id?, session_id?, message }
 --   sessions.resume_loading { session_id }
 --   sessions.replay.start   { session_id, count }
 --   sessions.replay.progress { session_id, replayed, total }
@@ -392,17 +393,28 @@ end
 local function acquire_session(action, session_id)
   local result = nefor.fs[action](session_id)
   if not result or not result.ok then
+    local message = result and result.error or "unknown error"
     if nefor.log then nefor.log.error("sessions: failed to acquire session", {
-      session_id = session_id, error = result and result.error or "unknown error",
+      session_id = session_id, error = message,
     }) end
-    return nil
+    return nil, message
   end
   return result
 end
 
+local function transition_failed(operation, request_id, session_id, message)
+  send_msg({ kind = "control", event = "sessions.transition_failed", extra = {
+    operation = operation,
+    request_id = request_id,
+    session_id = session_id,
+    message = message or "Failed to acquire the requested session.",
+  } })
+end
+
 ---@param target_session_id string
 ---@param show_loading boolean|nil
-local function do_resume(target_session_id, show_loading)
+---@param request_id string|nil
+local function do_resume(target_session_id, show_loading, request_id)
   if show_loading == nil then show_loading = true end
 
   local acquired
@@ -413,16 +425,22 @@ local function do_resume(target_session_id, show_loading)
       lease = state.current_session_lease,
     }
   else
-    acquired = acquire_session("session_resume", target_session_id)
+    local error_message
+    acquired, error_message = acquire_session("session_resume", target_session_id)
+    if not acquired then
+      transition_failed("resume", request_id, target_session_id, error_message)
+      return nil
+    end
   end
-  if not acquired then return nil end
 
   -- Opening is part of activation. Do it while the target lease is held and
   -- before touching the current session or its lifecycle events.
   if not session_file_exists(acquired.path) then
-    if nefor.log then nefor.log.error("sessions.resume: session file disappeared before activation", {
+    local message = "session file disappeared before activation"
+    if nefor.log then nefor.log.error("sessions.resume: " .. message, {
       path = acquired.path,
     }) end
+    transition_failed("resume", request_id, target_session_id, message)
     return nil
   end
   local fh, err, had_content = open_session_file(acquired.path, target_session_id)
@@ -430,15 +448,17 @@ local function do_resume(target_session_id, show_loading)
     if nefor.log then nefor.log.error("sessions.resume: failed to open session file", {
       path = acquired.path, error = err,
     }) end
+    transition_failed("resume", request_id, target_session_id, tostring(err))
     return nil
   end
   local committed = nefor.fs.session_commit_resume(acquired.lease)
   if not committed or not committed.ok then
     fh:close()
+    local message = committed and committed.error or "unknown error"
     if nefor.log then nefor.log.error("sessions.resume: failed to record provenance", {
-      session_id = target_session_id,
-      error = committed and committed.error or "unknown error",
+      session_id = target_session_id, error = message,
     }) end
+    transition_failed("resume", request_id, target_session_id, message)
     return nil
   end
 
@@ -455,7 +475,8 @@ local function do_resume(target_session_id, show_loading)
   state.should_prune_session = not had_content
 
   send_msg({ kind = "control", event = "sessions.session_start",
-             extra = { session_id = target_session_id, from_resume = true } })
+             extra = { session_id = target_session_id, from_resume = true,
+                       request_id = request_id } })
   if show_loading then
     send_msg({ kind = "control", event = "sessions.resume_loading",
                extra = { session_id = target_session_id } })
@@ -470,10 +491,13 @@ local function do_resume(target_session_id, show_loading)
   return target_session_id
 end
 
-local function do_new()
+local function do_new(request_id)
   local id = uuid_v4()
-  local acquired = acquire_session("session_create", id)
-  if not acquired then return nil end
+  local acquired, error_message = acquire_session("session_create", id)
+  if not acquired then
+    transition_failed("new", request_id, nil, error_message)
+    return nil
+  end
   cancel_replay()
   if state.current_session_id then
     send_msg({ kind = "control", event = "sessions.session_end", extra = { session_id = state.current_session_id } })
@@ -482,7 +506,8 @@ local function do_new()
   state.current_session_id = id
   state.current_session_path = acquired.path
   state.current_session_lease = acquired.lease
-  send_msg({ kind = "control", event = "sessions.session_start", extra = { session_id = id } })
+  send_msg({ kind = "control", event = "sessions.session_start",
+             extra = { session_id = id, request_id = request_id } })
   return id
 end
 
@@ -549,14 +574,14 @@ local function receive_msg(entry)
   if kind == "sessions.resume_request" then
     local target = decoded.body.session_id
     if type(target) == "string" and target ~= "" then
-      do_resume(target)
+      do_resume(target, nil, decoded.body.request_id)
     end
     return
   end
 
   -- Mint a fresh session.
   if kind == "sessions.new_request" then
-    do_new()
+    do_new(decoded.body.request_id)
     return
   end
 

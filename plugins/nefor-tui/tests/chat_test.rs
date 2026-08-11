@@ -1910,6 +1910,59 @@ fn slash_new_clears_transcript_and_mints_new_session() {
 }
 
 #[test]
+fn failed_new_retains_transcript_and_ignores_late_acknowledgements() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    fixture_message(&mut engine, "user", "authoritative old transcript");
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/new" }),
+    );
+    let _ = render_str(&mut engine);
+    assert!(engine.snapshot().contains("authoritative old transcript"));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.transition_failed", "operation": "new",
+            "request_id": "stale-request", "message": "stale failure" }),
+    );
+    let _ = render_str(&mut engine);
+    assert!(engine.snapshot().contains("authoritative old transcript"));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.transition_failed", "operation": "new",
+            "request_id": "chat-transition-1", "message": "disk unavailable" }),
+    );
+    let _ = render_str(&mut engine);
+    let failed = engine.snapshot();
+    assert!(failed.contains("authoritative old transcript"), "{failed}");
+    assert!(
+        failed.contains("Session switch failed") && failed.contains("disk unavailable"),
+        "{failed}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "late-session",
+            "request_id": "chat-transition-1" }),
+    );
+    let _ = render_str(&mut engine);
+    let late = engine.snapshot();
+    assert!(late.contains("authoritative old transcript"), "{late}");
+    let state = engine.state_table().expect("state");
+    assert_ne!(
+        state
+            .get::<Option<String>>("session_id")
+            .unwrap()
+            .as_deref(),
+        Some("late-session")
+    );
+}
+
+#[test]
 fn slash_new_clears_panel_runs() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -6684,6 +6737,11 @@ fn picker_enter_locally_clears_transcript_before_resume() {
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter pick");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": target,
+            "from_resume": true, "request_id": "chat-transition-1" }),
+    );
     let _ = render_str(&mut engine);
 
     let out = engine.snapshot();
@@ -6821,7 +6879,8 @@ fn realistic_new_flow_with_prior_content_displays_first_message() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+        json!({ "kind": "sessions.session_start", "session_id": "new",
+            "request_id": "chat-transition-1" }),
     );
     dispatch_event(
         &mut engine,
@@ -7017,7 +7076,8 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+        json!({ "kind": "sessions.session_start", "session_id": "new",
+            "request_id": "chat-transition-1" }),
     );
     dispatch_event(
         &mut engine,
@@ -9340,6 +9400,11 @@ fn slash_new_collapses_stale_scroll_region() {
         engine.handle_key(key(&ch.to_string())).expect("type");
     }
     engine.handle_key(key("enter")).expect("enter");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new",
+            "request_id": "chat-transition-1" }),
+    );
     let _ = render_str(&mut engine);
     let after = engine.snapshot();
 
@@ -9930,6 +9995,11 @@ fn config_chat_extension_coexists_with_canonical_conversation_projection() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "input.submit", "value": "/mode audio" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "audio-session",
+            "request_id": "chat-transition-1" }),
     );
     let state = engine.state_table().expect("state");
     assert_eq!(state.get::<String>("mode").unwrap(), "audio");

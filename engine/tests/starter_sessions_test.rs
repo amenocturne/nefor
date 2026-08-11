@@ -878,6 +878,63 @@ fn new_then_new_prunes_each_empty_predecessor() {
 }
 
 #[test]
+fn failed_new_preserves_current_identity_and_emits_correlated_failure() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local json = nefor.json
+        _sent = {}
+        nefor.engine.send = function(payload) table.insert(_sent, payload) end
+        local sessions = require("libs.sessions")
+        sessions.init()
+        _sent = {}
+        _original_id = sessions.current_id()
+        nefor.fs.session_create = function(_)
+          return { ok = false, error = "fixture create failure" }
+        end
+        sessions.receive_msg({ payload = json.encode({ body = {
+          kind = "sessions.new_request", request_id = "request-7",
+        } }) })
+        assert(sessions.current_id() == _original_id)
+        "#,
+    )
+    .exec()
+    .expect("failed new flow");
+
+    let sent: Table = lua.globals().get("_sent").expect("sent events");
+    let mut found = false;
+    for value in sent.sequence_values::<String>() {
+        let decoded: serde_json::Value = serde_json::from_str(&value.expect("payload")).unwrap();
+        if decoded.pointer("/body/kind").and_then(|v| v.as_str())
+            == Some("sessions.transition_failed")
+        {
+            assert_eq!(
+                decoded.pointer("/body/request_id").and_then(|v| v.as_str()),
+                Some("request-7")
+            );
+            assert_eq!(
+                decoded.pointer("/body/message").and_then(|v| v.as_str()),
+                Some("fixture create failure")
+            );
+            found = true;
+        }
+    }
+    assert!(found, "missing correlated transition failure");
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
 fn new_after_submit_preserves_prior_session() {
     // Asymmetric prune: a session with at least one user submit must
     // SURVIVE `/new`. Otherwise the user's first session of the day

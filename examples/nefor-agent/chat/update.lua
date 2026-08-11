@@ -33,6 +33,12 @@ local format_args   = common.format_args
 
 local M = {}
 local run_bindings = mag_run_bindings.new()
+local transition_sequence = 0
+
+local function next_transition_id()
+  transition_sequence = transition_sequence + 1
+  return "chat-transition-" .. tostring(transition_sequence)
+end
 
 local function active_config()
   local ok, cfg = pcall(function() return require("config").active end)
@@ -230,6 +236,54 @@ local function flush_before_transcript_replace(state)
   return transcript.flush_graph_results(state)
 end
 
+local function begin_session_transition(state, operation, patch)
+  local request_id = next_transition_id()
+  local transition_patch = {
+    input_value = "",
+    completion = NIL_SENTINEL,
+    popup = NIL_SENTINEL,
+    pending_session_transition = {
+      request_id = request_id,
+      operation = operation,
+      patch = patch or {},
+    },
+  }
+  if operation == "new" then
+    transition_patch.resume_loading = NIL_SENTINEL
+    transition_patch.replay_mode = NIL_SENTINEL
+  end
+  return shallow_merge(state, transition_patch), request_id
+end
+
+-- Effects which configure the acknowledged session must not run while the old
+-- session is still authoritative. Interruption and the acquisition request are
+-- the only immediate effects.
+local function prepare_transition_effects(state, effects, request_id)
+  local immediate, deferred = {}, {}
+  for _, effect in ipairs(effects or {}) do
+    if effect.kind == "send_to" and effect.target == "engine"
+        and type(effect.body) == "table"
+        and (effect.body.kind == "sessions.new_request"
+          or effect.body.kind == "sessions.resume_request") then
+      immediate[#immediate + 1] = shallow_merge(effect, {
+        body = shallow_merge(effect.body, { request_id = request_id }),
+      })
+    elseif effect.kind == "send_to" and type(effect.body) == "table"
+        and effect.body.kind == "chat.interrupt_all" then
+      immediate[#immediate + 1] = effect
+    else
+      deferred[#deferred + 1] = effect
+    end
+  end
+  if #deferred > 0 then
+    local pending = shallow_merge(state.pending_session_transition, {
+      effects = deferred,
+    })
+    state = shallow_merge(state, { pending_session_transition = pending })
+  end
+  return state, immediate
+end
+
 local function reset_session_state(state, patch)
   state = flush_before_transcript_replace(state)
   if state.resume_loading == nil then reset_transcript_scroll() end
@@ -308,22 +362,28 @@ local function handle_input_submit(msg, state)
         }, patch or {}))
       end,
       new_session = function(patch)
-        return reset_session_state(state, patch)
+        local pending, request_id = begin_session_transition(state, "new", patch)
+        return pending, request_id
       end,
     })
   if extension_state ~= nil then
+    local pending = extension_state.pending_session_transition
+    if type(pending) == "table" then
+      return prepare_transition_effects(
+        extension_state, extension_effects, pending.request_id)
+    end
     return extension_state, extension_effects
   end
   if cmd == "quit" or cmd == "exit" then
     return state, { { kind = "exit" } }
   end
   if cmd == "new" or cmd == "clear" then
-    local cleared = reset_session_state(state)
-    return cleared, {
+    local pending, request_id = begin_session_transition(state, "new")
+    return pending, {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt_all" } },
       { kind = "send_to", target = "engine",
-        body = { kind = "sessions.new_request" } },
+        body = { kind = "sessions.new_request", request_id = request_id } },
     }
   end
   if cmd == "help" then
@@ -509,12 +569,12 @@ local function handle_input_submit(msg, state)
   if cmd == "resume" then
     if args and #args > 0 then
       local id = args:match("^([%w%-]+)") or args
-      return reset_session_state(state, {
+      local pending, request_id = begin_session_transition(state, "resume", {
         resume_loading = { session_id = id, replayed = 0 },
         replay_mode = true,
-      }), {
-        sessions.emit_resume_request(id),
-      }
+      })
+      return prepare_transition_effects(
+        pending, { sessions.emit_resume_request(id) }, request_id)
     end
     local rows = sessions.list_recent()
     return shallow_merge(state, {
@@ -817,7 +877,10 @@ end
 
 -- ── session lifecycle ─────────────────────────────────────────────────
 
-local function handle_session_end(_msg, state)
+local function handle_session_end(msg, state)
+  if state.pending_session_transition ~= nil then return state, {} end
+  if msg.session_id ~= nil and state.session_id ~= nil
+      and msg.session_id ~= state.session_id then return state, {} end
   run_bindings = mag_run_bindings.new()
   state = close_and_flush_lead_unit(state)
   return shallow_merge(state, {
@@ -849,6 +912,15 @@ local function handle_session_end(_msg, state)
 end
 
 local function handle_session_start(msg, state)
+  local pending_transition = state.pending_session_transition
+  local effects = {}
+  if pending_transition == nil and msg.request_id ~= nil then return state, {} end
+  if type(pending_transition) == "table" then
+    if msg.request_id ~= pending_transition.request_id then return state, {} end
+    state = reset_session_state(state, shallow_merge(
+      pending_transition.patch or {}, { pending_session_transition = NIL_SENTINEL }))
+    effects = pending_transition.effects or {}
+  end
   run_bindings = mag_run_bindings.new()
   local runs = state.runs
   if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") == "1" and next(runs or {}) == nil then
@@ -876,7 +948,24 @@ local function handle_session_start(msg, state)
     conversation_id = NIL_SENTINEL,
     conversation_projection = conversation_projection.new(),
     instruction_notice_ids = {},
-  }), {}
+  }), effects
+end
+
+local function handle_transition_failed(msg, state)
+  local pending = state.pending_session_transition
+  if type(pending) ~= "table" or msg.request_id ~= pending.request_id then
+    return state, {}
+  end
+  local next_state = shallow_merge(state, {
+    pending_session_transition = NIL_SENTINEL,
+    pending = false,
+    turn_started_at = NIL_SENTINEL,
+  })
+  next_state = transcript.push_entry(next_state, Entry.error(
+    "Session switch failed",
+    msg.message or "Failed to acquire the requested session.",
+    true))
+  return next_state, {}
 end
 
 local function handle_resume_loading(msg, state)
@@ -1864,6 +1953,7 @@ local handlers = {
   ["chat.escape_timeout"]         = handle_escape_timeout,
   ["sessions.session_end"]        = handle_session_end,
   ["sessions.session_start"]      = handle_session_start,
+  ["sessions.transition_failed"]  = handle_transition_failed,
   ["sessions.resume_loading"]     = handle_resume_loading,
   ["sessions.replay.start"]       = handle_replay_start,
   ["sessions.replay.progress"]    = handle_replay_progress,
@@ -2038,12 +2128,13 @@ local function route_keys_and_popups(msg, state)
     }, msg)
     if result ~= nil then
       if result.selected ~= nil and result.selected.id then
-        return reset_session_state(state, {
-          resume_loading = { session_id = result.selected.id, replayed = 0 },
+        local id = result.selected.id
+        local pending, request_id = begin_session_transition(state, "resume", {
+          resume_loading = { session_id = id, replayed = 0 },
           replay_mode = true,
-        }), {
-          sessions.emit_resume_request(result.selected.id),
-        }
+        })
+        return prepare_transition_effects(
+          pending, { sessions.emit_resume_request(id) }, request_id)
       end
       return shallow_merge(state, {
         popup = shallow_merge(p, result.state),
