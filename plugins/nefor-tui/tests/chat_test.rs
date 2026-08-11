@@ -2992,6 +2992,69 @@ fn ctrl_o_toggles_expanded_details() {
     );
 }
 
+fn collapsed_read_file_snapshot(width: u16, running: bool) -> String {
+    let mut engine = Engine::new(width, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("ctrl_b")).expect("hide sidebar");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "read_file",
+            "display": {
+                "label": "Read file",
+                "primary": { "arg": "path" },
+                "result": { "kind": "content" }
+            }
+        }] }),
+    );
+    fixture_tool_started(
+        &mut engine,
+        "read-path",
+        "read_file",
+        json!({ "path": "/workspace/very/long/component/src/important.lua" }),
+    );
+    if !running {
+        fixture_tool_completed(&mut engine, "read-path", json!("contents"), false);
+    }
+    render_snapshot(&mut engine)
+}
+
+#[test]
+fn collapsed_completed_path_tool_keeps_prefix_and_path_tail() {
+    for width in [80, 48] {
+        let snapshot = collapsed_read_file_snapshot(width, false);
+        assert!(
+            snapshot.contains("▸ read_file · "),
+            "tool prefix must survive at width {width}: {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains("important.lua"),
+            "path tail must survive at width {width}: {snapshot:?}"
+        );
+    }
+}
+
+#[test]
+fn collapsed_running_path_tool_reserves_marker_after_path_tail() {
+    for width in [80, 48] {
+        let snapshot = collapsed_read_file_snapshot(width, true);
+        let header = snapshot
+            .lines()
+            .find(|line| line.contains("▸ read_file · "))
+            .unwrap_or_else(|| panic!("tool prefix must survive at width {width}: {snapshot:?}"));
+        assert!(
+            header.contains("important.lua"),
+            "path tail must survive at width {width}: {header:?}"
+        );
+        assert!(
+            header.trim_end().ends_with('…'),
+            "running marker must remain reserved at the row tail at width {width}: {header:?}"
+        );
+    }
+}
+
 #[test]
 fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_header() {
     let mut engine = Engine::new(120, 24).expect("engine");

@@ -158,10 +158,37 @@ local function collapsed_tool_header(entry)
   if entry.output == nil and not entry.error then header = header .. " …" end
   return header
 end
+local function collapsed_path_tool_header(entry, projection)
+  local style = entry.error and STYLE.tool_error or STYLE.tool_name
+  local label = entry.name or projection.label or "?"
+  local children = {
+    tui.text { content = "▸ " .. label .. " · ", style = style, wrap = "none" },
+    tui.expanded { child = tui.text {
+      content = projection.primary,
+      style = style,
+      wrap = "tail",
+    } },
+  }
+  if entry.output == nil and not entry.error then
+    children[#children + 1] = tui.text { content = " …", style = style, wrap = "none" }
+  end
+  return tui.row { gap = 0, children = children }
+end
 local function tool_collapsed(entry)
   local projection = semantic_projection(entry)
-  local wrap = projection and projection.primary_is_path and "tail" or "none"
-  local rows = { tui.text { content = collapsed_tool_header(entry), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = wrap } }
+  local header
+  if entry.name ~= "mag" and projection and projection.primary_is_path
+      and projection.primary and projection.primary ~= "" then
+    header = collapsed_path_tool_header(entry, projection)
+  else
+    local wrap = projection and projection.primary_is_path and "tail" or "none"
+    header = tui.text {
+      content = collapsed_tool_header(entry),
+      style = entry.error and STYLE.tool_error or STYLE.tool_name,
+      wrap = wrap,
+    }
+  end
+  local rows = { header }
   if entry.error then
     rows[#rows + 1] = tui.text { content = "  error:", style = STYLE.status_danger, wrap = "none" }
     local output_text
