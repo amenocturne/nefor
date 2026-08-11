@@ -25,9 +25,6 @@ Use `/safe`, `/auto`, or `/yolo` to switch live. At process start,
 so the last wins. Without an explicit startup mode, startup and resume are safe;
 mode is not restored as durable authority from a prior process.
 
-`/mode default` is a workflow reset, not a permission alias: it starts a new
-default session and does not mean `/safe`.
-
 ## 1. Ordinary tool permission
 
 The `tool-gate` transports gated calls and decisions. Before chat sees a popup,

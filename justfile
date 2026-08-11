@@ -87,7 +87,7 @@ test-tui-scenarios:
       tests/tui/starter-initial-prompt.json
       tests/tui/starter-mock-smoke.json
       tests/tui/starter-mock-multi-turn.json
-      tests/tui/starter-mode-commands.json
+      tests/tui/starter-permission-commands.json
       tests/tui/starter-sidebar-overflow.json
       tests/tui/starter-interrupt-recovery.json
     )

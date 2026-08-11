@@ -22,7 +22,6 @@ Submitted prompt history is separate: the starter keeps at most 50 newest submit
 ## New and resume
 
 - `/new` and `/clear` interrupt all workflows, close the current session, create a new ID, and reset the transcript/sidebar state.
-- `/mode default` also starts a fresh session while restoring configured provider/model defaults.
 - `/resume` lists recent non-empty sessions newest-first, showing the header timestamp and first submitted prompt.
 - `/resume <id>` switches directly. The parser uses the first word-like/hyphenated ID from the argument.
 - `nefor run --session <id>` starts on a saved session.

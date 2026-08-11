@@ -206,7 +206,7 @@ end
 -- the height cache keeps per-entry heights, and the scroll offset stays at
 -- the old bottom — so an emptied transcript renders a long blank scrolled
 -- region until new content forces a recompute. Every reset-shaped path
--- (/new, /clear, /mode default, resume, session-switch) calls this so the
+-- (/new, /clear, resume, session-switch) calls this so the
 -- viewport collapses immediately. Keyed "transcript" to match the chat
 -- widget's scrollable key (chat/view.lua).
 local function reset_transcript_scroll()
@@ -470,69 +470,6 @@ local function handle_input_submit(msg, state)
         awaiting  = awaiting,
       },
     }), effects
-  end
-  if cmd == "mode" then
-    local mode_arg = (args or ""):lower()
-    if mode_arg == "" then
-      local result = W.prompt.handle(prompt_widget_opts(state), {
-        kind = "input.changed",
-        value = "/mode ",
-      })
-      if result and result.state then
-        return fold_prompt_patch(state, result.state), {}
-      end
-      return shallow_merge(state, {
-        input_value = "/mode ",
-        completion = NIL_SENTINEL,
-        popup = NIL_SENTINEL,
-      }), {}
-    end
-    if mode_arg == "default" or mode_arg == "normal" then
-      local cfg = active_config()
-      local provider = cfg.default_provider or state.provider
-      local model = cfg.default_model or state.model
-      local toasts = {}
-      for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
-      toasts[#toasts + 1] = {
-        id = "mode-default-" .. tostring(tui.now_ms()),
-        text = "new default session: " .. tostring(provider or "?") .. "/" .. tostring(model or "?"),
-        level = "info",
-        started_at_ms = tui.now_ms(),
-        ttl_ms = 3000,
-      }
-      local cleared = reset_session_state(state, {
-        mode = "default",
-        provider = provider,
-        model = model,
-        toasts = toasts,
-      })
-      local effects = {
-        { kind = "send_to", target = "engine",
-          body = { kind = "chat.interrupt_all" } },
-        { kind = "send_to", target = "engine",
-          body = { kind = "sessions.new_request" } },
-      }
-      if type(provider) == "string" and provider ~= ""
-          and type(model) == "string" and model ~= "" then
-        effects[#effects + 1] = {
-          kind = "send_to", target = "engine",
-          body = {
-            kind = "chat.model.set",
-            provider = provider,
-            model = model,
-          },
-        }
-      end
-      return cleared, effects
-    end
-    return shallow_merge(state, {
-      input_value = "", completion = NIL_SENTINEL,
-      popup = {
-        variant = "warning",
-        title = "/mode",
-        body = "Usage: /mode default",
-      },
-    }), {}
   end
   if cmd == "think" or cmd == "effort" then
     if args == nil or #args == 0 then

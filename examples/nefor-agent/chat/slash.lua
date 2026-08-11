@@ -14,12 +14,6 @@ M.BASE_COMMANDS = {
   { name = "logout",  aliases = {},          hint = "revoke a provider's auth",               takes_args = true },
   { name = "model",   aliases = {},          hint = "list/switch active model",               takes_args = true },
   { name = "usage",   aliases = {},          hint = "show provider quota and reset times",     takes_args = false },
-  {
-    name = "mode", aliases = {}, hint = "switch workflow mode", takes_args = true,
-    arg_completions = {
-      { name = "default", hint = "normal agentic workflow" },
-    },
-  },
   { name = "think",   aliases = { "effort" }, hint = "set reasoning effort",                  takes_args = true },
   { name = "compact", aliases = {},          hint = "compact active model context",           takes_args = false },
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },

@@ -4456,10 +4456,8 @@ fn autocomplete_open_enter_runs_highlighted_command() {
         "autocomplete should list /model after typing /mo: {out:?}"
     );
 
-    // Ranking puts the shorter `/mode` first, so step the highlight
-    // down to `/model` — which also keeps this test honest: Enter runs
-    // the HIGHLIGHTED entry, not the typed fragment `mo`.
-    engine.handle_key(key("down")).expect("down");
+    // `/model` is the sole canonical match. Enter runs the highlighted entry,
+    // not the typed fragment `mo`.
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
@@ -4503,9 +4501,7 @@ fn autocomplete_open_tab_completes_without_submitting() {
         engine.handle_key(key(&ch.to_string())).expect("type");
     }
     let _ = render_str(&mut engine);
-    // `/mode` ranks above `/model` for the `/mo` prefix (shorter name
-    // wins); step down so Tab applies `/model`.
-    engine.handle_key(key("down")).expect("down");
+    // `/model` is the sole canonical match for this prefix.
     let _ = engine.take_emit_queue();
 
     engine.handle_key(key("tab")).expect("tab");
@@ -9855,7 +9851,7 @@ fn config_chat_extension_coexists_with_canonical_conversation_projection() {
               end,
             },
             {
-              name = "mode", extend = true,
+              name = "mode", hint = "test mode", takes_args = true,
               arg_completions = { { name = "audio", hint = "test mode" } },
               run = function(args, _state, api)
                 if args ~= "audio" then return nil end
