@@ -230,6 +230,48 @@ local function flush_before_transcript_replace(state)
   return transcript.flush_graph_results(state)
 end
 
+local function reset_session_state(state, patch)
+  state = flush_before_transcript_replace(state)
+  if state.resume_loading == nil then reset_transcript_scroll() end
+  run_bindings = mag_run_bindings.new()
+  return shallow_merge(state, shallow_merge({
+    entries = {},
+    in_flight = NIL_SENTINEL,
+    pending_graph_results = NIL_SENTINEL,
+    conversation_id = NIL_SENTINEL,
+    conversation_projection = conversation_projection.new(),
+    instruction_notice_ids = {},
+    input_value = "",
+    runs = {},
+    sidebar_folds = {},
+    node_previews = {},
+    mag_arrivals = {},
+    capability_owners = {},
+    scope_to_run = {},
+    popup = NIL_SENTINEL,
+    popup_queue = NIL_SENTINEL,
+    completion = NIL_SENTINEL,
+    stats = {},
+    current_context_tokens = NIL_SENTINEL,
+    pending_plan_status = NIL_SENTINEL,
+    pending = false,
+    turn_started_at = NIL_SENTINEL,
+    last_turn_duration_ms = NIL_SENTINEL,
+    active_turn_id = NIL_SENTINEL,
+    active_turn_entry_start = NIL_SENTINEL,
+    pending_user_echo = NIL_SENTINEL,
+    pending_user_echo_idx = NIL_SENTINEL,
+    queued_entry_idx = NIL_SENTINEL,
+    raw_tool_id = NIL_SENTINEL,
+    resume_loading = NIL_SENTINEL,
+    replay_mode = NIL_SENTINEL,
+    last_esc_ms = NIL_SENTINEL,
+    escape_token = NIL_SENTINEL,
+    escape_count = NIL_SENTINEL,
+    history_cursor = NIL_SENTINEL,
+  }, patch or {}))
+end
+
 local function handle_input_changed(msg, state)
   local result = W.prompt.handle(prompt_widget_opts(state), msg)
   if result and result.state then
@@ -266,23 +308,7 @@ local function handle_input_submit(msg, state)
         }, patch or {}))
       end,
       new_session = function(patch)
-        local reset = flush_before_transcript_replace(state)
-        reset_transcript_scroll()
-        return shallow_merge(reset, shallow_merge({
-          entries = {}, in_flight = NIL_SENTINEL,
-          pending_graph_results = NIL_SENTINEL, input_value = "",
-          pending = false, completion = NIL_SENTINEL,
-          runs = {}, sidebar_folds = {},
-          node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
-          turn_started_at = NIL_SENTINEL,
-          last_turn_duration_ms = NIL_SENTINEL,
-          last_esc_ms = NIL_SENTINEL,
-          escape_token = NIL_SENTINEL,
-          escape_count = NIL_SENTINEL,
-          history_cursor = NIL_SENTINEL,
-          popup = NIL_SENTINEL,
-          queued_entry_idx = NIL_SENTINEL,
-        }, patch or {}))
+        return reset_session_state(state, patch)
       end,
     })
   if extension_state ~= nil then
@@ -292,23 +318,7 @@ local function handle_input_submit(msg, state)
     return state, { { kind = "exit" } }
   end
   if cmd == "new" or cmd == "clear" then
-    state = flush_before_transcript_replace(state)
-    reset_transcript_scroll()
-    local cleared = shallow_merge(state, {
-      entries = {}, in_flight = NIL_SENTINEL,
-      pending_graph_results = NIL_SENTINEL, input_value = "",
-      pending = false, completion = NIL_SENTINEL,
-      runs = {}, sidebar_folds = {},
-      node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
-      turn_started_at = NIL_SENTINEL,
-      last_turn_duration_ms = NIL_SENTINEL,
-      last_esc_ms = NIL_SENTINEL,
-      escape_token = NIL_SENTINEL,
-      escape_count = NIL_SENTINEL,
-      history_cursor = NIL_SENTINEL,
-      popup = NIL_SENTINEL,
-      queued_entry_idx = NIL_SENTINEL,
-    })
+    local cleared = reset_session_state(state)
     return cleared, {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt_all" } },
@@ -490,22 +500,7 @@ local function handle_input_submit(msg, state)
         started_at_ms = tui.now_ms(),
         ttl_ms = 3000,
       }
-      state = flush_before_transcript_replace(state)
-      reset_transcript_scroll()
-      local cleared = shallow_merge(state, {
-        entries = {}, in_flight = NIL_SENTINEL,
-        pending_graph_results = NIL_SENTINEL, input_value = "",
-        pending = false, completion = NIL_SENTINEL,
-        runs = {}, sidebar_folds = {},
-        node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
-        turn_started_at = NIL_SENTINEL,
-        last_turn_duration_ms = NIL_SENTINEL,
-        last_esc_ms = NIL_SENTINEL,
-        escape_token = NIL_SENTINEL,
-        escape_count = NIL_SENTINEL,
-        history_cursor = NIL_SENTINEL,
-        popup = NIL_SENTINEL,
-        queued_entry_idx = NIL_SENTINEL,
+      local cleared = reset_session_state(state, {
         mode = "default",
         provider = provider,
         model = model,
@@ -577,17 +572,7 @@ local function handle_input_submit(msg, state)
   if cmd == "resume" then
     if args and #args > 0 then
       local id = args:match("^([%w%-]+)") or args
-      state = flush_before_transcript_replace(state)
-      reset_transcript_scroll()
-      return shallow_merge(state, {
-        input_value = "", completion = NIL_SENTINEL,
-        entries = {}, in_flight = NIL_SENTINEL,
-        pending_graph_results = NIL_SENTINEL,
-        pending = false, runs = {}, sidebar_folds = {},
-        node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
-        turn_started_at = NIL_SENTINEL,
-        last_turn_duration_ms = NIL_SENTINEL,
-        queued_entry_idx = NIL_SENTINEL,
+      return reset_session_state(state, {
         resume_loading = { session_id = id, replayed = 0 },
         replay_mode = true,
       }), {
@@ -899,21 +884,27 @@ local function handle_session_end(_msg, state)
   run_bindings = mag_run_bindings.new()
   state = close_and_flush_lead_unit(state)
   return shallow_merge(state, {
-    in_flight        = NIL_SENTINEL,
-    pending          = false,
-    turn_started_at  = NIL_SENTINEL,
+    in_flight = NIL_SENTINEL,
+    pending = false,
+    turn_started_at = NIL_SENTINEL,
     last_turn_duration_ms = NIL_SENTINEL,
-    popup            = NIL_SENTINEL,
-    popup_queue      = NIL_SENTINEL,
-    toasts           = {},
-    completion       = NIL_SENTINEL,
-    last_esc_ms      = NIL_SENTINEL,
-    escape_token     = NIL_SENTINEL,
-    escape_count     = NIL_SENTINEL,
-    runs             = {},
-    node_previews    = {}, mag_arrivals = {}, capability_owners = {},
-    scope_to_run     = {},
-    sidebar_folds    = {},
+    active_turn_id = NIL_SENTINEL,
+    active_turn_entry_start = NIL_SENTINEL,
+    stats = {},
+    current_context_tokens = NIL_SENTINEL,
+    pending_plan_status = NIL_SENTINEL,
+    raw_tool_id = NIL_SENTINEL,
+    popup = NIL_SENTINEL,
+    popup_queue = NIL_SENTINEL,
+    toasts = {},
+    completion = NIL_SENTINEL,
+    last_esc_ms = NIL_SENTINEL,
+    escape_token = NIL_SENTINEL,
+    escape_count = NIL_SENTINEL,
+    runs = {},
+    node_previews = {}, mag_arrivals = {}, capability_owners = {},
+    scope_to_run = {},
+    sidebar_folds = {},
     conversation_id = NIL_SENTINEL,
     conversation_projection = conversation_projection.new(),
     instruction_notice_ids = {},
@@ -2110,14 +2101,7 @@ local function route_keys_and_popups(msg, state)
     }, msg)
     if result ~= nil then
       if result.selected ~= nil and result.selected.id then
-        reset_transcript_scroll()
-        return shallow_merge(state, {
-          popup = NIL_SENTINEL,
-          entries = {}, in_flight = NIL_SENTINEL,
-          pending = false, runs = {}, sidebar_folds = {},
-          turn_started_at = NIL_SENTINEL,
-          last_turn_duration_ms = NIL_SENTINEL,
-          queued_entry_idx = NIL_SENTINEL,
+        return reset_session_state(state, {
           resume_loading = { session_id = result.selected.id, replayed = 0 },
           replay_mode = true,
         }), {

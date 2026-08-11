@@ -569,6 +569,66 @@ fn completed_turn_restores_context_used_widget() {
 }
 
 #[test]
+fn slash_new_clears_session_owned_context_usage() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "mock-plugin",
+            "models": ["mock-model"],
+            "context_windows": { "mock-model": 128000 },
+        }),
+    );
+    fixture_assistant_completed(
+        &mut engine,
+        Some("answer".into()),
+        json!({
+            "model": "mock-model",
+            "usage": { "input_tokens": 80_000, "output_tokens": 7 }
+        }),
+    );
+    assert!(render_str(&mut engine).contains("ctx 80k/128k"));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/new" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("ctx "),
+        "a fresh session must not display the previous session's context usage: {out:?}"
+    );
+}
+
+#[test]
+fn slash_new_during_cooperative_resume_clears_loading_state() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_loading", "session_id": "resume-1" }),
+    );
+    assert!(render_str(&mut engine).contains("loading session"));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/new" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("loading session"),
+        "/new must cancel the local loading presentation without waiting for resume_done: {out:?}"
+    );
+
+    assert!(
+        out.contains('╭'),
+        "the normal prompt must return immediately after /new: {out:?}"
+    );
+}
+
+#[test]
 fn input_field_has_no_default_placeholder() {
     // Belt-and-braces: even if the broader frame test above were edited
     // for unrelated reasons, this one specifically pins the contract
