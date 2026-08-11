@@ -10,8 +10,8 @@
 //! - `display()` — declarative model-facing presentation metadata.
 //! - `context()` — internal metadata consumed by wrappers. It is not part
 //!   of the model-facing schema.
-//! - `run(args)` — the implementation. Async because future tools (bash)
-//!   will be inherently async; read_file fits naturally here too via
+//! - `run(args)` — the implementation. Async because process tools are
+//!   inherently async; read_file fits naturally here too via
 //!   `tokio::fs`.
 //!
 //! The dispatch layer in [`crate::ncp`] looks up the named tool, parses
@@ -23,11 +23,13 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 
-pub mod bash;
 pub mod edit_file;
+pub mod process;
+pub mod process_exec;
 pub mod read_file;
 pub mod read_image;
 pub mod search_text;
+pub mod shell_script;
 pub mod write_file;
 
 /// Descriptor for a single registered tool. Used by the catalog builder
@@ -101,11 +103,18 @@ pub const TOOLS: &[ToolDescriptor] = &[
         display: edit_file::display,
     },
     ToolDescriptor {
-        name: bash::NAME,
-        description: bash::DESCRIPTION,
-        schema: bash::schema,
+        name: process_exec::NAME,
+        description: process_exec::DESCRIPTION,
+        schema: process_exec::schema,
         context: cwd_context,
-        display: bash::display,
+        display: process_exec::display,
+    },
+    ToolDescriptor {
+        name: shell_script::NAME,
+        description: shell_script::DESCRIPTION,
+        schema: shell_script::schema,
+        context: cwd_context,
+        display: shell_script::display,
     },
     ToolDescriptor {
         name: search_text::NAME,
@@ -129,7 +138,8 @@ pub async fn run_tool(name: &str, args: &Value) -> Result<Value, ToolError> {
         read_image::NAME => read_image::run(args).await,
         write_file::NAME => write_file::run(args).await.map(Value::String),
         edit_file::NAME => edit_file::run(args).await.map(Value::String),
-        bash::NAME => bash::run(args).await.map(Value::String),
+        process_exec::NAME => process_exec::run(args).await,
+        shell_script::NAME => shell_script::run(args).await,
         search_text::NAME => search_text::run(args).await.map(Value::String),
         other => Err(ToolError::BadArgs {
             tool: other.to_owned(),
@@ -165,7 +175,8 @@ mod tests {
             read_image::NAME,
             write_file::NAME,
             edit_file::NAME,
-            bash::NAME,
+            process_exec::NAME,
+            shell_script::NAME,
             search_text::NAME,
         ]
         .into_iter()
@@ -184,12 +195,13 @@ mod tests {
 
     #[test]
     fn module_owned_display_functions_compile() {
-        let displays: [fn() -> Value; 6] = [
+        let displays: [fn() -> Value; 7] = [
             read_file::display,
             read_image::display,
             write_file::display,
             edit_file::display,
-            bash::display,
+            process_exec::display,
+            shell_script::display,
             search_text::display,
         ];
         assert_eq!(displays.len(), TOOLS.len());

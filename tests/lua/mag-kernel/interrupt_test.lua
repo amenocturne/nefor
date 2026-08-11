@@ -137,7 +137,7 @@ do
   -- Fire a ToolCalls into run-tool: it constructs, emits one capability.invoke
   -- (correlation opened, minted id on the bus), and defers.
   h.router:fire("rt", "llm", "generic-tool.ToolCalls", {
-    calls = { { id = "call-1", name = "bash", args = { command = "sleep 10" } } },
+    calls = { { id = "call-1", name = "shell.script", args = { script = "sleep 10", cwd = ".", timeout = { present = false, milliseconds = 0 } } } },
   })
   local invoke = find_kind(h.bus, "tool.invoke")
   assert_true(invoke ~= nil, "run-tool put a tool.invoke on the bus")
@@ -195,7 +195,7 @@ do
   local h = harness()
 
   h.router:fire("rt", "llm", "generic-tool.ToolCalls", {
-    calls = { { id = "call-1", name = "bash", args = { command = "sleep 10" } } },
+    calls = { { id = "call-1", name = "shell.script", args = { script = "sleep 10", cwd = ".", timeout = { present = false, milliseconds = 0 } } } },
   })
   local invoke = find_kind(h.bus, "tool.invoke")
   assert_true(invoke ~= nil, "run-tool put a tool.invoke on the bus")

@@ -13,8 +13,8 @@
 --
 -- ## Per-tool policies
 --
--- `bash`: passes the command through `da` (https://github.com/amenocturne/da),
--- a bash-command classifier with explicit policy flags. da reads the
+-- `shell.script`: passes the command through `da` (https://github.com/amenocturne/da),
+-- a shell-script classifier with explicit policy flags. da reads the
 -- command on stdin and exits 0 / 1 / 2 for approve / defer / deny. We
 -- bind a fixed policy stack matching upstream's CC hook example:
 --
@@ -39,22 +39,26 @@
 --
 -- ## Registration seam
 --
--- `build{ read_only_tools, auto_approve_tools, bash_fastpaths }` returns
--- the actor spec. `read_only_tools` is the canonical inventory supplied by the
--- composition; the remaining seams are config-owned policy:
+-- `build{ read_only_tools, auto_approve_tools, shell_fastpaths,
+-- process_fastpaths }` returns the actor spec. `read_only_tools` is the
+-- canonical inventory supplied by the composition; the remaining seams are
+-- config-owned policy:
 --   * `auto_approve_tools` — tool names auto-approved unconditionally
 --     (e.g. a typed read-only wrapper that is schema-limited to safe
---     actions). Checked after yolo, before the edit/write/bash rules.
---   * `bash_fastpaths` — list of `function(command, read_only) -> bool`.
---     If any returns true the bash command is approved before `da` is
+--     actions). Checked after yolo, before the edit/write/shell/process rules.
+--   * `shell_fastpaths` — list of `function(script, read_only) -> bool`.
+--     If any returns true the shell script is approved before `da` is
 --     consulted. The predicate encodes its own read_only gating.
+--   * `process_fastpaths` — list of `function(argv, args, read_only) -> bool`.
+--     Predicates inspect the original argument vector; process arguments are
+--     never joined into shell text. Unknown process shapes fail closed.
 -- A downstream config passes its policy (e.g. a `mirror-projects` read
 -- fast-path) instead of forking this file.
 --
 -- ## Failure modes
 --
 -- `da` is installed by the plugin manager. If it is missing or cannot be
--- probed, fail loudly: the runtime is mis-installed and bash classification
+-- probed, fail loudly: the runtime is mis-installed and shell-script classification
 -- must not silently degrade.
 
 local envelope     = require("core.envelope")
@@ -98,7 +102,7 @@ local function auto_denial_reason(tool)
          "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
 end
 
--- build{ read_only_tools, auto_approve_tools, bash_fastpaths } -> actor spec.
+-- build{ read_only_tools, auto_approve_tools, shell_fastpaths, process_fastpaths } -> actor spec.
 -- State
 -- (da_cmd cache, gate_mode) is per-build so instances don't share.
 local function build(opts)
@@ -112,7 +116,8 @@ local function build(opts)
   for _, name in ipairs(opts.auto_approve_tools or {}) do
     auto_approve[name] = true
   end
-  local bash_fastpaths = opts.bash_fastpaths or {}
+  local shell_fastpaths = opts.shell_fastpaths or {}
+  local process_fastpaths = opts.process_fastpaths or {}
 
   local gate_mode = "safe"
   -- Resolved on first use. Holds the resolved cmd path
@@ -178,15 +183,15 @@ local function build(opts)
     })
   end
 
-  -- Classify a bash command through da. Returns one of:
+  -- Classify a shell script through da. Returns one of:
   --   "approve" | "deny" | "defer"
-  -- Config `bash_fastpaths` predicates get first refusal so a config can
+  -- Config `shell_fastpaths` predicates get first refusal so a config can
   -- approve narrow, self-limited commands (e.g. read-only typed-CLI
   -- subcommands) without permitting the wider `da` surface.
   -- `da` probe/spawn failure is a runtime install error and raises.
-  local function classify_bash(command, read_only)
+  local function classify_shell_script(command, read_only)
     if type(command) ~= "string" or #command == 0 then return "defer" end
-    for _, pred in ipairs(bash_fastpaths) do
+    for _, pred in ipairs(shell_fastpaths) do
       if pred(command, read_only) then return "approve" end
     end
     local cmd = probe_da()
@@ -203,6 +208,43 @@ local function build(opts)
     if r.code == 2 then return "deny" end
     if read_only then return "deny" end
     return "defer"
+  end
+
+  local function valid_argv(argv)
+    if type(argv) ~= "table" then return false end
+    local count = 0
+    for key, value in pairs(argv) do
+      if type(key) ~= "number" or key < 1 or key % 1 ~= 0
+          or type(value) ~= "string" then
+        return false
+      end
+      count = count + 1
+    end
+    if count == 0 then return false end
+    for index = 1, count do
+      if argv[index] == nil then return false end
+    end
+    return true
+  end
+
+  local function classify_process(args, read_only)
+    if type(args) ~= "table" or not valid_argv(args.argv) then return "deny" end
+    if type(args.cwd) ~= "string" or #args.cwd == 0 then return "deny" end
+    local timeout = args.timeout
+    if type(timeout) ~= "table" or type(timeout.present) ~= "boolean"
+        or type(timeout.milliseconds) ~= "number"
+        or timeout.milliseconds % 1 ~= 0 then
+      return "deny"
+    end
+    if timeout.present then
+      if timeout.milliseconds < 1 then return "deny" end
+    elseif timeout.milliseconds ~= 0 then
+      return "deny"
+    end
+    for _, pred in ipairs(process_fastpaths) do
+      if pred(args.argv, args, read_only) then return "approve" end
+    end
+    return "deny"
   end
 
   local function defer_or_deny(body)
@@ -291,25 +333,27 @@ local function build(opts)
       return
     end
 
-    if tool == "bash" then
-      if is_ro then
-        emit_response(id, "approve")
-        return
-      end
-      local cmd = (type(args) == "table" and args.command) or nil
-      local verdict = classify_bash(cmd, is_ro)
+    if tool == "shell.script" then
+      local script = (type(args) == "table" and args.script) or nil
+      local verdict = classify_shell_script(script, is_ro)
       if verdict == "approve" then
         emit_response(id, "approve")
         return
       end
-      if verdict == "deny" then
-        -- Forbidden is a risk classification, not a runtime verdict: in
-        -- safe mode the human accepts or rejects the risk via the popup;
-        -- auto denies (no human in the loop); yolo approved above.
+      -- A classifier denial describes risk, not the user's decision. Safe
+      -- mode still presents it; auto mode denies because no human is present.
+      defer_or_deny(body)
+      return
+    end
+
+    if tool == "process.exec" then
+      local verdict = classify_process(args, is_ro)
+      if verdict == "approve" then
+        emit_response(id, "approve")
+      else
         defer_or_deny(body)
-        return
       end
-      -- defer: fall through to popup (non-read-only agents only).
+      return
     elseif is_ro then
       emit_response(id, "approve")
       return
@@ -348,7 +392,8 @@ local function build(opts)
     send_msg    = function(_) end,
 
     _internals = {
-      classify_bash             = classify_bash,
+      classify_shell_script     = classify_shell_script,
+      classify_process          = classify_process,
       handle_permission_request = handle_permission_request,
       set_mode                  = set_mode,
       get_mode                  = function() return gate_mode end,

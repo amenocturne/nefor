@@ -4,7 +4,7 @@
 
 ;; A role string cannot turn an ordinary actor into the concrete source
 ;; boundary. Source authority comes from its factory and exact node shape.
-(let [ordinary (nefor.shell.command "fake-source" "printf fake")
+(let [ordinary (nefor.shell.script "fake-source" (as nefor.contracts.ShellScriptParams {:script "printf fake" :cwd "." :timeout (nefor.contracts.no-timeout)}))
       fake-source (nefor.graph.node
                     (get ordinary "id")
                     "source"

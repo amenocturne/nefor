@@ -105,14 +105,16 @@ M.schema = {
     "inside the expression should normally stay in the foreground rather than using " ..
     "shell backgrounding. Background only when a process intentionally needs a " ..
     "separately retained lifecycle. " ..
-    "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
+    "A direct command is (nefor.process.exec \"step\" " ..
+    "(as nefor.contracts.ProcessExecParams {:argv [\"rg\" \"-n\" \"TODO\" \"src/\"] " ..
+    ":cwd nefor.process.cwd :timeout (nefor.contracts.no-timeout)})); " ..
     "compose multi-node work in a .mag graph. Commands run until process exit, " ..
     "so awaiting a persistent foreground process such as an HTTP server waits " ..
     "indefinitely. Long-lived servers and watchers must use an appropriate retained " ..
     "or background lifecycle facility when available, or one bounded command that " ..
     "starts the process, waits for readiness, performs the dependent work, and tears " ..
     "it down. Never launch a server as a normal run and await its completion. " ..
-    "nefor.shell.command-with-options opts into a wall-clock bound. " ..
+    "Use nefor.shell.script only for explicit /bin/sh programs; both operations carry an explicit timeout option. " ..
     "The call acknowledges immediately with a stable run_id; " ..
     "call await-run with that handle when your next step depends on terminal " ..
     "output. The normal owner-scoped run-completion notification remains independent. " ..

@@ -94,17 +94,17 @@ artifact pipeline, so
 the expression itself is concise:
 
 ```lisp
-(nefor.shell.command "search" "rg -n TODO src/")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
 For a one-off pipeline, keep it inside the command node:
 
 ```lisp
-(nefor.shell.command "search" "rg -n TODO src/ | sort")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
-Multi-node pipelines are full `.mag` programs: construct `source`, command,
-pipe-command, and `output` nodes, place their edges in one flat list, then pass
+Multi-node pipelines are full `.mag` programs: construct `source`, `process.exec`
+or `shell.script`, and `output` nodes, place their edges in one flat list, then pass
 a `Graph -> Graph` function to `nefor.artifact.compile`. Each compilation
 applies that function to `empty-graph` and validates the result for a fresh
 run; it does not retrieve or mutate a stored graph.

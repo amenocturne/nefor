@@ -83,19 +83,41 @@ pub enum ToolError {
         message: String,
     },
 
-    /// `bash` exceeded its wall-clock timeout. Output captured up to the
-    /// kill point is included so the caller can see what ran.
-    #[error("bash timed out after {timeout_ms}ms; partial output:\n{output}")]
-    BashTimeout {
-        /// Configured timeout in milliseconds.
-        timeout_ms: u64,
-        /// Combined stdout+stderr captured before the kill.
-        output: String,
+    /// The executable or configured working directory could not be spawned.
+    #[error("failed to spawn process `{executable}`: {message}")]
+    ProcessSpawn {
+        /// Requested argv[0].
+        executable: String,
+        /// Operating-system diagnostic.
+        message: String,
     },
 
-    /// The invocation was cancelled by the user (double-Esc interrupt): the
-    /// child process group was killed. The message is what the caller sees on
-    /// the wire as `tool.result { error }`.
-    #[error("cancelled by user")]
-    Cancelled,
+    /// Process pipe or wait handling failed after spawn.
+    #[error("process I/O failed while {operation}: {message}")]
+    ProcessIo {
+        /// Lifecycle operation which failed.
+        operation: String,
+        /// Operating-system or task diagnostic.
+        message: String,
+    },
+
+    /// The wall-clock bound elapsed. Captured streams remain separate.
+    #[error("process timed out after {timeout_ms}ms; partial stdout: {stdout:?}; partial stderr: {stderr:?}")]
+    ProcessTimeout {
+        /// Configured timeout in milliseconds.
+        timeout_ms: u64,
+        /// Stdout captured before termination.
+        stdout: String,
+        /// Stderr captured before termination.
+        stderr: String,
+    },
+
+    /// Cancellation terminated and reaped the process group.
+    #[error("process cancelled; partial stdout: {stdout:?}; partial stderr: {stderr:?}")]
+    ProcessCancelled {
+        /// Stdout captured before termination.
+        stdout: String,
+        /// Stderr captured before termination.
+        stderr: String,
+    },
 }

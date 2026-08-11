@@ -5,8 +5,8 @@
 ;; Edge identity is logical endpoints plus route, but duplicate identities must
 ;; not erase evidence that one node id denotes divergent immutable definitions.
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      operation-a (nefor.shell.command "operation" "printf a")
-      operation-b (nefor.shell.command "operation" "printf b")
+      operation-a (nefor.shell.script "operation" (as nefor.contracts.ShellScriptParams {:script "printf a" :cwd "." :timeout (nefor.contracts.no-timeout)}))
+      operation-b (nefor.shell.script "operation" (as nefor.contracts.ShellScriptParams {:script "printf b" :cwd "." :timeout (nefor.contracts.no-timeout)}))
       result (nefor.graph.output-for "result" operation-a)]
   (nefor.artifact.compile
     (fn [[base nefor.graph.Graph]] -> nefor.graph.Graph

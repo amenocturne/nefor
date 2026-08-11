@@ -2165,7 +2165,7 @@ fn mag_run_failed_prunes_after_linger() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_spawned", "run_id": "run-failaaa", "id": "bash-1", "factory": "bash" }),
+        json!({ "kind": "mag.actor_spawned", "run_id": "run-failaaa", "id": "bash-1", "factory": "shell.script" }),
     );
     dispatch_event(
         &mut engine,
@@ -2923,7 +2923,7 @@ fn ctrl_o_toggles_expanded_details() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
-            "name": "bash",
+            "name": "shell.script",
             "display": {
                 "label": "Run command",
                 "primary": { "arg": "command" },
@@ -2934,7 +2934,7 @@ fn ctrl_o_toggles_expanded_details() {
     fixture_tool_started(
         &mut engine,
         "t1",
-        "bash",
+        "shell.script",
         json!({ "command": "ls -la /tmp" }),
     );
     fixture_tool_completed(&mut engine, "t1", json!("SECRET RAW OUTPUT"), false);
@@ -3131,7 +3131,7 @@ fn denied_tool_call_renders_error_state_not_empty_output() {
     fixture_tool_started(
         &mut engine,
         "call_mock_ls",
-        "bash",
+        "shell.script",
         json!({ "command": "ls -la" }),
     );
     fixture_tool_completed(
@@ -7101,7 +7101,7 @@ fn popup_paints_opaque_background_over_transcript() {
         json!({
             "kind": "chat.tool.popup_request",
             "id": "t1",
-            "tool": "bash",
+            "tool": "shell.script",
             "args": { "command": "ls -la" },
         }),
     );
@@ -10665,7 +10665,7 @@ fn agent_previews_hide_tool_streams_but_keep_conversation_activity() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "tool-gate.tool.invoke", "id": "shell-call", "name": "bash", "args": {},
+            "kind": "tool-gate.tool.invoke", "id": "shell-call", "name": "shell.script", "args": {},
             "invocation": { "run_id": "agent-run", "actor_id": "worker.llm" }
         }),
     );

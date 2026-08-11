@@ -1,0 +1,8 @@
+;; Lexical composition only: parent traversal and absolute-looking segments are
+;; deliberately preserved rather than confined or canonicalized.
+(def join (fn [[base String] [segment String]] -> String
+  (if (= base "")
+    segment
+    (if (= segment "")
+      base
+      (str (str base "/") segment)))))

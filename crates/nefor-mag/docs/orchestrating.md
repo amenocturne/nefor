@@ -11,7 +11,7 @@ This guide describes the lead-facing workflow. See [Authoring reference](languag
 `mag-eval` compiles and launches one node expression without creating a `.mag` file:
 
 ```lisp
-(nefor.shell.command "find-todos" "rg -n TODO src/")
+(nefor.shell.script "find-todos" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
 The tool call also requires a short, 1–5-word `intent`. It returns immediately with a stable `run_id`; use `await-run` when the next decision needs its terminal result. It is appropriate for finite, one-off commands. Use a program when work needs multiple nodes, agents, routing, review, or a durable source file.

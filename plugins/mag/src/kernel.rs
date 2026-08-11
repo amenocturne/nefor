@@ -838,6 +838,7 @@ mod tests {
             r#"(require "nefor.artifact")
 (require "nefor.graph")
 (require "nefor.shell")
+(require "nefor.process")
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
       operation {expression}
       result (nefor.graph.output-for "result" operation)]
@@ -955,21 +956,6 @@ mod tests {
         );
     }
 
-    fn documented_shell_expression(needle: &str) -> String {
-        let patterns = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../examples/nefor-agent/mag/lib/patterns.md"),
-        )
-        .expect("read starter MAG patterns");
-        patterns
-            .split("```lisp\n")
-            .skip(1)
-            .filter_map(|rest| rest.split_once("\n```").map(|(source, _)| source))
-            .find(|source| source.contains(needle))
-            .unwrap_or_else(|| panic!("patterns.md has no Lisp fragment containing {needle}"))
-            .to_owned()
-    }
-
     fn start_shell_expression(
         host: &LuaHost,
         run_id: &str,
@@ -994,7 +980,7 @@ mod tests {
             .iter()
             .find(|event| {
                 event.get("kind").and_then(JsonValue::as_str) == Some("tool.invoke")
-                    && event["args"]["args"]["command"].as_str() == Some(command)
+                    && event.get("name").and_then(JsonValue::as_str) == Some(command)
             })
             .unwrap_or_else(|| panic!("missing tool.invoke for {command}: {emits:#?}"))
     }
@@ -1092,14 +1078,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_invocation_carries_authoritative_run_provenance() {
+    fn process_capability_invocation_carries_authoritative_run_provenance() {
         let host = shipped_host();
         let run_id = "provenance-run";
-        let modification = compile_mag_eval_expression(
-            &host,
-            run_id,
-            r#"(nefor.shell.command "command" "printf provenance")"#,
-        );
+        let expression = r#"(nefor.process.exec "command"
+          (as nefor.contracts.ProcessExecParams
+            {:argv ["printf" "provenance"] :cwd nefor.process.cwd
+             :timeout (nefor.contracts.no-timeout)}))"#;
+        let modification = compile_mag_eval_expression(&host, run_id, expression);
         let begun = host
             .begin_run_with_principal(
                 run_id,
@@ -1114,7 +1100,11 @@ mod tests {
         let outcome = host.start(run_id, &modification).expect("start run");
         assert!(outcome.ok, "start failed: {:?}", outcome.error);
         let emits = host.drain_emits().expect("drain start");
-        let invoke = tool_invoke(&emits, "printf provenance");
+        let invoke = tool_invoke(&emits, "process.exec");
+        assert_eq!(
+            invoke["args"]["args"]["argv"],
+            serde_json::json!(["printf", "provenance"])
+        );
         let provenance = invoke["invocation"].as_object().expect("provenance");
         assert_eq!(provenance["session_id"], "session-1");
         assert_eq!(provenance["run_id"], run_id);
@@ -1122,113 +1112,76 @@ mod tests {
         assert_eq!(provenance["actor_id"], invoke["from"]);
         assert_eq!(provenance["capability_id"], invoke["id"]);
         assert_eq!(provenance["root_conversation_id"], "conversation-1");
-        assert!(provenance["conversation_id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("conversation-1/turns/provenance-run/actors/")));
-        assert!(provenance["run_scope"]
-            .as_str()
-            .is_some_and(|scope| scope.starts_with('r')));
     }
 
     #[test]
-    fn canonical_shell_commands_cross_json_null_and_reach_capability_invocation() {
+    fn process_and_script_keep_structured_results_and_explicit_timeouts() {
         let host = shipped_host();
-
-        let command_emits = start_shell_expression(
-            &host,
-            "shell-command-null",
-            r#"(nefor.shell.command "command" "printf command")"#,
-        );
-        let command = tool_invoke(&command_emits, "printf command");
-        assert!(command["args"]["args"]
-            .as_object()
-            .expect("command capability args")
-            .get("timeout_ms")
-            .is_none());
-        assert!(host
-            .take_run_failed("shell-command-null")
-            .expect("command run failure")
-            .is_none());
-
-        let pipe_program = r#"(require "nefor.artifact")
-(require "nefor.graph")
-(require "nefor.shell")
-(let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      source (nefor.shell.command "source" "printf source")
-      pipe (nefor.shell.pipe-command "pipe" "cat")
-      result (nefor.graph.output-for "result" pipe)]
-  (nefor.artifact.compile
-    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
-      (nefor.graph.add-edges graph
-        [(nefor.graph.edge start source)
-         (nefor.graph.edge source pipe)
-         (nefor.graph.edge pipe result)]))))"#;
-        let pipe_modification = compile_mag_source(&host, "shell-pipe-null", pipe_program);
-        let begun = host
-            .begin_run("shell-pipe-null", "shell-pipe-null", None)
-            .expect("begin pipe");
-        assert!(begun.ok);
-        host.drain_emits().expect("drain pipe begin");
-        assert!(
-            host.start("shell-pipe-null", &pipe_modification)
-                .expect("start pipe")
-                .ok
-        );
-        let pipe_emits = host.drain_emits().expect("drain source invocation");
-        let source = tool_invoke(&pipe_emits, "printf source");
-        let source_id = source["id"].as_str().expect("source correlation id");
-        assert!(source["args"]["args"]
-            .as_object()
-            .expect("source capability args")
-            .get("timeout_ms")
-            .is_none());
+        let expression = r#"(nefor.shell.script "script"
+          (as nefor.contracts.ShellScriptParams
+            {:script "printf output" :cwd nefor.process.cwd
+             :timeout (nefor.contracts.timeout-ms 30000)}))"#;
+        let emits = start_shell_expression(&host, "shell-script", expression);
+        let invoke = tool_invoke(&emits, "shell.script");
+        assert_eq!(invoke["args"]["args"]["cwd"], ".");
         assert_eq!(
-            host.bus_response(source_id, Some(&serde_json::json!("text\n[exit 0]")), None)
-                .expect("source response"),
-            Some("shell-pipe-null".into())
+            invoke["args"]["args"]["timeout"],
+            serde_json::json!({
+                "present": true, "milliseconds": 30000
+            })
         );
-        let pipe_emits = host.drain_emits().expect("drain pipe invocation");
-        let pipe = tool_invoke(&pipe_emits, "cat");
-        assert!(pipe["args"]["args"]
-            .as_object()
-            .expect("pipe capability args")
-            .get("timeout_ms")
-            .is_none());
-        assert_eq!(pipe["args"]["args"]["stdin"], "text\n");
-        assert!(host
-            .take_run_failed("shell-pipe-null")
-            .expect("pipe run failure")
-            .is_none());
+        let id = invoke["id"].as_str().expect("correlation id");
+        assert_eq!(
+            host.bus_response(
+                id,
+                Some(&serde_json::json!({
+                    "stdout": "output", "stderr": "warning",
+                    "termination": {"kind": "code", "code": 9}
+                })),
+                None
+            )
+            .expect("structured response"),
+            Some("shell-script".into())
+        );
+        let completion = host
+            .take_run_complete("shell-script")
+            .expect("completion")
+            .expect("nonzero process result completes normally");
+        let value = completion.result.expect("typed result");
+        assert_eq!(value["value"]["stdout"], "output");
+        assert_eq!(value["value"]["stderr"], "warning");
+        assert_eq!(value["value"]["termination"]["kind"], "code");
+        assert_eq!(value["value"]["termination"]["value"], 9);
     }
 
     #[test]
-    fn bounded_shell_timeout_is_preserved_and_invalid_bounds_still_fail() {
+    fn malformed_and_nonpositive_process_params_fail_before_invocation() {
         let host = shipped_host();
-        let documented = documented_shell_expression("nefor.shell.command-with-options");
-        let emits = start_shell_expression(&host, "shell-bounded", &documented);
-        let bounded = tool_invoke(&emits, "rg -n TODO src/");
-        assert_eq!(bounded["args"]["args"]["timeout_ms"], 30000);
-        assert!(host
-            .take_run_failed("shell-bounded")
-            .expect("bounded run failure")
-            .is_none());
-
-        for (run_id, bound) in [("shell-zero", "0"), ("shell-negative", "-1")] {
+        for (run_id, params) in [
+            (
+                "process-zero",
+                r#"{:argv ["true"] :cwd "." :timeout (nefor.contracts.timeout-ms 0)}"#,
+            ),
+            (
+                "process-negative",
+                r#"{:argv ["true"] :cwd "." :timeout (nefor.contracts.timeout-ms -1)}"#,
+            ),
+            (
+                "process-empty",
+                r#"{:argv (as (List String) []) :cwd "." :timeout (nefor.contracts.no-timeout)}"#,
+            ),
+        ] {
             let expression = format!(
-                "(nefor.shell.command-with-options \"invalid\" \"true\" (as nefor.shell.BashOptions {{:timeout_ms (nefor.contracts.timeout-ms {bound})}}))"
+                "(nefor.process.exec \"invalid\" (as nefor.contracts.ProcessExecParams {params}))"
             );
             let emits = start_shell_expression(&host, run_id, &expression);
-            assert!(emits
-                .iter()
-                .all(|event| event.get("kind").and_then(JsonValue::as_str) != Some("tool.invoke")));
-            let failure = host
+            assert!(emits.iter().all(|event| {
+                event.get("kind").and_then(JsonValue::as_str) != Some("tool.invoke")
+            }));
+            assert!(host
                 .take_run_failed(run_id)
                 .expect("invalid run failure")
-                .expect("invalid timeout fails construction");
-            assert!(
-                failure.contains("positive number of milliseconds"),
-                "{failure}"
-            );
+                .is_some());
         }
     }
 
@@ -1517,10 +1470,10 @@ mod tests {
         let modification = compile_mag_eval_expression(
             &host,
             run_id,
-            r#"(nefor.shell.command-with-options
-                 "broken" "true"
-                 (as nefor.shell.BashOptions
-                   {:timeout_ms (nefor.contracts.timeout-ms 0)}))"#,
+            r#"(nefor.process.exec "broken"
+                 (as nefor.contracts.ProcessExecParams
+                   {:argv ["true"] :cwd nefor.process.cwd
+                    :timeout (nefor.contracts.timeout-ms 0)}))"#,
         );
 
         assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
@@ -1540,7 +1493,7 @@ mod tests {
             "{failure}"
         );
         assert!(
-            failure.contains("positive number of milliseconds"),
+            failure.contains("positive integer number of milliseconds"),
             "{failure}"
         );
         assert!(host

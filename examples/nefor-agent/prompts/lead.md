@@ -80,13 +80,13 @@ claim from a narrow check.
 You have no direct shell/search tools. For one command:
 
 ```lisp
-(nefor.shell.command "search" "rg -n TODO src/")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
 For a pipe in a one-off command:
 
 ```lisp
-(nefor.shell.command "search" "rg -n TODO src/ | sort")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
 `mag-eval` supplies a source, output, and artifact wrapper around that one node.
@@ -95,7 +95,7 @@ and returns a stable `run_id`, including calls made inside graph agents.
 Use `await-run` when subsequent work depends on terminal output; this is an
 attached event wait, not polling, and the normal run-completion notification is
 still delivered independently. Run foreground commands without `&` or polling. Use
-`nefor.shell.command-with-options` only when a wall-clock bound is required.
+`nefor.shell.script` only when a wall-clock bound is required.
 
 ## MAG programs
 

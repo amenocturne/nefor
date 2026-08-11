@@ -1,7 +1,7 @@
-//! basic-tools — NCP v0.1 plugin: file/bash/etc. tool primitives.
+//! basic-tools — NCP v0.1 plugin: file, search, and process primitives.
 //!
-//! v1 ships a single tool — `read_file`. Future tools (`write_file`, `bash`,
-//! …) land here behind permission gating (see plugins/tool-gate).
+//! Mutating and process capabilities are intended to be composed behind
+//! permission gating (see plugins/tool-gate).
 //!
 //! Wire contract (see `docs/chat-contract.md` → "Tool calling (v1)"):
 //!
@@ -32,12 +32,12 @@ use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ToolError;
-use crate::tools::{bash, run_tool, TOOLS};
+use crate::tools::{process, process_exec, run_tool, shell_script, TOOLS};
 
 const CHANNEL_CAP: usize = 256;
 
-/// In-flight cancellable invocations, keyed by the invoke id. Only `bash`
-/// registers here (it is the one tool that holds a killable OS process); a
+/// In-flight cancellable invocations, keyed by invoke id. Only process
+/// capabilities register here because they hold killable OS process groups; a
 /// `basic-tools.tool.cancel { id }` fires the matching sender, which trips the
 /// running task's cancel arm and kills the child's process group.
 type Cancels = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
@@ -192,21 +192,27 @@ fn is_tool_cancel_event(body: &Map<String, Value>) -> bool {
 
 /// Handle a `basic-tools.tool.cancel { id }` (the gate forwards the kernel's
 /// interrupt cancel for the in-flight firing id). Fire the matching sender so
-/// the running bash task kills its process group and returns
-/// [`ToolError::Cancelled`]. No entry means the invocation already finished
-/// (or was never a bash) — a clean no-op.
+/// the running process task kills its process group and returns
+/// [`ToolError::ProcessCancelled`]. No entry means the invocation already
+/// finished (or was never a process capability) — a clean no-op.
 fn handle_tool_cancel(cancels: &Cancels, body: &Map<String, Value>) {
     let id = match body.get("id").and_then(Value::as_str) {
         Some(i) => i,
         None => return,
     };
-    let taken = cancels.lock().expect("cancels mutex poisoned").remove(id);
+    let taken = match cancels.lock() {
+        Ok(mut registrations) => registrations.remove(id),
+        Err(error) => {
+            tracing::error!(%error, "process cancellation registry poisoned");
+            return;
+        }
+    };
     match taken {
         Some(tx) => {
             // Err means the task already completed and dropped its receiver —
             // nothing left to cancel.
             let _ = tx.send(());
-            tracing::info!(id = %id, "tool.cancel: signalled in-flight bash to terminate");
+            tracing::info!(id = %id, "tool.cancel: signalled in-flight process to terminate");
         }
         None => {
             tracing::info!(id = %id, "tool.cancel: no in-flight cancellable invocation; no-op");
@@ -222,18 +228,25 @@ fn spawn_tool_invoke(
     let out_tx = out_tx.clone();
     let body = body.clone();
     let cancels = Arc::clone(cancels);
-    // Register a cancel channel only for bash (the one tool with a killable
-    // process). The id must be present to correlate a cancel back.
+    // Register cancellation for either capability backed by an OS process.
     let id = body.get("id").and_then(Value::as_str).map(str::to_owned);
-    let is_bash = body.get("name").and_then(Value::as_str) == Some(bash::NAME);
-    let cancel_rx = match (&id, is_bash) {
+    let is_process = body
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == process_exec::NAME || name == shell_script::NAME);
+    let cancel_rx = match (&id, is_process) {
         (Some(id), true) => {
             let (tx, rx) = oneshot::channel();
-            cancels
-                .lock()
-                .expect("cancels mutex poisoned")
-                .insert(id.clone(), tx);
-            Some(rx)
+            match cancels.lock() {
+                Ok(mut registrations) => {
+                    registrations.insert(id.clone(), tx);
+                    Some(rx)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "process cancellation registry poisoned");
+                    None
+                }
+            }
         }
         _ => None,
     };
@@ -244,7 +257,12 @@ fn spawn_tool_invoke(
         // Clear the registration on completion so a late cancel is a no-op and
         // the map doesn't leak finished invocations.
         if let Some(id) = id {
-            cancels.lock().expect("cancels mutex poisoned").remove(&id);
+            match cancels.lock() {
+                Ok(mut registrations) => {
+                    registrations.remove(&id);
+                }
+                Err(error) => tracing::error!(%error, "process cancellation registry poisoned"),
+            }
         }
     });
 }
@@ -300,25 +318,26 @@ async fn handle_tool_invoke(
         return Ok(());
     }
 
-    // bash gets the cancellable path (it holds a killable OS process); every
-    // other tool is a pure fast read with nothing to abort.
-    let outcome = if name == bash::NAME {
+    // Process capabilities share streaming and cancellation mechanics.
+    let outcome = if name == process_exec::NAME || name == shell_script::NAME {
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
         let stream_out = out_tx.clone();
         let stream_id = id.clone();
         let forward = tokio::spawn(async move {
             while let Some(chunk) = stream_rx.recv().await {
                 let (stream, bytes) = match chunk {
-                    bash::StreamChunk::Stdout(bytes) => ("stdout", bytes),
-                    bash::StreamChunk::Stderr(bytes) => ("stderr", bytes),
+                    process::StreamChunk::Stdout(bytes) => ("stdout", bytes),
+                    process::StreamChunk::Stderr(bytes) => ("stderr", bytes),
                 };
                 let text = String::from_utf8_lossy(&bytes);
                 let _ = send_event(&stream_out, tool_stream_body(&stream_id, stream, &text)).await;
             }
         });
-        let result = bash::run_cancellable_streaming(&args, cancel, Some(stream_tx))
-            .await
-            .map(Value::String);
+        let result = if name == process_exec::NAME {
+            process_exec::run_cancellable_streaming(&args, cancel, Some(stream_tx)).await
+        } else {
+            shell_script::run_cancellable_streaming(&args, cancel, Some(stream_tx)).await
+        };
         let _ = forward.await;
         result
     } else {
@@ -662,8 +681,12 @@ mod tests {
         let slow = json!({
             "kind": "basic-tools.tool.invoke",
             "id": "slow-call",
-            "name": "bash",
-            "args": { "command": "sleep 0.2; echo SLOW_DONE" }
+            "name": "shell.script",
+            "args": {
+                "script": "sleep 0.2; echo SLOW_DONE",
+                "cwd": ".",
+                "timeout": { "present": false, "milliseconds": 0 }
+            }
         })
         .as_object()
         .expect("obj")
@@ -671,8 +694,12 @@ mod tests {
         let fast = json!({
             "kind": "basic-tools.tool.invoke",
             "id": "fast-call",
-            "name": "bash",
-            "args": { "command": "echo FAST_DONE" }
+            "name": "shell.script",
+            "args": {
+                "script": "echo FAST_DONE",
+                "cwd": ".",
+                "timeout": { "present": false, "milliseconds": 0 }
+            }
         })
         .as_object()
         .expect("obj")
@@ -692,11 +719,13 @@ mod tests {
         );
         assert!(first
             .get("output")
+            .and_then(|output| output.get("stdout"))
             .and_then(Value::as_str)
             .is_some_and(|s| s.contains("FAST_DONE")));
         assert_eq!(second.get("id").and_then(Value::as_str), Some("slow-call"));
         assert!(second
             .get("output")
+            .and_then(|output| output.get("stdout"))
             .and_then(Value::as_str)
             .is_some_and(|s| s.contains("SLOW_DONE")));
     }

@@ -12,7 +12,7 @@
 //! v1 deliberately does NOT validate path traversal or sandbox — the caller
 //! passes whatever path they want, and basic-tools is trusted on the bus.
 //! Sandboxing lands with the permission-gating story alongside `write_file`
-//! and `bash`.
+//! and the process capabilities.
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};

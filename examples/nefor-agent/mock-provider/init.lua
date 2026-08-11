@@ -194,8 +194,8 @@ local HELP_BODY = table.concat({
   "",
   "- 📄 `read readme` — uses the `read_file` tool to fetch `README.md`",
   "  (requires `read_file` on the tool-gate allowlist, or auto)",
-  "- `what is my cwd` — uses `mag-eval` with `nefor.shell.command`",
-  "- 📁 `list files` — uses `mag-eval` with `nefor.shell.command`",
+  "- `what is my cwd` — uses `mag-eval` with `nefor.shell.script`",
+  "- 📁 `list files` — uses `mag-eval` with `nefor.shell.script`",
   "",
   "### 3. Memory",
   "",
@@ -531,7 +531,7 @@ local function pick_response_for(history)
         {
           id        = mint_tool_id("pwd"),
           name      = "mag-eval",
-          arguments = { intent = "Inspect workspace", expr = '(nefor.shell.command "pwd" "pwd")' },
+          arguments = { intent = "Inspect workspace", expr = '(nefor.shell.script "pwd" (as nefor.contracts.ShellScriptParams {:script "pwd" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")' },
         },
       },
     }
@@ -546,7 +546,7 @@ local function pick_response_for(history)
         {
           id        = mint_tool_id("ls"),
           name      = "mag-eval",
-          arguments = { intent = "Inspect workspace", expr = '(nefor.shell.command "ls" "ls -la")' },
+          arguments = { intent = "Inspect workspace", expr = '(nefor.shell.script "ls" (as nefor.contracts.ShellScriptParams {:script "ls -la" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")' },
         },
       },
     }

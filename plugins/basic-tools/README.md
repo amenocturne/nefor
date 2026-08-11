@@ -1,10 +1,10 @@
 # basic-tools
 
-NCP plugin: file, image, search, edit, and shell tool primitives.
+NCP plugin: file, image, search, edit, and process capability primitives.
 
 The shipped tool set is `read_file`, `read_image`, `write_file`, `edit_file`,
-`bash`, and `search_text`. Destructive or long-running operations are intended
-to be run behind `tool-gate` in the starter composition.
+`process.exec`, `shell.script`, and `search_text`. Destructive or long-running
+operations are intended to be run behind `tool-gate` in the starter composition.
 
 ## Wire contract
 
@@ -75,8 +75,19 @@ it with an explicit error when the active model does not support image input.
 
 - `write_file` — write text content to a path.
 - `edit_file` — replace one exact string match in an existing text file.
-- `bash` — run a shell command; supports cancellation via
-  `basic-tools.tool.cancel { id }`.
+- `process.exec` — execute required structured `argv` with explicit `cwd` and
+  timeout record.
+- `shell.script` — lower a script to `["/bin/sh", "-c", script]` and use the
+  same process executor.
+
+Both process capabilities accept optional `stdin`, stream stdout and stderr
+independently, and return structured JSON with separate `stdout`, `stderr`, and
+`termination` (`code` or `signal`). Nonzero exit codes are successful result
+data. Validation, spawn, I/O, timeout, and cancellation failures use the error
+channel; timeout and cancellation diagnostics retain partial stdout/stderr
+after killing and reaping the dedicated process group. Both support
+`basic-tools.tool.cancel { id }`.
+
 - `search_text` — search text under files/directories.
 
 In the starter these are composed behind `tool-validator` and `tool-gate`, so

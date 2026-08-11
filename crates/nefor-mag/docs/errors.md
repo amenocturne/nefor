@@ -58,7 +58,7 @@ The agent requests correction up to `:max-corrections`. When the budget is exhau
 
 ## Shell failures and hangs
 
-Shell nodes are unbounded unless configured with `timeout-ms`. A command that never exits keeps its run nonterminal, so `await-run` also waits indefinitely. Use `command-with-options` for operations that need a wall-clock bound. Never launch a persistent foreground server or watcher as a normal awaited run.
+Process and shell nodes are unbounded when their required timeout record uses `no-timeout`. A process that never exits keeps its run nonterminal, so `await-run` also waits indefinitely. Use `timeout-ms` in the `process.exec` or `shell.script` parameter record when an operation needs a wall-clock bound. Never launch a persistent foreground server or watcher as a normal awaited run.
 
 A compile success proves the command node is well-formed, not that its executable, working directory, permissions, or exit status will succeed. Handle routeable command outcomes where the library exposes them; otherwise an unhandled runtime failure fails the run.
 

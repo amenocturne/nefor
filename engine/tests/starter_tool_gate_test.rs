@@ -795,7 +795,7 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
             -- No instruction files under cwd in this test, so this contributes no reminder.
             {{ type = "event", from = "agentic-loop",
               body = {{ kind = "tool-gate.tool.invoke", id = "call-2",
-                       name = "bash", args = {{ command = "echo hi" }} }} }},
+                       name = "shell.script", args = {{ script = "echo hi", cwd = ".", timeout = {{ present = false, milliseconds = 0 }} }} }} }},
         }})
         "#,
         p = touched_str,

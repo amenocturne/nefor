@@ -5,7 +5,7 @@
 ;; A terminal ordinary actor is not the concrete output boundary merely
 ;; because its author writes the output role string.
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      ordinary (nefor.shell.command "fake-output" "printf fake")
+      ordinary (nefor.shell.script "fake-output" (as nefor.contracts.ShellScriptParams {:script "printf fake" :cwd "." :timeout (nefor.contracts.no-timeout)}))
       fake-output (nefor.graph.node
                     (get ordinary "id")
                     "output"

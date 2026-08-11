@@ -5,7 +5,7 @@
 ;; Initial messages are boundary authority, not a capability ordinary nodes
 ;; may obtain by placing a message in their record.
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      operation (nefor.shell.command "operation" "true")
+      operation (nefor.shell.script "operation" (as nefor.contracts.ShellScriptParams {:script "true" :cwd "." :timeout (nefor.contracts.no-timeout)}))
       injected (nefor.graph.node
                  (get operation "id")
                  "ordinary"

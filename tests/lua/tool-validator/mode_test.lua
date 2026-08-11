@@ -42,21 +42,21 @@ local function fresh(mode)
   _test.calls_clear()
 end
 
--- safe: a deferred bash classification opens a popup and does not deny.
+-- safe: a deferred shell script classification opens a popup and does not deny.
 do
   fresh("safe")
-  feed({ kind = "chat.tool.permission_request", id = "perm-safe", tool = "bash", args = { command = "maybe" } })
+  feed({ kind = "chat.tool.permission_request", id = "perm-safe", tool = "shell.script", args = { script = "maybe" } })
   local calls = decode_calls()
   assert_eq(#calls, 1, "safe defer emits one envelope")
   assert_eq(calls[1].kind, "chat.tool.popup_request", "safe defer opens popup")
   assert_eq(calls[1].id, "perm-safe", "popup keeps id")
 end
 
--- safe: even a forbidden bash classification opens a popup. Safe mode
+-- safe: even a forbidden shell script classification opens a popup. Safe mode
 -- means interactive governance, not hard runtime denial.
 do
   fresh("safe")
-  feed({ kind = "chat.tool.permission_request", id = "perm-safe-forbidden", tool = "bash", args = { command = "forbidden rm" } })
+  feed({ kind = "chat.tool.permission_request", id = "perm-safe-forbidden", tool = "shell.script", args = { script = "forbidden rm" } })
   local calls = decode_calls()
   assert_eq(#calls, 1, "safe forbidden emits one envelope")
   assert_eq(calls[1].kind, "chat.tool.popup_request", "safe forbidden opens popup")
@@ -66,7 +66,7 @@ end
 -- auto: the same deferred request is denied with recovery text and no popup.
 do
   fresh("auto")
-  feed({ kind = "chat.tool.permission_request", id = "perm-auto", tool = "bash", args = { command = "maybe" } })
+  feed({ kind = "chat.tool.permission_request", id = "perm-auto", tool = "shell.script", args = { script = "maybe" } })
   local calls = decode_calls()
   assert_eq(#calls, 1, "auto defer emits one envelope")
   assert_eq(calls[1].kind, "tool.permission_response", "auto defer denies")
@@ -75,10 +75,10 @@ do
     "auto denial includes recovery marker")
 end
 
--- auto: forbidden bash stays denied because auto has no human in the loop.
+-- auto: forbidden shell script stays denied because auto has no human in the loop.
 do
   fresh("auto")
-  feed({ kind = "chat.tool.permission_request", id = "perm-auto-forbidden", tool = "bash", args = { command = "forbidden rm" } })
+  feed({ kind = "chat.tool.permission_request", id = "perm-auto-forbidden", tool = "shell.script", args = { script = "forbidden rm" } })
   local calls = decode_calls()
   assert_eq(#calls, 1, "auto forbidden emits one envelope")
   assert_eq(calls[1].kind, "tool.permission_response", "auto forbidden denies")
@@ -88,7 +88,7 @@ end
 -- yolo: defensive approve if a prompt-mode request reaches the validator.
 do
   fresh("yolo")
-  feed({ kind = "chat.tool.permission_request", id = "perm-yolo", tool = "bash", args = { command = "maybe" } })
+  feed({ kind = "chat.tool.permission_request", id = "perm-yolo", tool = "shell.script", args = { script = "maybe" } })
   local calls = decode_calls()
   assert_eq(#calls, 1, "yolo emits one envelope")
   assert_eq(calls[1].kind, "tool.permission_response", "yolo approves")
@@ -177,6 +177,61 @@ do
   local calls = decode_calls()
   assert_eq(#calls, 1, "mixed allowlist emits one envelope")
   assert_eq(calls[1].kind, "chat.tool.popup_request", "mixed allowlist is not read-only")
+end
+
+-- process.exec preserves argv as structured data. Only an explicit structural
+-- predicate may approve it; malformed and unknown shapes fail closed.
+do
+  local seen
+  local validator = tv_lib.build {
+    process_fastpaths = {
+      function(argv, args, read_only)
+        seen = { argv = argv, args = args, read_only = read_only }
+        return read_only and argv[1] == "rg" and argv[2] == "--files" and #argv == 2
+      end,
+    },
+    read_only_tools = { "process.exec" },
+  }
+  validator._internals.set_mode("safe")
+  _test.calls_clear()
+  validator.receive_msg(make_entry({
+    kind = "chat.tool.permission_request",
+    id = "process-fastpath",
+    tool = "process.exec",
+    allowlist = { "process.exec" },
+    args = { argv = { "rg", "--files" }, cwd = "/repo with spaces",
+      timeout = { present = true, milliseconds = 5000 } },
+  }))
+  local calls = decode_calls()
+  assert_eq(calls[1].decision, "approve", "proven structural process fast path approves")
+  assert_eq(seen.argv[1], "rg", "predicate sees executable boundary")
+  assert_eq(seen.argv[2], "--files", "predicate sees argument boundary")
+  assert_eq(seen.args.cwd, "/repo with spaces", "predicate sees cwd separately")
+  assert_eq(seen.args.timeout.milliseconds, 5000, "predicate sees timeout separately")
+  assert_eq(seen.read_only, true, "predicate sees capability classification")
+
+  local cases = {
+    { id = "unknown", args = { argv = { "rg", "TODO" }, cwd = ".", timeout = { present = false, milliseconds = 0 } } },
+    { id = "joined", args = { argv = "rg --files", cwd = ".", timeout = { present = false, milliseconds = 0 } } },
+    { id = "empty", args = { argv = {}, cwd = ".", timeout = { present = false, milliseconds = 0 } } },
+    { id = "hole", args = { argv = { [1] = "rg", [3] = "--files" }, cwd = ".", timeout = { present = false, milliseconds = 0 } } },
+    { id = "cwd", args = { argv = { "rg", "--files" }, cwd = "", timeout = { present = false, milliseconds = 0 } } },
+    { id = "timeout", args = { argv = { "rg", "--files" }, cwd = ".", timeout = { present = true, milliseconds = 0 } } },
+  }
+  for _, case in ipairs(cases) do
+    validator._internals.reset()
+    validator._internals.set_mode("auto")
+    _test.calls_clear()
+    validator.receive_msg(make_entry({
+      kind = "chat.tool.permission_request",
+      id = "process-" .. case.id,
+      tool = "process.exec",
+      allowlist = { "process.exec" },
+      args = case.args,
+    }))
+    calls = decode_calls()
+    assert_eq(calls[1].decision, "deny", case.id .. " process shape fails closed")
+  end
 end
 
 -- Capability validation is fail-closed before every mode-specific policy,

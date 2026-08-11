@@ -29,7 +29,9 @@
 
 (type DaPolicy {:rules (Map String String)})
 (type Timeout {:present Bool :milliseconds Int})
-(type CommandFailure {:error String :command String})
+(type TerminationStatus {:kind String :value Int})
+(type ProcessResult {:stdout String :stderr String :termination TerminationStatus})
+(type ProcessFailure {:operation String :error String})
 
 (def no-identifier (fn [] -> OptionalIdentifier
   (as OptionalIdentifier {:present false :value ""})))
@@ -53,8 +55,12 @@
 (type RunToolParams {:tools (List String)
                      :da-policy DaPolicy})
 (type ToolResultParams {})
-(type BashParams {:command String
-                  :timeout_ms Timeout})
+(type ProcessExecParams {:argv (List String)
+                         :cwd String
+                         :timeout Timeout})
+(type ShellScriptParams {:script String
+                         :cwd String
+                         :timeout Timeout})
 (type HumanParams {:prompt String})
 (type SinkParams {})
 (type SourceParams [T] {:value T :value_type SemanticTypeId})
@@ -101,10 +107,15 @@
    :input ToolHandle
    :output ProviderInput})
 
-(foreign nefor.factory.bash
-  {:params BashParams
+(foreign nefor.factory.process-exec
+  {:params ProcessExecParams
    :input (| Unit Text)
-   :output Text})
+   :output ProcessResult})
+
+(foreign nefor.factory.shell-script
+  {:params ShellScriptParams
+   :input (| Unit Text)
+   :output ProcessResult})
 
 (foreign nefor.factory.human
   {:params HumanParams

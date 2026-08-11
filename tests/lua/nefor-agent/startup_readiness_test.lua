@@ -8,9 +8,9 @@ local function assert_eq(actual, expected, message)
 end
 
 local required_plugins = { "provider", "mag", "tool-gate", "basic-tools", "chat-surface" }
-local required_tools = { "read_file", "bash", "mag" }
+local required_tools = { "read_file", "process.exec", "shell.script", "mag" }
 local sources = {
-  ["basic-tools"] = { "read_file", "bash" },
+  ["basic-tools"] = { "read_file", "process.exec", "shell.script" },
   ["lead-workflow"] = { "mag" },
 }
 
@@ -25,7 +25,7 @@ do
     on_ready = function() ready = ready + 1 end,
   }
   barrier.observe({ kind = "tool.register", tools = {
-    { name = "mag" }, { name = "bash" }, { name = "read_file" },
+    { name = "mag" }, { name = "shell.script" }, { name = "process.exec" }, { name = "read_file" },
   } }, "tool-gate")
   barrier.observe({ kind = "basic-tools.hello" }, "basic-tools")
   barrier.observe({ kind = "tool-gate.hello" }, "tool-gate")
@@ -49,7 +49,7 @@ do
   }
   barrier.observe({ kind = "tool.register", tools = { { name = "mag" } } }, "tool-gate")
   barrier.observe({ kind = "tool.register", tools = {
-    { name = "read_file" }, { name = "bash" },
+    { name = "read_file" }, { name = "process.exec" }, { name = "shell.script" },
   } }, "tool-gate")
   local state = barrier.snapshot()
   assert_eq(state.ready, false, "replacement catalog remains incomplete")
@@ -69,7 +69,7 @@ do
     barrier.observe({ kind = name .. ".hello" }, name)
   end
   barrier.observe({ kind = "tool.register", tools = {
-    { name = "read_file" }, { name = "bash" },
+    { name = "read_file" }, { name = "process.exec" }, { name = "shell.script" },
   } }, "tool-gate")
   barrier.timeout()
   assert(failure and failure:find("mag", 1, true), "diagnostic names missing tool")

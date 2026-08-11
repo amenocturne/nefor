@@ -573,7 +573,7 @@ do
   normal_load.body.module_roots[1] = "/mutated/envelope"
   _test.calls_clear()
   invoke_tool("roots-eval", "mag-eval", { intent = "Evaluate expression",
-    expr = '(nefor.shell.command "roots" "true")',
+    expr = '(nefor.shell.script "roots" (as nefor.contracts.ShellScriptParams {:script "true" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")',
   })
   local eval_load = latest_mag_load()
   assert_true(eval_load ~= nil, "mag-eval emits mag.load")
@@ -586,7 +586,7 @@ do
 
   fresh()
   invoke_tool("roots-eval-reset", "mag-eval", { intent = "Evaluate expression",
-    expr = '(nefor.shell.command "roots-reset" "true")',
+    expr = '(nefor.shell.script "roots-reset" (as nefor.contracts.ShellScriptParams {:script "true" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")',
   })
   local reset_load = latest_mag_load()
   assert_eq(#reset_load.body.module_roots, 1,
@@ -1826,7 +1826,7 @@ do
   agentic_loop._internals.state.current_turn = { scope = "r7" }
   feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-77",
     caller_id = "r7/cap-1", from = "lead.llm", name = "mag-eval",
-    args = { intent = "  Inspect\t files\n", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+    args = { intent = "  Inspect\t files\n", expr = "(nefor.shell.script \"x\" \"pwd\")" } })
   local load = latest_mag_load()
   assert_true(load ~= nil, "lead eval starts a compile handshake")
   assert_eq(find_call(decode_calls(), function(c) return c.body.kind == "tool.result" end), nil,
@@ -1879,7 +1879,7 @@ do
   local agent_invocation = invocation(sessions.current_id(), "subagent",
     "r9/cap-4", "worker.run-tool", "parent-run")
   invoke_tool_with_metadata("gate-88", "mag-eval",
-    { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"pwd\")" },
+    { intent = "Inspect files", expr = "(nefor.shell.script \"x\" \"pwd\")" },
     { caller_id = "r9/cap-4", invocation = agent_invocation })
   load = latest_mag_load()
   _test.calls_clear()
@@ -1932,7 +1932,7 @@ do
   agent_invocation = invocation(sessions.current_id(), "subagent",
     "r9/cap-5", "worker.run-tool", "parent-run")
   invoke_tool_with_metadata("gate-eval-cancel", "mag-eval",
-    { intent = "Wait forever", expr = "(nefor.shell.command \"x\" \"sleep 10\")" },
+    { intent = "Wait forever", expr = "(nefor.shell.script \"x\" \"sleep 10\")" },
     { caller_id = "r9/cap-5", invocation = agent_invocation })
   load = latest_mag_load()
   _test.calls_clear()
@@ -1959,7 +1959,7 @@ do
     agentic_loop._internals.state.current_turn = { scope = "r7" }
     feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = inner,
       caller_id = outer, name = "mag-eval",
-      args = { intent = "Inspect lifecycle", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+      args = { intent = "Inspect lifecycle", expr = "(nefor.shell.script \"x\" \"pwd\")" } })
     local pending_load = latest_mag_load()
     _test.calls_clear()
     feed("mag", { kind = "mag.loaded", in_reply_to = pending_load.body.id,
@@ -2086,7 +2086,7 @@ do
   agentic_loop._internals.state.current_turn = { scope = "r7" }
   feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-pending",
     caller_id = "r7/cap-9", name = "mag-eval",
-    args = { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"sleep 1\")" } })
+    args = { intent = "Inspect files", expr = "(nefor.shell.script \"x\" \"sleep 1\")" } })
   local load = latest_mag_load()
   assert_true(mag_eval._internals.state.pending_loads[load.body.id] ~= nil,
     "compile is pending before cancellation")
@@ -2170,7 +2170,7 @@ do
   agentic_loop._internals.state.current_turn = { scope = "r7" }
   feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-validation-error",
     caller_id = "r7/cap-11", name = "mag-eval",
-    args = { intent = "Validate expression", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+    args = { intent = "Validate expression", expr = "(nefor.shell.script \"x\" \"pwd\")" } })
   load = latest_mag_load()
   local invalid = artifact_from_modification(read_only_modification())
   invalid.data.result = nil
@@ -2199,7 +2199,7 @@ do
   }) do
     feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = call.inner,
       caller_id = call.outer, name = "mag-eval",
-      args = { intent = call.intent, expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+      args = { intent = call.intent, expr = "(nefor.shell.script \"x\" \"pwd\")" } })
   end
   local loads = find_calls(decode_calls(), function(c)
     return c.body.kind == "mag.load" and c.target == "mag"
@@ -2524,14 +2524,14 @@ do
   fresh()
   _test.calls_clear()
   local mag_eval = require("libs.lead-workflow.mag-eval")
-  mag_eval.handle("intent-missing", { expr = "(nefor.shell.command \"x\" \"pwd\")" })
+  mag_eval.handle("intent-missing", { expr = "(nefor.shell.script \"x\" \"pwd\")" })
   local missing = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result" and c.body.id == "intent-missing"
   end)
   assert_true(missing ~= nil and missing.body.error:find("1%-5 words") ~= nil,
     "mag-eval rejects missing intent")
   _test.calls_clear()
-  mag_eval.handle("intent-long", { intent = "one two three four five six", expr = "(nefor.shell.command \"x\" \"pwd\")" })
+  mag_eval.handle("intent-long", { intent = "one two three four five six", expr = "(nefor.shell.script \"x\" \"pwd\")" })
   local long = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result" and c.body.id == "intent-long"
   end)
@@ -2602,7 +2602,7 @@ do
   local lead_eval = invocation(owning_session, "lead", "r-eval/cap-1")
   _test.calls_clear()
   invoke_tool_with_metadata("provenance-eval-lead", "mag-eval", {
-    intent = "Inspect provenance", expr = "(nefor.shell.command \"x\" \"pwd\")",
+    intent = "Inspect provenance", expr = "(nefor.shell.script \"x\" \"pwd\")",
   }, { caller_id = "opaque-gate-inner", invocation = lead_eval })
   local eval_load = latest_mag_load()
   feed("mag", { kind = "mag.loaded", in_reply_to = eval_load.body.id,
@@ -2622,7 +2622,7 @@ do
   sessions.new()
   _test.calls_clear()
   invoke_tool_with_metadata("stale-eval", "mag-eval", {
-    intent = "Never execute", expr = "(nefor.shell.command \"x\" \"pwd\")",
+    intent = "Never execute", expr = "(nefor.shell.script \"x\" \"pwd\")",
   }, { caller_id = "r-current/cap-2", invocation = stale_eval })
   calls = decode_calls()
   stale_error = find_call(calls, function(c)

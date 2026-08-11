@@ -1958,7 +1958,7 @@ mod tests {
         let mut state = make_state();
         let advertise = advertise_body(
             "basic-tools",
-            json!([{"name": "bash", "description": "", "parameters": {}}]),
+            json!([{"name": "shell.script", "description": "", "parameters": {}}]),
         );
         handle_tools_advertise(&tx, &advertise, &mut state)
             .await
@@ -1969,7 +1969,7 @@ mod tests {
         let invoke = json!({
             "kind": "tool-gate.tool.invoke",
             "id": "r16/cap-2",
-            "name": "bash",
+            "name": "shell.script",
             "args": { "command": "sleep 10" }
         })
         .as_object()
@@ -2076,7 +2076,7 @@ mod tests {
             PendingForward {
                 outer_id: "r21/cap-1".into(),
                 source: "basic-tools".into(),
-                name: "bash".into(),
+                name: "shell.script".into(),
             },
         );
         let result = json!({"kind": "tool.result", "id": "gate-1", "output": "done"})
@@ -2137,14 +2137,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         // Default `prompt` policy + a per-tool `deny` to prove yolo wins.
         let mut policy = Policy::new(Decision::Prompt);
-        policy.set("bash", Decision::Deny);
+        policy.set("shell.script", Decision::Deny);
         let mut state = GateState::new(policy);
         state.mode = GateMode::Yolo;
         let advertise = advertise_body(
             "basic-tools",
             json!([
                 {"name": "read_file", "description": "", "parameters": {}},
-                {"name": "bash", "description": "", "parameters": {}},
+                {"name": "shell.script", "description": "", "parameters": {}},
             ]),
         );
         handle_tools_advertise(&tx, &advertise, &mut state)
@@ -2152,7 +2152,7 @@ mod tests {
             .unwrap();
         let _ = rx.recv().await; // tool.register
 
-        for (id, name) in [("y-1", "read_file"), ("y-2", "bash")] {
+        for (id, name) in [("y-1", "read_file"), ("y-2", "shell.script")] {
             let invoke = json!({
                 "kind": "tool-gate.tool.invoke",
                 "id": id,
@@ -2296,7 +2296,7 @@ mod tests {
         let mut state = GateState::new(Policy::new(Decision::Prompt));
         let advertise = advertise_body(
             "basic-tools",
-            json!([{"name": "bash", "description": "", "parameters": {}}]),
+            json!([{"name": "shell.script", "description": "", "parameters": {}}]),
         );
         handle_tools_advertise(&tx, &advertise, &mut state)
             .await
@@ -2307,7 +2307,7 @@ mod tests {
         let first = json!({
             "kind": "tool-gate.tool.invoke",
             "id": "prov-pwd",
-            "name": "bash",
+            "name": "shell.script",
             "args": { "command": "pwd" },
         })
         .as_object()
@@ -2342,7 +2342,7 @@ mod tests {
         let second = json!({
             "kind": "tool-gate.tool.invoke",
             "id": "prov-ls",
-            "name": "bash",
+            "name": "shell.script",
             "args": { "command": "ls -la" },
         })
         .as_object()
@@ -2366,11 +2366,11 @@ mod tests {
     async fn deny_policy_replies_immediately_without_prompt() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let mut policy = Policy::new(Decision::Prompt);
-        policy.set("bash", Decision::Deny);
+        policy.set("shell.script", Decision::Deny);
         let mut state = GateState::new(policy);
         let advertise = advertise_body(
             "basic-tools",
-            json!([{"name": "bash", "description": "", "parameters": {}}]),
+            json!([{"name": "shell.script", "description": "", "parameters": {}}]),
         );
         handle_tools_advertise(&tx, &advertise, &mut state)
             .await
@@ -2380,7 +2380,7 @@ mod tests {
         let invoke = json!({
             "kind": "tool-gate.tool.invoke",
             "id": "prov-x",
-            "name": "bash",
+            "name": "shell.script",
             "args": {}
         })
         .as_object()

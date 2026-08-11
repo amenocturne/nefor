@@ -107,15 +107,15 @@ A one-off `mag-eval` expression returns one node and carries a required 1–5-wo
 `intent` describing the operation:
 
 ```lisp
-(nefor.shell.command "search" "rg -n TODO src/")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
 For a pipeline, write a graph program with source, command nodes, and output:
 
 ```lisp
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      search (nefor.shell.command "search" "rg -n TODO src/")
-      sort (nefor.shell.pipe-command "sort" "sort")
+      search (nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+      sort (nefor.shell.script "sort" (as nefor.contracts.ShellScriptParams {:script "sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag nefor.contracts.Text) "mag.Text")
       result (nefor.graph.output-for "result" sort)]
   (nefor.artifact.compile
     (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
@@ -125,16 +125,17 @@ For a pipeline, write a graph program with source, command nodes, and output:
          (nefor.graph.edge sort result)]))))
 ```
 
-Shell commands are unbounded unless `nefor.shell.command-with-options` receives
-`(as nefor.shell.BashOptions
-  {:timeout_ms (nefor.contracts.timeout-ms 30000)})`.
+Shell scripts carry an explicit `ShellScriptParams` record; use `no-timeout` for an unbounded operation or `timeout-ms` for a wall-clock bound.
 
 ```lisp
-(nefor.shell.command-with-options
+(nefor.shell.script
   "bounded-search"
-  "rg -n TODO src/"
-  (as nefor.shell.BashOptions
-    {:timeout_ms (nefor.contracts.timeout-ms 30000)}))
+  (as nefor.contracts.ShellScriptParams
+    {:script "rg -n TODO src/"
+     :cwd "."
+     :timeout (nefor.contracts.timeout-ms 30000)})
+  (type-tag Unit)
+  "mag.Unit")
 ```
 
 ## Products, unions, fan-out, and cycles

@@ -577,7 +577,7 @@ do
   -- lead transcript.
   _test.calls_clear()
   send_to_loop("tool-gate", {
-    kind = "tool-gate.tool.invoke", id = "r9/cap-1", name = "bash", args = {},
+    kind = "tool-gate.tool.invoke", id = "r9/cap-1", name = "shell.script", args = {},
   })
   assert_eq(find_kind(decode_calls(), "chat.tool.start"), nil,
     "foreign-scope gate invoke must not emit lead tool events")

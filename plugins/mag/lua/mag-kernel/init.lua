@@ -50,7 +50,7 @@ end
 local run_tool = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
 local adapter = require("factories.adapter")
-local bash = require("factories.bash")
+local process = require("factories.process")
 local worktree_create = require("factories.worktree-create")
 local worktree_open = require("factories.worktree-open")
 
@@ -91,7 +91,8 @@ local function build_registry()
   seed(run_tool)
   seed(tool_result)
   seed(adapter)
-  seed(bash)
+  seed(process.exec)
+  seed(process.script)
   seed(worktree_create)
   seed(worktree_open)
   return reg

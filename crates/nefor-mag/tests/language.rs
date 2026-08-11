@@ -668,7 +668,7 @@ fn product_positions_preserve_selected_constructor_evidence() {
 fn explicit_record_refinement_reports_missing_and_unexpected_fields() {
     let root = workspace("exact-refinement");
     let error = compile(
-        "(type BashOptions {:timeout_ms Int})\n(artifact \"test.exact/v1\" (as BashOptions {:timeout-ms 30000}))",
+        "(type ProcessOptions {:timeout_ms Int})\n(artifact \"test.exact/v1\" (as ProcessOptions {:timeout-ms 30000}))",
         &root,
     )
     .unwrap_err()

@@ -111,17 +111,20 @@ There is no graph mutation API. `graph`, `add-edges`, and `remove-edges` are tot
 ```lisp
 (require "nefor.shell")
 
-(nefor.shell.command "search" "rg -n TODO src/")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
 ```
 
-`command` takes `Unit`; `pipe-command` consumes the preceding text. Commands are unbounded by default. Bound an operation explicitly:
+`shell.script` takes explicit typed parameters, input type, and input wire. Use `Unit` for a source-like operation or `nefor.contracts.Text` for a pipeline stage. Timeouts are explicit in the parameter record:
 
 ```lisp
-(nefor.shell.command-with-options
+(nefor.shell.script
   "bounded-search"
-  "rg -n TODO src/"
-  (as nefor.shell.BashOptions
-    {:timeout_ms (nefor.contracts.timeout-ms 30000)}))
+  (as nefor.contracts.ShellScriptParams
+    {:script "rg -n TODO src/"
+     :cwd "."
+     :timeout (nefor.contracts.timeout-ms 30000)})
+  (type-tag Unit)
+  "mag.Unit")
 ```
 
 Use `(nefor.contracts.no-timeout)` only when waiting indefinitely is intentional. A timeout or command failure is a runtime outcome, not evidence that compilation failed.

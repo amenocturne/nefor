@@ -1,7 +1,12 @@
 (require "nefor.graph")
 (require "nefor.contracts")
 
-(def script (fn [[name String] [params nefor.contracts.ShellScriptParams]]
+;; Relative paths are resolved by the capability against the MAG host's
+;; inherited working directory. Keeping the captured base as data makes that
+;; authority explicit in every process request.
+(def cwd ".")
+
+(def exec (fn [[name String] [params nefor.contracts.ProcessExecParams]]
   -> (nefor.graph.Node (| Unit nefor.contracts.Text) nefor.contracts.ProcessResult)
   (let [input (nefor.graph.port name
                 (type-tag (| Unit nefor.contracts.Text))
@@ -11,7 +16,7 @@
                  "nefor.process.Result")]
     (as (nefor.graph.Node (| Unit nefor.contracts.Text) nefor.contracts.ProcessResult)
       {:id name :role "ordinary"
-       :actors [(nefor.graph.actor name nefor.factory.shell-script params
+       :actors [(nefor.graph.actor name nefor.factory.process-exec params
                    (nefor.graph.store-port input)
                    [(nefor.graph.store-port output)])]
        :routes (as (List nefor.graph.StoredRoute) [])

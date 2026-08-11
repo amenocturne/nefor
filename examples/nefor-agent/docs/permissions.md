@@ -48,7 +48,7 @@ read-only inventory.
 - `edit_file` passes for write-capable agents and is denied to read-only agents;
 - `write_file` passes only when a current approved write-review plan exists,
   except for the earlier `yolo` gate bypass;
-- write-capable `bash` is checked by `da` plus configured fast paths;
+- write-capable `shell.script` is checked by `da` plus configured fast paths;
 - missing or unusable `da` is an installation error, not permission fallback;
 - any remaining request is interactive in `safe`, denied with recovery guidance
   in `auto`, and approved in `yolo`.

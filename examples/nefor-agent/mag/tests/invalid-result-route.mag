@@ -4,9 +4,9 @@
 
 ;; Regression: the concrete output node is terminal and cannot source an edge.
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      first (nefor.shell.command "first" "printf first")
+      first (nefor.shell.script "first" (as nefor.contracts.ShellScriptParams {:script "printf first" :cwd "." :timeout (nefor.contracts.no-timeout)}))
       result (nefor.graph.output-for "result" first)
-      second (nefor.shell.pipe-command "second" "cat")]
+      second (nefor.shell.script "second" (as nefor.contracts.ShellScriptParams {:script "cat" :cwd "." :timeout (nefor.contracts.no-timeout)}))]
   (nefor.artifact.compile
     (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
       (nefor.graph.add-edges graph

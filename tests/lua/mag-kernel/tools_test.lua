@@ -183,7 +183,7 @@ do
   local msgs, emit = capture()
   local inst = run_tool.construct("rt", {}, emit)
   inst.deliver(single("llm", "generic-tool.ToolCalls", {
-    calls = { { id = "c1", name = "bash", args = { cmd = "false" } } },
+    calls = { { id = "c1", name = "shell.script", args = { script = "false", cwd = ".", timeout = { present = false, milliseconds = 0 } } } },
   }))
   local inv = find_kind(msgs, "capability.invoke")
 
@@ -219,7 +219,7 @@ do
   local msgs, emit = capture()
   local inst = run_tool.construct("rt", {}, emit)
   inst.deliver(single("llm", "generic-tool.ToolCalls", {
-    calls = { { id = "c1", name = "bash", args = { cmd = "sleep 1" } } },
+    calls = { { id = "c1", name = "shell.script", args = { script = "sleep 1", cwd = ".", timeout = { present = false, milliseconds = 0 } } } },
   }))
   local inv = find_kind(msgs, "capability.invoke")
 
@@ -247,7 +247,7 @@ do
     results = {
       { id = "call-1", name = "grep", output = "match at line 3" },
       { id = "call-2", name = "fs/read", output = { path = "a.txt", bytes = 12 } },
-      { id = "call-3", name = "bash", error = "exit 1" },
+      { id = "call-3", name = "shell.script", error = "exit 1" },
     },
   }))
   assert_eq(c.status, "ok", "synchronous adaptation returns a successful completion")

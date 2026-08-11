@@ -283,7 +283,7 @@ actor.spawn(require("libs.lead-workflow"))
 actor.spawn(require("read-only-tools"))
 
 -- Tool-validator owns the chat.tool.permission_request → chat.tool.
--- popup_request translation: classifies bash commands through `da`
+-- popup_request translation: classifies shell scripts through `da` and process argv structurally
 -- (approve/deny/defer), routes only the deferred ones to a user popup.
 -- Must be spawned BEFORE tool-gate so its subscription is live when
 -- the first gated invocation lands. The chat surface listens to
@@ -311,13 +311,13 @@ if startup.prompt ~= nil then
       cfg.default_provider, "mag", "tool-gate", "git-worktree", "basic-tools", "chat-surface",
     },
     required_tools = {
-      "read_file", "read_image", "write_file", "edit_file", "bash", "search_text",
+      "read_file", "read_image", "write_file", "edit_file", "search_text", "process.exec", "shell.script",
       "git_worktree_create", "git_worktree_open", "list_dir", "python-read",
       "instructions", "discover_instruction_files", "graph-status", "await-run",
       "terminate-graph", "write-review", "mag", "mag-eval",
     },
     tool_sources = {
-      ["basic-tools"] = { "read_file", "read_image", "write_file", "edit_file", "bash", "search_text" },
+      ["basic-tools"] = { "read_file", "read_image", "write_file", "edit_file", "search_text", "process.exec", "shell.script" },
       ["git-worktree"] = { "git_worktree_create", "git_worktree_open" },
       ["read-only-tools"] = { "list_dir", "python-read", "instructions", "discover_instruction_files" },
       ["lead-workflow"] = { "graph-status", "await-run", "terminate-graph", "write-review", "mag", "mag-eval" },

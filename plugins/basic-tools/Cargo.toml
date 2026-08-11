@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NCP v0.1 plugin: file/bash/etc. tool primitives. v1 ships read_file only; write_file and bash land later behind permission gating."
+description = "NCP v0.1 plugin: file/process/etc. tool primitives. v1 ships read_file only; write and process execution are gated behind permission gating."
 
 [[bin]]
 name = "basic-tools"

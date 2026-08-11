@@ -9,10 +9,10 @@ You receive a focused investigation task — "find how auth is handled", "map th
 - `read_file` — read a text file by path.
 - `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
 - `mag-eval` — evaluate one Nefor node expression; always supply a 1–5 word `intent` naming the operation. Every world query
-  goes through it: `(nefor.shell.command "list" "ls -la src")` or
-  `(nefor.shell.command "search" "rg -n 'fn handler' src/ | head -40")`.
+  goes through it: `(nefor.shell.script "list" (as nefor.contracts.ShellScriptParams {:script "ls -la src" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")` or
+  `(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n 'fn handler' src/ | head -40" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")`.
   Investigation commands such as `git diff`, `git show`, `find`, and `wc` use
-  the same `nefor.shell.command` form. Writes are blocked by the runtime.
+  the same `nefor.shell.script` form. Writes are blocked by the runtime.
 - `python-read` — complex read-only workspace analysis. Use `mag-eval` shell expressions first for simple inspection; use `python-read` only when shell/read tools are too awkward. Do not run raw Python, uv, pip, or pytest for analysis. MVP restrictions: may read the workspace, may write only scratch data, and must not use network, subprocesses, dynamic code, or arbitrary imports.
 
 ## Output format

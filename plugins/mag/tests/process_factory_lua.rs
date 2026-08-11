@@ -1,10 +1,10 @@
-//! Runs the bash-factory kernel Lua unit tests
-//! (`tests/lua/mag-kernel/bash_test.lua`) in a bare Lua VM — the same harness
+//! Runs the process-factory kernel Lua unit tests
+//! (`tests/lua/mag-kernel/process_test.lua`) in a bare Lua VM — the same harness
 //! shape as `engine/tests/starter_mag_kernel_test.rs`: a minimal `nefor` stub
 //! (`nefor.log`, matching the plugin host's `install_nefor`), `package.path`
 //! pointed at `plugins/mag/lua/mag-kernel/`, then exec the chunk (which `error()`s on
 //! the first failed assertion). Hosted here rather than in the engine's
-//! harness because the bash factory ships with the mag plugin's kernel.
+//! harness because the process factories ships with the mag plugin's kernel.
 
 use std::path::PathBuf;
 
@@ -18,7 +18,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn mag_kernel_bash_factory() {
+fn mag_kernel_process_factories() {
     let lua = Lua::new();
 
     // Stub nefor.log (the only host surface the factory modules need).
@@ -29,7 +29,7 @@ fn mag_kernel_bash_factory() {
     nefor.set("log", log).expect("set log");
     lua.globals().set("nefor", nefor).expect("set nefor");
 
-    // Bare requires (`require("kinds")`, `require("factories.bash")`) resolve
+    // Bare requires resolve resolve
     // against the kernel directory.
     let kernel_dir = repo_root().join("plugins/mag/lua/mag-kernel");
     let package: mlua::Table = lua.globals().get("package").expect("package");
@@ -45,7 +45,7 @@ fn mag_kernel_bash_factory() {
         )
         .expect("set package.path");
 
-    let test_path = repo_root().join("tests/lua/mag-kernel/bash_test.lua");
+    let test_path = repo_root().join("tests/lua/mag-kernel/process_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 
@@ -54,6 +54,6 @@ fn mag_kernel_bash_factory() {
         .set_name(test_path.display().to_string())
         .exec()
     {
-        panic!("bash_test.lua failed:\n{e}");
+        panic!("process_test.lua failed:\n{e}");
     }
 }

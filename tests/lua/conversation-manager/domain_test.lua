@@ -84,9 +84,9 @@ end
 do
   local store = manager.new(); create(store, "error-chat", "agent")
   append(store, fact("m", "error-chat", "message_started", { message_id = "m", role = "assistant" }))
-  append(store, fact("x", "error-chat", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "bash" }))
+  append(store, fact("x", "error-chat", "tool_exchange_started", { exchange_id = "x", message_id = "m", tool_name = "shell.script" }))
   append(store, fact("xc", "error-chat", "tool_call_completed", {
-    exchange_id = "x", call = { id = "external-x", name = "bash", arguments = {} },
+    exchange_id = "x", call = { id = "external-x", name = "shell.script", arguments = {} },
   }))
   append(store, fact("xe", "error-chat", "tool_error_recorded", { exchange_id = "x", error = { code = "exit", message = "1" } }))
   rejects(store, fact("xr", "error-chat", "tool_result_recorded", { exchange_id = "x", result = {} }), "tool_exchange_terminal")
