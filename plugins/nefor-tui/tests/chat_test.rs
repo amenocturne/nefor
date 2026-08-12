@@ -10020,6 +10020,31 @@ fn personal_extension_behavior_uses_canonical_tui() {
         json!({ "kind": "input.submit", "value": "/mode audio" }),
     );
     let state = engine.state_table().unwrap();
+    assert_eq!(state.get::<String>("mode").unwrap(), "default");
+    drop(state);
+    let effects = engine.take_emit_queue();
+    let request_id = effects
+        .iter()
+        .find_map(|(_, body)| {
+            (body.get("kind") == Some(&json!("sessions.new_request")))
+                .then(|| body.get("request_id").and_then(|value| value.as_str()))
+                .flatten()
+        })
+        .expect("personal mode switch must request a correlated session")
+        .to_owned();
+    assert!(effects
+        .iter()
+        .any(|(_, body)| body.get("kind") == Some(&json!("chat.interrupt_all"))));
+    assert!(!effects
+        .iter()
+        .any(|(_, body)| body.get("kind") == Some(&json!("chat.model.set"))));
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "audio-session",
+            "request_id": request_id }),
+    );
+    let state = engine.state_table().unwrap();
     assert_eq!(state.get::<String>("mode").unwrap(), "audio");
     assert_eq!(state.get::<String>("provider").unwrap(), "gemma-audio");
     assert_eq!(
@@ -10028,9 +10053,11 @@ fn personal_extension_behavior_uses_canonical_tui() {
     );
     drop(state);
     let effects = engine.take_emit_queue();
-    assert!(effects
-        .iter()
-        .any(|(_, body)| body.get("kind") == Some(&json!("chat.model.set"))));
+    assert!(effects.iter().any(|(_, body)| {
+        body.get("kind") == Some(&json!("chat.model.set"))
+            && body.get("provider") == Some(&json!("gemma-audio"))
+            && body.get("model") == Some(&json!("gemma-4-12b-audio-q4"))
+    }));
 
     let current = json!({
         "kind": "tool.register",
