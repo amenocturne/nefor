@@ -47,7 +47,10 @@ fn repo_root() -> PathBuf {
 }
 
 fn target_debug(bin: &str) -> PathBuf {
-    repo_root().join("target").join("debug").join(bin)
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| repo_root().join("target"), PathBuf::from)
+        .join("debug")
+        .join(bin)
 }
 
 /// Required binaries for the cli-config spawn pipeline.
@@ -134,7 +137,8 @@ fn base_command(xdg: &Path) -> Command {
         .arg("agentic-cli")
         .env("NEFOR_CONFIG", "test")
         .env("NEFOR_INSTALLATION_ID", "test:agentic-cli-mock-e2e")
-        .env("NEFOR_PLUGIN_DIR", repo_root().join("plugins"))
+        .env("NEFOR_PLUGIN_DIR", target_debug(""))
+        .env("NEFOR_TEST_BIN_DIR", target_debug(""))
         // Disable the mock provider's 80 tok/s pacing under tests so
         // the 10s scenario_timeout() stays comfortable. Interactive
         // launches (the user driving `nefor` directly) get pacing

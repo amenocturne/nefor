@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -60,32 +60,30 @@ fn provider_binaries() -> &'static HashMap<&'static str, PathBuf> {
     BINARIES.get_or_init(|| {
         let root = repo_root();
         let target_dir = root.join("target/structured-provider-e2e");
-        let status = Command::new(env!("CARGO"))
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .args([
+        let prepared = nefor_cargo_test_harness::run_cargo_and_prepare(
+            &root,
+            &[
                 "build",
                 "--locked",
                 "-p",
                 "openai-provider",
                 "-p",
                 "chatgpt-provider",
-            ])
-            .status()
-            .expect("run isolated Cargo provider build");
-        assert!(status.success(), "Cargo provider build failed: {status}");
+            ],
+            Some(&target_dir),
+            &target_dir.join("harness-artifacts"),
+        )
+        .expect("build and prepare isolated providers");
 
         ["openai-provider", "chatgpt-provider"]
             .into_iter()
             .map(|name| {
-                let binary = target_dir
-                    .join("debug")
-                    .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-                assert!(
-                    binary.is_file(),
-                    "Cargo did not produce expected provider binary {}",
-                    binary.display()
-                );
+                let binary = prepared
+                    .paths
+                    .iter()
+                    .find(|path| path.file_name().is_some_and(|file| file == name))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("Cargo did not report executable {name}"));
                 (name, binary)
             })
             .collect()

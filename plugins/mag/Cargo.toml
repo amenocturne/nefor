@@ -34,3 +34,4 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 git-worktree-plugin = { path = "../git-worktree" }
 tempfile = "3"
+nefor-cargo-test-harness = { path = "../../tools/cargo-test-harness" }

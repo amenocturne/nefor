@@ -1,0 +1,12 @@
+[package]
+name = "nefor-cargo-test-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+
+[lints.clippy]
+pedantic = "warn"

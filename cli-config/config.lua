@@ -8,14 +8,13 @@
 
 local M = {}
 
--- Binary path resolver. The CLI surface runs against in-tree builds, so
--- we read directly from `<repo>/target/debug/`; the engine still sets
--- NEFOR_PLUGIN_DIR but it points at the source-crate root in this layout
--- (where the binaries don't live), so we don't use it.
+-- Binary path resolver. Tests may select Cargo's effective target directory;
+-- normal in-tree use keeps the repository's `target/debug` default.
 do
   local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
   local PROJECT_ROOT = CONFIG_ROOT:match("^(.*)/[^/]+$") or "."
-  M.bin = function(name) return PROJECT_ROOT .. "/target/debug/" .. name end
+  local BIN_ROOT = os.getenv("NEFOR_TEST_BIN_DIR") or (PROJECT_ROOT .. "/target/debug")
+  M.bin = function(name) return BIN_ROOT .. "/" .. name end
 end
 
 M.prod = {

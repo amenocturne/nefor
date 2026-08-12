@@ -7,7 +7,7 @@
 //! native request/HTTP lowering is covered by the provider-owned suites.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -28,16 +28,18 @@ fn repo_root() -> PathBuf {
 fn built_binary(package: &str, binary: &str) -> PathBuf {
     let root = repo_root();
     let target_dir = root.join("target/chatgpt-tools-e2e");
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .args(["build", "--locked", "-p", package, "--bin", binary])
-        .status()
-        .unwrap_or_else(|error| panic!("build {package}: {error}"));
-    assert!(status.success(), "{package} build failed: {status}");
-    target_dir
-        .join("debug")
-        .join(format!("{binary}{}", std::env::consts::EXE_SUFFIX))
+    let prepared = nefor_cargo_test_harness::run_cargo_and_prepare(
+        &root,
+        &["build", "--locked", "-p", package, "--bin", binary],
+        Some(&target_dir),
+        &target_dir.join("harness-artifacts").join(binary),
+    )
+    .unwrap_or_else(|error| panic!("build and prepare {package}: {error}"));
+    prepared
+        .paths
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == binary))
+        .unwrap_or_else(|| panic!("Cargo did not report executable {binary}"))
 }
 
 fn tool_gate_binary() -> &'static PathBuf {
