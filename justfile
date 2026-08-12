@@ -120,9 +120,9 @@ test-tui-all: test-tui test-tui-scenarios
 test-tui-chat:
     cargo test -p nefor-tui --test chat_test -- --test-threads=1
 
-# Full local suite for cross-cutting or release-level validation.
-test-all:
-    cargo test --workspace --exclude nefor-tui
+# Full local suite for cross-cutting or release-level validation. The first Cargo phase is watchdog-protected; override its 2h deadline with the timeout argument.
+test-all timeout="7200":
+    cargo run --quiet -p nefor-test-watchdog -- --phase cargo-workspace-without-tui --timeout-seconds "{{timeout}}" -- cargo test --workspace --exclude nefor-tui
     cargo test -p nefor-tui --lib
     cargo test -p nefor-tui --test chat_test -- --test-threads=1
 

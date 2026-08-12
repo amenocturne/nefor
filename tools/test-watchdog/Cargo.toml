@@ -1,0 +1,10 @@
+[package]
+name = "nefor-test-watchdog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints.clippy]
+pedantic = "warn"
+
