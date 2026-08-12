@@ -94,13 +94,13 @@ artifact pipeline, so
 the expression itself is concise:
 
 ```lisp
-(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+(nefor.process.exec "search" (as nefor.contracts.ProcessExecParams {:argv ["rg" "-n" "TODO" "src/"] :cwd nefor.process.cwd :timeout (nefor.contracts.no-timeout)}))
 ```
 
 For a one-off pipeline, keep it inside the command node:
 
 ```lisp
-(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}))
 ```
 
 Multi-node pipelines are full `.mag` programs: construct `source`, `process.exec`

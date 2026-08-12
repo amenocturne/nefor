@@ -58,8 +58,8 @@ The transcript renders registered tools through semantic display contracts: a co
 
 A receipt is an observability view, not proof that every external side effect completed atomically. The tool result and terminal run status are the available completion evidence. Raw display can contain sensitive arguments or output.
 
-## Markdown links — Unreleased
+## Markdown links
 
-After v0.4.0, text rendered by the engine's Markdown widget carries safe link targets through wrapping and layout. An unmodified left-button press and release on the same linked text opens absolute `http`, `https`, or `mailto` URLs with the system handler. A drag cancels activation so selection remains usable. Opener failure is logged rather than turned into a chat popup.
+Text rendered by the engine's Markdown widget carries safe link targets through wrapping and layout. An unmodified left-button press and release on the same linked text opens absolute `http`, `https`, or `mailto` URLs with the system handler. A drag cancels activation so selection remains usable. Opener failure is logged rather than turned into a chat popup.
 
 Relative links, `#fragments`, `file:` URLs, and schemes such as `javascript:` are deliberately non-activating. The engine guarantee is limited to recognized Markdown link cells and the allowed schemes; the starter does not add a URL command, browsing sandbox, confirmation screen, or link-history export.

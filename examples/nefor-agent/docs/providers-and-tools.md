@@ -66,7 +66,7 @@ Registration makes a tool available; it does not authorize every invocation. `li
 return require("libs.tool-validator").build {
   read_only_tools = { "read_file", "my_read_tool" },
   auto_approve_tools = { "my_schema_limited_safe_tool" },
-  bash_fastpaths = {
+  shell_fastpaths = {
     function(command, read_only)
       return not read_only and command:match("^my%-cli%s+read%s") ~= nil
     end,
@@ -83,7 +83,7 @@ Policy precedence is:
 5. approve other tools when the entire capability allowlist is read-only;
 6. prompt in `safe` or deny in `auto`.
 
-Malformed or excluding capability data fails closed even in `yolo`. A missing allowlist retains legacy unrestricted behavior. `auto_approve_tools` is unconditional after capability validation, so use it only for schemas whose complete input space is safe. `bash_fastpaths` are trusted policy predicates and run before `da`.
+Malformed or excluding capability data fails closed even in `yolo`. A missing allowlist retains legacy unrestricted behavior. `auto_approve_tools` is unconditional after capability validation, so use it only for schemas whose complete input space is safe. `shell_fastpaths` are trusted policy predicates and run before `da`.
 
 `edit_file` is available only to write-capable agents. `write_file` additionally requires an active approved lead-workflow plan except in `yolo`. Non-read-only `shell.script` uses `da`; a missing classifier is an installation error, not a prompt fallback. See the user-facing [permissions guide](permissions.md).
 

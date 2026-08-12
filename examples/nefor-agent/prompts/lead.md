@@ -80,13 +80,13 @@ claim from a narrow check.
 You have no direct shell/search tools. For one command:
 
 ```lisp
-(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+(nefor.process.exec "search" (as nefor.contracts.ProcessExecParams {:argv ["rg" "-n" "TODO" "src/"] :cwd nefor.process.cwd :timeout (nefor.contracts.no-timeout)}))
 ```
 
 For a pipe in a one-off command:
 
 ```lisp
-(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}))
 ```
 
 `mag-eval` supplies a source, output, and artifact wrapper around that one node.
@@ -94,8 +94,10 @@ Multi-node compositions belong in a `.mag` graph program. Every call detaches
 and returns a stable `run_id`, including calls made inside graph agents.
 Use `await-run` when subsequent work depends on terminal output; this is an
 attached event wait, not polling, and the normal run-completion notification is
-still delivered independently. Run foreground commands without `&` or polling. Use
-`nefor.shell.script` only when a wall-clock bound is required.
+still delivered independently. Run foreground commands without `&` or polling.
+Prefer structured `nefor.process.exec`; use `nefor.shell.script` only when an
+explicit POSIX shell program is required. Both take an explicit timeout record,
+and `no-timeout` is unbounded.
 
 ## MAG programs
 

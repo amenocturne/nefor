@@ -26,7 +26,16 @@ Lua owns behavior that is composition-specific or bus-aware:
 - Provider/tool adapters and interface reducers.
 - MAG submission/control and workspace management.
 
-Pure reusable mechanisms live under `lua/core` or `lua/libs`; starter opinions and concrete wiring live under `examples/nefor-agent`.
+Pure reusable mechanisms live under `lua/core` or `lua/libs`; example opinions and concrete wiring live under `examples/nefor-agent`.
+
+### Conversation authority and turn orchestration
+
+The example deliberately separates durable meaning from transient execution:
+
+- `lua/libs/conversation-manager` is the canonical authority for recorded conversation facts. It validates and sequences those facts, derives provider-neutral projections for the TUI/CLI, and supplies the conversation context used to create model calls. Session replay feeds recorded facts back through this owner to reconstruct state; consumers do not infer a second transcript from provider or workflow traffic.
+- `lua/libs/agentic-loop` orchestrates the current lead turn. It queues input, starts the configured MAG turn program, manages ephemeral provider chats, and coordinates interruption and compaction requests. Its queue and active-turn bookkeeping are process state, not a competing conversation record.
+
+This split keeps replay authoritative without making the conversation manager responsible for live workflow scheduling. Surface reducers render conversation-manager projections and separately observe transient workflow state.
 
 ## Control plane
 

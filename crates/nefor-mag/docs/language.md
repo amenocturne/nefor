@@ -106,28 +106,55 @@ If a downstream reviewer can work with partial failed output, accept the full un
 
 There is no graph mutation API. `graph`, `add-edges`, and `remove-edges` are total pure set operations over the graph being authored.
 
-## Shell nodes
+## Process and shell nodes
+
+Use structured `process.exec` when one executable plus arguments expresses the
+operation:
+
+```lisp
+(require "nefor.process")
+
+(nefor.process.exec
+  "search"
+  (as nefor.contracts.ProcessExecParams
+    {:argv ["rg" "-n" "TODO" "src/"]
+     :cwd nefor.process.cwd
+     :timeout (nefor.contracts.no-timeout)}))
+```
+
+`argv` is passed directly to process spawn: no shell is inserted, so operators
+such as `|`, `>`, glob expansion, and shell built-ins are ordinary arguments.
+For shell syntax, use explicit POSIX `shell.script`, which lowers to
+`["/bin/sh", "-c", script]`:
 
 ```lisp
 (require "nefor.shell")
 
-(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
-```
-
-`shell.script` takes explicit typed parameters, input type, and input wire. Use `Unit` for a source-like operation or `nefor.contracts.Text` for a pipeline stage. Timeouts are explicit in the parameter record:
-
-```lisp
 (nefor.shell.script
   "bounded-search"
   (as nefor.contracts.ShellScriptParams
-    {:script "rg -n TODO src/"
+    {:script "rg -n TODO src/ | sort"
      :cwd "."
-     :timeout (nefor.contracts.timeout-ms 30000)})
-  (type-tag Unit)
-  "mag.Unit")
+     :timeout (nefor.contracts.timeout-ms 30000)}))
 ```
 
-Use `(nefor.contracts.no-timeout)` only when waiting indefinitely is intentional. A timeout or command failure is a runtime outcome, not evidence that compilation failed.
+POSIX shell does not imply Bash. When Bash semantics are required, invoke it
+explicitly with `process.exec`, for example `:argv ["/bin/bash" "-lc" "set -o
+pipefail; command"]`.
+
+Both nodes require a non-empty `cwd`; relative paths resolve from the MAG host's
+inherited working directory, exposed as `nefor.process.cwd` (`"."`). They accept
+a `Unit` input for no stdin or `nefor.contracts.Text` to pass upstream
+`content` as stdin. The output is `ProcessResult`, containing separate `stdout`,
+`stderr`, and an exit-or-signal termination record. Nonzero exit is result data,
+not a compilation failure.
+
+Timeouts are mandatory and explicit. `(nefor.contracts.no-timeout)` is
+unbounded; use it only when waiting indefinitely is intentional.
+`(nefor.contracts.timeout-ms N)` sets a positive wall-clock bound. A process
+that never exits keeps its run nonterminal, so an awaited run also waits
+indefinitely. The current API has no `bash`, `BashOptions`,
+`command-with-options`, or `pipe-command` compatibility surface.
 
 ## Human approvals
 
@@ -141,7 +168,7 @@ Most workflows should be fully static. When a runtime result determines how many
 (nefor.artifact.compile-program topology rules)
 ```
 
-A rule subscribes to a typed port created with `nefor.graph.rule`; its named pure MAG function returns a delta artifact. Use public helpers in `nefor.dynamic` for typed worker collection and the empty-list branch. Rules are program metadata, not graph edges, and do not give agents authority to alter the graph. See [Dynamic planner expansion](../../../plugins/mag/docs/patterns.md#dynamic-planner-expansion).
+A rule subscribes to a typed port created with `nefor.graph.rule`; its named pure MAG function returns a delta artifact. Use public helpers in `nefor.dynamic` for typed worker collection and the empty-list branch. Rules are program metadata, not graph edges, and do not give agents authority to alter the graph. See [MAG runtime patterns](../../../plugins/mag/docs/patterns.md).
 
 ## Worktrees
 

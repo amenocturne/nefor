@@ -26,7 +26,7 @@ interfaces, providers, and tools are composition or plugin concerns.
   installable composition demonstrating a TUI, providers, tools, sessions,
   permissions, and MAG orchestration. It is an example, not the product.
 - [Plugin index](../plugins/README.md) — plugin capabilities and local docs.
-- [Lua core](../lua/core/README.md) and [Lua libraries[Lua libraries](../lua/libs/) —
+- [Lua core](../lua/core/README.md) and [Lua libraries](../lua/libs/README.md) —
   reusable composition mechanisms.
 - [nefor-pm](../lua/nefor-pm/README.md) — package, checkout, lock, and runtime
   generation reference.

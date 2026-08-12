@@ -140,11 +140,11 @@ Type `@path` anywhere in a message to include a text file. Completion is cwd-rel
 
 Paste an image from the system clipboard with `Ctrl+V` or `Super+V`. The TUI saves it as a PNG and inserts its absolute path into the prompt. This gives the agent a path it can inspect with `read_image`; it does not itself attach image bytes to the user message. Text paste continues through the normal prompt path. Image interpretation still depends on a vision-capable provider/model.
 
-rendered Markdown links with absolute `http`, `https`, or `mailto` targets open through the system handler when the same linked text receives an unmodified left-button press and release. Dragging still selects text. Relative links, fragments, `file:` links, and effectful schemes render without activation. This is an engine behavior newly present after v0.4.0, not a starter command.
+Rendered Markdown links with absolute `http`, `https`, or `mailto` targets open through the system handler when the same linked text receives an unmodified left-button press and release. Dragging still selects text. Relative links, fragments, `file:` links, and effectful schemes render without activation. This is an engine behavior, not an example-composition command.
 
 ## Sessions and context
 
-Every real user submission is persisted to a JSONL session. `/new` (alias `/clear`) starts a fresh session and clears the visible transcript. `/resume` opens the recent-session picker; `/resume <id>` switches directly and replays the session in-process. See [sessions and context](../../examples/nefor-agent/docs/sessions.md) before sharing a session directory between installations.
+Every real user submission is persisted to a JSONL session. `/new` (alias `/clear`) requests a fresh session and interrupts active work; the visible transcript and other session-scoped projections reset only after the sessions actor acknowledges the replacement. Process-level provider registrations, authentication, and configuration survive because the process is not restarted. `/resume` opens the recent-session picker; `/resume <id>` switches directly and reconstructs canonical conversation state from the recorded session without re-running historical work. See [sessions and context](../../examples/nefor-agent/docs/sessions.md) before sharing a session directory between installations.
 
 `/compact` asks the active provider/model to compact its model context. The full persisted transcript remains the fallback, and compaction does not mean the transcript was deleted or exported.
 

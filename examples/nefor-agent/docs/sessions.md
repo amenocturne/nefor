@@ -21,12 +21,16 @@ Submitted prompt history is separate: the starter keeps at most 50 newest submit
 
 ## New and resume
 
-- `/new` and `/clear` interrupt all workflows, close the current session, create a new ID, and reset the transcript/sidebar state.
+- `/new` and its `/clear` alias first request interruption plus a replacement session. The old session remains authoritative until the sessions actor acknowledges the new ID; only then does the TUI replace session-scoped transcript, conversation, queue, compaction, popup, and workflow/sidebar projections. If acquisition fails, the current session is retained and the failure is shown.
 - `/resume` lists recent non-empty sessions newest-first, showing the header timestamp and first submitted prompt.
 - `/resume <id>` switches directly. The parser uses the first word-like/hyphenated ID from the argument.
 - `nefor run --session <id>` starts on a saved session.
 
-Resume occurs in the running process: the starter acquires the target, opens it, ends the old session, emits a new session lifecycle, and replays valid recorded engine-origin entries in bounded cooperative chunks. The TUI clears the old transcript, shows byte-based loading progress, suppresses historical run panels/popups, and reveals the rebuilt transcript when replay completes. Live work should not be inferred from historical MAG lifecycle events; the sidebar is a live observation surface.
+Resume occurs in the running process: the example acquires the target, acknowledges the replacement, opens it, ends the old session, emits a new session lifecycle, and replays valid recorded engine-origin entries in bounded cooperative chunks. The TUI replaces the old transcript only after that acknowledgement, shows byte-based loading progress, suppresses historical run panels/popups, and reveals the rebuilt transcript when replay completes. Live work should not be inferred from historical MAG lifecycle events; the sidebar is a live observation surface.
+
+The session log is the replay authority, and conversation-manager is the canonical consumer for recorded conversation facts, context, and provider-neutral transcript projection. Agentic-loop uses that state to orchestrate new turns; it does not own a second replay history. Replay reconstructs state but never re-runs recorded tools, provider calls, or MAG workflows.
+
+A session replacement resets session-scoped semantic and UI state, not every Lua value in the process. Provider catalogs, authentication/runtime registrations, installation configuration, and other process-level actors can survive `/new`, `/clear`, or `/resume` and then publish fresh live state into the new session. Restart Nefor when a full process reset is required.
 
 Malformed or non-replayable rows are skipped rather than converted into promises about recovery. A failed target open does not intentionally abandon the current session, but command-level failures are primarily logged and are not a migration facility.
 

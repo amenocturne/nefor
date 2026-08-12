@@ -75,20 +75,40 @@ it with an explicit error when the active model does not support image input.
 
 - `write_file` — write text content to a path.
 - `edit_file` — replace one exact string match in an existing text file.
-- `process.exec` — execute required structured `argv` with explicit `cwd` and
-  timeout record.
-- `shell.script` — lower a script to `["/bin/sh", "-c", script]` and use the
-  same process executor.
-
-Both process capabilities accept optional `stdin`, stream stdout and stderr
-independently, and return structured JSON with separate `stdout`, `stderr`, and
-`termination` (`code` or `signal`). Nonzero exit codes are successful result
-data. Validation, spawn, I/O, timeout, and cancellation failures use the error
-channel; timeout and cancellation diagnostics retain partial stdout/stderr
-after killing and reaping the dedicated process group. Both support
-`basic-tools.tool.cancel { id }`.
-
 - `search_text` — search text under files/directories.
+
+### Process capabilities
+
+`process.exec` is the structured default. It requires a non-empty `argv`, keeps
+arguments separate through spawn, and never inserts a shell. Pipelines,
+redirection, expansion, and shell built-ins therefore have no special meaning.
+If Bash is specifically required, make it explicit in `argv`, for example
+`["/bin/bash", "-lc", "set -o pipefail; rg -n TODO src/ | sort"]`.
+
+`shell.script` is the explicit POSIX-shell surface. It requires a non-empty
+`script` and executes exactly `["/bin/sh", "-c", script]`. It does not promise
+Bash syntax; invoke `/bin/bash` explicitly when Bash semantics are part of the
+program.
+
+Both capabilities require a non-empty `cwd`. Relative paths are resolved by the
+child process from that directory; in MAG, `nefor.process.cwd` is `"."`, meaning
+the working directory inherited by the Nefor/MAG host. Both also require an
+explicit timeout record: `no-timeout` is intentionally unbounded, while
+`timeout-ms N` must use a positive millisecond value. An unbounded process that
+never exits keeps its MAG run nonterminal.
+
+Direct tool invocations may pass optional string `stdin`. In a MAG graph a
+`Unit` input starts the process with no stdin, while an upstream
+`nefor.contracts.Text` value supplies its `content` as stdin. The result is
+structured data with independent `stdout`, `stderr`, and `termination`; MAG
+normalizes termination to `{ kind = "code" | "signal", value = N }`. A nonzero
+exit code is still result data. Validation, spawn, I/O, timeout, and cancellation
+failures use the error channel; timeout and cancellation diagnostics retain
+partial stdout/stderr after killing and reaping the dedicated process group.
+Both capabilities support `basic-tools.tool.cancel { id }`.
+
+These two names replace the old ambiguous command helpers; there is no current
+`bash`, `BashOptions`, `command-with-options`, or `pipe-command` API.
 
 In the starter these are composed behind `tool-validator` and `tool-gate`, so
 mutation/execution can be auto-approved, prompted, or denied according to the

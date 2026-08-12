@@ -62,11 +62,15 @@ graph retrieval or hot graph mutation in this API.
   (nefor.artifact.compile topology))
 ```
 
-`:tools` is the agent's capability boundary. Use
-`nefor.actors.read-only-tools` for investigation-only agents,
-`nefor.actors.general-tools` for common implementation agents, or author an
-explicit string list for a narrower/custom surface. The runtime gate rejects a
-model-emitted tool call that is not present in that invocation's allowlist,
+`:tools` is the agent's capability boundary. In the example composition,
+`nefor.actors.read-only-tools` requests `read_file`, `read_image`, `list_dir`,
+`search_text`, `python-read` (currently an unavailable placeholder),
+`instructions`, `discover_instruction_files`, `graph-status`, and `await-run`.
+`nefor.actors.general-tools` adds `edit_file`, `write_file`, `mag`, `mag-eval`,
+and `terminate-graph`. These profiles are projected through the live tool
+registry, so only enabled/advertised capabilities reach the provider. Author an
+explicit string list for a narrower or custom surface. The runtime gate rejects
+a model-emitted tool call that is not present in that invocation's allowlist,
 even when the tool is globally registered.
 
 `source<T>` is the only node kind allowed to have no incoming edge. It captures
@@ -101,21 +105,30 @@ than implicit flattening:
 The concrete element type in real programs is the relevant nominal node type;
 the example names it `WorkerNode` only to show the required function signature.
 
-## Shell work
+## Process and shell work
 
 A one-off `mag-eval` expression returns one node and carries a required 1–5-word
-`intent` describing the operation:
+`intent` describing the operation. Prefer structured argv:
 
 ```lisp
-(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+(nefor.process.exec "search"
+  (as nefor.contracts.ProcessExecParams
+    {:argv ["rg" "-n" "TODO" "src/"]
+     :cwd nefor.process.cwd
+     :timeout (nefor.contracts.no-timeout)}))
 ```
 
-For a pipeline, write a graph program with source, command nodes, and output:
+`process.exec` inserts no shell. Use `shell.script` only when the operation is an
+explicit POSIX `/bin/sh -c` program. For Bash, invoke `/bin/bash` explicitly in
+structured argv.
+
+For a shell pipeline, write a graph program with source, command nodes, and
+output:
 
 ```lisp
 (let [start (nefor.graph.source "start" (type-tag Unit) nil)
-      search (nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
-      sort (nefor.shell.script "sort" (as nefor.contracts.ShellScriptParams {:script "sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag nefor.contracts.Text) "mag.Text")
+      search (nefor.process.exec "search" (as nefor.contracts.ProcessExecParams {:argv ["rg" "-n" "TODO" "src/"] :cwd nefor.process.cwd :timeout (nefor.contracts.no-timeout)}))
+      sort (nefor.shell.script "sort" (as nefor.contracts.ShellScriptParams {:script "sort" :cwd "." :timeout (nefor.contracts.no-timeout)}))
       result (nefor.graph.output-for "result" sort)]
   (nefor.artifact.compile
     (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
@@ -125,7 +138,13 @@ For a pipeline, write a graph program with source, command nodes, and output:
          (nefor.graph.edge sort result)]))))
 ```
 
-Shell scripts carry an explicit `ShellScriptParams` record; use `no-timeout` for an unbounded operation or `timeout-ms` for a wall-clock bound.
+Both process surfaces carry explicit parameter records. `cwd` is required;
+`nefor.process.cwd` is `"."` relative to the MAG host's inherited working
+directory. A `Unit` input supplies no stdin, while upstream
+`nefor.contracts.Text` supplies its content as stdin. Results preserve stdout
+and stderr separately plus exit-or-signal termination; nonzero exit is data.
+Use `no-timeout` for an intentionally unbounded operation or `timeout-ms` for a
+positive wall-clock bound.
 
 ```lisp
 (nefor.shell.script

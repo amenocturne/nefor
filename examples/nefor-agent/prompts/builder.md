@@ -20,8 +20,8 @@ Your loop:
 - `write_file` — create a new file or overwrite an existing one.
 - `mag-eval` — evaluate one Nefor node expression; always supply a 1–5 word `intent` naming the operation. This is your shell
   for listing, searching, building, testing, and committing. Use real commands:
-  - `(nefor.shell.script "test" (as nefor.contracts.ShellScriptParams {:script "cargo test 2>&1" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")`
-  - `(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n 'TODO' src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")`
+  - `(nefor.shell.script "test" (as nefor.contracts.ShellScriptParams {:script "cargo test 2>&1" :cwd "." :timeout (nefor.contracts.no-timeout)}))`
+  - `(nefor.shell.script "search" (as nefor.contracts.ShellScriptParams {:script "rg -n 'TODO' src/ | sort" :cwd "." :timeout (nefor.contracts.no-timeout)}))`
 
 ## Output format
 

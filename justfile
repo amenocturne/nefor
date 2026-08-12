@@ -24,7 +24,11 @@ setup:
 test: test-fast
 
 # Formatting plus fast tests; use before committing ordinary scoped changes.
-check: fmt-check test-fast
+check: fmt-check test-docs test-fast
+
+# Validate local Markdown links and anchors without network access.
+test-docs:
+    bun tools/check-markdown-links.ts
 
 # Rust formatting check only.
 fmt-check:

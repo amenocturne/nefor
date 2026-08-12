@@ -11,12 +11,16 @@ This guide describes the lead-facing workflow. See [Authoring reference](languag
 `mag-eval` compiles and launches one node expression without creating a `.mag` file:
 
 ```lisp
-(nefor.shell.script "find-todos" (as nefor.contracts.ShellScriptParams {:script "rg -n TODO src/" :cwd "." :timeout (nefor.contracts.no-timeout)}) (type-tag Unit) "mag.Unit")
+(nefor.process.exec "find-todos"
+  (as nefor.contracts.ProcessExecParams
+    {:argv ["rg" "-n" "TODO" "src/"]
+     :cwd nefor.process.cwd
+     :timeout (nefor.contracts.no-timeout)}))
 ```
 
 The tool call also requires a short, 1–5-word `intent`. It returns immediately with a stable `run_id`; use `await-run` when the next decision needs its terminal result. It is appropriate for finite, one-off commands. Use a program when work needs multiple nodes, agents, routing, review, or a durable source file.
 
-A shell command runs until its process exits. Do not launch a foreground server or watcher and then await it: the run cannot become terminal. Prefer a retained/background facility, or one bounded command that starts the service, checks it, and tears it down.
+A process runs until it exits. `process.exec` is structured and does not invoke a shell; use `shell.script` only for an explicit `/bin/sh -c` program, or put `/bin/bash` in structured `argv` when Bash is required. Both surfaces require explicit cwd and timeout records, and `no-timeout` is unbounded. Do not launch a foreground server or watcher and then await it: the run cannot become terminal. Prefer a retained/background facility, or one bounded command that starts the service, checks it, and tears it down.
 
 ### `mag`: author and launch a program
 
