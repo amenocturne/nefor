@@ -3,10 +3,16 @@ local log = require("libs.chat.log")
 local M = {}
 
 local version = 0
+local local_identity = 0
 
 local function next_v()
   version = version + 1
   return version
+end
+
+local function next_local_id()
+  local_identity = local_identity + 1
+  return "chat-local-entry-" .. tostring(local_identity)
 end
 
 local function copy(entry)
@@ -21,7 +27,10 @@ end
 function M.user(text)
   local v = next_v()
   log.log("entry", "create kind=text role=user v=%d", v)
-  return { role = "user", kind = "text", text = text, v = v }
+  return {
+    role = "user", kind = "text", text = text,
+    local_id = next_local_id(), v = v,
+  }
 end
 
 function M.system(text)

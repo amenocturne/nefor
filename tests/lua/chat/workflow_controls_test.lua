@@ -1,4 +1,5 @@
 local controls = require("libs.chat.workflow_controls")
+local queued_input = require("libs.chat.queued_input")
 
 local function eq(actual, expected, message)
   if actual ~= expected then
@@ -30,23 +31,22 @@ local no_queue, no_queue_decisions = controls.escape_timeout(armed, 1)
 eq(no_queue.escape_token, nil, "matching timeout clears token")
 eq(#no_queue_decisions, 0, "timeout without queue is a no-op")
 
-local queued = state({ queued_entry_idx = 2, pending = true })
+local queued = queued_input.submit(state({ pending = true }), "queued", true)
 queued.escape_token, queued.last_esc_ms = 4, 100
 queued.escape_count = 1
 local timed, timed_decisions = controls.escape_timeout(queued, 4)
 eq(timed.escape_token, nil)
 eq(timed_decisions[1].kind, "steer_queued")
 
-local double = state({
-  entries = { { text = "lead" }, { text = "queued" }, { text = "tail" } },
-  queued_entry_idx = 2,
-  in_flight = 3,
+local double = queued_input.submit(state({
+  entries = { { text = "lead" }, { text = "tail" } },
+  in_flight = 2,
   input_value = "draft",
   escape_token = 7,
   escape_token_seq = 7,
   escape_count = 1,
   last_esc_ms = 100,
-})
+}), "queued", true)
 local stopped, stop_decisions, stop_meta = controls.escape(double, 650)
 eq(stop_decisions[1].kind, "hard_stop_lead")
 eq(stop_decisions[2].kind, "schedule_escape_timeout")
@@ -55,9 +55,9 @@ eq(stopped.escape_token, 8, "double Esc replaces the first press's timeout token
 eq(stopped.input_value, "queued draft", "queue is restored before draft with one space")
 eq(#stopped.entries, 2)
 eq(stopped.entries[2].text, "tail")
-eq(stopped.in_flight, 2, "entry removal adjusts in-flight index")
-eq(stopped.queued_entry_idx, nil)
-eq(stopped.pending_user_echo_idx, nil, "restoration clears durable echo ownership")
+eq(stopped.in_flight, 2, "tail ownership remains stable when a later queue is removed")
+eq(stopped.queued_entry_id, nil)
+eq(stopped.pending_user_echo_id, nil, "restoration clears durable echo ownership")
 eq(stop_meta.restored_queue, true)
 
 local after_stale, after_stale_decisions = controls.escape_timeout(stopped, 7)

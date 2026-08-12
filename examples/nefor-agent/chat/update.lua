@@ -314,8 +314,8 @@ local function reset_session_state(state, patch)
     active_turn_id = NIL_SENTINEL,
     active_turn_entry_start = NIL_SENTINEL,
     pending_user_echo = NIL_SENTINEL,
-    pending_user_echo_idx = NIL_SENTINEL,
-    queued_entry_idx = NIL_SENTINEL,
+    pending_user_echo_id = NIL_SENTINEL,
+    queued_entry_id = NIL_SENTINEL,
     raw_tool_id = NIL_SENTINEL,
     resume_loading = NIL_SENTINEL,
     replay_mode = NIL_SENTINEL,
@@ -1720,20 +1720,17 @@ end
 
 local function retain_optimistic_entries(state)
   local retained = {}
-  local pending_user_echo_idx
-  local queued_entry_idx
-  for idx, entry in ipairs(state.entries or {}) do
-    local owns_user_echo = idx == state.pending_user_echo_idx
-    local owns_queue = idx == state.queued_entry_idx
+  for _, entry in ipairs(state.entries or {}) do
+    local local_id = type(entry) == "table" and entry.local_id or nil
+    local owns_user_echo = local_id ~= nil and local_id == state.pending_user_echo_id
+    local owns_queue = local_id ~= nil and local_id == state.queued_entry_id
     local owns_compaction = type(entry) == "table"
         and entry.kind == "compaction" and entry.status == "pending"
     if owns_user_echo or owns_queue or owns_compaction then
       retained[#retained + 1] = entry
-      if owns_user_echo then pending_user_echo_idx = #retained end
-      if owns_queue then queued_entry_idx = #retained end
     end
   end
-  return retained, pending_user_echo_idx, queued_entry_idx
+  return retained
 end
 
 local function settle_terminal_provider_round(state, terminal)
@@ -1763,12 +1760,10 @@ end
 
 local function apply_conversation_action(state, item)
   if item.kind == "active_changed" then
-    local entries, pending_user_echo_idx, queued_entry_idx = retain_optimistic_entries(state)
+    local entries = retain_optimistic_entries(state)
     return shallow_merge(state, {
       conversation_id = item.conversation_id,
       entries = entries,
-      pending_user_echo_idx = pending_user_echo_idx or NIL_SENTINEL,
-      queued_entry_idx = queued_entry_idx or NIL_SENTINEL,
       in_flight = NIL_SENTINEL,
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,

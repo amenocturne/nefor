@@ -9,6 +9,7 @@ local W       = tui_lib.widget
 
 local common      = require("libs.chat.common")
 local entries_mod = require("libs.chat.entries")
+local queued_input = require("libs.chat.queued_input")
 -- statusline/slash are config-owned opinion files (they stay in
 -- examples/nefor-agent/chat, resolved via the `chat` searcher). This view assembles
 -- them by fixed module name — an implicit interface a later wave should
@@ -94,7 +95,7 @@ local function transcript(state)
     key          = concealed and "transcript-loading" or "transcript",
     entries      = function() return concealed and {} or (state.entries or {}) end,
     render_entry = function(e, i)
-      local queued = (state.queued_entry_idx == i)
+      local queued = queued_input.is_queued_entry(state, e)
       return entries_mod.render(e, i, state.expanded_details, queued, state.raw_tool_id)
     end,
     append       = concealed and nil or thinking_widget(state),

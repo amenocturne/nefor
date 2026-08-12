@@ -10938,3 +10938,116 @@ fn assistant_and_workflow_result_footers_share_compact_durations() {
         "assistant and workflow result footers must share the formatter:\n{snapshot}"
     );
 }
+
+#[test]
+fn queued_submit_promotes_to_canonical_next_turn_without_disappearing() {
+    let mut engine = Engine::new(120, 40).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    let conversation_id = "queued-order-conversation";
+    activate_conversation(&mut engine, conversation_id);
+    append_canonical_message(
+        &mut engine,
+        conversation_id,
+        "prior-user",
+        "user",
+        "prior-user-marker",
+    );
+    append_canonical_assistant_terminal(
+        &mut engine,
+        conversation_id,
+        "prior-turn",
+        "prior-assistant-marker",
+        "turn_completed",
+        json!({ "model": "mock-model" }),
+    );
+
+    // Keep a new prior turn active while its tool activity is projected. The
+    // local submit is therefore optimistic queue state, not a direct turn.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "turn_started", "turn_id": "busy-turn", "run_id": "busy-turn" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "tool_call_completed", "turn_id": "busy-turn",
+                "exchange": { "id": "before-queue", "name": "mag write", "status": "call_completed",
+                    "arguments": { "file": "before-queue.mag" } } }
+        }),
+    );
+    for ch in "queued-causal-marker".chars() {
+        engine
+            .handle_key(key(&ch.to_string()))
+            .expect("type queued input");
+    }
+    engine.handle_key(key("enter")).expect("queue input");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "tool_call_completed", "turn_id": "busy-turn",
+                "exchange": { "id": "after-queue", "name": "mag execute", "status": "call_completed",
+                    "arguments": { "file": "after-queue.mag" } } }
+        }),
+    );
+
+    // The old turn commits, then agentic-loop promotes its queued input. The
+    // optimistic row must move after all old-turn output and become the owner
+    // awaiting canonical message acknowledgement rather than being deleted.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+            "change": { "kind": "turn_completed", "turn_id": "busy-turn", "run_id": "busy-turn",
+                "terminal": { "model": "mock-model" } }
+        }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
+    let _ = render_str(&mut engine);
+    let promoted = engine.snapshot();
+    assert_eq!(
+        promoted.matches("queued-causal-marker").count(),
+        1,
+        "promoted frame:\n{promoted}"
+    );
+    assert!(
+        promoted.find("after-queue.mag") < promoted.find("queued-causal-marker"),
+        "promoted queue must follow intervening old-turn MAG output:\n{promoted}"
+    );
+
+    append_canonical_message(
+        &mut engine,
+        conversation_id,
+        "queued-user-message",
+        "user",
+        "queued-causal-marker",
+    );
+    append_canonical_assistant_terminal(
+        &mut engine,
+        conversation_id,
+        "queued-response-turn",
+        "queued-response-marker",
+        "turn_completed",
+        json!({ "model": "mock-model" }),
+    );
+
+    let _ = render_str(&mut engine);
+    let final_frame = engine.snapshot();
+    assert_eq!(final_frame.matches("queued-causal-marker").count(), 1);
+    let user = final_frame
+        .find("queued-causal-marker")
+        .expect("canonical user row");
+    let response = final_frame
+        .find("queued-response-marker")
+        .expect("response row");
+    assert!(
+        user < response,
+        "canonical user row must immediately precede its turn output:\n{final_frame}"
+    );
+}

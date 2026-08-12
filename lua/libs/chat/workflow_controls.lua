@@ -66,7 +66,7 @@ function M.escape_timeout(state, token)
   end
 
   local next_state = clear_escape(state)
-  if state.escape_count == 1 and state.queued_entry_idx ~= nil then
+  if state.escape_count == 1 and state.queued_entry_id ~= nil then
     return next_state, { { kind = "steer_queued" } }, { restored_queue = false }
   end
   return next_state, {}, { restored_queue = false }
