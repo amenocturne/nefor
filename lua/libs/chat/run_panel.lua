@@ -290,75 +290,94 @@ end
 -- status / activity window of a whole group or run).
 M.build_groups = build_groups
 
--- Group row. The elapsed window is the WHOLE-RUN clock (first member start →
--- now while live, frozen at the last finish once terminal) — deliberately
--- unlike member rows, which tick per activation. The collapsed row carries
--- identity + status + count + timer only; which member is currently working
--- is what unfolding the group is for.
-local function group_row_parts(group, now_ms)
-  local glyph = GLYPHS[group.status] or "·"
-  local style = NODE_STYLE[group.status] or STYLE.status_dim
-  local elapsed
+local DURATION_COLUMNS = 7
+local PENDING_DURATION = "–"
+
+local function text(content, style, wrap)
+  return tui.text { content = content, style = style, wrap = wrap or "none" }
+end
+
+local function duration_widget(elapsed, style)
+  local value = elapsed == nil and PENDING_DURATION or fmt_elapsed_ms(elapsed)
+  return text(string.rep(" ", DURATION_COLUMNS - #value) .. value, style)
+end
+
+local function name_widget(name, style)
+  return tui.expanded { child = text(name, style, "ellipsis") }
+end
+
+local function group_elapsed_ms(group, now_ms)
   if group.status == "running" then
-    elapsed = group.active_ms + now_ms - (group.active_since_ms or now_ms)
-  elseif TERMINAL_STATUS[group.status] and group.first_start then
-    elapsed = group.active_ms
+    return group.active_ms + math.max(0, now_ms - (group.active_since_ms or now_ms))
   end
-  local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
+  if TERMINAL_STATUS[group.status] and group.first_start then return group.active_ms end
+  return nil
+end
+
+local function group_row_widget(group, now_ms, selected)
+  local style = selected and CURSOR_ROW_STYLE or NODE_STYLE[group.status] or STYLE.status_dim
   local n = #group.members
-  local count_str = n > 1 and (" (" .. n .. ")") or ""
-  local text = glyph .. " " .. group.name .. count_str .. elapsed_str
-  return text, style
+  local count = n > 1 and (" (" .. n .. ")") or ""
+  return tui.row { gap = 0, children = {
+    text((GLYPHS[group.status] or "·") .. " ", style),
+    duration_widget(group_elapsed_ms(group, now_ms), style),
+    text(" ", style),
+    name_widget(group.name, style),
+    text(count, style),
+  } }
 end
 
--- Run header. Counts GROUPS (not raw actors): "(done/total)" where a
--- group is done once its aggregated status is terminal, with a trailing
--- rejected / no-op modification tail.
-local function mag_run_header_title(run, groups)
-  local ident
-  if type(run.run_name) == "string" and #run.run_name > 0 then
-    ident = run.run_name
-  else
-    ident = run.run_id and run.run_id:sub(1, 8) or "?"
-  end
-  local label = "MAG"
+local function run_ident(run)
+  if type(run.run_name) == "string" and #run.run_name > 0 then return run.run_name end
+  return run.run_id and run.run_id:sub(1, 8) or "?"
+end
+
+local function run_elapsed_ms(run, now_ms)
+  local finish = run.completed_at_ms or now_ms
+  return math.max(0, finish - (run.started_at_ms or finish))
+end
+
+-- Counts GROUPS (not raw actors). Duration is total workflow wall time,
+-- independent of the activity-only timers on group and actor rows.
+local function run_header_widget(run, groups, now_ms, selected)
+  local style = selected and CURSOR_ROW_STYLE or STYLE.footer
   local done = 0
-  for _, g in ipairs(groups) do
-    if TERMINAL_STATUS[g.status] then done = done + 1 end
+  for _, group in ipairs(groups) do
+    if TERMINAL_STATUS[group.status] then done = done + 1 end
   end
-  local title = string.format("%s %s (%d/%d)", label, ident, done, #groups)
   local extra = {}
-  if (run.rejected or 0) > 0 then extra[#extra + 1] = "✗" .. run.rejected .. " rej" end
-  if (run.noops or 0) > 0 then extra[#extra + 1] = "⊘" .. run.noops end
-  if #extra > 0 then title = title .. "  " .. table.concat(extra, " ") end
-  return title
+  if (run.rejected or 0) > 0 then extra[#extra + 1] = " ✗" .. run.rejected .. " rej" end
+  if (run.noops or 0) > 0 then extra[#extra + 1] = " ⊘" .. run.noops end
+  return tui.row { gap = 0, children = {
+    text("MAG ", style),
+    duration_widget(run_elapsed_ms(run, now_ms), style),
+    text(" ", style),
+    name_widget(run_ident(run), style),
+    text(string.format(" (%d/%d)", done, #groups), style),
+    text(table.concat(extra), style),
+  } }
 end
 
--- MAG member (actor leaf) row, rendered under an unfolded group:
--- `  ● explorer.llm  working 47s` (per-activation timer) or
--- `  · explorer.llm  idle` (between activations — no timer, no noise).
--- The stuck-agent signature — a BUSY actor whose last stream event went
--- stale — comes back as a second return: an indented sub-row
--- (`    ⚠ stale 32s`), following the last_tool sub-row idiom so the alarm
--- survives the narrow sidebar instead of clipping off the row's tail.
--- Idle-between-rounds deliberately never warns: silence is that state's
--- normal shape, only busy-and-silent smells stuck.
-local function actor_row_parts(actor_id, node, stream, now_ms)
-  local glyph = GLYPHS[node.status] or "·"
-  local style = NODE_STYLE[node.status] or STYLE.status_dim
-  local elapsed = node_elapsed_ms(node, now_ms)
-  local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
-  local text = "  " .. glyph .. " " .. actor_id .. "  "
-    .. (node.status or "?") .. elapsed_str
-  local stale_text
-  if node.status == "working" and stream ~= nil
-      and stream.last_activity_ms ~= nil then
+-- Member timers cover the current/cumulative activation. Pending and idle
+-- members reserve the same quiet duration slot so sibling names stay aligned.
+local function actor_row_widget(actor_id, node, now_ms, selected)
+  local style = selected and CURSOR_ROW_STYLE or NODE_STYLE[node.status] or STYLE.status_dim
+  return tui.row { gap = 0, children = {
+    text("  " .. (GLYPHS[node.status] or "·") .. " ", style),
+    duration_widget(node_elapsed_ms(node, now_ms), style),
+    text(" " .. (node.status or "?") .. " ", style),
+    name_widget(actor_id, style),
+  } }
+end
+
+local function actor_stale_text(node, stream, now_ms)
+  if node.status == "working" and stream ~= nil and stream.last_activity_ms ~= nil then
     local silent = now_ms - stream.last_activity_ms
     if silent >= preview_state.STALE_MS then
-      stale_text = "    ⚠ stale " .. fmt_elapsed_ms(silent)
+      return "    ⚠ stale " .. fmt_elapsed_ms(silent)
     end
   end
-  return text, style, stale_text
+  return nil
 end
 
 -- ── sidebar row model (fold state / cursor navigation) ────────────────
@@ -421,7 +440,7 @@ function M.row_model(state, now_ms)
         if unfolded then
           for _, m in ipairs(g.members) do
             local stream = run_streams[m.id]
-            local _, _, stale_text = actor_row_parts(m.id, m.node, stream, now_ms)
+            local stale_text = actor_stale_text(m.node, stream, now_ms)
             append({
               kind = "actor", run_id = run_id, actor_id = m.id,
               node = m.node, stream = stream,
@@ -469,26 +488,12 @@ local function panel_children(state, now_ms)
         children[#children + 1] = tui.text { content = "", wrap = "none" }
       end
       first_run = false
-      local title = mag_run_header_title(row.run, row.groups)
-      children[#children + 1] = tui.text {
-        content = title,
-        style   = on_cursor and CURSOR_ROW_STYLE or STYLE.footer,
-        wrap    = "none",
-      }
+      children[#children + 1] = run_header_widget(row.run, row.groups, now_ms, on_cursor)
     elseif row.kind == "group" then
-      local text, style = group_row_parts(row.group, now_ms)
-      children[#children + 1] = tui.text {
-        content = text,
-        style   = on_cursor and CURSOR_ROW_STYLE or style,
-        wrap    = "none",
-      }
+      children[#children + 1] = group_row_widget(row.group, now_ms, on_cursor)
     elseif row.kind == "actor" then
-      local text, style, stale_text = actor_row_parts(row.actor_id, row.node, row.stream, now_ms)
-      children[#children + 1] = tui.text {
-        content = text,
-        style   = on_cursor and CURSOR_ROW_STYLE or style,
-        wrap    = "none",
-      }
+      local stale_text = actor_stale_text(row.node, row.stream, now_ms)
+      children[#children + 1] = actor_row_widget(row.actor_id, row.node, now_ms, on_cursor)
       if stale_text ~= nil then
         children[#children + 1] = tui.text {
           content = stale_text,

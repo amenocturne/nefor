@@ -2033,7 +2033,7 @@ fn slash_new_clears_panel_runs() {
     );
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG run-aaaa"),
+        out.contains("MAG") && out.contains("run-aaaa"),
         "run-panel header should appear pre-/new: {out:?}"
     );
 
@@ -2087,7 +2087,7 @@ fn mag_run_lifecycle_renders_in_run_panel() {
     );
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG demo"),
+        out.contains("MAG") && out.contains("demo"),
         "mag run header should show the run name: {out:?}"
     );
     assert!(
@@ -2292,7 +2292,7 @@ fn mag_run_failed_prunes_after_linger() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG eval-5"),
+        out.contains("MAG") && out.contains("eval-5"),
         "failed run should linger initially: {out:?}"
     );
 
@@ -2301,7 +2301,7 @@ fn mag_run_failed_prunes_after_linger() {
     engine.advance_time(Duration::from_millis(3000));
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("MAG eval-5"),
+        !out.contains("eval-5"),
         "failed run should be pruned past the linger window: {out:?}"
     );
     assert!(
@@ -2339,7 +2339,7 @@ fn mag_killed_run_prunes_after_linger() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG victim"),
+        out.contains("MAG") && out.contains("victim"),
         "killed run should linger initially: {out:?}"
     );
 
@@ -2347,7 +2347,7 @@ fn mag_killed_run_prunes_after_linger() {
     dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("MAG victim"),
+        !out.contains("victim"),
         "killed run should be pruned past the linger window: {out:?}"
     );
 }
@@ -2388,7 +2388,7 @@ fn mag_modification_kill_keeps_run_live() {
     dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG living"),
+        out.contains("MAG") && out.contains("living"),
         "a modification kill must not prune the still-live run: {out:?}"
     );
 }
@@ -2577,7 +2577,10 @@ fn mag_concurrent_runs_key_panel_state_by_run_id() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("MAG lead") && snap.contains("MAG auth-fix"),
+        snap.contains("MAG")
+            && snap.contains("lead")
+            && snap.contains("MAG")
+            && snap.contains("auth-fix"),
         "both concurrent runs render, distinguishable by run_name:\n{snap}"
     );
 
@@ -2607,7 +2610,10 @@ fn mag_concurrent_runs_key_panel_state_by_run_id() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("MAG lead") && snap.contains("MAG auth-fix"),
+        snap.contains("MAG")
+            && snap.contains("lead")
+            && snap.contains("MAG")
+            && snap.contains("auth-fix"),
         "the completed sub-run lingers alongside the live lead run:\n{snap}"
     );
     assert!(
@@ -2791,7 +2797,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG run-dddd"),
+        out.contains("MAG") && out.contains("run-dddd"),
         "completed run should linger initially: {out:?}"
     );
 
@@ -2802,7 +2808,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     engine.advance_time(Duration::from_millis(3000));
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("MAG run-dddd"),
+        !out.contains("run-dddd"),
         "completed run should be hidden past linger window without a dispatch: {out:?}"
     );
     assert!(
@@ -2843,7 +2849,7 @@ fn graph_run_complete_removes_run_after_linger_window() {
     // The run is still within its linger window — header is visible.
     let out = render_str(&mut engine);
     assert!(
-        out.contains("MAG run-cccc"),
+        out.contains("MAG") && out.contains("run-cccc"),
         "completed run should linger initially: {out:?}"
     );
 
@@ -2854,7 +2860,7 @@ fn graph_run_complete_removes_run_after_linger_window() {
     dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("MAG run-cccc"),
+        !out.contains("run-cccc"),
         "completed run should be pruned past linger window: {out:?}"
     );
     // The empty-state hint should now show in the sidebar.
@@ -8575,7 +8581,7 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
     );
     let cursor = cursor_styled_text(&out);
     assert!(
-        cursor.contains("MAG demo"),
+        cursor.contains("MAG") && cursor.contains("demo"),
         "cursor highlight should start on the run header row: {cursor:?}"
     );
 
@@ -8584,7 +8590,7 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(
-        out.contains("explorer.entry") && out.contains("explorer.loop-counter"),
+        out.contains("explorer.entry") && out.contains("explorer.loop-c…"),
         "Enter on the group row must unfold its member rows: {out:?}"
     );
 
@@ -8629,14 +8635,14 @@ fn shift_tab_also_cycles_focus() {
     let out = render_str(&mut engine);
     let cursor = cursor_styled_text(&out);
     assert!(
-        cursor.contains("MAG demo"),
+        cursor.contains("MAG") && cursor.contains("demo"),
         "shift_tab must focus the sidebar too (2 panes ⇒ toggle): {cursor:?}"
     );
     engine.handle_key(key("shift_tab")).expect("shift_tab");
     let out = render_str(&mut engine);
     let cursor = cursor_styled_text(&out);
     assert!(
-        !cursor.contains("MAG demo"),
+        !cursor.contains("demo"),
         "second shift_tab must hand focus back to the prompt: {cursor:?}"
     );
 }
@@ -8663,7 +8669,7 @@ fn tab_is_noop_while_a_popup_owns_the_keyboard() {
     let out = render_str(&mut engine);
     let cursor = cursor_styled_text(&out);
     assert!(
-        !cursor.contains("MAG demo"),
+        !cursor.contains("demo"),
         "tab must not switch pane focus while a popup owns keys: {cursor:?}"
     );
 
@@ -8673,7 +8679,7 @@ fn tab_is_noop_while_a_popup_owns_the_keyboard() {
     let out = render_str(&mut engine);
     let cursor = cursor_styled_text(&out);
     assert!(
-        cursor.contains("MAG demo"),
+        cursor.contains("MAG") && cursor.contains("demo"),
         "after popup dismissal tab must focus the sidebar: {cursor:?}"
     );
 }
@@ -8699,7 +8705,7 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
     let out = render_str(&mut engine);
     let cursor = cursor_styled_text(&out);
     assert!(
-        !cursor.contains("MAG demo"),
+        !cursor.contains("demo"),
         "tab with the completion popup open must not move pane focus: {cursor:?}"
     );
     assert!(
@@ -8862,23 +8868,16 @@ fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("MAG investigate (1/3)"),
+        snap.contains("MAG") && snap.contains("investigate") && snap.contains("(1/3)"),
         "the settled task firing must count as completed while the run remains active:\n{snap}"
     );
     assert!(
-        snap.lines().any(|line| {
-            line.split('│').any(|segment| {
-                let node = segment.trim();
-                node.contains("✓ task ")
-                    && ["ms", "s", "m", "h"]
-                        .iter()
-                        .any(|unit| node.ends_with(unit))
-            })
-        }),
+        snap.lines()
+            .any(|line| line.contains("✓") && line.contains("0ms task")),
         "task must show its actual firing duration rather than the run lifetime:\n{snap}"
     );
     assert!(
-        snap.contains("● investigator") && snap.contains("○ result"),
+        snap.contains("●     0ms investigator") && snap.contains("○     – result"),
         "other nodes retain their independent running and pending states:\n{snap}"
     );
 
@@ -8889,7 +8888,12 @@ fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("MAG investigate (0/3)") && snap.contains("● task"),
+        snap.contains("MAG")
+            && snap.contains("investigate")
+            && snap.contains("(0/3)")
+            && snap
+                .lines()
+                .any(|line| line.contains("●") && line.contains("task")),
         "a later firing moves the same resident actor back to running:\n{snap}"
     );
 }
@@ -8913,11 +8917,11 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("lead.llm  working 5s"),
+        snap.contains("  ●      5s working lead.llm"),
         "the working member must tick its activation elapsed:\n{snap}"
     );
     assert!(
-        snap.contains("lead.run-tool  pending") && !snap.contains("pending 5"),
+        snap.contains("– pending lead.run-tool") && !snap.contains("pending 5"),
         "a pending member must not tick:\n{snap}"
     );
 
@@ -8940,11 +8944,11 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("lead.run-tool  working 3s"),
+        snap.contains("  ●      3s working lead.run-tool"),
         "the newly-busy member ticks its OWN activation window:\n{snap}"
     );
     assert!(
-        snap.contains("lead.llm  idle")
+        snap.contains("idle lead.llm")
             && !snap.contains("idle 3s")
             && !snap.contains("idle 5s")
             && !snap.contains("idle 8s"),
@@ -8970,7 +8974,7 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("lead.llm  working 2s"),
+        snap.contains("  ●      2s working lead.llm"),
         "a fresh activation must reset the member timer:\n{snap}"
     );
 
@@ -8986,7 +8990,11 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("MAG loop (1/1)") && snap.contains("✓ lead (2) 10s"),
+        snap.contains("MAG")
+            && snap.contains("loop")
+            && snap.contains("(1/1)")
+            && snap.contains("✓     10s lead")
+            && snap.contains("(2)"),
         "the settled group must be done with a frozen firing window:\n{snap}"
     );
     assert!(
@@ -9078,7 +9086,7 @@ fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
     // The cursor row stays the in-pane focus indicator.
     let cursor = cursor_styled_text(&out);
     assert!(
-        cursor.contains("MAG demo"),
+        cursor.contains("MAG") && cursor.contains("demo"),
         "the cursor row remains the in-pane focus indicator: {cursor:?}"
     );
 }
@@ -10905,9 +10913,9 @@ fn compact_duration_formatter_covers_unit_boundaries() {
         (60_000, "1m"),
         (61_000, "1m1s"),
         (3_600_000, "1h"),
-        (18_615_000, "5h10m15s"),
+        (18_615_000, "5h10m"),
         (86_400_000, "1d"),
-        (176_461_000, "2d1h1m1s"),
+        (176_461_000, "2d1h"),
     ] {
         let actual: String = engine
             .lua()
@@ -10946,7 +10954,7 @@ fn running_and_completed_workflow_rows_use_compact_durations() {
     let _ = render_str(&mut engine);
     let running = engine.snapshot();
     assert!(
-        running.contains("● worker 5m10s"),
+        running.contains("●   5m10s worker"),
         "running workflow row must stay compact:\n{running}"
     );
 
@@ -10957,7 +10965,7 @@ fn running_and_completed_workflow_rows_use_compact_durations() {
     let _ = render_str(&mut engine);
     let completed = engine.snapshot();
     assert!(
-        completed.contains("✓ worker 5m10s"),
+        completed.contains("✓   5m10s worker"),
         "completed workflow row must freeze the same compact duration:\n{completed}"
     );
 }
@@ -10984,7 +10992,7 @@ fn assistant_and_workflow_result_footers_share_compact_durations() {
     let _ = render_str(&mut engine);
     let snapshot = engine.snapshot();
     assert_eq!(
-        snapshot.matches("5h10m15s").count(),
+        snapshot.matches("5h10m").count(),
         2,
         "assistant and workflow result footers must share the formatter:\n{snapshot}"
     );
@@ -11103,5 +11111,103 @@ fn queued_submit_promotes_to_canonical_next_turn_without_disappearing() {
     assert!(
         user < response,
         "canonical user row must immediately precede its turn output:\n{final_frame}"
+    );
+}
+
+fn seed_responsive_sidebar(engine: &mut Engine, run_name: &str) {
+    dispatch_event(
+        engine,
+        json!({ "kind": "mag.run_started", "run_id": "responsive-run", "run_name": run_name }),
+    );
+    for id in ["语义投影工作流.entry", "pending-result"] {
+        dispatch_event(
+            engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "responsive-run", "id": id, "factory": "llm" }),
+        );
+    }
+    dispatch_event(
+        engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "responsive-run", "id": "语义投影工作流.entry" }),
+    );
+    dispatch_event(
+        engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "responsive-run", "id": "语义投影工作流.entry" }),
+    );
+}
+
+#[test]
+fn responsive_sidebar_protects_duration_progress_and_unicode_name_clipping() {
+    for width in [52, 80, 120] {
+        let mut engine = Engine::new(width, 20).expect("engine");
+        load_chat_scenario(&mut engine);
+        let _ = render_str(&mut engine);
+        seed_responsive_sidebar(&mut engine, "语义投影工作流-semantic-projection-oracle");
+        engine.advance_time(Duration::from_secs(68));
+        let snapshot = render_snapshot(&mut engine);
+        let header = snapshot
+            .lines()
+            .find(|line| line.contains("MAG"))
+            .expect("workflow header");
+        assert!(
+            header.contains("1m8s"),
+            "duration missing at width {width}: {header}"
+        );
+        assert!(
+            header.contains("(0/2)"),
+            "progress missing at width {width}: {header}"
+        );
+        assert!(
+            header.contains('…'),
+            "long name should clip at width {width}: {header}"
+        );
+        assert!(
+            !header.contains("semantic-projection-oracle"),
+            "full long name should not displace metadata at width {width}: {header}"
+        );
+    }
+}
+
+#[test]
+fn responsive_sidebar_timers_tick_then_freeze_and_pending_slots_align() {
+    let mut engine = Engine::new(80, 20).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    seed_responsive_sidebar(&mut engine, "workflow");
+
+    engine.advance_time(Duration::from_secs(5));
+    let active = render_snapshot(&mut engine);
+    assert!(
+        active.contains("MAG      5s workflow"),
+        "active wall clock missing:\n{active}"
+    );
+    assert!(
+        active
+            .lines()
+            .any(|line| line.contains("●      5s") && line.contains("语")),
+        "active child timer missing:\n{active}"
+    );
+    assert!(
+        active.contains("○     – pending-result"),
+        "pending duration slot missing:\n{active}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_complete", "run_id": "responsive-run" }),
+    );
+    let frozen = render_snapshot(&mut engine);
+    engine.advance_time(Duration::from_secs(1));
+    let later = render_snapshot(&mut engine);
+    let frozen_header = frozen
+        .lines()
+        .find(|line| line.contains("MAG"))
+        .expect("frozen header");
+    let later_header = later
+        .lines()
+        .find(|line| line.contains("MAG"))
+        .expect("later header");
+    assert_eq!(
+        frozen_header, later_header,
+        "terminal wall clock must freeze"
     );
 }

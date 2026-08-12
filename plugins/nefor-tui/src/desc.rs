@@ -353,6 +353,7 @@ pub enum WrapMode {
     Word,
     Char,
     None,
+    Ellipsis,
     Tail,
     TailEllipsis,
 }
@@ -1492,10 +1493,11 @@ fn parse_wrap(t: &Table) -> Result<WrapMode, TuiError> {
             "word" => Ok(WrapMode::Word),
             "char" => Ok(WrapMode::Char),
             "none" => Ok(WrapMode::None),
+            "ellipsis" => Ok(WrapMode::Ellipsis),
             "tail" => Ok(WrapMode::Tail),
             "tail-ellipsis" => Ok(WrapMode::TailEllipsis),
             other => Err(TuiError::InvalidDesc(format!(
-                "tui.text: `wrap` must be one of word|char|none|tail|tail-ellipsis (got `{other}`)"
+                "tui.text: `wrap` must be one of word|char|none|ellipsis|tail|tail-ellipsis (got `{other}`)"
             ))),
         },
         other => Err(TuiError::InvalidDesc(format!(
@@ -1711,6 +1713,7 @@ mod tests {
             ("word", WrapMode::Word),
             ("char", WrapMode::Char),
             ("none", WrapMode::None),
+            ("ellipsis", WrapMode::Ellipsis),
             ("tail", WrapMode::Tail),
             ("tail-ellipsis", WrapMode::TailEllipsis),
         ] {

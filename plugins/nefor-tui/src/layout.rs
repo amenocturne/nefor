@@ -1929,6 +1929,7 @@ pub fn wrap_styled(chars: &[StyledChar], width: u16, wrap: WrapMode) -> Vec<Vec<
         }
         match wrap {
             WrapMode::None => wrapped.push(take_styled_columns(&raw, limit)),
+            WrapMode::Ellipsis => wrapped.push(take_styled_columns_with_ellipsis(&raw, limit)),
             WrapMode::Tail => wrapped.push(take_styled_tail_columns(&raw, limit)),
             WrapMode::TailEllipsis => {
                 wrapped.push(take_styled_tail_columns_with_ellipsis(&raw, limit))
@@ -1951,6 +1952,24 @@ fn take_styled_columns(line: &[StyledChar], limit: usize) -> Vec<StyledChar> {
         out.push(c.clone());
         taken += w;
     }
+    out
+}
+
+fn take_styled_columns_with_ellipsis(line: &[StyledChar], limit: usize) -> Vec<StyledChar> {
+    let content_width: usize = line.iter().map(|c| char_width(c.ch)).sum();
+    if content_width <= limit {
+        return line.to_vec();
+    }
+    let ellipsis_width = char_width('…');
+    if ellipsis_width > limit {
+        return Vec::new();
+    }
+    let mut out = take_styled_columns(line, limit - ellipsis_width);
+    out.push(StyledChar {
+        ch: '…',
+        style: line.last().map(|c| c.style).unwrap_or_default(),
+        link: line.last().and_then(|c| c.link.clone()),
+    });
     out
 }
 
@@ -2161,6 +2180,7 @@ pub fn wrap_text(content: &str, width: u16, wrap: WrapMode) -> Vec<String> {
                 let truncated: String = take_columns(raw_line, width);
                 out.push(truncated);
             }
+            WrapMode::Ellipsis => out.push(take_columns_with_ellipsis(raw_line, width)),
             WrapMode::Tail => out.push(take_tail_columns(raw_line, width)),
             WrapMode::TailEllipsis => out.push(take_tail_columns_with_ellipsis(raw_line, width)),
             WrapMode::Char => out.extend(wrap_char(raw_line, width)),
@@ -2182,6 +2202,20 @@ fn take_columns(s: &str, width: u16) -> String {
         out.push(ch);
         taken += w;
     }
+    out
+}
+
+fn take_columns_with_ellipsis(s: &str, width: u16) -> String {
+    let limit = width as usize;
+    if string_width(s) <= limit {
+        return s.to_owned();
+    }
+    let ellipsis_width = char_width('…');
+    if ellipsis_width > limit {
+        return String::new();
+    }
+    let mut out = take_columns(s, (limit - ellipsis_width) as u16);
+    out.push('…');
     out
 }
 
@@ -2405,6 +2439,19 @@ mod tests {
         let root = rec.root.as_mut().unwrap();
         layout_and_paint(root, w, h, &mut buf);
         buf
+    }
+
+    #[test]
+    fn ellipsis_marks_end_overflow_with_display_width_accounting() {
+        assert_eq!(
+            wrap_text("semantic-projection", 10, WrapMode::Ellipsis),
+            vec!["semantic-…"]
+        );
+        assert_eq!(
+            wrap_text("语义workflow", 7, WrapMode::Ellipsis),
+            vec!["语义wo…"]
+        );
+        assert_eq!(wrap_text("你", 1, WrapMode::Ellipsis), vec!["…"]);
     }
 
     #[test]

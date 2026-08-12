@@ -118,6 +118,8 @@ function M.humanize_duration_ms(ms)
   if ms < 1000 then return tostring(ms) .. "ms" end
 
   local remaining = math.floor(ms / 1000)
+  local days = math.floor(remaining / 86400)
+  if days > 999 then return "999d+" end
   local units = {
     { suffix = "d", seconds = 86400 },
     { suffix = "h", seconds = 3600 },
@@ -130,6 +132,7 @@ function M.humanize_duration_ms(ms)
     if value > 0 then
       parts[#parts + 1] = tostring(value) .. unit.suffix
       remaining = remaining % unit.seconds
+      if #parts == 2 then break end
     end
   end
   return table.concat(parts)
