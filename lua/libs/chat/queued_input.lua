@@ -42,26 +42,29 @@ function M.is_queued_entry(state, entry)
   return type(entry) == "table" and entry.local_id == state.queued_entry_id
 end
 
-function M.submit(state, text, busy)
+function M.submit(state, text, busy, submission_id)
   if busy then
     local idx = owned_index(state, state.queued_entry_id)
     local old = idx and state.entries[idx] or nil
     if old ~= nil then
       local entries = copy_entries(state.entries)
       entries[idx] = Entry.set_text(old, old.text .. "\n" .. text)
+      local submission_ids = copy_entries(old.submission_ids)
+      submission_ids[#submission_ids + 1] = submission_id
+      entries[idx].submission_ids = submission_ids
       local next_state = copy_table(state)
       next_state.entries = entries
       return next_state
     end
 
-    local next_state = push_entry(state, Entry.user(text))
+    local next_state = push_entry(state, Entry.user(text, submission_id))
     next_state.queued_entry_id = next_state.entries[#next_state.entries].local_id
     return next_state
   end
 
-  local next_state = push_entry(state, Entry.user(text))
+  local next_state = push_entry(state, Entry.user(text, submission_id))
   local entry = next_state.entries[#next_state.entries]
-  next_state.pending_user_echo = text
+  next_state.pending_submission_ids = entry.submission_ids
   next_state.pending_user_echo_id = entry.local_id
   return next_state
 end
@@ -83,7 +86,7 @@ function M.accept_steered(state)
   local next_state = copy_table(state)
   next_state.entries = entries
   next_state.queued_entry_id = nil
-  next_state.pending_user_echo = owned.text
+  next_state.pending_submission_ids = owned.submission_ids
   next_state.pending_user_echo_id = owned.local_id
   if type(state.in_flight) == "number" then
     if state.in_flight > idx then
@@ -95,31 +98,47 @@ function M.accept_steered(state)
   return next_state, true
 end
 
-function M.observe_external_submit(state, text)
-  if state.pending_user_echo ~= nil and state.pending_user_echo == text then
-    return state, true
+function M.observe_external_submit(state, text, submission_id)
+  if type(submission_id) ~= "string" then return state, false end
+  for _, id in ipairs(state.pending_submission_ids or {}) do
+    if id == submission_id then return state, true end
   end
-  local next_state = push_entry(state, Entry.user(text))
+  local next_state = push_entry(state, Entry.user(text, submission_id))
   local entry = next_state.entries[#next_state.entries]
-  next_state.pending_user_echo = text
+  next_state.pending_submission_ids = entry.submission_ids
   next_state.pending_user_echo_id = entry.local_id
   return next_state, true
 end
 
-function M.reconcile_echo(state, text)
-  if state.pending_user_echo == nil or state.pending_user_echo ~= text then
-    return state, false
+function M.reconcile_echo(state, submission_ids, message_id, turn_id)
+  if type(submission_ids) ~= "table" then return state, false end
+  local acknowledged = {}
+  for _, id in ipairs(submission_ids) do acknowledged[id] = true end
+  local matched = false
+  for _, id in ipairs(state.pending_submission_ids or {}) do
+    if not acknowledged[id] then return state, false end
+    matched = true
   end
+  if not matched then return state, false end
 
   local idx = owned_index(state, state.pending_user_echo_id)
   local owned = idx and state.entries[idx] or nil
   local next_state = copy_table(state)
-  next_state.pending_user_echo = nil
+  next_state.pending_submission_ids = nil
   next_state.pending_user_echo_id = nil
-  if owned and owned.role == "user" and owned.text == text then
+  if owned and owned.role == "user" then
+    local entries = {}
+    for entry_idx, entry in ipairs(state.entries or {}) do
+      if entry_idx ~= idx then entries[#entries + 1] = entry end
+    end
+    entries[#entries + 1] = Entry.bind_canonical(owned, message_id, turn_id)
+    next_state.entries = entries
+    if type(state.in_flight) == "number" and state.in_flight > idx then
+      next_state.in_flight = state.in_flight - 1
+    end
     return next_state, true
   end
-  return push_entry(next_state, Entry.user(text)), true
+  return next_state, false
 end
 
 function M.restore(state)
@@ -134,7 +153,7 @@ function M.restore(state)
   local next_state = copy_table(state)
   next_state.entries = entries
   next_state.queued_entry_id = nil
-  next_state.pending_user_echo = nil
+  next_state.pending_submission_ids = nil
   next_state.pending_user_echo_id = nil
   if type(state.in_flight) == "number" and state.in_flight > idx then
     next_state.in_flight = state.in_flight - 1

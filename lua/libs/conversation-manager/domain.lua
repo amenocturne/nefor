@@ -102,6 +102,7 @@ handlers.message_started = function(c, event)
   local message = {
     id = event.message_id, role = event.role, status = "open",
     turn_id = event.turn_id, tool_call_id = event.tool_call_id,
+    submission_ids = copy(event.submission_ids or {}),
     tool_name = event.tool_name or (tool_exchange and tool_exchange.tool_name),
     chunks = {}, attempts = {}, exchange_ids = {},
   }

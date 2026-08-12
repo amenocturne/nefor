@@ -50,6 +50,7 @@ local function message_completed(state, actions, message)
       text = message.text or "",
       message_id = message.id,
       turn_id = message.turn_id,
+      submission_ids = message.submission_ids,
     })
   elseif message.role == "assistant" then
     action(actions, "assistant_completed", {
@@ -72,9 +73,8 @@ local function snapshot_actions(state, projection, actions)
   local tool_message_by_call_id = {}
   for _, exchange in ipairs(projection.exchanges or {}) do
     exchange_by_id[exchange.id] = exchange
-    local call = exchange.arguments
-    if type(call) == "table" and type(call.id) == "string" then
-      exchange_by_call_id[call.id] = exchange
+    if type(exchange.tool_call_id) == "string" then
+      exchange_by_call_id[exchange.tool_call_id] = exchange
     end
   end
   for _, message in ipairs(projection.messages or {}) do
@@ -97,16 +97,22 @@ local function snapshot_actions(state, projection, actions)
     record_message(state, message)
     if message.role == "assistant" then
       if type(message.reasoning) == "string" and message.reasoning ~= "" then
-        action(actions, "reasoning_delta", { text = message.reasoning, turn_id = message.turn_id })
+        action(actions, "reasoning_delta", {
+          text = message.reasoning, message_id = message.id, turn_id = message.turn_id,
+        })
       end
       if type(message.text) == "string" and message.text ~= "" then
-        action(actions, "text_delta", { text = message.text, turn_id = message.turn_id })
+        action(actions, "text_delta", {
+          text = message.text, message_id = message.id, turn_id = message.turn_id,
+        })
         if message.turn_id ~= nil then state.turn_text[message.turn_id] = message.text end
       end
       for _, call in ipairs(message.tool_calls or {}) do
-        state.exchanges[call.id] = call.status
+        local exchange = exchange_by_id[call.id] or exchange_by_call_id[call.id]
+        local exchange_id = exchange and exchange.id or call.id
+        state.exchanges[exchange_id] = call.status
         action(actions, "tool_started", {
-          exchange_id = call.id,
+          exchange_id = exchange_id,
           name = call.name,
           arguments = call.arguments,
           turn_id = message.turn_id,
@@ -119,11 +125,8 @@ local function snapshot_actions(state, projection, actions)
         terminal = message.terminal,
       })
       for _, call in ipairs(message.tool_calls or {}) do
-        local exchange = exchange_by_id[call.id]
-        local provider_call_id = type(exchange) == "table"
-            and type(exchange.arguments) == "table"
-            and exchange.arguments.id
-          or nil
+        local exchange = exchange_by_id[call.id] or exchange_by_call_id[call.id]
+        local provider_call_id = type(exchange) == "table" and exchange.tool_call_id or nil
         if provider_call_id == nil or not tool_message_by_call_id[provider_call_id] then
           complete_exchange(exchange)
         end
@@ -209,9 +212,13 @@ function M.reduce(previous, body)
         if message.turn_id ~= nil then
           state.turn_text[message.turn_id] = (state.turn_text[message.turn_id] or "") .. chunk.data
         end
-        action(actions, "text_delta", { text = chunk.data, turn_id = message.turn_id })
+        action(actions, "text_delta", {
+          text = chunk.data, message_id = change.message_id, turn_id = message.turn_id,
+        })
       elseif chunk.kind == "reasoning" then
-        action(actions, "reasoning_delta", { text = chunk.data, turn_id = message.turn_id })
+        action(actions, "reasoning_delta", {
+          text = chunk.data, message_id = change.message_id, turn_id = message.turn_id,
+        })
       end
     end
   elseif kind == "message_completed" then

@@ -68,7 +68,7 @@ function M.flush_graph_results_if_stable(state)
   return M.flush_graph_results(state)
 end
 
-function M.append_assistant_delta(state, delta)
+function M.append_assistant_delta(state, delta, message_id, turn_id)
   if state.in_flight ~= nil and state.entries[state.in_flight] then
     local e = state.entries[state.in_flight]
     local new_entry = Entry.append_text(e, delta)
@@ -77,7 +77,7 @@ function M.append_assistant_delta(state, delta)
       state.in_flight, #delta, new_entry.v)
     return shallow_merge(state, { entries = new_entries, pending = false })
   end
-  local new_entry = Entry.assistant_stream()
+  local new_entry = Entry.bind_canonical(Entry.assistant_stream(), message_id, turn_id)
   new_entry = Entry.append_text(new_entry, delta)
   local new_entries = append_entry(state.entries, new_entry)
   log.log("transcript", "delta new_stream v=%d count=%d",
@@ -89,10 +89,10 @@ function M.append_assistant_delta(state, delta)
   })
 end
 
-function M.append_reasoning_delta(state, delta)
+function M.append_reasoning_delta(state, delta, message_id, turn_id)
   local idx = state.in_flight
   if idx == nil then
-    local new_entry = Entry.assistant_stream()
+    local new_entry = Entry.bind_canonical(Entry.assistant_stream(), message_id, turn_id)
     new_entry = Entry.append_reasoning(new_entry, delta)
     local new_entries = append_entry(state.entries, new_entry)
     log.log("transcript", "reasoning_delta new_stream v=%d count=%d",
@@ -110,7 +110,7 @@ function M.append_reasoning_delta(state, delta)
   return shallow_merge(state, { entries = new_entries, pending = false })
 end
 
-function M.finalize_assistant(state, final_text, model, duration_ms)
+function M.finalize_assistant(state, final_text, model, duration_ms, message_id, turn_id)
   local now = tui.now_ms()
   local turn_dur = duration_ms
     or (state.turn_started_at and (now - state.turn_started_at))
@@ -118,7 +118,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
 
   if state.in_flight == nil then
     if (final_text and #final_text > 0) or model ~= nil or duration_ms ~= nil then
-      local new_entry = Entry.assistant_stream()
+      local new_entry = Entry.bind_canonical(Entry.assistant_stream(), message_id, turn_id)
       new_entry = Entry.finalize(new_entry, {
         text = final_text, model = model, duration_ms = duration_ms,
       })
@@ -146,6 +146,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     end
     local opts = { model = model or e.model, duration_ms = duration_ms or e.duration_ms }
     if final_text and #final_text > 0 then opts.text = final_text end
+    if message_id ~= nil then e = Entry.bind_canonical(e, message_id, turn_id) end
     local new_entry = Entry.finalize(e, opts)
     local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
     log.log("transcript", "finalize_assistant in_flight=%d new_v=%d",

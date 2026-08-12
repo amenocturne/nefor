@@ -34,7 +34,7 @@ M.declaration = {
     provider_error_type = "string", validation_error_type = "string",
     max_corrections = "number",
     conversation_id = "string?",
-    turn_id = "string?",
+    turn_id = "string?", submission_ids = "table?",
   },
   inputs = { provider_input = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", RESULT },

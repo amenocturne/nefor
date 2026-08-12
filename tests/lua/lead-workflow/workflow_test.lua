@@ -1867,10 +1867,10 @@ do
   assert_eq(lw._internals.state.completed_runs[#lw._internals.state.completed_runs].run_id,
     run_id, "terminal result archives the stable run handle")
   local queued = agentic_loop._internals.state.pending_user_inputs[1]
-  assert_true(type(queued) == "string" and queued:find("the eval output", 1, true) ~= nil,
+  assert_true(type(queued) == "table" and queued.text:find("the eval output", 1, true) ~= nil,
     "terminal output reaches the deferred graph completion channel")
-  assert_true(queued:find("run_name=Inspect files", 1, true) ~= nil
-      and queued:find("run_id=" .. run_id, 1, true) ~= nil,
+  assert_true(queued.text:find("run_name=Inspect files", 1, true) ~= nil
+      and queued.text:find("run_id=" .. run_id, 1, true) ~= nil,
     "completion prefers the readable name while retaining the opaque handle")
 
   -- Graph-agent caller: submission detaches immediately under the dispatching

@@ -24,12 +24,17 @@ end
 
 -- constructors
 
-function M.user(text)
+function M.next_submission_id()
+  return next_local_id()
+end
+
+function M.user(text, submission_id)
   local v = next_v()
+  local local_id = next_local_id()
   log.log("entry", "create kind=text role=user v=%d", v)
   return {
     role = "user", kind = "text", text = text,
-    local_id = next_local_id(), v = v,
+    local_id = local_id, submission_ids = { submission_id or local_id }, v = v,
   }
 end
 
@@ -58,12 +63,13 @@ function M.assistant_stream()
   return { role = "assistant", kind = "stream", text = "", streaming = true, v = v }
 end
 
-function M.tool_call(id, name, input, input_table, display, raw_input)
+function M.tool_call(id, name, input, input_table, display, raw_input, turn_id)
   local v = next_v()
   log.log("entry", "create kind=tool_call name=%s v=%d", name or "?", v)
   return {
     role = "tool", kind = "tool_call",
-    id = id, name = name, input = input, input_table = input_table,
+    id = id, exchange_id = id, turn_id = turn_id,
+    name = name, input = input, input_table = input_table,
     raw_input = raw_input, display = display,
     v = v,
   }
@@ -186,6 +192,13 @@ function M.set_status(entry, status)
   local new = copy(entry)
   new.status = status
   log.log("entry", "mutate fn=set_status old_v=%d new_v=%d", entry.v, new.v)
+  return new
+end
+
+function M.bind_canonical(entry, message_id, turn_id)
+  local new = copy(entry)
+  new.message_id = message_id
+  new.turn_id = turn_id
   return new
 end
 

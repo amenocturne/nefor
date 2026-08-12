@@ -311,6 +311,15 @@ fn fixture_assistant_completed(engine: &mut Engine, text: Option<String>, termin
 }
 
 fn fixture_message(engine: &mut Engine, role: &str, text: impl Into<String>) {
+    fixture_message_with_submissions(engine, role, text, &[]);
+}
+
+fn fixture_message_with_submissions(
+    engine: &mut Engine,
+    role: &str,
+    text: impl Into<String>,
+    submission_ids: &[&str],
+) {
     let text = text.into();
     let key = fixture_key(engine);
     let (conversation_id, message_id) = FIXTURE_CONVERSATIONS.with(|fixtures| {
@@ -344,7 +353,7 @@ fn fixture_message(engine: &mut Engine, role: &str, text: impl Into<String>) {
         json!({
             "kind": "conversation.projection.delta", "conversation_id": conversation_id,
             "change": { "kind": "message_completed",
-                "message": { "id": message_id, "role": role, "text": text } }
+                "message": { "id": message_id, "role": role, "text": text, "submission_ids": submission_ids } }
         }),
     );
 }
@@ -390,6 +399,33 @@ fn fixture_compaction(engine: &mut Engine, status: &str, fields: JsonValue) {
             "kind": "conversation.projection.delta", "conversation_id": conversation_id,
             "change": { "kind": format!("context_compaction_{status}"), "compaction": fields }
         }),
+    );
+}
+
+fn append_canonical_message_with_submissions(
+    engine: &mut Engine,
+    conversation_id: &str,
+    message_id: &str,
+    role: &str,
+    text: &str,
+    submission_ids: &[&str],
+) {
+    dispatch_event(
+        engine,
+        json!({ "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+        "change": { "kind": "message_started", "message": { "id": message_id, "role": role } } }),
+    );
+    dispatch_event(
+        engine,
+        json!({ "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+        "change": { "kind": "content_chunk_appended", "message_id": message_id,
+            "chunk": { "kind": "text", "data": text } } }),
+    );
+    dispatch_event(
+        engine,
+        json!({ "kind": "conversation.projection.delta", "conversation_id": conversation_id,
+        "change": { "kind": "message_completed", "message": { "id": message_id, "role": role,
+            "text": text, "submission_ids": submission_ids } } }),
     );
 }
 
@@ -1575,7 +1611,8 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
     let _ = engine.take_emit_queue();
     let _ = render_str(&mut engine);
     submit_text(&mut engine, "queued");
-    let _ = engine.take_emit_queue();
+    let queued_emits = engine.take_emit_queue();
+    let queued_submission = submission_id(&queued_emits).to_owned();
 
     engine.handle_key(key("escape")).expect("escape");
     assert!(
@@ -1593,7 +1630,7 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
 
     let _ = render_str(&mut engine);
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    fixture_message(&mut engine, "user", "queued");
+    fixture_message_with_submissions(&mut engine, "user", "queued", &[&queued_submission]);
     let out = render_snapshot(&mut engine);
     assert_eq!(
         out.matches("queued").count(),
@@ -1612,11 +1649,12 @@ fn accepted_steering_reconciles_indexed_entry_after_non_tail_interleaving() {
     let _ = engine.take_emit_queue();
     let _ = render_str(&mut engine);
     submit_text(&mut engine, "queued-owned");
-    let _ = engine.take_emit_queue();
+    let queued_emits = engine.take_emit_queue();
+    let queued_submission = submission_id(&queued_emits).to_owned();
 
     fixture_message(&mut engine, "assistant", "interleaved-result");
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    fixture_message(&mut engine, "user", "queued-owned");
+    fixture_message_with_submissions(&mut engine, "user", "queued-owned", &[&queued_submission]);
 
     let out = render_snapshot(&mut engine);
     assert!(
@@ -1640,10 +1678,11 @@ fn accepted_steering_preserves_repeated_equal_user_text() {
     let _ = engine.take_emit_queue();
     let _ = render_str(&mut engine);
     submit_text(&mut engine, "same-text");
-    let _ = engine.take_emit_queue();
+    let queued_emits = engine.take_emit_queue();
+    let queued_submission = submission_id(&queued_emits).to_owned();
 
     dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    fixture_message(&mut engine, "user", "same-text");
+    fixture_message_with_submissions(&mut engine, "user", "same-text", &[&queued_submission]);
     fixture_message(&mut engine, "user", "same-text");
 
     let out = render_snapshot(&mut engine);
@@ -6615,10 +6654,11 @@ fn live_submit_dedups_orchestrator_echo() {
         engine.handle_key(key(&ch.to_string())).expect("type");
     }
     engine.handle_key(key("enter")).expect("enter");
-    let _ = engine.take_emit_queue();
+    let submit_emits = engine.take_emit_queue();
+    let submit_submission = submission_id(&submit_emits).to_owned();
     let _ = render_str(&mut engine);
 
-    fixture_message(&mut engine, "user", "abc");
+    fixture_message_with_submissions(&mut engine, "user", "abc", &[&submit_submission]);
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
 
@@ -7707,6 +7747,17 @@ fn type_text(engine: &mut Engine, s: &str) {
 fn submit_text(engine: &mut Engine, s: &str) {
     type_text(engine, s);
     engine.handle_key(key("enter")).expect("enter");
+}
+
+fn submission_id(emits: &[(Option<String>, serde_json::Map<String, JsonValue>)]) -> &str {
+    emits
+        .iter()
+        .find_map(|(_, body)| {
+            (body.get("kind").and_then(|value| value.as_str()) == Some("chat.input.submit"))
+                .then(|| body.get("submission_id").and_then(|value| value.as_str()))
+                .flatten()
+        })
+        .expect("chat.input.submit submission_id")
 }
 
 #[test]
@@ -10987,6 +11038,8 @@ fn queued_submit_promotes_to_canonical_next_turn_without_disappearing() {
             .expect("type queued input");
     }
     engine.handle_key(key("enter")).expect("queue input");
+    let queued_emits = engine.take_emit_queue();
+    let queued_submission = submission_id(&queued_emits).to_owned();
     dispatch_event(
         &mut engine,
         json!({
@@ -11021,12 +11074,13 @@ fn queued_submit_promotes_to_canonical_next_turn_without_disappearing() {
         "promoted queue must follow intervening old-turn MAG output:\n{promoted}"
     );
 
-    append_canonical_message(
+    append_canonical_message_with_submissions(
         &mut engine,
         conversation_id,
         "queued-user-message",
         "user",
         "queued-causal-marker",
+        &[&queued_submission],
     );
     append_canonical_assistant_terminal(
         &mut engine,

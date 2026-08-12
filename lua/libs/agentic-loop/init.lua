@@ -569,11 +569,11 @@ end
 -- canonical conversation identity onto the lead llm actor, and submits
 -- `mag.execute`. The provider actor reads history from conversation-manager;
 -- duplicating it in this persisted command would make session growth quadratic.
-local function submit_orchestrator_run(user_text)
+local function submit_orchestrator_run(user_text, submission_ids)
   if state.current_run_id ~= nil then return nil end
   local conversation_id = ensure_conversation_id()
   if not conversation_ready() then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = user_text
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = user_text, submission_ids = submission_ids or {} }
     ensure_lead_program_loaded()
     return nil
   end
@@ -581,7 +581,7 @@ local function submit_orchestrator_run(user_text)
   if p.artifact == nil then
     -- Program not compiled yet: queue the text and (re)kick the load; the
     -- mag.loaded reply flushes the queue.
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = user_text
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = user_text, submission_ids = submission_ids or {} }
     ensure_lead_program_loaded()
     return nil
   end
@@ -596,6 +596,7 @@ local function submit_orchestrator_run(user_text)
 
   local overlay_params = {
     conversation_id = conversation_id,
+    submission_ids = submission_ids,
   }
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
     overlay_params.provider = state.config.provider
@@ -677,14 +678,19 @@ flush_pending_user_inputs = function()
   if state.lead_program.artifact == nil then return end
   if #state.pending_user_inputs == 0 then return end
   local inputs = state.pending_user_inputs
-  local combined = table.concat(inputs, "\n")
+  local texts, submission_ids = {}, {}
+  for _, input in ipairs(inputs) do
+    texts[#texts + 1] = input.text
+    for _, id in ipairs(input.submission_ids or {}) do submission_ids[#submission_ids + 1] = id end
+  end
+  local combined = table.concat(texts, "\n")
   nefor.log.info("agentic-loop: flushing queued user inputs", {
     count = #inputs,
     text_preview = string.sub(combined, 1, 80),
   })
   state.pending_user_inputs = {}
   emit("nefor-tui", { kind = "chat.queue.steered" })
-  submit_orchestrator_run(combined)
+  submit_orchestrator_run(combined, submission_ids)
 end
 
 -- ── interrupt = kill ──────────────────────────────────────────────────
@@ -747,21 +753,27 @@ end
 local function steer_pending_inputs()
   if state.current_run_id == nil or state.pending_steer ~= nil then return false end
   if #state.pending_user_inputs == 0 then return false end
-  local texts = state.pending_user_inputs
+  local inputs = state.pending_user_inputs
   state.pending_user_inputs = {}
+  local texts, submission_ids = {}, {}
+  for _, input in ipairs(inputs) do
+    texts[#texts + 1] = input.text
+    for _, id in ipairs(input.submission_ids or {}) do submission_ids[#submission_ids + 1] = id end
+  end
   local text = table.concat(texts, "\n")
   local id = "lead-steer-" .. envelope.uuid_lite()
   state.pending_steer = {
     id = id,
     run_id = state.current_run_id,
     texts = texts,
+    inputs = inputs,
   }
   emit("mag", {
     kind = "mag.steer_run",
     id = id,
     run_id = state.current_run_id,
     actor_id = state.lead_program.llm_actor,
-    message = { role = "user", content = text },
+    message = { role = "user", content = text, submission_ids = submission_ids },
   })
   return true
 end
@@ -777,8 +789,8 @@ local function handle_run_steered(body)
     return
   end
   local restored = {}
-  for _, text in ipairs(pending.texts) do restored[#restored + 1] = text end
-  for _, text in ipairs(state.pending_user_inputs) do restored[#restored + 1] = text end
+  for _, input in ipairs(pending.inputs) do restored[#restored + 1] = input end
+  for _, input in ipairs(state.pending_user_inputs) do restored[#restored + 1] = input end
   state.pending_user_inputs = restored
   flush_pending_user_inputs()
 end
@@ -909,6 +921,7 @@ end
 
 local function handle_chat_input_submit(body)
   local text = body.text or ""
+  local submission_ids = type(body.submission_id) == "string" and { body.submission_id } or {}
   if type(text) ~= "string" or #text == 0 then return end
 
   nefor.log.info("agentic-loop: chat.input.submit received", {
@@ -922,13 +935,13 @@ local function handle_chat_input_submit(body)
   ensure_conversation_id()
   if state.current_run_id ~= nil or conversation_commit_pending()
       or not conversation_ready() then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
     ensure_lead_program_loaded()
     return
   end
 
   if state.lead_program.artifact == nil then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
     ensure_lead_program_loaded()
     return
   end
@@ -938,7 +951,7 @@ local function handle_chat_input_submit(body)
     text = deferred .. "\n\n---\n\n" .. text
   end
 
-  submit_orchestrator_run(text)
+  submit_orchestrator_run(text, submission_ids)
 end
 
 local function handle_chat_reset()

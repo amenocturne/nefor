@@ -313,7 +313,7 @@ local function reset_session_state(state, patch)
     last_turn_duration_ms = NIL_SENTINEL,
     active_turn_id = NIL_SENTINEL,
     active_turn_entry_start = NIL_SENTINEL,
-    pending_user_echo = NIL_SENTINEL,
+    pending_submission_ids = NIL_SENTINEL,
     pending_user_echo_id = NIL_SENTINEL,
     queued_entry_id = NIL_SENTINEL,
     raw_tool_id = NIL_SENTINEL,
@@ -620,18 +620,21 @@ local function handle_input_submit(msg, state)
   -- When a turn is already in flight, coalesce into a single queued
   -- entry instead of pushing a new user bubble per message.
   if state.pending or state.in_flight ~= nil then
-    local next_state = shallow_merge(queued_input.submit(state, wire_text, true), {
+    local submission_id = Entry.next_submission_id()
+    local optimistic = queued_input.submit(state, wire_text, true, submission_id)
+    local next_state = shallow_merge(optimistic, {
       input_value = "", completion = NIL_SENTINEL,
       prompt_history = hist, history_cursor = NIL_SENTINEL,
     })
     tui.scroll_into_view("transcript")
     return next_state, {
       { kind = "send_to", target = "engine",
-        body = { kind = "chat.input.submit", text = wire_text } },
+        body = { kind = "chat.input.submit", text = wire_text, submission_id = submission_id } },
     }
   end
 
-  local cleared = shallow_merge(queued_input.submit(state, wire_text, false), {
+  local submission_id = Entry.next_submission_id()
+  local cleared = shallow_merge(queued_input.submit(state, wire_text, false, submission_id), {
     input_value = "", pending = true,
     turn_started_at = tui.now_ms(), completion = NIL_SENTINEL,
     prompt_history = hist,
@@ -640,7 +643,7 @@ local function handle_input_submit(msg, state)
   tui.scroll_into_view("transcript")
   return cleared, {
     { kind = "send_to", target = "engine",
-      body = { kind = "chat.input.submit", text = wire_text } },
+      body = { kind = "chat.input.submit", text = wire_text, submission_id = submission_id } },
   }
 end
 
@@ -1067,7 +1070,7 @@ local function handle_chat_submit(msg, state)
   if msg._event_source ~= "startup" then return state, {} end
   local text = msg.text or ""
   if #text == 0 then return state, {} end
-  return queued_input.observe_external_submit(state, text), {}
+  return queued_input.observe_external_submit(state, text, msg.submission_id), {}
 end
 
 local function handle_message(msg, state)
@@ -1075,7 +1078,8 @@ local function handle_message(msg, state)
   if #text == 0 then return state, {} end
   local role = msg.role or "system"
   if role == "user" then
-    local reconciled, matched = queued_input.reconcile_echo(state, text)
+    local reconciled, matched = queued_input.reconcile_echo(
+      state, msg.submission_ids, msg.message_id, msg.turn_id)
     if matched then return reconciled, {} end
   end
   local turn_state = role == "system"
@@ -1087,9 +1091,9 @@ local function handle_message(msg, state)
       Entry.system(text)
     ), {}
   end
-  return transcript.push_entry(shallow_merge(state, turn_state), {
-    role = role, text = text, kind = "text",
-  }), {}
+  local entry = Entry.user(text)
+  entry = Entry.bind_canonical(entry, msg.message_id, msg.turn_id)
+  return transcript.push_entry(shallow_merge(state, turn_state), entry), {}
 end
 
 local function handle_error_append(msg, state)
@@ -1161,7 +1165,7 @@ local function handle_tool_start(msg, state)
   return transcript.push_entry(state, Entry.tool_call(
     msg.id or "", msg.name or "?", input_str,
     type(msg.input) == "table" and msg.input or nil,
-    contract, raw_input)), {}
+    contract, raw_input, msg.turn_id)), {}
 end
 
 local function handle_tool_register(msg, state)
@@ -1794,15 +1798,18 @@ local function apply_conversation_action(state, item)
     return select(1, handle_message(item, state))
   end
   if item.kind == "text_delta" then
-    return transcript.append_assistant_delta(state, item.text)
+    return transcript.append_assistant_delta(
+      state, item.text, item.message_id, item.turn_id)
   end
   if item.kind == "reasoning_delta" then
-    return transcript.append_reasoning_delta(state, item.text)
+    return transcript.append_reasoning_delta(
+      state, item.text, item.message_id, item.turn_id)
   end
   if item.kind == "assistant_completed" then
     local terminal = item.terminal or {}
     local next_state = transcript.finalize_assistant(
-      state, item.text, terminal.model, terminal.duration_ms)
+      state, item.text, terminal.model, terminal.duration_ms,
+      item.message_id, item.turn_id)
     if type(terminal.usage) == "table" then
       next_state = transcript.attach_latest_assistant_stats(
         next_state,
@@ -1819,6 +1826,7 @@ local function apply_conversation_action(state, item)
       id = item.exchange_id,
       name = item.name,
       input = item.arguments,
+      turn_id = item.turn_id,
     }, state))
   end
   if item.kind == "tool_completed" then

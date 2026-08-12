@@ -1058,7 +1058,7 @@ do
     kind = "mag.run_steered", in_reply_to = steer.body.id,
     run_id = exec.body.run_id, accepted = false,
   })
-  assert_eq(agentic_loop._internals.state.pending_user_inputs[1], "queued",
+  assert_eq(agentic_loop._internals.state.pending_user_inputs[1].text, "queued",
     "rejected steer restores the queued input")
 end
 

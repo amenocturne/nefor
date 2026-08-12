@@ -96,6 +96,9 @@ function M.construct(id, params, emit, options)
   local firing_sequence = 0
   local conversation_created = conversation.is_root
   local seed_recorded = false
+  local submission_ids = params.submission_ids
+  params.submission_ids = nil
+  local submission_identity_recorded = false
 
   local function start_firing()
     firing_sequence = firing_sequence + 1
@@ -200,14 +203,21 @@ function M.construct(id, params, emit, options)
   end
 
   local function record_input(input)
+    local function append(message)
+      if not submission_identity_recorded and message.role == "user" then
+        message.submission_ids = submission_ids
+        submission_identity_recorded = true
+      end
+      state:append(message)
+    end
     if type(input) == "string" then
-      state:append({ role = "user", content = input })
+      append({ role = "user", content = input })
     elseif type(input) == "table" and type(input.messages) == "table" then
-      for _, message in ipairs(input.messages) do state:append(message) end
+      for _, message in ipairs(input.messages) do append(message) end
     elseif type(input) == "table" and input.role ~= nil then
-      state:append(input)
+      append(input)
     elseif type(input) == "table" and input.text ~= nil then
-      state:append({ role = "user", content = input.text })
+      append({ role = "user", content = input.text })
     end
   end
 
