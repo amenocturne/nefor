@@ -149,6 +149,7 @@ eq(actor._internals.get("replayed").last_sequence, 1, "recorded facts rebuild du
 eq(reader:watermark("replayed"), 1, "replay rebuilds the shared read service")
 eq(last_body().kind, "conversation.projection.delta")
 eq(last_body().replay, true)
+eq(last_body().session_id, "session-2", "replay projections carry canonical session authority")
 
 local after_replay_projection = #emitted
 receive({ kind = "conversation.get.request", request_id = "replayed-query", conversation_id = "replayed" })
@@ -298,6 +299,7 @@ local active_changed = last_body()
 eq(active_changed.kind, "conversation.active.changed")
 eq(active_changed.conversation_id, "replayed")
 eq(actor._internals.active_conversation_id(), "replayed")
+eq(active_changed.session_id, "session-2", "active projection carries canonical session authority")
 eq(body_at(#emitted - 1).kind, "conversation.projection.delta")
 eq(body_at(#emitted - 2).kind, "conversation.fact.recorded", "active selection is replay-safe canonical state")
 

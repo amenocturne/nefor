@@ -96,6 +96,7 @@ function M.build(options)
     if conversation and not duplicate and replay_active() then
       send({
         kind = "conversation.projection.delta",
+        session_id = session_id,
         conversation_id = event.conversation_id,
         sequence = event.sequence,
         replay = true,
@@ -106,6 +107,7 @@ function M.build(options)
       active_conversation_id = event.conversation_id
       send({
         kind = "conversation.active.changed",
+        session_id = session_id,
         conversation_id = active_conversation_id,
         sequence = event.sequence,
         replay = replay_active() or nil,
@@ -229,6 +231,7 @@ function M.build(options)
       send({
         kind = "conversation.active.changed",
         request_id = body.request_id,
+        session_id = session_id,
         conversation_id = active_conversation_id,
         sequence = event.sequence,
       })

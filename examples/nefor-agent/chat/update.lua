@@ -971,14 +971,31 @@ local function handle_transition_failed(msg, state)
   return next_state, {}
 end
 
+local function replay_event_is_current(msg, state)
+  if msg.session_id ~= nil and state.session_id ~= nil
+      and msg.session_id ~= state.session_id then return false end
+  local loading = state.resume_loading
+  if type(loading) == "table" and loading.request_id ~= nil
+      and msg.request_id ~= nil and msg.request_id ~= loading.request_id then
+    return false
+  end
+  return true
+end
+
 local function handle_resume_loading(msg, state)
+  if not replay_event_is_current(msg, state) then return state, {} end
   return shallow_merge(state, {
-    resume_loading = { session_id = msg.session_id, replayed = 0 },
+    resume_loading = {
+      session_id = msg.session_id,
+      request_id = msg.request_id,
+      replayed = 0,
+    },
     replay_mode = true,
   }), {}
 end
 
 local function handle_replay_start(msg, state)
+  if not replay_event_is_current(msg, state) then return state, {} end
   if state.resume_loading == nil then
     return shallow_merge(state, { replay_mode = true }), {}
   end
@@ -987,6 +1004,7 @@ local function handle_replay_start(msg, state)
     replay_mode = true,
     resume_loading = {
       session_id = loading.session_id or msg.session_id,
+      request_id = loading.request_id or msg.request_id,
       replayed = loading.replayed or 0,
       total = msg.count or 0,
     },
@@ -994,26 +1012,31 @@ local function handle_replay_start(msg, state)
 end
 
 local function handle_replay_progress(msg, state)
-  if state.resume_loading == nil then return state, {} end
+  if not replay_event_is_current(msg, state) or state.resume_loading == nil then
+    return state, {}
+  end
   local previous = state.resume_loading.replayed or 0
   local replayed = math.max(previous, msg.replayed or 0)
   return shallow_merge(state, {
     resume_loading = {
       session_id = state.resume_loading.session_id or msg.session_id,
+      request_id = state.resume_loading.request_id or msg.request_id,
       replayed = replayed,
       total = msg.total or state.resume_loading.total,
     },
   }), {}
 end
 
-local function handle_replay_end(_msg, state)
+local function handle_replay_end(msg, state)
+  if not replay_event_is_current(msg, state) then return state, {} end
   if state.resume_loading == nil then
     return shallow_merge(state, { replay_mode = NIL_SENTINEL }), {}
   end
   return state, {}
 end
 
-local function handle_resume_done(_msg, state)
+local function handle_resume_done(msg, state)
+  if not replay_event_is_current(msg, state) then return state, {} end
   return shallow_merge(state, {
     replay_mode = NIL_SENTINEL,
     resume_loading = NIL_SENTINEL,
@@ -1928,6 +1951,8 @@ local function apply_conversation_action(state, item)
 end
 
 local function handle_conversation_event(msg, state)
+  if msg.session_id ~= nil and state.session_id ~= nil
+      and msg.session_id ~= state.session_id then return state, {} end
   local projection_state, actions = conversation_projection.reduce(
     state.conversation_projection, msg)
   local next_state = shallow_merge(state, { conversation_projection = projection_state })

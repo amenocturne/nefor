@@ -2018,6 +2018,178 @@ fn failed_new_retains_transcript_and_ignores_late_acknowledgements() {
 }
 
 #[test]
+fn superseded_resume_events_cannot_mutate_acknowledged_replacement() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "session-old" }),
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/resume resume-a" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "resume-a",
+            "from_resume": true, "request_id": "chat-transition-1" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_loading", "session_id": "resume-a",
+            "request_id": "chat-transition-1" }),
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "session-b",
+            "request_id": "chat-transition-2" }),
+    );
+    activate_conversation(&mut engine, "conversation-b");
+    append_canonical_message(
+        &mut engine,
+        "conversation-b",
+        "message-b",
+        "user",
+        "replacement transcript",
+    );
+    append_canonical_assistant_turn(
+        &mut engine,
+        "conversation-b",
+        "turn-b",
+        "replacement answer",
+        json!({ "model": "mock-model", "usage": { "input_tokens": 41 } }),
+    );
+    let _ = render_str(&mut engine);
+
+    for body in [
+        json!({ "kind": "sessions.replay.start", "session_id": "resume-a",
+            "request_id": "chat-transition-1", "count": 100 }),
+        json!({ "kind": "sessions.replay.progress", "session_id": "resume-a",
+            "request_id": "chat-transition-1", "replayed": 50, "total": 100 }),
+        json!({ "kind": "conversation.active.changed", "session_id": "resume-a",
+            "conversation_id": "conversation-a", "replay": true }),
+        json!({ "kind": "conversation.projection.delta", "session_id": "resume-a",
+            "conversation_id": "conversation-a", "replay": true,
+            "change": { "kind": "message_completed",
+                "message": { "id": "late-a", "role": "user", "text": "STALE REPLAY A" } } }),
+        json!({ "kind": "sessions.replay.end", "session_id": "resume-a",
+            "request_id": "chat-transition-1" }),
+        json!({ "kind": "sessions.resume_done", "session_id": "resume-a",
+            "request_id": "chat-transition-1", "replayed": 100 }),
+        json!({ "kind": "sessions.transition_failed", "operation": "resume",
+            "session_id": "resume-a", "request_id": "chat-transition-1",
+            "message": "stale failure" }),
+    ] {
+        dispatch_event(&mut engine, body);
+    }
+
+    let _ = render_str(&mut engine);
+    let snapshot = engine.snapshot();
+    assert!(snapshot.contains("replacement transcript"), "{snapshot}");
+    assert!(!snapshot.contains("STALE REPLAY A"), "{snapshot}");
+    assert!(!snapshot.contains("loading session"), "{snapshot}");
+    assert!(!snapshot.contains("stale failure"), "{snapshot}");
+    let state = engine.state_table().expect("state");
+    assert_eq!(
+        state
+            .get::<Option<String>>("session_id")
+            .unwrap()
+            .as_deref(),
+        Some("session-b")
+    );
+    assert_eq!(
+        state
+            .get::<Option<String>>("conversation_id")
+            .unwrap()
+            .as_deref(),
+        Some("conversation-b")
+    );
+    assert_eq!(
+        state.get::<Option<i64>>("current_context_tokens").unwrap(),
+        Some(41)
+    );
+    assert!(!state.get::<bool>("replay_mode").unwrap_or(false));
+    assert!(state.get::<mlua::Value>("resume_loading").unwrap().is_nil());
+}
+
+#[test]
+fn resume_correlation_rejects_superseded_and_out_of_order_terminals() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "session-old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/resume resume-a" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/resume resume-c" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "resume-c",
+            "from_resume": true, "request_id": "chat-transition-2" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_loading", "session_id": "resume-c",
+            "request_id": "chat-transition-2" }),
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "resume-a",
+        "request_id": "chat-transition-1", "replayed": 1 }),
+    );
+    let _ = render_str(&mut engine);
+    assert!(engine.snapshot().contains("loading session"));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.end", "session_id": "resume-c",
+        "request_id": "chat-transition-2" }),
+    );
+    let _ = render_str(&mut engine);
+    assert!(engine.snapshot().contains("loading session"));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "resume-c",
+        "request_id": "chat-transition-2", "replayed": 1 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "resume-c",
+        "request_id": "chat-transition-2", "replayed": 1 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.end", "session_id": "resume-c",
+        "request_id": "chat-transition-2" }),
+    );
+    let snapshot = render_str(&mut engine);
+    assert!(!snapshot.contains("loading session"), "{snapshot}");
+    let state = engine.state_table().expect("state");
+    assert_eq!(
+        state
+            .get::<Option<String>>("session_id")
+            .unwrap()
+            .as_deref(),
+        Some("resume-c")
+    );
+    assert!(!state.get::<bool>("replay_mode").unwrap_or(false));
+}
+
+#[test]
 fn slash_new_clears_panel_runs() {
     let mut engine = Engine::new(120, 24).expect("engine");
     load_chat_scenario(&mut engine);

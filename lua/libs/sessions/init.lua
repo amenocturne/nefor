@@ -17,11 +17,11 @@
 --   sessions.session_start { session_id, from_resume?, request_id? }
 --   sessions.session_end   { session_id }
 --   sessions.transition_failed { operation, request_id?, session_id?, message }
---   sessions.resume_loading { session_id }
---   sessions.replay.start   { session_id, count }
---   sessions.replay.progress { session_id, replayed, total }
---   sessions.replay.end     { session_id }
---   sessions.resume_done    { session_id, replayed }
+--   sessions.resume_loading { session_id, request_id? }
+--   sessions.replay.start   { session_id, request_id?, count }
+--   sessions.replay.progress { session_id, request_id?, replayed, total }
+--   sessions.replay.end     { session_id, request_id? }
+--   sessions.resume_done    { session_id, request_id?, replayed }
 --     ↑ emitted
 --
 --   sessions.resume_request { session_id }
@@ -287,10 +287,11 @@ end
 
 ---@param path string|nil
 ---@param session_id string
+---@param request_id string|nil
 ---@param report_progress boolean
 ---@param generation integer
 ---@param finish fun(replayed: integer)
-local function begin_replay(path, session_id, report_progress, generation, finish)
+local function begin_replay(path, session_id, request_id, report_progress, generation, finish)
   local fh = path and io.open(path, "r") or nil
   local total = fh and file_size(fh) or 0
   if total == nil then
@@ -303,9 +304,10 @@ local function begin_replay(path, session_id, report_progress, generation, finis
 
   if not fh then
     send_msg({ kind = "control", event = "sessions.replay.start",
-               extra = { session_id = session_id, count = total } })
+               extra = { session_id = session_id, request_id = request_id,
+                         count = total } })
     send_msg({ kind = "control", event = "sessions.replay.end",
-               extra = { session_id = session_id } })
+               extra = { session_id = session_id, request_id = request_id } })
     finish(0)
     return
   end
@@ -363,19 +365,21 @@ local function begin_replay(path, session_id, report_progress, generation, finis
     -- single chunk larger than REPLAY_CHUNK_BYTES.
     replay_window.set(true)
     send_msg({ kind = "control", event = "sessions.replay.start",
-               extra = { session_id = session_id, count = total } })
+               extra = { session_id = session_id, request_id = request_id,
+                         count = total } })
     for _, decoded in ipairs(replay_entries) do
       send_msg({ kind = "replay_envelope", payload = decoded.payload,
                  target = decoded.target })
       delivered = delivered + 1
     end
     send_msg({ kind = "control", event = "sessions.replay.end",
-               extra = { session_id = session_id } })
+               extra = { session_id = session_id, request_id = request_id } })
     replay_window.set(false)
 
     if progress_due then
       send_msg({ kind = "control", event = "sessions.replay.progress",
-                 extra = { session_id = session_id, replayed = replayed, total = total } })
+                 extra = { session_id = session_id, request_id = request_id,
+                           replayed = replayed, total = total } })
       next_progress = replayed + progress_step
     end
 
@@ -479,14 +483,15 @@ local function do_resume(target_session_id, show_loading, request_id)
                        request_id = request_id } })
   if show_loading then
     send_msg({ kind = "control", event = "sessions.resume_loading",
-               extra = { session_id = target_session_id } })
+               extra = { session_id = target_session_id, request_id = request_id } })
   end
   local generation = state.replay_generation
-  begin_replay(acquired.path, target_session_id, show_loading, generation, function(replayed)
+  begin_replay(acquired.path, target_session_id, request_id, show_loading, generation, function(replayed)
     if generation ~= state.replay_generation then return end
     state.replay_session_id = nil
     send_msg({ kind = "control", event = "sessions.resume_done",
-               extra = { session_id = target_session_id, replayed = replayed } })
+               extra = { session_id = target_session_id, request_id = request_id,
+                         replayed = replayed } })
   end)
   return target_session_id
 end
