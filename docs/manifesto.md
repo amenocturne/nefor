@@ -32,6 +32,28 @@ A decision is user-owned only when its effective source and selected default are
 
 Defaults are welcome. They must be explicit choices made by a distribution, not privileges that the engine or a supposedly generic component quietly grants itself.
 
+## Provide replaceable mechanisms, not a mandatory framework
+
+Nefor's shipped Lua libraries make common behavior easier to assemble. They
+provide focused mechanisms, useful implementations, and explicit composition
+seams. They do not form a mandatory application framework, and being shipped
+gives an implementation no special authority.
+
+A user's composition may use a library implementation unchanged, configure or
+wrap it, replace part of it, provide an independent implementation of the same
+interface, or ignore the shipped libraries and work directly against the
+engine's process and routing boundaries. Consumers depend on declared behavior
+and interfaces, not on a particular library function's identity or private
+state.
+
+Reusable libraries must not hide a deployment-shaped actor, workflow, or
+product behind a generic-looking API. Complete assemblies belong to
+configurations and examples. When configurations repeatedly copy the same
+mechanism, extract that mechanism into a focused library with replaceable
+components; do not make one configuration inherit another, and do not make
+bypassing the library harder than implementing the underlying boundary
+directly.
+
 ## Make components replaceable in practice
 
 A capability declares the inputs, outputs, configuration, environment, and lifecycle behavior it needs. It depends on those boundaries, not on a particular neighbor's name, private data, timing accident, or undocumented optional behavior.
