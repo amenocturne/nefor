@@ -112,7 +112,6 @@ local conversation_reader = conversation_service:reader()
 actor.spawn(require("libs.conversation-manager.runtime").build({
   service = conversation_service,
 }))
-actor.spawn(require("libs.state-tracking"))
 
 local startup_args = require("startup")
 local startup = startup_args.parse((nefor.runtime and nefor.runtime.argv) or {})

@@ -45,6 +45,36 @@ fn starter_startup_parser_and_mode_application() {
 
     let init = std::fs::read_to_string(root.join("examples/nefor-agent/init.lua"))
         .expect("read starter init");
+    assert!(
+        !init.contains("state-tracking") && !init.contains("state_tracking"),
+        "starter composition must not import or spawn personal state tracking"
+    );
+    assert!(
+        !root.join("lua/libs/state-tracking").exists(),
+        "personal state-tracking library must not ship in the shared Lua tree"
+    );
+
+    let sessions = init
+        .find("actor.spawn(sessions)")
+        .expect("sessions actor registration");
+    let conversation = init
+        .find("actor.spawn(require(\"libs.conversation-manager.runtime\").build({")
+        .expect("conversation manager actor registration");
+    let session_init = init
+        .find("sessions.init(startup.session_id)")
+        .expect("session initialization");
+    let agentic_loop = init
+        .find("actor.spawn(agentic_loop)")
+        .expect("agentic loop registration");
+    let lead_workflow = init
+        .find("actor.spawn(require(\"libs.lead-workflow\"))")
+        .expect("lead workflow registration");
+    let read_only_tools = init
+        .find("actor.spawn(require(\"read-only-tools\"))")
+        .expect("read-only tools registration");
+    let tool_validator = init
+        .find("actor.spawn(require(\"tool-validator\"))")
+        .expect("tool validator registration");
     let gate = init
         .find(r#"actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))"#)
         .expect("tool gate registration");
@@ -54,8 +84,16 @@ fn starter_startup_parser_and_mode_application() {
     let mode = init
         .find("startup_args.apply_mode(startup, agentic_loop)")
         .expect("startup mode application");
+    let chat = init
+        .find("actor.spawn(require(\"libs.compositors.chat_bridge\").spawn_spec({")
+        .expect("chat surface registration");
     let prompt = init
         .find("if startup.prompt ~= nil then")
-        .expect("startup prompt submission");
-    assert!(gate < basic_tools && basic_tools < mode && mode < prompt);
+        .expect("startup prompt readiness barrier");
+
+    assert!(sessions < conversation && conversation < session_init);
+    assert!(session_init < agentic_loop && agentic_loop < lead_workflow);
+    assert!(lead_workflow < read_only_tools && read_only_tools < tool_validator);
+    assert!(tool_validator < gate && gate < basic_tools && basic_tools < mode);
+    assert!(mode < chat && chat < prompt);
 }

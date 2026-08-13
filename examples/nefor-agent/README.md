@@ -4,7 +4,7 @@ Reference config for the nefor engine. NCP v0.1 protocol semantics live here in 
 
 ## Layout
 
-- `init.lua` — top-level composition. Sets `package.path`, defines the global `dispatch` hook, and spawns every actor via `actor.spawn` (sessions, state-tracking, agentic-loop, providers, mag kernel, read-only-tools, tool-validator, tool-gate, basic-tools, lead-workflow, chat surface).
+- `init.lua` — top-level composition. Sets `package.path`, defines the global `dispatch` hook, and spawns every actor via `actor.spawn` (sessions, conversation manager, agentic-loop, providers, mag kernel, read-only-tools, tool-validator, tool-gate, basic-tools, lead-workflow, chat surface).
 - `chat/` — the canonical chat consumer over `tui.*` primitives. `chat/init.lua` is the entry point loaded by `nefor-tui --script`; transcript state is projected only from conversation-manager events. Configs extend commands and presentation through `config.active.chat_extension` rather than copying the reducer. Shared mechanisms live in `lua/libs/chat/`.
 - the virtual `agentic-cli` plugin used by `cli-config/init.lua` for `nefor plugin agentic-cli "<prompt>"` now ships in the shared Lua tree at `lua/libs/cli/` (require as `libs.cli`), not here.
 - `agentic-loop/` — the config-owned turn-program (`lead-turn.mag`) plus a re-export shim. The shared mechanism at `lua/libs/agentic-loop/` (require as `libs.agentic-loop`) owns transient turn submission, queueing, and ephemeral provider-chat orchestration. Canonical recorded conversation facts, context, and provider-neutral projections belong to `lua/libs/conversation-manager/`. (The MAG kernel likewise ships with the MAG plugin at `plugins/mag/lua/mag-kernel/`.)
