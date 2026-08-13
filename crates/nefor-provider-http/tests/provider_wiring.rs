@@ -4,7 +4,7 @@ fn production(source: &str) -> &str {
 
 #[test]
 fn every_provider_client_is_built_through_shared_trust() {
-    let combined = [
+    let production_sources = [
         production(include_str!("../../../plugins/openai-provider/src/main.rs")),
         production(include_str!(
             "../../../plugins/chatgpt-provider/src/main.rs"
@@ -18,11 +18,15 @@ fn every_provider_client_is_built_through_shared_trust() {
         production(include_str!(
             "../../../plugins/chatgpt-provider/src/responses/mod.rs"
         )),
-    ]
-    .join("\n");
+    ];
+    let combined = production_sources.join("\n");
 
     assert!(!combined.contains("reqwest::Client::new()"));
-    assert!(!combined.contains("reqwest::Client::builder()"));
+    assert_eq!(
+        combined.matches("reqwest::Client::builder()").count(),
+        1,
+        "only the explicit local plain-HTTP refresh path may bypass TLS trust construction"
+    );
     assert!(
         combined
             .matches("nefor_provider_http::client_builder()")

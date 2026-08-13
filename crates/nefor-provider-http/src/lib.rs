@@ -39,7 +39,7 @@ fn builder_from_native_roots(
         loaded: roots.certs.len(),
         rejected: roots.errors.len(),
     };
-    if roots.certs.is_empty() && !roots.errors.is_empty() {
+    if roots.certs.is_empty() {
         return Err(ProviderHttpError::UnusableNativeRoots {
             errors: roots.errors.len(),
         });
@@ -73,4 +73,19 @@ pub fn add_native_roots(
         builder = builder.add_root_certificate(certificate);
     }
     Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_native_store_is_rejected_without_loader_errors() {
+        let error = builder_from_native_roots(CertificateResult::default())
+            .expect_err("empty native store must not fall back to bundled roots only");
+        assert!(matches!(
+            error,
+            ProviderHttpError::UnusableNativeRoots { errors: 0 }
+        ));
+    }
 }
