@@ -65,6 +65,7 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 
 ## Commands
 
+- During development, run only targeted tests for the code and behavior that changed. The full workspace suite takes substantial time, so reserve it for final integration or release validation rather than each iterative change.
 - `just run` — launch engine with `./examples/nefor-agent` config (debug build). Sets `NEFOR_DEV_DIR` so Lua files load from the repo, not the installed copy.
 - `just test` — workspace tests.
 - `just lint` — clippy with `-D warnings`.
