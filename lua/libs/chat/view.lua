@@ -10,14 +10,8 @@ local W       = tui_lib.widget
 local common      = require("libs.chat.common")
 local entries_mod = require("libs.chat.entries")
 local queued_input = require("libs.chat.queued_input")
--- statusline/slash are config-owned opinion files (they stay in
--- examples/nefor-agent/chat, resolved via the `chat` searcher). This view assembles
--- them by fixed module name — an implicit interface a later wave should
--- parameterize (pass the statusline/slash renderers in as deps).
-local statusline  = require("chat.statusline")
 local run_panel   = require("libs.chat.run_panel")
 local popups      = require("libs.chat.popups")
-local slash       = require("chat.slash")
 
 local STYLE   = common.STYLE
 local compact = common.compact
@@ -78,7 +72,7 @@ local function loading_widget(state)
   return tui.text { content = body, style = STYLE.system, wrap = "none" }
 end
 
-local function transcript(state)
+local function transcript(state, statusline)
   -- Welcome banner shows on a fresh surface only; the chat widget's
   -- `empty_view` slot accepts a fn returning the banner tree, which
   -- it stacks over an empty scrollable so scroll_position keeps
@@ -126,7 +120,7 @@ local function render_keepalive(state)
   }
 end
 
-function M.render(state)
+local function render(state, statusline, slash)
   -- The input drops focus while certain popups own the keyboard. Tool
   -- permission expects single-char A/D; model picker takes printable
   -- chars as filter input — both paths require input to stop
@@ -216,7 +210,7 @@ function M.render(state)
     children = compact {
       blank_row(),
       loading_widget(state),
-      tui.expanded { child = transcript(state) },
+      tui.expanded { child = transcript(state, statusline) },
       input_field,
       statusline.view(state),
       blank_row(),
@@ -254,6 +248,17 @@ function M.render(state)
       W.toast.view({ toasts = state.toasts }),
     },
   }
+end
+
+function M.build(deps)
+  deps = deps or {}
+  assert(type(deps.statusline) == "table", "chat view requires a statusline dependency")
+  assert(type(deps.slash) == "table", "chat view requires a slash dependency")
+  assert(type(deps.statusline.view) == "function", "chat statusline requires view(state)")
+  assert(type(deps.slash.completions) == "function", "chat slash requires completions()")
+  return function(state)
+    return render(state, deps.statusline, deps.slash)
+  end
 end
 
 return M

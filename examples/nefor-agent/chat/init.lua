@@ -186,7 +186,12 @@ local extensions = require("libs.chat.extensions")
 extensions.load(active_config())
 
 local history = require("libs.chat.history")
-local view    = require("libs.chat.view")
+local statusline = require("chat.statusline")
+local slash = require("chat.slash")
+local view = require("libs.chat.view").build {
+  statusline = statusline,
+  slash = slash,
+}
 local input_submit = require("chat.commands")
 local dispatch = require("libs.chat.dispatch")
 local update = require("libs.chat.controller").build {
@@ -284,7 +289,7 @@ local function initial_state()
     -- first run / read failure.
     prompt_history   = history.load(),
     history_cursor   = nil,
-    command_completions = require("chat.slash").completions(),
+    command_completions = slash.completions(),
   }
   local patch = extensions.initial_patch(state)
   if patch ~= nil then
@@ -295,7 +300,7 @@ end
 
 tui.start {
   initial_state = initial_state(),
-  view          = view.render,
+  view          = view,
   update        = update,
 }
 

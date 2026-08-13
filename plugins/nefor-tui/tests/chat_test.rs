@@ -11411,6 +11411,78 @@ fn responsive_sidebar_timers_tick_then_freeze_and_pending_slots_align() {
     );
 }
 
+fn differential_chat_source(repo_root: &std::path::Path, mutate: bool) -> String {
+    let fixture =
+        std::fs::read_to_string(repo_root.join("tests/fixtures/chat-controller-differential.lua"))
+            .expect("read differential fixture");
+    let lua_root = repo_root.join("lua").display().to_string();
+    let tui_root = repo_root
+        .join("plugins/nefor-tui/lua")
+        .display()
+        .to_string();
+    let chat_root = repo_root
+        .join("examples/nefor-agent/chat")
+        .display()
+        .to_string();
+    let oracle = repo_root
+        .join("tests/fixtures/chat-pre-extraction-update.lua")
+        .display()
+        .to_string();
+    format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua", "{lua_root}/?/init.lua", "{chat_root}/../?.lua", package.path
+        }}, ";")
+        table.insert(package.searchers, 1, function(name)
+          if name ~= "nefor-tui" and name:sub(1, 10) ~= "nefor-tui." then return nil end
+          local rel = name == "nefor-tui" and "init.lua"
+            or name:sub(11):gsub("%.", "/") .. ".lua"
+          local path = "{tui_root}/" .. rel
+          local chunk, err = loadfile(path)
+          if chunk then return chunk end
+          return "\\n\\tno nefor-tui module at " .. path .. ": " .. tostring(err)
+        end)
+        CHAT_PRE_EXTRACTION_ORACLE = "{oracle}"
+        CHAT_DIFFERENTIAL_MUTATION = {mutate}
+        {fixture}"#,
+        mutate = if mutate { "true" } else { "false" },
+    )
+}
+
+fn run_chat_controller_differential(mutate: bool) -> Result<u64, String> {
+    ensure_test_data_home();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("repo root");
+    let mut engine = Engine::new(60, 12).map_err(|error| error.to_string())?;
+    engine
+        .load_scenario(&differential_chat_source(repo_root, mutate))
+        .map_err(|error| error.to_string())?;
+    let state = engine.state_table().map_err(|error| error.to_string())?;
+    state
+        .get::<u64>("differential_steps")
+        .map_err(|error| error.to_string())
+}
+
+#[test]
+fn extracted_chat_controller_matches_frozen_pre_extraction_reducer_after_every_step() {
+    let steps = run_chat_controller_differential(false).expect("differential fixture");
+    assert!(
+        steps >= 50,
+        "fixture should exercise representative sequences"
+    );
+}
+
+#[test]
+fn chat_controller_differential_fixture_detects_meaningful_divergence() {
+    let error = run_chat_controller_differential(true).expect_err("mutation must be detected");
+    assert!(
+        error.contains("differential state divergence") && error.contains("safe auto yolo effects"),
+        "unexpected mutation failure: {error}"
+    );
+}
+
 #[test]
 fn independent_house_composes_public_chat_blocks_without_example_imports() {
     ensure_test_data_home();
@@ -11423,8 +11495,12 @@ fn independent_house_composes_public_chat_blocks_without_example_imports() {
         std::fs::read_to_string(repo_root.join("tests/fixtures/chat-independent-house/init.lua"))
             .expect("read independent house fixture");
     assert!(
-        !source.contains("chat.update") && !source.contains("examples/nefor-agent"),
-        "independent assembly must not import the starter"
+        !source.contains("chat.update")
+            && !source.contains("chat.statusline")
+            && !source.contains("chat.slash")
+            && !source.contains("libs.chat.view")
+            && !source.contains("examples/nefor-agent"),
+        "independent assembly must use public blocks and direct nefor-tui primitives without starter opinions"
     );
     let lua_root = repo_root.join("lua").display().to_string();
     let tui_root = repo_root
