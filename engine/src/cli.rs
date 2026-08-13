@@ -32,7 +32,8 @@ use clap::{Parser, Subcommand};
                   content all live in plugins loaded from the user's init.lua.\n\n\
                   Config: $NEFOR_CONFIG_DIR or $XDG_CONFIG_HOME/nefor/ (default ~/.config/nefor/).\n\
                   Data:   $NEFOR_DATA_DIR or $XDG_DATA_HOME/nefor/ (default ~/.local/share/nefor/).\n\
-                  CLI flags --config/--data-dir override env vars."
+                  Logs: $NEFOR_LOG_FILE or $NEFOR_DATA_DIR/logs/nefor.log; NEFOR_LOG_STDERR selects stderr.\n\
+                  CLI flags --config/--data-dir/--log-file override env vars."
 )]
 pub struct Cli {
     /// Override the config directory (highest precedence; beats `NEFOR_CONFIG_DIR`).
@@ -43,6 +44,12 @@ pub struct Cli {
     /// and the XDG default `~/.local/share/nefor/`).
     #[arg(long, value_name = "DIR", global = true)]
     pub data_dir: Option<PathBuf>,
+
+    /// Write aggregate engine, plugin, and Lua logs to this exact path
+    /// (highest precedence; beats `NEFOR_LOG_FILE`). Ignored when
+    /// `NEFOR_LOG_STDERR` is set to a non-empty value.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub log_file: Option<PathBuf>,
 
     /// Optional subcommand. When omitted, the engine runs in serve mode
     /// with no Lua argv (boot init.lua, spawn plugins, broker). When

@@ -1,10 +1,9 @@
 //! Tracing setup.
 //!
-//! Writes to `<config_dir>/nefor.log` by default so log output doesn't paint
-//! over a plugin that may have taken over the terminal (alternate-screen
-//! buffer, raw mode, etc.). When `NEFOR_LOG_STDERR` is set (any non-empty
-//! value), logs go to stderr instead — useful for headless runs
-//! (`cargo test`, `--help` inspections, debugging with the terminal visible).
+//! File logging keeps output from painting over a plugin that may have taken
+//! over the terminal (alternate-screen buffer, raw mode, etc.). Explicit
+//! stderr mode remains available for headless runs and terminal-visible
+//! debugging.
 //!
 //! Filter comes from `RUST_LOG` via `EnvFilter`, defaulting to `info`.
 //!
@@ -15,11 +14,26 @@
 //! the process boundary after terminal-owning plugins have shut down.
 
 use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 use tracing_subscriber::{fmt, EnvFilter, Layer};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogDestination {
+    File(PathBuf),
+    Stderr,
+}
+
+impl std::fmt::Display for LogDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => path.display().fmt(f),
+            Self::Stderr => f.write_str("stderr"),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogInitError {
@@ -33,25 +47,26 @@ pub enum LogInitError {
     Init(#[from] TryInitError),
 }
 
-/// Initialize the global tracing subscriber writing to `log_path`.
+/// Initialize the global tracing subscriber for the selected destination.
 ///
-/// Creates parent directories if needed; appends if the file already exists.
-/// ANSI color codes are suppressed for file output (terminals don't interpret
-/// them mid-file and plain text is friendlier to `cat` / `less`).
-pub fn init(log_path: &Path) -> Result<(), LogInitError> {
+/// File destinations are used exactly as selected. Their parent directories
+/// are created if needed, and existing files are appended to.
+pub fn init(destination: &LogDestination) -> Result<(), LogInitError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let use_stderr = std::env::var_os("NEFOR_LOG_STDERR").is_some_and(|v| !v.is_empty());
 
-    if use_stderr {
+    let LogDestination::File(log_path) = destination else {
         fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .finish()
             .try_init()?;
         return Ok(());
-    }
+    };
 
-    if let Some(parent) = log_path.parent() {
+    if let Some(parent) = log_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).map_err(|source| LogInitError::OpenFile {
             path: log_path.to_path_buf(),
             source,

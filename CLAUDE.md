@@ -44,7 +44,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 | `NEFOR_CONFIG_DIR`   | `--config`     | `$XDG_CONFIG_HOME/nefor`   | `init.lua`                                                                                                   |
 | `NEFOR_DATA_DIR`     | `--data-dir`   | `$XDG_DATA_HOME/nefor`     | writable runtime data other than sessions                                                                    |
 | `NEFOR_SESSIONS_DIR` | —              | `$NEFOR_DATA_DIR/sessions` | composition-selected root for session event logs and MAG trees                                               |
-| `NEFOR_PLUGIN_DIR`   | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins`  | binaries                                                                                                     |
+| `NEFOR_PLUGIN_DIR`   | —              | `$NEFOR_DATA_DIR/plugins`  | binaries (resolved by Lua distribution composition)                                                         |\n| `NEFOR_LOG_FILE`     | `--log-file`   | `$NEFOR_DATA_DIR/logs/nefor.log` | aggregate engine, plugin, and Lua log; `NEFOR_LOG_STDERR` selects stderr                               |
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 

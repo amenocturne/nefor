@@ -1,7 +1,10 @@
 # Troubleshooting
 
 Start with the visible symptom. Unless an error says otherwise, inspect
-`<config-dir>/nefor.log`; the default is `~/.config/nefor/nefor.log`.
+`<data-dir>/logs/nefor.log`; the default is
+`~/.local/share/nefor/logs/nefor.log`. `--log-file` and `NEFOR_LOG_FILE` select
+another exact path, while non-empty `NEFOR_LOG_STDERR` sends aggregate logs to
+stderr instead.
 
 ## `nefor: no init.lua found`
 
@@ -46,8 +49,8 @@ Avoid pointing `NEFOR_EXECUTABLE_ROOT` at the Lua source overlay under
 - Remove stale `NEFOR_EXECUTABLE_ROOT` overrides unless they are intentional.
 - If using explicit paths, pass the directory containing executables such as
   `nefor-tui`, `mock-plugin`, and `mag-plugin`.
-- Read `nefor.log`. After the TUI closes, abnormal plugin exits are also
-  reported on stderr with the log path.
+- Read the selected aggregate log. After the TUI closes, abnormal plugin exits
+  are also reported on stderr with the selected destination.
 
 ## First launch asks for credentials or uses ChatGPT unexpectedly
 
@@ -81,7 +84,7 @@ Provider enablement and provider authentication are separate.
 - Use `/model` to select a model registered by an enabled provider.
 
 Provider HTTP and model-capability errors should appear in the transcript; the
-engine and plugin details remain in `nefor.log`.
+engine and plugin details remain in the selected aggregate log.
 
 ## `nefor --session ...` is rejected
 

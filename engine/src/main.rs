@@ -4,7 +4,7 @@
 //!
 //! 1. Parse CLI (`--config`, `--data-dir`, optional
 //!    Lua argv / `plugin` subcommand).
-//! 2. Resolve the config dir, initialize tracing to a file under it.
+//! 2. Resolve the config and data dirs, then initialize tracing at the selected\n//!    file path or on stderr.
 //! 3. Boot the Lua VM with a [`BrokerOps`] routing sink and run
 //!    `init.lua`. Cache the global `dispatch` function — fatal if missing.
 //! 4. Branch on [`cli::EngineMode`]:
@@ -73,13 +73,14 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
     }
 
-    let log_path = config_dir.as_path().join("nefor.log");
-    if let Err(e) = log::init(&log_path) {
-        eprintln!("nefor: failed to initialize logging at {log_path:?}: {e}");
+    let log_destination = config::resolve_log_destination(&args, &data_dir);
+    if let Err(e) = log::init(&log_destination) {
+        eprintln!("nefor: failed to initialize logging at {log_destination}: {e}");
+        std::process::exit(1);
     }
 
-    // Route panics through tracing so a hard engine death leaves evidence in
-    // nefor.log — the default hook prints to stderr, which the TUI plugin's
+    // Route panics through tracing so a hard engine death leaves evidence at
+    // the selected log destination — the default hook prints to stderr, which the TUI plugin's
     // alternate screen owns and erases. Chained before the default hook so
     // stderr still gets the message when it survives.
     {
@@ -97,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         config_dir = %config_dir,
         data_dir = %data_dir,
-        log_path = %log_path.display(),
+        log_destination = %log_destination,
         ?mode,
         "nefor starting"
     );
@@ -148,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
         .context("caching dispatch function from init.lua")?;
 
     match mode {
-        EngineMode::Serve => run_serve(host, plugins, shared, &log_path).await,
+        EngineMode::Serve => run_serve(host, plugins, shared, &log_destination).await,
         EngineMode::PluginList => run_plugin_list(plugins),
         EngineMode::PluginDispatch { name, args: argv } => {
             run_plugin_dispatch(host, plugins, shared, name, argv).await
@@ -161,7 +162,7 @@ async fn run_serve(
     host: LuaHost,
     plugins: SharedPluginRegistry,
     shared: Arc<Mutex<BrokerShared>>,
-    log_path: &std::path::Path,
+    log_destination: &log::LogDestination,
 ) -> anyhow::Result<()> {
     let specs = drain_specs(&plugins);
 
@@ -200,7 +201,7 @@ async fn run_serve(
     for (name, code) in &exits {
         eprintln!(
             "nefor: plugin '{name}' exited abnormally ({code}); see {} for details",
-            log_path.display()
+            log_destination
         );
     }
 

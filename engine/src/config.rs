@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use crate::cli::Cli;
+use crate::log::LogDestination;
 use crate::paths::{ConfigDir, DataDir};
 
 /// Typed errors produced during directory resolution.
@@ -84,6 +85,29 @@ pub fn resolve_data_from(cli: &Cli, env: &impl EnvReader) -> Result<DataDir, Con
     Ok(DataDir::new(xdg.join("nefor")))
 }
 
+/// Resolve the aggregate logging destination. Explicit stderr mode has highest
+/// precedence, followed by the CLI file path, the environment file path, and
+/// finally `<data-dir>/logs/nefor.log`.
+pub fn resolve_log_destination_from(
+    cli: &Cli,
+    env: &impl EnvReader,
+    data_dir: &DataDir,
+) -> LogDestination {
+    if env
+        .get("NEFOR_LOG_STDERR")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return LogDestination::Stderr;
+    }
+    if let Some(path) = &cli.log_file {
+        return LogDestination::File(path.clone());
+    }
+    if let Some(raw) = env.get("NEFOR_LOG_FILE").filter(|s| !s.is_empty()) {
+        return LogDestination::File(PathBuf::from(raw));
+    }
+    LogDestination::File(data_dir.as_path().join("logs/nefor.log"))
+}
+
 /// Resolve the config directory using the real process environment.
 pub fn resolve_config(cli: &Cli) -> Result<ConfigDir, ConfigError> {
     resolve_config_from(cli, &SystemEnv)
@@ -92,6 +116,11 @@ pub fn resolve_config(cli: &Cli) -> Result<ConfigDir, ConfigError> {
 /// Resolve the data directory using the real process environment.
 pub fn resolve_data(cli: &Cli) -> Result<DataDir, ConfigError> {
     resolve_data_from(cli, &SystemEnv)
+}
+
+/// Resolve the aggregate logging destination using the real process environment.
+pub fn resolve_log_destination(cli: &Cli, data_dir: &DataDir) -> LogDestination {
+    resolve_log_destination_from(cli, &SystemEnv, data_dir)
 }
 
 #[cfg(test)]
@@ -135,6 +164,7 @@ mod tests {
         Cli {
             config: None,
             data_dir: None,
+            log_file: None,
             command: None,
         }
     }
@@ -142,6 +172,8 @@ mod tests {
         Cli {
             config: Some(PathBuf::from(dir)),
             data_dir: None,
+            plugin_dir: None,
+            log_file: None,
             command: None,
         }
     }
@@ -149,6 +181,7 @@ mod tests {
         Cli {
             config: None,
             data_dir: Some(PathBuf::from(dir)),
+            log_file: None,
             command: None,
         }
     }
@@ -234,5 +267,53 @@ mod tests {
         let env = FakeEnv::new(None, None);
         let err = resolve_data_from(&cli, &env).expect_err("must error");
         assert!(matches!(err, ConfigError::NoXdgDataDir));
+    }
+
+    #[test]
+    fn log_defaults_under_data_dir() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(None, None);
+        let data = DataDir::new(PathBuf::from("/data/root"));
+        assert_eq!(
+            resolve_log_destination_from(&cli, &env, &data),
+            LogDestination::File(PathBuf::from("/data/root/logs/nefor.log"))
+        );
+    }
+
+    #[test]
+    fn log_file_cli_beats_environment_file() {
+        let mut cli = cli_bare();
+        cli.log_file = Some(PathBuf::from("relative/custom.log"));
+        let env = FakeEnv::new(None, None).with("NEFOR_LOG_FILE", "/env/nefor.log");
+        let data = DataDir::new(PathBuf::from("/data/root"));
+        assert_eq!(
+            resolve_log_destination_from(&cli, &env, &data),
+            LogDestination::File(PathBuf::from("relative/custom.log"))
+        );
+    }
+
+    #[test]
+    fn log_file_environment_beats_default() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(None, None).with("NEFOR_LOG_FILE", "/env/nefor.log");
+        let data = DataDir::new(PathBuf::from("/data/root"));
+        assert_eq!(
+            resolve_log_destination_from(&cli, &env, &data),
+            LogDestination::File(PathBuf::from("/env/nefor.log"))
+        );
+    }
+
+    #[test]
+    fn stderr_mode_beats_cli_and_environment_file_paths() {
+        let mut cli = cli_bare();
+        cli.log_file = Some(PathBuf::from("/cli/nefor.log"));
+        let env = FakeEnv::new(None, None)
+            .with("NEFOR_LOG_FILE", "/env/nefor.log")
+            .with("NEFOR_LOG_STDERR", "1");
+        let data = DataDir::new(PathBuf::from("/data/root"));
+        assert_eq!(
+            resolve_log_destination_from(&cli, &env, &data),
+            LogDestination::Stderr
+        );
     }
 }
