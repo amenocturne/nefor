@@ -260,7 +260,7 @@ async fn catalog_filters_by_allowlist_at_translator_step() {
         .into_iter()
         .filter(|t| allowed.iter().any(|a| a == &t.name))
         .collect();
-    let wire = tools_to_responses_format(&filtered);
+    let (_, wire) = tools_to_responses_format(&filtered).expect("mapping");
     assert_eq!(wire.len(), 1);
     assert_eq!(
         wire[0].get("name").and_then(|v| v.as_str()),

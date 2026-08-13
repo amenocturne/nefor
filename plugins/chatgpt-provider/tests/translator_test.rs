@@ -158,7 +158,7 @@ fn tools_to_responses_format_round_trip_through_request() {
         description: "Read a file".into(),
         input_schema: json!({"type": "object"}),
     }];
-    let tools = tools_to_responses_format(&specs);
+    let (_, tools) = tools_to_responses_format(&specs).expect("mapping");
     let req = ResponsesApiRequest {
         model: "test-model".into(),
         instructions: String::new(),

@@ -153,6 +153,11 @@ async fn structured_request_reaches_local_responses_server_with_explicit_object_
                 let request: serde_json::Value =
                     serde_json::from_slice(&bytes[header_end + 4..header_end + 4 + content_length])
                         .expect("request JSON");
+                let mapped_name = request["tools"][0]["name"].as_str().expect("tool name");
+                assert_ne!(mapped_name, "shell.script");
+                assert!(mapped_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
                 let schema = &request["text"]["format"]["schema"];
                 assert_eq!(
                     schema["type"], "object",
@@ -187,6 +192,14 @@ async fn structured_request_reaches_local_responses_server_with_explicit_object_
         .to_provider_schema()
         .expect("supported MAG schema");
     let mut request = minimal_request();
+    let specs = vec![chatgpt_provider::catalog::ToolSpec {
+        name: "shell.script".into(),
+        description: "Run a shell script".into(),
+        input_schema: json!({"type": "object"}),
+    }];
+    let (_, tools) = chatgpt_provider::translator::tools_to_responses_format(&specs)
+        .expect("provider tool mapping");
+    request.tools = tools;
     request.text = Some(TextControls {
         verbosity: None,
         format: Some(json!({
@@ -440,6 +453,11 @@ async fn native_compaction_v2_posts_responses_trigger_and_accepts_streamed_item(
             assert_eq!(request["model"], "gpt-5.6-sol");
             assert_eq!(request["input"][0]["type"], "message");
             assert_eq!(request["input"][1], json!({"type": "compaction_trigger"}));
+            let mapped_name = request["tools"][0]["name"].as_str().expect("tool name");
+            assert_ne!(mapped_name, "process.exec");
+            assert!(mapped_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
             assert_eq!(request["stream"], true);
             assert_eq!(request["store"], false);
             break;
@@ -469,6 +487,14 @@ async fn native_compaction_v2_posts_responses_trigger_and_accepts_streamed_item(
     );
     let mut request = minimal_request();
     request.model = "gpt-5.6-sol".into();
+    let specs = vec![chatgpt_provider::catalog::ToolSpec {
+        name: "process.exec".into(),
+        description: "Execute a process".into(),
+        input_schema: json!({"type": "object"}),
+    }];
+    let (_, tools) = chatgpt_provider::translator::tools_to_responses_format(&specs)
+        .expect("provider tool mapping");
+    request.tools = tools;
     request.input.push(ResponseItem::CompactionTrigger {});
     let mut turn = ResponsesTurnContext::new("session", "thread");
     let compacted = client

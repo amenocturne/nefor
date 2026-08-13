@@ -2161,8 +2161,28 @@ async fn compact_chat(
             .collect(),
         None => tools_specs,
     };
-    let tools_json = translator::tools_to_responses_format(&filtered_specs);
-    let translated = translator::history_to_input(&snapshot.history, snapshot.system.as_deref());
+    let (provider_tool_names, tools_json) =
+        match translator::tools_to_responses_format(&filtered_specs) {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                send_event(
+                    &ctx.out_tx,
+                    turn_error_body(&ctx.args, Some(chat_id), &error.to_string()),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    let mut translated =
+        translator::history_to_input(&snapshot.history, snapshot.system.as_deref());
+    if let Err(error) = provider_tool_names.map_input_to_provider(&mut translated.input) {
+        send_event(
+            &ctx.out_tx,
+            turn_error_body(&ctx.args, Some(chat_id), &error.to_string()),
+        )
+        .await?;
+        return Ok(());
+    }
     let supports_reasoning = if ctx.chats.model_reasoning_unsupported(&snapshot.model).await {
         false
     } else if let Some(api) = ctx.chats.model_capability_reasoning(&snapshot.model).await {
@@ -2232,7 +2252,17 @@ async fn compact_chat(
     };
 
     let compacted = match compacted {
-        Ok(items) if !items.is_empty() => items,
+        Ok(mut items) if !items.is_empty() => {
+            if let Err(error) = provider_tool_names.map_output_to_internal(&mut items) {
+                send_event(
+                    &ctx.out_tx,
+                    turn_error_body(&ctx.args, Some(chat_id), &error.to_string()),
+                )
+                .await?;
+                return Ok(());
+            }
+            items
+        }
         Ok(_) => {
             send_event(
                 &ctx.out_tx,
@@ -2397,17 +2427,22 @@ impl ToolCallBuffer {
         }
     }
 
-    fn into_tool_calls(self) -> Vec<ToolCall> {
+    fn into_tool_calls(
+        self,
+        names: &crate::provider_tool_names::ProviderToolNames,
+    ) -> Result<Vec<ToolCall>, crate::provider_tool_names::ProviderToolNameError> {
         let mut by_id = self.by_item_id;
         self.order
             .into_iter()
             .filter_map(|item_id| by_id.remove(&item_id))
-            .map(|pc| ToolCall {
-                id: pc.call_id,
-                function: ToolCallFunction {
-                    name: pc.name,
-                    arguments: pc.args,
-                },
+            .map(|pc| {
+                Ok(ToolCall {
+                    id: pc.call_id,
+                    function: ToolCallFunction {
+                        name: names.to_internal(&pc.name)?.to_owned(),
+                        arguments: pc.args,
+                    },
+                })
             })
             .collect()
     }
@@ -2732,7 +2767,24 @@ fn spawn_turn(
                     .collect(),
                 None => tools_specs,
             };
-            let tools_json = translator::tools_to_responses_format(&filtered_specs);
+            let (provider_tool_names, tools_json) =
+                match translator::tools_to_responses_format(&filtered_specs) {
+                    Ok(mapped) => mapped,
+                    Err(error) => {
+                        errored = true;
+                        final_finish_reason = Some("error".into());
+                        final_error = Some(error.to_string());
+                        let _ = ctx
+                            .out_tx
+                            .send(PluginOutgoing::event(turn_error_body(
+                                &ctx.args,
+                                Some(&chat_id),
+                                &error.to_string(),
+                            )))
+                            .await;
+                        break;
+                    }
+                };
             tracing::info!(
                 count = filtered_specs.len(),
                 names = ?filtered_specs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
@@ -2740,8 +2792,22 @@ fn spawn_turn(
                 "sending tools to Responses API"
             );
 
-            let translated =
+            let mut translated =
                 translator::history_to_input(&snapshot.history, snapshot.system.as_deref());
+            if let Err(error) = provider_tool_names.map_input_to_provider(&mut translated.input) {
+                errored = true;
+                final_finish_reason = Some("error".into());
+                final_error = Some(error.to_string());
+                let _ = ctx
+                    .out_tx
+                    .send(PluginOutgoing::event(turn_error_body(
+                        &ctx.args,
+                        Some(&chat_id),
+                        &error.to_string(),
+                    )))
+                    .await;
+                break;
+            }
             tracing::info!(
                 instructions_len = translated.instructions.len(),
                 instructions_preview = %translated.instructions.chars().take(120).collect::<String>(),
@@ -3343,7 +3409,23 @@ fn spawn_turn(
                 break;
             }
 
-            let tool_calls = tool_buf.into_tool_calls();
+            let tool_calls = match tool_buf.into_tool_calls(&provider_tool_names) {
+                Ok(calls) => calls,
+                Err(error) => {
+                    errored = true;
+                    final_finish_reason = Some("error".into());
+                    final_error = Some(error.to_string());
+                    let _ = ctx
+                        .out_tx
+                        .send(PluginOutgoing::event(turn_error_body(
+                            &ctx.args,
+                            Some(&chat_id),
+                            &error.to_string(),
+                        )))
+                        .await;
+                    break;
+                }
+            };
             if !tool_calls.is_empty() {
                 let _ = ctx
                     .chats
@@ -4161,21 +4243,29 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_buffer_accumulates_args_in_order() {
+    fn tool_call_buffer_reverse_maps_streamed_provider_name() {
+        let specs = vec![crate::catalog::ToolSpec {
+            name: "process.exec".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }];
+        let names =
+            crate::provider_tool_names::ProviderToolNames::from_specs(&specs).expect("mapping");
+        let provider_name = names.to_provider("process.exec").expect("provider name");
         let mut b = ToolCallBuffer::default();
         b.on_item_added(
             "call_1".into(),
             "call_1".into(),
-            "read_file".into(),
+            provider_name.into(),
             String::new(),
         );
         b.on_args_delta(Some("call_1"), r#"{"pa"#);
         b.on_args_delta(Some("call_1"), r#"th":"/x"}"#);
         b.on_item_done(Some("call_1"), r#"{"path":"/x"}"#);
-        let calls = b.into_tool_calls();
+        let calls = b.into_tool_calls(&names).expect("known name");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.name, "process.exec");
         assert_eq!(calls[0].function.arguments, r#"{"path":"/x"}"#);
     }
 
@@ -4185,7 +4275,14 @@ mod tests {
         let mut b = ToolCallBuffer::default();
         b.on_item_added("call_1".into(), "call_1".into(), "x".into(), String::new());
         b.on_item_done(Some("call_1"), r#"{"a":1}"#);
-        let calls = b.into_tool_calls();
+        let specs = vec![crate::catalog::ToolSpec {
+            name: "x".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }];
+        let names =
+            crate::provider_tool_names::ProviderToolNames::from_specs(&specs).expect("mapping");
+        let calls = b.into_tool_calls(&names).expect("known name");
         assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
     }
 

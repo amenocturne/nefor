@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 use crate::catalog::ToolSpec;
+use crate::provider_tool_names::{ProviderToolNameError, ProviderToolNames};
 use crate::responses::request::{MessageContent, ResponseItem};
 use crate::state::{HistoryEntry, Message};
 
@@ -214,19 +215,26 @@ fn parse_image_tool_output(content: &str) -> Option<ImageToolOutput> {
 /// JSON-schema enforcement to bounce calls that nefor's tool plugins
 /// would happily accept. Per-chat allowlist filtering is the caller's
 /// job — apply before calling this function.
-pub fn tools_to_responses_format(tools: &[ToolSpec]) -> Vec<Value> {
-    tools
+pub fn tools_to_responses_format(
+    tools: &[ToolSpec],
+) -> Result<(ProviderToolNames, Vec<Value>), ProviderToolNameError> {
+    let names = ProviderToolNames::from_specs(tools)?;
+    let values = tools
         .iter()
         .map(|t| {
             let mut obj = Map::new();
             obj.insert("type".into(), Value::String("function".into()));
-            obj.insert("name".into(), Value::String(t.name.clone()));
+            obj.insert(
+                "name".into(),
+                Value::String(names.to_provider(&t.name)?.to_owned()),
+            );
             obj.insert("description".into(), Value::String(t.description.clone()));
             obj.insert("parameters".into(), t.input_schema.clone());
             obj.insert("strict".into(), Value::Bool(false));
-            Value::Object(obj)
+            Ok(Value::Object(obj))
         })
-        .collect()
+        .collect::<Result<Vec<_>, ProviderToolNameError>>()?;
+    Ok((names, values))
 }
 
 /// True when the model name is one we know supports the
@@ -535,7 +543,7 @@ mod tests {
                 "required": ["path"],
             }),
         }];
-        let out = tools_to_responses_format(&specs);
+        let (_, out) = tools_to_responses_format(&specs).expect("mapping");
         assert_eq!(out.len(), 1);
         let t = &out[0];
         assert_eq!(t.get("type").and_then(Value::as_str), Some("function"));
