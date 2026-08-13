@@ -570,7 +570,7 @@ end
 -- canonical conversation identity onto the lead llm actor, and submits
 -- `mag.execute`. The provider actor reads history from conversation-manager;
 -- duplicating it in this persisted command would make session growth quadratic.
-local function submit_orchestrator_run(user_text, submission_ids)
+local function submit_orchestrator_run(user_text, submission_ids, input_cause)
   if state.current_run_id ~= nil then return nil end
   local conversation_id = ensure_conversation_id()
   if not conversation_ready() then
@@ -598,6 +598,7 @@ local function submit_orchestrator_run(user_text, submission_ids)
   local overlay_params = {
     conversation_id = conversation_id,
     submission_ids = submission_ids,
+    input_cause = input_cause,
   }
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
     overlay_params.provider = state.config.provider
@@ -670,7 +671,7 @@ local function flush_deferred()
   nefor.log.info("agentic-loop: flushing deferred run completions", {
     text_preview = string.sub(merged, 1, 80),
   })
-  submit_orchestrator_run(merged)
+  submit_orchestrator_run(merged, nil, "internal_async_completion")
 end
 
 flush_pending_user_inputs = function()
@@ -950,7 +951,12 @@ local function handle_chat_input_submit(body)
 
   local deferred = drain_deferred_text()
   if type(deferred) == "string" then
-    text = deferred .. "\n\n---\n\n" .. text
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = {
+      text = text,
+      submission_ids = submission_ids,
+    }
+    submit_orchestrator_run(deferred, nil, "internal_async_completion")
+    return
   end
 
   submit_orchestrator_run(text, submission_ids)

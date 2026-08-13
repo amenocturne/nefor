@@ -48,6 +48,7 @@ local function projected_message(conversation, message)
     id = message.id,
     turn_id = message.turn_id,
     submission_ids = domain.copy(message.submission_ids or {}),
+    input_cause = message.input_cause,
     role = message.role,
     status = message.status,
     tool_call_id = message.tool_call_id,

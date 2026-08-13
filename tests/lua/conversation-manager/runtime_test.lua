@@ -265,13 +265,30 @@ eq(context.context.messages[3].tool_call_id, "provider-call-42")
 eq(context.context.messages[3].content.text, "data")
 eq(context.context.watermark, actor._internals.get("replayed").last_sequence)
 
+append_fact("internal-turn", "turn_started", { turn_id = "turn-internal", run_id = "run-internal" })
+append_fact("internal-user", "message_started", {
+  turn_id = "turn-internal", message_id = "internal-user", role = "user",
+  input_cause = "internal_async_completion",
+})
+append_fact("internal-text", "content_chunk_appended", {
+  message_id = "internal-user", chunk = { kind = "text", data = "[mag_run(run_id=sub) result] payload" },
+})
+append_fact("internal-done", "message_completed", { message_id = "internal-user" })
+append_fact("internal-turn-done", "turn_completed", { turn_id = "turn-internal", run_id = "run-internal" })
+receive({ kind = "conversation.context.request", request_id = "context-internal", conversation_id = "replayed" })
+local internal_context = last_body().context
+eq(internal_context.messages[4].input_cause, "internal_async_completion",
+  "internal completion cause survives persistence and context reconstruction")
+eq(internal_context.messages[4].text, "[mag_run(run_id=sub) result] payload",
+  "internal completion remains available for agent consumption")
+
 receive({
   kind = "conversation.context.compact.request", request_id = "compact-1",
   conversation_id = "replayed", provider = "chatgpt", model = "gpt-5.6-sol",
 })
 delta = last_body()
 eq(delta.change.kind, "context_compaction_pending")
-eq(delta.change.compaction.history_cutoff, 3)
+eq(delta.change.compaction.history_cutoff, 4)
 eq(delta.change.compaction.provider, "chatgpt", "pending compaction preserves routing provider")
 eq(delta.change.compaction.model, "gpt-5.6-sol", "pending compaction preserves the selected model")
 receive({
@@ -290,7 +307,7 @@ receive({
   conversation_id = "replayed",
 })
 context = last_body().context
-eq(#context.messages, 3, "full neutral history remains universally available")
+eq(#context.messages, 4, "full neutral history remains universally available")
 eq(#context.tail_messages, 0, "checkpoint tail begins after its cutoff")
 eq(context.compaction.checkpoint.opaque, "provider-owned")
 eq(context.compaction.provider, "chatgpt")

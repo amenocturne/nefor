@@ -218,4 +218,54 @@ eq(snapshot_user.submission_ids[1], "submission-s", "snapshot preserves submissi
 assert(tool_end_index ~= nil and final_text_index ~= nil and tool_end_index < final_text_index,
   "snapshot tool completion must remain before the following assistant message")
 
+local internal_state = projection.new()
+internal_state = select(1, projection.reduce(internal_state, {
+  kind = "conversation.active.changed", conversation_id = "internal",
+}))
+local internal_actions
+internal_state, internal_actions = projection.reduce(internal_state, {
+  kind = "conversation.snapshot", conversation_id = "internal", found = true,
+  projection = {
+    messages = {
+      { id = "authored", turn_id = "turn-authored", role = "user", text = "real question" },
+      {
+        id = "completion", turn_id = "turn-completion", role = "user",
+        input_cause = "internal_async_completion",
+        text = "[mag_run(run_name=inspect, run_id=run-1) result] raw semantic output",
+      },
+      { id = "answer", turn_id = "turn-completion", role = "assistant", text = "result summary" },
+    },
+    turns = {}, exchanges = {}, compactions = {},
+  },
+})
+local visible_users = {}
+local visible_answer = false
+for _, item in ipairs(internal_actions) do
+  if item.kind == "message" then visible_users[#visible_users + 1] = item.text end
+  if item.kind == "text_delta" and item.text == "result summary" then visible_answer = true end
+end
+eq(#visible_users, 1, "snapshot hides internal asynchronous completion inputs")
+eq(visible_users[1], "real question", "snapshot preserves genuine user-authored messages")
+eq(visible_answer, true, "snapshot preserves the agent response to an internal completion")
+
+local live_state = projection.new()
+live_state = select(1, projection.reduce(live_state, {
+  kind = "conversation.active.changed", conversation_id = "internal-live",
+}))
+live_state = select(1, projection.reduce(live_state, {
+  kind = "conversation.projection.delta", conversation_id = "internal-live",
+  change = { kind = "message_started", message = {
+    id = "completion-live", role = "user", input_cause = "internal_async_completion",
+  } },
+}))
+local live_actions
+live_state, live_actions = projection.reduce(live_state, {
+  kind = "conversation.projection.delta", conversation_id = "internal-live",
+  change = { kind = "message_completed", message = {
+    id = "completion-live", role = "user", input_cause = "internal_async_completion",
+    text = "[mag_run(run_id=run-live) result] raw semantic output",
+  } },
+})
+eq(#live_actions, 0, "live projection also hides internal asynchronous completion inputs")
+
 print("conversation_projection_test: all assertions passed")

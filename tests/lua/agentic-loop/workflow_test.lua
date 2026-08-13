@@ -1178,6 +1178,9 @@ do
   local exec2 = find_kind(calls, "mag.execute")
   assert(exec2 ~= nil, "an idle lead relays the completion immediately")
   local prompt = task_prompt(exec2.body.artifact.data)
+  assert_eq(exec2.body.params_overlay["lead.llm"].input_cause,
+    "internal_async_completion",
+    "the relay persists its causal identity separately from user authorship")
   assert(string.find(prompt, "mag-sub-1", 1, true) ~= nil,
     "the relay turn names the finished run")
   assert(string.find(prompt, "sub answer", 1, true) ~= nil,

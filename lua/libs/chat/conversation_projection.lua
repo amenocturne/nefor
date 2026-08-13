@@ -58,7 +58,7 @@ end
 local function message_completed(state, actions, message)
   record_message(state, message)
   if type(message) ~= "table" then return end
-  if message.role == "user" then
+  if message.role == "user" and message.input_cause ~= "internal_async_completion" then
     local text = visible_text(message)
     local recorded = state.messages[message.id]
     if text == "" and type(recorded) == "table"
@@ -149,7 +149,7 @@ local function snapshot_actions(state, projection, actions)
           complete_exchange(exchange)
         end
       end
-    elseif message.role == "user" then
+    elseif message.role == "user" and message.input_cause ~= "internal_async_completion" then
       action(actions, "message", {
         role = message.role,
         text = visible_text(message),

@@ -177,6 +177,7 @@ function M.new(options)
       tool_call_id = message.tool_call_id,
       name = message.name,
       submission_ids = message.submission_ids,
+      input_cause = message.input_cause,
     })
     local chunk = content_chunk(message.content)
     if chunk then self:content(message_id, chunk.kind, chunk.data) end

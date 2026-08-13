@@ -36,7 +36,7 @@ M.declaration = {
     profile = "string?", reasoning_effort = "string?",
     provider = "string?", history = "table?",
     conversation_id = "string?",
-    turn_id = "string?", submission_ids = "table?",
+    turn_id = "string?", submission_ids = "table?", input_cause = "string?",
   },
   inputs = { provider_input = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" },
