@@ -18,34 +18,9 @@ local function env_truthy(name)
   return v == "1" or v == "true" or v == "TRUE" or v == "yes" or v == "YES"
 end
 
-local function resolved_bin(name, path, source)
-  if nefor and nefor.log and nefor.log.info then
-    nefor.log.info("config: resolved plugin binary", {
-      name = name,
-      path = path,
-      source = source,
-    })
-  end
-  return path
-end
+local distribution = require("config.distribution")
 
--- Binary path resolver. Plugins call `require("config").bin("<name>")` to
--- get the absolute path of a sibling plugin binary; the engine sets
--- NEFOR_PLUGIN_DIR before any Lua runs (resolved from the engine's
--- install layout — see crates/nefor/src/main.rs).
---
--- Installed and development launchers both provide the plugin directory
--- explicitly. Runtime resolution never probes mutable source checkouts.
-M.bin = function(name)
-  local plugin_dir = os.getenv("NEFOR_PLUGIN_DIR")
-  if not plugin_dir or plugin_dir == "" then
-    error("NEFOR_PLUGIN_DIR is not set; the engine resolves this "
-       .. "automatically when started via `nefor`. If you see this "
-       .. "from a custom harness, set it explicitly or pass --plugin-dir.")
-  end
-
-  return resolved_bin(name, plugin_dir .. "/" .. name, "NEFOR_PLUGIN_DIR")
-end
+M.bin = distribution.binary
 
 local DEFAULT_PROVIDER = os.getenv("NEFOR_DEFAULT_PROVIDER") or "mock-plugin"
 local DEFAULT_MODEL    = os.getenv("NEFOR_DEFAULT_MODEL") or "mock-model"

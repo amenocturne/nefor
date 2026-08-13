@@ -11,10 +11,9 @@
 //! reached through a Lua-side registry installed by the spawn binding.
 //!
 //! The runner spawns subprocesses with direct `Command::new(binary)` —
-//! no shell, no env-map, no cwd override. Working directory is
-//! `<plugin-root>/<name>/` (resolved at spawn time by the engine). Plugins
-//! that need shell features wrap themselves in a user-chosen wrapper
-//! script and expose that as their `command`.
+//! no shell, no env map, no cwd override, and no installation-layout
+//! discovery. Plugins that need shell features wrap themselves in a
+//! user-chosen wrapper script and expose that as their `command`.
 
 use std::sync::{Arc, Mutex};
 

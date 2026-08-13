@@ -135,7 +135,6 @@ mod tests {
         Cli {
             config: None,
             data_dir: None,
-            plugin_dir: None,
             command: None,
         }
     }
@@ -143,7 +142,6 @@ mod tests {
         Cli {
             config: Some(PathBuf::from(dir)),
             data_dir: None,
-            plugin_dir: None,
             command: None,
         }
     }
@@ -151,7 +149,6 @@ mod tests {
         Cli {
             config: None,
             data_dir: Some(PathBuf::from(dir)),
-            plugin_dir: None,
             command: None,
         }
     }

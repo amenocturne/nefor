@@ -19,7 +19,7 @@ ncp.spawn {
 
 Names should be lowercase alphanumeric with hyphens. Avoid dots because event kinds use `<plugin-name>.` prefixes.
 
-The engine starts `command[0]` directly with the remaining entries as argv. It does not invoke a shell or manage per-plugin cwd/env maps. Children inherit the engine process cwd and environment. Resolved `NEFOR_CONFIG_DIR`, `NEFOR_DATA_DIR`, and `NEFOR_PLUGIN_DIR` are exported before spawn.
+The engine starts `command[0]` directly with the remaining entries as argv. It does not invoke a shell or manage per-plugin cwd/env maps. Children inherit the engine process cwd and environment. Resolved `NEFOR_CONFIG_DIR` and `NEFOR_DATA_DIR` are exported before spawn. Executable lookup belongs to the Lua composition or its distribution helper.
 
 A plugin owns its CLI and settings schema. The engine validates the composition's `name` and non-empty command strings; it does not interpret plugin flags. Use an explicit shell/wrapper when custom environment, cwd, shell expansion, supervision, or a daemon bridge is required.
 

@@ -12,7 +12,7 @@ Rust code still shares protocol-adjacent newtypes such as plugin names and times
 
 Plugins are OS processes connected over stdin/stdout. Stdout lines from a plugin are complete JSON values encoded as JSON Lines. Stderr is logging, not bus traffic.
 
-The runner starts command[0] directly with std::process::Command; it does not invoke a shell, set per-plugin cwd, or manage per-plugin env maps. Children inherit the engine process cwd and environment. The engine resolves and exports NEFOR_CONFIG_DIR, NEFOR_DATA_DIR, and NEFOR_PLUGIN_DIR before spawning so Lua configs and child processes see the same roots.
+The runner starts command[0] directly with std::process::Command; it does not invoke a shell, set per-plugin cwd, or manage per-plugin env maps. Children inherit the engine process cwd and environment. The engine exports resolved NEFOR_CONFIG_DIR and NEFOR_DATA_DIR before spawning. Lua registers the exact executable command; the engine performs no plugin-root discovery.
 
 ## Plugin-authored lines
 

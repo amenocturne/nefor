@@ -22,7 +22,8 @@ fi
 
 plugin_dir="$dist_dir/share/nefor/plugins"
 manifest="$dist_dir/share/nefor/plugins.manifest"
-mkdir -p "$dist_dir/bin" "$plugin_dir" "$dist_dir/share/nefor/examples/nefor-agent"
+runtime_root="$dist_dir/share/nefor/runtime"
+mkdir -p "$dist_dir/bin" "$plugin_dir" "$dist_dir/share/nefor/examples/nefor-agent" "$runtime_root/lua" "$runtime_root/plugins"
 cp "$target_bin/nefor" "$dist_dir/bin/nefor"
 if [ ! -x "$target_bin/mag" ]; then
   echo "missing compiler binary: $target_bin/mag" >&2
@@ -44,6 +45,17 @@ if [ ! -s "$manifest" ]; then
   echo "plugin manifest is empty" >&2
   exit 1
 fi
+
+
+cp -R "$repo_root/lua/." "$runtime_root/lua/"
+for plugin_lua in "$repo_root"/plugins/*/lua; do
+  [ -d "$plugin_lua" ] || continue
+  plugin_name=$(basename "$(dirname "$plugin_lua")")
+  mkdir -p "$runtime_root/plugins/$plugin_name"
+  cp -R "$plugin_lua" "$runtime_root/plugins/$plugin_name/lua"
+done
+mkdir -p "$runtime_root/examples/nefor-agent"
+cp -R "$repo_root/examples/nefor-agent/." "$runtime_root/examples/nefor-agent/"
 
 cp -R "$repo_root/examples/nefor-agent/." "$dist_dir/share/nefor/examples/nefor-agent/"
 cp "$repo_root/LICENSE" "$repo_root/README.md" "$dist_dir/share/nefor/"

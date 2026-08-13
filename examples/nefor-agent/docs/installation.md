@@ -90,7 +90,7 @@ needs no credentials. `nefor run` accepts starter-owned arguments such as
 
 ```sh
 nefor --config /path/to/config --data-dir /path/to/data \
-  --plugin-dir /path/to/plugins run --mode safe
+  run --mode safe
 ```
 
 ## Paths and precedence
@@ -100,7 +100,7 @@ nefor --config /path/to/config --data-dir /path/to/data \
 | Config containing `init.lua` | `--config`, then `NEFOR_CONFIG_DIR`                                    | `$XDG_CONFIG_HOME/nefor`, or `~/.config/nefor`    |
 | Writable runtime data        | `--data-dir`, then `NEFOR_DATA_DIR`                                    | `$XDG_DATA_HOME/nefor`, or `~/.local/share/nefor` |
 | Sessions                     | `NEFOR_SESSIONS_DIR`                                                   | `<data-dir>/sessions`                             |
-| Plugin binaries              | `--plugin-dir`, then `NEFOR_PLUGIN_DIR`, then install-layout discovery | source installs use `~/.local/share/nefor/bin`    |
+| Plugin binaries              | Lua distribution helper (`NEFOR_EXECUTABLE_ROOT` override) | source installs use `~/.local/share/nefor/bin`    |
 
 `NEFOR_DEV_DIR` is a deliberate live-checkout override used by `just run`, not a
 normal installed-user setting. Installed distributions may set

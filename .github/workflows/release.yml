@@ -289,8 +289,9 @@ jobs:
               r'\n  def install\n.*?\n  end\n',
               (
                   '\n  def install\n'
-                  '    bin.install "bin/nefor"\n'
+                  '    bin.install "bin/nefor", "bin/mag"\n'
                   '    (share/"nefor/plugins").install Dir["share/nefor/plugins/*"]\n'
+                  '    (share/"nefor/runtime").install Dir["share/nefor/runtime/*"]\n'
                   '    (share/"nefor/examples/nefor-agent").install Dir["share/nefor/examples/nefor-agent/*"]\n'
                   '    share.install "share/nefor/LICENSE", "share/nefor/README.md"\n'
                   '    share.install "share/nefor/CHANGELOG.md" if File.exist?("share/nefor/CHANGELOG.md")\n'

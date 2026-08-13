@@ -89,7 +89,7 @@ The full chat surface comes up via the engine launcher:
 
 ```sh
 cargo build --workspace
-NEFOR_CONFIG_DIR=/examples/nefor-agent NEFOR_PLUGIN_DIR=$PWD/target/debug cargo run --bin nefor
+NEFOR_DEV_DIR=$PWD NEFOR_CONFIG_DIR=$PWD/examples/nefor-agent cargo run --bin nefor
 ```
 
 ## Layout

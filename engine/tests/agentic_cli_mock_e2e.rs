@@ -136,7 +136,7 @@ fn base_command(xdg: &Path) -> Command {
         .arg("plugin")
         .arg("agentic-cli")
         .env("NEFOR_CONFIG", "test")
-        .env("NEFOR_PLUGIN_DIR", target_debug(""))
+        .env("NEFOR_EXECUTABLE_ROOT", target_debug(""))
         .env("NEFOR_TEST_BIN_DIR", target_debug(""))
         // Disable the mock provider's 80 tok/s pacing under tests so
         // the 10s scenario_timeout() stays comfortable. Interactive

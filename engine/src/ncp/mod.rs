@@ -2,10 +2,10 @@
 //!
 //! Post-Slice-2-I3 the engine is protocol-agnostic string routing:
 //!
-//! - **Runner** (`runner`) — resolves the plugin root directory, spawns
-//!   the declared binary with `Command::new(binary).args(...)`, bridges
-//!   stdio. No shell, no env map. Exposes a [`Transport`](transport::Transport)
-//!   to the broker.
+//! - **Runner** (`runner`) — spawns the Lua-declared command with
+//!   `Command::new(binary).args(...)` and bridges stdio. No shell, no env map,
+//!   and no installation-layout discovery. Exposes a
+//!   [`Transport`](transport::Transport) to the broker.
 //! - **Broker** (`broker`) — stamps inbound lines, mirrors them to the
 //!   session log, invokes the Lua `step` function, and routes step's
 //!   outbound sends to connection writers. No envelope parsing, no
@@ -32,6 +32,5 @@ pub mod transport;
 
 pub use broker::{Broker, BrokerOps, BrokerShared};
 pub use error::BrokerError;
-#[allow(unused_imports)]
-pub use runner::{resolve_plugin_root, spawn_plugin, PluginRoot};
+pub use runner::spawn_plugin;
 pub use spawn::{PluginKind, PluginRegistry, PluginSpec, SharedPluginRegistry};

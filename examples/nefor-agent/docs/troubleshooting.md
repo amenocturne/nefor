@@ -37,13 +37,13 @@ manager's command path.
 ## Plugins fail to spawn or the engine cannot resolve a plugin root
 
 A runtime binary and its plugin set are missing or from different layouts.
-Avoid pointing `NEFOR_PLUGIN_DIR` at the Lua source overlay under
+Avoid pointing `NEFOR_EXECUTABLE_ROOT` at the Lua source overlay under
 `~/.local/share/nefor/plugins`; source installs place executables in
 `~/.local/share/nefor/bin`.
 
 - Reinstall the complete runtime with `just install-nefor source`, `latest`, or
   `nightly`.
-- Remove stale `NEFOR_PLUGIN_DIR` overrides unless they are intentional.
+- Remove stale `NEFOR_EXECUTABLE_ROOT` overrides unless they are intentional.
 - If using explicit paths, pass the directory containing executables such as
   `nefor-tui`, `mock-plugin`, and `mag-plugin`.
 - Read `nefor.log`. After the TUI closes, abnormal plugin exits are also

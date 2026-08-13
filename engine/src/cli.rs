@@ -9,7 +9,7 @@
 //!   plugins that registered a `cli` field or invokes the named plugin's
 //!   `cli` function with the leftover argv.
 //!
-//! `--config` / `--data-dir` / `--plugin-dir` are engine flags. `nefor run`
+//! `--config` / `--data-dir` are engine flags. `nefor run`
 //! enters serve mode with trailing args exposed unchanged to Lua composition
 //! code.
 
@@ -32,8 +32,7 @@ use clap::{Parser, Subcommand};
                   content all live in plugins loaded from the user's init.lua.\n\n\
                   Config: $NEFOR_CONFIG_DIR or $XDG_CONFIG_HOME/nefor/ (default ~/.config/nefor/).\n\
                   Data:   $NEFOR_DATA_DIR or $XDG_DATA_HOME/nefor/ (default ~/.local/share/nefor/).\n\
-                  Plugins: $NEFOR_PLUGIN_DIR or $NEFOR_DATA_DIR/plugins/.\n\
-                  CLI flags --config/--data-dir/--plugin-dir override env vars."
+                  CLI flags --config/--data-dir override env vars."
 )]
 pub struct Cli {
     /// Override the config directory (highest precedence; beats `NEFOR_CONFIG_DIR`).
@@ -44,11 +43,6 @@ pub struct Cli {
     /// and the XDG default `~/.local/share/nefor/`).
     #[arg(long, value_name = "DIR", global = true)]
     pub data_dir: Option<PathBuf>,
-
-    /// Override the plugin root directory (highest precedence; beats
-    /// `NEFOR_PLUGIN_DIR` and the XDG / dev fallbacks).
-    #[arg(long, value_name = "DIR", global = true)]
-    pub plugin_dir: Option<PathBuf>,
 
     /// Optional subcommand. When omitted, the engine runs in serve mode
     /// with no Lua argv (boot init.lua, spawn plugins, broker). When
@@ -215,6 +209,13 @@ mod tests {
             engine_mode_from_cli(&cli),
             EngineMode::PluginDispatch { .. }
         ));
+    }
+
+    #[test]
+    fn engine_rejects_removed_plugin_dir_flag() {
+        let err =
+            Cli::try_parse_from(["nefor", "--plugin-dir", "/tmp/plugins"]).expect_err("parse err");
+        assert!(err.to_string().contains("unexpected argument"), "{err}");
     }
 
     #[test]

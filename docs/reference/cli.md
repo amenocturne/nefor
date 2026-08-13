@@ -17,7 +17,6 @@ Global options:
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--config <DIR>`         | Configuration directory containing `init.lua`.                                |
 | `--data-dir <DIR>`       | Writable runtime data root.                                                   |
-| `--plugin-dir <DIR>`     | Runtime plugin executable root.                                               |
 | `-h`, `--help`           | Engine help.                                                                  |
 | `-V`, `--version`        | Build version.                                                                |
 
@@ -59,16 +58,9 @@ Data:
 2. `NEFOR_DATA_DIR`
 3. `$XDG_DATA_HOME/nefor`, otherwise `~/.local/share/nefor`
 
-Plugin executable root:
 
-1. `--plugin-dir`
-2. `NEFOR_PLUGIN_DIR`
-3. executable directory when it contains the bundled plugin set
-4. `<data-root>/bin` when it contains the bundled plugin set
-5. the executable's adjacent installed `share/nefor/plugins`
-6. an existing `$NEFOR_DATA_DIR/plugins`
-7. `$XDG_DATA_HOME/nefor/plugins`, otherwise `~/.local/share/nefor/plugins`
+Plugin executable and immutable runtime roots are selected by the active Lua distribution helper, not by the engine.
 
-The engine exports resolved `NEFOR_CONFIG_DIR`, `NEFOR_DATA_DIR`, and `NEFOR_PLUGIN_DIR` before Lua composition and subprocess spawn.
+The engine exports resolved `NEFOR_CONFIG_DIR` and `NEFOR_DATA_DIR` before Lua composition and subprocess spawn. Plugin commands are resolved by Lua/distribution code.
 
 ## Version output

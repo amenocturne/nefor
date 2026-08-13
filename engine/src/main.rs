@@ -2,7 +2,7 @@
 //!
 //! Startup sequence:
 //!
-//! 1. Parse CLI (`--config`, `--data-dir`, `--plugin-dir`, optional
+//! 1. Parse CLI (`--config`, `--data-dir`, optional
 //!    Lua argv / `plugin` subcommand).
 //! 2. Resolve the config dir, initialize tracing to a file under it.
 //! 3. Boot the Lua VM with a [`BrokerOps`] routing sink and run
@@ -46,8 +46,7 @@ use crate::events::EventBus;
 use crate::lua::bindings::EngineOps;
 use crate::lua::LuaHost;
 use crate::ncp::{
-    resolve_plugin_root, spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry, PluginRoot,
-    PluginSpec, SharedPluginRegistry,
+    spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry, PluginSpec, SharedPluginRegistry,
 };
 
 #[tokio::main]
@@ -73,24 +72,6 @@ async fn main() -> anyhow::Result<()> {
     unsafe {
         std::env::set_var("NEFOR_CONFIG_DIR", config_dir.as_path());
         std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
-    }
-
-    // Resolve and propagate NEFOR_PLUGIN_DIR so init.lua's `bin()` helper
-    // can find the right path before any plugin gets spawned. The starter
-    // reads `os.getenv("NEFOR_PLUGIN_DIR")` directly; setting it here means
-    // `<exe>/../share/nefor/plugins` (Homebrew layout) and `<exe-dir>`
-    // (in-tree dev) both work without per-install configuration.
-    let plugin_root_unset = std::env::var("NEFOR_PLUGIN_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_none();
-    if plugin_root_unset {
-        if let Some(root) = resolve_plugin_root(args.plugin_dir.clone()) {
-            // SAFETY: single-threaded at this point, before any thread spawns.
-            unsafe {
-                std::env::set_var("NEFOR_PLUGIN_DIR", root.as_path());
-            }
-        }
     }
 
     let log_path = config_dir.as_path().join("nefor.log");
@@ -168,22 +149,12 @@ async fn main() -> anyhow::Result<()> {
         .context("caching dispatch function from init.lua")?;
 
     match mode {
-        EngineMode::Serve => {
-            run_serve(host, plugins, shared, args.plugin_dir.clone(), &log_path).await
-        }
+        EngineMode::Serve => run_serve(host, plugins, shared, &log_path).await,
         EngineMode::PluginList => run_plugin_list(plugins),
         EngineMode::PluginDispatch { name, args: argv } => {
-            run_plugin_dispatch(host, plugins, shared, args.plugin_dir.clone(), name, argv).await
+            run_plugin_dispatch(host, plugins, shared, name, argv).await
         }
     }
-}
-
-fn require_plugin_root(root: Option<PluginRoot>) -> anyhow::Result<PluginRoot> {
-    root.ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
-        )
-    })
 }
 
 /// Standard run loop — broker until shutdown.
@@ -191,7 +162,6 @@ async fn run_serve(
     host: LuaHost,
     plugins: SharedPluginRegistry,
     shared: Arc<Mutex<BrokerShared>>,
-    plugin_dir_override: Option<std::path::PathBuf>,
     log_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let specs = drain_specs(&plugins);
@@ -204,11 +174,8 @@ async fn run_serve(
         return Ok(());
     }
 
-    let plugin_root = require_plugin_root(resolve_plugin_root(plugin_dir_override))?;
-    tracing::info!(plugin_root = %plugin_root.as_path().display(), "plugin root resolved");
-
     let mut broker = Broker::new(Arc::clone(&shared), host);
-    spawn_specs(&mut broker, &specs, &plugin_root);
+    spawn_specs(&mut broker, &specs);
 
     let abnormal_exits = broker.abnormal_exits_handle();
     let shutdown = broker.shutdown_handle();
@@ -273,7 +240,6 @@ async fn run_plugin_dispatch(
     host: LuaHost,
     plugins: SharedPluginRegistry,
     shared: Arc<Mutex<BrokerShared>>,
-    plugin_dir_override: Option<std::path::PathBuf>,
     name: String,
     argv: Vec<String>,
 ) -> anyhow::Result<()> {
@@ -284,17 +250,6 @@ async fn run_plugin_dispatch(
         std::process::exit(1);
     }
 
-    let plugin_root = match resolve_plugin_root(plugin_dir_override) {
-        Some(r) => r,
-        None => {
-            tracing::error!(
-                "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
-            );
-            std::process::exit(1);
-        }
-    };
-    tracing::info!(plugin_root = %plugin_root.as_path().display(), "plugin root resolved");
-
     // Bridge the binary's stdin into nefor.io.read_line. Done before
     // the broker takes ownership of the host so the read_line binding
     // sees the pump receiver before the cli function ever runs.
@@ -302,7 +257,7 @@ async fn run_plugin_dispatch(
     host.attach_stdin_pump(stdin_rx);
 
     let mut broker = Broker::new(Arc::clone(&shared), host);
-    spawn_specs(&mut broker, &specs, &plugin_root);
+    spawn_specs(&mut broker, &specs);
 
     let shutdown = broker.shutdown_handle();
     let ctrl_c_task = tokio::spawn(async move {
@@ -367,13 +322,13 @@ fn drain_specs(plugins: &SharedPluginRegistry) -> Vec<PluginSpec> {
 /// Spawn every spec that carries a `command`, attaching the resulting
 /// transport to the broker. Virtual specs (no command) are skipped — they
 /// exist only as CLI entry points.
-fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec], plugin_root: &ncp::PluginRoot) {
+fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec]) {
     for spec in specs {
         if spec.command().is_none() {
             tracing::debug!(plugin = %spec.name, "skipping virtual plugin spawn (no command)");
             continue;
         }
-        match spawn_plugin(spec, plugin_root) {
+        match spawn_plugin(spec) {
             Ok(transport) => {
                 let id = broker.attach_transport(transport, spec.name.clone());
                 tracing::info!(
@@ -393,7 +348,6 @@ fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec], plugin_root: &ncp::Plu
                 // Surface the spawn failure to the bus so step can translate
                 // it into a user-visible notification (e.g. a chat.popup).
                 let code = match &e {
-                    crate::ncp::BrokerError::MissingPluginDir { .. } => "missing_dir",
                     crate::ncp::BrokerError::Spawn { .. } => "spawn_failed",
                     crate::ncp::BrokerError::Io(_) => "io_error",
                 };
@@ -425,15 +379,6 @@ mod dispatch_tests {
                 ncp::PluginKind::Command(vec!["echo".into()])
             },
         }
-    }
-
-    #[test]
-    fn unresolved_plugin_root_is_an_explicit_startup_error() {
-        let err = require_plugin_root(None).expect_err("serve startup must fail");
-        assert_eq!(
-            err.to_string(),
-            "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
-        );
     }
 
     #[test]

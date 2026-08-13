@@ -36,12 +36,12 @@ in
     home.packages = [ cfg.package ];
 
     home.sessionVariables = {
-      NEFOR_DEV_DIR = "${neforPkgs.nefor-engine}";
-      NEFOR_PLUGIN_DIR = "${cfg.package}/share/nefor/plugins";
+      NEFOR_RUNTIME_ROOT = "${neforPkgs.nefor-engine}";
+      NEFOR_EXECUTABLE_ROOT = "${cfg.package}/share/nefor/plugins";
     };
 
     xdg.configFile."nefor" = lib.mkIf cfg.starter.enable {
-      source = neforPkgs.nefor-starter;
+      source = neforPkgs.nefor-agent;
       recursive = true;
     };
   };

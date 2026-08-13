@@ -35,7 +35,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 ## Path resolution
 
-`nefor` resolves directories via XDG-style env vars, with CLI flags taking highest precedence:
+`nefor` resolves config and writable data directories via XDG-style env vars, with CLI flags taking highest precedence. Plugin commands and immutable runtime source are selected by Lua/distribution helpers:
 
 | Env var              | CLI flag       | Default                    | Holds                                                                                                        |
 | -------------------- | -------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -44,7 +44,6 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 | `NEFOR_CONFIG_DIR`   | `--config`     | `$XDG_CONFIG_HOME/nefor`   | `init.lua`                                                                                                   |
 | `NEFOR_DATA_DIR`     | `--data-dir`   | `$XDG_DATA_HOME/nefor`     | writable runtime data other than sessions                                                                    |
 | `NEFOR_SESSIONS_DIR` | —              | `$NEFOR_DATA_DIR/sessions` | session event logs and MAG trees                                                       |
-| `NEFOR_PLUGIN_DIR`   | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins`  | binaries                                                                                                     |
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 

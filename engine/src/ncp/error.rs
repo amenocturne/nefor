@@ -1,12 +1,10 @@
 //! Broker-internal error types.
 
-use std::path::PathBuf;
-
 /// Errors produced by the NCP broker.
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
     /// Spawning the plugin subprocess failed before we could observe a line
-    /// of input (exec not found, permission denied, cwd missing).
+    /// of input (exec not found or permission denied).
     #[error("failed to spawn plugin {name:?} (command {command:?}): {source}")]
     Spawn {
         /// Plugin name (from spawn config).
@@ -16,22 +14,6 @@ pub enum BrokerError {
         /// Underlying IO error.
         #[source]
         source: std::io::Error,
-    },
-
-    /// The plugin's working directory does not exist. The runner expects
-    /// `<plugin-root>/<name>/` to be present; directory creation is a
-    /// plugin-manager concern, not the engine's.
-    ///
-    /// Not currently constructed — the runner no longer validates cwd
-    /// existence. Retained for the exhaustive match in `main.rs`'s
-    /// spawn-error handler and potential future use.
-    #[allow(dead_code)]
-    #[error("plugin {name:?} working directory {cwd:?} does not exist")]
-    MissingPluginDir {
-        /// Plugin name.
-        name: String,
-        /// The resolved cwd path.
-        cwd: PathBuf,
     },
 
     /// Generic IO failure not attributable to a single connection.

@@ -31,7 +31,7 @@ The starter's `config/init.lua` returns `{ active = ... }`. A practical customiz
 local M = {}
 
 M.bin = function(name)
-  local root = assert(os.getenv("NEFOR_PLUGIN_DIR"), "NEFOR_PLUGIN_DIR is required")
+  local root = assert(os.getenv("NEFOR_EXECUTABLE_ROOT"), "NEFOR_EXECUTABLE_ROOT is required")
   return root .. "/" .. name
 end
 

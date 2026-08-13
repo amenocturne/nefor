@@ -8,7 +8,6 @@ run:
     export RUST_LOG=debug
     export NEFOR_DEV_DIR="{{justfile_directory()}}"
     export NEFOR_CONFIG_DIR="{{justfile_directory()}}/examples/nefor-agent"
-    export NEFOR_PLUGIN_DIR="{{justfile_directory()}}/target/debug"
     cargo run --bin nefor
 
 # Fetch all workspace dependencies without compiling — warms the cache.
@@ -277,6 +276,8 @@ install-nefor channel="source":
       install -m 0755 "$tmp/nefor-${target}/bin/mag" "$PREFIX/bin/mag"
       echo "  $PREFIX/bin/nefor"
       echo "  $PREFIX/bin/mag"
+      rm -rf "$LIBEXEC_ROOT/runtime"
+      cp -R "$tmp/nefor-${target}/share/nefor/runtime" "$LIBEXEC_ROOT/runtime"
       local installed=""
       for bin in "$tmp/nefor-${target}/share/nefor/plugins/"*; do
         install -m 0755 "$bin" "$LIBEXEC_BIN/$(basename "$bin")"
@@ -298,6 +299,9 @@ install-nefor channel="source":
         # Derive runtime plugins from packages physically under plugins/.
         # Target names, not crate directories, are authoritative: the MAG
         # runtime directory is `mag`, while its binary is `mag-plugin`.
+        rm -rf "$LIBEXEC_ROOT/runtime"
+        mkdir -p "$LIBEXEC_ROOT/runtime"
+        cp -R lua plugins examples "$LIBEXEC_ROOT/runtime/"
         plugins=$(tools/plugin-binaries.sh)
         for name in $plugins; do
           install -m 0755 "target/release/$name" "$LIBEXEC_BIN/$name"
