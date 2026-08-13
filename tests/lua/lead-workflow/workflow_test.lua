@@ -7,6 +7,12 @@ local lw   = require("libs.lead-workflow")
 local json = nefor.json
 local agentic_loop = require("libs.agentic-loop")
 local sessions = require("libs.sessions")
+local sessions_root = nefor.fs.data_root() .. "/sessions"
+sessions.configure { root = sessions_root }
+require("libs.mag-workspace").configure {
+  library_dir = "examples/nefor-agent/mag/lib",
+  sessions_root = sessions_root,
+}
 
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then
