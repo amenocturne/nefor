@@ -42,6 +42,11 @@ local ncp            = require("core.ncp")
 local actor          = require("core.actor")
 local replay_window = require("core.replay_window")
 local sessions       = require("libs.sessions")
+local sessions_root = os.getenv("NEFOR_SESSIONS_DIR")
+if sessions_root == nil or sessions_root == "" then
+  sessions_root = nefor.fs.data_root() .. "/sessions"
+end
+sessions.configure { root = sessions_root }
 local cfg            = require("config").active
 local lead_role      = require("libs.lead-workflow.role")
 
@@ -54,6 +59,10 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
+require("libs.mag-workspace").configure {
+  library_dir = STARTER_ROOT .. "/mag/lib",
+  sessions_root = sessions_root,
+}
 -- Defense-in-depth fallback for the synchronous `replay_window.set`
 -- path that sessions drives around its replay burst. Wired explicitly
 -- here so module load stays free of bus dependencies.

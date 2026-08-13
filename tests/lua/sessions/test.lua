@@ -30,7 +30,6 @@ return {
 
   -- Helpers exposed for direct unit-testing.
   _uuid_v4   = i.uuid_v4,
-  -- The sessions-root resolver delegates to nefor.fs.sessions_root(); tests
-  -- override the binding to drive different roots.
-  _sessions_root = i.compute_sessions_root,
+  -- The root is selected by composition and injected through configure.
+  _sessions_root = i.current_sessions_root,
 }

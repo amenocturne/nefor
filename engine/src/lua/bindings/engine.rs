@@ -5,7 +5,7 @@
 //!
 //! * [`send`](EngineOps::send) — **emission**. The Lua caller is publishing
 //!   a new envelope onto the bus. The broker stamps it as `Origin::Step`,
-//!   appends a [`LogEntry`](crate::session::LogEntry), and writes the line
+//!   appends a [`LogEntry`](crate::event_log::LogEntry), and writes the line
 //!   to the target peer (broadcast = every connected peer). One emission,
 //!   one log entry. Lua exposes this as `nefor.engine.send(payload, target?)`.
 //! * [`deliver`](EngineOps::deliver) — **delivery**. The Lua caller is

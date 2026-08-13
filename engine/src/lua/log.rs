@@ -1,4 +1,4 @@
-//! Lua-table conversion for `session::LogEntry`.
+//! Lua-table conversion for `event_log::LogEntry`.
 //!
 //! The step function in `init.lua` takes a single array of entries — the
 //! current log (everything routed through the broker this run). Each entry
@@ -15,7 +15,7 @@
 
 use mlua::{Lua, Table, Value};
 
-use crate::session::{LogEntry, Origin};
+use crate::event_log::{LogEntry, Origin};
 
 /// Convert a single [`LogEntry`] to a Lua table with the canonical field
 /// layout described in the module doc.

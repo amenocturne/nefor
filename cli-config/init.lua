@@ -74,6 +74,11 @@ pm.install({
 local ncp      = require("core.ncp")
 local actor    = require("core.actor")
 local sessions = require("libs.sessions")
+local sessions_root = os.getenv("NEFOR_SESSIONS_DIR")
+if sessions_root == nil or sessions_root == "" then
+  sessions_root = nefor.fs.data_root() .. "/sessions"
+end
+sessions.configure { root = sessions_root }
 local cfg      = require("config").active
 
 function dispatch(current_log)
@@ -88,7 +93,10 @@ actor.install()
 
 -- The CLI config lives beside starter rather than containing its own MAG
 -- library tree. Seed session workspaces from the shared starter library.
-require("libs.mag-workspace").configure { library_dir = STARTER_ROOT .. "/mag/lib" }
+require("libs.mag-workspace").configure {
+  library_dir = STARTER_ROOT .. "/mag/lib",
+  sessions_root = sessions_root,
+}
 
 actor.spawn(sessions)
 local conversation_service = require("libs.conversation-manager.service").new()

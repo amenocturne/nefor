@@ -1,15 +1,8 @@
-//! In-memory log-entry types passed between the broker and the Lua VM.
+//! In-memory event-entry types passed between the broker and Lua.
 //!
-//! Post-session-blind refactor the engine no longer persists anything to
-//! disk. The broker stamps every inbound and outbound envelope into a
-//! [`LogEntry`] and hands it to the Lua dispatch hook (and to bus
-//! subscribers); persistence to a per-session jsonl file lives entirely in
-//! `lua/libs/sessions`. The module name `session` is a historical
-//! artefact — the types here aren't session-scoped, they're just the
-//! engine's log-line shape.
-//!
-//! Kept separate from `nefor-protocol`'s envelope types because the broker
-//! deliberately does not parse envelope bodies: `payload` is a raw line.
+//! The broker stamps inbound and outbound lines without interpreting payloads.
+//! These generic entries feed dispatch and bus subscribers; storage policy lives
+//! entirely outside the engine.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;

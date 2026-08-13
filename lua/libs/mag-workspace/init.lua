@@ -14,10 +14,12 @@
 
 local M = {}
 local configured_library_dir = nil
+local configured_sessions_root = nil
 
 function M.configure(options)
   options = options or {}
   configured_library_dir = options.library_dir
+  configured_sessions_root = options.sessions_root or configured_sessions_root
 end
 
 local function sh_quote(value)
@@ -25,19 +27,7 @@ local function sh_quote(value)
 end
 
 local function sessions_root()
-  if nefor and nefor.fs and type(nefor.fs.sessions_root) == "function" then
-    local ok, root = pcall(nefor.fs.sessions_root)
-    if ok and type(root) == "string" and root ~= "" then return root end
-  end
-  local override = os.getenv("NEFOR_SESSIONS_DIR")
-  if override ~= nil and override ~= "" then return override end
-  local data_override = os.getenv("NEFOR_DATA_DIR")
-  if data_override ~= nil and data_override ~= "" then return data_override .. "/sessions" end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor/sessions" end
-  local home = os.getenv("HOME") or ""
-  if home == "" then return nil end
-  return home .. "/.local/share/nefor/sessions"
+  return configured_sessions_root
 end
 
 local function mkdir_p(path)

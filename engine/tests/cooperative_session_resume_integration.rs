@@ -154,6 +154,7 @@ fn engine_init_source(root: &Path) -> String {
         local actor = require("core.actor")
         local replay_window = require("core.replay_window")
         local sessions = require("libs.sessions")
+        sessions.configure {{ root = nefor.fs.data_root() .. "/sessions" }}
 
         function dispatch(current_log) ncp.dispatch(current_log) end
         function invoke_from_plugin(source, payload)
@@ -272,12 +273,11 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
-    let mut host = LuaHost::new_with_sessions_root(
+    let mut host = LuaHost::new(
         bus,
         plugins,
         ops,
         DataDir::new(data_dir.path().to_path_buf()),
-        None,
     )
     .expect("create real engine LuaHost");
     host.exec_str("cooperative-resume-init.lua", &engine_init_source(&root))
@@ -560,12 +560,11 @@ fn switching_sessions_between_chunks_cancels_the_stale_replay() {
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(shared));
-    let host = LuaHost::new_with_sessions_root(
+    let host = LuaHost::new(
         bus,
         plugins,
         ops,
         DataDir::new(data_dir.path().to_path_buf()),
-        None,
     )
     .expect("create real engine LuaHost");
     host.exec_str(

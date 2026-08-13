@@ -37,10 +37,8 @@
 --
 -- ## On-disk path
 --
--- Resolved once at module load from `nefor.fs.sessions_root()` — the
--- engine's canonical resolved session directory (`NEFOR_SESSIONS_DIR`,
--- otherwise `<data-root>/sessions`).
--- Path: `<sessions-root>/<id>.jsonl`. Parent dir is created on init.
+-- The composition supplies the selected root through `configure` before
+-- initialization. Path: `<sessions-root>/<id>.jsonl`.
 
 local json = nefor.json
 local replay_window = require("core.replay_window")
@@ -52,7 +50,6 @@ local state = {
   current_session_path = nil,
   ---@type file*|nil
   current_session_file = nil,
-  current_session_lease = nil,
 
   -- True when the active session has nothing worth keeping; flipped
   -- false when a real user submit is persisted. Startup-only sessions
@@ -76,17 +73,25 @@ local state = {
   replay_session_id = nil,
 }
 
----@return string|nil
-local function compute_sessions_root()
-  return nefor.fs.sessions_root()
+local sessions_dir = nil
+
+local function configure(options)
+  options = options or {}
+  local root = options.root
+  if type(root) ~= "string" or root == "" then
+    error("sessions.configure: root must be a non-empty string")
+  end
+  sessions_dir = root
 end
 
-local SESSIONS_DIR = compute_sessions_root()
+local function current_sessions_root()
+  return sessions_dir
+end
 
 ---@param id string
 ---@return string|nil
 local function session_path_for(id)
-  return SESSIONS_DIR and (SESSIONS_DIR .. "/" .. id .. ".jsonl") or nil
+  return sessions_dir and (sessions_dir .. "/" .. id .. ".jsonl") or nil
 end
 
 ---@param path string
@@ -160,11 +165,10 @@ local function close_and_prune_if_empty()
   if state.should_prune_session and state.current_session_path then
     pcall(os.remove, state.current_session_path)
     local id = state.current_session_id
-    if id and SESSIONS_DIR then
-      pcall(nefor.fs.remove_dir_all, SESSIONS_DIR .. "/" .. id)
+    if id and sessions_dir then
+      pcall(nefor.fs.remove_dir_all, sessions_dir .. "/" .. id)
     end
   end
-  state.current_session_lease = nil
   state.should_prune_session = true
 end
 
@@ -180,7 +184,7 @@ end
 local function ensure_current_session_file()
   if state.current_session_file then return state.current_session_file end
   if not state.current_session_path then return nil end
-  if SESSIONS_DIR then ensure_dir(SESSIONS_DIR) end
+  if sessions_dir then ensure_dir(sessions_dir) end
   local fh, err, had_content =
       open_session_file(state.current_session_path, state.current_session_id)
   if not fh then
@@ -399,16 +403,30 @@ local function begin_replay(path, session_id, request_id, report_progress, gener
   nefor.engine.defer(step)
 end
 
+local function valid_session_id(id)
+  return type(id) == "string" and id ~= "" and id ~= "." and id ~= ".."
+    and not id:find("/", 1, true) and not id:find("\\", 1, true)
+end
+
 local function acquire_session(action, session_id)
-  local result = nefor.fs[action](session_id)
-  if not result or not result.ok then
-    local message = result and result.error or "unknown error"
-    if nefor.log then nefor.log.error("sessions: failed to acquire session", {
-      session_id = session_id, error = message,
-    }) end
-    return nil, message
+  if not valid_session_id(session_id) then
+    return nil, string.format("invalid session id %q", tostring(session_id))
   end
-  return result
+  if not sessions_dir then return nil, "session root is not configured" end
+  local path = session_path_for(session_id)
+  if action == "resume" then
+    if not session_file_exists(path) then
+      return nil, string.format("session '%s' does not exist", session_id)
+    end
+  elseif action == "create" then
+    if nefor.fs.exists(path) or nefor.fs.exists(sessions_dir .. "/" .. session_id) then
+      return nil, string.format("session '%s' already exists", session_id)
+    end
+    ensure_dir(sessions_dir)
+  else
+    return nil, "unknown session operation"
+  end
+  return { ok = true, path = path }
 end
 
 local function transition_failed(operation, request_id, session_id, message)
@@ -427,23 +445,19 @@ local function do_resume(target_session_id, show_loading, request_id)
   if show_loading == nil then show_loading = true end
 
   local acquired
-  if state.current_session_id == target_session_id and state.current_session_lease then
-    acquired = {
-      ok = true,
-      path = state.current_session_path,
-      lease = state.current_session_lease,
-    }
+  if state.current_session_id == target_session_id and state.current_session_path then
+    acquired = { ok = true, path = state.current_session_path }
   else
     local error_message
-    acquired, error_message = acquire_session("session_resume", target_session_id)
+    acquired, error_message = acquire_session("resume", target_session_id)
     if not acquired then
       transition_failed("resume", request_id, target_session_id, error_message)
       return nil
     end
   end
 
-  -- Opening is part of activation. Do it while the target lease is held and
-  -- before touching the current session or its lifecycle events.
+  -- Opening is part of activation. Do it before touching the current session
+  -- or emitting its lifecycle events.
   if not session_file_exists(acquired.path) then
     local message = "session file disappeared before activation"
     if nefor.log then nefor.log.error("sessions.resume: " .. message, {
@@ -469,7 +483,6 @@ local function do_resume(target_session_id, show_loading, request_id)
   state.current_session_id = target_session_id
   state.current_session_path = acquired.path
   state.current_session_file = fh
-  state.current_session_lease = acquired.lease
   state.should_prune_session = not had_content
 
   send_msg({ kind = "control", event = "sessions.session_start",
@@ -492,7 +505,7 @@ end
 
 local function do_new(request_id)
   local id = uuid_v4()
-  local acquired, error_message = acquire_session("session_create", id)
+  local acquired, error_message = acquire_session("create", id)
   if not acquired then
     transition_failed("new", request_id, nil, error_message)
     return nil
@@ -504,7 +517,6 @@ local function do_new(request_id)
   close_and_prune_if_empty()
   state.current_session_id = id
   state.current_session_path = acquired.path
-  state.current_session_lease = acquired.lease
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = id, request_id = request_id } })
   return id
@@ -538,14 +550,13 @@ local function do_init(resume_id)
   end
 
   local id = uuid_v4()
-  local acquired = acquire_session("session_create", id)
+  local acquired = acquire_session("create", id)
   if not acquired then
     state.initialised = false
     return nil
   end
   state.current_session_id = id
   state.current_session_path = acquired.path
-  state.current_session_lease = acquired.lease
   state.current_session_file = nil
   state.should_prune_session = true
   send_msg({ kind = "control", event = "sessions.session_start", extra = { session_id = id } })
@@ -614,6 +625,7 @@ return {
   send_msg    = send_msg,
 
   -- public Lua API
+  configure        = configure,
   init             = do_init,
   resume           = do_resume,
   new              = do_new,
@@ -633,12 +645,11 @@ return {
     do_new             = do_new,
     do_shutdown        = do_shutdown,
     uuid_v4            = uuid_v4,
-    compute_sessions_root = compute_sessions_root,
+    current_sessions_root = current_sessions_root,
     reset_state        = function()
       close_session_file()
       state.current_session_id    = nil
       state.current_session_path  = nil
-      state.current_session_lease = nil
       state.should_prune_session  = true
       state.initialised           = false
       state.in_replay_window      = false

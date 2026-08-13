@@ -46,6 +46,7 @@ fn jsonl_excludes_session_control_events() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -193,6 +194,7 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -333,6 +335,7 @@ fn resume_emits_lifecycle_markers_in_order() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
 
@@ -395,6 +398,7 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
         lua.load(
             r#"
             sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
             sessions_test = require("sessions.test")
             sessions.init()
             "#,
@@ -426,6 +430,7 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
         lua.load(
             r#"
             sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
             sessions_test = require("sessions.test")
             sessions.init()
             local json = nefor.json
@@ -481,6 +486,7 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -566,6 +572,7 @@ fn resume_to_existing_session_appends_in_order() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         "#,
@@ -664,6 +671,7 @@ fn resume_to_self_replays_log_so_chat_repaints() {
             end
         end
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
 
@@ -735,6 +743,7 @@ fn failed_resume_retains_current_session() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions.init()
         _before_id = sessions.current_id()
         _before_path = sessions.current_path()
@@ -788,6 +797,7 @@ fn init_with_resume_id_cold_starts_without_session_end() {
             return original_send(payload, target)
         end
         sessions = require("libs.sessions")
+        sessions.configure {{ root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }}
         sessions.init("{target_id}")
         "#
     );
@@ -844,6 +854,7 @@ fn new_then_new_prunes_each_empty_predecessor() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         sessions_test._on_new_request(nil)  -- /new #1
@@ -897,12 +908,11 @@ fn failed_new_preserves_current_identity_and_emits_correlated_failure() {
         _sent = {}
         nefor.engine.send = function(payload) table.insert(_sent, payload) end
         local sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions.init()
         _sent = {}
         _original_id = sessions.current_id()
-        nefor.fs.session_create = function(_)
-          return { ok = false, error = "fixture create failure" }
-        end
+        nefor.fs.exists = function(_) return true end
         sessions.receive_msg({ payload = json.encode({ body = {
           kind = "sessions.new_request", request_id = "request-7",
         } }) })
@@ -923,10 +933,10 @@ fn failed_new_preserves_current_identity_and_emits_correlated_failure() {
                 decoded.pointer("/body/request_id").and_then(|v| v.as_str()),
                 Some("request-7")
             );
-            assert_eq!(
-                decoded.pointer("/body/message").and_then(|v| v.as_str()),
-                Some("fixture create failure")
-            );
+            assert!(decoded
+                .pointer("/body/message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|message| message.contains("already exists")));
             found = true;
         }
     }
@@ -955,6 +965,7 @@ fn new_after_submit_preserves_prior_session() {
     lua.load(
         r#"
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         local json = nefor.json
@@ -1041,6 +1052,7 @@ fn replay_window_frames_resume_and_skips_persistence_inside() {
             end
         end
         sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions_test = require("sessions.test")
         sessions.init()
         _emits = {}
@@ -1190,6 +1202,7 @@ fn resume_sets_global_replay_window_during_replay_burst() {
             end
         end
         sessions = require("libs.sessions")
+        sessions.configure {{ root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }}
         sessions.init()
         _active_trace = {{}}
         sessions.resume("{target_id}")
@@ -1276,6 +1289,7 @@ fn large_resume_replays_complete_burst_without_progress_workaround() {
             end
         end
         sessions = require("libs.sessions")
+        sessions.configure {{ root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }}
         sessions.init()
         sessions.resume("{target_id}")
         "#
@@ -1347,6 +1361,7 @@ fn resume_skips_malformed_and_non_object_jsonl_rows() {
             end
         end
         sessions = require("libs.sessions")
+        sessions.configure {{ root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }}
         sessions.init()
         _seen = {{}}
         sessions.resume("{target_id}")
@@ -1417,6 +1432,7 @@ fn session_switch_cancels_stale_replay_before_new_window() {
           end
         end
         local sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions.init()
         sessions.resume("66666666-2222-4333-8444-555555555555")
         sessions.resume("55555555-2222-4333-8444-555555555555")
@@ -1488,6 +1504,7 @@ fn cooperative_resume_exposes_numeric_byte_progress_before_completion() {
           end
         end
         local sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions.init()
         sessions.resume("77777777-2222-4333-8444-555555555555")
         assert(_progress == nil and not _done)
@@ -1553,6 +1570,7 @@ fn resume_progress_is_monotonic_and_bounded() {
           end
         end
         local sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         sessions.init()
         _trace = {}
         sessions.resume("11111111-2222-4333-8444-555555555555")
@@ -1596,6 +1614,7 @@ fn failed_resume_preserves_current_identity_and_writable_history() {
     lua.load(
         r#"
         local sessions = require("libs.sessions")
+        sessions.configure { root = os.getenv("NEFOR_DATA_DIR") .. "/sessions" }
         local sessions_test = require("sessions.test")
         sessions.init()
         local json = nefor.json
@@ -1651,54 +1670,6 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-test-data"));
     nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir.clone()))?;
-    // Most legacy session tests isolate Lua behavior from the Rust provenance
-    // boundary. Focused binding/store tests exercise locking and metadata.
-    let fs: Table = nefor.get("fs")?;
-    let create_root = data_dir.clone();
-    std::fs::create_dir_all(create_root.join("sessions"))?;
-    fs.set(
-        "session_create",
-        lua.create_function(move |lua, id: String| {
-            let result = lua.create_table()?;
-            result.set("ok", true)?;
-            result.set(
-                "path",
-                create_root
-                    .join("sessions")
-                    .join(format!("{id}.jsonl"))
-                    .to_string_lossy()
-                    .into_owned(),
-            )?;
-            result.set("lease", true)?;
-            Ok(result)
-        })?,
-    )?;
-    fs.set(
-        "session_commit_resume",
-        lua.create_function(|lua, _: Value| {
-            let result = lua.create_table()?;
-            result.set("ok", true)?;
-            Ok(result)
-        })?,
-    )?;
-    let resume_root = data_dir;
-    fs.set(
-        "session_resume",
-        lua.create_function(move |lua, id: String| {
-            let result = lua.create_table()?;
-            result.set("ok", true)?;
-            result.set(
-                "path",
-                resume_root
-                    .join("sessions")
-                    .join(format!("{id}.jsonl"))
-                    .to_string_lossy()
-                    .into_owned(),
-            )?;
-            result.set("lease", true)?;
-            Ok(result)
-        })?,
-    )?;
 
     // log.* — no-op
     let log_tbl = lua.create_table()?;

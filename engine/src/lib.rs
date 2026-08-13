@@ -8,10 +8,8 @@
 //! private. `paths` is exposed so test harnesses can build the
 //! `DataDir` newtype that `LuaHost::new` requires.
 
+pub mod event_log;
 pub mod events;
 pub mod lua;
 pub mod ncp;
 pub mod paths;
-pub mod session;
-
-pub mod session_store;

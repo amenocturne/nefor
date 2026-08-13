@@ -28,13 +28,12 @@
 mod cli;
 mod config;
 mod error;
+mod event_log;
 mod events;
 mod log;
 mod lua;
 mod ncp;
 mod paths;
-mod session;
-mod session_store;
 
 use std::sync::{Arc, Mutex};
 

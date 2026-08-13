@@ -19,15 +19,7 @@ use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 
-use mlua::{AnyUserData, Lua, Table, UserData};
-
-use crate::session_store;
-
-struct LuaSessionHandle {
-    #[allow(dead_code)]
-    handle: session_store::SessionHandle,
-}
-impl UserData for LuaSessionHandle {}
+use mlua::{Lua, Table};
 
 use crate::paths::DataDir;
 
@@ -41,15 +33,6 @@ use crate::paths::DataDir;
 /// the Rust resolver doesn't know about).
 #[allow(dead_code)]
 pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Result<()> {
-    install_fs_with_sessions_root(lua, nefor_tbl, data_dir, None)
-}
-
-pub(crate) fn install_fs_with_sessions_root(
-    lua: &Lua,
-    nefor_tbl: &Table,
-    data_dir: DataDir,
-    configured_sessions_root: Option<std::ffi::OsString>,
-) -> mlua::Result<()> {
     let fs_tbl = lua.create_table()?;
 
     let data_root: PathBuf = data_dir.as_path().to_path_buf();
@@ -57,31 +40,6 @@ pub(crate) fn install_fs_with_sessions_root(
     fs_tbl.set(
         "data_root",
         lua.create_function(move |_, _: ()| Ok(data_root_string.clone()))?,
-    )?;
-
-    let session_root = resolve_session_root(&data_root, configured_sessions_root);
-    let session_root_string = session_root.to_string_lossy().into_owned();
-    fs_tbl.set(
-        "sessions_root",
-        lua.create_function(move |_, _: ()| Ok(session_root_string.clone()))?,
-    )?;
-
-    let create_session_root = session_root.clone();
-    fs_tbl.set(
-        "session_create",
-        lua.create_function(move |lua, id: String| {
-            session_result(
-                lua,
-                session_store::create_session(&create_session_root, &id),
-            )
-        })?,
-    )?;
-
-    fs_tbl.set(
-        "session_resume",
-        lua.create_function(move |lua, id: String| {
-            session_result(lua, session_store::resume_session(&session_root, &id))
-        })?,
     )?;
 
     fs_tbl.set(
@@ -231,12 +189,6 @@ pub(crate) fn install_fs_with_sessions_root(
     Ok(())
 }
 
-fn resolve_session_root(data_root: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
-    configured
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_root.join("sessions"))
-}
-
 fn ok_or_err(lua: &Lua, result: std::io::Result<()>) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     match result {
@@ -251,27 +203,6 @@ fn ok_or_err(lua: &Lua, result: std::io::Result<()>) -> mlua::Result<Table> {
     Ok(t)
 }
 
-fn session_result(
-    lua: &Lua,
-    result: Result<session_store::SessionHandle, session_store::SessionStoreError>,
-) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    match result {
-        Ok(lease) => {
-            let path = lease.events_path().to_string_lossy().into_owned();
-            let userdata: AnyUserData = lua.create_userdata(LuaSessionHandle { handle: lease })?;
-            table.set("ok", true)?;
-            table.set("path", path)?;
-            table.set("lease", userdata)?;
-        }
-        Err(error) => {
-            table.set("ok", false)?;
-            table.set("error", error.to_string())?;
-        }
-    }
-    Ok(table)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +214,7 @@ mod tests {
     fn setup_with_data_dir(data_dir: PathBuf) -> Lua {
         let lua = Lua::new();
         let nefor = lua.create_table().unwrap();
-        install_fs_with_sessions_root(&lua, &nefor, DataDir::new(data_dir), None).unwrap();
+        install_fs(&lua, &nefor, DataDir::new(data_dir)).unwrap();
         lua.globals().set("nefor", nefor).unwrap();
         lua
     }
@@ -293,26 +224,6 @@ mod tests {
         let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
         let got: String = lua.load("return nefor.fs.data_root()").eval().unwrap();
         assert_eq!(got, "/some/explicit/data");
-    }
-
-    #[test]
-    fn sessions_root_defaults_below_engine_resolved_data_path() {
-        let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
-        let got: String = lua.load("return nefor.fs.sessions_root()").eval().unwrap();
-        assert_eq!(got, "/some/explicit/data/sessions");
-    }
-
-    #[test]
-    fn session_root_defaults_below_data_root_and_accepts_an_explicit_directory() {
-        let data_root = Path::new("/some/data");
-        assert_eq!(
-            resolve_session_root(data_root, None),
-            PathBuf::from("/some/data/sessions")
-        );
-        assert_eq!(
-            resolve_session_root(data_root, Some("/shared/sessions".into())),
-            PathBuf::from("/shared/sessions")
-        );
     }
 
     #[test]

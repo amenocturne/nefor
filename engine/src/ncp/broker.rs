@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use nefor_protocol::{PluginName, Timestamp};
 use tokio::sync::mpsc;
 
+use crate::event_log::{LogEntry, Origin};
 use crate::events::{EventBus, EventName, EventPayload, SHUTDOWN};
 use crate::lua::bindings::{EngineOps, SendTarget};
 use crate::lua::LuaHost;
@@ -43,7 +44,6 @@ use crate::ncp::connection::{
     ConnectionOutbound, ReaderEnd, DEFAULT_QUEUE_CAPACITY,
 };
 use crate::ncp::transport::{ExitOutcome, Transport};
-use crate::session::{LogEntry, Origin};
 
 /// Default shutdown grace — see §5.3. The broker still accepts an override
 /// at `shutdown` time for operator flexibility.
