@@ -50,8 +50,8 @@ fn set_registry_path(lua: &Lua, path: &Path) -> Result<(), MagError> {
     let patterns = [
         directory.join("?.lua"),
         directory.join("?/init.lua"),
-        directory.join("../../../lua/?.lua"),
-        directory.join("../../../lua/?/init.lua"),
+        directory.join("../../../../lua/?.lua"),
+        directory.join("../../../../lua/?/init.lua"),
     ];
     let package: Table = lua
         .globals()
@@ -104,4 +104,27 @@ fn install_registry_host(lua: &Lua) -> Result<(), MagError> {
         .set("nefor", nefor)
         .map_err(|error| MagError::Eval(format!("install registry host: {error}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::load_registry_contracts;
+
+    #[test]
+    fn loads_shipped_kernel_registry_with_shared_lua_modules() {
+        let registry = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/mag/lua/mag-kernel/init.lua");
+
+        let contracts = load_registry_contracts(&registry)
+            .expect("shipped kernel registry should resolve the shared Lua tree");
+
+        assert!(
+            contracts
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty()),
+            "shipped kernel registry should export foreign contracts"
+        );
+    }
 }
