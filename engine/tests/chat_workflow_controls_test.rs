@@ -137,6 +137,11 @@ fn queued_input_ownership_laws() {
 }
 
 #[test]
+fn context_usage_projection_contract() {
+    run_pure_chat_fixture("context_usage_test.lua");
+}
+
+#[test]
 fn conversation_projection_surface_contract() {
     let lua = Lua::new();
     let root = repo_root();

@@ -51,7 +51,12 @@
 //!     { "id": "<call-id>", "name": "<tool-name>", "arguments": <any-json> }
 //!   ],
 //!   "finish_reason"?: "stop" | "tool_calls" | "length" | "content_filter",
-//!   "usage"?: { "prompt_tokens": ..., "completion_tokens": ..., "model": "..." }
+//!   "usage"?: {
+//!     "prompt_tokens": ...,       // aggregate operation input
+//!     "completion_tokens": ...,   // aggregate operation output
+//!     "context_input_tokens"?: ..., // final request's input/context occupancy
+//!     "model": "..."
+//!   }
 //! }
 //!
 //! // generic-provider.ChatHistory

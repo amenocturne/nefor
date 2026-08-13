@@ -565,7 +565,8 @@ do
   local instance, msgs, facts = make("observed-usage.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   instance.handle_observation({ binding = "conversation", value = {
-    kind = "usage", prompt_tokens = 80, completion_tokens = 7,
+    kind = "usage", prompt_tokens = 290, completion_tokens = 22,
+    context_input_tokens = 105,
     model = "observed-model", duration_ms = 50,
   } })
   instance.deliver({
@@ -576,10 +577,12 @@ do
 
   local terminal = facts[#facts]
   assert_eq(terminal.kind, "turn_completed", "observed usage reaches the terminal fact")
-  assert_eq(terminal.detail.usage.input_tokens, 80,
-    "provider prompt usage is normalized for the context-used projection")
-  assert_eq(terminal.detail.usage.output_tokens, 7,
-    "provider completion usage is normalized with the input count")
+  assert_eq(terminal.detail.usage.input_tokens, 290,
+    "aggregate provider prompt usage is preserved for operation statistics")
+  assert_eq(terminal.detail.usage.output_tokens, 22,
+    "aggregate provider completion usage is preserved with the input count")
+  assert_eq(terminal.detail.usage.context_input_tokens, 105,
+    "final-request context usage crosses the MAG provider boundary unchanged")
   assert_eq(terminal.detail.model, "observed-model", "usage observation preserves the model")
 end
 

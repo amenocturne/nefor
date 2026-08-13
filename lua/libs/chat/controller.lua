@@ -14,6 +14,7 @@ local transcript   = require("libs.chat.transcript")
 local conversation_projection = require("libs.chat.conversation_projection")
 local popups       = require("libs.chat.popups")
 local usage_view   = require("libs.chat.usage")
+local context_usage = require("libs.chat.context_usage")
 local Entry        = require("libs.chat.entry")
 local log          = require("libs.chat.log")
 local tool_display = require("libs.chat.tool_display")
@@ -1559,7 +1560,7 @@ local function apply_conversation_action(state, item)
       stats = stats,
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
-      current_context_tokens = usage.input_tokens or usage.prompt_tokens,
+      current_context_tokens = context_usage.current_input_tokens(usage),
     }
     if terminal.model ~= nil then
       patch.model = terminal.model

@@ -2526,6 +2526,46 @@ fn parsed_token_usage(response: &Value) -> Option<(u64, u64)> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    context_input_tokens: u64,
+}
+
+impl OperationUsage {
+    fn record_iteration(current: Option<Self>, input_tokens: u64, output_tokens: u64) -> Self {
+        let (prior_input, prior_output) = current
+            .map(|usage| (usage.input_tokens, usage.output_tokens))
+            .unwrap_or_default();
+        Self {
+            input_tokens: prior_input.saturating_add(input_tokens),
+            output_tokens: prior_output.saturating_add(output_tokens),
+            context_input_tokens: input_tokens,
+        }
+    }
+
+    fn totals(self) -> (u64, u64) {
+        (self.input_tokens, self.output_tokens)
+    }
+
+    fn completion_fields(self, model: &str, duration_ms: u64) -> [(&'static str, Value); 5] {
+        [
+            ("prompt_tokens", Value::Number(self.input_tokens.into())),
+            (
+                "completion_tokens",
+                Value::Number(self.output_tokens.into()),
+            ),
+            (
+                "context_input_tokens",
+                Value::Number(self.context_input_tokens.into()),
+            ),
+            ("model", Value::String(model.to_owned())),
+            ("duration_ms", Value::Number(duration_ms.into())),
+        ]
+    }
+}
+
 fn usage_to_record(interrupted: bool, total_usage: Option<(u64, u64)>) -> Option<(u64, u64)> {
     if interrupted {
         total_usage
@@ -2618,7 +2658,7 @@ fn spawn_turn(
         let mut final_tool_calls: Vec<ToolCall> = Vec::new();
         let mut interrupted = false;
         let mut errored = false;
-        let mut total_usage: Option<(u64, u64)> = None;
+        let mut operation_usage: Option<OperationUsage> = None;
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
         let mut pre_output_retry_started: Option<Instant> = None;
@@ -2932,8 +2972,7 @@ fn spawn_turn(
             let mut reasoning_started_at: Option<std::time::Instant> = None;
             let mut tool_buf = ToolCallBuffer::default();
             let mut iter_finish_reason: Option<String> = None;
-            let mut iter_input_tokens: u64 = 0;
-            let mut iter_output_tokens: u64 = 0;
+            let mut iter_usage: Option<(u64, u64)> = None;
             let mut iter_interrupted = false;
             let mut iter_errored: Option<String> = None;
             let mut iter_retryable_before_output = false;
@@ -3110,11 +3149,7 @@ fn spawn_turn(
                                 ResponseEvent::Completed { response } => {
                                     iter_finish_reason =
                                         response.get("finish_reason").and_then(|v| v.as_str()).map(str::to_owned);
-                                    if let Some((input, output)) = parsed_token_usage(&response) {
-                                        iter_input_tokens = input;
-                                        iter_output_tokens = output;
-                                        total_usage.get_or_insert((0, 0));
-                                    }
+                                    iter_usage = parsed_token_usage(&response);
                                     break;
                                 }
                                 ResponseEvent::Failed { response } => {
@@ -3238,9 +3273,12 @@ fn spawn_turn(
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
-            if let Some((total_input_tokens, total_output_tokens)) = total_usage.as_mut() {
-                *total_input_tokens = total_input_tokens.saturating_add(iter_input_tokens);
-                *total_output_tokens = total_output_tokens.saturating_add(iter_output_tokens);
+            if let Some((input_tokens, output_tokens)) = iter_usage {
+                operation_usage = Some(OperationUsage::record_iteration(
+                    operation_usage,
+                    input_tokens,
+                    output_tokens,
+                ));
             }
 
             if let Some(err_msg) = iter_errored {
@@ -3352,17 +3390,12 @@ fn spawn_turn(
             }
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
-            if let Some((prompt_tokens, completion_tokens)) = total_usage {
+            if let Some(usage) = operation_usage {
                 let body = completion_event_body(
                     &ctx.args,
                     request_id,
                     "usage",
-                    [
-                        ("prompt_tokens", Value::Number(prompt_tokens.into())),
-                        ("completion_tokens", Value::Number(completion_tokens.into())),
-                        ("model", Value::String(active_model.clone())),
-                        ("duration_ms", Value::Number(elapsed_ms.into())),
-                    ],
+                    usage.completion_fields(&active_model, elapsed_ms),
                 );
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
@@ -3427,7 +3460,7 @@ fn spawn_turn(
             .record_turn(
                 &chat_id,
                 Some(&active_model),
-                usage_to_record(interrupted, total_usage),
+                usage_to_record(interrupted, operation_usage.map(OperationUsage::totals)),
                 elapsed_ms,
             )
             .await;
@@ -4235,6 +4268,22 @@ mod tests {
             assert_eq!(stats.last_turn_duration_ms, Some(456));
             assert_eq!(stats.model.as_deref(), Some("gpt-5"));
         }
+    }
+
+    #[test]
+    fn operation_usage_separates_aggregate_cost_from_final_request_context() {
+        let usage = OperationUsage::record_iteration(None, 80, 7);
+        let usage = OperationUsage::record_iteration(Some(usage), 105, 11);
+        let usage = OperationUsage::record_iteration(Some(usage), 105, 4);
+
+        assert_eq!(usage.input_tokens, 290);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.context_input_tokens, 105);
+        assert_eq!(usage.totals(), (290, 22));
+        let fields = usage.completion_fields("gpt-test", 42);
+        assert_eq!(fields[0].1.as_u64(), Some(290));
+        assert_eq!(fields[1].1.as_u64(), Some(22));
+        assert_eq!(fields[2].1.as_u64(), Some(105));
     }
 
     #[test]
