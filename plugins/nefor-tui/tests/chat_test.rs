@@ -3002,6 +3002,51 @@ fn first_canonical_activation_preserves_optimistic_user_message() {
 }
 
 #[test]
+fn resumed_snapshot_renders_structured_first_task_once_before_assistant() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    activate_conversation(&mut engine, "root");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.snapshot", "conversation_id": "root", "found": true,
+            "projection": {
+                "messages": [
+                    { "id": "system", "role": "system", "text": "system prompt" },
+                    { "id": "user", "turn_id": "turn", "role": "user", "text": "",
+                      "display_text": "resumed visible prompt", "structured": [{
+                        "value": { "prompt": "resumed visible prompt" },
+                        "mag_type": { "version": 1, "root": {
+                          "kind": "named", "name": "nefor.contracts.Task"
+                        } }
+                      }] },
+                    { "id": "assistant", "turn_id": "turn", "role": "assistant",
+                      "text": "assistant output", "terminal": {} }
+                ],
+                "exchanges": [],
+                "turns": [{ "id": "turn", "run_id": "run", "status": "completed",
+                  "terminal": { "model": "test" } }]
+            }
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert_eq!(
+        out.matches("resumed visible prompt").count(),
+        1,
+        "replayed structured Task must render exactly once without an optimistic row:\n{out}"
+    );
+    let prompt = out.find("resumed visible prompt").expect("visible prompt");
+    let answer = out.find("assistant output").expect("assistant output");
+    assert!(
+        prompt < answer,
+        "first user prompt must precede assistant output:\n{out}"
+    );
+}
+
+#[test]
 fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     // Regression for the "fully green sidebar until I interact" bug:
     // the wallclock_tick in plugins/nefor-tui/src/main.rs paints

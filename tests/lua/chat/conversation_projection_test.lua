@@ -125,6 +125,54 @@ actions = reduce({
 })
 eq(actions[1].kind, "compaction_completed", "compaction completes without provider artifact")
 
+local function structured_user_actions(chunk_data, completed)
+  local structured = projection.new()
+  structured = select(1, projection.reduce(structured, {
+    kind = "conversation.active.changed", conversation_id = "structured",
+  }))
+  structured = select(1, projection.reduce(structured, {
+    kind = "conversation.projection.delta", conversation_id = "structured",
+    change = { kind = "message_started", message = {
+      id = "structured-user", turn_id = "structured-turn", role = "user",
+    } },
+  }))
+  structured = select(1, projection.reduce(structured, {
+    kind = "conversation.projection.delta", conversation_id = "structured",
+    change = { kind = "content_chunk_appended", message_id = "structured-user",
+      chunk = { kind = "structured", data = chunk_data } },
+  }))
+  local produced
+  structured, produced = projection.reduce(structured, {
+    kind = "conversation.projection.delta", conversation_id = "structured",
+    change = { kind = "message_completed", message = completed },
+  })
+  return produced
+end
+
+local task_data = { value = { prompt = "session-derived prompt" },
+  mag_type = { version = 1, root = {
+    kind = "named", name = "nefor.contracts.Task",
+  } } }
+actions = structured_user_actions(task_data, {
+  id = "structured-user", turn_id = "structured-turn", role = "user", text = "",
+})
+eq(actions[1].text, "session-derived prompt",
+  "live structured Task delta supplies completion display text")
+eq(actions[1].message_id, "structured-user", "live structured display preserves message identity")
+
+actions = structured_user_actions({ value = { prompt = "not a task" },
+  mag_type = { version = 1, root = { kind = "named", name = "Other" } } }, {
+  id = "structured-user", turn_id = "structured-turn", role = "user", text = "",
+})
+eq(actions[1].text, "", "non-Task structured content has no invented transcript serialization")
+actions = structured_user_actions({ value = { prompt = 42 },
+  mag_type = { version = 1, root = {
+    kind = "named", name = "nefor.contracts.Task",
+  } } }, {
+  id = "structured-user", turn_id = "structured-turn", role = "user", text = "",
+})
+eq(actions[1].text, "", "malformed Task structured content stays undisplayed")
+
 local snapshot_state = projection.new()
 snapshot_state = select(1, projection.reduce(snapshot_state, {
   kind = "conversation.active.changed", conversation_id = "snapshot",
@@ -134,7 +182,9 @@ snapshot_state, snapshot_actions = projection.reduce(snapshot_state, {
   kind = "conversation.snapshot", conversation_id = "snapshot", found = true,
   projection = {
     messages = {
-      { id = "user", turn_id = "turn-s", role = "user", text = "inspect" },
+      { id = "user", turn_id = "turn-s", role = "user", text = "",
+        display_text = "session-derived prompt", structured = { task_data },
+        submission_ids = { "submission-s" } },
       {
         id = "assistant-call", turn_id = "turn-s", role = "assistant", text = "",
         tool_calls = {
@@ -157,10 +207,14 @@ snapshot_state, snapshot_actions = projection.reduce(snapshot_state, {
 })
 local tool_end_index
 local final_text_index
+local snapshot_user
 for index, item in ipairs(snapshot_actions) do
+  if item.kind == "message" then snapshot_user = item end
   if item.kind == "tool_completed" then tool_end_index = index end
   if item.kind == "text_delta" and item.text == "done" then final_text_index = index end
 end
+eq(snapshot_user.text, "session-derived prompt", "snapshot uses the same structured Task display")
+eq(snapshot_user.submission_ids[1], "submission-s", "snapshot preserves submission identity")
 assert(tool_end_index ~= nil and final_text_index ~= nil and tool_end_index < final_text_index,
   "snapshot tool completion must remain before the following assistant message")
 

@@ -1,4 +1,5 @@
 local domain = require("libs.conversation-manager.domain")
+local display = require("libs.conversation-manager.display")
 
 local M = {}
 
@@ -38,6 +39,10 @@ local function projected_message(conversation, message)
     end
   end
   local content = table.concat(text)
+  local display_text = content
+  if display_text == "" and #structured == 1 then
+    display_text = display.structured_text(structured[1]) or ""
+  end
   if content == "" and #structured == 1 then content = domain.copy(structured[1]) end
   return {
     id = message.id,
@@ -50,6 +55,7 @@ local function projected_message(conversation, message)
     chunks = chunks,
     content = content,
     text = table.concat(text),
+    display_text = display_text,
     reasoning = table.concat(reasoning),
     structured = structured,
     tool_calls = tool_calls,

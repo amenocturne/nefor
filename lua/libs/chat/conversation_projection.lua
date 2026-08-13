@@ -1,3 +1,5 @@
+local display = require("libs.conversation-manager.display")
+
 local M = {}
 
 local function copy_map(source)
@@ -35,19 +37,35 @@ end
 
 local function record_message(state, message)
   if type(message) ~= "table" or type(message.id) ~= "string" then return end
+  local previous = state.messages[message.id] or {}
   state.messages[message.id] = {
     role = message.role,
     turn_id = message.turn_id,
+    display_text = previous.display_text,
   }
+end
+
+local function visible_text(message)
+  if type(message) ~= "table" then return "" end
+  if type(message.display_text) == "string" then return message.display_text end
+  if type(message.text) == "string" and message.text ~= "" then return message.text end
+  if type(message.structured) == "table" and #message.structured == 1 then
+    return display.structured_text(message.structured[1]) or ""
+  end
+  return ""
 end
 
 local function message_completed(state, actions, message)
   record_message(state, message)
   if type(message) ~= "table" then return end
   if message.role == "user" then
+    local text = visible_text(message)
+    local recorded = state.messages[message.id]
+    if text == "" and type(recorded) == "table"
+        and type(recorded.display_text) == "string" then text = recorded.display_text end
     action(actions, "message", {
       role = message.role,
-      text = message.text or "",
+      text = text,
       message_id = message.id,
       turn_id = message.turn_id,
       submission_ids = message.submission_ids,
@@ -134,9 +152,10 @@ local function snapshot_actions(state, projection, actions)
     elseif message.role == "user" then
       action(actions, "message", {
         role = message.role,
-        text = message.text or "",
+        text = visible_text(message),
         message_id = message.id,
         turn_id = message.turn_id,
+        submission_ids = message.submission_ids,
       })
     elseif message.role == "tool" then
       complete_exchange(exchange_by_call_id[message.tool_call_id])
@@ -206,7 +225,10 @@ function M.reduce(previous, body)
   elseif kind == "content_chunk_appended" then
     local message = state.messages[change.message_id]
     local chunk = change.chunk
-    if message and message.role == "assistant" and type(chunk) == "table"
+    if message and message.role == "user" and type(chunk) == "table"
+        and chunk.kind == "structured" then
+      message.display_text = display.structured_text(chunk.data)
+    elseif message and message.role == "assistant" and type(chunk) == "table"
         and type(chunk.data) == "string" and chunk.data ~= "" then
       if chunk.kind == "text" then
         if message.turn_id ~= nil then
