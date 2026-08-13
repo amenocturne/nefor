@@ -10157,8 +10157,8 @@ fn config_chat_extension_coexists_with_canonical_conversation_projection() {
     std::fs::create_dir_all(config.join("config")).expect("config module dir");
     std::fs::create_dir_all(config.join("chat")).expect("poison chat dir");
     std::fs::write(
-        config.join("chat/update.lua"),
-        "error('foreign config shadowed canonical chat.update')",
+        config.join("chat/commands.lua"),
+        "error('foreign config shadowed canonical chat.commands')",
     )
     .expect("write poison reducer");
     std::fs::write(
@@ -11409,4 +11409,63 @@ fn responsive_sidebar_timers_tick_then_freeze_and_pending_slots_align() {
         frozen_header, later_header,
         "terminal wall clock must freeze"
     );
+}
+
+#[test]
+fn independent_house_composes_public_chat_blocks_without_example_imports() {
+    ensure_test_data_home();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("repo root");
+    let source =
+        std::fs::read_to_string(repo_root.join("tests/fixtures/chat-independent-house/init.lua"))
+            .expect("read independent house fixture");
+    assert!(
+        !source.contains("chat.update") && !source.contains("examples/nefor-agent"),
+        "independent assembly must not import the starter"
+    );
+    let lua_root = repo_root.join("lua").display().to_string();
+    let tui_root = repo_root
+        .join("plugins/nefor-tui/lua")
+        .display()
+        .to_string();
+    let source = format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua", "{lua_root}/?/init.lua", package.path
+        }}, ";")
+        table.insert(package.searchers, 1, function(name)
+          if name ~= "nefor-tui" and name:sub(1, 10) ~= "nefor-tui." then return nil end
+          local rel = name == "nefor-tui" and "init.lua"
+            or name:sub(11):gsub("%.", "/") .. ".lua"
+          local path = "{tui_root}/" .. rel
+          local chunk, err = loadfile(path)
+          if chunk then return chunk end
+          return "\n\tno nefor-tui module at " .. path .. ": " .. tostring(err)
+        end)
+        {source}"#,
+    );
+    let mut engine = Engine::new(60, 12).expect("engine");
+    engine
+        .load_scenario(&source)
+        .expect("load independent house");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "own surface" }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "sessions.resume_done" }));
+    let state = engine.state_table().expect("state");
+    assert_eq!(state.get::<String>("value").expect("value"), "own surface");
+    assert_eq!(state.get::<u64>("seen").expect("seen"), 1);
+    assert_eq!(
+        state.get::<String>("lifecycle").expect("lifecycle"),
+        "replaced",
+        "an independent assembly can replace one lifecycle stage",
+    );
+    let effects = engine.take_emit_queue();
+    assert!(effects.iter().any(|(_, body)| {
+        body.get("kind").and_then(JsonValue::as_str) == Some("house.submitted")
+            && body.get("value").and_then(JsonValue::as_str) == Some("own surface")
+    }));
 }

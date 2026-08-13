@@ -92,7 +92,7 @@ do
   -- statusline with stale reducer copies. nefor-tui exports the `--script`
   -- parent as NEFOR_STARTER_CHAT_DIR; explicit overrides remain available to
   -- in-process tests and development launchers.
-  local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/update.lua", table.pack(
+  local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/commands.lua", table.pack(
     dev_dir    and (dev_dir    .. "/examples/nefor-agent/chat") or nil,
     runtime_dir and (runtime_dir .. "/examples/nefor-agent/chat") or nil,
     pm_root    and (pm_root    .. "/examples/nefor-agent/chat") or nil,
@@ -187,7 +187,13 @@ extensions.load(active_config())
 
 local history = require("libs.chat.history")
 local view    = require("libs.chat.view")
-local update  = require("chat.update")
+local input_submit = require("chat.commands")
+local dispatch = require("libs.chat.dispatch")
+local update = require("libs.chat.controller").build {
+  handler_groups = {
+    dispatch.group("starter commands", { ["input.submit"] = input_submit }),
+  },
+}
 
 local function sidebar_fixture_runs()
   if os.getenv("NEFOR_TEST_SIDEBAR_OVERFLOW") ~= "1" then return {} end
@@ -278,6 +284,7 @@ local function initial_state()
     -- first run / read failure.
     prompt_history   = history.load(),
     history_cursor   = nil,
+    command_completions = require("chat.slash").completions(),
   }
   local patch = extensions.initial_patch(state)
   if patch ~= nil then
@@ -289,7 +296,7 @@ end
 tui.start {
   initial_state = initial_state(),
   view          = view.render,
-  update        = update.update,
+  update        = update,
 }
 
 -- Startup prompts must wait until this process has loaded the composition;

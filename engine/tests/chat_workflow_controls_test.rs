@@ -12,6 +12,34 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn run_pure_chat_fixture(filename: &str) {
+    let lua = Lua::new();
+    let root = repo_root();
+    let lua_root = root.join("lua").display().to_string();
+    lua.load(format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
+          package.path,
+        }}, ";")"#,
+    ))
+    .exec()
+    .expect("set package.path");
+
+    let test_path = root.join("tests/lua/chat").join(filename);
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", test_path.display()));
+    lua.load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+        .unwrap_or_else(|error| panic!("{filename} failed:\n{error}"));
+}
+
+#[test]
+fn dispatch_registration_contract() {
+    run_pure_chat_fixture("dispatch_test.lua");
+}
+
 #[test]
 fn workflow_controls_transition_laws() {
     let lua = Lua::new();

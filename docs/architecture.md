@@ -24,6 +24,7 @@ Lua owns behavior that is composition-specific or bus-aware:
 - Session persistence and resume (`lua/libs/sessions`).
 - Approval and tool validation policy (`lua/libs/tool-validator`, `lua/libs/lead-workflow`).
 - Provider/tool adapters and interface reducers.
+- Chat event/key sequencing through `libs.chat.controller`, assembled from named handler groups with `libs.chat.dispatch`. The starter supplies its command handler as one visible group; consumers can use the defaults, wrap or replace a handler with an explicit duplicate policy, or bypass the controller and use `nefor-tui` primitives directly.
 - MAG submission/control and workspace management.
 
 Pure reusable mechanisms live under `lua/core` or `lua/libs`; example opinions and concrete wiring live under `examples/nefor-agent`.
