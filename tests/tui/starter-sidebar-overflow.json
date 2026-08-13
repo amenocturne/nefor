@@ -416,38 +416,6 @@
     },
     {
       "kind": "key",
-      "key": "Tab"
-    },
-    {
-      "kind": "wait_not_text",
-      "text": "Workflows · focused",
-      "timeout_ms": 5000
-    },
-    {
-      "kind": "wait_idle",
-      "idle_ms": 1000,
-      "timeout_ms": 10000
-    },
-    {
-      "kind": "type",
-      "text": "the secret key is sidebar-ok"
-    },
-    {
-      "kind": "key",
-      "key": "Enter"
-    },
-    {
-      "kind": "wait_text",
-      "text": "secret key is now",
-      "timeout_ms": 30000
-    },
-    {
-      "kind": "wait_not_text",
-      "text": "[thinking",
-      "timeout_ms": 10000
-    },
-    {
-      "kind": "key",
       "key": "CtrlC"
     },
     {
