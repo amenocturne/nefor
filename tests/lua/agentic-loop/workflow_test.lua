@@ -671,7 +671,8 @@ do
   local compact = find_kind(calls, "conversation.context.compact.request")
   assert(compact ~= nil, "compaction delegates to conversation-manager")
   assert_eq(compact.target, "conversation-manager")
-  assert_eq(compact.body.provider, "mock", "compaction carries provider routing only")
+  assert_eq(compact.body.provider, "mock", "compaction carries provider routing")
+  assert_eq(compact.body.model, "test-model", "compaction carries the active model")
   assert_eq(find_kind(calls, "mock.chat.create"), nil,
     "agentic-loop does not orchestrate provider chats")
 
@@ -685,6 +686,8 @@ do
     },
   })
   calls = decode_calls()
+  local completed = find_kind(calls, "chat.compaction.commit")
+  assert(completed ~= nil, "manual compaction pending lifecycle completes")
   local query = find_kind(calls, "conversation.context.request")
   assert(query ~= nil, "completed compaction refreshes universal context")
   send_to_loop("conversation-manager", {
@@ -710,6 +713,36 @@ do
     "opaque provider checkpoints never enter MAG overlays")
   assert_eq(second_overlay.history, nil,
     "canonical history never enters MAG overlays")
+end
+
+-- Structured manager/provider failures complete the manual lifecycle with a
+-- deterministic diagnostic instead of leaking Lua table identities.
+do
+  fresh_loop()
+  local first = begin_bound_turn("before failed compaction", "r31")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = first.body.run_id,
+    status = "completed", result = { text = "remember this" },
+  })
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.compaction.request", trigger = "manual" })
+  local compact = find_kind(decode_calls(), "conversation.context.compact.request")
+  assert(compact ~= nil)
+  _test.calls_clear()
+  manager_delta({
+    kind = "context_compaction_failed",
+    compaction = {
+      request_id = compact.body.request_id, status = "failed",
+      error = { code = "provider_compaction_failed",
+        message = "no model configured", detail = { field = "model" } },
+    },
+  })
+  local failed = find_kind(decode_calls(), "chat.compaction.failed")
+  assert(failed ~= nil, "manual compaction pending lifecycle fails")
+  assert_eq(failed.body.message,
+    "provider_compaction_failed: no model configured (field=model)")
+  assert(not failed.body.message:find("table: 0x", 1, true),
+    "structured errors never leak Lua table addresses")
 end
 
 -- (universal context projection) manager-projected tool exchanges are seeded

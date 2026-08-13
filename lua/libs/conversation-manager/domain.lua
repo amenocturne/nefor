@@ -309,6 +309,7 @@ handlers.context_compaction_requested = function(c, event)
     history_cutoff = event.history_cutoff,
     requested_sequence = event.sequence,
     provider = event.provider,
+    model = event.model,
   }
   c.compactions[#c.compactions + 1] = compaction
   c.compaction_by_id[compaction.request_id] = compaction

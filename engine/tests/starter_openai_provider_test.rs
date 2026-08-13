@@ -113,7 +113,7 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
             conversation_id = "lead",
             change = {
               kind = "context_compaction_pending",
-              provider = "chatgpt",
+              provider = "chatgpt", model = "gpt-5.6-sol",
               compaction = { request_id = "compact-1" },
             },
           },
@@ -122,6 +122,7 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
         assert(#delivered == 3)
         assert(delivered[1].kind == "chatgpt.chat.create")
         assert(delivered[1].conversation_id == "lead")
+        assert(delivered[1].body.model == "gpt-5.6-sol")
         assert(delivered[2].kind == "chatgpt.chat.append")
         assert(delivered[3].kind == "chatgpt.chat.compact")
 
@@ -146,6 +147,90 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
     )
     .exec()
     .expect("drive universal compaction lifecycle");
+}
+
+#[test]
+fn provider_adapter_normalizes_structured_compaction_errors() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        package.preload["throwing-provider"] = function()
+          return { translator = function(name)
+            local t = require("openai-provider").translator(name)
+            t.compact_context = function()
+              error({ code = "request_shape_invalid", message = "bad compaction request",
+                detail = { field = "model" } }, 0)
+            end
+            return t
+          end }
+        end
+        local op = require("libs.compositors.provider")
+        local spec = op.spawn_spec("broken", { "/bin/true" }, {
+          agentic_loop = {}, translator_lib = "throwing-provider",
+          conversations = { context = function()
+            return { messages = {{ role = "user", content = "context" }} }
+          end },
+        })
+        spec.to_plugin({{
+          type = "event", from = "conversation-manager", body = {
+            kind = "conversation.projection.delta", conversation_id = "lead",
+            change = { kind = "context_compaction_pending", provider = "broken",
+              compaction = { request_id = "compact-table-error" } },
+          },
+        }})
+        local sent = _test.sent()
+        assert(#sent == 1)
+        assert(sent[1].kind == "conversation.context.compact.failed")
+        assert(sent[1].body.error.code == "request_shape_invalid")
+        assert(sent[1].body.error.message == "bad compaction request")
+        assert(sent[1].body.error.detail.field == "model")
+        assert(not sent[1].body.error.message:find("table: 0x", 1, true))
+        "#,
+    )
+    .exec()
+    .expect("normalize table-valued compaction error");
+}
+
+#[test]
+fn provider_adapter_recovers_the_concrete_missing_model_failure() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        package.preload["returning-provider"] = function()
+          return { translator = function(name)
+            local t = require("openai-provider").translator(name)
+            t.compact_context = function()
+              return nil, { code = "provider_compaction_failed",
+                message = "no model configured: pass `model` in chat.create or set the provider default via model.set (the user picks via `/model` in the chat surface)",
+                context = { field = "model", provider = name } }
+            end
+            return t
+          end }
+        end
+        local spec = require("libs.compositors.provider").spawn_spec("returned", { "/bin/true" }, {
+          agentic_loop = {}, translator_lib = "returning-provider",
+          conversations = { context = function()
+            return { messages = {{ role = "user", content = "context" }} }
+          end },
+        })
+        spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
+          kind = "conversation.projection.delta", conversation_id = "lead",
+          change = { kind = "context_compaction_pending", provider = "returned",
+            compaction = { request_id = "compact-returned-error" } },
+        } }})
+        local failure = _test.sent()[1].body.error
+        assert(failure.code == "provider_compaction_failed")
+        assert(failure.message:find("no model configured", 1, true))
+        assert(failure.detail.field == "model" and failure.detail.provider == "returned")
+        assert(not failure.message:find("table: 0x", 1, true))
+        "#,
+    )
+    .exec()
+    .expect("recover concrete missing-model compaction failure");
 }
 
 #[test]
@@ -179,6 +264,9 @@ fn unsupported_provider_returns_universal_compaction_failure() {
         local sent = _test.sent()
         assert(#sent == 1)
         assert(sent[1].kind == "conversation.context.compact.failed")
+        assert(sent[1].body.error.code == "provider_compaction_failed")
+        assert(sent[1].body.error.message == "context compaction is not supported by ollama")
+        assert(not sent[1].body.error.message:find("table: 0x", 1, true))
         assert(#_test.delivered() == 0)
         "#,
     )

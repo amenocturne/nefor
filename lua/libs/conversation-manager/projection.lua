@@ -75,6 +75,7 @@ local function public_compaction(compaction, include_checkpoint)
     status = compaction.status,
     history_cutoff = compaction.history_cutoff,
     provider = compaction.provider,
+    model = compaction.model,
     error = domain.copy(compaction.error),
   }
   if include_checkpoint then out.checkpoint = domain.copy(compaction.checkpoint) end

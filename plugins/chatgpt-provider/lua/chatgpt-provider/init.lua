@@ -74,6 +74,7 @@ local function translator(name)
         kind = prefix .. "chat.create",
         chat_id = chat_id,
         conversation_id = change.conversation_id,
+        model = change.model or (change.compaction and change.compaction.model),
       },
       messages = context.messages,
       compact = {

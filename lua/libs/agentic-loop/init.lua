@@ -52,6 +52,7 @@ local json = nefor.json
 local envelope        = require("core.envelope")
 local ids             = require("core.ids")
 local results_lib     = require("libs.agentic-loop.results")
+local error_value     = require("core.error")
 local replay_window   = require("core.replay_window")
 local conversation_projection = require("libs.agentic-loop.conversation_projection")
 
@@ -875,6 +876,7 @@ local function handle_chat_compaction_request(body)
     request_id = request_id,
     conversation_id = state.conversation_id,
     provider = state.config.provider,
+    model = state.config.model,
   })
 end
 
@@ -1298,7 +1300,8 @@ local function handle_conversation_projection_delta(body)
       state.pending_compaction = nil
       local detail = type(change.compaction) == "table" and change.compaction.error
         or change.error
-      compaction_failure(tostring(detail or "context compaction failed"), pending)
+      compaction_failure(error_value.display(detail, "context_compaction_failed",
+        "context compaction failed"), pending)
       flush_pending_user_inputs()
       flush_deferred()
     end
@@ -1351,7 +1354,8 @@ local function handle_conversation_rejection(body)
   if type(pending) == "table"
       and body.event_id == "compaction:" .. pending.request_id .. ":requested" then
     state.pending_compaction = nil
-    compaction_failure(tostring(body.code or "context compaction rejected"), pending)
+    compaction_failure(error_value.display(body, "context_compaction_rejected",
+      "context compaction rejected"), pending)
     flush_pending_user_inputs()
     flush_deferred()
   end

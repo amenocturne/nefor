@@ -42,6 +42,7 @@
 
 local M = {}
 local json_data = require("core.json_data")
+local error_value = require("core.error")
 
 -- opts.hooks lets downstream callers splice per-envelope logic into the
 -- two translation seams without forking this file. Both hooks are
@@ -209,12 +210,13 @@ function M.spawn_spec(name, command, opts)
     return true
   end
 
-  local function publish_compaction_failed(change, message)
+  local function publish_compaction_failed(change, failure)
     emit_synthetic(name, {
       kind = "conversation.context.compact.failed",
       request_id = change.compaction and change.compaction.request_id,
       conversation_id = change.conversation_id,
-      error = { code = "provider_compaction_failed", message = tostring(message) },
+      error = error_value.normalize(failure, "provider_compaction_failed",
+        "context compaction failed"),
     })
   end
 
@@ -229,9 +231,10 @@ function M.spawn_spec(name, command, opts)
     end
     local lowered = clone_table(change)
     lowered.context = context
-    local plan, message = translator.compact_context(lowered)
-    if not plan then
-      publish_compaction_failed(change, message or "context compaction is unsupported")
+    local lowered_ok, plan, message = pcall(translator.compact_context, lowered)
+    if not lowered_ok or not plan then
+      publish_compaction_failed(change, lowered_ok
+        and (message or "context compaction is unsupported") or plan)
       return true
     end
     pending_compactions[plan.chat_id] = {
@@ -239,16 +242,22 @@ function M.spawn_spec(name, command, opts)
       conversation_id = change.conversation_id,
       delete = plan.delete,
     }
-    translator.deliver(plan.create)
-    if plan.restore then translator.deliver(plan.restore) end
-    for _, message_body in ipairs(plan.messages or {}) do
-      translator.deliver({
-        kind = kinds.chat_append,
-        chat_id = plan.chat_id,
-        message = clone_table(message_body),
-      })
+    local delivered, delivery_error = pcall(function()
+      translator.deliver(plan.create)
+      if plan.restore then translator.deliver(plan.restore) end
+      for _, message_body in ipairs(plan.messages or {}) do
+        translator.deliver({
+          kind = kinds.chat_append,
+          chat_id = plan.chat_id,
+          message = clone_table(message_body),
+        })
+      end
+      translator.deliver(plan.compact)
+    end)
+    if not delivered then
+      pending_compactions[plan.chat_id] = nil
+      publish_compaction_failed(change, delivery_error)
     end
-    translator.deliver(plan.compact)
     return true
   end
 
@@ -280,10 +289,8 @@ function M.spawn_spec(name, command, opts)
         kind = "conversation.context.compact.failed",
         request_id = pending.request_id,
         conversation_id = pending.conversation_id,
-        error = {
-          code = "provider_compaction_failed",
-          message = tostring(body.message or body.error or "context compaction failed"),
-        },
+        error = error_value.normalize(body.error or body.message,
+          "provider_compaction_failed", "context compaction failed"),
       })
     end
     return true

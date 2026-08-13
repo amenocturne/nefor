@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use chatgpt_provider::auth::store::{AccessToken, RefreshToken, TokenData};
 use chatgpt_provider::auth::{AuthSnapshot, AuthState, TokenSource};
 use chatgpt_provider::responses::{
-    MessageContent, Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem,
+    CompactRequest, MessageContent, Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem,
     ResponsesApiRequest, ResponsesClient, ResponsesTurnContext, TextControls, Verbosity,
 };
 use serde_json::json;
@@ -230,6 +230,100 @@ async fn structured_request_reaches_local_responses_server_with_explicit_object_
     let decoded = mag_schema.validate_provider_json(&delta);
     assert!(decoded.ok, "{:?}", decoded.violations);
     assert_eq!(decoded.value, Some(json!({"content": "done"})));
+}
+
+#[tokio::test]
+async fn native_compaction_posts_current_request_shape_and_accepts_output_wrapper() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.expect("read request");
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            assert!(headers.starts_with("POST /responses/compact HTTP/1.1"));
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|length| length.parse::<usize>().ok())
+                })
+                .expect("content length");
+            if bytes.len() < header_end + 4 + content_length {
+                continue;
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&bytes[header_end + 4..header_end + 4 + content_length])
+                    .expect("request JSON");
+            assert_eq!(request["model"], "gpt-5.6-sol");
+            assert!(request["input"].is_array());
+            assert!(request["tools"].is_array());
+            assert_eq!(request["parallel_tool_calls"], false);
+            assert_eq!(request["reasoning"]["summary"], "concise");
+            assert_eq!(request["prompt_cache_key"], "thread");
+            break;
+        }
+        let body = r#"{"output":[{"type":"compaction","encrypted_content":"sealed"}]}"#;
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let auth = AuthSnapshot {
+        tokens: Some(TokenData {
+            id_token: "test-id".into(),
+            access_token: AccessToken("test-access".into()),
+            refresh_token: RefreshToken("test-refresh".into()),
+            account_id: None,
+        }),
+        state: AuthState::Connected,
+        source: Some(TokenSource::AuthSet),
+    };
+    let client = ResponsesClient::new(
+        format!("http://{addr}"),
+        "test-installation".into(),
+        "nefor_test".into(),
+    );
+    let request = CompactRequest {
+        model: "gpt-5.6-sol".into(),
+        instructions: String::new(),
+        input: vec![ResponseItem::Message {
+            role: "user".into(),
+            content: vec![MessageContent::InputText {
+                text: "remember".into(),
+            }],
+        }],
+        tools: vec![],
+        parallel_tool_calls: false,
+        reasoning: Some(Reasoning {
+            effort: Some(ReasoningEffort::High),
+            summary: Some(ReasoningSummary::Concise),
+        }),
+        service_tier: None,
+        prompt_cache_key: Some("thread".into()),
+        text: None,
+    };
+    let turn = ResponsesTurnContext::new("session", "thread");
+    let compacted = client
+        .compact(&request, &auth, &turn)
+        .await
+        .expect("compact");
+    server.await.expect("server");
+    assert_eq!(
+        compacted,
+        vec![ResponseItem::Compaction {
+            encrypted_content: "sealed".into()
+        }]
+    );
 }
 
 #[test]

@@ -267,12 +267,13 @@ eq(context.context.watermark, actor._internals.get("replayed").last_sequence)
 
 receive({
   kind = "conversation.context.compact.request", request_id = "compact-1",
-  conversation_id = "replayed", provider = "chatgpt",
+  conversation_id = "replayed", provider = "chatgpt", model = "gpt-5.6-sol",
 })
 delta = last_body()
 eq(delta.change.kind, "context_compaction_pending")
 eq(delta.change.compaction.history_cutoff, 3)
 eq(delta.change.compaction.provider, "chatgpt", "pending compaction preserves routing provider")
+eq(delta.change.compaction.model, "gpt-5.6-sol", "pending compaction preserves the selected model")
 receive({
   kind = "conversation.context.compact.complete",
   request_id = "compact-1",

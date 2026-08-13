@@ -192,6 +192,7 @@ function M.build(options)
       request_id = body.request_id,
       history_cutoff = projection.context(conversation).history_length,
       provider = body.provider,
+      model = body.model,
     })
   end
 
