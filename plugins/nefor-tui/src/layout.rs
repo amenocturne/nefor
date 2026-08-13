@@ -21,8 +21,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::animation::{sample as animation_sample, AnimationState};
 use crate::desc::{
-    Alignment, Anchor, AnimationFrame, Dimension, ScrollableStyle, Span, Style, TextInputStyle,
-    WidgetDescription, WrapMode,
+    Alignment, Anchor, AnimationFrame, Dimension, FlexFit, ScrollableStyle, Span, Style,
+    TextInputStyle, WidgetDescription, WrapMode,
 };
 use crate::instance::{InstanceKind, InstanceState, WidgetInstance};
 use crate::render::{Cell, FrameBuffer};
@@ -568,15 +568,20 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         handed_out_main = handed_out_main.saturating_add(allotment as u32);
         main_allotments[i] = allotment;
 
+        let min_main = if child_flex_fit(&inst.children[i]) == FlexFit::Tight {
+            allotment
+        } else {
+            0
+        };
         let child_constraints = match axis {
             Axis::Vertical => Constraints {
                 min_width: 0,
                 max_width: c.max_width,
-                min_height: allotment,
+                min_height: min_main,
                 max_height: allotment,
             },
             Axis::Horizontal => Constraints {
-                min_width: allotment,
+                min_width: min_main,
                 max_width: allotment,
                 min_height: 0,
                 max_height: c.max_height,
@@ -1801,6 +1806,13 @@ fn child_flex_factor(child: &WidgetInstance) -> u16 {
     }
 }
 
+fn child_flex_fit(child: &WidgetInstance) -> FlexFit {
+    match &child.last_desc {
+        WidgetDescription::Expanded { fit, .. } => *fit,
+        _ => FlexFit::Tight,
+    }
+}
+
 /// Whether `child` opts into cross-axis stretch inside a flex parent
 /// (`row` or `column`) on `axis`. The flex layout treats cross-greedy
 /// children differently:
@@ -2649,6 +2661,7 @@ mod tests {
     fn expanded(child: WidgetDescription, flex: u16) -> WidgetDescription {
         WidgetDescription::Expanded {
             flex,
+            fit: FlexFit::Tight,
             child: Box::new(child),
             key: None,
         }
@@ -2672,6 +2685,54 @@ mod tests {
         let _ = layout(root, Constraints::loose(20, 1));
         // First child main = 3, expanded main = 17.
         assert_eq!(root.layout.flex_main_sizes, vec![3, 17]);
+    }
+
+    #[test]
+    fn loose_expanded_uses_natural_width_up_to_its_allotment() {
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![
+                text("prefix "),
+                WidgetDescription::Expanded {
+                    flex: 1,
+                    fit: FlexFit::Loose,
+                    child: Box::new(text("name")),
+                    key: None,
+                },
+                text(" (1/3)"),
+            ],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let size = layout(root, Constraints::loose(30, 1));
+        assert_eq!(root.layout.flex_main_sizes, vec![7, 4, 6]);
+        assert_eq!(size.width, 17);
+    }
+
+    #[test]
+    fn loose_expanded_clips_to_its_allotment_when_content_is_long() {
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![
+                text("prefix "),
+                WidgetDescription::Expanded {
+                    flex: 1,
+                    fit: FlexFit::Loose,
+                    child: Box::new(text("a very long workflow name")),
+                    key: None,
+                },
+                text(" (1/3)"),
+            ],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let size = layout(root, Constraints::loose(20, 1));
+        assert_eq!(root.layout.flex_main_sizes, vec![7, 7, 6]);
+        assert_eq!(size.width, 20);
     }
 
     #[test]

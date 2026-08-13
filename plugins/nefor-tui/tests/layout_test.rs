@@ -10,7 +10,7 @@
 //! so future regressions surface as a specific row/col mismatch instead
 //! of a long opaque ANSI diff.
 
-use nefor_tui::desc::{Alignment, Anchor, Dimension, WidgetDescription, WrapMode};
+use nefor_tui::desc::{Alignment, Anchor, Dimension, FlexFit, WidgetDescription, WrapMode};
 use nefor_tui::layout;
 use nefor_tui::reconciler::Reconciler;
 use nefor_tui::render::{FrameBuffer, Renderer};
@@ -44,6 +44,7 @@ fn row(children: Vec<WidgetDescription>, gap: u16) -> WidgetDescription {
 fn expanded(child: WidgetDescription) -> WidgetDescription {
     WidgetDescription::Expanded {
         flex: 1,
+        fit: FlexFit::Tight,
         child: Box::new(child),
         key: None,
     }

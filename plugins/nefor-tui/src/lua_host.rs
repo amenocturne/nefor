@@ -511,7 +511,7 @@ fn install_tui(
     })?;
     tui.set("stack", stack_fn)?;
 
-    // tui.expanded { flex?, child, key? }
+    // tui.expanded { flex?, fit? = "tight"|"loose", child, key? }
     let expanded_fn = lua.create_function(|_, args: Table| {
         args.set(KIND_FIELD, "expanded")?;
         Ok(args)

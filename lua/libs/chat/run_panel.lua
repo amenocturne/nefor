@@ -303,7 +303,7 @@ local function duration_widget(elapsed, style)
 end
 
 local function name_widget(name, style)
-  return tui.expanded { child = text(name, style, "ellipsis") }
+  return tui.expanded { fit = "loose", child = text(name, style, "ellipsis") }
 end
 
 local function group_elapsed_ms(group, now_ms)

@@ -8990,6 +8990,140 @@ fn engine_with_cycling_group() -> Engine {
 }
 
 #[test]
+fn workflow_rows_keep_semantic_fields_contiguous_across_sidebar_widths() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started",
+            "run_id": "layout-1",
+            "run_name": "lead",
+            "scope": "layout"
+        }),
+    );
+    for id in ["lead.entry", "lead.worker", "result", "tâche.worker"] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.actor_spawned",
+                "run_id": "layout-1",
+                "id": id,
+                "factory": "nefor.factory.llm"
+            }),
+        );
+    }
+    for kind in ["mag.actor_ready", "mag.actor_busy"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": kind, "run_id": "layout-1", "id": "lead.entry" }),
+        );
+    }
+    for kind in ["mag.actor_ready", "mag.actor_busy", "mag.actor_idle"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": kind, "run_id": "layout-1", "id": "tâche.worker" }),
+        );
+    }
+    engine.advance_time(Duration::from_millis(2_000));
+
+    let assert_compact = |snapshot: &str| {
+        let rows = snapshot.lines().collect::<Vec<_>>();
+        let header = rows
+            .iter()
+            .find(|line| line.contains("MAG") && line.contains("lead"))
+            .expect("workflow header");
+        assert!(
+            header.contains("2s lead (1/3)"),
+            "duration, name, and progress must remain contiguous:\n{snapshot}"
+        );
+        let lead = rows
+            .iter()
+            .find(|line| line.contains('●') && line.contains("lead"))
+            .expect("active group row");
+        assert!(
+            lead.contains("2s lead (2)"),
+            "active duration, name, and count must remain contiguous:\n{snapshot}"
+        );
+        let pending = rows
+            .iter()
+            .find(|line| line.contains('○') && line.contains("result"))
+            .expect("pending group row");
+        assert!(
+            pending.contains("– result"),
+            "pending placeholder and name must remain contiguous:\n{snapshot}"
+        );
+        let unicode = rows
+            .iter()
+            .find(|line| line.contains('✓') && line.contains("tâche"))
+            .unwrap_or_else(|| panic!("unicode completed group row:\n{snapshot}"));
+        assert!(
+            unicode.contains("0ms tâche"),
+            "frozen duration and Unicode name must remain contiguous:\n{snapshot}"
+        );
+    };
+
+    let wide = render_snapshot(&mut engine);
+    assert_compact(&wide);
+
+    engine
+        .handle_resize(70, 24)
+        .expect("screenshot-width sidebar");
+    let screenshot_width = render_snapshot(&mut engine);
+    assert_compact(&screenshot_width);
+
+    engine.handle_resize(42, 24).expect("narrow sidebar");
+    let narrow = render_snapshot(&mut engine);
+    assert_compact(&narrow);
+}
+
+#[test]
+fn long_workflow_name_ellipsizes_before_protected_progress() {
+    let mut engine = Engine::new(42, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started",
+            "run_id": "layout-long",
+            "run_name": "超長い-workflow-name-that-must-shrink"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned",
+            "run_id": "layout-long",
+            "id": "output",
+            "factory": "nefor.factory.output"
+        }),
+    );
+
+    let snapshot = render_snapshot(&mut engine);
+    let header = snapshot
+        .lines()
+        .find(|line| line.contains("MAG"))
+        .expect("workflow header");
+    assert!(
+        header.contains('…'),
+        "long Unicode name must ellipsize:\n{snapshot}"
+    );
+    assert!(
+        header.contains("(0/1)"),
+        "progress must remain visible after the flexible name:\n{snapshot}"
+    );
+    let ellipsis = header.find('…').expect("ellipsis");
+    let progress = header.find("(0/1)").expect("progress");
+    assert!(
+        progress - ellipsis <= 5,
+        "ellipsis and progress must have no distributed interior gap:\n{snapshot}"
+    );
+}
+
+#[test]
 fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
     let mut engine = Engine::new(120, 30).expect("engine");
     load_chat_scenario(&mut engine);

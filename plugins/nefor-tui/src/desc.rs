@@ -87,6 +87,7 @@ pub enum WidgetDescription {
     },
     Expanded {
         flex: u16,
+        fit: FlexFit,
         child: Box<WidgetDescription>,
         key: Option<String>,
     },
@@ -260,6 +261,13 @@ pub enum Dimension {
     Intrinsic,
     Cells(u16),
     Percent(u8),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FlexFit {
+    #[default]
+    Tight,
+    Loose,
 }
 
 impl WidgetDescription {
@@ -902,6 +910,24 @@ fn parse_stack(t: &Table) -> Result<WidgetDescription, TuiError> {
 
 fn parse_expanded(t: &Table) -> Result<WidgetDescription, TuiError> {
     let flex = parse_u16(t, "flex", 1, "tui.expanded")?;
+    let fit = match t.get::<Value>("fit")? {
+        Value::Nil => FlexFit::Tight,
+        Value::String(value) => match lua_string_lossy(&value).as_str() {
+            "tight" => FlexFit::Tight,
+            "loose" => FlexFit::Loose,
+            other => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.expanded: `fit` must be tight|loose (got `{other}`)"
+                )));
+            }
+        },
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.expanded: `fit` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
     let child_val: Value = t.get("child")?;
     let child_tbl = match child_val {
         Value::Table(t) => t,
@@ -919,7 +945,12 @@ fn parse_expanded(t: &Table) -> Result<WidgetDescription, TuiError> {
     };
     let child = Box::new(from_lua_table(&child_tbl)?);
     let key = parse_key(t)?;
-    Ok(WidgetDescription::Expanded { flex, child, key })
+    Ok(WidgetDescription::Expanded {
+        flex,
+        fit,
+        child,
+        key,
+    })
 }
 
 fn parse_spacer(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -1870,7 +1901,30 @@ mod tests {
         );
         let d = from_lua_table(&t).expect("parse");
         match d {
-            WidgetDescription::Expanded { flex, .. } => assert_eq!(flex, 1),
+            WidgetDescription::Expanded { flex, fit, .. } => {
+                assert_eq!(flex, 1);
+                assert_eq!(fit, FlexFit::Tight);
+            }
+            _ => panic!("expected expanded"),
+        }
+    }
+
+    #[test]
+    fn expanded_table_parses_loose_fit() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "expanded",
+              fit = "loose",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Expanded { fit, .. } => assert_eq!(fit, FlexFit::Loose),
             _ => panic!("expected expanded"),
         }
     }
