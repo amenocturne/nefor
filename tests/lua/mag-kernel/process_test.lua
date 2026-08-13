@@ -86,6 +86,20 @@ do
   assert_eq(failed.value.operation, "process.exec", "failure identifies operation")
 end
 
+do
+  local messages, emit = capture()
+  local instance = process.script.construct("malformed", {
+    script="printf hello", cwd="/repo", timeout=unbounded(),
+  }, emit)
+  instance.deliver(input("mag.Unit", {}))
+  local invocation = find(messages, "capability.invoke")
+  local failed = instance.deliver(reply(invocation.ref, "dumped output summary"))
+  assert_eq(failed.status, "failed", "malformed process result fails without crashing")
+  assert_eq(failed.failure, "nefor.process.CapabilityFailed", "malformed result uses typed failure")
+  assert_eq(failed.value.error, "capability returned malformed ProcessResult",
+    "malformed result explains the contract failure")
+end
+
 for _, bad in ipairs({
   {argv={"true"}, cwd="/repo", timeout={present=true,milliseconds=0}},
   {argv={"true"}, cwd="/repo", timeout={present=true,milliseconds=-1}},

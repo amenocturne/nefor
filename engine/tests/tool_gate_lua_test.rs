@@ -622,6 +622,58 @@ fn maybe_dump_output_rewrites_huge_output_into_summary_and_writes_disk() {
 }
 
 #[test]
+fn maybe_dump_output_preserves_structured_process_results() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            local lib = require("tool-gate")
+            local body = {
+              kind = "tool.result",
+              id = "process-big",
+              name = "shell.script",
+              output = {
+                stdout = string.rep("PAYLOAD\n", 5000),
+                stderr = "",
+                termination = { kind = "code", code = 0 },
+              },
+            }
+            local rewritten, path = lib.maybe_dump_output(body, "chat-1")
+            return {
+              same = rewritten == body,
+              path = path,
+              stdout = rewritten.output.stdout,
+              code = rewritten.output.termination.code,
+            }
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    let same: bool = result.get("same").expect("same");
+    let path: Option<String> = result.get("path").expect("path");
+    let stdout: String = result.get("stdout").expect("stdout");
+    let code: i64 = result.get("code").expect("code");
+    assert!(same);
+    assert!(path.is_none());
+    assert_eq!(stdout, "PAYLOAD\n".repeat(5000));
+    assert_eq!(code, 0);
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
 fn maybe_dump_output_ignores_bodies_without_string_id() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

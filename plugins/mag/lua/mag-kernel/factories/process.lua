@@ -118,7 +118,12 @@ local function factory(config)
       local result = activation.result
       local termination = type(result) == "table" and result.termination or nil
       local termination_kind = type(termination) == "table" and termination.kind or nil
-      local termination_value = termination_kind == "code" and termination.code or termination.signal
+      local termination_value
+      if termination_kind == "code" then
+        termination_value = termination.code
+      elseif termination_kind == "signal" then
+        termination_value = termination.signal
+      end
       if type(result) ~= "table"
           or type(result.stdout) ~= "string"
           or type(result.stderr) ~= "string"
