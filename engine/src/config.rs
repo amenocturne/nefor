@@ -172,7 +172,6 @@ mod tests {
         Cli {
             config: Some(PathBuf::from(dir)),
             data_dir: None,
-            plugin_dir: None,
             log_file: None,
             command: None,
         }
