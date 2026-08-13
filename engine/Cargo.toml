@@ -25,5 +25,6 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 
 [dev-dependencies]
+nefor-mag = { path = "../crates/nefor-mag" }
 nefor-tui = { path = "../plugins/nefor-tui" }
 tempfile = "3"

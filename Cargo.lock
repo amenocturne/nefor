@@ -1594,6 +1594,7 @@ dependencies = [
  "dirs",
  "futures",
  "mlua",
+ "nefor-mag",
  "nefor-protocol",
  "nefor-tui",
  "serde",

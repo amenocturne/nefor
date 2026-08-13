@@ -55,6 +55,65 @@ fn starter_lead_workflow_full() {
     }
 }
 
+#[test]
+fn production_mag_eval_wrapper_compiles_direct_process_exec() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let build_source: Function = lua
+        .load(
+            r#"
+            return require("libs.lead-workflow.mag-eval")._internals.build_source
+            "#,
+        )
+        .eval()
+        .expect("load production mag-eval wrapper");
+    let expression = r#"(nefor.process.exec "step"
+      (as nefor.contracts.ProcessExecParams
+        {:argv ["printf" "ok"] :cwd nefor.process.cwd
+         :timeout (nefor.contracts.no-timeout)}))"#;
+    let (source, _): (String, Table) = build_source
+        .call(expression)
+        .expect("generate production mag-eval source");
+
+    let inputs = serde_json::json!({
+        "foreign_contracts": [
+            {
+                "identity": "nefor.factory.process-exec",
+                "type_scheme": {
+                    "input_tags": ["nefor.process.Input"],
+                    "outputs": ["nefor.process.Result", "nefor.process.CapabilityFailed"]
+                }
+            },
+            {
+                "identity": "nefor.factory.source",
+                "type_scheme": {
+                    "input_tags": ["mag.Unit"],
+                    "outputs": ["nefor.graph.Value"]
+                }
+            },
+            {
+                "identity": "nefor.factory.output",
+                "type_scheme": {
+                    "input_tags": ["nefor.graph.Value"],
+                    "outputs": ["nefor.graph.Value"]
+                }
+            }
+        ]
+    });
+    let module_root = starter_dir().join("mag/lib");
+    let artifact = nefor_mag::compile_with_inputs_and_module_roots(
+        &source,
+        &module_root,
+        inputs,
+        std::slice::from_ref(&module_root),
+    )
+    .unwrap_or_else(|error| panic!("production mag-eval wrapper failed to compile: {error}"));
+
+    assert_eq!(artifact.format, "nefor.graph-modification/v1");
+}
+
 /// The retired graph IR shape ({nodes, edges, terminal} + the popen compiler
 /// bridge) must stay dead: the lead reads the modification off `mag.loaded`
 /// replies (lua/libs/lead-workflow/init.lua resume_pending_load), never a

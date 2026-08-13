@@ -162,6 +162,7 @@ local function build_source(expr)
   local prefix = table.concat({
     '(require "nefor.artifact")\n',
     '(require "nefor.graph")\n',
+    '(require "nefor.process")\n',
     '(require "nefor.shell")\n',
     '(let [start (nefor.graph.source "eval-input" (type-tag Unit) nil)\n',
     '      operation ',
