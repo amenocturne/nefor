@@ -73,7 +73,18 @@ local function sorted_keys(m)
 end
 
 local function fmt_elapsed_ms(ms)
-  return common.humanize_duration_ms(ms) or ""
+  local seconds = math.max(0, math.floor((ms or 0) / 1000))
+  local value, unit
+  if seconds < 100 then
+    value, unit = seconds, "s"
+  elseif seconds < 100 * 60 then
+    value, unit = math.floor(seconds / 60), "m"
+  elseif seconds < 100 * 60 * 60 then
+    value, unit = math.floor(seconds / 3600), "h"
+  else
+    value, unit = math.min(99, math.floor(seconds / 86400)), "d"
+  end
+  return string.format("%02d%s", value, unit)
 end
 M.fmt_elapsed_ms = fmt_elapsed_ms
 
@@ -290,16 +301,12 @@ end
 -- status / activity window of a whole group or run).
 M.build_groups = build_groups
 
-local DURATION_COLUMNS = 7
-local PENDING_DURATION = "–"
-
 local function text(content, style, wrap)
   return tui.text { content = content, style = style, wrap = wrap or "none" }
 end
 
 local function duration_widget(elapsed, style)
-  local value = elapsed == nil and PENDING_DURATION or fmt_elapsed_ms(elapsed)
-  return text(string.rep(" ", DURATION_COLUMNS - #value) .. value, style)
+  return text(fmt_elapsed_ms(elapsed), style)
 end
 
 local function name_widget(name, style)
@@ -360,13 +367,20 @@ end
 
 -- Member timers cover the current/cumulative activation. Pending and idle
 -- members reserve the same quiet duration slot so sibling names stay aligned.
-local function actor_row_widget(actor_id, node, now_ms, selected)
+local function member_label(parent_id, actor_id)
+  local prefix = parent_id .. "."
+  if actor_id:sub(1, #prefix) == prefix then return actor_id:sub(#prefix + 1) end
+  return actor_id
+end
+M.member_label = member_label
+
+local function actor_row_widget(parent_id, actor_id, node, now_ms, selected)
   local style = selected and CURSOR_ROW_STYLE or NODE_STYLE[node.status] or STYLE.status_dim
   return tui.row { gap = 0, children = {
     text("  " .. (GLYPHS[node.status] or "·") .. " ", style),
     duration_widget(node_elapsed_ms(node, now_ms), style),
-    text(" " .. (node.status or "?") .. " ", style),
-    name_widget(actor_id, style),
+    text(" ", style),
+    name_widget(member_label(parent_id, actor_id), style),
   } }
 end
 
@@ -442,7 +456,7 @@ function M.row_model(state, now_ms)
             local stream = run_streams[m.id]
             local stale_text = actor_stale_text(m.node, stream, now_ms)
             append({
-              kind = "actor", run_id = run_id, actor_id = m.id,
+              kind = "actor", run_id = run_id, parent_id = g.name, actor_id = m.id,
               node = m.node, stream = stream,
             }, stale_text ~= nil and 2 or 1)
           end
@@ -493,7 +507,8 @@ local function panel_children(state, now_ms)
       children[#children + 1] = group_row_widget(row.group, now_ms, on_cursor)
     elseif row.kind == "actor" then
       local stale_text = actor_stale_text(row.node, row.stream, now_ms)
-      children[#children + 1] = actor_row_widget(row.actor_id, row.node, now_ms, on_cursor)
+      children[#children + 1] = actor_row_widget(
+        row.parent_id, row.actor_id, row.node, now_ms, on_cursor)
       if stale_text ~= nil then
         children[#children + 1] = tui.text {
           content = stale_text,

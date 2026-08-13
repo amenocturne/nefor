@@ -22,6 +22,23 @@ local function eq(actual, expected, message)
   end
 end
 
+local durations = {
+  { 0, "00s" }, { 999, "00s" }, { 1000, "01s" }, { 9000, "09s" },
+  { 99000, "99s" }, { 100000, "01m" }, { 5999000, "99m" },
+  { 6000000, "01h" }, { 359999000, "99h" }, { 360000000, "04d" },
+  { 99 * 86400000, "99d" }, { 1000 * 86400000, "99d" },
+}
+for _, case in ipairs(durations) do
+  eq(run_panel.fmt_elapsed_ms(case[1]), case[2], "fixed-width sidebar duration")
+end
+
+eq(run_panel.member_label("lead", "lead.entry"), "entry",
+  "member label is relative to its exact parent")
+eq(run_panel.member_label("lead", "leader.entry"), "leader.entry",
+  "similarly named unrelated ids retain their canonical label")
+eq(run_panel.member_label("lead", "other.lead.entry"), "other.lead.entry",
+  "arbitrary prefixes are not stripped")
+
 local state = { runs = {} }
 state = run_panel.mag_run_started(state, "run", "workflow", "lead", 0)
 state = run_panel.actor_spawned(state, "run", "worker.entry", "entry", 100)

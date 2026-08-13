@@ -2313,6 +2313,77 @@ fn mag_run_lifecycle_renders_in_run_panel() {
     );
 }
 
+#[test]
+fn workflow_sidebar_uses_compact_protected_row_grammar() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "grammar-run",
+            "run_name": "lead-界界界界界界界界界界界界界界" }),
+    );
+    for id in [
+        "lead.entry",
+        "lead.llm",
+        "lead.run-tool",
+        "lead.tool-result",
+        "result",
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "grammar-run", "id": id,
+                "factory": "fixture" }),
+        );
+    }
+    for id in ["lead.entry", "lead.run-tool", "lead.tool-result"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_ready", "run_id": "grammar-run", "id": id }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "grammar-run", "id": "lead.llm" }),
+    );
+    engine.advance_time(Duration::from_secs(120));
+
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select lead group");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("enter")).expect("unfold lead group");
+    let _ = render_str(&mut engine);
+    let snapshot = engine.snapshot();
+
+    for expected in [
+        " ● 02m lead (4)",
+        "   · 00s entry",
+        "   ● 02m llm",
+        "   · 00s run-tool",
+        "   · 00s tool-result",
+        " ○ 00s result",
+    ] {
+        assert!(
+            snapshot.contains(expected),
+            "missing protected compact row {expected:?}:\n{snapshot}"
+        );
+    }
+    assert!(
+        snapshot.contains("MAG 02m lead-")
+            && snapshot.contains("… (0/2)")
+            && !snapshot.contains("lead-界界界界界界界界界界界界界界"),
+        "long Unicode workflow name should end-ellipsize while preserving progress:\n{snapshot}"
+    );
+    for forbidden in [" idle ", " working ", "lead.entry", "lead.llm"] {
+        assert!(
+            !snapshot.contains(forbidden),
+            "sidebar must not expose {forbidden:?}:\n{snapshot}"
+        );
+    }
+}
+
 // A killed actor renders with its own glyph, distinct from a
 // failed/errored node. Under grouping, killing the group's members marks
 // the group row ⊗.
@@ -8919,12 +8990,12 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
     engine.handle_key(key("escape")).expect("escape");
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("[read-only]") && out.contains("worker.llm"),
+        !out.contains("[read-only]") && out.contains("● 00s llm"),
         "Esc must close the view and land back on the focused sidebar: {out:?}"
     );
     let cursor = cursor_styled_text(&out);
     assert!(
-        cursor.contains("worker.llm"),
+        cursor.contains("llm"),
         "cursor must be preserved on the actor row: {cursor:?}"
     );
     engine.handle_key(key("space")).expect("space");
@@ -8942,12 +9013,12 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("worker.llm"),
+        snap.contains("● 00s llm"),
         "fold state must survive handing focus back to the prompt:\n{snap}"
     );
     let cursor = cursor_styled_text(&engine.snapshot_ansi());
     assert!(
-        !cursor.contains("worker.llm"),
+        !cursor.contains("llm"),
         "the cursor highlight must leave with sidebar focus: {cursor:?}"
     );
     for ch in ["z", "q", "z"] {
@@ -9036,7 +9107,7 @@ fn workflow_rows_keep_semantic_fields_contiguous_across_sidebar_widths() {
             .find(|line| line.contains("MAG") && line.contains("lead"))
             .expect("workflow header");
         assert!(
-            header.contains("2s lead (1/3)"),
+            header.contains("02s lead (1/3)"),
             "duration, name, and progress must remain contiguous:\n{snapshot}"
         );
         let lead = rows
@@ -9044,7 +9115,7 @@ fn workflow_rows_keep_semantic_fields_contiguous_across_sidebar_widths() {
             .find(|line| line.contains('●') && line.contains("lead"))
             .expect("active group row");
         assert!(
-            lead.contains("2s lead (2)"),
+            lead.contains("02s lead (2)"),
             "active duration, name, and count must remain contiguous:\n{snapshot}"
         );
         let pending = rows
@@ -9052,7 +9123,7 @@ fn workflow_rows_keep_semantic_fields_contiguous_across_sidebar_widths() {
             .find(|line| line.contains('○') && line.contains("result"))
             .expect("pending group row");
         assert!(
-            pending.contains("– result"),
+            pending.contains("00s result"),
             "pending placeholder and name must remain contiguous:\n{snapshot}"
         );
         let unicode = rows
@@ -9060,7 +9131,7 @@ fn workflow_rows_keep_semantic_fields_contiguous_across_sidebar_widths() {
             .find(|line| line.contains('✓') && line.contains("tâche"))
             .unwrap_or_else(|| panic!("unicode completed group row:\n{snapshot}"));
         assert!(
-            unicode.contains("0ms tâche"),
+            unicode.contains("00s tâche"),
             "frozen duration and Unicode name must remain contiguous:\n{snapshot}"
         );
     };
@@ -9179,11 +9250,11 @@ fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
     );
     assert!(
         snap.lines()
-            .any(|line| line.contains("✓") && line.contains("0ms task")),
+            .any(|line| line.contains("✓") && line.contains("00s task")),
         "task must show its actual firing duration rather than the run lifetime:\n{snap}"
     );
     assert!(
-        snap.contains("●     0ms investigator") && snap.contains("○     – result"),
+        snap.contains("● 00s investigator") && snap.contains("○ 00s result"),
         "other nodes retain their independent running and pending states:\n{snap}"
     );
 
@@ -9223,11 +9294,11 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("  ●      5s working lead.llm"),
+        snap.contains("  ● 05s llm"),
         "the working member must tick its activation elapsed:\n{snap}"
     );
     assert!(
-        snap.contains("– pending lead.run-tool") && !snap.contains("pending 5"),
+        snap.contains("  ○ 00s run-tool") && !snap.contains("pending 5"),
         "a pending member must not tick:\n{snap}"
     );
 
@@ -9250,18 +9321,15 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("  ●      3s working lead.run-tool"),
+        snap.contains("  ● 03s run-tool"),
         "the newly-busy member ticks its OWN activation window:\n{snap}"
     );
     assert!(
-        snap.contains("idle lead.llm")
-            && !snap.contains("idle 3s")
-            && !snap.contains("idle 5s")
-            && !snap.contains("idle 8s"),
+        snap.contains("  · 00s llm") && !snap.contains(" idle "),
         "an idle member renders without a timer:\n{snap}"
     );
     assert!(
-        !snap.contains("working 8s"),
+        !snap.contains(" working "),
         "no member may tick the run's wall clock:\n{snap}"
     );
 
@@ -9280,7 +9348,7 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("  ●      2s working lead.llm"),
+        snap.contains("  ● 02s llm"),
         "a fresh activation must reset the member timer:\n{snap}"
     );
 
@@ -9299,12 +9367,12 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
         snap.contains("MAG")
             && snap.contains("loop")
             && snap.contains("(1/1)")
-            && snap.contains("✓     10s lead")
+            && snap.contains("✓ 10s lead")
             && snap.contains("(2)"),
         "the settled group must be done with a frozen firing window:\n{snap}"
     );
     assert!(
-        !snap.contains("working"),
+        !snap.contains(" working "),
         "no member is working between rounds:\n{snap}"
     );
 }
@@ -11287,7 +11355,7 @@ fn running_and_completed_workflow_rows_use_compact_durations() {
     let _ = render_str(&mut engine);
     let running = engine.snapshot();
     assert!(
-        running.contains("●   5m10s worker"),
+        running.contains("● 05m worker"),
         "running workflow row must stay compact:\n{running}"
     );
 
@@ -11298,7 +11366,7 @@ fn running_and_completed_workflow_rows_use_compact_durations() {
     let _ = render_str(&mut engine);
     let completed = engine.snapshot();
     assert!(
-        completed.contains("✓   5m10s worker"),
+        completed.contains("✓ 05m worker"),
         "completed workflow row must freeze the same compact duration:\n{completed}"
     );
 }
@@ -11482,7 +11550,7 @@ fn responsive_sidebar_protects_duration_progress_and_unicode_name_clipping() {
             .find(|line| line.contains("MAG"))
             .expect("workflow header");
         assert!(
-            header.contains("1m8s"),
+            header.contains("68s"),
             "duration missing at width {width}: {header}"
         );
         assert!(
@@ -11510,17 +11578,17 @@ fn responsive_sidebar_timers_tick_then_freeze_and_pending_slots_align() {
     engine.advance_time(Duration::from_secs(5));
     let active = render_snapshot(&mut engine);
     assert!(
-        active.contains("MAG      5s workflow"),
+        active.contains("MAG 05s workflow"),
         "active wall clock missing:\n{active}"
     );
     assert!(
         active
             .lines()
-            .any(|line| line.contains("●      5s") && line.contains("语")),
+            .any(|line| line.contains("● 05s") && line.contains("语")),
         "active child timer missing:\n{active}"
     );
     assert!(
-        active.contains("○     – pending-result"),
+        active.contains("○ 00s pending-result"),
         "pending duration slot missing:\n{active}"
     );
 
