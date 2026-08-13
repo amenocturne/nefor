@@ -443,7 +443,7 @@ local function popup_shell(title, header, body, unseen)
     header = header,
     child = body,
     footer = tui.text { content = (unseen and "* unseen output · " or "")
-      .. "Ctrl+O details · Up/Down PgUp/PgDn Home/End scroll · Esc/Q close · read-only",
+      .. "Ctrl+O details · Up/Down PgUp/PgDn Home/End scroll · Esc/Q close",
       style = unseen and STYLE.status_warn or STYLE.status_dim, wrap = "none" },
   })
 end
@@ -479,7 +479,7 @@ local function node_inspector(state, p, now_ms)
   local assignment = assignment_widget(state, p.run_id, group)
   local body = preview_view.node(state, p.run_id, p.actor_id, { hide_tool_streams = is_agent })
   if assignment then body = tui.column { gap = 1, children = { assignment, body } } end
-  return popup_shell("── node · " .. tostring(p.actor_id or "?") .. " [read-only] ──",
+  return popup_shell("── node · " .. tostring(p.actor_id or "?") .. " ──",
     header, body, p.unseen)
 end
 
@@ -521,7 +521,7 @@ local function aggregate_inspector(state, p, now_ms)
     activity_widget(last_ms, last_kind, false, now_ms),
     tui.text { content = string.rep("─", 48), style = STYLE.footer },
   } }
-  return popup_shell("── " .. label .. " [read-only] ──", header,
+  return popup_shell("── " .. label .. " ──", header,
     tui.column { gap = 1, children = children }, p.unseen)
 end
 
@@ -549,7 +549,7 @@ function M.node_inspector(state)
       tui.text { content = string.rep("─", 48), style = STYLE.footer },
     } }
     return popup_shell("── run · " .. run_ident_of(run, p.run_id)
-      .. " [read-only] ──", header, tui.column { gap = 1, children = children }, p.unseen)
+      .. " ──", header, tui.column { gap = 1, children = children }, p.unseen)
   end
   if p.actor_id then return node_inspector(state, p, now_ms) end
   return aggregate_inspector(state, p, now_ms)

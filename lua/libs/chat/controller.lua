@@ -1737,8 +1737,8 @@ local function route_keys_and_popups(msg, state)
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
   end
 
-  -- Node inspector: read-only, so dismiss, scroll, and the shared detail
-  -- toggle are the only verbs. Keeping Ctrl+O aligned with lead chat makes
+  -- Node inspector interaction is limited to dismiss, scroll, and the shared
+  -- detail toggle. Keeping Ctrl+O aligned with lead chat makes
   -- full reasoning/tool payloads deliberately accessible without making
   -- debug-shaped output the default.
   if state.popup and state.popup.variant == "node_inspector"

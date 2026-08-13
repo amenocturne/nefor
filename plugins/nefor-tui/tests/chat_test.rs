@@ -9003,7 +9003,7 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
 }
 
 #[test]
-fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt() {
+fn node_inspector_navigation_is_inert_and_closes_back_to_sidebar_then_prompt() {
     let mut engine = engine_with_scoped_worker();
 
     // Tab, unfold the worker group, land on the leaf (the helper renders
@@ -9013,7 +9013,10 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
     focus_worker_leaf(&mut engine);
     engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
-    assert!(out.contains("[read-only]"), "view should be open: {out:?}");
+    assert!(
+        out.contains("node · worker.llm"),
+        "view should be open: {out:?}"
+    );
     engine.take_emit_queue();
 
     // Keys that would type into the prompt (or approve a tool) do
@@ -9023,9 +9026,9 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
     }
     assert!(
         engine.take_emit_queue().is_empty(),
-        "keystrokes inside the read-only view must not emit envelopes"
+        "ordinary inspector keystrokes must not emit envelopes"
     );
-    // Read-only keypresses can still coincide with an elapsed-time repaint of
+    // Inert keypresses can still coincide with an elapsed-time repaint of
     // the workflow underlay. The empty emit queue above proves they had no
     // input effect; Esc below proves the inspector remains on top.
     let _ = render_str(&mut engine);
@@ -9035,7 +9038,7 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
     engine.handle_key(key("escape")).expect("escape");
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("[read-only]") && out.contains("● 00s llm"),
+        !out.contains("node · worker.llm") && out.contains("● 00s llm"),
         "Esc must close the view and land back on the focused sidebar: {out:?}"
     );
     let cursor = cursor_styled_text(&out);
@@ -9046,7 +9049,7 @@ fn node_inspector_navigation_is_read_only_and_closes_back_to_sidebar_then_prompt
     engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
     assert!(
-        out.contains("[read-only]"),
+        out.contains("node · worker.llm"),
         "Space must re-open the view for the preserved cursor row: {out:?}"
     );
 
@@ -10715,7 +10718,7 @@ fn tui_projects_generic_diagnostics_without_factory_specific_renderer() {
         "inspector must keep header above its flex body and pin the footer below it:\n{frame}"
     );
     assert!(
-        frame.contains("node · custom.node [read-only]"),
+        frame.contains("node · custom.node") && !frame.contains("[read-only]"),
         "shared shell identity missing:\n{frame}"
     );
     assert!(
@@ -10807,7 +10810,10 @@ fn completed_local_projection_remains_inspectable_and_bounded_to_latest_run() {
         .handle_key(key("space"))
         .expect("open retained completed run");
     let concise = render_snapshot(&mut engine);
-    assert!(concise.contains("run · preview-demo"), "{concise}");
+    assert!(
+        concise.contains("run · preview-demo") && !concise.contains("[read-only]"),
+        "completed run inspector title must not imply agent capabilities:\n{concise}"
+    );
     assert!(
         !concise.contains("RETAINED COMPLETED OUTPUT"),
         "details must remain progressive:\n{concise}"
@@ -11172,7 +11178,7 @@ fn appended_consumer_projection_does_not_steal_manual_scroll_position() {
 }
 
 #[test]
-fn node_inspector_is_read_only_and_escape_restores_sidebar_focus() {
+fn node_inspector_keeps_ordinary_keys_inert_and_escape_restores_sidebar_focus() {
     let mut engine = Engine::new(100, 26).expect("engine");
     load_chat_scenario(&mut engine);
     open_single_node(&mut engine, "readonly", "readonly.node");
@@ -11233,6 +11239,10 @@ fn agent_group_inspector_shows_its_initial_assignment() {
         .handle_key(key("space"))
         .expect("open group inspector");
     let snapshot = render_snapshot(&mut engine);
+    assert!(
+        snapshot.contains("group · worker") && !snapshot.contains("[read-only]"),
+        "group inspector title must not imply agent capabilities:\n{snapshot}"
+    );
     assert!(
         snapshot.contains("Initial assignment") && snapshot.contains("Implement the bounded fix."),
         "agent inspector must expose the task delegated by its lead:\n{snapshot}"
