@@ -60,12 +60,30 @@ pub fn spawn_plugin(spec: &PluginSpec) -> Result<Transport, BrokerError> {
     let exit = Box::pin(async move {
         match child.wait().await {
             Ok(status) if status.success() => ExitOutcome::CleanExit,
-            Ok(_) => ExitOutcome::Crash,
-            Err(_) => ExitOutcome::Unknown,
+            Ok(status) => exit_outcome(status),
+            Err(error) => ExitOutcome::Unknown {
+                reason: error.to_string(),
+            },
         }
     });
 
     Ok(stdio_transport(stdin, stdout, stderr, exit))
+}
+
+fn exit_outcome(status: std::process::ExitStatus) -> ExitOutcome {
+    if let Some(code) = status.code() {
+        return ExitOutcome::ExitCode(code);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return ExitOutcome::Signal(signal);
+        }
+    }
+
+    ExitOutcome::Crash
 }
 
 fn io_err(msg: &str) -> BrokerError {

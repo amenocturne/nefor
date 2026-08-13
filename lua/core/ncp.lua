@@ -56,7 +56,7 @@
 --
 -- Broker drains new tail entries through `M.dispatch(current_log)`:
 --   1. Skip Plugin entries — those are engine-injected synthetics
---      (`engine.plugin_failed`); they go through their own translation
+--      (typed process lifecycle facts); they go through their own translation
 --      below.
 --   2. Step entries are bus emissions. We decode the payload and
 --      accumulate per-peer batches; once the entire new-tail slice has
@@ -398,33 +398,33 @@ local function handle_engine_envelope(decoded)
   local body = decoded.body
   if type(body) ~= "table" or type(body.kind) ~= "string" then return end
 
-  if body.kind == "engine.plugin_failed" then
-    local chat_present = false
-    for _, name in ipairs(nefor.engine.plugins()) do
-      if name == "nefor-tui" then chat_present = true; break end
+  if body.kind == "engine.plugin_process_terminated" then
+    local outcome = body.outcome or {}
+    if outcome.kind ~= "clean_exit" then
+      local chat_present = false
+      for _, name in ipairs(nefor.engine.plugins()) do
+        if name == "nefor-tui" then chat_present = true; break end
+      end
+      if chat_present then
+        local detail = outcome.reason or outcome.code or outcome.signal or outcome.kind or "unknown"
+        local popup = engine_envelope({
+          kind    = "chat.popup",
+          level   = "error",
+          title   = "plugin stopped",
+          message = string.format("%s stopped (%s)", tostring(body.plugin or "<unknown>"), tostring(detail)),
+          source  = "engine",
+        }, "event")
+        if not ready_plugins["nefor-tui"] then
+          pending_chat_popups[#pending_chat_popups + 1] = popup
+        else
+          pcall(nefor.engine.deliver, "nefor-tui", encode(popup))
+        end
+      end
     end
-    if not chat_present then return end
 
-    local plugin = tostring(body.plugin or "<unknown>")
-    local phase  = tostring(body.phase  or "<unknown>")
-    local reason = tostring(body.reason or "<no reason>")
-    local popup = engine_envelope({
-      kind    = "chat.popup",
-      level   = "error",
-      title   = "plugin failed",
-      message = string.format("%s failed during %s: %s", plugin, phase, reason),
-      source  = "engine",
-    }, "event")
-
-    if not ready_plugins["nefor-tui"] then
-      pending_chat_popups[#pending_chat_popups + 1] = popup
-      return
-    end
-    -- Use deliver: the popup is targeted (only nefor-tui needs to see
-    -- it) and going through send would inflate the bus log with one
-    -- step entry per engine.plugin_failed.
-    pcall(nefor.engine.deliver, "nefor-tui", encode(popup))
+    return
   end
+
 end
 
 -- ------------------------------------------------------------------

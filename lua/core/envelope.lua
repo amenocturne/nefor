@@ -105,8 +105,8 @@ function M.emit_as(from, target, body)
         nefor.engine.send(popup_payload, peer)
       end
     end
-    if nefor.engine and type(nefor.engine.exit) == "function" then
-      nefor.engine.exit(1)
+    if nefor.engine and type(nefor.engine.shutdown) == "function" then
+      nefor.engine.shutdown { code = 1, reason = "composition requested shutdown", grace_ms = 2000 }
     end
     return
   end

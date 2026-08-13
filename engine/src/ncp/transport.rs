@@ -43,21 +43,24 @@ pub struct Transport {
 /// `tokio::process::Child::wait`.
 pub type ExitWatcher = Pin<Box<dyn std::future::Future<Output = ExitOutcome> + Send>>;
 
-/// How the plugin process ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+/// Closed account of how a plugin process ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitOutcome {
-    /// Clean exit with code 0.
+    /// Process exited successfully.
     CleanExit,
-    /// Non-zero exit code or signal. Broker logs the abnormal
-    /// termination.
+    /// Process returned a non-zero exit code.
+    ExitCode(i32),
+    /// Process was terminated by an operating-system signal.
+    Signal(i32),
+    /// Process ended unsuccessfully but the platform exposed neither code nor signal.
     Crash,
-    /// Engine-initiated close (we killed it because it didn't honour the
-    /// shutdown grace, etc.).
-    Evicted,
-    /// The broker couldn't observe the exit (wait failed). Treated as
-    /// crash for safety.
-    Unknown,
+    /// The process could not be spawned.
+    SpawnFailure { reason: String },
+    /// The process transport failed before a more specific process outcome was available.
+    #[allow(dead_code)]
+    TransportFailure { reason: String },
+    /// The engine could not observe the process outcome.
+    Unknown { reason: String },
 }
 
 /// Build a [`Transport`] from a `tokio::process::Child`'s stdio halves. Caller

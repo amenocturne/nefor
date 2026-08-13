@@ -114,16 +114,10 @@ pub trait EngineOps: Send + Sync {
     /// sends instead.
     fn plugins(&self) -> Vec<PluginName>;
 
-    /// Request engine shutdown with the given exit code. The implementation
-    /// signals the broker to wind down (closing every plugin connection's
-    /// outbound channel within the cooperative-shutdown grace) and stashes
-    /// the requested exit code so the caller can read it back after the
-    /// broker's run loop returns. Idempotent — first call wins.
-    ///
-    /// Default impl is a no-op so test recorders that don't care about
-    /// shutdown signalling stay terse. Production wires this to the
-    /// broker's shutdown handle + an `AtomicI32` exit-code slot.
-    fn request_exit(&self, _code: i32) {}
+    /// Request engine shutdown. The first request accepted by the broker owns
+    /// the exit code, reason, and one cooperative grace deadline; later
+    /// requests are ignored.
+    fn request_shutdown(&self, _code: i32, _reason: String, _grace_ms: u64) {}
 }
 
 /// Install `nefor.engine.send` onto `nefor_tbl`.
@@ -314,39 +308,37 @@ pub fn install_engine(
     })?;
     engine.set("plugins", plugins_fn)?;
 
-    // nefor.engine.exit(code?) — request a clean shutdown with the given
-    // exit code (defaults to 0). Broadcasts the cascade-close to every
-    // plugin's outbound queue, then the engine process terminates with
-    // the requested code once the broker's run loop unwinds.
-    let ops_for_exit = Arc::clone(&ops);
-    let exit_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
-        let code: i32 = match args.first() {
-            None | Some(Value::Nil) => 0,
-            Some(Value::Integer(i)) => i32::try_from(*i).map_err(|_| {
-                mlua::Error::runtime(format!("nefor.engine.exit: code {i} does not fit in i32"))
-            })?,
-            Some(Value::Number(n)) => {
-                if n.fract() != 0.0 {
-                    return Err(mlua::Error::runtime(format!(
-                        "nefor.engine.exit: code must be an integer (got {n})"
-                    )));
-                }
-                let i = *n as i64;
-                i32::try_from(i).map_err(|_| {
-                    mlua::Error::runtime(format!("nefor.engine.exit: code {i} does not fit in i32"))
-                })?
-            }
-            Some(other) => {
-                return Err(mlua::Error::runtime(format!(
-                    "nefor.engine.exit: code must be an integer or nil (got {})",
-                    other.type_name(),
-                )));
-            }
-        };
-        ops_for_exit.request_exit(code);
+    // nefor.engine.shutdown { code, reason, grace_ms } — composition-owned
+    // shutdown policy. All fields are explicit; the broker applies first-request
+    // semantics to the complete request.
+    let ops_for_shutdown = Arc::clone(&ops);
+    let shutdown_fn = lua.create_function(move |_, request: Table| {
+        let code = request
+            .get::<i64>("code")
+            .map_err(|_| mlua::Error::runtime("nefor.engine.shutdown: code must be an integer"))?;
+        let code = i32::try_from(code).map_err(|_| {
+            mlua::Error::runtime(format!(
+                "nefor.engine.shutdown: code {code} does not fit in i32"
+            ))
+        })?;
+        let reason = request
+            .get::<String>("reason")
+            .map_err(|_| mlua::Error::runtime("nefor.engine.shutdown: reason must be a string"))?;
+        if reason.is_empty() {
+            return Err(mlua::Error::runtime(
+                "nefor.engine.shutdown: reason must not be empty",
+            ));
+        }
+        let grace_ms = request.get::<i64>("grace_ms").map_err(|_| {
+            mlua::Error::runtime("nefor.engine.shutdown: grace_ms must be a non-negative integer")
+        })?;
+        let grace_ms = u64::try_from(grace_ms).map_err(|_| {
+            mlua::Error::runtime("nefor.engine.shutdown: grace_ms must be a non-negative integer")
+        })?;
+        ops_for_shutdown.request_shutdown(code, reason, grace_ms);
         Ok(())
     })?;
-    engine.set("exit", exit_fn)?;
+    engine.set("shutdown", shutdown_fn)?;
 
     nefor_tbl.set("engine", engine)?;
     Ok(())
@@ -361,7 +353,7 @@ mod tests {
         calls: Mutex<Vec<(SendTarget, String)>>,
         deliveries: Mutex<Vec<(PluginName, String)>>,
         plugins: Mutex<Vec<PluginName>>,
-        exit_code: Mutex<Option<i32>>,
+        shutdown_request: Mutex<Option<(i32, String, u64)>>,
         // When set, deliver() returns Err with this message — lets tests
         // exercise the error surface without needing a real broker.
         deliver_err: Mutex<Option<String>>,
@@ -373,7 +365,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 deliveries: Mutex::new(Vec::new()),
                 plugins: Mutex::new(Vec::new()),
-                exit_code: Mutex::new(None),
+                shutdown_request: Mutex::new(None),
                 deliver_err: Mutex::new(None),
             })
         }
@@ -394,8 +386,8 @@ mod tests {
             *self.deliver_err.lock().unwrap() = Some(msg.to_owned());
         }
 
-        fn exit_code(&self) -> Option<i32> {
-            *self.exit_code.lock().unwrap()
+        fn shutdown_request(&self) -> Option<(i32, String, u64)> {
+            self.shutdown_request.lock().unwrap().clone()
         }
     }
 
@@ -413,8 +405,8 @@ mod tests {
         fn plugins(&self) -> Vec<PluginName> {
             self.plugins.lock().unwrap().clone()
         }
-        fn request_exit(&self, code: i32) {
-            *self.exit_code.lock().unwrap() = Some(code);
+        fn request_shutdown(&self, code: i32, reason: String, grace_ms: u64) {
+            *self.shutdown_request.lock().unwrap() = Some((code, reason, grace_ms));
         }
     }
 
@@ -714,45 +706,27 @@ mod tests {
     }
 
     #[test]
-    fn engine_exit_default_code_is_zero() {
+    fn engine_shutdown_records_explicit_request() {
         let (lua, ops) = setup();
-        lua.load(r#"nefor.engine.exit()"#).exec().unwrap();
-        assert_eq!(ops.exit_code(), Some(0));
+        lua.load(
+            r#"nefor.engine.shutdown { code = 7, reason = "plugin exited", grace_ms = 2000 }"#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(
+            ops.shutdown_request(),
+            Some((7, "plugin exited".into(), 2000))
+        );
     }
 
     #[test]
-    fn engine_exit_explicit_code_is_recorded() {
-        let (lua, ops) = setup();
-        lua.load(r#"nefor.engine.exit(42)"#).exec().unwrap();
-        assert_eq!(ops.exit_code(), Some(42));
-    }
-
-    #[test]
-    fn engine_exit_nil_code_is_zero() {
-        let (lua, ops) = setup();
-        lua.load(r#"nefor.engine.exit(nil)"#).exec().unwrap();
-        assert_eq!(ops.exit_code(), Some(0));
-    }
-
-    #[test]
-    fn engine_exit_rejects_non_integer() {
+    fn engine_shutdown_rejects_incomplete_request() {
         let (lua, ops) = setup();
         let err = lua
-            .load(r#"nefor.engine.exit("oops")"#)
+            .load(r#"nefor.engine.shutdown { code = 0, grace_ms = 1 }"#)
             .exec()
-            .expect_err("string code must be rejected");
-        assert!(err.to_string().contains("must be an integer"));
-        assert_eq!(ops.exit_code(), None);
-    }
-
-    #[test]
-    fn engine_exit_rejects_fractional_number() {
-        let (lua, ops) = setup();
-        let err = lua
-            .load(r#"nefor.engine.exit(1.5)"#)
-            .exec()
-            .expect_err("fractional code must be rejected");
-        assert!(err.to_string().contains("must be an integer"));
-        assert_eq!(ops.exit_code(), None);
+            .expect_err("reason is required");
+        assert!(err.to_string().contains("reason"));
+        assert_eq!(ops.shutdown_request(), None);
     }
 }

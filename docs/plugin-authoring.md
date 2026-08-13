@@ -56,7 +56,31 @@ These are ordinary event data. NCP does not enforce them, and `body.to` is not a
 
 ### Lifecycle
 
-Stdin EOF/process termination is the shutdown signal. A plugin may publish a namespaced goodbye event before exiting, but the engine does not synthesize an NCP shutdown message. A subprocess exit normally cascades shutdown across the engine session.
+Rust reports every spawned-process termination to Lua as one
+`engine.plugin_process_terminated` fact with the composition-assigned plugin
+identity and a closed `outcome`: `clean_exit`, `exit_code`, `signal`, `crash`,
+`spawn_failure`, `transport_failure`, or `unknown`. Reporting is observational:
+it does not close peers or select which processes are essential.
+
+Composition requests engine shutdown explicitly with:
+
+```lua
+nefor.engine.shutdown {
+  code = 0,
+  reason = "operator requested shutdown",
+  grace_ms = 2000,
+}
+```
+
+The first request owns all three fields; later requests are ignored. The engine
+notifies Lua before honoring a shutdown requested in reaction to a process
+fact. During the single grace window, lifecycle subscribers and queued plugin
+writes run before stdin EOF; remaining connections are force-closed at the
+deadline. The shipped starter keeps its existing product behavior by requesting
+shutdown with a 2000 ms grace whenever any spawned plugin terminates.
+
+A plugin may publish a namespaced goodbye event before exiting, but the engine
+does not synthesize an NCP shutdown message.
 
 For restart/backoff, use an external supervisor or explicit wrapper. For a long-running daemon, spawn a small stdio bridge per engine session. Containers work when attached to stdin/stdout, for example:
 

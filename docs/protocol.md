@@ -59,4 +59,4 @@ Malformed JSON, invalid envelope type, event body that is not an object, unknown
 
 Ordinary live writer-queue overflow drops the oldest queued live line and is logged by the engine; no shipped protocol-level queue_overflow message is emitted. Explicit finite replay batches are lossless and do not make the live queue unbounded.
 
-The engine does not synthesize an NCP shutdown system message on normal peer departure. Shutdown is connection closure/cascade-close behavior coordinated by the engine and Lua composition. Plugins that want to announce departure may publish an ordinary plugin-authored goodbye event before exiting.
+The engine does not synthesize an NCP shutdown system message. Rust reports an `engine.plugin_process_terminated` lifecycle fact to Lua; composition may then request `nefor.engine.shutdown` explicitly. The starter requests shutdown for every such fact. Plugins that want to announce departure may publish an ordinary plugin-authored goodbye event before exiting.

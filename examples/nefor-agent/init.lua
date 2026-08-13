@@ -52,10 +52,28 @@ local lead_role      = require("libs.lead-workflow.role")
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
+  local entry = current_log[#current_log]
+  if entry and entry.origin == "engine" then
+    local ok, decoded = pcall(nefor.json.decode, entry.payload)
+    local body = ok and type(decoded) == "table" and decoded.body or nil
+    if type(body) == "table" and body.kind == "engine.plugin_process_terminated" then
+      plugin_process_terminated(body)
+    end
+  end
 end
 
 function invoke_from_plugin(source, payload)
   ncp.invoke_from_plugin(source, payload)
+end
+
+-- Starter lifecycle policy: every spawned-process termination ends this
+-- composition. Rust reports the fact before invoking this callback.
+function plugin_process_terminated(fact)
+  nefor.engine.shutdown {
+    code = 0,
+    reason = "plugin " .. tostring(fact.plugin) .. " terminated",
+    grace_ms = 2000,
+  }
 end
 
 actor.install()
@@ -294,7 +312,7 @@ if startup.prompt ~= nil then
     on_error = function(message)
       io.stderr:write("nefor: " .. message .. "\n")
       io.stderr:flush()
-      nefor.engine.exit(1)
+      nefor.engine.shutdown { code = 1, reason = "composition requested shutdown", grace_ms = 2000 }
     end,
   }
 end

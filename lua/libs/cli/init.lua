@@ -38,7 +38,7 @@
 -- there's no way to wait for events while holding the VM. We sidestep
 -- that: in REPL mode, the canonical terminal callback reads the next line.
 -- The "loop" is a chain of in-process callbacks. EOF on read_line ends
--- the session via `nefor.engine.exit(0)`.
+-- the session via `nefor.engine.shutdown { code = 0, reason = "composition requested shutdown", grace_ms = 2000 }`.
 --
 -- See module's `--help` text for the full flag table.
 
@@ -303,7 +303,7 @@ local function wait_until_ready(on_ready)
     on_ready = on_ready,
     on_error = function(message)
       write_stderr("agentic-cli: " .. message .. "\n")
-      nefor.engine.exit(1)
+      nefor.engine.shutdown { code = 1, reason = "composition requested shutdown", grace_ms = 2000 }
     end,
   }
 end
@@ -355,7 +355,7 @@ local function run_single_shot(prompt, format, state, turn_start_ms, gate)
     end
     -- stream-json: nothing extra; the run-close tool.result already
     -- passed through the bus subscription.
-    nefor.engine.exit(0)
+    nefor.engine.shutdown { code = 0, reason = "composition requested shutdown", grace_ms = 2000 }
   end
 
   state.on_terminal = function(_turn_id, status, answer, terminal)
@@ -428,7 +428,7 @@ local function run_repl(format, state, gate)
     if line == nil then
       -- EOF — exit cleanly.
       write_stderr("\n")
-      nefor.engine.exit(0)
+      nefor.engine.shutdown { code = 0, reason = "composition requested shutdown", grace_ms = 2000 }
       return
     end
     reset_json_state()
@@ -455,12 +455,12 @@ function M.run(argv)
   if parse_err then
     write_stderr("agentic-cli: " .. parse_err .. "\n\n")
     write_stderr(USAGE)
-    nefor.engine.exit(2)
+    nefor.engine.shutdown { code = 2, reason = "composition requested shutdown", grace_ms = 2000 }
     return 2
   end
   if opts.help then
     write_stdout(USAGE)
-    nefor.engine.exit(0)
+    nefor.engine.shutdown { code = 0, reason = "composition requested shutdown", grace_ms = 2000 }
     return 0
   end
 
@@ -468,14 +468,14 @@ function M.run(argv)
   -- prompt yet).
   if opts.file ~= nil and opts.prompt == nil then
     write_stderr("agentic-cli: -f/--file requires a positional PROMPT\n")
-    nefor.engine.exit(2)
+    nefor.engine.shutdown { code = 2, reason = "composition requested shutdown", grace_ms = 2000 }
     return 2
   end
   if opts.file ~= nil then
     local prompt, err = build_prompt_with_file(opts.prompt, opts.file)
     if err then
       write_stderr("agentic-cli: " .. err .. "\n")
-      nefor.engine.exit(1)
+      nefor.engine.shutdown { code = 1, reason = "composition requested shutdown", grace_ms = 2000 }
       return 1
     end
     opts.prompt = prompt

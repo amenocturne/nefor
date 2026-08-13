@@ -26,6 +26,7 @@ Lua owns behavior that is composition-specific or bus-aware:
 - Provider/tool adapters and interface reducers.
 - Chat event/key sequencing through `libs.chat.controller`, assembled from named handler groups with `libs.chat.dispatch`. The starter supplies its command handler as one visible group; consumers can use the defaults, wrap or replace a handler with an explicit duplicate policy, or bypass the controller and use `nefor-tui` primitives directly.
 - MAG submission/control and workspace management.
+- Plugin process lifecycle policy. Rust reports typed termination facts with authoritative plugin identity; composition decides whether a fact warrants `nefor.engine.shutdown { code, reason, grace_ms }`. The first shutdown request owns the complete request and its single cooperative grace window.
 
 Pure reusable mechanisms live under `lua/core` or `lua/libs`; example opinions and concrete wiring live under `examples/nefor-agent`.
 

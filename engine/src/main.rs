@@ -16,7 +16,7 @@
 //!      the named virtual or hybrid plugin's `cli` function, invoke it
 //!      with the leftover argv. The broker continues running afterwards
 //!      so registered `nefor.bus.on_event` handlers receive events; the
-//!      cli function (or a handler) calls `nefor.engine.exit(code)` to
+//!      cli function (or a handler) calls `nefor.engine.shutdown { code, reason, grace_ms }` to
 //!      shut down.
 //!
 //! Per D-02 the engine is pure glue: no plugins registered → log a message
@@ -177,13 +177,12 @@ async fn run_serve(
     spawn_specs(&mut broker, &specs);
 
     let abnormal_exits = broker.abnormal_exits_handle();
+    let (exit_code, exit_requested) = broker.requested_exit_code_handle();
     let shutdown = broker.shutdown_handle();
     let ctrl_c_task = tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             tracing::info!("ctrl_c received; requesting broker shutdown");
-            shutdown
-                .shutdown(crate::ncp::broker::DEFAULT_SHUTDOWN_GRACE_MS)
-                .await;
+            shutdown.shutdown(2000).await;
         }
     });
 
@@ -203,6 +202,10 @@ async fn run_serve(
             "nefor: plugin '{name}' exited abnormally ({code}); see {} for details",
             log_path.display()
         );
+    }
+
+    if exit_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        std::process::exit(exit_code.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     Ok(())
@@ -234,7 +237,7 @@ fn run_plugin_list(plugins: SharedPluginRegistry) -> anyhow::Result<()> {
 }
 
 /// `nefor plugin <name> [args...]` — boot, spawn, then call the named
-/// `cli` function. Subsequent broker work continues until `engine.exit`.
+/// `cli` function. Subsequent broker work continues until `engine.shutdown`.
 async fn run_plugin_dispatch(
     host: LuaHost,
     plugins: SharedPluginRegistry,
@@ -262,15 +265,13 @@ async fn run_plugin_dispatch(
     let ctrl_c_task = tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             tracing::info!("ctrl_c received; requesting broker shutdown");
-            shutdown
-                .shutdown(crate::ncp::broker::DEFAULT_SHUTDOWN_GRACE_MS)
-                .await;
+            shutdown.shutdown(2000).await;
         }
     });
 
     // The cli function runs synchronously before the broker enters its
     // run loop. The broker drives step (and on_event handlers)
-    // afterwards; engine.exit signals the shutdown handle and stashes
+    // afterwards; engine.shutdown signals the shutdown handle and stashes
     // the requested exit code which we propagate to process::exit.
     let exit_code = broker.run_with_cli_dispatch(&name, &argv).await;
     ctrl_c_task.abort();
@@ -344,19 +345,12 @@ fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec]) {
                     error = %e,
                     "failed to spawn plugin"
                 );
-                // Surface the spawn failure to the bus so step can translate
-                // it into a user-visible notification (e.g. a chat.popup).
-                let code = match &e {
-                    crate::ncp::BrokerError::Spawn { .. } => "spawn_failed",
-                    crate::ncp::BrokerError::Io(_) => "io_error",
-                };
-                broker.queue_engine_envelope(serde_json::json!({
-                    "kind":   "engine.plugin_failed",
-                    "plugin": spec.name.as_str(),
-                    "phase":  "spawn",
-                    "reason": e.to_string(),
-                    "code":   code,
-                }));
+                broker.queue_process_fact(
+                    spec.name.clone(),
+                    crate::ncp::transport::ExitOutcome::SpawnFailure {
+                        reason: e.to_string(),
+                    },
+                );
             }
         }
     }
