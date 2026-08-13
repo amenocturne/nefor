@@ -17,7 +17,6 @@ Global options:
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--config <DIR>`         | Configuration directory containing `init.lua`.                                |
 | `--data-dir <DIR>`       | Writable runtime data root.                                                   |
-| `--installation-id <ID>` | Distribution generation recorded in provenance; also `NEFOR_INSTALLATION_ID`. |
 | `--plugin-dir <DIR>`     | Runtime plugin executable root.                                               |
 | `-h`, `--help`           | Engine help.                                                                  |
 | `-V`, `--version`        | Build version.                                                                |

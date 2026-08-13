@@ -122,7 +122,7 @@ Before the project has public compatibility guarantees, compatibility is only
 promised within one minor line: `0.y.x` remains compatible with `0.y.0`.
 Cross-minor config, wire-format, and old-session compatibility is not promised.
 Keep the originating distribution available when an old session matters; see
-[session provenance](../../../docs/session-provenance.md).
+[session documentation](sessions.md).
 
 ## Nix or Home Manager behaves differently
 

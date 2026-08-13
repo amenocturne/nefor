@@ -45,10 +45,6 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", global = true)]
     pub data_dir: Option<PathBuf>,
 
-    /// Full installed-distribution generation ID recorded in session provenance.
-    #[arg(long, value_name = "ID", global = true, env = "NEFOR_INSTALLATION_ID")]
-    pub installation_id: Option<String>,
-
     /// Override the plugin root directory (highest precedence; beats
     /// `NEFOR_PLUGIN_DIR` and the XDG / dev fallbacks).
     #[arg(long, value_name = "DIR", global = true)]
@@ -219,6 +215,13 @@ mod tests {
             engine_mode_from_cli(&cli),
             EngineMode::PluginDispatch { .. }
         ));
+    }
+
+    #[test]
+    fn engine_rejects_removed_installation_id_flag() {
+        let err = Cli::try_parse_from(["nefor", "--installation-id", "generation"])
+            .expect_err("parse err");
+        assert!(err.to_string().contains("unexpected argument"), "{err}");
     }
 
     #[test]

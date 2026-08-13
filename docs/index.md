@@ -16,8 +16,6 @@ interfaces, providers, and tools are composition or plugin concerns.
   Lua/plugin convention layered over the string bus.
 - [Plugin authoring](plugin-authoring.md) — subprocess contract and composition
   wrappers.
-- [Session provenance](session-provenance.md) — distribution identity for
-  persisted sessions.
 - [Glossary](glossary.md) — project terminology.
 
 ## Explore and compose

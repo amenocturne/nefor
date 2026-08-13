@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nefor::events::EventBus;
@@ -18,13 +18,6 @@ const SESSION_ID: &str = "cooperative-resume";
 const REPLAY_ENTRIES: usize = 130;
 const REPLAY_MESSAGES: usize = 42;
 const CONVERSATION_ID: &str = "cooperative-conversation";
-
-fn install_fixture_identity() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        std::env::set_var("NEFOR_INSTALLATION_ID", "test:cooperative-session-resume");
-    });
-}
 
 fn format_replay_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -49,24 +42,9 @@ fn lua_string(path: &Path) -> String {
     serde_json::to_string(&path.display().to_string()).expect("path is JSON-encodable")
 }
 
-fn write_session_metadata(sessions_dir: &Path, session_id: &str) {
-    let session_dir = sessions_dir.join(session_id);
-    std::fs::create_dir_all(&session_dir).expect("create session metadata directory");
-    std::fs::write(
-        session_dir.join("metadata.json"),
-        serde_json::to_string_pretty(&json!({
-            "created_with": "fixture-installation",
-            "installation_history": ["fixture-installation"],
-        }))
-        .expect("serialize session metadata"),
-    )
-    .expect("write session metadata");
-}
-
 fn write_empty_session_fixture(data_dir: &Path, session_id: &str) {
     let sessions_dir = data_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("create sessions fixture directory");
-    write_session_metadata(&sessions_dir, session_id);
     std::fs::write(sessions_dir.join(format!("{session_id}.jsonl")), "")
         .expect("write empty session fixture");
 }
@@ -74,7 +52,6 @@ fn write_empty_session_fixture(data_dir: &Path, session_id: &str) {
 fn write_session_fixture(data_dir: &Path) {
     let sessions_dir = data_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("create sessions fixture directory");
-    write_session_metadata(&sessions_dir, SESSION_ID);
     let mut lines = vec![serde_json::to_string(&json!({
         "_session": true,
         "session_id": SESSION_ID,
@@ -286,7 +263,6 @@ fn dispatch_to_tui(tui: &mut TuiEngine, envelope: &JsonValue) {
 
 #[tokio::test]
 async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
-    install_fixture_identity();
     let root = repo_root();
     let data_dir = TempDir::new().expect("engine data tempdir");
     let tui_data_dir = TempDir::new().expect("TUI data tempdir");
@@ -575,7 +551,6 @@ async fn cooperative_resume_rebuilds_tui_across_multiple_replay_chunks() {
 
 #[test]
 fn switching_sessions_between_chunks_cancels_the_stale_replay() {
-    install_fixture_identity();
     let root = repo_root();
     let data_dir = TempDir::new().expect("engine data tempdir");
     write_session_fixture(data_dir.path());

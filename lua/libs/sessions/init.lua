@@ -460,17 +460,6 @@ local function do_resume(target_session_id, show_loading, request_id)
     transition_failed("resume", request_id, target_session_id, tostring(err))
     return nil
   end
-  local committed = nefor.fs.session_commit_resume(acquired.lease)
-  if not committed or not committed.ok then
-    fh:close()
-    local message = committed and committed.error or "unknown error"
-    if nefor.log then nefor.log.error("sessions.resume: failed to record provenance", {
-      session_id = target_session_id, error = message,
-    }) end
-    transition_failed("resume", request_id, target_session_id, message)
-    return nil
-  end
-
   cancel_replay()
   if state.current_session_id then
     send_msg({ kind = "control", event = "sessions.session_end",

@@ -158,7 +158,6 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/empty/lead-workflow-test"));
     nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir))?;
-    std::env::set_var("NEFOR_INSTALLATION_ID", "test-generation");
 
     let log_tbl = lua.create_table()?;
     let no_op: Function = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;

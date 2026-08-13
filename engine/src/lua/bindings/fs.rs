@@ -59,15 +59,6 @@ pub(crate) fn install_fs_with_sessions_root(
         lua.create_function(move |_, _: ()| Ok(data_root_string.clone()))?,
     )?;
 
-    fs_tbl.set(
-        "installation_id",
-        lua.create_function(|_, _: ()| {
-            Ok(std::env::var("NEFOR_INSTALLATION_ID")
-                .ok()
-                .filter(|value| !value.is_empty()))
-        })?,
-    )?;
-
     let session_root = resolve_session_root(&data_root, configured_sessions_root);
     let session_root_string = session_root.to_string_lossy().into_owned();
     fs_tbl.set(
@@ -79,45 +70,17 @@ pub(crate) fn install_fs_with_sessions_root(
     fs_tbl.set(
         "session_create",
         lua.create_function(move |lua, id: String| {
-            let installation_id = std::env::var("NEFOR_INSTALLATION_ID").map_err(|_| {
-                mlua::Error::runtime("NEFOR_INSTALLATION_ID is required to create sessions")
-            })?;
             session_result(
                 lua,
-                session_store::create_session(&create_session_root, &id, &installation_id),
+                session_store::create_session(&create_session_root, &id),
             )
-        })?,
-    )?;
-
-    fs_tbl.set(
-        "session_commit_resume",
-        lua.create_function(|lua, lease: AnyUserData| {
-            let installation_id = std::env::var("NEFOR_INSTALLATION_ID").map_err(|_| {
-                mlua::Error::runtime("NEFOR_INSTALLATION_ID is required to resume sessions")
-            })?;
-            let mut handle = lease.borrow_mut::<LuaSessionHandle>()?;
-            let table = lua.create_table()?;
-            match handle.handle.commit_resume(&installation_id) {
-                Ok(()) => table.set("ok", true)?,
-                Err(error) => {
-                    table.set("ok", false)?;
-                    table.set("error", error.to_string())?;
-                }
-            }
-            Ok(table)
         })?,
     )?;
 
     fs_tbl.set(
         "session_resume",
         lua.create_function(move |lua, id: String| {
-            let installation_id = std::env::var("NEFOR_INSTALLATION_ID").map_err(|_| {
-                mlua::Error::runtime("NEFOR_INSTALLATION_ID is required to resume sessions")
-            })?;
-            session_result(
-                lua,
-                session_store::resume_session(&session_root, &id, &installation_id),
-            )
+            session_result(lua, session_store::resume_session(&session_root, &id))
         })?,
     )?;
 

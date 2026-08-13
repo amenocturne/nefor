@@ -2,14 +2,9 @@ default:
     @just --list
 
 # Launch the nefor TUI against this exact checkout (debug build).
-# This is explicit live-checkout development: provenance records the current
-# commit plus `-dirty` when tracked or untracked checkout content differs.
 run:
     #!/usr/bin/env bash
     set -euo pipefail
-    dirty=""
-    if [ -n "$(git -C '{{justfile_directory()}}' status --porcelain)" ]; then dirty="-dirty"; fi
-    export NEFOR_INSTALLATION_ID="development:$(git -C '{{justfile_directory()}}' rev-parse --verify 'HEAD^{commit}')$dirty"
     export RUST_LOG=debug
     export NEFOR_DEV_DIR="{{justfile_directory()}}"
     export NEFOR_CONFIG_DIR="{{justfile_directory()}}/examples/nefor-agent"

@@ -54,7 +54,7 @@ nefor
 
 ## Runtime root contract
 
-Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-managed Nefor checkout. The starter and chat runtime load Lua and plugin support only from that root (with copied binaries selected separately through `NEFOR_PLUGIN_DIR`). The starter registers those already-materialized module roots in-memory and does not create package-manager links or lockfiles. `NEFOR_DEV_DIR` is the sole live-checkout override and is intended for explicit in-repository development such as `just run`; that recipe records `development:<full HEAD>` provenance with a `-dirty` suffix whenever the checkout differs from the commit. Source-repository registry fields and filesystem proximity are never runtime roots.
+Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-managed Nefor checkout. The starter and chat runtime load Lua and plugin support only from that root (with copied binaries selected separately through `NEFOR_PLUGIN_DIR`). The starter registers those already-materialized module roots in-memory and does not create package-manager links or lockfiles. `NEFOR_DEV_DIR` is the sole live-checkout override and is intended for explicit in-repository development such as `just run`. Source-repository registry fields and filesystem proximity are never runtime roots.
 
 ## Customize
 
@@ -64,8 +64,6 @@ Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-m
 - **Switch provider/model**: edit the `providers` list in `config/init.lua`. `mock-plugin` is spawned out of the box and is the default provider for deterministic startup. `chatgpt` and `ollama` are opt-in via `NEFOR_ENABLE_CHATGPT=1` and `NEFOR_ENABLE_OLLAMA=1` (or by editing `config/init.lua`). Pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.
 - **Compact ChatGPT context**: `/compact` asks ChatGPT’s native Responses compaction endpoint to seal the conversation so far. Later turns restore that compacted context into their fresh provider chats; switching provider or model falls back to the full local transcript.
 - **Inspect ChatGPT quota**: `/usage` shows both quota windows and reset times. When the active provider advertises usage support, the footer keeps a compact available-capacity gauge such as `◔ 34% until 14:30`.
-
-Session provenance, the shared-session-root contract, and the required installed-distribution generation ID are documented in [`docs/session-provenance.md`](../../docs/session-provenance.md).
 
 ## Example guides
 

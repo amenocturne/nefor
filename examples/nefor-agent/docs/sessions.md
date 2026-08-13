@@ -34,11 +34,9 @@ A session replacement resets session-scoped semantic and UI state, not every Lua
 
 Malformed or non-replayable rows are skipped rather than converted into promises about recovery. A failed target open does not intentionally abandon the current session, but command-level failures are primarily logged and are not a migration facility.
 
-## One writer, shared roots, and provenance
+## One writer and shared roots
 
 A session should have **one active writer**. Stable and edge installations may share `NEFOR_SESSIONS_DIR`, but the current implementation adds no synchronization for opening the same session in two processes. Concurrent writers can corrupt assumptions even if both processes appear healthy.
-
-Installed distributions record an opaque installation generation in `metadata.json` as `created_with` plus ordered `installation_history`. This records custody, not compatibility. Successful resume appends the active generation after opening; failed resume does not.
 
 Nefor's pre-public compatibility policy guarantees compatibility only within one minor line (`0.y.x` with `0.y.0`). Across minor lines, session wire/layout compatibility is not guaranteed; an old session failing to resume after `0.y → 0.y+1` is acceptable. There is no promised automatic migration, downgrade path, cross-minor repair, retention period, cloud sync, or export mechanism.
 

@@ -73,9 +73,6 @@ async fn main() -> anyhow::Result<()> {
     unsafe {
         std::env::set_var("NEFOR_CONFIG_DIR", config_dir.as_path());
         std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
-        if let Some(installation_id) = &args.installation_id {
-            std::env::set_var("NEFOR_INSTALLATION_ID", installation_id);
-        }
     }
 
     // Resolve and propagate NEFOR_PLUGIN_DIR so init.lua's `bin()` helper
@@ -150,30 +147,11 @@ async fn main() -> anyhow::Result<()> {
 
     let init_lua = config_dir.as_path().join("init.lua");
     if init_lua.exists() {
-        match host.load_init(&init_lua).await {
-            Ok(()) => {
-                tracing::info!(path = %init_lua.display(), "init.lua loaded");
-            }
-            Err(lua::LuaError::InitLuaExec { source, location }) => match location {
-                Some(loc) => tracing::error!(
-                    at = %loc,
-                    error = %source,
-                    "init.lua execution error (continuing with partial state)",
-                ),
-                None => tracing::error!(
-                    path = %init_lua.display(),
-                    error = %source,
-                    "init.lua execution error (continuing with partial state)",
-                ),
-            },
-            Err(other) => {
-                tracing::error!(
-                    path = %init_lua.display(),
-                    error = %other,
-                    "failed to load init.lua",
-                );
-            }
-        }
+        host.load_init(&init_lua)
+            .await
+            .map_err(NeforError::from)
+            .with_context(|| format!("loading {}", init_lua.display()))?;
+        tracing::info!(path = %init_lua.display(), "init.lua loaded");
     } else {
         eprintln!(
             "nefor: no init.lua found at {}. \
