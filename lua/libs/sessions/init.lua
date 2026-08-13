@@ -232,6 +232,11 @@ local function persist_envelope(entry)
   if ok and type(decoded) == "table" and type(decoded.body) == "table" then
     local kind = decoded.body.kind
     if type(kind) == "string" and kind:sub(1, 9) == "sessions." then return end
+    -- Permission mode is process/session-scoped runtime authority, not
+    -- conversation history. Persisting either the request or the gate's UI
+    -- announcement lets a later replay project stale authority that the fresh
+    -- gate process does not hold.
+    if kind == "tool-gate.set_mode" or kind == "tool-gate.mode_changed" then return end
     if type(kind) == "string" and kind:sub(1, 13) == "conversation." then
       local canonical = kind == "conversation.fact.recorded"
         and decoded.from == "conversation-manager"

@@ -1672,6 +1672,10 @@ end
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     teardown_for_session_end()
+    -- Modes are session-scoped authority. A session switch must reset the
+    -- live gate rather than letting the previous session's process state leak
+    -- across the boundary; explicit startup mode is applied separately.
+    set_mode("safe")
   end)
   -- Replay is chunked; settle the restored conversation only after the whole
   -- resume, never at each chunk boundary.

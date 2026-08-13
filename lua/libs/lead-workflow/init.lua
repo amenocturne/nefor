@@ -2053,6 +2053,7 @@ end
 -- Bus subscriptions — session lifecycle.
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(entry)
+    state.gate_mode = "safe"
     local session_id
     if type(entry) == "table" and type(entry.payload) == "string" then
       local ok, decoded = pcall(json.decode, entry.payload)

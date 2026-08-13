@@ -627,6 +627,7 @@ local function handle_session_start(msg, state)
   end
   return shallow_merge(state, {
     session_id = msg.session_id,
+    gate_mode = "safe",
     runs = runs,
     node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
     conversation_id = NIL_SENTINEL,

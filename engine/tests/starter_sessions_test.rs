@@ -84,6 +84,10 @@ fn jsonl_excludes_session_control_events() {
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.session_end", session_id = "x" }))
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.session_start", session_id = "y" }))
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.resume_done", session_id = "y" }))
+        -- Runtime permission authority and its presentation acknowledgement are
+        -- session/process-local, never replay input.
+        sessions_test._persist_envelope(entry("nefor-tui", { kind = "tool-gate.set_mode", mode = "yolo" }))
+        sessions_test._persist_envelope(entry("tool-gate", { kind = "tool-gate.mode_changed", mode = "yolo" }))
         -- Another normal entry.
         sessions_test._persist_envelope(entry("ollama", { kind = "chat.message.append", role = "user", text = "hi" }))
         -- Conversation-manager uses a single event-sourcing boundary. Commands,

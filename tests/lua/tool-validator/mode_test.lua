@@ -85,6 +85,13 @@ do
   assert_eq(calls[1].decision, "deny", "auto forbidden decision is deny")
 end
 
+-- Session switches revoke process-local mode authority.
+do
+  fresh("yolo")
+  feed({ kind = "sessions.session_end", session_id = "old-session" })
+  assert_eq(tv._internals.get_mode(), "safe", "session end resets validator mode")
+end
+
 -- yolo: defensive approve if a prompt-mode request reaches the validator.
 do
   fresh("yolo")

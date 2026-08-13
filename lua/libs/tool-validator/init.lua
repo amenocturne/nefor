@@ -378,6 +378,10 @@ local function build(opts)
     local evt = event.decode(entry)
     if evt == nil then return end
     local body = evt.body
+    if evt.kind == "sessions.session_end" then
+      gate_mode = "safe"
+      return
+    end
     if evt.kind == "tool-gate.mode_changed" then
       set_mode(body.mode)
       return

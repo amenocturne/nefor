@@ -192,15 +192,19 @@ do
   local replay_window = require("core.replay_window")
   replay_window.install()
   _test.set_plugins({ "ollama", "mag", "nefor-tui" })
+  agentic_loop.set_mode("yolo")
   _test.calls_clear()
   _test.fire_bus("sessions.session_end", {})
+  local reset_mode
   for _, c in ipairs(_test.calls()) do
     local ok, decoded = pcall(json.decode, c.payload)
     if ok and type(decoded) == "table" and type(decoded.body) == "table" then
       assert(decoded.body.kind ~= "chat.reset",
         "session_end must NOT broadcast chat.reset — would wipe sibling chat histories on the provider, breaking later /resume")
+      if decoded.body.kind == "tool-gate.set_mode" then reset_mode = decoded.body.mode end
     end
   end
+  assert_eq(reset_mode, "safe", "session end revokes the previous session's mode authority")
 end
 
 -- Replay-window gating flips on the framing markers.
