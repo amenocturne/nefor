@@ -235,11 +235,14 @@ async fn cancel_aborts_inflight_completion_and_provider_serves_next() {
     let _ = auth.apply_auth_set("test-token".into()).await;
     let catalog = Arc::new(ToolCatalog::new());
     let broker = Arc::new(ToolBroker::new());
-    let responses_client = Arc::new(ResponsesClient::new(
-        format!("http://{addr}"),
-        "test-installation".into(),
-        "nefor_test".into(),
-    ));
+    let responses_client = Arc::new(
+        ResponsesClient::new(
+            format!("http://{addr}"),
+            "test-installation".into(),
+            "nefor_test".into(),
+        )
+        .expect("client"),
+    );
 
     let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(256);
     let ctx = DispatcherContext::new(args, chats, auth, catalog, broker, responses_client, out_tx);
@@ -440,11 +443,14 @@ async fn invalid_direct_completion_tools_fail_once_before_http() {
         auth,
         catalog,
         Arc::new(ToolBroker::new()),
-        Arc::new(ResponsesClient::new(
-            format!("http://{addr}"),
-            "test-installation".into(),
-            "nefor_test".into(),
-        )),
+        Arc::new(
+            ResponsesClient::new(
+                format!("http://{addr}"),
+                "test-installation".into(),
+                "nefor_test".into(),
+            )
+            .expect("client"),
+        ),
         out_tx,
     );
     let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
@@ -552,11 +558,14 @@ async fn concurrent_direct_completions_keep_request_local_tool_allowlists() {
         auth,
         catalog,
         Arc::new(ToolBroker::new()),
-        Arc::new(ResponsesClient::new(
-            format!("http://{addr}"),
-            "test-installation".into(),
-            "nefor_test".into(),
-        )),
+        Arc::new(
+            ResponsesClient::new(
+                format!("http://{addr}"),
+                "test-installation".into(),
+                "nefor_test".into(),
+            )
+            .expect("client"),
+        ),
         out_tx,
     );
     let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);
@@ -669,11 +678,14 @@ async fn clean_eof_requires_terminal_event_and_next_submissions_settle() {
         auth,
         Arc::new(ToolCatalog::new()),
         Arc::new(ToolBroker::new()),
-        Arc::new(ResponsesClient::new(
-            format!("http://{addr}"),
-            "test-installation".into(),
-            "nefor_test".into(),
-        )),
+        Arc::new(
+            ResponsesClient::new(
+                format!("http://{addr}"),
+                "test-installation".into(),
+                "nefor_test".into(),
+            )
+            .expect("client"),
+        ),
         out_tx,
     );
     let (in_tx, in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(64);

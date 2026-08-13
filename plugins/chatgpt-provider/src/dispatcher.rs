@@ -4026,7 +4026,8 @@ mod tests {
         )
         .await
         .expect("auth");
-        let client = ResponsesClient::new(
+        let client = ResponsesClient::with_http(
+            reqwest::Client::builder().build().expect("HTTP client"),
             format!("http://{addr}"),
             "installation".into(),
             "test".into(),

@@ -223,7 +223,8 @@ async fn structured_request_reaches_local_responses_server_with_explicit_object_
         format!("http://{addr}"),
         "test-installation".into(),
         "nefor_test".into(),
-    );
+    )
+    .expect("client");
     let mut turn = ResponsesTurnContext::new("session", "thread");
     let mut response = client
         .stream(&request, &auth, &mut turn)
@@ -308,7 +309,8 @@ async fn native_compaction_posts_current_request_shape_and_accepts_output_wrappe
         format!("http://{addr}"),
         "test-installation".into(),
         "nefor_test".into(),
-    );
+    )
+    .expect("client");
     let request = CompactRequest {
         model: "gpt-5.6-sol".into(),
         instructions: String::new(),
@@ -392,7 +394,8 @@ async fn native_compaction_accepts_legacy_bare_item_list() {
         format!("http://{addr}"),
         "test-installation".into(),
         "nefor_test".into(),
-    );
+    )
+    .expect("client");
     let request = CompactRequest {
         model: "gpt-5.6-sol".into(),
         instructions: String::new(),
@@ -484,7 +487,8 @@ async fn native_compaction_v2_posts_responses_trigger_and_accepts_streamed_item(
         format!("http://{addr}"),
         "installation".into(),
         "test".into(),
-    );
+    )
+    .expect("client");
     let mut request = minimal_request();
     request.model = "gpt-5.6-sol".into();
     let specs = vec![chatgpt_provider::catalog::ToolSpec {

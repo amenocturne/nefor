@@ -2,12 +2,12 @@
 
 nefor runs as a small engine plus user-owned Lua composition. The shipped starter layers MAG, providers, tools, approvals, sessions, and interfaces on top of that substrate; those choices are replaceable composition, not engine behavior.
 
-| Layer                         | What it owns                                                                                                                                                       | What it avoids                                                                                               |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| Engine / bus                  | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp. | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals.      |
-| Plugins                       | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors.                                                        | Cross-plugin policy or hard-coded knowledge of how another plugin is used.                                   |
-| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces.                         | Heavy provider/tool implementation that belongs in a process plugin.                                         |
-| MAG                           | Pure namespaced evaluation; libraries define typed graph data, foreign capabilities, validation, and lowering into a generic `Artifact`.                           | Knowing actors, factories, shell, sinks, or Nefor wire types; those live in libraries and runtime contracts. |
+| Layer                         | What it owns                                                                                                                                                                                                                                               | What it avoids                                                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Engine / bus                  | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp.                                                                                         | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals.      |
+| Plugins                       | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors. Provider plugins own HTTPS policy and construct clients through `nefor-provider-http`, which adds native system roots to bundled WebPKI roots. | Cross-plugin policy or hard-coded knowledge of how another plugin is used. The engine has no TLS policy.     |
+| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces.                                                                                                                 | Heavy provider/tool implementation that belongs in a process plugin.                                         |
+| MAG                           | Pure namespaced evaluation; libraries define typed graph data, foreign capabilities, validation, and lowering into a generic `Artifact`.                                                                                                                   | Knowing actors, factories, shell, sinks, or Nefor wire types; those live in libraries and runtime contracts. |
 
 ## The decoupling rule
 
@@ -38,6 +38,17 @@ The example deliberately separates durable meaning from transient execution:
 - `lua/libs/agentic-loop` orchestrates the current lead turn. It queues input, starts the configured MAG turn program, manages ephemeral provider chats, and coordinates interruption and compaction requests. Its queue and active-turn bookkeeping are process state, not a competing conversation record.
 
 This split keeps replay authoritative without making the conversation manager responsible for live workflow scheduling. Surface reducers render conversation-manager projections and separately observe transient workflow state.
+
+## Provider HTTPS trust
+
+Network-owning Rust providers construct HTTPS clients through the
+`nefor-provider-http` crate. It preserves reqwest/rustls's bundled WebPKI public
+roots and adds certificates loaded from the platform trust store (including
+macOS Keychain roots). Individual native entries which the platform loader
+rejects are counted and logged without certificate contents; if loading yields
+no certificates and reports errors, provider startup fails visibly. Hostname
+and certificate-chain validation remain enabled. This is provider mechanism,
+not engine or Lua policy, and there is no custom-PEM configuration surface.
 
 ## Control plane
 

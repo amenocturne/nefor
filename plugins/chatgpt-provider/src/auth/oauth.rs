@@ -268,7 +268,7 @@ pub async fn exchange_code_for_tokens(
         urlencoding::encode(&pkce.code_verifier),
     );
 
-    let client = reqwest::Client::new();
+    let client = nefor_provider_http::client()?;
     let resp = client
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")

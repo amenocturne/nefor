@@ -42,7 +42,7 @@ pub async fn revoke_tokens(refresh_token: &RefreshToken) -> Result<(), ChatgptEr
         token_type_hint: "refresh_token",
         client_id: CLIENT_ID,
     };
-    let client = reqwest::Client::new();
+    let client = nefor_provider_http::client()?;
     let resp = client
         .post(REVOKE_URL)
         .header("Content-Type", "application/json")
@@ -94,10 +94,13 @@ pub async fn refresh_tokens_at(
         refresh_token: &tokens.refresh_token.0,
     };
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(REFRESH_CONNECT_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let builder = if token_url.starts_with("http://") {
+        // Local/test endpoints do not enter the TLS trust boundary.
+        reqwest::Client::builder()
+    } else {
+        nefor_provider_http::client_builder()?.0
+    };
+    let client = builder.connect_timeout(REFRESH_CONNECT_TIMEOUT).build()?;
     let resp = post_refresh_with_retry(&client, &body, token_url).await?;
 
     let status = resp.status();

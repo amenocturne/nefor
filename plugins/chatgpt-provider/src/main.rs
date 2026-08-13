@@ -102,7 +102,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
         args.base_url.clone(),
         installation_id,
         DEFAULT_ORIGINATOR.to_string(),
-    ));
+    )?);
 
     emit_startup_events(&args, &auth, &chats, &responses_client, &out_tx).await?;
 

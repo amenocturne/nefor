@@ -205,17 +205,24 @@ pub struct ResponsesClient {
 }
 
 impl ResponsesClient {
-    pub fn new(base_url: String, installation_id: String, originator: String) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+    pub fn new(
+        base_url: String,
+        installation_id: String,
+        originator: String,
+    ) -> Result<Self, ChatgptError> {
+        let (builder, roots) = nefor_provider_http::client_builder()?;
+        tracing::info!(
+            native_roots = roots.loaded,
+            rejected_native_roots = roots.rejected,
+            "provider HTTPS trust initialized"
+        );
+        let http = builder.connect_timeout(CONNECT_TIMEOUT).build()?;
+        Ok(Self {
             http,
             base_url,
             installation_id,
             originator,
-        }
+        })
     }
 
     /// Variant that lets the caller bring their own `reqwest::Client`

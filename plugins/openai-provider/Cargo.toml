@@ -19,6 +19,7 @@ path = "src/main.rs"
 nefor-protocol = { path = "../../crates/nefor-protocol" }
 nefor-plugin-sdk = { path = "../../crates/nefor-plugin-sdk" }
 nefor-sse = { path = "../../crates/nefor-sse" }
+nefor-provider-http = { path = "../../crates/nefor-provider-http" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

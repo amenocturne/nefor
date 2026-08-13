@@ -116,10 +116,15 @@ async fn main() {
 
 async fn run() -> Result<(), LlmError> {
     let config = Config::from_args();
-    let client = reqwest::Client::builder()
+    let (client_builder, roots) = nefor_provider_http::client_builder()?;
+    tracing::info!(
+        native_roots = roots.loaded,
+        rejected_native_roots = roots.rejected,
+        "provider HTTPS trust initialized"
+    );
+    let client = client_builder
         .connect_timeout(Duration::from_secs(10))
-        .build()
-        .expect("reqwest client build");
+        .build()?;
 
     let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);

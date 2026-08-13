@@ -3,6 +3,8 @@
 #[derive(Debug, thiserror::Error)]
 pub enum ChatgptError {
     #[error(transparent)]
+    ProviderHttp(#[from] nefor_provider_http::ProviderHttpError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error("HTTP transport error: {0}")]

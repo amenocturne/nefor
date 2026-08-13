@@ -1,0 +1,20 @@
+[package]
+name = "nefor-provider-http"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared HTTPS client construction for Nefor provider plugins"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-rustls = "0.26"
+rcgen = "0.13"
