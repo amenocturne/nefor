@@ -248,6 +248,9 @@ async fn native_compaction_posts_current_request_shape_and_accepts_output_wrappe
             };
             let headers = String::from_utf8_lossy(&bytes[..header_end]);
             assert!(headers.starts_with("POST /responses/compact HTTP/1.1"));
+            assert!(headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("accept: text/event-stream")));
             let content_length = headers
                 .lines()
                 .find_map(|line| {
@@ -317,6 +320,161 @@ async fn native_compaction_posts_current_request_shape_and_accepts_output_wrappe
         .compact(&request, &auth, &turn)
         .await
         .expect("compact");
+    server.await.expect("server");
+    assert_eq!(
+        compacted,
+        vec![ResponseItem::Compaction {
+            encrypted_content: "sealed".into()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn native_compaction_accepts_legacy_bare_item_list() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.expect("read request");
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            assert!(headers.starts_with("POST /responses/compact HTTP/1.1"));
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|length| length.parse::<usize>().ok())
+                })
+                .expect("content length");
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        let body = r#"[{"type":"compaction_summary","encrypted_content":"legacy"}]"#;
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let auth = AuthSnapshot {
+        tokens: Some(TokenData {
+            id_token: "test-id".into(),
+            access_token: AccessToken("test-access".into()),
+            refresh_token: RefreshToken("test-refresh".into()),
+            account_id: None,
+        }),
+        state: AuthState::Connected,
+        source: Some(TokenSource::AuthSet),
+    };
+    let client = ResponsesClient::new(
+        format!("http://{addr}"),
+        "test-installation".into(),
+        "nefor_test".into(),
+    );
+    let request = CompactRequest {
+        model: "gpt-5.6-sol".into(),
+        instructions: String::new(),
+        input: vec![ResponseItem::Message {
+            role: "user".into(),
+            content: vec![MessageContent::InputText { text: "Hi".into() }],
+        }],
+        tools: vec![],
+        parallel_tool_calls: false,
+        reasoning: None,
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+    };
+    let turn = ResponsesTurnContext::new("session", "thread");
+    let compacted = client
+        .compact(&request, &auth, &turn)
+        .await
+        .expect("compact");
+    server.await.expect("server");
+    assert!(matches!(
+        &compacted[..],
+        [ResponseItem::CompactionSummary { encrypted_content: Some(content), .. }]
+            if content == "legacy"
+    ));
+}
+
+#[tokio::test]
+async fn native_compaction_v2_posts_responses_trigger_and_accepts_streamed_item() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.expect("read request");
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            assert!(headers.starts_with("POST /responses HTTP/1.1"));
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|length| length.parse::<usize>().ok())
+                })
+                .expect("content length");
+            if bytes.len() < header_end + 4 + content_length {
+                continue;
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&bytes[header_end + 4..header_end + 4 + content_length])
+                    .expect("request JSON");
+            assert_eq!(request["model"], "gpt-5.6-sol");
+            assert_eq!(request["input"][0]["type"], "message");
+            assert_eq!(request["input"][1], json!({"type": "compaction_trigger"}));
+            assert_eq!(request["stream"], true);
+            assert_eq!(request["store"], false);
+            break;
+        }
+        let body = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"sealed\"},\"output_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n";
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let auth = AuthSnapshot {
+        tokens: Some(TokenData {
+            id_token: "test-id".into(),
+            access_token: AccessToken("test-access".into()),
+            refresh_token: RefreshToken("test-refresh".into()),
+            account_id: None,
+        }),
+        state: AuthState::Connected,
+        source: Some(TokenSource::AuthSet),
+    };
+    let client = ResponsesClient::new(
+        format!("http://{addr}"),
+        "installation".into(),
+        "test".into(),
+    );
+    let mut request = minimal_request();
+    request.model = "gpt-5.6-sol".into();
+    request.input.push(ResponseItem::CompactionTrigger {});
+    let mut turn = ResponsesTurnContext::new("session", "thread");
+    let compacted = client
+        .compact_v2(&request, &auth, &mut turn)
+        .await
+        .expect("compact v2");
     server.await.expect("server");
     assert_eq!(
         compacted,

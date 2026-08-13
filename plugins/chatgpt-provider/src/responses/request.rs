@@ -143,6 +143,13 @@ pub enum ResponseItem {
     Compaction {
         encrypted_content: String,
     },
+    CompactionTrigger {},
+    ContextCompaction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     CompactionSummary {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

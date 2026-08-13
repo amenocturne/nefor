@@ -507,6 +507,49 @@ impl ResponsesClient {
         Ok(parsed.models)
     }
 
+    /// POST `{base_url}/responses` with the native compaction trigger and
+    /// return the single opaque compaction item from the SSE response.
+    pub async fn compact_v2(
+        &self,
+        request: &ResponsesApiRequest,
+        auth: &AuthSnapshot,
+        turn: &mut ResponsesTurnContext,
+    ) -> Result<Vec<ResponseItem>, ChatgptError> {
+        let mut stream = self.stream(request, auth, turn).await?;
+        let mut compacted = Vec::new();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                ResponseEvent::OutputItemDone {
+                    item: item @ ResponseItem::Compaction { .. },
+                    ..
+                }
+                | ResponseEvent::OutputItemDone {
+                    item:
+                        item @ ResponseItem::ContextCompaction {
+                            encrypted_content: Some(_),
+                            ..
+                        },
+                    ..
+                } => compacted.push(item),
+                ResponseEvent::Completed { .. } => completed = true,
+                _ => {}
+            }
+        }
+        if !completed {
+            return Err(ChatgptError::ResponsesStreamParse(
+                "compaction stream closed before response.completed".into(),
+            ));
+        }
+        if compacted.len() != 1 {
+            return Err(ChatgptError::ResponsesStreamParse(format!(
+                "compaction response expected one supported compaction item, got {}",
+                compacted.len()
+            )));
+        }
+        Ok(compacted)
+    }
+
     /// POST `{base_url}/responses/compact` and return the native
     /// compacted Responses items. ChatGPT's Codex backend historically
     /// returned the compacted item list directly; the public API wraps

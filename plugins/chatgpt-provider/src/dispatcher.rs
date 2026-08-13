@@ -36,9 +36,7 @@ use crate::responses::request::{
     Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest, TextControls,
 };
 use crate::responses::stream::ResponseEvent;
-use crate::responses::{
-    CompactRequest, ModelEntry, ResponsesClient, ResponsesTurnContext, UsageSnapshot,
-};
+use crate::responses::{ModelEntry, ResponsesClient, ResponsesTurnContext, UsageSnapshot};
 use crate::state::{
     ChatId, ChatStats, Chats, ChatsError, Message, MessageRestore, ToolCall, ToolCallFunction,
     TurnToken,
@@ -513,6 +511,10 @@ fn chat_compaction_commit_body(
     );
     let encrypted = compacted_items.iter().any(|item| match item {
         ResponseItem::Compaction { .. } => true,
+        ResponseItem::ContextCompaction {
+            encrypted_content: Some(_),
+            ..
+        } => true,
         ResponseItem::CompactionSummary {
             encrypted_content, ..
         } => encrypted_content.is_some(),
@@ -2174,7 +2176,7 @@ async fn compact_chat(
     });
     let conversation_id = logical_routing_id(snapshot.conversation_id.as_deref(), chat_id);
     let provider_routing = provider_routing_identity(&conversation_id);
-    let response_turn = ResponsesTurnContext::new(
+    let mut response_turn = ResponsesTurnContext::new(
         provider_routing.session_id,
         provider_routing.thread_id.clone(),
     );
@@ -2199,13 +2201,19 @@ async fn compact_chat(
     }
     let auth_snap = ctx.auth.snapshot().await;
 
-    let req = CompactRequest {
+    let mut input = translated.input;
+    input.push(ResponseItem::CompactionTrigger {});
+    let req = ResponsesApiRequest {
         model: snapshot.model.clone(),
         instructions: translated.instructions,
-        input: translated.input,
+        input,
         tools: tools_json,
+        tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning,
+        store: false,
+        stream: true,
+        include: vec![],
         service_tier: None,
         prompt_cache_key: Some(provider_routing.thread_id),
         text: None,
@@ -2220,7 +2228,7 @@ async fn compact_chat(
             .await?;
             return Ok(());
         }
-        result = ctx.responses_client.compact(&req, &auth_snap, &response_turn) => result,
+        result = ctx.responses_client.compact_v2(&req, &auth_snap, &mut response_turn) => result,
     };
 
     let compacted = match compacted {
