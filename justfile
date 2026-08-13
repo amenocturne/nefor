@@ -98,6 +98,8 @@ test-tui-scenarios:
       tui-driver run-script "$scenario" \
         --repo-root "{{ justfile_directory() }}" \
         --artifacts-dir "{{ justfile_directory() }}/tmp/tui-driver-artifacts" \
+        --env "NEFOR_DEV_DIR={{ justfile_directory() }}" \
+        --env "NEFOR_CONFIG_DIR={{ justfile_directory() }}/examples/nefor-agent" \
         --env "NEFOR_DATA_DIR=$data_dir" \
         --env NEFOR_DEFAULT_PROVIDER=mock-plugin \
         --env NEFOR_DEFAULT_MODEL=mock-model \
