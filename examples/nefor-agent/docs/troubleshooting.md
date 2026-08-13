@@ -37,9 +37,13 @@ nefor --version
 For Homebrew, use `brew --prefix` and `brew doctor` to diagnose the package
 manager's command path.
 
-## Plugins fail to spawn or the engine cannot resolve a plugin root
+## Plugin commands are missing or fail to spawn
 
-A runtime binary and its plugin set are missing or from different layouts.
+The active Lua distribution could not materialize a command, or the command it
+registered does not match the installed layout. The engine does not resolve a
+plugin root or discover plugin inventory; it executes the exact command arrays
+registered by `init.lua`.
+
 Avoid pointing `NEFOR_EXECUTABLE_ROOT` at the Lua source overlay under
 `~/.local/share/nefor/plugins`; source installs place executables in
 `~/.local/share/nefor/bin`.
@@ -108,8 +112,8 @@ cd /path/to/project
 nefor
 ```
 
-Changing the config or plugin directory does not change the tools' working
-directory.
+Changing the config path or distribution-selected executable root does not
+change the tools' working directory.
 
 ## An update did not change my starter behavior
 

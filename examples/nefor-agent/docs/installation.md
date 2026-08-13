@@ -95,20 +95,23 @@ nefor --config /path/to/config --data-dir /path/to/data \
 
 ## Paths and precedence
 
-| Purpose                      | Override                                                               | Default                                           |
-| ---------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------- |
-| Config containing `init.lua` | `--config`, then `NEFOR_CONFIG_DIR`                                    | `$XDG_CONFIG_HOME/nefor`, or `~/.config/nefor`    |
-| Writable runtime data        | `--data-dir`, then `NEFOR_DATA_DIR`                                    | `$XDG_DATA_HOME/nefor`, or `~/.local/share/nefor` |
-| Sessions                     | `NEFOR_SESSIONS_DIR`                                                   | `<data-dir>/sessions`                             |
-| Plugin binaries              | Lua distribution helper (`NEFOR_EXECUTABLE_ROOT` override)                   | source installs use `~/.local/share/nefor/bin`    |\n| Aggregate log file           | `NEFOR_LOG_STDERR`; otherwise `--log-file`, then `NEFOR_LOG_FILE`             | `<data-dir>/logs/nefor.log`                       |\n\n`NEFOR_LOG_STDERR` takes precedence over file paths when set to a non-empty value. Explicit file paths are used as selected, including relative paths; the engine creates their parent directories and does not relocate them under the data directory.
+| Purpose                      | Override                                                                    | Default                                           |
+| ---------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------- |
+| Config containing `init.lua` | `--config`, then `NEFOR_CONFIG_DIR`                                         | `$XDG_CONFIG_HOME/nefor`, or `~/.config/nefor`    |
+| Writable runtime data        | `--data-dir`, then `NEFOR_DATA_DIR`                                         | `$XDG_DATA_HOME/nefor`, or `~/.local/share/nefor` |
+| Sessions                     | `NEFOR_SESSIONS_DIR`                                                        | `<data-dir>/sessions`                             |
+| Plugin binaries              | Lua distribution helper; `NEFOR_EXECUTABLE_ROOT` override                   | source installs use `~/.local/share/nefor/bin`    |
+| Aggregate log file           | non-empty `NEFOR_LOG_STDERR`; otherwise `--log-file`, then `NEFOR_LOG_FILE` | `<data-dir>/logs/nefor.log`                       |
+
+`NEFOR_LOG_STDERR` takes precedence over every file choice. Explicit file paths are used as selected, including relative paths; the engine creates their parent directories and does not relocate them under the data directory.
 
 `NEFOR_DEV_DIR` is a deliberate live-checkout override used by `just run`, not a
 normal installed-user setting. Installed distributions may set
 `NEFOR_RUNTIME_ROOT` to their immutable runtime checkout.
 
-The engine writes `nefor.log` in the resolved config directory. Provider data,
-including ChatGPT OAuth state when that provider is used, belongs under the
-resolved data directory.
+The engine writes aggregate logs to `<data-dir>/logs/nefor.log` by default.
+Provider data, including ChatGPT OAuth state when that provider is used, belongs
+under the resolved data directory.
 
 ## Updating
 

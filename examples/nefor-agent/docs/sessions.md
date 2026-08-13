@@ -7,6 +7,8 @@ The starter opens a session at startup. It delays creating a JSONL file until th
 1. `NEFOR_SESSIONS_DIR`, when set;
 2. otherwise `$NEFOR_DATA_DIR/sessions` (with Nefor's normal data-root default).
 
+The starter—not Rust—selects this root before initializing `libs.sessions`. The engine exposes generic filesystem primitives but carries no session ID, root, persistence, resume, or replay API. Changing the composition-selected root therefore preserves the same session mechanism without adding session awareness to the engine.
+
 A persisted session can include:
 
 ```text

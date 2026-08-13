@@ -79,7 +79,7 @@ pub fn install_plugins(
                 let hint = match removed {
                     "args" => "put args inside the command array, e.g. command = { binary, \"--flag\", \"value\" }",
                     "env" => "set env vars in a wrapper script and invoke that script as the command",
-                    "cwd" => "the engine always uses <plugin-dir>/<name>/ as cwd; use a wrapper script if you need a different one",
+                    "cwd" => "plugin commands inherit the engine working directory; use a wrapper script if you need a different one",
                     // Safety: the `for` loop iterates a fixed 3-element array;
                     // every element is handled by the branches above.
                     _ => unreachable!(),

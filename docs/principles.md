@@ -60,7 +60,7 @@ Every piece of state that carries meaning — errors, kinds, reasons, codes, mod
 
 The engine binary has two relevant subsystems:
 
-- **Runner** — resolves plugin binaries, starts declared subprocesses with direct Command::new(binary).args(...), bridges stdio, and detects exit. It does not invoke a shell, set per-plugin cwd, or parse NCP.
+- **Runner** — starts the exact command registered by Lua with direct `Command::new(binary).args(...)`, bridges stdio, and detects exit. It does not discover binaries or installation layouts, invoke a shell, set per-plugin cwd, or parse NCP.
 - **Broker** — receives raw plugin lines, appends Lua-published emissions to an in-memory log, drains that log through Lua dispatch, and writes direct deliveries to plugin stdin. It does not own NCP envelope parsing, session jsonl, ready timeouts, queue-overflow protocol messages, or shutdown system messages.
 
 Lua's NCP framework owns ready/ready_ok, event classification, default routing, replay-on-attach, and direct error replies.

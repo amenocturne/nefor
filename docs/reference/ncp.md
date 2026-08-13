@@ -8,9 +8,9 @@ NCP connects subprocesses. Lua actors and MAG actors are different in-process ab
 
 A plugin is an OS subprocess whose stdin and stdout carry one complete JSON value per line. Stdout is bus traffic; stderr is logging.
 
-The engine starts `command[0]` directly and passes the remaining strings as argv. It does not invoke a shell or provide per-plugin cwd/environment maps. Children inherit the engine cwd and environment, including resolved `NEFOR_CONFIG_DIR` and `NEFOR_DATA_DIR`. Executable resolution is owned by Lua/distribution code. Use an explicit wrapper for shell features, environment setup, another cwd, supervision, or daemon bridging.
+The engine starts `command[0]` directly and passes the remaining strings as argv. It does not invoke a shell, provide per-plugin cwd/environment maps, discover a plugin directory, inspect manifests, or attach installation provenance. Children inherit the engine cwd and environment, including resolved `NEFOR_CONFIG_DIR` and `NEFOR_DATA_DIR`. Executable and immutable-runtime resolution—including packaged offline closure—is owned by Lua/distribution code. Use an explicit wrapper for shell features, environment setup, another cwd, supervision, or daemon bridging.
 
-There is no NCP shutdown message synthesized on ordinary departure. Rust reports process termination to Lua as `engine.plugin_process_terminated`; connection closure happens only when composition explicitly requests engine shutdown (or every process has already ended).
+There is no NCP shutdown message synthesized on ordinary departure. Rust reports each spawned-process termination to Lua as a typed `engine.plugin_process_terminated` fact with the composition-assigned plugin identity and outcome; reporting is observational and does not request shutdown. Lua decides whether and when to call `nefor.engine.shutdown`. The starter calls it for every termination fact with a 2000 ms grace, preserving cascade shutdown. Otherwise, connection closure occurs only after an explicit shutdown request or when every process has already ended.
 
 ## Authored and delivered forms
 

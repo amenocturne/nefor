@@ -713,8 +713,8 @@ local function test_spawn_rejects_cwd_field_with_hint()
   local err = assert_spawn_errors_with(
     { name = "p", command = { "/bin/echo" }, cwd = "/tmp" },
     "unknown field 'cwd'", "cwd field rejected")
-  assert_true(err:find("<plugin-dir>/<name>", 1, true) ~= nil,
-    "cwd hint mentions plugin-dir/name policy")
+  assert_true(err:find("inherit the engine working directory", 1, true) ~= nil,
+    "cwd hint names inherited engine working directory")
 end
 
 local function test_spawn_rejects_unknown_field()

@@ -23,6 +23,8 @@ Use `NEFOR_DEV_DIR` only for live source development. Installed distributions sh
 
 Config-local modules precede shared runtime modules on `package.path`. The starter then registers already-materialized module directories with `nefor-pm`; immutable distributions should do the same rather than creating mutable lock state.
 
+The engine consumes none of these roots. It executes the explicit command arrays the composition registers and carries no plugin directory, discovery, manifest, or installation-provenance state. The distribution helper must therefore resolve every executable and runtime source before spawn.
+
 ## Installer channels
 
 From a source checkout:

@@ -739,7 +739,7 @@ function M.spawn(cfg)
       elseif k == "args" then
         hint = "ncp.spawn: unknown field 'args'; put args inside the command array, e.g. `command = { binary, \"--flag\", \"value\" }`"
       elseif k == "cwd" then
-        hint = "ncp.spawn: unknown field 'cwd'; the engine always uses <plugin-dir>/<name>/ as cwd"
+        hint = "ncp.spawn: unknown field 'cwd'; plugin commands inherit the engine working directory"
       else
         hint = "ncp.spawn: unknown field '" .. tostring(k) .. "'"
       end

@@ -37,14 +37,17 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 `nefor` resolves config and writable data directories via XDG-style env vars, with CLI flags taking highest precedence. Plugin commands and immutable runtime source are selected by Lua/distribution helpers:
 
-| Env var              | CLI flag       | Default                    | Holds                                                                                                        |
-| -------------------- | -------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `NEFOR_DEV_DIR`      | —              | (unset)                    | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `examples/nefor-agent/` from here first |
-| `NEFOR_LOCAL_DIR`    | —              | (unset)                    | installed-config local checkout override — lets pm use an unpushed local repo instead of fetching GitHub     |
-| `NEFOR_CONFIG_DIR`   | `--config`     | `$XDG_CONFIG_HOME/nefor`   | `init.lua`                                                                                                   |
-| `NEFOR_DATA_DIR`     | `--data-dir`   | `$XDG_DATA_HOME/nefor`     | writable runtime data other than sessions                                                                    |
-| `NEFOR_SESSIONS_DIR` | —              | `$NEFOR_DATA_DIR/sessions` | composition-selected root for session event logs and MAG trees                                               |
-| `NEFOR_PLUGIN_DIR`   | —              | `$NEFOR_DATA_DIR/plugins`  | binaries (resolved by Lua distribution composition)                                                         |\n| `NEFOR_LOG_FILE`     | `--log-file`   | `$NEFOR_DATA_DIR/logs/nefor.log` | aggregate engine, plugin, and Lua log; `NEFOR_LOG_STDERR` selects stderr                               |
+| Env / launcher input    | CLI flag     | Default                          | Owner / purpose                                                                                        |
+| ----------------------- | ------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `NEFOR_CONFIG_DIR`      | `--config`   | `$XDG_CONFIG_HOME/nefor`         | Engine-selected directory containing `init.lua`                                                        |
+| `NEFOR_DATA_DIR`        | `--data-dir` | `$XDG_DATA_HOME/nefor`           | Engine-selected writable data root                                                                     |
+| `NEFOR_LOG_FILE`        | `--log-file` | `$NEFOR_DATA_DIR/logs/nefor.log` | Engine aggregate log destination; non-empty `NEFOR_LOG_STDERR` takes precedence over every file choice |
+| `NEFOR_SESSIONS_DIR`    | —            | `$NEFOR_DATA_DIR/sessions`       | Starter composition-selected session event-log and MAG root                                            |
+| `NEFOR_DEV_DIR`         | —            | (unset)                          | Starter distribution's live-checkout override                                                          |
+| `NEFOR_RUNTIME_ROOT`    | —            | distribution-managed             | Starter distribution's immutable Lua/runtime source root                                               |
+| `NEFOR_EXECUTABLE_ROOT` | —            | distribution-managed             | Starter distribution's plugin-command root                                                             |
+
+The engine executes the exact commands registered by Lua. It has no plugin directory, discovery, manifest, or installation-provenance model; those are distribution concerns.
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 

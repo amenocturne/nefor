@@ -13,12 +13,13 @@ nefor [GLOBAL_OPTIONS] plugin <NAME> [PLUGIN_ARG ...]
 
 Global options:
 
-| Option                   | Meaning                                                                       |
-| ------------------------ | ----------------------------------------------------------------------------- |
-| `--config <DIR>`         | Configuration directory containing `init.lua`.                                |
-| `--data-dir <DIR>`       | Writable runtime data root.                                                   |\n| `--log-file <PATH>`      | Exact aggregate log file path.                                                |
-| `-h`, `--help`           | Engine help.                                                                  |
-| `-V`, `--version`        | Build version.                                                                |
+| Option              | Meaning                                        |
+| ------------------- | ---------------------------------------------- |
+| `--config <DIR>`    | Configuration directory containing `init.lua`. |
+| `--data-dir <DIR>`  | Writable runtime data root.                    |
+| `--log-file <PATH>` | Exact aggregate log file path.                 |
+| `-h`, `--help`      | Engine help.                                   |
+| `-V`, `--version`   | Build version.                                 |
 
 Bare `nefor` and `nefor run` both start serve mode. Only `run` forwards trailing arguments to Lua as `nefor.runtime.argv`. Every token after `run`, including a hyphenated token, belongs to the composition; put engine options before `run`.
 
@@ -58,8 +59,16 @@ Data:
 2. `NEFOR_DATA_DIR`
 3. `$XDG_DATA_HOME/nefor`, otherwise `~/.local/share/nefor`
 
+Aggregate logging destination:
 
-Aggregate logging destination:\n\n1. non-empty `NEFOR_LOG_STDERR` selects stderr\n2. `--log-file` selects that exact path\n3. `NEFOR_LOG_FILE` selects that exact path\n4. `<data-root>/logs/nefor.log`\n\nExplicit file paths are not relocated under the data root. The engine creates parent directories and exits with a diagnostic naming the selected path if it cannot initialize logging.\n\nPlugin executable and immutable runtime roots are selected by the active Lua distribution helper, not by the engine.
+1. non-empty `NEFOR_LOG_STDERR` selects stderr;
+2. `--log-file` selects that exact path;
+3. `NEFOR_LOG_FILE` selects that exact path;
+4. `<data-root>/logs/nefor.log`.
+
+Explicit file paths are not relocated under the data root. The engine creates parent directories and exits with a diagnostic naming the selected path if it cannot initialize logging.
+
+Plugin executable and immutable runtime roots are selected by the active Lua distribution helper, not by the engine. The engine has no plugin-directory flag, discovery, inventory, or installation-provenance concept; it executes the exact command arrays registered by Lua.
 
 The engine exports resolved `NEFOR_CONFIG_DIR` and `NEFOR_DATA_DIR` before Lua composition and subprocess spawn. Plugin commands are resolved by Lua/distribution code.
 

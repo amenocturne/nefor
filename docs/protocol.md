@@ -4,7 +4,7 @@ This document describes the protocol behavior shipped by the current Nefor Lua/p
 
 ## Boundary
 
-The engine is a process spawner, raw line router, and Lua host. It does not parse NCP envelopes for routing and it does not own sessions or an on-disk session log. Plugin lines enter Lua through core.ncp; Lua decides whether a line is handshake traffic, a bus event, a direct delivery, or a dropped/error case.
+The engine is a process spawner, raw line router, and Lua host. It does not parse NCP envelopes for routing, own sessions, choose a session root, or write an on-disk session log. The active composition selects the session root and wires persistence/resume through `lua/libs/sessions`. Plugin lines enter Lua through `core.ncp`; Lua decides whether a line is handshake traffic, a bus event, a direct delivery, or a dropped/error case.
 
 Rust code still shares protocol-adjacent newtypes such as plugin names and timestamps, and Rust plugins may use nefor-protocol codecs. The shipped engine bus semantics are Lua-owned.
 
@@ -12,7 +12,7 @@ Rust code still shares protocol-adjacent newtypes such as plugin names and times
 
 Plugins are OS processes connected over stdin/stdout. Stdout lines from a plugin are complete JSON values encoded as JSON Lines. Stderr is logging, not bus traffic.
 
-The runner starts command[0] directly with std::process::Command; it does not invoke a shell, set per-plugin cwd, or manage per-plugin env maps. Children inherit the engine process cwd and environment. The engine exports resolved NEFOR_CONFIG_DIR and NEFOR_DATA_DIR before spawning. Lua registers the exact executable command; the engine performs no plugin-root discovery.
+The runner starts `command[0]` directly with `std::process::Command`; it does not invoke a shell, set per-plugin cwd, manage per-plugin env maps, discover a plugin directory, inspect distribution inventory, or attach installation provenance. Children inherit the engine process cwd and environment. The engine exports resolved `NEFOR_CONFIG_DIR` and `NEFOR_DATA_DIR` before spawning. Lua registers the exact executable command; Lua/distribution code owns executable and immutable-runtime resolution, including packaged offline closure.
 
 ## Plugin-authored lines
 
@@ -59,4 +59,4 @@ Malformed JSON, invalid envelope type, event body that is not an object, unknown
 
 Ordinary live writer-queue overflow drops the oldest queued live line and is logged by the engine; no shipped protocol-level queue_overflow message is emitted. Explicit finite replay batches are lossless and do not make the live queue unbounded.
 
-The engine does not synthesize an NCP shutdown system message. Rust reports an `engine.plugin_process_terminated` lifecycle fact to Lua; composition may then request `nefor.engine.shutdown` explicitly. The starter requests shutdown for every such fact. Plugins that want to announce departure may publish an ordinary plugin-authored goodbye event before exiting.
+The engine does not synthesize an NCP shutdown system message. Rust reports one `engine.plugin_process_terminated` lifecycle fact for each spawned process termination, carrying the composition-assigned plugin identity and a typed outcome. Reporting the fact does not itself initiate shutdown. Lua composition decides whether and when to call `nefor.engine.shutdown { code, reason, grace_ms }`; the first request owns the shutdown fields and the single cooperative grace window. The starter requests shutdown with `grace_ms = 2000` for every termination fact, preserving its cascade behavior. Plugins that want to announce departure may publish an ordinary plugin-authored goodbye event before exiting.

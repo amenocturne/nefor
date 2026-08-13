@@ -19,8 +19,11 @@ Most tools expose selected extension points. Eventually you hit the wall: this
 part is configurable, that part is not.
 
 Nefor moves the wall into Lua. Plugins are independent OS processes. Interfaces
-are another composition. Routing, persistence, orchestration, approvals, and
-protocol semantics live where you can read and rewrite them.
+are another composition. Routing, persistence, orchestration, approvals,
+protocol semantics, session roots, and process-lifecycle policy live where you
+can read and rewrite them. The engine executes the exact plugin commands Lua
+registers; it has no plugin-directory discovery or installation-provenance
+model.
 
 The example proves the shape with a chat surface, providers, tool gates,
 sessions, and a MAG-based agentic loop. MAG itself is a pure, namespaced typed
@@ -105,12 +108,12 @@ wiring.
 The engine spawns processes and routes lines through Lua. Everything else is
 composition.
 
-| Layer                                                          | What it owns                                                                                                           |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **Engine / bus**                                               | Process spawning, line routing, Lua hosting, and identity stamping (`origin`, `ts`). It does not parse message bodies. |
-| **Plugins** (`plugins/`)                                       | Self-contained work over stdio. Each plugin owns one scoped task.                                                      |
-| **Lua config / example** (`init.lua`, `examples/nefor-agent/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces.                           |
-| **Interfaces**                                                 | User surfaces composed over the same bus. The example uses `nefor-tui`; you can wire another.                          |
+| Layer                                                          | What it owns                                                                                                                                                                                 |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Engine / bus**                                               | Executes plugin commands registered by Lua, routes lines, hosts Lua, stamps identity/time, and reports typed process termination. It owns no sessions, plugin discovery, or shutdown policy. |
+| **Plugins** (`plugins/`)                                       | Self-contained work over stdio. Each plugin owns one scoped task.                                                                                                                            |
+| **Lua config / example** (`init.lua`, `examples/nefor-agent/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces.                                                                                                 |
+| **Interfaces**                                                 | User surfaces composed over the same bus. The example uses `nefor-tui`; you can wire another.                                                                                                |
 
 Bash-tool test: a plugin should feel like a self-contained utility you could run
 from a shell, then compose elsewhere. Plugins should not know their neighbors;

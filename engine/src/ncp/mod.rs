@@ -6,11 +6,11 @@
 //!   `Command::new(binary).args(...)` and bridges stdio. No shell, no env map,
 //!   and no installation-layout discovery. Exposes a
 //!   [`Transport`](transport::Transport) to the broker.
-//! - **Broker** (`broker`) — stamps inbound lines, mirrors them to the
-//!   session log, invokes the Lua `step` function, and routes step's
-//!   outbound sends to connection writers. No envelope parsing, no
-//!   system-message dispatch, no replay-on-attach. All NCP protocol
-//!   handling lives in `examples/nefor-agent/init.lua`.
+//! - **Broker** (`broker`) — stamps inbound lines, appends published entries to
+//!   its in-memory dispatch log, invokes the Lua `dispatch` function, and routes
+//!   outbound deliveries to connection writers. It owns no session ID or
+//!   persistent session log and performs no envelope parsing, system-message
+//!   dispatch, or replay-on-attach; those behaviors live in Lua composition.
 //!
 //! # Submodules
 //!
