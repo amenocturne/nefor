@@ -474,13 +474,8 @@ local function node_inspector(state, p, now_ms)
       status == "working", now_ms),
     tui.text { content = string.rep("─", 48), style = STYLE.footer, wrap = "none" },
   } }
-  local group = run_panel.group_of(p.actor_id or "")
-  local is_agent = preview_state.agent_assignment(state, p.run_id, group)
-  local assignment = assignment_widget(state, p.run_id, group)
-  local body = preview_view.node(state, p.run_id, p.actor_id, { hide_tool_streams = is_agent })
-  if assignment then body = tui.column { gap = 1, children = { assignment, body } } end
   return popup_shell("── node · " .. tostring(p.actor_id or "?") .. " ──",
-    header, body, p.unseen)
+    header, preview_view.node(state, p.run_id, p.actor_id), p.unseen)
 end
 
 local function aggregate_inspector(state, p, now_ms)

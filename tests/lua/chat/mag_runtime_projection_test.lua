@@ -193,9 +193,19 @@ capabilities = preview_state.observe_capability(capabilities, {
 capabilities = preview_state.observe_capability(capabilities, {
   kind = "tool.stream", id = "scope/read-2", stream = "stdout", text = "same",
 }, 11)
-eq(#capability_values(capabilities), 6,
-  "intentionally identical adjacent stream chunks remain distinct")
-eq(capability_values(capabilities)[5].value.text, "same")
-eq(capability_values(capabilities)[6].value.text, "same")
+eq(#capability_values(capabilities), 5,
+  "adjacent chunks from the same terminal stream coalesce")
+eq(capability_values(capabilities)[5].value.text, "samesame",
+  "coalescing preserves byte order across chunks")
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool.stream", id = "scope/read-2", stream = "stderr", text = "warn",
+}, 12)
+capabilities = preview_state.observe_capability(capabilities, {
+  kind = "tool.stream", id = "scope/read-2", stream = "stdout", text = "tail",
+}, 13)
+eq(#capability_values(capabilities), 7,
+  "stream changes remain separate chronological activity")
+eq(capability_values(capabilities)[6].value.kind, "stderr")
+eq(capability_values(capabilities)[7].value.text, "tail")
 
 print("mag_runtime_projection_test: all assertions passed")

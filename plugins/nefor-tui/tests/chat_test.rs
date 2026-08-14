@@ -11379,6 +11379,172 @@ fn agent_previews_hide_tool_streams_but_keep_conversation_activity() {
 }
 
 #[test]
+fn exact_run_tool_node_uses_full_factory_preview_without_agent_siblings() {
+    let mut engine = Engine::new(120, 44).expect("engine");
+    load_chat_scenario(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "tool-run", "run_name": "delegated"
+        }),
+    );
+    for (id, factory, spec) in [
+        (
+            "worker.llm",
+            "llm",
+            json!({ "params": { "system": "base\n\n---\n\nSIBLING ASSIGNMENT MUST STAY OUT" } }),
+        ),
+        (
+            "worker.run-tool",
+            "nefor.factory.run-tool",
+            json!({ "params": { "allowlist": ["process.exec"] } }),
+        ),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "mag.actor_spawned", "run_id": "tool-run", "id": id,
+                "factory": factory, "spec": spec
+            }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke", "id": "exact-call", "name": "process.exec",
+            "args": { "argv": ["printf", "FULL INVOCATION"] },
+            "invocation": { "run_id": "tool-run", "actor_id": "worker.run-tool" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool.stream", "id": "exact-call", "stream": "stdout", "text": "streamed output\n"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool.result", "id": "exact-call", "result": "FULL RESULT"
+        }),
+    );
+
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select group");
+    engine.handle_key(key("enter")).expect("unfold group");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select llm");
+    engine.handle_key(key("down")).expect("select run-tool");
+    engine.handle_key(key("space")).expect("inspect run-tool");
+    let snapshot = render_snapshot(&mut engine);
+    for expected in [
+        "FULL INVOCATION",
+        "streamed output",
+        "FULL RESULT",
+        "exact-call",
+    ] {
+        assert!(
+            snapshot.contains(expected),
+            "exact run-tool preview lost {expected:?}:\n{snapshot}"
+        );
+    }
+    assert!(
+        !snapshot.contains("SIBLING ASSIGNMENT MUST STAY OUT"),
+        "exact actor inherited group assignment:\n{snapshot}"
+    );
+    assert!(
+        !snapshot.contains("worker.llm"),
+        "exact actor inherited sibling activity:\n{snapshot}"
+    );
+}
+
+#[test]
+fn source_node_renders_its_typed_task_value() {
+    let mut engine = Engine::new(110, 32).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "source-run", "run_name": "source-demo"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "source-run", "id": "task",
+            "factory": "nefor.factory.source", "spec": { "params": {
+                "value": { "prompt": "VISIBLE TYPED TASK PROMPT" },
+                "value_type": "nefor.contracts.Task"
+            } }
+        }),
+    );
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select source");
+    engine.handle_key(key("enter")).expect("unfold source");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select source actor");
+    engine.handle_key(key("space")).expect("inspect source");
+    let snapshot = render_snapshot(&mut engine);
+    assert!(
+        snapshot.contains("Value") && snapshot.contains("VISIBLE TYPED TASK PROMPT"),
+        "source preview omitted its factory-owned value:\n{snapshot}"
+    );
+}
+
+#[test]
+fn process_preview_coalesces_stdout_and_marks_stderr_without_repeated_labels() {
+    let mut engine = Engine::new(110, 34).expect("engine");
+    load_chat_scenario(&mut engine);
+    open_single_node(&mut engine, "nefor.factory.process-exec", "process.node");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke", "id": "process-call", "name": "process.exec", "args": {},
+            "invocation": { "run_id": "preview-run", "actor_id": "process.node" }
+        }),
+    );
+    for (stream, text) in [
+        ("stdout", "first line\n"),
+        ("stdout", "second line\n"),
+        ("stderr", "warning line\n"),
+        ("stdout", "last line\n"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "tool.stream", "id": "process-call", "stream": stream, "text": text
+            }),
+        );
+    }
+    let snapshot = render_snapshot(&mut engine);
+    for expected in ["first line", "second line", "warning line", "last line"] {
+        assert!(
+            snapshot.contains(expected),
+            "terminal preview lost {expected:?}:\n{snapshot}"
+        );
+    }
+    assert!(
+        !snapshot.contains("stdout\n"),
+        "terminal stdout must not carry per-chunk labels:\n{snapshot}"
+    );
+    assert!(
+        !snapshot.contains("stderr\n"),
+        "stderr distinction should use existing style, not noisy labels:\n{snapshot}"
+    );
+    let first = snapshot.find("first line").expect("first");
+    let second = snapshot.find("second line").expect("second");
+    let warning = snapshot.find("warning line").expect("warning");
+    let last = snapshot.find("last line").expect("last");
+    assert!(
+        first < second && second < warning && warning < last,
+        "terminal stream ordering changed:\n{snapshot}"
+    );
+}
+
+#[test]
 fn compact_duration_formatter_covers_unit_boundaries() {
     let mut engine = Engine::new(80, 24).expect("engine");
     load_chat_scenario(&mut engine);

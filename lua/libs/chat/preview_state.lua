@@ -47,7 +47,8 @@ local function append_stream(state, run_id, actor_id, binding, value, now_ms)
     local previous_value = previous and previous.value
     if type(previous_value) == "table" and type(value) == "table"
         and previous_value.kind == value.kind
-        and (value.kind == "reasoning" or value.kind == "assistant")
+        and (value.kind == "reasoning" or value.kind == "assistant"
+          or value.kind == "stdout" or value.kind == "stderr")
         and type(previous_value.text) == "string" and type(value.text) == "string" then
       local joined = copy_map(previous_value)
       joined.text = previous_value.text .. value.text

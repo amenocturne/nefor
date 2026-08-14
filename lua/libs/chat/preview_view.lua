@@ -58,7 +58,7 @@ local function concise_error(value)
 end
 
 local function tool_value(value, result, ctx)
-  local expanded = ctx.state.expanded_details == true
+  local expanded = ctx.force_details == true or ctx.state.expanded_details == true
   local original, name, id, args = tool_parts(value)
   if result then
     local failed = original.error ~= nil
@@ -106,7 +106,7 @@ end
 
 M.format_value = encode
 
-local function section(title, values)
+local function section(title, values, options)
   local keys = {}
   for key in pairs(values or {}) do
     if key ~= "last" then keys[#keys + 1] = key end
@@ -117,21 +117,51 @@ local function section(title, values)
   local children = { tui.text { content = title, style = STYLE.popup_user, wrap = "none" } }
   for _, key in ipairs(keys) do
     children[#children + 1] = tui.text {
-      content = tostring(key) .. "\n" .. encode(values[key]), style = STYLE.status, wrap = "word",
+      content = (options and options.hide_keys) and encode(values[key])
+        or (tostring(key) .. "\n" .. encode(values[key])),
+      style = STYLE.status, wrap = "word",
     }
   end
   return tui.column { gap = 1, children = children }
 end
 
+local function factory_kind(factory)
+  return tostring(factory or ""):gsub("^nefor%.factory%.", "")
+end
+
+local RENDER_PROFILES = {
+  source = { source = true },
+  llm = { hide_tool_streams = true },
+  ["run-tool"] = { force_details = true, terminal = true },
+  ["process-exec"] = { terminal = true },
+  ["shell-script"] = { terminal = true },
+}
+
+local function render_profile(node)
+  local profile = {}
+  for key, value in pairs(RENDER_PROFILES[factory_kind(node.factory)] or {}) do
+    profile[key] = value
+  end
+  return profile
+end
+
 function M.node(state, run_id, actor_id, options)
   local node = preview_state.node(state, run_id, actor_id)
   if not node then return tui.text { content = "Node is no longer available.", style = STYLE.status_dim } end
+  local profile = render_profile(node)
+  for key, value in pairs(options or {}) do profile[key] = value end
   local children = {
     tui.text { content = tostring(node.factory or "actor") .. " · " .. tostring(node.status or "pending"),
       style = STYLE.status, wrap = "word" },
   }
-  local sections = { section("Params", node.params), section("Input", node.inputs),
-    section("Output", node.outputs) }
+  local sections
+  if profile.source then
+    sections = { section("Value", { value = (node.params or {}).value }, { hide_keys = true }),
+      section("Input", node.inputs), section("Output", node.outputs) }
+  else
+    sections = { section("Params", node.params), section("Input", node.inputs),
+      section("Output", node.outputs) }
+  end
   for index = 1, 3 do
     local candidate = sections[index]
     if candidate then children[#children + 1] = candidate end
@@ -139,7 +169,7 @@ function M.node(state, run_id, actor_id, options)
   local items = preview_state.merged(state, run_id, function(id) return id == actor_id end)
   local activity = {}
   for index, item in ipairs(items) do
-    local widget = M.activity(item, state, node, index == #items, options)
+    local widget = M.activity(item, state, node, index == #items, profile)
     if widget then activity[#activity + 1] = widget end
   end
   if #activity > 0 then
@@ -162,11 +192,15 @@ function M.activity(item, state, node, is_last, options)
       or kind == "tool_result" or kind == "result" or kind == "error" then
     local result = kind == "tool_result" or kind == "result" or kind == "error"
     local content, primary_is_path = tool_value(value.value, result, {
-      state = state, node = node or {},
+      state = state, node = node or {}, force_details = options and options.force_details,
     })
     return tui.text { content = content, style = result and (kind == "error" and STYLE.tool_error or STYLE.status_ok)
       or STYLE.system, wrap = (not result and primary_is_path)
         and (state.expanded_details == true and "char" or "tail") or "word" }
+  elseif (kind == "stdout" or kind == "stderr") and options and options.terminal then
+    local content = type(value.text) == "string" and value.text or encode(value)
+    return tui.text { content = content,
+      style = kind == "stderr" and STYLE.status_warn or STYLE.status, wrap = "word" }
   elseif kind == "diagnostic" and type(value.value) == "table" then
     local diagnostic = value.value
     if diagnostic.kind == "validation" then
