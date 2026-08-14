@@ -115,10 +115,10 @@ M.schema = {
     "starts the process, waits for readiness, performs the dependent work, and tears " ..
     "it down. Never launch a server as a normal run and await its completion. " ..
     "Use nefor.shell.script only for explicit /bin/sh programs; both operations carry an explicit timeout option. " ..
-    "The call acknowledges immediately with a stable run_id; " ..
-    "call await-run with that handle when your next step depends on terminal " ..
-    "output. The normal owner-scoped run-completion notification remains independent. " ..
-    "Multi-step or multi-file work runs as a .mag program via the " ..
+    "The call acknowledges immediately with a stable run_id. Root-lead completion " ..
+    "arrives through the normal owner-scoped notification; delegated callers use their " ..
+    "available run-wait capability when dependent work cannot be composed into the same " ..
+    "graph. Multi-step or multi-file work runs as a .mag program via the " ..
     "mag tool instead.",
   parameters  = {
     type = "object",

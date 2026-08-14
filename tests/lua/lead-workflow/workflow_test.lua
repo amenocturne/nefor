@@ -113,16 +113,24 @@ do
     return call.body.kind == "tool-gate.tools.advertise"
   end)
   assert_true(advertised ~= nil, "lead workflow advertises its tool schemas")
-  local mag_schema, mag_eval_schema, await_schema
+  local mag_schema, mag_eval_schema, await_schema, graph_status_schema
   for _, schema in ipairs(advertised.body.tools or {}) do
     assert_true(type(schema.display) == "table", schema.name .. " has display metadata")
     if schema.name == "mag" then mag_schema = schema end
     if schema.name == "mag-eval" then mag_eval_schema = schema end
     if schema.name == "await-run" then await_schema = schema end
+    if schema.name == "graph-status" then graph_status_schema = schema end
   end
   assert_true(mag_schema ~= nil, "the MAG tool schema is advertised")
   assert_true(mag_eval_schema ~= nil, "the mag-eval tool schema is advertised")
   assert_true(await_schema ~= nil, "the await-run schema is advertised")
+  assert_true(graph_status_schema ~= nil, "the graph-status schema is advertised")
+  assert_true(graph_status_schema.description:find("One-shot snapshot", 1, true) ~= nil
+      and graph_status_schema.description:find("never call it in a polling loop", 1, true) ~= nil,
+    "graph-status is described only as a current-state snapshot, not an await")
+  assert_true(graph_status_schema.description:find("when your next step depends", 1, true) == nil
+      and graph_status_schema.description:find("Block until", 1, true) == nil,
+    "graph-status carries no dependency-wait affordance")
   assert_eq(await_schema.display.label, "Await run", "await-run has semantic display metadata")
   assert_eq(await_schema.display.primary.arg, "run_id", "await-run displays its stable handle")
   assert_eq(mag_eval_schema.display.label, "mag-eval", "mag-eval display keeps stable tool identity")
@@ -130,6 +138,14 @@ do
   assert_true(mag_eval_schema.description:find("Commands run until process exit", 1, true) ~= nil
       and mag_eval_schema.description:find("Never launch a server as a normal run", 1, true) ~= nil,
     "mag-eval canonically warns that persistent commands cannot be awaited to completion")
+  assert_true(mag_eval_schema.description:find("Root-lead completion", 1, true) ~= nil
+      and mag_eval_schema.description:find("owner-scoped notification", 1, true) ~= nil,
+    "shared mag-eval schema accurately names root-lead notification delivery")
+  assert_true(mag_eval_schema.description:find("call await-run", 1, true) == nil,
+    "shared mag-eval schema does not command a root lead to use an unavailable tool")
+  assert_true(mag_eval_schema.description:find("delegated callers", 1, true) ~= nil
+      and mag_eval_schema.description:find("available run-wait capability", 1, true) ~= nil,
+    "shared mag-eval schema preserves worker dependency waiting without assuming a surface")
   assert_true(await_schema.description:find("waits indefinitely", 1, true) ~= nil,
     "await-run canonically warns about persistent foreground processes")
   assert_true(string.find(mag_schema.description, "lib/patterns.md", 1, true) ~= nil,
@@ -1853,6 +1869,15 @@ do
   assert_eq(ack.body.output.run_id, exec.body.run_id, "ack handle equals execute run id")
   assert_eq(exec.body.run_name, "Inspect files", "eval intent is the canonical readable run name")
   assert_eq(ack.body.output.run_name, "Inspect files", "eval acknowledgment prefers the same run name")
+  assert_true(ack.body.output.message:find("stop this turn", 1, true) ~= nil
+      and ack.body.output.message:find("owner-scoped completion notification", 1, true) ~= nil,
+    "root-lead acknowledgment assigns waiting to the completion notification")
+  assert_true(ack.body.output.message:find("await-run", 1, true) == nil,
+    "root-lead acknowledgment names no unavailable wait tool")
+  assert_true(ack.body.output.message:find("graph-status merely to wait", 1, true) ~= nil,
+    "root-lead acknowledgment keeps graph-status out of dependency synchronization")
+  assert_true(ack.body.output.message:find("one MAG graph or bounded operation", 1, true) ~= nil,
+    "root-lead acknowledgment teaches within-workflow dependency composition")
   assert_true(load.body.entry:match("^eval/eval%-%d+%.mag$") ~= nil,
     "eval keeps its internal filename separate from the readable run name")
   local run_id = exec.body.run_id
@@ -1902,6 +1927,10 @@ do
     "graph-agent eval uses the structured executing acknowledgment")
   assert_eq(ack.body.output.run_id, exec.body.run_id,
     "graph-agent acknowledgment exposes the stable run handle")
+  assert_true(ack.body.output.message:find("Use await-run", 1, true) ~= nil,
+    "worker acknowledgment accurately names its available dependency wait tool")
+  assert_true(ack.body.output.message:find("do not poll graph-status", 1, true) ~= nil,
+    "worker acknowledgment distinguishes awaiting from status snapshots")
   assert_eq(exec.body.conversation_id, "worker.run-tool:conversation",
     "nested eval preserves the dispatching worker conversation")
   assert_true(lw._internals.state.active_runs[exec.body.run_id] ~= nil,

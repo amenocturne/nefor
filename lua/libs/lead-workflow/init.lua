@@ -1693,15 +1693,24 @@ submit_loaded_run = function(pending, body, error_prefix)
   register_active_run(pending.run_id, actors, terminal_id,
     pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id)
   emit_as(SOURCE_NAME, "mag", exec)
+  local message
+  if pending.dispatcher_id == nil then
+    message = "Program submitted to the MAG actor kernel. If completion is required, stop " ..
+      "this turn and wait for the normal owner-scoped completion notification; do not call " ..
+      "graph-status merely to wait. Compose dependent work into one MAG graph or bounded " ..
+      "operation when it must continue within one workflow."
+  else
+    message = "Program submitted to the MAG actor kernel. Use await-run with this run_id when " ..
+      "your next step depends on completion; do not poll graph-status. The normal completion " ..
+      "notification remains independent."
+  end
   emit_tool_result_ok(pending.firing_id, {
     status = "executing",
     run_id = pending.run_id,
     run_name = pending.run_name,
     hash = body.hash,
     engine = "mag-kernel",
-    message = "Program submitted to the MAG actor kernel. Use await-run with this run_id when " ..
-      "your next step depends on completion; do not poll graph-status. The normal completion " ..
-      "notification remains independent.",
+    message = message,
   })
   return true
 end
