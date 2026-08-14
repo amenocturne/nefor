@@ -1457,8 +1457,9 @@ local function lead_workflow_tool_schemas()
       description =
         "Report active graph runs, or one active/recent completed run " ..
         "when run_id is provided. One-shot snapshot for when you or the " ..
-        "user need to know what's in flight — never call it in a " ..
-        "polling loop; run outcomes are delivered to you when they land.",
+        "user need to know what's in flight — not an await or wait mechanism. " ..
+        "Never call it in a polling loop or immediately after dispatch merely " ..
+        "to wait; run outcomes are delivered to you when they land.",
       parameters  = {
         type = "object",
         properties = {

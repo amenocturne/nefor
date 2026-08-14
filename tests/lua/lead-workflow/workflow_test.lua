@@ -126,8 +126,11 @@ do
   assert_true(await_schema ~= nil, "the await-run schema is advertised")
   assert_true(graph_status_schema ~= nil, "the graph-status schema is advertised")
   assert_true(graph_status_schema.description:find("One-shot snapshot", 1, true) ~= nil
-      and graph_status_schema.description:find("never call it in a polling loop", 1, true) ~= nil,
+      and graph_status_schema.description:find("not an await or wait mechanism", 1, true) ~= nil
+      and graph_status_schema.description:find("Never call it in a polling loop", 1, true) ~= nil,
     "graph-status is described only as a current-state snapshot, not an await")
+  assert_true(graph_status_schema.description:find("immediately after dispatch merely to wait", 1, true) ~= nil,
+    "graph-status explicitly rejects post-dispatch waiting")
   assert_true(graph_status_schema.description:find("when your next step depends", 1, true) == nil
       and graph_status_schema.description:find("Block until", 1, true) == nil,
     "graph-status carries no dependency-wait affordance")
