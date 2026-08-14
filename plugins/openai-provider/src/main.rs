@@ -1627,9 +1627,9 @@ fn spawn_turn(
                     }
 
                     if !outcome.tool_calls.is_empty() {
-                        // Persist the assistant turn (text + tool calls)
-                        // so the next request shows the same shape OpenAI
-                        // expects: assistant message → tool messages.
+                        // Persist the raw assistant turn. Provider-bound serialization
+                        // normalizes malformed arguments without changing what tool
+                        // execution receives below.
                         let _ = chats
                             .push_assistant_tool_calls(
                                 &chat_id,
@@ -2197,7 +2197,16 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
             if let Some(arr) = obj.get("tool_calls").and_then(Value::as_array) {
                 for v in arr {
                     match serde_json::from_value::<ToolCall>(v.clone()) {
-                        Ok(tc) => tool_calls.push(tc),
+                        Ok(tc) => {
+                            if serde_json::from_str::<Value>(&tc.function.arguments).is_err() {
+                                tool_call_failures.push(ToolCallParseFailure {
+                                    id: Some(tc.id.clone()),
+                                    error: "function.arguments is not valid JSON".to_owned(),
+                                    raw: Value::String(tc.function.arguments.clone()),
+                                });
+                            }
+                            tool_calls.push(tc);
+                        }
                         Err(e) => {
                             let id = v.get("id").and_then(Value::as_str).map(str::to_owned);
                             tool_call_failures.push(ToolCallParseFailure {
@@ -4234,6 +4243,26 @@ mod tests {
         assert_eq!(events[1].get("error").and_then(Value::as_bool), Some(true));
     }
 
+    #[test]
+    fn legacy_history_normalizes_malformed_tool_arguments_but_execution_keeps_raw_feedback() {
+        let raw = r#"{"path":"x""#;
+        let execution_call = ToolCall {
+            id: "call-bad".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: raw.into(),
+            },
+        };
+        assert_eq!(execution_call.function.arguments, raw);
+        let request = serde_json::to_value(Message::assistant_tool_calls(vec![execution_call]))
+            .expect("serialize provider history");
+        let arguments = request["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string");
+        assert_eq!(serde_json::from_str::<Value>(arguments).unwrap(), raw);
+    }
+
     #[tokio::test]
     async fn run_one_tool_call_reports_malformed_arguments_to_model() {
         let catalog = Arc::new(ToolCatalog::new());
@@ -4438,6 +4467,140 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role(), "user");
         assert_eq!(history[0].content(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn chat_append_normalizes_native_tool_arguments_and_adds_correction_feedback() {
+        let (auth, tx, mut rx) = auth_test_rig(None);
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+        let chat_id = ChatId::new("append-malformed");
+        chats
+            .create(chat_id.clone(), None, None, None, None, None)
+            .await
+            .expect("seed");
+        let raw = r#"{"path":"x""#;
+        let body = make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String(chat_id.to_string())),
+                (
+                    "message",
+                    serde_json::json!({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-bad", "type": "function",
+                            "function": {"name": "read_file", "arguments": raw}
+                        }]
+                    }),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
+        )
+        .await
+        .expect("dispatch");
+        let emitted = drain(&mut rx).await;
+        assert_eq!(emitted[0]["kind"], "ollama.chat.appended");
+
+        let history = chats.history_snapshot(&chat_id).await.expect("history");
+        assert_eq!(
+            history.len(),
+            2,
+            "assistant call plus correction tool result"
+        );
+        let arguments = &history[0].tool_calls()[0].function.arguments;
+        assert_eq!(arguments, raw, "history preserves the source text");
+        let wire = serde_json::to_value(&history[0]).expect("provider serialization");
+        let provider_arguments = wire["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string");
+        assert_eq!(
+            serde_json::from_str::<Value>(provider_arguments).unwrap(),
+            raw
+        );
+        assert!(history[1]
+            .content()
+            .unwrap_or_default()
+            .contains("function.arguments is not valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn chat_restore_normalizes_native_tool_arguments_and_adds_correction_feedback() {
+        let (auth, tx, mut rx) = auth_test_rig(None);
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+        let raw = r#"{"path":"x""#;
+        let body = make_event_body(
+            "ollama.chat.restore",
+            &[
+                ("chat_id", Value::String("restore-malformed".into())),
+                (
+                    "history",
+                    serde_json::json!([{
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-bad", "type": "function",
+                            "function": {"name": "read_file", "arguments": raw}
+                        }]
+                    }]),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
+        )
+        .await
+        .expect("dispatch");
+        let emitted = drain(&mut rx).await;
+        assert_eq!(emitted[0]["kind"], "ollama.chat.appended");
+
+        let history = chats
+            .history_snapshot(&ChatId::new("restore-malformed"))
+            .await
+            .expect("history");
+        assert_eq!(
+            history.len(),
+            2,
+            "restored call plus correction tool result"
+        );
+        let arguments = &history[0].tool_calls()[0].function.arguments;
+        assert_eq!(arguments, raw, "history preserves the source text");
+        let wire = serde_json::to_value(&history[0]).expect("provider serialization");
+        let provider_arguments = wire["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string");
+        assert_eq!(
+            serde_json::from_str::<Value>(provider_arguments).unwrap(),
+            raw
+        );
+        assert!(history[1]
+            .content()
+            .unwrap_or_default()
+            .contains("function.arguments is not valid JSON"));
     }
 
     #[tokio::test]

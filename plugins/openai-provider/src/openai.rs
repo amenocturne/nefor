@@ -33,14 +33,38 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolCallFunction {
     pub name: String,
-    /// Argument JSON as a single string — the API contract is that the
-    /// model emits a JSON-encoded string here. We do not parse it; it
-    /// rides through to the next request's `tool` message verbatim, and
-    /// the tool plugin parses it on receipt.
+    /// Argument JSON as a single string. Provider-bound serialization
+    /// preserves valid JSON verbatim and wraps malformed model output as
+    /// a JSON string, so every request satisfies the OpenAI wire contract.
     pub arguments: String,
+}
+
+impl Serialize for ToolCallFunction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ToolCallFunction", 2)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("arguments", &provider_arguments(&self.arguments))?;
+        state.end()
+    }
+}
+
+/// Return an OpenAI-compatible `function.arguments` string without double
+/// encoding already-valid JSON. Malformed source remains available to the
+/// model as the value of a JSON string.
+pub fn provider_arguments(arguments: &str) -> String {
+    if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
+        arguments.to_owned()
+    } else {
+        serde_json::to_string(arguments).unwrap_or_else(|_| "null".to_owned())
+    }
 }
 
 /// Single chat message in the conversation.
@@ -828,6 +852,36 @@ mod tests {
             }
             other => panic!("expected ToolCallBatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_tool_arguments_preserve_valid_json_without_double_encoding() {
+        let call = ToolCallFunction {
+            name: "read_file".into(),
+            arguments: r#"{"path":"x"}"#.into(),
+        };
+        let wire = serde_json::to_value(call).expect("serialize tool call");
+        assert_eq!(wire["arguments"], r#"{"path":"x"}"#);
+    }
+
+    #[test]
+    fn provider_tool_arguments_wrap_malformed_source_once() {
+        let raw = r#"{"path":"x""#;
+        let call = ToolCallFunction {
+            name: "read_file".into(),
+            arguments: raw.into(),
+        };
+        let wire = serde_json::to_value(call).expect("serialize tool call");
+        let arguments = wire["arguments"].as_str().expect("arguments string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
+            raw
+        );
+        assert_ne!(
+            serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
+            serde_json::to_string(raw).unwrap(),
+            "malformed source is not double encoded",
+        );
     }
 
     #[test]

@@ -655,6 +655,30 @@ local function test_openai_adapter_no_static_token_skips_injection()
   end
 end
 
+local function test_openai_followup_history_json_encodes_malformed_tool_arguments()
+  local translator = require("openai-provider").translator("ollama")
+  local raw_arguments = '{"intent":"inspect the current work machine config"'
+  local request = translator.complete({ request_id = "followup-1" }, {
+    messages = {
+      { role = "user", content = "inspect config" },
+      {
+        role = "assistant", content = "",
+        tool_calls = { { id = "call-1", name = "mag-eval", arguments = raw_arguments } },
+      },
+      { role = "tool", tool_call_id = "call-1",
+        content = "mag-eval: 'intent' must contain 1-5 words" },
+    },
+  })
+
+  local arguments = request.messages[2].tool_calls[1]["function"].arguments
+  local ok, decoded = pcall(json.decode, arguments)
+  assert_true(ok, "provider-bound assistant tool_call.arguments must always be valid JSON")
+  assert_eq(decoded, raw_arguments,
+    "JSON normalization preserves malformed model output for semantic correction")
+  assert_eq(request.messages[3].content, "mag-eval: 'intent' must contain 1-5 words",
+    "the follow-up request preserves tool validation feedback")
+end
+
 -- ------------------------------------------------------------------
 -- M.spawn — config-load-time validation of cfg fields
 -- ------------------------------------------------------------------
@@ -1124,6 +1148,7 @@ local tests = {
   { name = "kind_prefix_self_announces_to_all_peers", fn = test_kind_prefix_self_announces_to_all_peers },
   { name = "openai_adapter_static_token_injects_auth_set_on_ready", fn = test_openai_adapter_static_token_injects_auth_set_on_ready },
   { name = "openai_adapter_no_static_token_skips_injection", fn = test_openai_adapter_no_static_token_skips_injection },
+  { name = "openai_followup_history_json_encodes_malformed_tool_arguments", fn = test_openai_followup_history_json_encodes_malformed_tool_arguments },
   { name = "spawn_rejects_env_field_with_hint", fn = test_spawn_rejects_env_field_with_hint },
   { name = "spawn_rejects_args_field_with_hint", fn = test_spawn_rejects_args_field_with_hint },
   { name = "spawn_rejects_cwd_field_with_hint", fn = test_spawn_rejects_cwd_field_with_hint },

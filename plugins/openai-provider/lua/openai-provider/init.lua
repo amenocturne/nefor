@@ -297,10 +297,13 @@ function M.translator(name)
       if type(call) == "table" and type(call.id) == "string"
           and type(call.name) == "string" then
         local arguments = call.arguments
-        if type(arguments) ~= "string" then
-          local ok, encoded = pcall(json.encode, arguments == nil and {} or arguments)
-          arguments = ok and encoded or "{}"
+        if type(arguments) == "string" then
+          local decoded_ok, decoded = pcall(json.decode, arguments)
+          if decoded_ok then arguments = decoded end
         end
+        local encoded_ok, encoded = pcall(json.encode, arguments == nil and {} or arguments)
+        if not encoded_ok then error("openai-provider: tool arguments are not JSON-encodable") end
+        arguments = encoded
         calls[#calls + 1] = {
           id = call.id,
           type = "function",
