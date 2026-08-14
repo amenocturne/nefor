@@ -815,6 +815,9 @@ end
 
 local function handle_context_usage(msg, state)
   if msg.provider ~= nil and msg.provider ~= state.provider then return state, {} end
+  if msg.conversation_id ~= nil and msg.conversation_id ~= state.conversation_id then
+    return state, {}
+  end
   local tokens = msg.context_input_tokens
   if type(tokens) ~= "number" then return state, {} end
   return shallow_merge(state, { current_context_tokens = tokens }), {}
