@@ -140,6 +140,20 @@ function M.spawn_spec(name, command, opts)
     emit_synthetic(name, reported)
   end
 
+  local function publish_context_usage(body)
+    if type(body) ~= "table" or body.event ~= "usage"
+        or type(body.context_input_tokens) ~= "number" then return end
+    emit_synthetic(name, {
+      kind = "conversation.provider.context_usage",
+      provider = name,
+      request_id = body.request_id,
+      conversation_id = pending_requests[body.request_id]
+        and pending_requests[body.request_id].conversation_id or nil,
+      context_input_tokens = body.context_input_tokens,
+      accuracy = body.context_input_accuracy or "authoritative",
+    })
+  end
+
   local function fail_request(body, code, message)
     report({
       request_id = body and body.request_id,
@@ -337,6 +351,7 @@ function M.spawn_spec(name, command, opts)
         local request_id = translated.request_id
         if type(request_id) == "string" and pending_requests[request_id] then
           translated.kind = nil
+          publish_context_usage(translated)
           report(translated)
           if translated.event == "completed" or translated.event == "result"
               or translated.event == "failed" or translated.event == "error"

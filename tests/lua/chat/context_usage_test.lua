@@ -17,4 +17,12 @@ eq(context_usage.current_input_tokens({ prompt_tokens = 70 }), 70,
   "legacy provider prompt usage remains a fallback")
 eq(context_usage.current_input_tokens({}), nil, "missing usage remains unknown")
 
+local estimate = context_usage.current_input_tokens({ context_input_tokens = 123 })
+eq(estimate, 123, "display projection uses the provider request estimate")
+
+local controller_path = package.searchpath("libs.chat.controller", package.path)
+local source = assert(io.open(controller_path, "r")):read("*a")
+assert(not source:find("gpt%-5", 1), "chat controller must not encode model names")
+assert(not source:find("272000", 1, true), "chat controller must not encode context windows")
+
 print("context_usage_test: all assertions passed")

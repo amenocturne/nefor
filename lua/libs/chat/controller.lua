@@ -813,6 +813,13 @@ local function handle_error_append(msg, state)
   return transcript.flush_graph_results(next_state), {}
 end
 
+local function handle_context_usage(msg, state)
+  if msg.provider ~= nil and msg.provider ~= state.provider then return state, {} end
+  local tokens = msg.context_input_tokens
+  if type(tokens) ~= "number" then return state, {} end
+  return shallow_merge(state, { current_context_tokens = tokens }), {}
+end
+
 local function handle_usage_updated(msg, state)
   local provider = msg.provider or ""
   if provider == "" then return state, {} end
@@ -1676,6 +1683,7 @@ local default_handlers = {
   ["conversation.active.changed"] = handle_conversation_event,
   ["conversation.projection.delta"] = handle_conversation_event,
   ["conversation.snapshot"]       = handle_conversation_event,
+  ["conversation.provider.context_usage"] = handle_context_usage,
   ["chat.usage.updated"]          = handle_usage_updated,
   ["chat.usage.error"]            = handle_usage_error,
   ["tool.register"]               = handle_tool_register,

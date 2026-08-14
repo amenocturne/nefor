@@ -144,15 +144,21 @@ function M.construct(id, params, emit, options)
       end
     end
     local usage = merged.usage
-    if type(usage) ~= "table" and type(merged.prompt_tokens) == "number" then
+    if type(usage) ~= "table"
+        and (type(merged.prompt_tokens) == "number"
+          or type(merged.context_input_tokens) == "number") then
       usage = {
         prompt_tokens = merged.prompt_tokens,
         completion_tokens = merged.completion_tokens,
+        context_input_tokens = merged.context_input_tokens,
       }
     end
     if type(usage) == "table" then
       if usage.input_tokens == nil then usage.input_tokens = usage.prompt_tokens end
       if usage.output_tokens == nil then usage.output_tokens = usage.completion_tokens end
+      if usage.context_input_tokens == nil then
+        usage.context_input_tokens = terminal_metadata.context_input_tokens
+      end
       merged.usage = usage
     end
     return merged
@@ -381,6 +387,9 @@ function M.construct(id, params, emit, options)
         facts:retry(value.error or value.message or "provider_retry", value)
       elseif value.kind == "usage" then
         terminal_metadata.usage = value.usage or value.result or value
+        terminal_metadata.context_input_tokens = value.context_input_tokens
+          or (type(value.usage) == "table" and value.usage.context_input_tokens)
+          or terminal_metadata.context_input_tokens
         terminal_metadata.model = value.model or terminal_metadata.model
         terminal_metadata.duration_ms = value.duration_ms or terminal_metadata.duration_ms
       elseif value.kind == "interrupted" then

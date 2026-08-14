@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod installation;
 pub mod provider_tool_names;
+pub mod request_usage;
 pub mod responses;
 pub mod state;
 pub mod translator;

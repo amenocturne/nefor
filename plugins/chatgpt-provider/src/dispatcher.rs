@@ -372,6 +372,16 @@ fn session_stats_body(args: &ServeArgs, chat_id: &ChatId, stats: &ChatStats) -> 
     make_event(format!("{}session.stats", args.event_prefix()), m)
 }
 
+/// Context window supplied by provider policy when `/models` omits it.
+/// Keep model metadata here, at the provider boundary; UI/config consumers
+/// receive a complete model-specific value and never infer model families.
+fn provider_context_window(model: &ModelEntry) -> u64 {
+    model.context_length.unwrap_or(match model.slug.as_str() {
+        "gpt-5.6-sol" => 272_000,
+        _ => 272_000,
+    })
+}
+
 fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Value> {
     let arr: Vec<Value> = models
         .iter()
@@ -381,9 +391,11 @@ fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Va
     m.insert("models".into(), Value::Array(arr));
     let ctx_map: Map<String, Value> = models
         .iter()
-        .filter_map(|me| {
-            me.context_length
-                .map(|cw| (me.slug.clone(), Value::Number(cw.into())))
+        .map(|model| {
+            (
+                model.slug.clone(),
+                Value::Number(provider_context_window(model).into()),
+            )
         })
         .collect();
     if !ctx_map.is_empty() {
@@ -2810,7 +2822,6 @@ fn spawn_turn(
             }
             tracing::info!(
                 instructions_len = translated.instructions.len(),
-                instructions_preview = %translated.instructions.chars().take(120).collect::<String>(),
                 input_items = translated.input.len(),
                 model = %snapshot.model,
                 "Responses request — final payload summary"
@@ -2864,6 +2875,24 @@ fn spawn_turn(
                 prompt_cache_key: Some(cache_key.clone()),
                 text,
             };
+
+            // This request is the provider's exact model-visible representation.
+            // Publish a content-free estimate now so canonical user/tool/deferred
+            // additions move the statusline before the response completes. A later
+            // backend usage event replaces it with the authoritative token count.
+            if let Some((request_id, _)) = &direct_request {
+                let estimate = crate::request_usage::estimate_serialized_tokens(&req);
+                let body = completion_event_body(
+                    &ctx.args,
+                    request_id,
+                    "usage",
+                    [
+                        ("context_input_tokens", Value::Number(estimate.into())),
+                        ("context_input_accuracy", Value::String("estimated".into())),
+                    ],
+                );
+                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+            }
 
             // Snapshot auth before sending so we can fail fast on
             // LoginRequired/Error without burning an HTTP round trip.
@@ -4124,6 +4153,29 @@ mod tests {
         let models = body.get("models").and_then(Value::as_array).expect("array");
         let slugs: Vec<&str> = models.iter().filter_map(Value::as_str).collect();
         assert_eq!(slugs, vec!["gpt-5", "gpt-5-codex"]);
+        let windows = body
+            .get("context_windows")
+            .and_then(Value::as_object)
+            .expect("provider-owned context windows");
+        assert_eq!(windows.get("gpt-5").and_then(Value::as_u64), Some(272_000));
+        assert_eq!(
+            windows.get("gpt-5-codex").and_then(Value::as_u64),
+            Some(272_000)
+        );
+    }
+
+    #[test]
+    fn missing_sol_metadata_uses_the_full_provider_window() {
+        let model = ModelEntry {
+            slug: "gpt-5.6-sol".into(),
+            display_name: None,
+            description: None,
+            priority: None,
+            supports_reasoning_summaries: true,
+            supports_parallel_tool_calls: true,
+            context_length: None,
+        };
+        assert_eq!(provider_context_window(&model), 272_000);
     }
 
     #[test]

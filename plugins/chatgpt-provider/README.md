@@ -36,6 +36,15 @@ Usage adds `<prefix>.usage.requested`, `.usage.updated`, and `.usage.error`.
 The update payload carries the backend's primary/secondary windows, reset
 timestamps, plan type, and credits without deriving quota from local tokens.
 
+Direct completion accounting publishes the occupancy of the exact lowered
+Responses request before it is sent, then replaces that estimate with backend
+input usage when the response completes. The local estimate is
+`ceil(serialized_request_json_bytes / 4)`: because it runs after provider
+lowering, instructions, native/checkpoint items, attachments, tool schemas,
+structured output, and reasoning controls each enter through their one wire
+representation. Events carry only counts and accuracy, never request content.
+Aggregate input/output usage remains separate from current request occupancy.
+
 Image media returned by tools such as `read_image` is converted to Responses
 API `InputImage` items for vision-capable models. If the active model cannot
 accept images, the provider returns an explicit model-capability error instead
