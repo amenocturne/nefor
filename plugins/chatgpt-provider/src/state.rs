@@ -370,6 +370,10 @@ pub struct Chats {
     /// model came in via `model.set` without going through /models),
     /// the dispatcher's static heuristic is the fallback.
     capabilities: Mutex<HashMap<String, ModelCapabilities>>,
+    /// Context maxima resolved at the provider boundary. A model may be selected
+    /// only when it has either backend metadata cached here or exact static
+    /// provider metadata.
+    context_windows: Mutex<HashMap<String, u64>>,
     /// Per-model "reasoning unsupported" override populated reactively
     /// when a 400 from /responses reports `reasoning.summary` (or any
     /// `reasoning.*`) as an unsupported parameter — defense in depth
@@ -389,6 +393,7 @@ impl Chats {
             default_model: Mutex::new(model),
             inner: Mutex::new(HashMap::new()),
             capabilities: Mutex::new(HashMap::new()),
+            context_windows: Mutex::new(HashMap::new()),
             reasoning_unsupported: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -408,6 +413,19 @@ impl Chats {
         for (slug, caps) in entries {
             g.insert(slug, caps);
         }
+    }
+
+    pub async fn record_model_context_windows<I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (String, u64)>,
+    {
+        let mut windows = self.context_windows.lock().await;
+        windows.clear();
+        windows.extend(entries);
+    }
+
+    pub async fn model_context_window(&self, model: &str) -> Option<u64> {
+        self.context_windows.lock().await.get(model).copied()
     }
 
     /// Authoritative reasoning-summary capability for `model` when we

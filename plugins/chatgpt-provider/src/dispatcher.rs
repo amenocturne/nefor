@@ -372,31 +372,46 @@ fn session_stats_body(args: &ServeArgs, chat_id: &ChatId, stats: &ChatStats) -> 
     make_event(format!("{}session.stats", args.event_prefix()), m)
 }
 
-/// Context window supplied by provider policy when `/models` omits it.
-/// Keep model metadata here, at the provider boundary; UI/config consumers
-/// receive a complete model-specific value and never infer model families.
-fn provider_context_window(model: &ModelEntry) -> u64 {
-    model.context_length.unwrap_or(match model.slug.as_str() {
-        "gpt-5.6-sol" => 272_000,
-        _ => 272_000,
-    })
+/// Provider-owned context metadata for models whose `/models` entry omits it.
+///
+/// These values mirror Codex's bundled model catalog. Exact slugs are
+/// intentional: a newly introduced model is not assumed to share a family
+/// window until either the backend or this metadata says so.
+fn known_context_window(slug: &str) -> Option<u64> {
+    match slug {
+        "gpt-5.6-sol" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex"
+        | "gpt-5.2-codex" | "gpt-5.2" | "gpt-5.1-codex-max" | "gpt-5.1-codex" | "gpt-5.1"
+        | "gpt-5-codex" | "gpt-5" | "gpt-5.1-codex-mini" | "gpt-5-codex-mini"
+        | "codex-auto-review" => Some(272_000),
+        "gpt-oss-120b" | "gpt-oss-20b" => Some(128_000),
+        _ => None,
+    }
+}
+
+fn provider_context_window(model: &ModelEntry) -> Option<u64> {
+    model
+        .context_length
+        .or_else(|| known_context_window(&model.slug))
 }
 
 fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Value> {
-    let arr: Vec<Value> = models
+    // A listed model is selectable by generic Lua, which requires a context
+    // maximum. Keep entries with authoritative upstream metadata or an exact
+    // provider-owned fallback; withhold unknown incomplete entries rather than
+    // publishing an invented limit.
+    let resolved: Vec<(&ModelEntry, u64)> = models
         .iter()
-        .map(|m| Value::String(m.slug.clone()))
+        .filter_map(|model| provider_context_window(model).map(|window| (model, window)))
+        .collect();
+    let arr: Vec<Value> = resolved
+        .iter()
+        .map(|(model, _)| Value::String(model.slug.clone()))
         .collect();
     let mut m = Map::new();
     m.insert("models".into(), Value::Array(arr));
-    let ctx_map: Map<String, Value> = models
+    let ctx_map: Map<String, Value> = resolved
         .iter()
-        .map(|model| {
-            (
-                model.slug.clone(),
-                Value::Number(provider_context_window(model).into()),
-            )
-        })
+        .map(|(model, window)| (model.slug.clone(), Value::Number((*window).into())))
         .collect();
     if !ctx_map.is_empty() {
         m.insert("context_windows".into(), Value::Object(ctx_map));
@@ -784,6 +799,11 @@ fn spawn_models_fetch(
                                 supports_parallel_tool_calls: m.supports_parallel_tool_calls,
                             },
                         )
+                    }))
+                    .await;
+                chats
+                    .record_model_context_windows(models.iter().filter_map(|model| {
+                        provider_context_window(model).map(|window| (model.slug.clone(), window))
                     }))
                     .await;
                 let body = models_listed_body(&args, &models);
@@ -1218,6 +1238,25 @@ async fn dispatch_event(
                     return Ok(());
                 }
             };
+            let context_window = ctx
+                .chats
+                .model_context_window(&model)
+                .await
+                .or_else(|| known_context_window(&model));
+            if context_window.is_none() {
+                send_event(
+                    &ctx.out_tx,
+                    turn_error_body(
+                        &ctx.args,
+                        read_chat_id(body).as_ref(),
+                        &format!(
+                            "model {model:?} has no known context window and cannot be selected"
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
             ctx.chats.set_default_model(model.clone()).await;
             let chat_id = read_chat_id(body);
             if let Some(cid) = &chat_id {
@@ -4175,7 +4214,56 @@ mod tests {
             supports_parallel_tool_calls: true,
             context_length: None,
         };
-        assert_eq!(provider_context_window(&model), 272_000);
+        assert_eq!(provider_context_window(&model), Some(272_000));
+    }
+
+    #[test]
+    fn explicit_upstream_context_window_takes_precedence() {
+        let model = ModelEntry {
+            slug: "gpt-5.6-sol".into(),
+            display_name: None,
+            description: None,
+            priority: None,
+            supports_reasoning_summaries: true,
+            supports_parallel_tool_calls: true,
+            context_length: Some(999_999),
+        };
+        assert_eq!(provider_context_window(&model), Some(999_999));
+    }
+
+    #[test]
+    fn known_missing_metadata_uses_model_specific_provider_metadata() {
+        let model = ModelEntry {
+            slug: "gpt-oss-120b".into(),
+            display_name: None,
+            description: None,
+            priority: None,
+            supports_reasoning_summaries: false,
+            supports_parallel_tool_calls: true,
+            context_length: None,
+        };
+        assert_eq!(provider_context_window(&model), Some(128_000));
+    }
+
+    #[test]
+    fn unknown_missing_metadata_is_not_advertised() {
+        let unknown = ModelEntry {
+            slug: "future-model".into(),
+            display_name: None,
+            description: None,
+            priority: None,
+            supports_reasoning_summaries: false,
+            supports_parallel_tool_calls: true,
+            context_length: None,
+        };
+        assert_eq!(provider_context_window(&unknown), None);
+
+        let body = models_listed_body(&args(), &[unknown]);
+        assert!(body
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty));
+        assert!(body.get("context_windows").is_none());
     }
 
     #[test]
