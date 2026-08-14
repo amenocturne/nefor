@@ -1499,14 +1499,10 @@ fn typing_and_enter_emits_chat_input_submit() {
 }
 
 #[test]
-fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
-    // Lead-turn flip: the kernel owns turn queueing, so the chat
-    // surface no longer buffers busy follow-ups locally. Each submit
-    // while a turn is in flight (a) emits chat.input.submit right away
-    // and (b) renders immediately, coalesced into ONE user entry
-    // rather than one bubble per message. (This replaces the old
-    // "queued follow-up widget" contract, whose text stayed out of the
-    // transcript until stream end promoted it.)
+fn busy_submits_emit_immediately_and_coalesce_above_prompt() {
+    // The kernel still receives every busy submit immediately. The chat
+    // surface coalesces their optimistic representation into one pinned
+    // entry above the prompt until the queue is promoted into a turn.
     let mut engine = Engine::new(80, 24).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
@@ -1533,19 +1529,32 @@ fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
         assert_eq!(body.get("text").and_then(|v| v.as_str()), Some(*text));
     }
 
-    // Full-frame snapshot: "second" already rendered on the previous
-    // frame, so the line-diff from render_str would only carry "third".
-    let out = render_snapshot(&mut engine);
-    assert!(
-        out.contains("second") && out.contains("third"),
-        "busy follow-ups must render in the transcript immediately: {out:?}"
-    );
-    assert!(
-        !out.contains("queued follow-up"),
-        "the old pending-widget UX must not come back: {out:?}"
+    type_text(&mut engine, "draft-in-prompt");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.error.append", "title": "late-assistant-output" }),
     );
 
-    // No local buffer means stream end has nothing left to promote.
+    // Full-frame snapshot: the queued entry is outside the scrollable
+    // transcript, so even transcript content arriving later stays above it;
+    // the draft remains immediately below it in the prompt.
+    let out = render_snapshot(&mut engine);
+    let assistant = out.find("late-assistant-output").expect("assistant output");
+    let second = out.find("second").expect("first queued message");
+    let third = out.find("third").expect("second queued message");
+    let draft = out.find("draft-in-prompt").expect("prompt draft");
+    assert!(
+        assistant < second && second < third && third < draft,
+        "queued follow-ups must stay pinned between transcript and prompt: {out:?}"
+    );
+    assert_eq!(
+        out.matches("second").count(),
+        1,
+        "the pinned entry must not also render in the transcript: {out:?}"
+    );
+
+    // Agent-side queueing remains unchanged: stream end does not re-emit
+    // follow-ups because every submit already went out on the bus.
     fixture_assistant_completed(
         &mut engine,
         None,
@@ -1628,14 +1637,27 @@ fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
         Some("chat.steer")
     );
 
-    let _ = render_str(&mut engine);
-    dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
-    fixture_message_with_submissions(&mut engine, "user", "queued", &[&queued_submission]);
-    let out = render_snapshot(&mut engine);
+    let pinned = render_snapshot(&mut engine);
     assert_eq!(
-        out.matches("queued").count(),
+        pinned.matches("queued").count(),
         1,
-        "accepted steering keeps exactly one visible user occurrence: {out:?}"
+        "queue is visible before delivery"
+    );
+
+    dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
+    let promoted = render_snapshot(&mut engine);
+    assert_eq!(
+        promoted.matches("queued").count(),
+        1,
+        "promotion moves the same optimistic row into chat without a disappearance: {promoted:?}"
+    );
+
+    fixture_message_with_submissions(&mut engine, "user", "queued", &[&queued_submission]);
+    let delivered = render_snapshot(&mut engine);
+    assert_eq!(
+        delivered.matches("queued").count(),
+        1,
+        "durable delivery keeps exactly one ordinary user occurrence: {delivered:?}"
     );
 }
 

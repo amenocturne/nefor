@@ -72,6 +72,30 @@ local function loading_widget(state)
   return tui.text { content = body, style = STYLE.system, wrap = "none" }
 end
 
+local function transcript_entries(state)
+  if state.queued_entry_id == nil then return state.entries or {} end
+  local visible = {}
+  for _, entry in ipairs(state.entries or {}) do
+    if not queued_input.is_queued_entry(state, entry) then
+      visible[#visible + 1] = entry
+    end
+  end
+  return visible
+end
+
+local function queued_message(state)
+  for _, entry in ipairs(state.entries or {}) do
+    if queued_input.is_queued_entry(state, entry) then
+      return tui.column {
+        key = "queued-message",
+        gap = 0,
+        children = { entries_mod.render(entry, 0, false, true, state.raw_tool_id) },
+      }
+    end
+  end
+  return nil
+end
+
 local function transcript(state, statusline)
   -- Welcome banner shows on a fresh surface only; the chat widget's
   -- `empty_view` slot accepts a fn returning the banner tree, which
@@ -87,10 +111,9 @@ local function transcript(state, statusline)
   local concealed = state.resume_loading ~= nil
   return W.chat.view({
     key          = concealed and "transcript-loading" or "transcript",
-    entries      = function() return concealed and {} or (state.entries or {}) end,
+    entries      = function() return concealed and {} or transcript_entries(state) end,
     render_entry = function(e, i)
-      local queued = queued_input.is_queued_entry(state, e)
-      return entries_mod.render(e, i, state.expanded_details, queued, state.raw_tool_id)
+      return entries_mod.render(e, i, state.expanded_details, false, state.raw_tool_id)
     end,
     append       = concealed and nil or thinking_widget(state),
     empty_view   = empty_view,
@@ -211,6 +234,7 @@ local function render(state, statusline, slash)
       blank_row(),
       loading_widget(state),
       tui.expanded { child = transcript(state, statusline) },
+      queued_message(state),
       input_field,
       statusline.view(state),
       blank_row(),
