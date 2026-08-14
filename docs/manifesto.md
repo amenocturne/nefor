@@ -16,6 +16,12 @@ Every feature added to Nefor must fit the world described below. If it does not,
 
 The implementation will change. Rust, Lua, processes, JSON Lines, NCP, MAG, and the terminal interface are current choices unless a published contract deliberately makes one of them stable. What should survive those choices is the user's real ability to find, change, remove, and replace behavior without patching unrelated machinery.
 
+## Keep changes inside their boundary
+
+Changes and fixes stay within the explicitly stated problem and ownership boundary. Correcting a defect does not grant authority to change business logic, product constraints, or semantics owned elsewhere, even when doing so would make the local implementation simpler.
+
+If evidence shows that the stated boundary or an adjacent business rule is wrong, stop treating the work as an implementation fix. Make the proposed change an explicit design decision, reconsider its owner and consequences, and only then change the rule.
+
 ## Protect the engine
 
 The engine is Nefor's most important and most protected part. Feature work does not normally change it. New behavior belongs in the components the engine runs, the libraries they use, or the composition that connects them.
