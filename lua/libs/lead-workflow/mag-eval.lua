@@ -100,8 +100,10 @@ M.schema = {
   name        = "mag-eval",
   display = { label = "mag-eval", primary = { arg = "intent" }, result = { kind = "content" } },
   description =
-    "Evaluate one MAG node expression on the actor kernel. The tool submits an " ..
-    "asynchronous run and acknowledges immediately with a stable run_id, so commands " ..
+    "Evaluate one MAG node expression on the actor kernel. The tool submits a run and " ..
+    "waits briefly for that exact run's canonical terminal result. A quick success or " ..
+    "failure returns directly; otherwise it returns the existing asynchronous " ..
+    "acknowledgment with a stable run_id, so commands " ..
     "inside the expression should normally stay in the foreground rather than using " ..
     "shell backgrounding. Background only when a process intentionally needs a " ..
     "separately retained lifecycle. " ..
@@ -115,8 +117,9 @@ M.schema = {
     "starts the process, waits for readiness, performs the dependent work, and tears " ..
     "it down. Never launch a server as a normal run and await its completion. " ..
     "Use nefor.shell.script only for explicit /bin/sh programs; both operations carry an explicit timeout option. " ..
-    "The call acknowledges immediately with a stable run_id. Root-lead completion " ..
-    "arrives through the normal owner-scoped notification; delegated callers use their " ..
+    "After an asynchronous acknowledgment, root-lead completion arrives through the " ..
+    "normal owner-scoped notification; a terminal tool return is already final and must " ..
+    "not be narrated as waiting. delegated callers use their " ..
     "available run-wait capability when dependent work cannot be composed into the same " ..
     "graph. Multi-step or multi-file work runs as a .mag program via the " ..
     "mag tool instead.",

@@ -104,6 +104,21 @@ local run_registry = RunRegistry.new({
 local dependency_module_roots = {}
 local agent_defaults = nil
 
+local SYNC_COMPLETION_GRACE_MS = 3000
+local grace_scheduler
+
+local function default_grace_scheduler(delay_ms, callback)
+  local seconds = math.max(delay_ms, 1) / 1000
+  local timer = nefor.process.spawn({
+    cmd = "sh",
+    args = { "-c", "sleep " .. tostring(seconds) },
+    on_exit = callback,
+  })
+  return function()
+    pcall(function() timer:kill() end)
+  end
+end
+
 local function copy_roots(roots)
   local copy = {}
   for i = 1, #roots do copy[i] = roots[i] end
@@ -184,6 +199,11 @@ local state = {
   -- with the compiler message. One entry per in-flight handshake.
   pending_mag_load = {},
 
+  -- Invocations awaiting the short terminal-result grace deadline, keyed by
+  -- exact run_id. Timeout emits the unchanged detached acknowledgment;
+  -- terminal settlement claims the same slot for synchronous delivery.
+  completion_grace_waiters = {},
+
   -- Kernel runs are concurrent: every kernel lifecycle event
   -- (`mag.actor_spawned` / `mag.actor_ready` / `mag.actor_killed` /
   -- `mag.run_complete`) carries its run_id, and the tracker keys straight
@@ -203,6 +223,9 @@ local now_ms
 local emit_verdict_approved
 local emit_verdict_rejected
 local emit_verdict_discarded
+local begin_completion_grace
+local cancel_completion_grace
+local expire_completion_grace
 
 local function orchestration_profiles()
   local ok, cfg = pcall(require, "config")
@@ -1133,7 +1156,13 @@ local function handle_mag_run_result(body)
     emit_await_outcome(firing_id, settled.outcome)
   end
 
+  local grace_waiter = cancel_completion_grace(run_id)
+  if grace_waiter then
+    emit_await_outcome(grace_waiter.firing_id, settled.outcome)
+  end
+
   if not run_registry:claim_delivery(run_id) then return end
+  if grace_waiter then return end
   local root_owned = run.dispatcher_id == nil
   if failed then
     if root_owned then
@@ -1423,6 +1452,9 @@ end
 
 local function terminate_active_graph(session_id)
   invalidate_pending_mag_loads(nil)
+  for run_id in pairs(state.completion_grace_waiters) do
+    cancel_completion_grace(run_id)
+  end
   state.active_plan = nil
   state.graph_status_cooldowns = {}
 
@@ -1535,9 +1567,12 @@ local function lead_workflow_tool_schemas()
         "Write, compile, and execute MAG programs on the actor kernel. " ..
         "Use action='write' to create/update a .mag file in the workspace. " ..
         "Use action='compile' (default) to compile and preview the actor " ..
-        "modification. Use action='execute' to compile, validate, and submit an " ..
-        "asynchronous run; the tool returns a stable run_id without waiting for " ..
-        "terminal output. MAG already owns the run lifecycle, so commands inside " ..
+        "modification. Use action='execute' to compile, validate, and submit a run. " ..
+        "Execution waits briefly for that exact run's canonical terminal result. A quick " ..
+        "success or failure returns directly; otherwise the existing asynchronous " ..
+        "acknowledgment with a stable run_id is returned and completion arrives later " ..
+        "through the normal owner-scoped notification. Do not narrate waiting after a " ..
+        "terminal result. MAG already owns the run lifecycle, so commands inside " ..
         "the graph should normally stay in the foreground rather than using shell " ..
         "backgrounding. Background only when a process intentionally needs a " ..
         "separately retained lifecycle. Graph and agent semantics live in " ..
@@ -1649,6 +1684,63 @@ invalidate_pending_mag_loads = function(firing_id)
   return hit
 end
 
+local function async_run_ack(pending, body)
+  local message
+  if pending.dispatcher_id == nil then
+    message = "Program submitted to the MAG actor kernel. If completion is required, stop " ..
+      "this turn and wait for the normal owner-scoped completion notification; do not call " ..
+      "graph-status merely to wait. Compose dependent work into one MAG graph or bounded " ..
+      "operation when it must continue within one workflow."
+  else
+    message = "Program submitted to the MAG actor kernel. Use await-run with this run_id when " ..
+      "your next step depends on completion; do not poll graph-status. The normal completion " ..
+      "notification remains independent."
+  end
+  return {
+    status = "executing",
+    run_id = pending.run_id,
+    run_name = pending.run_name,
+    hash = body.hash,
+    engine = "mag-kernel",
+    message = message,
+  }
+end
+
+local function expire_completion_grace(run_id)
+  local waiter = state.completion_grace_waiters[run_id]
+  if not waiter then return false end
+  state.completion_grace_waiters[run_id] = nil
+  emit_tool_result_ok(waiter.firing_id, waiter.ack)
+  return true
+end
+
+begin_completion_grace = function(run, ack)
+  local waiter = { firing_id = run.dispatch_firing_id, ack = ack }
+  state.completion_grace_waiters[run.run_id] = waiter
+  local schedule = grace_scheduler or default_grace_scheduler
+  waiter.cancel_timer = schedule(SYNC_COMPLETION_GRACE_MS, function()
+    expire_completion_grace(run.run_id)
+  end)
+end
+
+cancel_completion_grace = function(run_id)
+  local waiter = state.completion_grace_waiters[run_id]
+  if not waiter then return nil end
+  state.completion_grace_waiters[run_id] = nil
+  if type(waiter.cancel_timer) == "function" then waiter.cancel_timer() end
+  return waiter
+end
+
+local function cancel_completion_grace_by_firing(firing_id)
+  for run_id, waiter in pairs(state.completion_grace_waiters) do
+    if waiter.firing_id == firing_id then
+      cancel_completion_grace(run_id)
+      return true
+    end
+  end
+  return false
+end
+
 -- Validate and submit one loaded artifact through the standard active-run
 -- channel. Both file-based `mag execute` and `mag-eval` use this
 -- path, so lifecycle/control/rendering/archival/cleanup have one owner.
@@ -1690,28 +1782,10 @@ submit_loaded_run = function(pending, body, error_prefix)
     artifact = artifact,
   }
   if next(overlay) ~= nil then exec.params_overlay = overlay end
-  register_active_run(pending.run_id, actors, terminal_id,
+  local run = register_active_run(pending.run_id, actors, terminal_id,
     pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id)
+  begin_completion_grace(run, async_run_ack(pending, body))
   emit_as(SOURCE_NAME, "mag", exec)
-  local message
-  if pending.dispatcher_id == nil then
-    message = "Program submitted to the MAG actor kernel. If completion is required, stop " ..
-      "this turn and wait for the normal owner-scoped completion notification; do not call " ..
-      "graph-status merely to wait. Compose dependent work into one MAG graph or bounded " ..
-      "operation when it must continue within one workflow."
-  else
-    message = "Program submitted to the MAG actor kernel. Use await-run with this run_id when " ..
-      "your next step depends on completion; do not poll graph-status. The normal completion " ..
-      "notification remains independent."
-  end
-  emit_tool_result_ok(pending.firing_id, {
-    status = "executing",
-    run_id = pending.run_id,
-    run_name = pending.run_name,
-    hash = body.hash,
-    engine = "mag-kernel",
-    message = message,
-  })
   return true
 end
 
@@ -1924,6 +1998,7 @@ local function receive_msg(entry)
       clear_pending_plan(plan)
     end
     if run_registry:detach_waiter(body.id) then return end
+    cancel_completion_grace_by_firing(body.id)
     mag_eval.cancel(body.id)
     invalidate_pending_mag_loads(body.id)
     interrupt_run_by_dispatch_firing(body.id)
@@ -2101,6 +2176,11 @@ local M = {
     run_registry = run_registry,
     await_run = await_run,
     graph_status_cooldown_limit = GRAPH_STATUS_COOLDOWN_LIMIT,
+    sync_completion_grace_ms = SYNC_COMPLETION_GRACE_MS,
+    expire_completion_grace = expire_completion_grace,
+    set_grace_scheduler = function(scheduler)
+      grace_scheduler = scheduler
+    end,
     set_graph_status_now = function(now_fn)
       graph_status_now = now_fn or os.time
     end,
@@ -2115,6 +2195,11 @@ local M = {
       state.gate_mode = "safe"
       state.kernel_factories = {}
       state.pending_mag_load = {}
+      for run_id in pairs(state.completion_grace_waiters) do
+        cancel_completion_grace(run_id)
+      end
+      state.completion_grace_waiters = {}
+      grace_scheduler = nil
       dependency_module_roots = {}
       agent_defaults = nil
       mag_eval._internals.reset()

@@ -67,6 +67,10 @@ end
 
 local function fresh()
   lw._internals.reset()
+  lw._internals.set_grace_scheduler(function(_, callback)
+    callback()
+    return function() end
+  end)
   agentic_loop._internals.reset()
   sessions._internals.reset_state()
   sessions.init()
@@ -122,6 +126,9 @@ do
     if schema.name == "graph-status" then graph_status_schema = schema end
   end
   assert_true(mag_schema ~= nil, "the MAG tool schema is advertised")
+  assert_true(mag_schema.description:find("A quick success or failure returns directly", 1, true) ~= nil
+      and mag_schema.description:find("Do not narrate waiting after a terminal result", 1, true) ~= nil,
+    "mag execute schema explains both grace outcomes")
   assert_true(mag_eval_schema ~= nil, "the mag-eval tool schema is advertised")
   assert_true(await_schema ~= nil, "the await-run schema is advertised")
   assert_true(graph_status_schema ~= nil, "the graph-status schema is advertised")
@@ -141,9 +148,9 @@ do
   assert_true(mag_eval_schema.description:find("Commands run until process exit", 1, true) ~= nil
       and mag_eval_schema.description:find("Never launch a server as a normal run", 1, true) ~= nil,
     "mag-eval canonically warns that persistent commands cannot be awaited to completion")
-  assert_true(mag_eval_schema.description:find("Root-lead completion", 1, true) ~= nil
-      and mag_eval_schema.description:find("owner-scoped notification", 1, true) ~= nil,
-    "shared mag-eval schema accurately names root-lead notification delivery")
+  assert_true(mag_eval_schema.description:find("owner-scoped notification", 1, true) ~= nil
+      and mag_eval_schema.description:find("terminal tool return is already final", 1, true) ~= nil,
+    "shared mag-eval schema explains its two delivery outcomes")
   assert_true(mag_eval_schema.description:find("call await-run", 1, true) == nil,
     "shared mag-eval schema does not command a root lead to use an unavailable tool")
   assert_true(mag_eval_schema.description:find("delegated callers", 1, true) ~= nil
@@ -834,6 +841,130 @@ do
   assert_true(err.body.error:find("compilation failed", 1, true) ~= nil
               and err.body.error:find("terminal binding", 1, true) ~= nil,
     "compile failure carries the compiler message; got " .. json.encode(_test.calls()))
+end
+
+local function has_relayed_lead_turn()
+  return find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.body.entry == "agentic-loop/lead-turn.mag"
+  end) ~= nil
+end
+
+-- ------------------------------------------------------------------
+-- Shared execute grace: mag execute and mag-eval register at the same
+-- run owner. Tests drive the deadline callback explicitly (no wall clock).
+-- ------------------------------------------------------------------
+
+local function controlled_grace()
+  local timers = {}
+  lw._internals.set_grace_scheduler(function(delay_ms, callback)
+    assert_eq(delay_ms, lw._internals.sync_completion_grace_ms,
+      "the named completion grace default is used")
+    local timer = { callback = callback, canceled = false }
+    timers[#timers + 1] = timer
+    return function() timer.canceled = true end
+  end)
+  return timers
+end
+
+local function start_file_run(firing_id, file)
+  write_mag_file(firing_id .. "-write", file, READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag(firing_id, file)
+  feed_loaded(read_only_modification())
+  local exec = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+  end)
+  assert_true(exec ~= nil, "file execution reaches the shared run owner")
+  return exec.body.run_id
+end
+
+local function start_eval_run(firing_id)
+  invoke_tool(firing_id, "mag-eval", {
+    intent = "Print value",
+    expr = '(nefor.process.exec "print" (as nefor.contracts.ProcessExecParams {:argv ["printf" "ok"] :cwd nefor.process.cwd :timeout (nefor.contracts.no-timeout)}))',
+  })
+  feed_loaded(read_only_modification())
+  local exec = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+  end)
+  assert_true(exec ~= nil, "mag-eval reaches the shared run owner")
+  return exec.body.run_id
+end
+
+do
+  fresh()
+  local timers = controlled_grace()
+  local run_id = start_file_run("grace-fast-success", "grace-fast-success.mag")
+  assert_eq(tool_result("grace-fast-success"), nil,
+    "execute remains open during the grace window")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
+    result = { value = "fast result" } })
+  local result = tool_result("grace-fast-success")
+  assert_eq(result.body.output.status, "completed",
+    "completion before grace returns the canonical terminal result")
+  assert_eq(result.body.output.result.value, "fast result",
+    "synchronous result preserves canonical payload")
+  assert_true(timers[1].canceled, "terminal settlement cancels its deadline")
+  assert_eq(has_relayed_lead_turn(), false,
+    "synchronously delivered completion is not relayed as a second lead turn")
+end
+
+do
+  fresh()
+  local timers = controlled_grace()
+  local run_id = start_eval_run("grace-fast-failure")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id, status = "failed",
+    error = "fast boom" })
+  local result = tool_result("grace-fast-failure")
+  assert_true(result.body.error:find("fast boom", 1, true) ~= nil,
+    "failure before grace returns the canonical terminal failure")
+  assert_eq(result.body.status, "failed", "terminal failure keeps failed status")
+  assert_true(timers[1].canceled, "failed settlement cancels its deadline")
+  assert_eq(has_relayed_lead_turn(), false,
+    "synchronously delivered failure is not relayed a second time")
+end
+
+do
+  fresh()
+  local timers = controlled_grace()
+  local run_id = start_file_run("grace-timeout", "grace-timeout.mag")
+  _test.calls_clear()
+  timers[1].callback()
+  local ack = tool_result("grace-timeout")
+  assert_eq(ack.body.output.status, "executing",
+    "deadline returns the existing asynchronous acknowledgment")
+  assert_eq(ack.body.output.run_id, run_id, "acknowledgment preserves the exact run id")
+  assert_eq(ack.body.output.engine, "mag-kernel", "acknowledgment preserves the engine")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
+    result = { value = "late result" } })
+  assert_true(has_relayed_lead_turn(),
+    "completion after timeout follows the normal owner-scoped notification path")
+  assert_eq(tool_result("grace-timeout"), nil,
+    "late completion does not deliver the tool result twice")
+end
+
+do
+  fresh()
+  local timers = controlled_grace()
+  local first = start_file_run("grace-concurrent-a", "grace-concurrent-a.mag")
+  _test.calls_clear()
+  local second = start_eval_run("grace-concurrent-b")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = second, status = "completed",
+    result = { value = "second" } })
+  assert_eq(tool_result("grace-concurrent-a"), nil,
+    "a terminal result cannot settle another run's firing")
+  assert_eq(tool_result("grace-concurrent-b").body.output.result.value, "second",
+    "terminal correlation is strictly by run_id")
+  assert_true(timers[2].canceled and not timers[1].canceled,
+    "only the matching run's deadline is canceled")
+  _test.calls_clear()
+  timers[1].callback()
+  assert_eq(tool_result("grace-concurrent-a").body.output.run_id, first,
+    "the remaining run keeps its own asynchronous acknowledgment")
 end
 
 -- ------------------------------------------------------------------

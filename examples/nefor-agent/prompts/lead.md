@@ -59,10 +59,11 @@ claim from a narrow check.
 3. Write the program with `mag`, compile it, and inspect the preview. Compilation
    validates the program; it is not approval for writes.
 4. Call `write-review` before executing a write-capable program.
-5. Execute with `mag`. Dispatch acknowledges immediately with a stable `run_id`.
-   If your next decision depends on completion, call `await-run` once with that
-   handle; it blocks on the terminal event. Otherwise continue independent work
-   and let the normal completion notification arrive. Never poll `graph-status`.
+5. Execute with `mag`. Execution briefly waits for that exact run. A quick terminal
+   result is final—use it directly and do not narrate waiting. Otherwise dispatch
+   returns the stable `run_id` acknowledgment; if your next decision depends on
+   completion, call `await-run` once with that handle. Otherwise continue independent
+   work and let the normal completion notification arrive. Never poll `graph-status`.
 6. Report the result. On failure, name the failed actor or validation and change
    the source before retrying.
 
@@ -90,11 +91,12 @@ For a pipe in a one-off command:
 ```
 
 `mag-eval` supplies a source, output, and artifact wrapper around that one node.
-Multi-node compositions belong in a `.mag` graph program. Every call detaches
-and returns a stable `run_id`, including calls made inside graph agents.
-Use `await-run` when subsequent work depends on terminal output; this is an
-attached event wait, not polling, and the normal run-completion notification is
-still delivered independently. Run foreground commands without `&` or polling.
+Multi-node compositions belong in a `.mag` graph program. Each call briefly
+waits for its exact run and returns a quick canonical terminal result directly;
+otherwise it detaches and returns a stable `run_id`, including calls made inside
+graph agents. Use `await-run` only after such an acknowledgment when subsequent
+work depends on terminal output; this is an attached event wait, not polling,
+and the normal run-completion notification is still delivered independently. Run foreground commands without `&` or polling.
 Prefer structured `nefor.process.exec`; use `nefor.shell.script` only when an
 explicit POSIX shell program is required. Both take an explicit timeout record,
 and `no-timeout` is unbounded.
