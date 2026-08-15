@@ -46,18 +46,38 @@ local function json_encode(value)
   return ok and encoded or "<unencodable>"
 end
 
-local function correction(validation, wrapped)
-  local detail
+local DIAGNOSTIC_LIMIT = 512
+
+local function bounded(value)
+  value = tostring(value or "")
+  if #value <= DIAGNOSTIC_LIMIT then return value end
+  return value:sub(1, DIAGNOSTIC_LIMIT) .. "…"
+end
+
+local function diagnostic(validation)
   if type(validation.error) == "table" then
-    detail = validation.error.kind .. ": " .. validation.error.message
-  else
-    detail = json_encode(validation.violations or {})
+    return bounded(tostring(validation.error.kind or "invalid") .. " at $: "
+      .. tostring(validation.error.message or "invalid structured output"))
   end
-  local shape = wrapped
-    and 'Return only a JSON object of the form {"value": <corrected value>}.'
-    or "Return the corrected JSON object only."
-  return "Your previous response was not valid for the required MAG type. "
-    .. shape .. " Diagnostics: " .. detail
+  local details = {}
+  for _, violation in ipairs(validation.violations or {}) do
+    details[#details + 1] = string.format("%s [%s]: expected %s, got %s (%s)",
+      bounded(violation.path or "$"), bounded(violation.code or "invalid"),
+      bounded(violation.expected or "schema match"), bounded(violation.actual or "invalid"),
+      bounded(violation.message or "validation failed"))
+    if #details >= 4 then break end
+  end
+  return #details > 0 and table.concat(details, "; ") or "invalid structured output at $"
+end
+
+local function correction(validation, provider_schema)
+  local shape = provider_schema.wrapped
+    and 'The required root envelope is {"value": <corrected value>}.'
+    or "The response root must match the schema directly."
+  return "Correct the previous response to the exact expected JSON Schema: "
+    .. json_encode(provider_schema.schema) .. ". Failure: " .. diagnostic(validation) .. ". "
+    .. shape .. " Return JSON only: no prose, Markdown, or code fences. "
+    .. "Use valid JSON escaping: encode newlines as \\n and all control characters with JSON escapes."
 end
 
 local function root_union(schema)
@@ -189,7 +209,7 @@ function M.construct(id, params, emit, deps)
       corrections = corrections + 1
       state:append({
         role = "user",
-        content = correction(validation, provider_schema.wrapped),
+        content = correction(validation, provider_schema),
         visibility = "diagnostic",
       })
       state:retry("structured_output_correction")

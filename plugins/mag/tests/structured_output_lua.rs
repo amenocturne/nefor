@@ -158,6 +158,11 @@ fn structured_output_retries_and_preserves_tool_rounds() {
         assert(emitted[#emitted].request.input == nil)
         local correction = last_text()
         assert(correction:find("malformed_json"), correction)
+        assert(correction:find('"type":"object"', 1, true), correction)
+        assert(correction:find("JSON only", 1, true), correction)
+        assert(correction:find("code fences", 1, true), correction)
+        assert(correction:find("newlines as \\n", 1, true), correction)
+        assert(correction:find("control characters", 1, true), correction)
 
         actor.deliver({ kind = "reply", result = { text = [[{"task":4}]] } })
         assert(emitted[#emitted].kind == "capability.invoke")

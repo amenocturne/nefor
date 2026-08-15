@@ -1885,7 +1885,7 @@ mod tests {
                 "result": {"from": {
                     "actor": "answer",
                     "type": "audit.CodeAudit",
-                    "wire": "generic-provider.FinalAnswer"
+                    "wire": "generic-provider.TextAnswer"
                 }}
             }
         });
@@ -1893,7 +1893,7 @@ mod tests {
         assert_eq!(modification["result"]["from"]["actor"], "answer");
         assert_eq!(
             modification["result"]["from"]["wire"],
-            "generic-provider.FinalAnswer"
+            "generic-provider.TextAnswer"
         );
         assert_eq!(modification["actors"].as_array().map(Vec::len), Some(1));
     }
@@ -2028,7 +2028,7 @@ mod tests {
 
         let provider_input = named("nefor.contracts.ProviderInput");
         let tool_calls = named("nefor.contracts.ToolCalls");
-        let final_answer = named("nefor.contracts.FinalAnswer");
+        let text_answer = named("nefor.contracts.TextAnswer");
         let modification = serde_json::json!({
             "actors": [{
                 "id": "answer",
@@ -2036,15 +2036,15 @@ mod tests {
                 "evidence": evidence(
                     "nefor.factory.llm",
                     provider_input.clone(),
-                    serde_json::json!({"kind":"union","items":[tool_calls.clone(),final_answer.clone()]})
+                    serde_json::json!({"kind":"union","items":[tool_calls.clone(),text_answer.clone()]})
                 ),
                 "input": {"wire":"generic-provider.ProviderOut","type":provider_input},
                 "outputs": [
                     {"wire":"generic-tool.ToolCalls","type":tool_calls},
-                    {"wire":"generic-provider.FinalAnswer","type":final_answer}
+                    {"wire":"generic-provider.TextAnswer","type":text_answer}
                 ],
                 "params": {"provider":"provider-a"},
-                "routes": {"generic-tool.ToolCalls":[],"generic-provider.FinalAnswer":[]}
+                "routes": {"generic-tool.ToolCalls":[],"generic-provider.TextAnswer":[]}
             }],
             "messages": [{
                 "to": "answer",
@@ -2054,8 +2054,8 @@ mod tests {
             "rules": [],
             "result": {"from": {
                 "actor":"answer",
-                "type":"generic-provider.FinalAnswer",
-                "wire":"generic-provider.FinalAnswer"
+                "type":"generic-provider.TextAnswer",
+                "wire":"generic-provider.TextAnswer"
             }}
         });
 
@@ -2123,7 +2123,7 @@ mod tests {
                 serde_json::json!({
                     "text":"terminal-aggregate-must-not-append",
                     "result": {
-                        "final_answer":"semantic-only",
+                        "text_answer":"semantic-only",
                         "text":"terminal-result-must-not-append"
                     }
                 }),
@@ -2155,7 +2155,7 @@ mod tests {
 
         let result = terminal_result.expect("durable terminal result");
         assert_eq!(result["value"]["content"], "semantic-only");
-        assert_eq!(result["final_answer"], "semantic-only");
+        assert_eq!(result["text_answer"], "semantic-only");
     }
 
     #[test]

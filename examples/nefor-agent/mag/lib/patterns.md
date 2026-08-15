@@ -50,10 +50,10 @@ graph retrieval or hot graph mutation in this API.
          :da-policy (nefor.contracts.no-da-policy) :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
-        (type-tag nefor.contracts.FinalAnswer))
+        (type-tag nefor.contracts.TextAnswer))
       result
       (nefor.graph.output "result"
-        (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+        (type-tag (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))
       topology
       (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
         (nefor.graph.add-edges graph

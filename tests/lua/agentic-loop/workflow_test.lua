@@ -62,7 +62,7 @@ local function result_context_messages(body)
   local delta = result.test_context_messages
   if type(delta) == "table" and #delta > 0 then return delta end
   local turn = agentic_loop._internals.state.current_turn or {}
-  local answer = result.text or result.final_answer
+  local answer = result.text or result.text_answer
   if type(answer) ~= "string" then
     local error_text = tostring(body.error or body.status)
     answer = (body.status == "killed" or error_text:find("interrupt", 1, true))
@@ -262,8 +262,8 @@ local function lead_artifact()
     rules = {},
     result = { from = {
       actor = "lead.llm",
-      type = "nefor.contracts.FinalAnswer",
-      wire = "generic-provider.FinalAnswer",
+      type = "nefor.contracts.TextAnswer",
+      wire = "generic-provider.TextAnswer",
     } },
   } }
 end
@@ -899,7 +899,7 @@ do
     kind = "mag.run_result", run_id = exec.body.run_id, status = "completed",
     result = {
       semantic_type_id = "sha256:final-answer",
-      semantic_type = { kind = "named", name = "nefor.contracts.FinalAnswer" },
+      semantic_type = { kind = "named", name = "nefor.contracts.TextAnswer" },
       value = { content = "clean answer" },
     },
   })

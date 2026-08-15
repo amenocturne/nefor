@@ -179,7 +179,7 @@ async fn structured_request_reaches_local_responses_server_with_explicit_object_
     let mag_schema = TypeSchema {
         version: SCHEMA_VERSION,
         root: SchemaType::Named {
-            name: "nefor.contracts.FinalAnswer".into(),
+            name: "nefor.contracts.TextAnswer".into(),
             body: Box::new(SchemaType::Record {
                 fields: vec![SchemaField {
                     name: "content".into(),

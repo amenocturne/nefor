@@ -1044,8 +1044,8 @@ local function last_output_text(value)
   if type(last) == "string" and #last > 0 then return last end
   if type(last) ~= "table" then return nil end
   if type(last.text) == "string" and #last.text > 0 then return last.text end
-  if type(last.final_answer) == "string" and #last.final_answer > 0 then
-    return last.final_answer
+  if type(last.text_answer) == "string" and #last.text_answer > 0 then
+    return last.text_answer
   end
   return nil
 end
@@ -1123,8 +1123,8 @@ local function mag_result_text(result)
   if type(result.text) == "string" and #result.text > 0 then
     return result.text
   end
-  if type(result.final_answer) == "string" and #result.final_answer > 0 then
-    return result.final_answer
+  if type(result.text_answer) == "string" and #result.text_answer > 0 then
+    return result.text_answer
   end
   local ok, encoded = pcall(json.encode, result)
   if ok and type(encoded) == "string" then return encoded end

@@ -261,7 +261,7 @@ do
   })
   inst.deliver({
     shape = "single",
-    messages = { { from = "up", tag = "generic-provider.FinalAnswer", message = { text = "final" } } },
+    messages = { { from = "up", tag = "generic-provider.TextAnswer", message = { text = "final" } } },
   })
   assert_true(sink_persisted["sink"] ~= nil, "the sink's final output landed via deps.writer, keyed by id")
   assert_eq(sink_persisted["sink"].text, "final", "the sink persisted the final answer")

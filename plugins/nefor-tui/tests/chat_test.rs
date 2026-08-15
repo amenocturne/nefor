@@ -1409,7 +1409,7 @@ fn structured_chat_error_is_readable_and_closes_the_provider_round() {
 }
 
 #[test]
-fn tool_start_closes_empty_provider_round_before_final_answer_projection() {
+fn tool_start_closes_empty_provider_round_before_text_answer_projection() {
     let mut engine = Engine::new(100, 30).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);

@@ -73,7 +73,7 @@ end
 -- ------------------------------------------------------------------
 
 -- A deterministic stand-in for the produce llm: same declared boundary
--- (ProviderInput in, FinalAnswer out) but synchronous — each firing emits
+-- (ProviderInput in, TextAnswer out) but synchronous — each firing emits
 -- "draft <n>" instead of a provider round-trip.
 local function producer_factory()
   return {
@@ -81,12 +81,12 @@ local function producer_factory()
       name = "producer",
       params = {},
       inputs = { provider_input = "generic-provider.ProviderOut" },
-      outputs = { "generic-provider.FinalAnswer" },
+      outputs = { "generic-provider.TextAnswer" },
       semantic = {
         input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
-        output={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},
+        output={kind="named",name="nefor.contracts.TextAnswer",arguments={}},
         inputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
-        outputs={{wire="generic-provider.FinalAnswer",type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}}},
+        outputs={{wire="generic-provider.TextAnswer",type={kind="named",name="nefor.contracts.TextAnswer",arguments={}}}},
       },
     },
     construct = function(id, params, emit, deps)
@@ -94,7 +94,7 @@ local function producer_factory()
       local inst = { id = id }
       function inst.deliver(activation)
         n = n + 1
-        emit({ kind = "generic-provider.FinalAnswer", from = id, text = "draft " .. n })
+        emit({ kind = "generic-provider.TextAnswer", from = id, text = "draft " .. n })
         return { status = "ok" }
       end
       emit({ kind = "mag.ready", from = id })
@@ -167,14 +167,14 @@ local function gate_actors()
   return {
     {
       id = "produce", factory = "producer", params = {},
-      evidence={version=2,identity="nefor.factory.producer",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}},
-      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
-      routes = { ["generic-provider.FinalAnswer"] = { { actor = "approve", wire = "generic-provider.FinalAnswer" } } },
+      evidence={version=2,identity="nefor.factory.producer",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="named",name="nefor.contracts.TextAnswer",arguments={}}},
+      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"}},
+      routes = { ["generic-provider.TextAnswer"] = { { actor = "approve", wire = "generic-provider.TextAnswer" } } },
     },
     {
       id = "approve", factory = "human", params = { prompt = "Approve the draft?" },
-      evidence={version=2,identity="nefor.factory.human",arguments={},input={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.Approved",arguments={}},{kind="named",name="nefor.contracts.Rejected",arguments={}}}}},
-      input={type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"},outputs={{type={kind="named",name="test.Approved",arguments={}},wire="human.Approved"},{type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"}},
+      evidence={version=2,identity="nefor.factory.human",arguments={},input={kind="named",name="nefor.contracts.TextAnswer",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.Approved",arguments={}},{kind="named",name="nefor.contracts.Rejected",arguments={}}}}},
+      input={type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"},outputs={{type={kind="named",name="test.Approved",arguments={}},wire="human.Approved"},{type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"}},
       routes = {
         ["human.Approved"] = { { actor = "out", wire = "human.Approved" } },
         ["human.Rejected"] = { { actor = "rework", wire = "human.Rejected" } },
@@ -402,14 +402,14 @@ do
       {
         id = "review.produce", factory = "llm",
         params = { provider = "chatgpt-provider", model = "opus" },
-        evidence={version=2,identity="nefor.factory.llm",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.ToolCalls",arguments={}},{kind="named",name="nefor.contracts.FinalAnswer",arguments={}}}}},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
-        routes = { ["generic-provider.FinalAnswer"] = { { actor = "review.approve", wire = "generic-provider.FinalAnswer" } } },
+        evidence={version=2,identity="nefor.factory.llm",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.ToolCalls",arguments={}},{kind="named",name="nefor.contracts.TextAnswer",arguments={}}}}},
+        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"}},
+        routes = { ["generic-provider.TextAnswer"] = { { actor = "review.approve", wire = "generic-provider.TextAnswer" } } },
       },
       {
         id = "review.approve", factory = "human", params = { prompt = "Approve this result?" },
-        evidence={version=2,identity="nefor.factory.human",arguments={},input={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.Approved",arguments={}},{kind="named",name="nefor.contracts.Rejected",arguments={}}}}},
-        input={type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"},outputs={{type={kind="named",name="test.Approved",arguments={}},wire="human.Approved"},{type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"}},
+        evidence={version=2,identity="nefor.factory.human",arguments={},input={kind="named",name="nefor.contracts.TextAnswer",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.Approved",arguments={}},{kind="named",name="nefor.contracts.Rejected",arguments={}}}}},
+        input={type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"},outputs={{type={kind="named",name="test.Approved",arguments={}},wire="human.Approved"},{type={kind="named",name="test.Rejected",arguments={}},wire="human.Rejected"}},
         routes = {
           ["human.Approved"] = { { actor = "sink", wire = "human.Approved" } },
           ["human.Rejected"] = { { actor = "review.rework", wire = "human.Rejected" } },

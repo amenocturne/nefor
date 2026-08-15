@@ -71,7 +71,7 @@ Two obligations:
   type-checks against declared contracts; nothing selects inputs by sniffing
   their shape. In a cyclic composition (the agentic loop), which output exits
   the cycle is a type fact — a declared algebraic type, built from sums and
-  products, e.g. `ProviderInput -> (ToolCalls | FinalAnswer)` — never a
+  products, e.g. `ProviderInput -> (ToolCalls | TextAnswer)` — never a
   position heuristic. The input side carries firing semantics the same way:
   single type fires per message, union fires on any, product fires on all
   (see ir.md, Firing).
@@ -278,16 +278,16 @@ code today. Every outbound message is id-signed (`from = <actor id>`, omitted
 below). These are pinned contracts: a producer emits exactly this, a consumer
 reads exactly this — no alias fallbacks, no shape sniffing.
 
-| Kind                           | Emitter → consumer            | Payload (beyond `kind`, `from`)                                                                                                             |
-| ------------------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `generic-tool.ToolCalls`       | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                                                         |
-| `generic-tool.ToolHandle`      | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                                                                 |
-| `generic-provider.FinalAnswer` | llm → result boundary / human | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                                                    |
-| `mag.ApprovalRequest`          | human → control plane         | intercepted emit, surfaced as the `mag.approval_request` event: `correlation = <id>`, `prompt?`, `subject` (the input message)              |
-| `mag.ApprovalReply`            | control plane → human         | injected via a `mag.apply` message; delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
-| `mag.ApprovalCancel`           | human (drain) → control plane | intercepted emit, surfaced as the `mag.approval_cancel` event: `correlation = <id>`                                                         |
-| `human.Approved`               | human → downstream            | `subject`, `content`                                                                                                                        |
-| `human.Rejected`               | human → downstream            | `subject`, `reason`                                                                                                                         |
+| Kind                          | Emitter → consumer            | Payload (beyond `kind`, `from`)                                                                                                             |
+| ----------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `generic-tool.ToolCalls`      | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                                                         |
+| `generic-tool.ToolHandle`     | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                                                                 |
+| `generic-provider.TextAnswer` | llm → result boundary / human | `result` (raw provider result); `text?`, `text_answer?` (lifted when result is a table)                                                     |
+| `mag.ApprovalRequest`         | human → control plane         | intercepted emit, surfaced as the `mag.approval_request` event: `correlation = <id>`, `prompt?`, `subject` (the input message)              |
+| `mag.ApprovalReply`           | control plane → human         | injected via a `mag.apply` message; delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
+| `mag.ApprovalCancel`          | human (drain) → control plane | intercepted emit, surfaced as the `mag.approval_cancel` event: `correlation = <id>`                                                         |
+| `human.Approved`              | human → downstream            | `subject`, `content`                                                                                                                        |
+| `human.Rejected`              | human → downstream            | `subject`, `reason`                                                                                                                         |
 
 The llm factory is the provider boundary: it normalizes the provider's native
 tool-call shape (`name`/`arguments`, or a nested `function`) into the pinned

@@ -1057,7 +1057,7 @@ mod tests {
                 variants: vec![SchemaVariant {
                     tag: "sha256:answer".into(),
                     schema: SchemaType::Named {
-                        name: "FinalAnswer".into(),
+                        name: "TextAnswer".into(),
                         body: Box::new(SchemaType::Record {
                             fields: vec![SchemaField {
                                 name: "content".into(),

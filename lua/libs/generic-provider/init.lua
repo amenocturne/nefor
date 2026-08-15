@@ -12,7 +12,7 @@
 -- - `generic-provider.ProviderOut` — chat-completion response shape
 -- - `generic-provider.ChatHistory` — provider-shaped reasoner state
 -- - `generic-provider.NoState`     — unit/empty state for stateless reasoners
--- - `generic-provider.FinalAnswer` — escape-edge type emitted by `tool_split`
+-- - `generic-provider.TextAnswer` — escape-edge type emitted by `tool_split`
 --
 -- Concrete provider plugins (openai-provider, mock-plugin, …) declare
 -- `Into<generic-provider.ProviderIn, <them>.RawRequest>` and
@@ -45,7 +45,7 @@ M.PROVIDER_REQUEST   = FROM .. ".ProviderIn"
 M.PROVIDER_INPUT  = FROM .. ".ProviderOut"
 M.CHAT_HISTORY  = FROM .. ".ChatHistory"
 M.NO_STATE      = FROM .. ".NoState"
-M.FINAL_ANSWER  = FROM .. ".FinalAnswer"
+M.TEXT_ANSWER  = FROM .. ".TextAnswer"
 
 -- Bare-name list emitted in `combinators.register`'s `types[]`.
 local BARE_TYPES = {
@@ -53,7 +53,7 @@ local BARE_TYPES = {
   "ProviderOut",
   "ChatHistory",
   "NoState",
-  "FinalAnswer",
+  "TextAnswer",
 }
 
 local function emit_register()

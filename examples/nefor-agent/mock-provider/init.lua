@@ -92,9 +92,9 @@ local CANNED_MAG_PROGRAM = table.concat({
   '                   :tools [] :da-policy (nefor.contracts.no-da-policy)',
   '                   :max-corrections 2})',
   '                (type-tag (| LighthouseSummary nefor.contracts.AgentError)) "nefor.agent.Result"',
-  '                (type-tag nefor.contracts.FinalAnswer))',
+  '                (type-tag nefor.contracts.TextAnswer))',
   '      result (nefor.graph.output "result"',
-  '               (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))',
+  '               (type-tag (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))',
   '      topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph',
   '                 (nefor.graph.add-edges graph',
   '                   [(nefor.graph.edge start sx)',
@@ -827,7 +827,7 @@ local function complete_request(body)
 
   local resp = pick_response_for(history)
   -- The starter's agent boundary is typed: successful terminal text must be
-  -- a bare JSON FinalAnswer value. Tool-call and error turns use their own
+  -- a bare JSON TextAnswer value. Tool-call and error turns use their own
   -- wire shapes and deliberately bypass this encoding. Keep `resp.text`
   -- human-readable for stream events; only the terminal provider result and
   -- provider-side history carry the typed JSON wire value.

@@ -79,25 +79,41 @@
            {:seed "provider-in" :schema (type-schema input-type)})
          (nefor.graph.store-port entry-in)
          [(nefor.graph.store-port entry-out)])
-       (nefor.graph.actor llm-id (specialize nefor.factory.structured-output [O])
-         (as nefor.contracts.StructuredOutputParams {:model (get config "model")
-          :profile (get config "profile")
-          :provider (get config "provider")
-          :system (get config "system")
-          :tools (or (get config "tools") (as (List String) []))
-          :schema (type-schema output-type)
-          :output_type (type-id (type-evidence output-type))
-          :error_type
-            (type-id (type-evidence (type-tag nefor.contracts.AgentError)))
-          :provider_error_type
-            (type-id (type-evidence (type-tag nefor.contracts.ProviderError)))
-          :validation_error_type
-            (type-id
-              (type-evidence (type-tag nefor.contracts.OutputValidationError)))
-          :max_corrections (get config "max-corrections")})
-         (nefor.graph.store-port llm-in)
-         [(nefor.graph.store-port tool-calls)
-          (nefor.graph.store-port result)])
+       (if (= (type-id (type-evidence output-type))
+              (type-id (type-evidence (type-tag nefor.contracts.TextAnswer))))
+         (nefor.graph.actor llm-id nefor.factory.llm
+           (as nefor.contracts.LlmParams {:model (get config "model")
+            :profile (get config "profile")
+            :provider (get config "provider")
+            :system (get config "system")
+            :tools (or (get config "tools") (as (List String) []))
+            :output_type (type-id (type-evidence output-type))
+            :error_type
+              (type-id (type-evidence (type-tag nefor.contracts.AgentError)))
+            :provider_error_type
+              (type-id (type-evidence (type-tag nefor.contracts.ProviderError)))})
+           (nefor.graph.store-port llm-in)
+           [(nefor.graph.store-port tool-calls)
+            (nefor.graph.store-port result)])
+         (nefor.graph.actor llm-id (specialize nefor.factory.structured-output [O])
+           (as nefor.contracts.StructuredOutputParams {:model (get config "model")
+            :profile (get config "profile")
+            :provider (get config "provider")
+            :system (get config "system")
+            :tools (or (get config "tools") (as (List String) []))
+            :schema (type-schema output-type)
+            :output_type (type-id (type-evidence output-type))
+            :error_type
+              (type-id (type-evidence (type-tag nefor.contracts.AgentError)))
+            :provider_error_type
+              (type-id (type-evidence (type-tag nefor.contracts.ProviderError)))
+            :validation_error_type
+              (type-id
+                (type-evidence (type-tag nefor.contracts.OutputValidationError)))
+            :max_corrections (get config "max-corrections")})
+           (nefor.graph.store-port llm-in)
+           [(nefor.graph.store-port tool-calls)
+            (nefor.graph.store-port result)]))
        (nefor.graph.actor run-tool-id nefor.factory.run-tool
          (as nefor.contracts.RunToolParams
            {:tools (or (get config "tools") (as (List String) []))
@@ -155,19 +171,19 @@
        :second exhausted}))))
 
 (def approval-gate (fn [[config ApprovalConfig]]
-  -> (BranchNode nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)
+  -> (BranchNode nefor.contracts.TextAnswer nefor.contracts.Approved nefor.contracts.Rejected)
   (let [id (get config "id")
         actor-id (str id ".human")
         input (nefor.graph.port actor-id
-                (type-tag nefor.contracts.FinalAnswer)
-                "generic-provider.FinalAnswer")
+                (type-tag nefor.contracts.TextAnswer)
+                "generic-provider.TextAnswer")
         approved (nefor.graph.port actor-id
                    (type-tag nefor.contracts.Approved)
                    "human.Approved")
         rejected (nefor.graph.port actor-id
                    (type-tag nefor.contracts.Rejected)
                    "human.Rejected")]
-    (as (BranchNode nefor.contracts.FinalAnswer nefor.contracts.Approved nefor.contracts.Rejected)
+    (as (BranchNode nefor.contracts.TextAnswer nefor.contracts.Approved nefor.contracts.Rejected)
      {:id id :actors [(nefor.graph.actor actor-id nefor.factory.human
                 (as nefor.contracts.HumanParams {:prompt (get config "prompt")})
                 (nefor.graph.store-port input)

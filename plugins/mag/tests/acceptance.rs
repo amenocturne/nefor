@@ -131,7 +131,7 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 
 /// Build the two-agent modification. Each agent `aN` is a full provider loop:
 /// `aN.llm → aN.run-tool → aN.tool-result → aN.llm`. `a1.llm` is the declared
-/// result on `generic-provider.FinalAnswer`. Both `llm`s are seeded with a
+/// result on `generic-provider.TextAnswer`. Both `llm`s are seeded with a
 /// `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
     fn named(name: &str) -> Value {
@@ -143,22 +143,22 @@ fn two_agent_modification() -> Value {
     fn agent(prefix: &str) -> Vec<Value> {
         let provider_input = named("nefor.contracts.ProviderInput");
         let tool_calls = named("nefor.contracts.ToolCalls");
-        let final_answer = named("nefor.contracts.FinalAnswer");
+        let text_answer = named("nefor.contracts.TextAnswer");
         let tool_handle = named("nefor.contracts.ToolHandle");
         vec![
             json!({
                 "id": format!("{prefix}.llm"),
                 "factory": "llm",
-                "evidence": evidence("nefor.factory.llm",provider_input.clone(),json!({"kind":"union","items":[tool_calls.clone(),final_answer.clone()]})),
+                "evidence": evidence("nefor.factory.llm",provider_input.clone(),json!({"kind":"union","items":[tool_calls.clone(),text_answer.clone()]})),
                 "input":{"wire":"generic-provider.ProviderOut","type":provider_input.clone()},
-                "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"generic-provider.FinalAnswer","type":final_answer}],
+                "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"generic-provider.TextAnswer","type":text_answer}],
                 "params": { "model": "opus", "provider": PROVIDER, "system": "work" },
                 "routes": {
                     "generic-tool.ToolCalls": [{
                         "actor": format!("{prefix}.run-tool"),
                         "wire": "generic-tool.ToolCalls"
                     }],
-                    "generic-provider.FinalAnswer": []
+                    "generic-provider.TextAnswer": []
                 }
             }),
             json!({
@@ -201,8 +201,8 @@ fn two_agent_modification() -> Value {
         "result": {
             "from": {
                 "actor": "a1.llm",
-                "type": "generic-provider.FinalAnswer",
-                "wire": "generic-provider.FinalAnswer"
+                "type": "generic-provider.TextAnswer",
+                "wire": "generic-provider.TextAnswer"
             }
         }
     })
@@ -553,7 +553,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     }
 
     // ── SIX STEPS #3: the survivor's every node output persisted, typed per
-    //    the declared contracts (llm ToolCalls/FinalAnswer, run-tool ToolHandle,
+    //    the declared contracts (llm ToolCalls/TextAnswer, run-tool ToolHandle,
     //    tool-result ProviderInput). ─────────────────────────────────────────────
     for node in ["a1.llm", "a1.run-tool", "a1.tool-result"] {
         assert!(

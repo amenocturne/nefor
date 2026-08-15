@@ -182,29 +182,29 @@ end
 -- strings only document what the lead writes to disk.
 local READ_ONLY_MAG = [[
 (type mag.Task)
-(type generic-provider.FinalAnswer)
+(type generic-provider.TextAnswer)
 
 (let [worker (agent {:id "worker"
                      :system "Answer the task."
                      :provider "chatgpt"
                      :profile "standard"
                      :tools ["read_file"]}
-               : mag.Task -> generic-provider.FinalAnswer)
-      out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+               : mag.Task -> generic-provider.TextAnswer)
+      out    (node "sink" {} : generic-provider.TextAnswer -> generic-provider.TextAnswer)]
   (graph worker -> out :terminal out))
 ]]
 
 local WRITER_MAG = [[
 (type mag.Task)
-(type generic-provider.FinalAnswer)
+(type generic-provider.TextAnswer)
 
 (let [build (agent {:id "build"
                     :system "Implement feature X."
                     :provider "chatgpt"
                     :profile "fast"
                     :tools ["read_file" "write_file"]}
-              : mag.Task -> generic-provider.FinalAnswer)
-      out   (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+              : mag.Task -> generic-provider.TextAnswer)
+      out   (node "sink" {} : generic-provider.TextAnswer -> generic-provider.TextAnswer)]
   (graph build -> out :terminal out))
 ]]
 
@@ -284,7 +284,7 @@ local function read_only_modification()
       { id = "worker.llm", factory = "llm",
         params = { system = "Answer the task.", provider = "chatgpt",
                    profile = "standard", tools = { "read_file" } },
-        routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
+        routes = { ["generic-provider.TextAnswer"] = { { actor = "sink", wire = "generic-provider.TextAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
     messages = { { to = "worker.entry", content = { kind = "task", prompt = "<initial task text>" } } },
@@ -299,7 +299,7 @@ local function writer_modification()
       { id = "build.llm", factory = "llm",
         params = { system = "Implement feature X.", provider = "chatgpt",
                    profile = "fast", tools = { "read_file", "write_file" } },
-        routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
+        routes = { ["generic-provider.TextAnswer"] = { { actor = "sink", wire = "generic-provider.TextAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
     messages = { { to = "build.llm", content = { kind = "task", prompt = "<initial task text>" } } },
@@ -791,7 +791,7 @@ do
   for _, needle in ipairs({
     "worker.llm (nefor.factory.llm)",                      -- actor + capability
     "provider: \"chatgpt\"",                               -- params summary
-    "Result: worker.llm (generic-provider.FinalAnswer)",   -- structural result
+    "Result: worker.llm (generic-provider.TextAnswer)",   -- structural result
     "-> worker.entry (task)",                              -- initial message
     "Hash: sha256:test",                                   -- hash
     "Registry factories: adapter, llm",                    -- kernel registry
@@ -857,7 +857,7 @@ local function lead_turn_modification()
       { id = "lead.entry", factory = "adapter", params = { seed = "provider-in" },
         routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } } },
       { id = "lead.llm", factory = "llm", params = {},
-        routes = { ["generic-provider.FinalAnswer"] = { { actor = "sink", wire = "generic-provider.FinalAnswer" } } } },
+        routes = { ["generic-provider.TextAnswer"] = { { actor = "sink", wire = "generic-provider.TextAnswer" } } } },
       { id = "sink", factory = "sink", params = {}, routes = {} },
     },
     messages = { { to = "lead.source", content = { kind = "mag.Unit" } } },
@@ -1040,7 +1040,7 @@ do
     run_id    = run_id,
     status    = "completed",
     persisted = false,
-    result    = { from = "worker.llm", kind = "generic-provider.FinalAnswer",
+    result    = { from = "worker.llm", kind = "generic-provider.TextAnswer",
                   text = "INLINE RESULT TEXT" },
   })
 

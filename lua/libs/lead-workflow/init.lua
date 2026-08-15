@@ -999,10 +999,9 @@ local function mag_result_text(result)
   if type(result) ~= "table" then return nil end
   local semantic = result.semantic_type
   if type(semantic) == "table"
-      and semantic.name == "nefor.contracts.FinalAnswer"
-      and type(result.value) == "table"
-      and type(result.value.content) == "string" then
-    return result.value.content
+      and semantic.name == "nefor.contracts.TextAnswer"
+      and type(result.value) == "string" then
+    return result.value
   end
   if type(result.text) == "string" and #result.text > 0 then
     return result.text
@@ -1551,7 +1550,7 @@ local function lead_workflow_tool_schemas()
         "by the injected canonical contract. " ..
         "Pass compiler-checked semantic type witnesses separately from runtime " ..
         "wire tags; use (type-tag nefor.contracts.Task), wire \"task\", and " ..
-        "an output such as (type-tag nefor.contracts.FinalAnswer). Exactly one " ..
+        "an output such as (type-tag nefor.contracts.TextAnswer). Exactly one " ..
         "concrete output<T> identity node marks the result boundary. Graph " ..
         "operations are pure, retrieve no stored graph, and never mutate a live run. Agent loops are unbounded; " ..
         "stop early via interrupt/kill. The injected lib/patterns.md is the " ..

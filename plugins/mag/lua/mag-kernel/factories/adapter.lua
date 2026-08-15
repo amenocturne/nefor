@@ -5,22 +5,22 @@
 -- "the entry adapter's role") opens with an `entry` node of factory `adapter`,
 -- params `{ seed = "provider-in" }`, wired `IN -> generic-provider.ProviderOut`.
 -- Its job is the boundary type shift: whatever crosses into the agent — the
--- program's initial task seed, or an upstream agent's FinalAnswer — is lifted
+-- program's initial task seed, or an upstream agent's TextAnswer — is lifted
 -- into the `generic-provider.ProviderOut` turn the downstream `llm` consumes.
 -- This is why the same template instantiates against `mag.Task` (agent 1) and
--- `generic-provider.FinalAnswer` (agent 2) unchanged: the entry adapter absorbs
+-- `generic-provider.TextAnswer` (agent 2) unchanged: the entry adapter absorbs
 -- the difference (two-agents.mag, "Boundary contract").
 --
 -- Contract (reconciled against tests/fixtures/two-agents.modification.json and
 -- the loader's eval_agent, which authors this node; flagged):
---   input   ( task | generic-provider.FinalAnswer | human.Rejected )
+--   input   ( task | generic-provider.TextAnswer | human.Rejected )
 --           union — fires on any
 --   output  generic-provider.ProviderOut              the next provider turn
 --
 -- The union input is the whole point of the boundary: `task` is the initial
 -- activation content the loader seeds a source agent with (crates/nefor-mag
 -- ir.rs initial_activation_content -> `{ kind = "task", prompt = ... }`),
--- `generic-provider.FinalAnswer` is what an upstream agent routes in
+-- `generic-provider.TextAnswer` is what an upstream agent routes in
 -- (docs-explorer.llm -> code-writer.entry), and `human.Rejected` is the gate
 -- template's revise leg (examples/nefor-agent/mag/lib/templates.mag: the rejection reason
 -- re-enters the producing llm as its next turn — the llm's owned transcript
@@ -41,12 +41,12 @@
 --   sniffing their shape" — the firing machine already stamped the type fact
 --   onto the activation triple):
 --     task                          -> content = message.prompt
---     generic-provider.FinalAnswer  -> content = message.final_answer
+--     generic-provider.TextAnswer  -> content = message.text_answer
 --                                                 or message.text
 --                                                 or message.result
 --     human.Rejected                -> content = message.reason
---   The FinalAnswer preference order mirrors what factories/llm.lua lifts onto a
---   FinalAnswer (`final_answer`/`text` when the provider result is a table, else
+--   The TextAnswer preference order mirrors what factories/llm.lua lifts onto a
+--   TextAnswer (`text_answer`/`text` when the provider result is a table, else
 --   the raw `result`). A string passes through; a structured value passes
 --   through verbatim for the provider layer to serialize (the kernel VM ships no
 --   json binding — see factories/tool-result.lua — so this factory stays pure
@@ -61,7 +61,7 @@ local kinds = require("kinds")
 
 local M = {}
 
-local FINAL_ANSWER = "generic-provider.FinalAnswer"
+local TEXT_ANSWER = "generic-provider.TextAnswer"
 local PROVIDER_INPUT = "generic-provider.ProviderOut"
 local REJECTED = "human.Rejected"
 local AGENT_RESULT = "nefor.agent.Result"
@@ -74,7 +74,7 @@ M.declaration = {
     output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
     inputs = {
       {wire="task",type={kind="variable",name="T"}},
-      {wire=FINAL_ANSWER,type={kind="variable",name="T"}},
+      {wire=TEXT_ANSWER,type={kind="variable",name="T"}},
       {wire=REJECTED,type={kind="variable",name="T"}},
       {wire=PROVIDER_INPUT,type={kind="variable",name="T"}},
       {wire=AGENT_RESULT,type={kind="variable",name="T"}},
@@ -89,11 +89,11 @@ M.declaration = {
     schema = "table",
   },
 
-  -- Union input (shape.lua): the initial task seed, an upstream FinalAnswer,
+  -- Union input (shape.lua): the initial task seed, an upstream TextAnswer,
   -- or a human gate's rejection re-entering the provider loop (the gate
   -- template's revise leg). Firing "on any".
   inputs = {
-    boundary = { "task", FINAL_ANSWER, REJECTED, PROVIDER_INPUT, AGENT_RESULT },
+    boundary = { "task", TEXT_ANSWER, REJECTED, PROVIDER_INPUT, AGENT_RESULT },
   },
 
   outputs = {
@@ -129,9 +129,9 @@ local function turn_message(tag, message, schema, arrival)
   local content = message.value
   if tag == REJECTED and type(content) == "table" and content.reason ~= nil then
     content = content.reason
-  elseif content == nil and tag == FINAL_ANSWER then
+  elseif content == nil and tag == TEXT_ANSWER then
     -- Legacy/non-strict factory tests still exercise the old provider envelope.
-    content = message.final_answer or message.text or message.result
+    content = message.text_answer or message.text or message.result
   elseif content == nil and tag == REJECTED then
     content = message.reason
   elseif content == nil and message.prompt ~= nil then

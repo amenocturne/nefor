@@ -443,20 +443,6 @@ async fn write_sse(stream: &mut TcpStream, body: &str) {
         .expect("write SSE response");
 }
 
-fn assert_strict_final_answer_schema(schema: &Value) {
-    assert_eq!(schema["type"], "object");
-    assert_eq!(schema["properties"]["content"]["type"], "string");
-    assert_eq!(schema["required"], json!(["content"]));
-    assert_eq!(schema["additionalProperties"], false);
-    let object = schema.as_object().expect("provider schema object");
-    for descriptor in ["version", "root", "kind"] {
-        assert!(
-            !object.contains_key(descriptor),
-            "provider schema must omit MAG descriptor field `{descriptor}`: {schema}"
-        );
-    }
-}
-
 async fn fake_server(kind: ProviderKind, listener: TcpListener) {
     loop {
         let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
@@ -483,31 +469,20 @@ async fn fake_server(kind: ProviderKind, listener: TcpListener) {
         match kind {
             ProviderKind::OpenAi => {
                 assert!(request_line.contains(" /v1/chat/completions "));
-                assert_eq!(request["response_format"]["type"], "json_schema");
-                assert_eq!(
-                    request["response_format"]["json_schema"]["name"],
-                    "mag_output"
-                );
-                assert_eq!(request["response_format"]["json_schema"]["strict"], true);
-                assert_strict_final_answer_schema(
-                    &request["response_format"]["json_schema"]["schema"],
-                );
+                assert!(request.get("response_format").is_none());
                 write_sse(
                     &mut stream,
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"content\\\":\\\"done\\\"}\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                 )
                 .await;
             }
             ProviderKind::ChatGpt => {
                 assert!(request_line.contains(" /responses "));
                 assert_eq!(request["tools"], json!([]));
-                assert_eq!(request["text"]["format"]["type"], "json_schema");
-                assert_eq!(request["text"]["format"]["name"], "mag_output");
-                assert_eq!(request["text"]["format"]["strict"], true);
-                assert_strict_final_answer_schema(&request["text"]["format"]["schema"]);
+                assert!(request["text"].get("format").is_none());
                 write_sse(
                     &mut stream,
-                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"content\\\":\\\"done\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n",
                 )
                 .await;
             }
@@ -516,7 +491,7 @@ async fn fake_server(kind: ProviderKind, listener: TcpListener) {
     }
 }
 
-async fn load_final_answer_program(
+async fn load_text_answer_program(
     reader: &mut BufReader<ChildStdout>,
     stdin: &mut ChildStdin,
     source_dir: &Path,
@@ -541,9 +516,9 @@ async fn load_final_answer_program(
                 :max-corrections 0})
                (type-tag nefor.contracts.Task)
                "task"
-               (type-tag nefor.contracts.FinalAnswer))
+               (type-tag nefor.contracts.TextAnswer))
       output (nefor.graph.output "result"
-               (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+               (type-tag (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))
       topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
                  (nefor.graph.add-edges graph
                    [(nefor.graph.edge start answer)
@@ -594,14 +569,14 @@ async fn run_case(kind: ProviderKind) {
         .await;
     }
 
-    let artifact = load_final_answer_program(&mut mag_out, &mut mag_in, temp.path()).await;
+    let artifact = load_text_answer_program(&mut mag_out, &mut mag_in, temp.path()).await;
     let constructor_id = artifact["data"]["actors"]
         .as_array()
         .expect("artifact actors")
         .iter()
-        .find(|actor| actor["foreign"] == "nefor.factory.structured-output")
+        .find(|actor| actor["foreign"] == "nefor.factory.llm")
         .and_then(|actor| actor["params"]["output_type"].as_str())
-        .expect("compiler-derived FinalAnswer constructor identity")
+        .expect("compiler-derived TextAnswer constructor identity")
         .to_owned();
 
     send_event(
@@ -621,7 +596,7 @@ async fn run_case(kind: ProviderKind) {
     .await;
 
     let (invocation, facts) = next_provider_request_with_facts(&mut mag_out, kind.name()).await;
-    assert_strict_final_answer_schema(&invocation["output_schema"]);
+    assert!(invocation.get("output_schema").is_none());
     let request_id = invocation["request_id"]
         .as_str()
         .expect("provider request id")
@@ -648,7 +623,8 @@ async fn run_case(kind: ProviderKind) {
             Some(request_id.as_str())
         );
         if body.get("event").and_then(Value::as_str) == Some("text_delta") {
-            panic!("structured JSON deltas must stay suppressed: {body:?}");
+            assert_eq!(body.get("text"), Some(&json!("done")));
+            continue;
         }
         if body.get("event").and_then(Value::as_str) == Some("completed") {
             break body;
@@ -659,7 +635,7 @@ async fn run_case(kind: ProviderKind) {
             .get("result")
             .and_then(|result| result.get("text"))
             .or_else(|| completed.get("text")),
-        Some(&json!(r#"{"content":"done"}"#))
+        Some(&json!("done"))
     );
     assert!(completed.get("chat_id").is_none());
     send_event(
@@ -671,7 +647,7 @@ async fn run_case(kind: ProviderKind) {
 
     let result = next_event_of_kind(&mut mag_out, "mag.run_result").await;
     assert_eq!(result["status"], "completed");
-    assert_eq!(result["result"]["value"]["content"], "done");
+    assert_eq!(result["result"]["value"], "done");
     assert_eq!(result["result"]["semantic_type_id"], constructor_id);
     assert_eq!(result["result"]["constructor_id"], constructor_id);
     assert!(result["result"].get("variant").is_none());
@@ -682,11 +658,11 @@ async fn run_case(kind: ProviderKind) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn final_answer_through_openai_chat_completions_dispatcher() {
+async fn text_answer_through_openai_chat_completions_dispatcher() {
     run_case(ProviderKind::OpenAi).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn final_answer_through_chatgpt_responses_dispatcher() {
+async fn text_answer_through_chatgpt_responses_dispatcher() {
     run_case(ProviderKind::ChatGpt).await;
 }

@@ -54,12 +54,12 @@ local M = {}
 M.declaration = {
   name = "human",
   semantic = {
-    input={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},
+    input={kind="named",name="nefor.contracts.TextAnswer",arguments={}},
     output={kind="union",items={
       {kind="named",name="nefor.contracts.Approved",arguments={}},
       {kind="named",name="nefor.contracts.Rejected",arguments={}},
     }},
-    inputs={{wire="generic-provider.FinalAnswer",type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}}},
+    inputs={{wire="generic-provider.TextAnswer",type={kind="named",name="nefor.contracts.TextAnswer",arguments={}}}},
     outputs={
       {wire="human.Approved",type={kind="named",name="nefor.contracts.Approved",arguments={}}},
       {wire="human.Rejected",type={kind="named",name="nefor.contracts.Rejected",arguments={}}},
@@ -71,7 +71,7 @@ M.declaration = {
   },
 
   inputs = {
-    subject = "generic-provider.FinalAnswer",
+    subject = "generic-provider.TextAnswer",
   },
 
   outputs = {

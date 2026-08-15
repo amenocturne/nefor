@@ -506,7 +506,7 @@ end
 function M.answer_text(result)
   if type(result) == "string" then return result end
   if type(result) ~= "table" then return nil end
-  if type(result.final_answer) == "string" then return result.final_answer end
+  if type(result.text_answer) == "string" then return result.text_answer end
   if type(result.text) == "string" then return result.text end
   if type(result.result) == "string" then return result.result end
   return nil

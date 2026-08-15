@@ -8,7 +8,7 @@ Owns five canonical types that every provider-shaped reasoner agrees on:
 - `generic-provider.ProviderOut` -- standard chat-completion response
 - `generic-provider.ChatHistory` -- provider-shaped reasoner state
 - `generic-provider.NoState` -- unit/empty state for stateless reasoners
-- `generic-provider.FinalAnswer` -- escape-edge type emitted by `tool_split`
+- `generic-provider.TextAnswer` -- escape-edge type emitted by `tool_split`
 
 On startup, emits a `combinators.register` event consumed by MAG/routing glue. Concrete
 providers (openai-provider, anthropic-provider, ...) separately declare

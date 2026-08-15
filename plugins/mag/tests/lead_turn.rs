@@ -1085,12 +1085,16 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         !continuation_history.contains(notice_text),
         "instruction notices are absent from canonical conversation history"
     );
+    assert!(
+        create2.get("output_schema").is_none(),
+        "TextAnswer requests direct terminal text without a provider schema"
+    );
     send_event(
         &mut stdin,
         completed(
             PROVIDER,
             &request_id2,
-            json!({ "text": "{\"content\":\"the repo holds nefor\"}" }),
+            json!({ "text": "the repo holds nefor" }),
         ),
     )
     .await;
@@ -1105,7 +1109,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         Some("exec-turn-1")
     );
     assert_eq!(
-        result.pointer_str("/result/value/content"),
+        result.pointer_str("/result/value"),
         Some("the repo holds nefor"),
         "the sink's final answer rides the terminal reply inline"
     );
@@ -1392,7 +1396,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
         completed(
             PROVIDER,
             &request_id2,
-            json!({ "text": "{\"content\":\"I stopped the read as you asked.\"}" }),
+            json!({ "text": "I stopped the read as you asked." }),
         ),
     )
     .await;
@@ -1408,7 +1412,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
         "the surviving run settles its original execute reply"
     );
     assert_eq!(
-        result.pointer_str("/result/value/content"),
+        result.pointer_str("/result/value"),
         Some("I stopped the read as you asked."),
         "the lead's post-interrupt final answer rides the terminal reply"
     );

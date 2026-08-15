@@ -6,7 +6,7 @@
 -- factory in isolation: a capturing `emit` stands in for the kernel outbound,
 -- so no real provider, bus, or router is needed. Covers the task's factory-
 -- level list: capability.invoke on a graph activation; tool-calls reply →
--- ToolCalls + mag.complete; no-tool-calls reply → FinalAnswer + mag.complete;
+-- ToolCalls + mag.complete; no-tool-calls reply → TextAnswer + mag.complete;
 -- provider-error reply → mag.failed; kill mid-flight → provider cancel
 -- envelope; drain idle vs in-flight. Plus transcript seeding (params.history):
 -- seed replays ahead of the round-1 activation, seed + accumulated turns stay
@@ -154,7 +154,7 @@ do
   local outs = {}
   for _, t in ipairs(reg:declaration("llm").outputs) do outs[t] = true end
   assert_true(outs["generic-tool.ToolCalls"], "declares the ToolCalls exit")
-  assert_true(outs["generic-provider.FinalAnswer"], "declares the FinalAnswer exit")
+  assert_true(outs["generic-provider.TextAnswer"], "declares the TextAnswer exit")
 
   local sigs = {}
   for _, s in ipairs(reg:declaration("llm").signals) do sigs[s] = true end
@@ -177,7 +177,7 @@ do
     result = { text = "current answer", finish_reason = "stop" },
   })
 
-  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
+  assert_true(find_kind(msgs, "generic-provider.TextAnswer") == nil,
     "a queued steer keeps the run open instead of finishing after the current answer")
   local second = find_last_kind(msgs, "capability.invoke")
   local history = conversation_messages(facts)
@@ -277,8 +277,8 @@ do
   assert_eq(calls.calls[1].args.path, "x", "the provider arguments are normalized to .args")
   assert_true(calls.tool_calls == nil, "the raw provider tool_calls field is not surfaced")
   assert_true(find_kind(msgs, "mag.complete") ~= nil, "deferred success signalled with mag.complete")
-  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
-    "no FinalAnswer when tool calls are present")
+  assert_true(find_kind(msgs, "generic-provider.TextAnswer") == nil,
+    "no TextAnswer when tool calls are present")
 end
 
 -- ==================================================================
@@ -379,7 +379,7 @@ do
 end
 
 -- ==================================================================
--- reply without tool calls → generic-provider.FinalAnswer + mag.complete
+-- reply without tool calls → generic-provider.TextAnswer + mag.complete
 -- ==================================================================
 
 do
@@ -390,12 +390,12 @@ do
   instance.deliver({
     kind = "reply",
     ref = invoke.ref,
-    result = { text = "done", final_answer = { text = "done" } },
+    result = { text = "done", text_answer = { text = "done" } },
   })
 
-  local final = find_kind(msgs, "generic-provider.FinalAnswer")
-  assert_true(final ~= nil, "a reply without tool calls emits generic-provider.FinalAnswer")
-  assert_eq(final.text, "done", "FinalAnswer carries the provider text")
+  local final = find_kind(msgs, "generic-provider.TextAnswer")
+  assert_true(final ~= nil, "a reply without tool calls emits generic-provider.TextAnswer")
+  assert_eq(final.text, "done", "TextAnswer carries the provider text")
   assert_true(find_kind(msgs, "mag.complete") ~= nil, "deferred success signalled with mag.complete")
   assert_true(find_kind(msgs, "generic-tool.ToolCalls") == nil,
     "no ToolCalls when the result has none")
@@ -404,8 +404,8 @@ do
   local i2, m2 = make("x.llm", { provider = "p" })
   i2.deliver(turn({}))
   i2.deliver({ kind = "reply", ref = find_kind(m2, "capability.invoke").ref, result = { tool_calls = {}, text = "hi" } })
-  assert_true(find_kind(m2, "generic-provider.FinalAnswer") ~= nil,
-    "an empty tool_calls array classifies as a FinalAnswer")
+  assert_true(find_kind(m2, "generic-provider.TextAnswer") ~= nil,
+    "an empty tool_calls array classifies as a TextAnswer")
 end
 
 -- ==================================================================
@@ -598,9 +598,9 @@ do
   end
   instance.deliver({ kind = "reply", ref = r2.ref, result = { text = "the answer" } })
 
-  local final = find_kind(msgs, "generic-provider.FinalAnswer")
-  assert_true(final ~= nil, "the run ends in a FinalAnswer")
-  assert_eq(final.transcript_delta, nil, "FinalAnswer carries no transcript reconstruction data")
+  local final = find_kind(msgs, "generic-provider.TextAnswer")
+  assert_true(final ~= nil, "the run ends in a TextAnswer")
+  assert_eq(final.transcript_delta, nil, "TextAnswer carries no transcript reconstruction data")
   assert_eq(facts[1].kind, "created", "the logical actor conversation is explicit")
   assert_eq(facts[#facts].kind, "turn_completed", "the turn closes at final output")
   local started, exchanges, results = 0, 0, 0
@@ -617,7 +617,7 @@ do
   local i2, m2, f2facts = make("plain.llm", { provider = "p" })
   i2.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   i2.deliver({ kind = "reply", ref = find_kind(m2, "capability.invoke").ref, result = { text = "done" } })
-  local f2 = find_kind(m2, "generic-provider.FinalAnswer")
+  local f2 = find_kind(m2, "generic-provider.TextAnswer")
   assert_eq(f2.transcript_delta, nil, "unseeded turns also rely on canonical facts")
   assert_eq(f2facts[#f2facts].kind, "turn_completed", "unseeded turn closes")
 end
@@ -849,7 +849,7 @@ do
 end
 
 -- ==================================================================
--- a result with finish_reason "error" is a suffered failure, never a FinalAnswer
+-- a result with finish_reason "error" is a suffered failure, never a TextAnswer
 -- ==================================================================
 
 do
@@ -867,8 +867,8 @@ do
   assert_true(failed ~= nil, "a finish_reason error emits mag.failed")
   assert_eq(failed.failure, "mag.Failed", "mag.failed names the reserved suffered-failure tag")
   assert_eq(failed.value.error, "HTTP 400: boom", "the failure threads the provider's detail")
-  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
-    "an errored round must never classify as a FinalAnswer (error masking)")
+  assert_true(find_kind(msgs, "generic-provider.TextAnswer") == nil,
+    "an errored round must never classify as a TextAnswer (error masking)")
   assert_true(find_kind(msgs, "mag.complete") == nil, "an errored round does not complete-ok")
 
   -- A detail-less provider error still carries a readable failure.
@@ -924,7 +924,7 @@ do
   assert_eq(failed.failure, "mag.Failed", "mag.failed names the reserved suffered-failure tag")
   assert_eq(failed.value.error, "provider timed out", "the failure carries the provider error")
   assert_true(find_kind(msgs, "mag.complete") == nil, "an errored reply does not also complete-ok")
-  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
+  assert_true(find_kind(msgs, "generic-provider.TextAnswer") == nil,
     "an errored reply emits no data output")
 end
 
@@ -948,7 +948,7 @@ do
 
   -- A late reply after kill is ignored (pending was cleared).
   instance.deliver({ kind = "reply", ref = invoke.ref, result = { text = "late" } })
-  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
+  assert_true(find_kind(msgs, "generic-provider.TextAnswer") == nil,
     "a reply arriving after kill produces no output")
 end
 
@@ -977,7 +977,7 @@ do
   assert_eq(invokes, 1, "no second provider request is started while draining")
 
   busy.deliver({ kind = "reply", ref = invoke.ref, result = { text = "flush" } })
-  assert_true(find_kind(bm, "generic-provider.FinalAnswer") ~= nil,
+  assert_true(find_kind(bm, "generic-provider.TextAnswer") ~= nil,
     "the pending reply flushes its output during drain")
   assert_true(find_kind(bm, "mag.complete") ~= nil, "and signals deferred completion")
 end

@@ -879,18 +879,18 @@ mod tests {
       right-task (nefor.graph.source "right-task" (type-tag nefor.contracts.Task)
                     (as nefor.contracts.Task {:prompt "right"}))
       left (make-agent "left" (type-tag nefor.contracts.Task) "task"
-             (type-tag nefor.contracts.FinalAnswer))
+             (type-tag nefor.contracts.TextAnswer))
       middle (make-agent "middle" (type-tag nefor.contracts.Task) "task"
-               (type-tag nefor.contracts.FinalAnswer))
+               (type-tag nefor.contracts.TextAnswer))
       right (make-agent "right" (type-tag nefor.contracts.Task) "task"
-              (type-tag nefor.contracts.FinalAnswer))
+              (type-tag nefor.contracts.TextAnswer))
       synthesis (make-agent "synthesis"
-                  (type-tag (+ (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)
-                               (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)
-                               (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
-                  "nefor.agent.Result" (type-tag nefor.contracts.FinalAnswer))
+                  (type-tag (+ (| nefor.contracts.TextAnswer nefor.contracts.AgentError)
+                               (| nefor.contracts.TextAnswer nefor.contracts.AgentError)
+                               (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))
+                  "nefor.agent.Result" (type-tag nefor.contracts.TextAnswer))
       result (nefor.graph.output "result"
-               (type-tag (| nefor.contracts.FinalAnswer nefor.contracts.AgentError)))
+               (type-tag (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))
       topology (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
                  (nefor.graph.add-edges graph
                    [(nefor.graph.edge left-task left)

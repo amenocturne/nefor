@@ -5,7 +5,7 @@
 -- nefor.log surface, points package.path at plugins/mag/lua/mag-kernel/). Tests the
 -- factory in isolation: a capturing `emit` stands in for the kernel outbound.
 -- The adapter is the agent's boundary type shift — it lifts either the initial
--- task seed OR an upstream agent's FinalAnswer into the `ProviderInput` turn the
+-- task seed OR an upstream agent's TextAnswer into the `ProviderInput` turn the
 -- downstream `llm` consumes. Both directions are asserted here.
 
 local Registry = require("registry")
@@ -106,7 +106,7 @@ do
   local tags = {}
   for _, t in ipairs(input) do tags[t] = true end
   assert_true(tags["task"], "boundary input accepts the initial task seed")
-  assert_true(tags["generic-provider.FinalAnswer"], "boundary input accepts an upstream FinalAnswer")
+  assert_true(tags["generic-provider.TextAnswer"], "boundary input accepts an upstream TextAnswer")
 
   assert_eq(decl.outputs[1], "generic-provider.ProviderOut", "adapter output is the provider turn")
   assert_eq(#decl.signals, 0, "adapter is synchronous — declares no signal handlers")
@@ -149,41 +149,41 @@ do
 end
 
 -- ==================================================================
--- FinalAnswer in -> ProviderInput out (upstream agent hand-off)
+-- TextAnswer in -> ProviderInput out (upstream agent hand-off)
 -- ==================================================================
 
 do
   local msgs, emit = capture()
   local inst = adapter.construct("code-writer.entry", { seed = "provider-in", schema = schema }, emit)
 
-  -- final_answer preferred when present.
-  inst.deliver(single("docs-explorer.llm", "generic-provider.FinalAnswer",
-    { kind = "generic-provider.FinalAnswer", final_answer = "found the bug in foo.rs", text = "raw text" }))
+  -- text_answer preferred when present.
+  inst.deliver(single("docs-explorer.llm", "generic-provider.TextAnswer",
+    { kind = "generic-provider.TextAnswer", text_answer = "found the bug in foo.rs", text = "raw text" }))
   local out = find_kind(msgs, "generic-provider.ProviderOut")
-  assert_true(out ~= nil, "an upstream FinalAnswer lifts into a ProviderInput turn")
+  assert_true(out ~= nil, "an upstream TextAnswer lifts into a ProviderInput turn")
   assert_eq(out.from, "code-writer.entry", "ProviderInput is id-signed")
   assert_eq(out.messages[1].role, "user", "the hand-off becomes a user-role turn")
   assert_eq(out.messages[1].content.value, "found the bug in foo.rs",
-    "final_answer is preferred as the turn content")
+    "text_answer is preferred as the turn content")
 end
 
 -- ==================================================================
--- FinalAnswer content fallbacks: text, then raw result
+-- TextAnswer content fallbacks: text, then raw result
 -- ==================================================================
 
 do
   local msgs, emit = capture()
   local inst = adapter.construct("code-writer.entry", { schema = schema }, emit)
 
-  -- text used when no final_answer.
-  inst.deliver(single("up", "generic-provider.FinalAnswer",
-    { kind = "generic-provider.FinalAnswer", text = "just the text" }))
+  -- text used when no text_answer.
+  inst.deliver(single("up", "generic-provider.TextAnswer",
+    { kind = "generic-provider.TextAnswer", text = "just the text" }))
   local out1 = msgs[#msgs]
-  assert_eq(out1.messages[1].content.value, "just the text", "text is used when final_answer is absent")
+  assert_eq(out1.messages[1].content.value, "just the text", "text is used when text_answer is absent")
 
-  -- raw result passes through verbatim when neither final_answer nor text.
-  inst.deliver(single("up", "generic-provider.FinalAnswer",
-    { kind = "generic-provider.FinalAnswer", result = { nested = "structured" } }))
+  -- raw result passes through verbatim when neither text_answer nor text.
+  inst.deliver(single("up", "generic-provider.TextAnswer",
+    { kind = "generic-provider.TextAnswer", result = { nested = "structured" } }))
   local out2 = msgs[#msgs]
   assert_eq(out2.messages[1].content.value.nested, "structured",
     "the raw result passes through verbatim for the provider layer to serialize")
@@ -196,7 +196,7 @@ end
 do
   local task_schema = { kind = "named", name = "Task", body = { kind = "string" } }
   local answer_schema = { kind = "union", variants = {
-    { tag = "final-id", schema = { kind = "named", name = "FinalAnswer", body = { kind = "string" } } },
+    { tag = "final-id", schema = { kind = "named", name = "TextAnswer", body = { kind = "string" } } },
     { tag = "error-id", schema = { kind = "named", name = "AgentError", body = { kind = "string" } } },
   } }
   local product_schema = { version = 1, root = { kind = "product", components = {
@@ -207,7 +207,7 @@ do
   inst.deliver({ shape = "product", messages = {
     { tag = "task", message = { value = { prompt = "coordinate" } },
       arrival = { constructor_id = "task-id" } },
-    { tag = "generic-provider.FinalAnswer", message = { final_answer = "done" },
+    { tag = "generic-provider.TextAnswer", message = { text_answer = "done" },
       arrival = { constructor_id = "final-id" } },
     { tag = "nefor.agent.Result", message = { value = { error = "blocked" } },
       arrival = { constructor_id = "error-id" } },
@@ -222,9 +222,9 @@ do
   assert_eq(out.messages[2].content.mag_type.root.kind, "union",
     "position two carries its own union schema")
   assert_eq(out.messages[2].content.value.type, "final-id",
-    "position two preserves the selected FinalAnswer constructor")
+    "position two preserves the selected TextAnswer constructor")
   assert_eq(out.messages[2].content.value.value, "done",
-    "position two includes the FinalAnswer payload")
+    "position two includes the TextAnswer payload")
   assert_eq(out.messages[3].content.value.type, "error-id",
     "position three preserves the selected AgentError constructor")
   assert_eq(out.messages[3].content.value.value.error, "blocked",
@@ -238,7 +238,7 @@ end
 do
   local product_schema = { version = 1, root = { kind = "product", components = {
     { kind = "named", name = "Task", body = { kind = "string" } },
-    { kind = "named", name = "FinalAnswer", body = { kind = "string" } },
+    { kind = "named", name = "TextAnswer", body = { kind = "string" } },
   } } }
   local msgs, emit = capture()
   local inst = adapter.construct("whole.entry", { schema = product_schema }, emit)
@@ -260,7 +260,7 @@ do
   local product_schema = { version = 1, root = { kind = "product", components = {
     { kind = "named", name = "Task", body = { kind = "string" } },
     { kind = "union", variants = {
-      { tag = "final-id", schema = { kind = "named", name = "FinalAnswer", body = { kind = "string" } } },
+      { tag = "final-id", schema = { kind = "named", name = "TextAnswer", body = { kind = "string" } } },
       { tag = "error-id", schema = { kind = "named", name = "AgentError", body = { kind = "string" } } },
     } },
   } } }
@@ -282,7 +282,7 @@ do
   end)
   entry.deliver({ shape = "product", messages = {
     { tag = "task", message = { value = { prompt = "go" } } },
-    { tag = "generic-provider.FinalAnswer", message = {
+    { tag = "generic-provider.TextAnswer", message = {
         value = { content = string.rep("v", 2048) },
         transcript_delta = { { role = "tool", content = string.rep("x", 2 * 1024 * 1024) } },
         result = { raw_log = string.rep("y", 2 * 1024 * 1024) },

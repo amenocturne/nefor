@@ -16,7 +16,7 @@
 --      carries the final result and whether it was persisted, so the control
 --      plane can read the run result and mark the run done.
 --
--- Input contract: `( generic-provider.FinalAnswer | mag.Text | human.Approved )`
+-- Input contract: `( generic-provider.TextAnswer | mag.Text | human.Approved )`
 -- (union) — the fixture's `code-writer.llm -> sink` edge, the shell chain's
 -- implicit terminal edge (`bash -> sink`, docs/lowering.md "The program
 -- sink"), and the gate template's approval exit (an approval-terminated
@@ -35,7 +35,7 @@ M.declaration = {
     input={kind="variable",name="T"},
     output={kind="primitive",name="Unit"},
     inputs={
-      {wire="generic-provider.FinalAnswer",type={kind="variable",name="T"}},
+      {wire="generic-provider.TextAnswer",type={kind="variable",name="T"}},
       {wire="mag.Text",type={kind="variable",name="T"}},
       {wire="human.Approved",type={kind="variable",name="T"}},
     },
@@ -46,12 +46,12 @@ M.declaration = {
   params = {},
 
   inputs = {
-    -- Union (fires on any): an agent program terminates in a FinalAnswer;
+    -- Union (fires on any): an agent program terminates in a TextAnswer;
     -- a shell program's implicit terminal receives the last command's stdout
     -- (mag.Text — the bash capability node, factories/bash.lua); a gate
     -- program terminates in the human's approval (human.Approved —
     -- factories/human.lua, the gate template's exit).
-    final = { "generic-provider.FinalAnswer", "mag.Text", "human.Approved" },
+    final = { "generic-provider.TextAnswer", "mag.Text", "human.Approved" },
   },
 
   -- Completion is kernel-synthesized; the sink itself emits no data output.
@@ -73,7 +73,7 @@ function M.construct(id, params, emit, deps)
   local instance = { id = id }
 
   -- deliver(activation) -> completion (routing.lua, the kernel⇄factory
-  -- contract). Single input: fires per arriving FinalAnswer. Synchronous —
+  -- contract). Single input: fires per arriving TextAnswer. Synchronous —
   -- propose run completion and return a successful activation completion.
   function instance.deliver(activation)
     activation = activation or {}

@@ -97,8 +97,8 @@ do
   local ready = find_kind(msgs, "mag.ready")
   assert_true(ready ~= nil and ready.from == "sink", "sink emits an id-signed ready")
 
-  local done_completion = inst.deliver(single("up", "generic-provider.FinalAnswer",
-    { kind = "generic-provider.FinalAnswer", text = "the final answer" }))
+  local done_completion = inst.deliver(single("up", "generic-provider.TextAnswer",
+    { kind = "generic-provider.TextAnswer", text = "the final answer" }))
   assert_eq(done_completion.status, "ok", "synchronous sink returns a successful completion")
 
   assert_eq(#persisted, 1, "sink persisted the final output via the injected writer")
@@ -121,8 +121,8 @@ do
   local writer = function(final) persisted[#persisted + 1] = final end
 
   local inst = sink.construct("sink", {}, emit, { writer = writer })
-  inst.deliver(single("up", "generic-provider.FinalAnswer", {
-    kind = "generic-provider.FinalAnswer",
+  inst.deliver(single("up", "generic-provider.TextAnswer", {
+    kind = "generic-provider.TextAnswer",
     text = "the answer",
   }))
 
@@ -152,8 +152,8 @@ do
   local inst, cerr = reg:construct("sink", "sink", {}, emit, { writer = writer })
   assert_true(inst ~= nil and cerr == nil, "sink constructs through the registry with deps")
 
-  inst.deliver(single("up", "generic-provider.FinalAnswer",
-    { kind = "generic-provider.FinalAnswer", text = "through the registry" }))
+  inst.deliver(single("up", "generic-provider.TextAnswer",
+    { kind = "generic-provider.TextAnswer", text = "through the registry" }))
 
   assert_eq(#persisted, 1, "registry-threaded deps.writer received the final output")
   assert_eq(persisted[1].text, "through the registry",
@@ -170,8 +170,8 @@ end
 do
   local msgs, emit = capture()
   local inst = sink.construct("sink", {}, emit, {}) -- no writer in deps
-  inst.deliver(single("up", "generic-provider.FinalAnswer",
-    { kind = "generic-provider.FinalAnswer", text = "x" }))
+  inst.deliver(single("up", "generic-provider.TextAnswer",
+    { kind = "generic-provider.TextAnswer", text = "x" }))
   local done = find_kind(msgs, "mag.RunComplete")
   assert_true(done ~= nil, "sink still signals completion without a writer")
   assert_eq(done.persisted, false, "run-complete flags persisted=false when no writer wired")
@@ -188,7 +188,7 @@ do
   assert_true(ready ~= nil and ready.from == "gate", "human emits an id-signed ready")
 
   -- A subject arrives → an approval request goes out; completion is deferred.
-  local pending = inst.deliver(single("up", "generic-provider.FinalAnswer", { text = "proposed plan" }))
+  local pending = inst.deliver(single("up", "generic-provider.TextAnswer", { text = "proposed plan" }))
   assert_eq(pending.status, "pending", "an async gate defers completion on the subject")
   local req = find_kind(msgs, "mag.ApprovalRequest")
   assert_true(req ~= nil, "human emits an approval request for the subject")
@@ -219,7 +219,7 @@ end
 do
   local msgs, emit = capture()
   local inst = human.construct("gate", {}, emit)
-  inst.deliver(single("up", "generic-provider.FinalAnswer", { text = "risky plan" }))
+  inst.deliver(single("up", "generic-provider.TextAnswer", { text = "risky plan" }))
   inst.deliver(single("chat", "mag.ApprovalReply", { approved = false, reason = "too risky" }))
   local rejected = find_kind(msgs, "human.Rejected")
   assert_true(rejected ~= nil, "a non-approving reply takes the rejected exit")
@@ -248,7 +248,7 @@ end
 do
   local msgs, emit = capture()
   local inst = human.construct("gate", {}, emit)
-  inst.deliver(single("up", "generic-provider.FinalAnswer", { text = "awaiting" }))
+  inst.deliver(single("up", "generic-provider.TextAnswer", { text = "awaiting" }))
 
   inst.handle_drain()
   local cancel = find_kind(msgs, "mag.ApprovalCancel")

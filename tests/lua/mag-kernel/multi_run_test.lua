@@ -79,8 +79,8 @@ local function program()
         id = "agent",
         factory = "llm",
         params = { model = "m", provider = "prov", system = "answer" },
-        evidence={version=2,identity="nefor.factory.llm",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.ToolCalls",arguments={}},{kind="named",name="nefor.contracts.FinalAnswer",arguments={}}}}},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}},wire="generic-provider.FinalAnswer"}},
+        evidence={version=2,identity="nefor.factory.llm",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="union",items={{kind="named",name="nefor.contracts.ToolCalls",arguments={}},{kind="named",name="nefor.contracts.TextAnswer",arguments={}}}}},
+        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"}},
         routes = {},
       },
     },
@@ -94,7 +94,7 @@ local function program()
     rules = {},
     result = { from = {
       actor = "agent",
-      wire = "generic-provider.FinalAnswer",
+      wire = "generic-provider.TextAnswer",
     } },
   }
 end

@@ -6,7 +6,9 @@
 
 (type Task {:prompt String})
 (type ProviderInput {:content JsonValue})
-(type FinalAnswer {:content String})
+;; Direct-text codec: provider terminal text is the value. Unlike every other
+;; named contract, this exact nominal type bypasses structured JSON.
+(type TextAnswer String)
 (type ToolCall {:name String :arguments JsonValue})
 (type ToolCalls {:calls (List ToolCall)})
 (type ToolHandle {:results JsonValue})
@@ -51,7 +53,10 @@
                  :profile OptionalIdentifier
                  :provider String
                  :system String
-                 :tools (List String)})
+                 :tools (List String)
+                 :output_type SemanticTypeId
+                 :error_type SemanticTypeId
+                 :provider_error_type SemanticTypeId})
 (type RunToolParams {:tools (List String)
                      :da-policy DaPolicy})
 (type ToolResultParams {})
@@ -90,7 +95,7 @@
 (foreign nefor.factory.llm
   {:params LlmParams
    :input ProviderInput
-   :output (| ToolCalls FinalAnswer)})
+   :output (| ToolCalls TextAnswer)})
 
 (foreign nefor.factory.structured-output [T]
   {:params StructuredOutputParams
@@ -119,7 +124,7 @@
 
 (foreign nefor.factory.human
   {:params HumanParams
-   :input FinalAnswer
+   :input TextAnswer
    :output (| Approved Rejected)})
 
 (foreign nefor.factory.sink [T]

@@ -231,7 +231,7 @@ do
   -- construct hook (init.lua's seam) builds the instance on demand.
   local res = h.inv.apply({ actors = { { id = "b", factory = "sink", params = {}, routes = {},
     evidence={version=2,identity="nefor.factory.sink",arguments={{kind="named",name="test.Answer",arguments={}}},input={kind="named",name="test.Answer",arguments={}},output={kind="primitive",name="Unit"}},
-    input={type={kind="named",name="test.Answer",arguments={}},wire="generic-provider.FinalAnswer"},outputs={{type={kind="primitive",name="Unit"},wire="mag.Unit"}} } } })
+    input={type={kind="named",name="test.Answer",arguments={}},wire="generic-provider.TextAnswer"},outputs={{type={kind="primitive",name="Unit"},wire="mag.Unit"}} } } })
   assert_true(res.ok, "spawn b: " .. tostring(res.error))
   h.router:set_construct(function(record)
     order[#order + 1] = "construct:" .. record.id

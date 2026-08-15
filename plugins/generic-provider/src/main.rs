@@ -7,7 +7,7 @@
 //! - `generic-provider.ProviderOut`  — the standard chat-completion response.
 //! - `generic-provider.ChatHistory`  — provider-shaped reasoner state.
 //! - `generic-provider.NoState`      — unit/empty state for stateless reasoners.
-//! - `generic-provider.FinalAnswer`  — the escape-edge type emitted by `tool_split`.
+//! - `generic-provider.TextAnswer`  — the escape-edge type emitted by `tool_split`.
 //!
 //! On startup the plugin sends a `combinators.register` declaring just
 //! these types (with no implementations of its own). Concrete provider
@@ -65,7 +65,7 @@
 //! // generic-provider.NoState
 //! {}
 //!
-//! // generic-provider.FinalAnswer
+//! // generic-provider.TextAnswer
 //! { "text": "..." }
 //! ```
 
@@ -91,7 +91,7 @@ const CANONICAL_TYPES: &[&str] = &[
     "ProviderOut",
     "ChatHistory",
     "NoState",
-    "FinalAnswer",
+    "TextAnswer",
 ];
 
 #[tokio::main]
@@ -295,7 +295,7 @@ mod tests {
                 "ProviderOut",
                 "ChatHistory",
                 "NoState",
-                "FinalAnswer"
+                "TextAnswer"
             ]
         );
     }
@@ -342,7 +342,7 @@ mod tests {
             "ProviderOut",
             "ChatHistory",
             "NoState",
-            "FinalAnswer",
+            "TextAnswer",
         ]
         .into_iter()
         .collect();

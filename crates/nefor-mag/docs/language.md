@@ -50,10 +50,10 @@ Declare nominal records and algebraic types with `type`:
            :max-corrections 2})
         (type-tag nefor.contracts.Task)
         "task"
-        (type-tag nefor.contracts.FinalAnswer))
+        (type-tag nefor.contracts.TextAnswer))
       result
       (nefor.graph.output "result"
-        (type-tag (| nefor.contracts.FinalAnswer
+        (type-tag (| nefor.contracts.TextAnswer
                      nefor.contracts.AgentError)))]
   (nefor.artifact.compile
     (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
@@ -158,7 +158,7 @@ indefinitely. The current API has no `bash`, `BashOptions`,
 
 ## Human approvals
 
-`nefor.actors.approval-gate` branches a `FinalAnswer` into nominal `Approved` and `Rejected` results. Use it when human judgment is part of the graph's meaning. It is distinct from lead `write-review`, which authorizes execution of a write-capable orchestration plan before launch. See [Orchestrating MAG](orchestrating.md#mag-author-and-launch-a-program).
+`nefor.actors.approval-gate` branches a `TextAnswer` into nominal `Approved` and `Rejected` results. Use it when human judgment is part of the graph's meaning. It is distinct from lead `write-review`, which authorizes execution of a write-capable orchestration plan before launch. See [Orchestrating MAG](orchestrating.md#mag-author-and-launch-a-program).
 
 ## Dynamic rules
 

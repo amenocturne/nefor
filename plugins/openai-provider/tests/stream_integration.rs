@@ -76,7 +76,7 @@ async fn structured_request_has_object_root_and_decodes_successful_response() {
     let mag_schema = TypeSchema {
         version: SCHEMA_VERSION,
         root: SchemaType::Named {
-            name: "nefor.contracts.FinalAnswer".into(),
+            name: "nefor.contracts.TextAnswer".into(),
             body: Box::new(SchemaType::Record {
                 fields: vec![SchemaField {
                     name: "content".into(),

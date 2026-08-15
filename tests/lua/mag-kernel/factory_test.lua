@@ -172,10 +172,10 @@ do
   assert_true(not shape.accepts("generic-provider.ProviderOut", "other.Tag"),
     "single input rejects a different tag")
 
-  local union_in = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" }
+  local union_in = { "generic-tool.ToolCalls", "generic-provider.TextAnswer" }
   assert_true(shape.accepts(union_in, "generic-tool.ToolCalls"),
     "union input accepts either variant (a)")
-  assert_true(shape.accepts(union_in, "generic-provider.FinalAnswer"),
+  assert_true(shape.accepts(union_in, "generic-provider.TextAnswer"),
     "union input accepts either variant (b)")
   assert_true(not shape.accepts(union_in, "generic-provider.ProviderOut"),
     "union input rejects a non-variant tag")
