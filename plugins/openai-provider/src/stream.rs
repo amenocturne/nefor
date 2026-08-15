@@ -24,6 +24,7 @@ use crate::openai::{
     parse_models_response, parse_sse_chunk, ChatRequest, Message, ModelInfo, SseEvent,
     StreamOptions, ToolCall, ToolCallFunction, Usage,
 };
+use crate::wire::WireTrace;
 
 // Retry budget sized for rate-limited internal gateways (429 storms that
 // last tens of seconds): 8 attempts = 7 retries at 0.5s, 1s, 2s, 4s, 8s,
@@ -237,9 +238,50 @@ pub async fn run_chat_stream_with_retry_progress_and_format<F, R, P>(
     reasoning_effort: Option<&str>,
     response_format: Option<&serde_json::Value>,
     cancel: CancellationToken,
+    on_delta: F,
+    on_reasoning: R,
+    on_retry_progress: P,
+) -> Result<StreamOutcome, StreamError>
+where
+    F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
+    P: FnMut(RetryProgress),
+{
+    run_chat_stream_with_retry_progress_and_format_and_wire(
+        client,
+        endpoint,
+        api_key,
+        auth_header,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        response_format,
+        cancel,
+        on_delta,
+        on_reasoning,
+        on_retry_progress,
+        WireTrace::from_env(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_chat_stream_with_retry_progress_and_format_and_wire<F, R, P>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    auth_header: &str,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    reasoning_effort: Option<&str>,
+    response_format: Option<&serde_json::Value>,
+    cancel: CancellationToken,
     mut on_delta: F,
     mut on_reasoning: R,
     mut on_retry_progress: P,
+    mut wire: WireTrace,
 ) -> Result<StreamOutcome, StreamError>
 where
     F: FnMut(&str),
@@ -258,9 +300,9 @@ where
         response_format,
     };
 
+    let body_json =
+        serde_json::to_string(&req).unwrap_or_else(|e| format!("<serialize-error: {e}>"));
     if tracing::enabled!(tracing::Level::INFO) {
-        let body_json =
-            serde_json::to_string(&req).unwrap_or_else(|e| format!("<serialize-error: {e}>"));
         tracing::info!(
             target: "openai_provider::http",
             endpoint = endpoint,
@@ -271,10 +313,12 @@ where
             "POST chat completion",
         );
     }
+    wire.begin("POST", endpoint);
 
-    let response = {
+    let (response, successful_attempt) = {
         let mut attempt = 1usize;
         loop {
+            wire.request(attempt, "POST", endpoint, &body_json);
             let mut builder = client
                 .post(endpoint)
                 .header(ACCEPT, "text/event-stream")
@@ -287,6 +331,7 @@ where
             let sent = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
+                    wire.cancel(Some(attempt));
                     return Ok(StreamOutcome {
                         interrupted: true,
                         ..Default::default()
@@ -304,8 +349,10 @@ where
             let response = match sent {
                 Ok(response) => response,
                 Err(e) => {
+                    wire.error(Some(attempt), e.to_string());
                     if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&e) {
                         let delay = retry_delay(attempt, None);
+                        wire.retry(attempt, format!("delay_ms={} error={e}", delay.as_millis()));
                         tracing::warn!(
                             attempt,
                             max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
@@ -320,6 +367,7 @@ where
                             next_delay: delay,
                         });
                         if !sleep_before_retry(&cancel, delay).await {
+                            wire.cancel(Some(attempt));
                             return Ok(StreamOutcome {
                                 interrupted: true,
                                 ..Default::default()
@@ -332,28 +380,37 @@ where
                 }
             };
 
+            let status = response.status().as_u16();
+            wire.response(attempt, status, response.headers());
             if response.status().is_success() {
-                break response;
+                break (response, attempt);
             }
 
-            let status = response.status().as_u16();
             let retry_after = retry_after_delay(response.headers());
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable response body>".into());
+            let body_bytes = match response.bytes().await {
+                Ok(bytes) => bytes.to_vec(),
+                Err(_) => b"<unreadable response body>".to_vec(),
+            };
+            wire.response_body(attempt, &body_bytes);
+            let body = String::from_utf8_lossy(&body_bytes).into_owned();
             if status == 401 {
+                wire.error(Some(attempt), format!("HTTP {status}"));
                 return Err(StreamError::Unauthorized { body });
             }
             // Reactive fallback: only meaningful when the request actually
             // carried tools. If we sent no tools and still got the signature,
             // the server is telling us something else — fall through to Http.
             if status == 400 && tools.is_some() && body_signals_tools_unsupported(&body) {
+                wire.error(Some(attempt), "HTTP 400 tools unsupported".to_owned());
                 return Err(StreamError::ToolsUnsupported { body });
             }
             let err = StreamError::Http { status, body };
             if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&err) {
                 let delay = retry_delay(attempt, retry_after);
+                wire.retry(
+                    attempt,
+                    format!("delay_ms={} HTTP {status}", delay.as_millis()),
+                );
                 tracing::warn!(
                     attempt,
                     max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
@@ -368,6 +425,7 @@ where
                     next_delay: delay,
                 });
                 if !sleep_before_retry(&cancel, delay).await {
+                    wire.cancel(Some(attempt));
                     return Ok(StreamOutcome {
                         interrupted: true,
                         ..Default::default()
@@ -376,6 +434,7 @@ where
                 attempt += 1;
                 continue;
             }
+            wire.error(Some(attempt), err.to_string());
             return Err(err);
         }
     };
@@ -392,6 +451,7 @@ where
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                wire.cancel(Some(successful_attempt));
                 outcome.interrupted = true;
                 outcome.tool_calls = tc_acc.finalize().unwrap_or_default();
                 maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
@@ -404,34 +464,50 @@ where
                         if stream_semantically_complete(&outcome) && buffer.is_empty() {
                             break;
                         }
-                        return Err(StreamError::Body(reqwest_error_detail(&e)));
+                        let error = StreamError::Body(reqwest_error_detail(&e));
+                        wire.error(Some(successful_attempt), error.to_string());
+                        return Err(error);
                     }
                     Some(Ok(bytes)) => {
+                        wire.stream_data(successful_attempt, &bytes);
                         buffer.push(&bytes);
-                        drain_complete_frames(
+                        if let Err(error) = drain_complete_frames(
                             &mut buffer,
                             &mut outcome,
                             &mut tc_acc,
                             &mut reasoning_ended,
                             &mut on_delta,
                             &mut on_reasoning,
-                        )?;
+                        ) {
+                            wire.error(Some(successful_attempt), error.to_string());
+                            return Err(error);
+                        }
                     }
                 }
             }
         }
     }
     // Drain any leftover frame the server didn't terminate with `\n\n`.
-    drain_complete_frames(
+    if let Err(error) = drain_complete_frames(
         &mut buffer,
         &mut outcome,
         &mut tc_acc,
         &mut reasoning_ended,
         &mut on_delta,
         &mut on_reasoning,
-    )?;
-    outcome.tool_calls = tc_acc.finalize()?;
+    ) {
+        wire.error(Some(successful_attempt), error.to_string());
+        return Err(error);
+    }
+    outcome.tool_calls = match tc_acc.finalize() {
+        Ok(tool_calls) => tool_calls,
+        Err(error) => {
+            wire.error(Some(successful_attempt), error.to_string());
+            return Err(error);
+        }
+    };
     maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
+    wire.end(Some(successful_attempt), "stream_complete");
     Ok(outcome)
 }
 
@@ -533,31 +609,50 @@ pub async fn list_models(
     auth_header: &str,
 ) -> Result<Vec<ModelInfo>, StreamError> {
     let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let mut wire = WireTrace::from_env();
+    wire.begin("GET", &endpoint);
+    wire.request(1, "GET", &endpoint, "");
     let mut builder = client.get(&endpoint).timeout(Duration::from_secs(30));
     if let Some(k) = api_key {
         builder = apply_auth(builder, auth_header, k);
     }
-    let response = builder
-        .send()
-        .await
-        .map_err(|e| StreamError::Request(e.to_string()))?;
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = StreamError::Request(error.to_string());
+            wire.error(Some(1), error.to_string());
+            return Err(error);
+        }
+    };
+    let status = response.status().as_u16();
+    wire.response(1, status, response.headers());
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable response body>".into());
-        if status == 401 {
-            return Err(StreamError::Unauthorized { body });
-        }
-        return Err(StreamError::Http { status, body });
+        let body_bytes = match response.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(_) => b"<unreadable response body>".to_vec(),
+        };
+        wire.response_body(1, &body_bytes);
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
+        let error = if status == 401 {
+            StreamError::Unauthorized { body }
+        } else {
+            StreamError::Http { status, body }
+        };
+        wire.error(Some(1), error.to_string());
+        return Err(error);
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|e| StreamError::Body(e.to_string()))?;
-    Ok(parse_models_response(&body))
+    let body_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let error = StreamError::Body(error.to_string());
+            wire.error(Some(1), error.to_string());
+            return Err(error);
+        }
+    };
+    wire.response_body(1, &body_bytes);
+    wire.end(Some(1), "response_complete");
+    Ok(parse_models_response(&String::from_utf8_lossy(&body_bytes)))
 }
 
 fn reqwest_error_detail(err: &reqwest::Error) -> String {

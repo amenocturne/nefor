@@ -54,6 +54,30 @@ Four CLI flags, all optional:
 
 Why CLI flags and not env vars: the engine's `nefor.plugins.spawn` API does not propagate per-instance env to children. CLI args ride the command line straight through. `--api-key` keeps an env-var fallback because real users want to set secrets through the shell, not by editing `init.lua`.
 
+## Opt-in raw wire logging
+
+Set `NEFOR_OPENAI_WIRE_LOG=1` in the environment inherited by Nefor to emit raw
+OpenAI-provider HTTP/SSE records through the normal plugin stderr -> aggregate
+Nefor log sink. It is disabled by default; `true`, `yes`, `on`, and `enabled`
+(case-insensitive) also enable it.
+
+> **Sensitive data warning:** raw wire records contain complete request JSON
+> (prompts, conversation messages, tool definitions/results, continuation
+> shapes) and raw model response bytes. Enable this only for local diagnosis,
+> protect the aggregate log accordingly, and disable it afterward. API keys,
+> Authorization values, cookies, and other credential-bearing headers are never
+> recorded even in this mode.
+
+Each JSON record is logged under tracing target `openai_provider::wire` and has
+`session_id`, `request_id`, monotonic `sequence`, optional `attempt`, and an
+`event`. A call starts with `begin`; each HTTP attempt records `request`, then
+`response` (status plus an allowlist of correlation/rate-limit/retry headers).
+Non-2xx bodies use `response_body`; successful streams use `stream_data` for
+each byte chunk in arrival order, with both lossy text and exact `body_hex`.
+`retry`, `end`, `error`, and `cancel` make lifecycle outcomes explicit. Request
+headers are described only by fixed non-secret content-negotiation headers;
+the request builder and credential headers are never debug-formatted.
+
 ## Example configurations
 
 The defaults match a local Ollama install. Override the four flags per spawn for everything else.

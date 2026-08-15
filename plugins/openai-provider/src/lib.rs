@@ -12,3 +12,4 @@ pub mod config;
 pub mod openai;
 pub mod state;
 pub mod stream;
+pub mod wire;
