@@ -182,8 +182,13 @@ sequence("safe auto yolo effects", {
   { kind = "tool-gate.mode_changed", mode = "yolo" },
 })
 
+-- `/model <args>` is deliberately no longer equivalent to the frozen reducer:
+-- the legacy form sent whatever was typed to the alphabetically-first connected
+-- provider, which cannot express a cross-provider switch. Its replacement is
+-- specified by tests/lua/chat/model_selection_test.lua and the `/model`
+-- scenarios in plugins/nefor-tui/tests/chat_test.rs. Acknowledgement handling
+-- for a non-active provider is unchanged and stays under the oracle.
 sequence("model think compact resume", {
-  { kind = "input.submit", value = "/model model-b" },
   { kind = "chat.model.set_ack", provider = "fixture_provider", model = "model-b" },
   { kind = "input.submit", value = "/think high" },
   { kind = "chat.reasoning.set_ack", effort = "high" },

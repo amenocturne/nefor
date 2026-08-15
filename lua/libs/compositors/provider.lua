@@ -101,6 +101,11 @@ function M.spawn_spec(name, command, opts)
   local kinds = translator.kinds
   local pending_compactions = {}
   local pending_requests = {}
+  -- A model selection this provider has been asked to adopt but has not
+  -- acknowledged yet. The binary reports a refusal as an untargeted turn error;
+  -- correlating it here is the only place that knows a selection was in flight,
+  -- and turns an anonymous system message into a settled selection failure.
+  local pending_model_set = nil
 
   local function emit_synthetic(from, body)
     nefor.engine.send(nefor.json.encode({
@@ -339,6 +344,23 @@ function M.spawn_spec(name, command, opts)
         end
       end
 
+      if type(env.body) == "table" and env.body.kind == kinds.model_set_ack then
+        pending_model_set = nil
+      elseif type(env.body) == "table"
+          and env.body.kind == kinds.turn_error
+          and type(env.body.chat_id) ~= "string"
+          and pending_model_set ~= nil then
+        local refused = pending_model_set
+        pending_model_set = nil
+        emit_synthetic(name, {
+          kind = "chat.model.set_failed",
+          provider = name,
+          model = refused.model,
+          error = tostring(env.body.message or env.body.error or "provider error"),
+        })
+        goto continue
+      end
+
       if type(env.body) == "table"
           and env.body.kind == kinds.turn_error
           and type(env.body.chat_id) == "string" then
@@ -416,6 +438,9 @@ function M.spawn_spec(name, command, opts)
 
         local body = translator.inbound(env)
         if body ~= nil then
+          if body.kind == kinds.model_set then
+            pending_model_set = { model = body.model }
+          end
           translator.deliver(body)
         end
       end

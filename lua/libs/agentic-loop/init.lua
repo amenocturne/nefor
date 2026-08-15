@@ -886,6 +886,13 @@ end
 -- its opaque checkpoint is compatible or full history is required.
 local function set_model(provider, model)
   if type(provider) == "string" and #provider > 0 then
+    -- Reasoning effort is provider-specific vocabulary. Carrying the previous
+    -- provider's effort across a cross-provider switch would send a value the
+    -- new provider never advertised; the new provider's default applies until
+    -- the user selects one again.
+    if state.config.provider ~= provider then
+      state.config.reasoning_effort = nil
+    end
     state.config.provider = provider
   end
   if type(model) == "string" and #model > 0 then

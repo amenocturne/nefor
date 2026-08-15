@@ -242,4 +242,51 @@ do
   eq(store:get("linear").events, nil, "aggregate does not duplicate canonical history")
 end
 
+-- Transcript disposition is an explicit, validated distinction. A message may
+-- declare it up front, or narrow to diagnostic at its terminal fact; it can
+-- never be promoted back into the transcript, and every disposition stays in
+-- the model context projection.
+do
+  local projection = require("libs.conversation-manager.projection")
+  local store = manager.new(); create(store, "visible", "lead")
+  append(store, fact("t", "visible", "turn_started", { turn_id = "turn", run_id = "run" }))
+
+  append(store, fact("m1", "visible", "message_started", {
+    message_id = "declared", role = "user", visibility = "diagnostic", turn_id = "turn",
+  }))
+  append(store, fact("c1", "visible", "content_chunk_appended", {
+    message_id = "declared", chunk = { kind = "text", data = "correction" },
+  }))
+  append(store, fact("d1", "visible", "message_completed", { message_id = "declared" }))
+  eq(store:get("visible").messages[1].visibility, "diagnostic",
+    "a declared diagnostic message keeps its disposition")
+
+  append(store, fact("m2", "visible", "message_started", {
+    message_id = "streamed", role = "assistant", turn_id = "turn",
+  }))
+  eq(store:get("visible").messages[2].visibility, "transcript",
+    "a message with no declared disposition is ordinary transcript")
+  append(store, fact("d2", "visible", "message_completed", {
+    message_id = "streamed", visibility = "diagnostic",
+  }))
+  eq(store:get("visible").messages[2].visibility, "diagnostic",
+    "a terminal fact may narrow a streamed message into diagnostic")
+
+  append(store, fact("m3", "visible", "message_started", {
+    message_id = "promoted", role = "assistant", visibility = "diagnostic", turn_id = "turn",
+  }))
+  rejects(store, fact("d3", "visible", "message_completed", {
+    message_id = "promoted", visibility = "transcript",
+  }), "invalid_visibility_promotion")
+  rejects(store, fact("m4", "visible", "message_started", {
+    message_id = "bogus", role = "assistant", visibility = "hidden", turn_id = "turn",
+  }), "invalid_visibility")
+  append(store, fact("d4", "visible", "message_completed", { message_id = "promoted" }))
+
+  local context = projection.context(store:peek("visible"))
+  eq(#context.messages, 3, "every disposition remains available as model context")
+  eq(context.messages[1].visibility, "diagnostic",
+    "the context projection reports each message's disposition")
+end
+
 print("conversation_manager_domain_test: all assertions passed")

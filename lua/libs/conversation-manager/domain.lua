@@ -7,6 +7,11 @@ local json_data = require("core.json_data")
 local terminal_conversation = { completed = true, interrupted = true, failed = true }
 local chunk_kinds = { text = true, reasoning = true, structured = true, native = true }
 local roles = { system = true, user = true, assistant = true, tool = true }
+-- A message's transcript disposition. "transcript" is ordinary conversation;
+-- "diagnostic" is model context that no surface renders as conversation (a
+-- rejected structured-output attempt and its correction prompt). Both remain in
+-- the model context projection; only the display projection distinguishes them.
+local visibilities = { transcript = true, diagnostic = true }
 
 local copy = json_data.copy
 M.copy = copy
@@ -99,8 +104,12 @@ handlers.message_started = function(c, event)
   local turn = event.turn_id and c.turn_by_id[event.turn_id] or nil
   if event.turn_id and not turn then return err("turn_not_found", { turn_id = event.turn_id }) end
   if turn and turn.status ~= "open" then return err("turn_not_open", { turn_id = turn.id, status = turn.status }) end
+  if event.visibility ~= nil and not visibilities[event.visibility] then
+    return err("invalid_visibility", { message_id = event.message_id, visibility = event.visibility })
+  end
   local message = {
     id = event.message_id, role = event.role, status = "open",
+    visibility = event.visibility or "transcript",
     turn_id = event.turn_id, tool_call_id = event.tool_call_id,
     submission_ids = copy(event.submission_ids or {}),
     input_cause = event.input_cause,
@@ -199,11 +208,27 @@ end
 handlers.tool_result_recorded = function(c, e) return finish_exchange(c, e, "result", "result") end
 handlers.tool_error_recorded = function(c, e) return finish_exchange(c, e, "error", "error") end
 
+-- Visibility may only narrow at a message's terminal fact: content already
+-- streamed to a surface can be retracted, but nothing that was recorded as
+-- diagnostic may be promoted into the transcript afterwards.
+local function settle_visibility(message, event)
+  if event.visibility == nil then return true end
+  if not visibilities[event.visibility] then
+    return err("invalid_visibility", { message_id = message.id, visibility = event.visibility })
+  end
+  if message.visibility == "diagnostic" and event.visibility == "transcript" then
+    return err("invalid_visibility_promotion", { message_id = message.id })
+  end
+  message.visibility = event.visibility
+  return true
+end
+
 handlers.message_completed = function(c, event)
   local ok, e = require_live(c, event); if not ok then return nil, e end
   local message = find_message(c, event.message_id)
   if not message then return err("message_not_found", { message_id = event.message_id }) end
   if message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  ok, e = settle_visibility(message, event); if not ok then return nil, e end
   for _, exchange_id in ipairs(message.exchange_ids) do
     local exchange = c.exchange_by_id[exchange_id]
     if exchange.status == "call_open" then
@@ -229,6 +254,7 @@ handlers.message_interrupted = function(c, event)
   local message = find_message(c, event.message_id)
   if not message then return err("message_not_found", { message_id = event.message_id }) end
   if message.status ~= "open" then return err("message_not_open", { message_id = event.message_id, status = message.status }) end
+  ok, e = settle_visibility(message, event); if not ok then return nil, e end
   message.status = "interrupted"
   c.open_messages = c.open_messages - 1
   local turn = message.turn_id and find_turn(c, message.turn_id) or nil

@@ -51,6 +51,7 @@ local function projected_message(conversation, message)
     input_cause = message.input_cause,
     role = message.role,
     status = message.status,
+    visibility = message.visibility or "transcript",
     tool_call_id = message.tool_call_id,
     tool_name = message.tool_name,
     chunks = chunks,

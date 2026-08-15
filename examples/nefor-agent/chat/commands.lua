@@ -12,6 +12,7 @@ local usage_view = require("libs.chat.usage")
 local Entry = require("libs.chat.entry")
 local height_cache = require("libs.chat.height_cache")
 local queued_input = require("libs.chat.queued_input")
+local model_selection = require("libs.chat.model_selection")
 local extensions = require("libs.chat.extensions")
 local controller = require("libs.chat.controller")
 local begin_session_transition = controller.lifecycle_context.begin_session_transition
@@ -176,19 +177,22 @@ return function(msg, state)
     }), {}
   end
   if cmd == "model" then
-    if args and #args > 0 then
-      local provider = nil
-      local connected = {}
-      for n, st in pairs(state.auth or {}) do
-        if st == "connected" then connected[#connected + 1] = n end
-      end
-      table.sort(connected)
-      provider = connected[1]
-      local body = { kind = "chat.model.set", model = args }
-      if provider then body.provider = provider end
-      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine", body = body },
-      }
+    local cleared = shallow_merge(state, { input_value = "", completion = NIL_SENTINEL })
+    local resolution = model_selection.resolve(args, state.auth or {}, state.model_catalog)
+    if resolution.kind == "select" then
+      return model_selection.request(cleared, resolution.provider, resolution.model)
+    end
+    if resolution.kind == "ambiguous" then
+      return shallow_merge(cleared, {
+        popup = { variant = "warning", title = "/model",
+          body = model_selection.ambiguous_message(resolution) },
+      }), {}
+    end
+    if resolution.kind == "unresolved" then
+      return shallow_merge(cleared, {
+        popup = { variant = "warning", title = "/model",
+          body = model_selection.unresolved_message(resolution) },
+      }), {}
     end
     local providers = {}
     for n, st in pairs(state.auth or {}) do

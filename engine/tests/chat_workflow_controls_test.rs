@@ -41,6 +41,11 @@ fn dispatch_registration_contract() {
 }
 
 #[test]
+fn model_selection_correlation_laws() {
+    run_pure_chat_fixture("model_selection_test.lua");
+}
+
+#[test]
 fn workflow_controls_transition_laws() {
     let lua = Lua::new();
     let root = repo_root();

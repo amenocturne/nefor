@@ -10,6 +10,7 @@ local sessions = require("libs.chat.sessions")
 local preview_state = require("libs.chat.preview_state")
 local preview_view  = require("libs.chat.preview_view")
 local run_panel     = require("libs.chat.run_panel")
+local model_selection = require("libs.chat.model_selection")
 
 local STYLE         = common.STYLE
 local C             = common.C
@@ -44,7 +45,9 @@ Slash commands:
   /quit /exit  exit nefor
   /safe /auto /yolo  set tool permission mode
   /login /logout  provider auth
-  /model       list/switch model
+  /model       browse every provider's catalog and pick a model
+  /model <provider> <model>  switch provider and model together
+  /model <model>             switch when one catalog offers that model
   /usage       account quota and reset times
   /resume      resume a previous session]]
 
@@ -268,6 +271,18 @@ function M.model_picker(state)
     return STYLE.status_danger
   end
 
+  -- Overlay parity: the picker marks the same pair the statusline shows, and
+  -- marks a selection that has been requested but not yet acknowledged, so the
+  -- two surfaces can never disagree about which model is active.
+  local active = model_selection.active(state)
+  local function selection_marker(provider, model)
+    if provider == active.pending_provider and model == active.pending_model then
+      return "◌ "
+    end
+    if provider == active.provider and model == active.model then return "● " end
+    return "  "
+  end
+
   local children = {}
   children[#children + 1] = tui.text {
     content = "search: " .. (p.query or ""),
@@ -324,7 +339,7 @@ function M.model_picker(state)
         flat_idx = flat_idx + 1
         local style = (flat_idx == cursor) and CURSOR_ROW_STYLE or STYLE.status
         children[#children + 1] = tui.text {
-          content = "  " .. m, style = style, wrap = "none",
+          content = selection_marker(prov.name, m) .. m, style = style, wrap = "none",
         }
       end
     end

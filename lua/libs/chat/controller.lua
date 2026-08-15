@@ -22,6 +22,7 @@ local height_cache = require("libs.chat.height_cache")
 local workflow_controls = require("libs.chat.workflow_controls")
 local exit_controls = require("libs.chat.exit_controls")
 local queued_input = require("libs.chat.queued_input")
+local model_selection = require("libs.chat.model_selection")
 local dispatch      = require("libs.chat.dispatch")
 local mag_run_bindings = require("libs.mag-run-bindings")
 
@@ -1002,22 +1003,34 @@ local function handle_toast(msg, state)
   return shallow_merge(state, { toasts = toasts }), {}
 end
 
+local selection_lookups = {
+  reasoning_default = function(provider, model)
+    local k = model_key(provider, model)
+    return k ~= nil and model_reasoning_defaults[k] or nil
+  end,
+  context_window = function(_, model)
+    if type(model) ~= "string" then return nil end
+    return model_context_windows[model]
+  end,
+}
+
 local function handle_model_set_ack(msg, state)
   if state.replay_mode then return state, {} end
-  if type(msg.provider) == "string" and msg.provider ~= state.provider then
-    return state, {}
-  end
-  local provider = msg.provider or state.provider
-  local effort = msg.reasoning_effort or state.reasoning_effort
-  local k = model_key(provider, msg.model)
-  if effort == nil and k ~= nil then
-    effort = model_reasoning_defaults[k]
-  end
-  return shallow_merge(state, {
-    model = msg.model or state.model,
-    provider = provider,
-    reasoning_effort = effort,
-    max_tokens = model_context_windows[msg.model] or state.max_tokens,
+  return model_selection.acknowledge(state, msg, selection_lookups), {}
+end
+
+local function handle_model_set_failed(msg, state)
+  if state.replay_mode then return state, {} end
+  local next_state, rolled_back = model_selection.reject(state, msg)
+  if not rolled_back then return state, {} end
+  return shallow_merge(next_state, {
+    popup = {
+      variant = "warning",
+      title = "/model",
+      body = "`" .. tostring(msg.provider or "?") .. " " .. tostring(msg.model or "?")
+        .. "` was not accepted.\n" .. tostring(msg.error or msg.message
+          or "The provider rejected the model."),
+    },
   }), {}
 end
 
@@ -1055,9 +1068,14 @@ local function handle_models_listed(msg, state)
       end
     end
   end
-  local next_state = state
+  -- The catalog is surface state, not picker state: a bare `/model <model>`
+  -- decides uniqueness from it whether or not a picker was ever opened.
+  local next_state = shallow_merge(state, {
+    model_catalog = model_selection.absorb_catalog(
+      state.model_catalog, msg.provider, msg.models),
+  })
   if active_ctx ~= nil or (active_effort ~= nil and state.reasoning_effort == nil) then
-    next_state = shallow_merge(state, {
+    next_state = shallow_merge(next_state, {
       max_tokens       = active_ctx or state.max_tokens,
       reasoning_effort = state.reasoning_effort or active_effort,
     })
@@ -1143,13 +1161,17 @@ local function handle_auth_status(msg, state)
     end
     new_popup = shallow_merge(state.popup, { providers = new_providers })
   end
-  return shallow_merge(state, {
+  -- A pending selection can only ever be acknowledged by the provider that
+  -- owns it. If that provider stops being reachable the request is dead; roll
+  -- back rather than leave the surface waiting on an ack that cannot arrive.
+  local next_state = shallow_merge(state, {
     auth = auth,
     supports_login = supports,
     supports_usage = supports_usage,
     usage = usage,
     popup = new_popup,
-  }), {}
+  })
+  return select(1, model_selection.provider_unavailable(next_state, provider, status)), {}
 end
 
 local function handle_tool_popup_request(msg, state)
@@ -1464,9 +1486,14 @@ local function settle_terminal_provider_round(state, terminal)
   end
 
   local has_assistant = has_assistant_since(state.entries)
+  -- A turn whose every assistant round was retracted has no answer to settle;
+  -- synthesizing a metadata-only bubble next to the failure would read as two
+  -- outcomes for one turn.
+  local retracted_only = state.turn_discarded_assistant == true and not has_assistant
   local next_state = state
   if state.in_flight ~= nil
-      or (not has_assistant and (terminal.model ~= nil or terminal.duration_ms ~= nil)) then
+      or (not retracted_only and not has_assistant
+        and (terminal.model ~= nil or terminal.duration_ms ~= nil)) then
     next_state = transcript.finalize_assistant(
       state, nil, terminal.model, terminal.duration_ms)
     has_assistant = has_assistant_since(next_state.entries)
@@ -1507,6 +1534,7 @@ local function apply_conversation_action(state, item)
       active_turn_id = item.turn_id,
       active_turn_entry_start = #(state.entries or {}) + 1,
       pending = true,
+      turn_discarded_assistant = NIL_SENTINEL,
     })
   end
   if item.kind == "message" then
@@ -1532,6 +1560,14 @@ local function apply_conversation_action(state, item)
         terminal.duration_ms)
     end
     return next_state
+  end
+  if item.kind == "message_discarded" then
+    -- The conversation authority retracted a provisional provider round. Drop
+    -- what streamed for it and remember that this turn produced no assistant
+    -- content, so a terminal fact cannot synthesize an empty answer entry.
+    return shallow_merge(
+      transcript.discard_message(state, item.message_id),
+      { turn_discarded_assistant = true })
   end
   if item.kind == "message_interrupted" then
     return transcript.close_lead_unit(state)
@@ -1571,6 +1607,7 @@ local function apply_conversation_action(state, item)
       stats = stats,
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
+      turn_discarded_assistant = NIL_SENTINEL,
       current_context_tokens = context_usage.current_input_tokens(usage),
     }
     if terminal.model ~= nil then
@@ -1585,6 +1622,7 @@ local function apply_conversation_action(state, item)
     next_state = transcript.flush_graph_results(shallow_merge(next_state, {
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
+      turn_discarded_assistant = NIL_SENTINEL,
     }))
     return transcript.push_entry(
       next_state, Entry.system(display_value(terminal.reason or "interrupted")))
@@ -1596,6 +1634,7 @@ local function apply_conversation_action(state, item)
     next_state = transcript.flush_graph_results(shallow_merge(next_state, {
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
+      turn_discarded_assistant = NIL_SENTINEL,
     }))
     return transcript.push_entry(
       next_state, Entry.error("Conversation failed", display_value(message), true))
@@ -1696,6 +1735,7 @@ local default_handlers = {
   ["chat.popup"]                  = handle_popup,
   ["chat.toast"]                  = handle_toast,
   ["chat.model.set_ack"]          = handle_model_set_ack,
+  ["chat.model.set_failed"]       = handle_model_set_failed,
   ["chat.reasoning.set_ack"]      = handle_reasoning_set_ack,
   ["chat.models.listed"]          = handle_models_listed,
   ["chat.auth.status"]            = handle_auth_status,
@@ -1793,14 +1833,9 @@ local function route_keys_and_popups(msg, state)
     }, msg)
     if result ~= nil then
       if result.selected ~= nil then
-        return shallow_merge(state, { popup = NIL_SENTINEL }), {
-          { kind = "send_to", target = "engine",
-            body = {
-              kind     = "chat.model.set",
-              provider = result.selected.provider,
-              model    = result.selected.model,
-            } },
-        }
+        return model_selection.request(
+          shallow_merge(state, { popup = NIL_SENTINEL }),
+          result.selected.provider, result.selected.model)
       end
       return shallow_merge(state, {
         popup = shallow_merge(p, result.state),

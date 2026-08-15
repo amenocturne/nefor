@@ -205,6 +205,33 @@ function M.close_lead_unit(state)
   })
 end
 
+-- Remove the entries bound to a canonical message the conversation authority
+-- retracted (a structured-output attempt that failed validation). The next
+-- attempt re-streams into the position this one occupied.
+function M.discard_message(state, message_id)
+  if type(message_id) ~= "string" or message_id == "" then return state end
+  local entries, removed_before_in_flight, removed_in_flight = {}, 0, false
+  for index, entry in ipairs(state.entries or {}) do
+    if type(entry) == "table" and entry.message_id == message_id then
+      if state.in_flight == index then removed_in_flight = true end
+      if state.in_flight ~= nil and index < state.in_flight then
+        removed_before_in_flight = removed_before_in_flight + 1
+      end
+    else
+      entries[#entries + 1] = entry
+    end
+  end
+  if #entries == #(state.entries or {}) then return state end
+  local in_flight = state.in_flight
+  if removed_in_flight or in_flight == nil then
+    in_flight = NIL_SENTINEL
+  else
+    in_flight = in_flight - removed_before_in_flight
+  end
+  log.log("transcript", "discard_message id=%s count=%d", message_id, #entries)
+  return shallow_merge(state, { entries = entries, in_flight = in_flight })
+end
+
 function M.attach_tool_end(state, id, output, error_flag)
   for i = #state.entries, 1, -1 do
     local e = state.entries[i]

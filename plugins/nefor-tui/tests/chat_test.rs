@@ -11990,3 +11990,595 @@ fn independent_house_composes_public_chat_blocks_without_example_imports() {
             && body.get("value").and_then(JsonValue::as_str) == Some("own surface")
     }));
 }
+
+// ============================================================
+// Structured-output presentation
+// ============================================================
+//
+// The lead answers through a typed provider boundary. An attempt that fails
+// schema validation, and the correction prompt that answers it, are model
+// context the conversation authority marks `visibility = "diagnostic"`. The
+// surface must never render either as conversation: the user sees exactly one
+// accepted answer, in the position the turn's provider round occupied, or —
+// when the correction budget runs out — exactly one failure.
+
+fn transcript_entry_fields(engine: &mut Engine, field: &str) -> Vec<String> {
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    let mut out = Vec::new();
+    for index in 1..=entries.raw_len() {
+        let entry: mlua::Table = entries.get(index).expect("entry");
+        if let Some(value) = entry.get::<Option<String>>(field).expect("entry field") {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Roles of the conversation entries the transcript kept. Surface-local rows
+/// (system notices, errors, tool calls) are not conversation and are excluded.
+fn transcript_roles(engine: &mut Engine) -> Vec<String> {
+    transcript_entry_fields(engine, "role")
+        .into_iter()
+        .filter(|role| role == "user" || role == "assistant")
+        .collect()
+}
+
+/// Kinds of the non-conversation entries (errors, notices) the transcript kept.
+fn transcript_kinds(engine: &mut Engine) -> Vec<String> {
+    transcript_entry_fields(engine, "kind")
+}
+
+fn typed_delta(engine: &mut Engine, conversation_id: &str, change: JsonValue) {
+    dispatch_event(
+        engine,
+        json!({
+            "kind": "conversation.projection.delta",
+            "conversation_id": conversation_id,
+            "change": change,
+        }),
+    );
+}
+
+fn typed_attempt(
+    engine: &mut Engine,
+    conversation_id: &str,
+    turn_id: &str,
+    message_id: &str,
+    reasoning: &str,
+    text: &str,
+    accepted: bool,
+) {
+    typed_delta(
+        engine,
+        conversation_id,
+        json!({ "kind": "message_started", "turn_id": turn_id,
+            "message": { "id": message_id, "turn_id": turn_id, "role": "assistant" } }),
+    );
+    typed_delta(
+        engine,
+        conversation_id,
+        json!({ "kind": "content_chunk_appended", "turn_id": turn_id,
+            "message_id": message_id, "chunk": { "kind": "reasoning", "data": reasoning } }),
+    );
+    let mut message = json!({
+        "id": message_id, "turn_id": turn_id, "role": "assistant", "text": text,
+        "terminal": { "model": "structured-model", "duration_ms": 11 },
+    });
+    if accepted {
+        typed_delta(
+            engine,
+            conversation_id,
+            json!({ "kind": "content_chunk_appended", "turn_id": turn_id,
+                "message_id": message_id, "chunk": { "kind": "text", "data": text } }),
+        );
+    } else {
+        message["visibility"] = json!("diagnostic");
+    }
+    typed_delta(
+        engine,
+        conversation_id,
+        json!({ "kind": "message_completed", "turn_id": turn_id, "message": message }),
+    );
+}
+
+fn typed_correction(engine: &mut Engine, conversation_id: &str, turn_id: &str, id: &str) {
+    let message = json!({
+        "id": id, "turn_id": turn_id, "role": "user", "visibility": "diagnostic",
+        "text": "Your previous response was not valid for the required MAG type.",
+    });
+    typed_delta(
+        engine,
+        conversation_id,
+        json!({ "kind": "message_started", "turn_id": turn_id, "message": message }),
+    );
+    typed_delta(
+        engine,
+        conversation_id,
+        json!({ "kind": "message_completed", "turn_id": turn_id, "message": message }),
+    );
+}
+
+#[test]
+fn rejected_structured_attempt_leaves_one_answer_at_the_original_turn_position() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    let conversation = "typed-conversation";
+    activate_conversation(&mut engine, conversation);
+    typed_delta(
+        &mut engine,
+        conversation,
+        json!({ "kind": "message_started",
+            "message": { "id": "input", "role": "user", "text": "how do I do it?" } }),
+    );
+    typed_delta(
+        &mut engine,
+        conversation,
+        json!({ "kind": "message_completed",
+            "message": { "id": "input", "role": "user", "text": "how do I do it?" } }),
+    );
+    typed_delta(
+        &mut engine,
+        conversation,
+        json!({ "kind": "turn_started", "turn_id": "typed-turn", "run_id": "typed-run" }),
+    );
+
+    typed_attempt(
+        &mut engine,
+        conversation,
+        "typed-turn",
+        "attempt-1",
+        "provisional deliberation",
+        "here is some prose instead of JSON",
+        false,
+    );
+    typed_correction(&mut engine, conversation, "typed-turn", "correction-1");
+    typed_attempt(
+        &mut engine,
+        conversation,
+        "typed-turn",
+        "attempt-2",
+        "settled deliberation",
+        "the accepted answer",
+        true,
+    );
+    typed_delta(
+        &mut engine,
+        conversation,
+        json!({ "kind": "turn_completed", "turn_id": "typed-turn", "run_id": "typed-run",
+            "terminal": { "model": "structured-model", "duration_ms": 11 } }),
+    );
+
+    let roles = transcript_roles(&mut engine);
+    let out = render_snapshot(&mut engine);
+    assert_eq!(
+        roles,
+        vec!["user".to_string(), "assistant".to_string()],
+        "the turn leaves exactly one user input and one accepted answer: {out:?}"
+    );
+    assert!(
+        out.contains("the accepted answer"),
+        "the accepted answer must reach the transcript: {out:?}"
+    );
+    assert!(
+        !out.contains("here is some prose instead of JSON"),
+        "a rejected attempt's prose must never be ordinary transcript: {out:?}"
+    );
+    assert!(
+        !out.contains("provisional deliberation"),
+        "a rejected attempt's reasoning must never be ordinary transcript: {out:?}"
+    );
+    assert!(
+        !out.contains("Your previous response was not valid"),
+        "the correction prompt must never render as a user message: {out:?}"
+    );
+    let question = out
+        .find("how do I do it?")
+        .expect("the user's question stays visible");
+    let answer = out
+        .find("the accepted answer")
+        .expect("the answer is visible");
+    assert!(
+        question < answer,
+        "the accepted answer keeps the original turn position after the user's input: {out:?}"
+    );
+}
+
+#[test]
+fn exhausted_structured_corrections_render_one_coherent_failure() {
+    let mut engine = Engine::new(100, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    let conversation = "typed-exhausted";
+    activate_conversation(&mut engine, conversation);
+    typed_delta(
+        &mut engine,
+        conversation,
+        json!({ "kind": "turn_started", "turn_id": "exhausted-turn", "run_id": "exhausted-run" }),
+    );
+    typed_attempt(
+        &mut engine,
+        conversation,
+        "exhausted-turn",
+        "attempt-1",
+        "first deliberation",
+        "prose one",
+        false,
+    );
+    typed_correction(&mut engine, conversation, "exhausted-turn", "correction-1");
+    typed_attempt(
+        &mut engine,
+        conversation,
+        "exhausted-turn",
+        "attempt-2",
+        "second deliberation",
+        "prose two",
+        false,
+    );
+    typed_delta(
+        &mut engine,
+        conversation,
+        json!({ "kind": "turn_completed", "turn_id": "exhausted-turn", "run_id": "exhausted-run",
+            "terminal": { "model": "structured-model", "duration_ms": 11 } }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.error.append",
+            "title": "Agent run failed",
+            "message": "The agent could not produce a valid answer.",
+        }),
+    );
+
+    let roles = transcript_roles(&mut engine);
+    let kinds = transcript_kinds(&mut engine);
+    let out = render_snapshot(&mut engine);
+    assert_eq!(
+        roles,
+        Vec::<String>::new(),
+        "a fully retracted turn leaves no conversation message behind: {out:?}"
+    );
+    assert_eq!(
+        kinds,
+        vec!["error".to_string()],
+        "exhaustion renders exactly one failure entry: {out:?}"
+    );
+    assert!(
+        out.contains("The agent could not produce a valid answer."),
+        "the failure states what went wrong: {out:?}"
+    );
+    assert!(
+        !out.contains("prose one") && !out.contains("prose two"),
+        "no rejected attempt survives in the transcript: {out:?}"
+    );
+    assert!(
+        !out.contains("first deliberation") && !out.contains("second deliberation"),
+        "no rejected attempt's reasoning survives in the transcript: {out:?}"
+    );
+    assert!(
+        !out.contains("▣ structured-model"),
+        "a fully retracted turn must not settle an empty answer beside its failure: {out:?}"
+    );
+}
+
+// ============================================================
+// Cross-provider model selection
+// ============================================================
+
+fn type_line(engine: &mut Engine, text: &str) {
+    for ch in text.chars() {
+        engine
+            .handle_key(key(&ch.to_string()))
+            .unwrap_or_else(|error| panic!("type {ch:?}: {error}"));
+    }
+}
+
+fn connect_provider(engine: &mut Engine, provider: &str) {
+    dispatch_event(
+        engine,
+        json!({ "kind": "chat.auth.status", "provider": provider, "status": "connected" }),
+    );
+}
+
+fn publish_catalog(engine: &mut Engine, provider: &str, models: JsonValue) {
+    dispatch_event(
+        engine,
+        json!({ "kind": "chat.models.listed", "provider": provider, "models": models }),
+    );
+}
+
+#[test]
+fn qualified_slash_model_selects_a_cross_provider_pair_with_a_slashed_model_id() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "openrouter");
+
+    let _ = engine.take_emit_queue();
+    type_line(&mut engine, "/model openrouter anthropic/claude-sonnet-4.5");
+    engine.handle_key(key("enter")).expect("enter");
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "a qualified selection emits exactly one request: {emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(JsonValue::as_str),
+        Some("chat.model.set")
+    );
+    assert_eq!(
+        emits[0].1.get("provider").and_then(JsonValue::as_str),
+        Some("openrouter"),
+        "the request must name the provider the user qualified, not the first connected one"
+    );
+    assert_eq!(
+        emits[0].1.get("model").and_then(JsonValue::as_str),
+        Some("anthropic/claude-sonnet-4.5"),
+        "a model id keeps every slash it was given"
+    );
+
+    let pending = render_snapshot(&mut engine);
+    assert!(
+        pending.contains("mock-model"),
+        "an unacknowledged selection must not move the surface: {pending:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack", "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.5" }),
+    );
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("anthropic/claude-sonnet-4.5"),
+        "an acknowledged cross-provider selection updates the surface immediately: {out:?}"
+    );
+    assert!(
+        !out.contains("mock-model"),
+        "the previous model must not linger after the switch: {out:?}"
+    );
+}
+
+#[test]
+fn stale_model_ack_cannot_move_a_pending_cross_provider_selection() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "openrouter");
+
+    type_line(&mut engine, "/model openrouter anthropic/claude-sonnet-4.5");
+    engine.handle_key(key("enter")).expect("enter");
+
+    // Acks for other pairs: the previously active provider answering an
+    // earlier request, and the pending provider answering a superseded one.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack", "provider": "mock-plugin", "model": "stale-model" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack", "provider": "openrouter", "model": "superseded" }),
+    );
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("stale-model") && !out.contains("superseded"),
+        "an ack that does not correlate to the pending pair changes nothing: {out:?}"
+    );
+    assert!(
+        out.contains("mock-model"),
+        "the surface stays on the active pair while the selection is pending: {out:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack", "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.5" }),
+    );
+    let settled = render_snapshot(&mut engine);
+    assert!(
+        settled.contains("anthropic/claude-sonnet-4.5"),
+        "the correlated ack still settles the selection: {settled:?}"
+    );
+}
+
+#[test]
+fn rejected_model_selection_rolls_the_surface_back_and_clears_the_request() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "openrouter");
+
+    type_line(&mut engine, "/model openrouter refused-model");
+    engine.handle_key(key("enter")).expect("enter");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_failed", "provider": "openrouter",
+            "model": "refused-model",
+            "error": "model \"refused-model\" has no known context window" }),
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("mock-model"),
+        "a refused selection restores the previous pair: {out:?}"
+    );
+    assert!(
+        out.contains("no known context window"),
+        "a refused selection reports why: {out:?}"
+    );
+
+    // The request is settled: a late ack for it no longer correlates.
+    engine.handle_key(key("escape")).expect("escape");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack", "provider": "openrouter",
+            "model": "refused-model" }),
+    );
+    let after = render_snapshot(&mut engine);
+    assert!(
+        !after.contains("refused-model") || after.contains("mock-model"),
+        "a late ack for a settled request must not resurrect it: {after:?}"
+    );
+}
+
+#[test]
+fn losing_the_pending_provider_rolls_the_selection_back() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "openrouter");
+
+    type_line(&mut engine, "/model openrouter anthropic/claude-sonnet-4.5");
+    engine.handle_key(key("enter")).expect("enter");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "openrouter", "status": "login_required" }),
+    );
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("mock-model"),
+        "a selection that can never be acknowledged rolls back: {out:?}"
+    );
+}
+
+#[test]
+fn bare_slash_model_resolves_only_when_unique_across_catalogs() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "ollama");
+    connect_provider(&mut engine, "openrouter");
+    publish_catalog(&mut engine, "ollama", json!(["qwen2:7b", "shared-model"]));
+    publish_catalog(&mut engine, "openrouter", json!(["shared-model"]));
+
+    let _ = engine.take_emit_queue();
+    type_line(&mut engine, "/model qwen2:7b");
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "a bare model unique across catalogs selects: {emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("provider").and_then(JsonValue::as_str),
+        Some("ollama"),
+        "bare resolution names the only catalog offering the model"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(JsonValue::as_str),
+        Some("chat.model.set"),
+        "the bare form uses the same request primitive as the picker"
+    );
+}
+
+#[test]
+fn ambiguous_bare_slash_model_is_rejected_with_runnable_guidance() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "ollama");
+    connect_provider(&mut engine, "openrouter");
+    publish_catalog(&mut engine, "ollama", json!(["shared-model"]));
+    publish_catalog(&mut engine, "openrouter", json!(["shared-model"]));
+
+    let _ = engine.take_emit_queue();
+    type_line(&mut engine, "/model shared-model");
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert!(
+        emits.is_empty(),
+        "an ambiguous bare model must not guess a provider: {emits:?}"
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("/model ollama shared-model")
+            && out.contains("/model openrouter shared-model"),
+        "ambiguity must offer every runnable qualified command: {out:?}"
+    );
+}
+
+#[test]
+fn unknown_bare_slash_model_reports_where_it_looked() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "ollama");
+    publish_catalog(&mut engine, "ollama", json!(["qwen2:7b"]));
+
+    let _ = engine.take_emit_queue();
+    type_line(&mut engine, "/model no-such-model");
+    engine.handle_key(key("enter")).expect("enter");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "an unresolvable bare model must not be sent to an arbitrary provider"
+    );
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("/model <provider> no-such-model"),
+        "unresolved guidance names the qualified form: {out:?}"
+    );
+}
+
+#[test]
+fn model_picker_marks_the_active_pair_and_the_pending_one() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    connect_provider(&mut engine, "ollama");
+
+    type_line(&mut engine, "/model");
+    engine.handle_key(key("enter")).expect("enter");
+    publish_catalog(&mut engine, "ollama", json!(["llama3:8b", "qwen2:7b"]));
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    // Enter on the alphabetically-first row requests it through the same
+    // primitive the slash form uses.
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "the picker emits one request: {emits:?}");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(JsonValue::as_str),
+        Some("chat.model.set"),
+        "the picker and the slash form share one request shape"
+    );
+
+    // Reopen the picker while the request is outstanding: the overlay marks
+    // the pending pair, not an adopted one. Render first so the prompt widget
+    // syncs to the cleared input before the next keystrokes arrive.
+    let _ = render_str(&mut engine);
+    type_line(&mut engine, "/model");
+    engine.handle_key(key("enter")).expect("enter");
+    publish_catalog(&mut engine, "ollama", json!(["llama3:8b", "qwen2:7b"]));
+    let pending = render_snapshot(&mut engine);
+    assert!(
+        pending.contains("◌ llama3:8b"),
+        "the overlay marks a requested-but-unacknowledged pair: {pending:?}"
+    );
+
+    engine.handle_key(key("escape")).expect("escape");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack", "provider": "ollama", "model": "llama3:8b" }),
+    );
+    let _ = render_str(&mut engine);
+    type_line(&mut engine, "/model");
+    engine.handle_key(key("enter")).expect("enter");
+    publish_catalog(&mut engine, "ollama", json!(["llama3:8b", "qwen2:7b"]));
+    let adopted = render_snapshot(&mut engine);
+    assert!(
+        adopted.contains("● llama3:8b"),
+        "the overlay marks the same pair the statusline shows: {adopted:?}"
+    );
+    assert!(
+        adopted.contains("llama3:8b") && !adopted.contains("◌ llama3:8b"),
+        "nothing stays pending once the selection is adopted: {adopted:?}"
+    );
+}

@@ -35,6 +35,14 @@ local function terminal_text(terminal)
   return nil
 end
 
+-- Diagnostic messages are model context that never becomes conversation: a
+-- rejected structured-output attempt and the correction prompt that answers it.
+-- The manager still keeps them in the context projection; the surface must not
+-- render them, and must retract anything already streamed for one.
+local function diagnostic(message)
+  return type(message) == "table" and message.visibility == "diagnostic"
+end
+
 local function record_message(state, message)
   if type(message) ~= "table" or type(message.id) ~= "string" then return end
   local previous = state.messages[message.id] or {}
@@ -42,7 +50,25 @@ local function record_message(state, message)
     role = message.role,
     turn_id = message.turn_id,
     display_text = previous.display_text,
+    visibility = message.visibility or previous.visibility or "transcript",
+    streamed = previous.streamed == true,
   }
+end
+
+-- Returns true when this terminal fact narrows an already-streamed message into
+-- diagnostic: the surface has to remove what it showed.
+local function settle_hidden(state, actions, message)
+  local recorded = state.messages[type(message) == "table" and message.id or ""]
+  local was_streamed = type(recorded) == "table" and recorded.streamed == true
+  record_message(state, message)
+  if not diagnostic(message) then return false end
+  if was_streamed then
+    action(actions, "message_discarded", {
+      message_id = message.id,
+      turn_id = message.turn_id,
+    })
+  end
+  return true
 end
 
 local function visible_text(message)
@@ -56,7 +82,7 @@ local function visible_text(message)
 end
 
 local function message_completed(state, actions, message)
-  record_message(state, message)
+  if settle_hidden(state, actions, message) then return end
   if type(message) ~= "table" then return end
   if message.role == "user" and message.input_cause ~= "internal_async_completion" then
     local text = visible_text(message)
@@ -113,7 +139,9 @@ local function snapshot_actions(state, projection, actions)
 
   for _, message in ipairs(projection.messages or {}) do
     record_message(state, message)
-    if message.role == "assistant" then
+    if diagnostic(message) then
+      -- Rejected attempts and their corrections replay as model context only.
+    elseif message.role == "assistant" then
       if type(message.reasoning) == "string" and message.reasoning ~= "" then
         action(actions, "reasoning_delta", {
           text = message.reasoning, message_id = message.id, turn_id = message.turn_id,
@@ -225,11 +253,14 @@ function M.reduce(previous, body)
   elseif kind == "content_chunk_appended" then
     local message = state.messages[change.message_id]
     local chunk = change.chunk
-    if message and message.role == "user" and type(chunk) == "table"
+    if message and message.visibility == "diagnostic" then
+      -- Model context only; no delta reaches the transcript.
+    elseif message and message.role == "user" and type(chunk) == "table"
         and chunk.kind == "structured" then
       message.display_text = display.structured_text(chunk.data)
     elseif message and message.role == "assistant" and type(chunk) == "table"
         and type(chunk.data) == "string" and chunk.data ~= "" then
+      message.streamed = true
       if chunk.kind == "text" then
         if message.turn_id ~= nil then
           state.turn_text[message.turn_id] = (state.turn_text[message.turn_id] or "") .. chunk.data
@@ -246,7 +277,7 @@ function M.reduce(previous, body)
   elseif kind == "message_completed" then
     message_completed(state, actions, change.message)
   elseif kind == "message_interrupted" then
-    record_message(state, change.message)
+    if settle_hidden(state, actions, change.message) then return state, actions end
     action(actions, "message_interrupted", {
       message = change.message,
       turn_id = change.turn_id,

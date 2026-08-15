@@ -166,4 +166,31 @@ eq(partial_text.entries[1].model, "partial-model")
 eq(partial_text.entries[1].duration_ms, 12)
 eq(partial_text.entries[1].output_tokens, 3)
 
+-- Retracting a provisional provider round removes exactly its entries and
+-- releases the in-flight slot, so the next attempt streams into the position
+-- the retracted one occupied.
+local Entry = require("libs.chat.entry")
+local discardable = { entries = {}, pending = true, turn_started_at = 900 }
+discardable = transcript.push_entry(discardable,
+  Entry.bind_canonical(Entry.assistant_stream(), "kept", "turn"))
+discardable = transcript.append_reasoning_delta(discardable, "provisional", "attempt-1", "turn")
+eq(discardable.in_flight, 2, "the provisional attempt owns the in-flight slot")
+local discarded = transcript.discard_message(discardable, "attempt-1")
+eq(#discarded.entries, 1, "the retracted attempt's entry is removed")
+eq(discarded.entries[1].message_id, "kept", "unrelated entries are untouched")
+eq(discarded.in_flight, nil, "retracting the in-flight attempt releases the slot")
+eq(transcript.discard_message(discarded, "attempt-1").entries, discarded.entries,
+  "retracting an unknown message is a no-op")
+eq(transcript.discard_message(discarded, "").entries, discarded.entries,
+  "an empty message id retracts nothing")
+
+local shifted = { entries = {}, pending = true }
+shifted = transcript.push_entry(shifted,
+  Entry.bind_canonical(Entry.assistant_stream(), "gone", "turn"))
+shifted = transcript.push_entry(shifted,
+  Entry.bind_canonical(Entry.assistant_stream(), "later", "turn"))
+shifted.in_flight = 2
+local reindexed = transcript.discard_message(shifted, "gone")
+eq(reindexed.in_flight, 1, "removing an earlier entry keeps the in-flight index aligned")
+
 print("transcript_test: all assertions passed")

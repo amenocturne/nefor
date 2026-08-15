@@ -39,7 +39,63 @@ The example deliberately separates durable meaning from transient execution:
 
 This split keeps replay authoritative without making the conversation manager responsible for live workflow scheduling. Surface reducers render conversation-manager projections and separately observe transient workflow state.
 
+#### Transcript disposition
+
+Not every recorded message is conversation. A message fact carries an explicit
+`visibility`: `transcript` (the default — ordinary conversation) or
+`diagnostic` (model context that no surface renders as conversation). The
+conversation manager validates it, keeps both dispositions in the context
+projection it hands to providers, and lets a message narrow to `diagnostic`
+exactly once at its terminal fact — content that already streamed can be
+retracted, but nothing recorded as diagnostic is ever promoted back.
+
+The typed provider boundary (`structured-output`) is the current use. An
+attempt whose text fails schema validation, and the bounded correction prompt
+that answers it, are recorded diagnostic: the next round still sees them, and
+the surface never shows a rejected attempt's prose, reasoning, or streamed
+deltas as an assistant message, nor its correction as a user message. The
+surface retracts what a narrowed message already streamed, so the accepted
+answer occupies the position the turn's provider round started in, and a turn
+that exhausts its correction budget settles as one failure with no
+metadata-only answer beside it. Attempt counts and violations remain visible on
+the existing `mag.diagnostic` channel, which carries no candidate output.
+
 The provider boundary treats finalized tool arguments as untrusted model output. A call is executable only when its `function.arguments` decodes to a JSON object; empty, malformed, scalar, null, and array values are quarantined. The malformed assistant call is not recorded. Instead, the canonical conversation records a bounded user correction naming the call and diagnostic, then requests another completion. This keeps every reconstructed OpenAI assistant tool call provider-valid across continuation and session replay.
+
+### Model selection
+
+Selecting a model is a request to the provider that owns it, not a fact the
+surface may assume. `lua/libs/chat/model_selection` is the single primitive
+behind every entry point — the `/model` picker, `/model <provider> <model>`, and
+`/model <model>`:
+
+- The surface records the requested `(provider, model)` pair plus the state a
+  failure restores, then emits `chat.model.set`.
+- `chat.model.set_ack` is correlated against that pending pair. The matching ack
+  adopts provider, model, that pair's reasoning default and that pair's context
+  window in one patch, before any turn runs. An ack for another pair — a
+  provider hello, a replayed session, a superseded request — changes nothing.
+  With no pending selection, an ack is adopted only for the already-active
+  provider.
+- `chat.model.set_failed`, or the pending provider leaving the connected state,
+  restores the captured pair and clears the request. The provider compositor is
+  the one place that knows a selection was in flight, so it correlates the
+  provider's untargeted turn error into `chat.model.set_failed` rather than an
+  anonymous system message.
+- `/model <model>` resolves against the catalogs reported by
+  `chat.models.listed`. It selects only when exactly one catalog offers that
+  model; two or more, or none, produce runnable qualified commands instead of a
+  guess. `/model <provider> <model>` is the user's own authority and does not
+  require catalog membership, so a model id containing slashes works.
+
+Route enforcement is deliberately out of scope: the composition targets a
+selection at a provider actor, and that actor decides what it will serve. Nefor
+does not template per-model endpoints or carry routing metadata that would let
+one provider claim another's models. There is no generic seam that could verify
+a qualified pair before the owning provider answers, so an unserved pair
+surfaces as that provider's rejection (rollback) rather than as a pre-flight
+error. Adding such a seam would be a separate design with its own authority and
+lifecycle questions.
 
 ## Provider HTTPS trust
 

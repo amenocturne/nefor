@@ -166,7 +166,13 @@ function M.construct(id, params, emit, deps)
         finish_result(state, selected, value)
         return
       end
-      if text ~= nil then state:append({ role = "assistant", content = text }) end
+      -- A rejected candidate and its correction prompt are model context, not
+      -- conversation. They stay in canonical history so the next round can see
+      -- them, and are marked diagnostic so no surface renders a provisional
+      -- attempt as an ordinary transcript entry.
+      if text ~= nil or state:is_streaming() then
+        state:append({ role = "assistant", content = text, visibility = "diagnostic" })
+      end
       if state:is_draining() then
         state:fail("structured output was draining and could not start a correction round")
         return
@@ -181,7 +187,11 @@ function M.construct(id, params, emit, deps)
         return
       end
       corrections = corrections + 1
-      state:append({ role = "user", content = correction(validation, provider_schema.wrapped) })
+      state:append({
+        role = "user",
+        content = correction(validation, provider_schema.wrapped),
+        visibility = "diagnostic",
+      })
       state:retry("structured_output_correction")
     end,
     on_tool_calls = function(_, result)

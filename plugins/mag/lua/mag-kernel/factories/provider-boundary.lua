@@ -263,6 +263,10 @@ function M.construct(id, params, emit, options)
   end
   function state:emit(message) emit(sign(message)) end
   function state:is_draining() return draining end
+  -- True while a provider round has an open streamed assistant message. A
+  -- classifier must close it even when the round produced no text, otherwise
+  -- the turn cannot reach a terminal fact.
+  function state:is_streaming() return streamed_message_id ~= nil end
   function state:finish(message, terminal_detail)
     self:emit(message)
     self:emit({ kind = kinds.complete })

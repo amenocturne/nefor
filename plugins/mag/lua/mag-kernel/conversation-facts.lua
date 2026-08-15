@@ -142,6 +142,16 @@ function M.new(options)
     return message_id
   end
 
+  -- Visibility is the message's transcript disposition. It may be declared when
+  -- a message starts, or narrowed to "diagnostic" exactly once at the message's
+  -- terminal fact — a provider round is only known to be a rejected attempt
+  -- after its content has already streamed.
+  local function visibility_of(message)
+    local declared = type(message) == "table" and message.visibility or nil
+    if declared == "diagnostic" or declared == "transcript" then return declared end
+    return nil
+  end
+
   function recorder:content(message_id, kind, data)
     if data == nil or data == "" then return false end
     return emit("content_chunk_appended", {
@@ -164,11 +174,19 @@ function M.new(options)
         })
       end
     end
-    emit("message_completed", { message_id = message_id, completion = completion or {} })
+    emit("message_completed", {
+      message_id = message_id,
+      completion = completion or {},
+      visibility = visibility_of(message),
+    })
   end
 
-  function recorder:interrupt_message(message_id, detail)
-    return emit("message_interrupted", { message_id = message_id, detail = detail or {} })
+  function recorder:interrupt_message(message_id, detail, visibility)
+    return emit("message_interrupted", {
+      message_id = message_id,
+      detail = detail or {},
+      visibility = visibility_of({ visibility = visibility }),
+    })
   end
 
   function recorder:message(message, completion)
@@ -178,6 +196,7 @@ function M.new(options)
       name = message.name,
       submission_ids = message.submission_ids,
       input_cause = message.input_cause,
+      visibility = visibility_of(message),
     })
     local chunk = content_chunk(message.content)
     if chunk then self:content(message_id, chunk.kind, chunk.data) end
