@@ -299,9 +299,15 @@ function M.translator(name)
         local arguments = call.arguments
         if type(arguments) == "string" then
           local decoded_ok, decoded = pcall(json.decode, arguments)
-          if decoded_ok then arguments = decoded end
+          if not decoded_ok then
+            error("openai-provider: canonical tool arguments are malformed JSON")
+          end
+          arguments = decoded
         end
-        local encoded_ok, encoded = pcall(json.encode, arguments == nil and {} or arguments)
+        if type(arguments) ~= "table" or json_data.is_array(arguments) then
+          error("openai-provider: canonical tool arguments must be a JSON object")
+        end
+        local encoded_ok, encoded = pcall(json.encode, arguments)
         if not encoded_ok then error("openai-provider: tool arguments are not JSON-encodable") end
         arguments = encoded
         calls[#calls + 1] = {

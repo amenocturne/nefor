@@ -282,6 +282,103 @@ do
 end
 
 -- ==================================================================
+-- malformed tool arguments are quarantined and corrected in-model
+-- ==================================================================
+
+local function count_kind(messages, kind)
+  local count = 0
+  for _, message in ipairs(messages) do
+    if message.kind == kind then count = count + 1 end
+  end
+  return count
+end
+
+for _, case in ipairs({
+  { label = "empty", arguments = "", diagnostic = "was empty" },
+  { label = "malformed", arguments = "{\"path\":", diagnostic = "malformed JSON" },
+  { label = "string", arguments = '"path"', diagnostic = "JSON string" },
+  { label = "number", arguments = "42", diagnostic = "JSON number" },
+  { label = "null", arguments = "null", diagnostic = "JSON null" },
+  { label = "array", arguments = "[]", diagnostic = "JSON array" },
+}) do
+  local instance, msgs, facts = make("invalid-" .. case.label .. ".llm", {
+    provider = "p", max_tool_call_corrections = 1,
+  })
+  instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
+  local first = find_last_kind(msgs, "capability.invoke")
+  instance.deliver({ kind = "reply", ref = first.ref, result = {
+    finish_reason = "tool_calls",
+    tool_calls = { { id = "call-bad", name = "read_file", arguments = case.arguments } },
+  } })
+  assert_true(find_kind(msgs, "generic-tool.ToolCalls") == nil,
+    case.label .. " arguments never leave the provider boundary as executable calls")
+  local second = find_last_kind(msgs, "capability.invoke")
+  assert_true(second ~= first, case.label .. " arguments trigger another provider completion")
+  local history = conversation_messages(facts)
+  local feedback = history[#history]
+  assert_eq(feedback.role, "user", "correction feedback is provider-valid user context")
+  assert_true(feedback.content:find("not executed", 1, true) ~= nil,
+    "correction states that the call was not executed")
+  assert_true(feedback.content:find(case.diagnostic, 1, true) ~= nil,
+    case.label .. " correction includes diagnostic " .. case.diagnostic .. ": " .. feedback.content)
+  assert_true(feedback.content:find("call-bad", 1, true) ~= nil
+      and feedback.content:find("read_file", 1, true) ~= nil,
+    "correction identifies the attempted call")
+  for _, message in ipairs(history) do
+    assert_true(#message.tool_calls == 0,
+      "quarantined malformed calls never enter canonical assistant history")
+  end
+end
+
+do
+  local instance, msgs, facts = make("valid-object.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
+  instance.deliver({ kind = "reply", ref = find_last_kind(msgs, "capability.invoke").ref,
+    result = { tool_calls = {
+      { id = "empty-object", name = "zero", arguments = "{}" },
+      { id = "required-object", name = "read", arguments = '{"path":"x"}' },
+    } } })
+  local calls = find_kind(msgs, "generic-tool.ToolCalls")
+  assert_true(calls ~= nil and #calls.calls == 2, "JSON objects proceed to normal tool handling")
+  assert_eq(calls.calls[2].args.path, "x", "object strings decode before tool execution")
+  local history = conversation_messages(facts)
+  assert_eq(history[#history].tool_calls[1].arguments ~= nil, true,
+    "valid calls remain canonical and replayable")
+end
+
+do
+  local instance, msgs, facts = make("mixed-invalid.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
+  instance.deliver({ kind = "reply", ref = find_last_kind(msgs, "capability.invoke").ref,
+    result = { tool_calls = {
+      { id = "valid", name = "read", arguments = { path = "x" } },
+      { id = "invalid", name = "write", arguments = "" },
+    } } })
+  assert_true(find_kind(msgs, "generic-tool.ToolCalls") == nil,
+    "a mixed batch is atomic and executes no calls when one call is invalid")
+  for _, message in ipairs(conversation_messages(facts)) do
+    assert_true(#message.tool_calls == 0, "the entire malformed batch is quarantined from history")
+  end
+end
+
+do
+  local instance, msgs = make("bounded-invalid.llm", {
+    provider = "p", max_tool_call_corrections = 1,
+  })
+  instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
+  local first = find_last_kind(msgs, "capability.invoke")
+  instance.deliver({ kind = "reply", ref = first.ref,
+    result = { tool_calls = { { id = "bad-1", name = "read", arguments = "" } } } })
+  local second = find_last_kind(msgs, "capability.invoke")
+  instance.deliver({ kind = "reply", ref = second.ref,
+    result = { tool_calls = { { id = "bad-2", name = "read", arguments = "[]" } } } })
+  assert_eq(count_kind(msgs, "capability.invoke"), 2,
+    "repeated malformed calls stop at the configured correction bound")
+  assert_true(find_kind(msgs, "mag.failed") ~= nil,
+    "exhausting correction feedback settles the actor instead of looping")
+end
+
+-- ==================================================================
 -- reply without tool calls → generic-provider.FinalAnswer + mag.complete
 -- ==================================================================
 

@@ -2102,6 +2102,13 @@ fn snippet(s: &str) -> String {
     }
 }
 
+fn valid_tool_call_arguments(call: &ToolCall) -> bool {
+    matches!(
+        serde_json::from_str::<Value>(&call.function.arguments),
+        Ok(Value::Object(_))
+    )
+}
+
 fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -2226,14 +2233,15 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
                 for v in arr {
                     match serde_json::from_value::<ToolCall>(v.clone()) {
                         Ok(tc) => {
-                            if serde_json::from_str::<Value>(&tc.function.arguments).is_err() {
+                            if valid_tool_call_arguments(&tc) {
+                                tool_calls.push(tc);
+                            } else {
                                 tool_call_failures.push(ToolCallParseFailure {
                                     id: Some(tc.id.clone()),
-                                    error: "function.arguments is not valid JSON".to_owned(),
+                                    error: "function.arguments is not a JSON object".to_owned(),
                                     raw: Value::String(tc.function.arguments.clone()),
                                 });
                             }
-                            tool_calls.push(tc);
                         }
                         Err(e) => {
                             let id = v.get("id").and_then(Value::as_str).map(str::to_owned);

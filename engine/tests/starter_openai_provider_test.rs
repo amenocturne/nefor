@@ -87,6 +87,34 @@ fn chatgpt_direct_terminals_keep_provider_output_on_canonical_completion_events(
 }
 
 #[test]
+fn openai_lowering_rejects_non_object_canonical_tool_arguments() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local t = require("openai-provider").translator("openai")
+        local valid = t.context_message({ role = "assistant", tool_calls = {
+          { id = "empty", name = "zero", arguments = {} },
+          { id = "required", name = "read", arguments = { path = "x" } },
+        }})
+        for _, call in ipairs(valid.tool_calls) do
+          local decoded = nefor.json.decode(call["function"].arguments)
+          assert(type(decoded) == "table" and not nefor.json.is_array(decoded))
+        end
+        for _, arguments in ipairs({ "", "{bad", '"scalar"', "null", "[]" }) do
+          local ok = pcall(t.context_message, { role = "assistant", tool_calls = {
+            { id = "bad", name = "read", arguments = arguments },
+          }})
+          assert(not ok, "strict continuation lowering must reject " .. arguments)
+        end
+        "#,
+    )
+    .exec()
+    .expect("validate strict OpenAI history lowering");
+}
+
+#[test]
 fn provider_adapter_owns_universal_compaction_lifecycle() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");

@@ -6,7 +6,70 @@
 
 local kinds = require("kinds")
 local conversation_facts = require("conversation-facts")
+local json_data = require("core.json_data")
 local M = {}
+
+local DEFAULT_TOOL_CALL_CORRECTIONS = 2
+local DIAGNOSTIC_LIMIT = 160
+
+local function bounded(value)
+  value = tostring(value or "")
+  if #value <= DIAGNOSTIC_LIMIT then return value end
+  return value:sub(1, DIAGNOSTIC_LIMIT) .. "…"
+end
+
+local function argument_diagnostic(arguments)
+  if type(arguments) == "table" then
+    if json_data.is_array(arguments) then return "arguments decoded to a JSON array" end
+    return nil
+  end
+  if type(arguments) == "string" then
+    if arguments == "" then return "function.arguments was empty" end
+    local ok, decoded = pcall(nefor.json.decode, arguments)
+    if not ok then return "function.arguments was malformed JSON: " .. bounded(decoded) end
+    if type(decoded) == "table" and not json_data.is_array(decoded) then return nil, decoded end
+    if type(decoded) == "table" then return "arguments decoded to a JSON array" end
+    if type(decoded) == "userdata" then return "arguments decoded to JSON null" end
+    return "arguments decoded to a JSON " .. type(decoded)
+  end
+  if type(arguments) == "userdata" then return "arguments decoded to JSON null" end
+  return "arguments decoded to a JSON " .. type(arguments)
+end
+
+local function inspect_tool_calls(tool_calls)
+  local calls, invalid = {}, {}
+  for index, raw in ipairs(tool_calls or {}) do
+    raw = raw or {}
+    local fn = type(raw["function"]) == "table" and raw["function"] or {}
+    local call = {
+      id = raw.id,
+      name = raw.name or fn.name,
+      args = raw.args,
+    }
+    if call.args == nil then call.args = raw.arguments end
+    if call.args == nil then call.args = fn.arguments end
+    local reason, decoded = argument_diagnostic(call.args)
+    if decoded ~= nil then call.args = decoded end
+    calls[index] = call
+    if reason then
+      invalid[#invalid + 1] = {
+        id = call.id or "<missing>", name = call.name or "<missing>", reason = reason,
+      }
+    end
+  end
+  return calls, invalid
+end
+
+local function correction_message(invalid)
+  local diagnostics = {}
+  for _, item in ipairs(invalid) do
+    diagnostics[#diagnostics + 1] = string.format("call id=%s name=%s: %s",
+      bounded(item.id), bounded(item.name), bounded(item.reason))
+  end
+  return "Your attempted tool call batch was not executed because function.arguments "
+    .. "must be a JSON object. " .. table.concat(diagnostics, "; ") .. ". "
+    .. "Emit a new tool call with a JSON object matching the advertised tool schema."
+end
 
 local function validate_seed_history(id, factory_name, seed)
   local copied = {}
@@ -94,6 +157,14 @@ function M.construct(id, params, emit, options)
   local terminal_metadata = {}
   local facts = nil
   local firing_sequence = 0
+  local tool_call_corrections = 0
+  local max_tool_call_corrections = params.max_tool_call_corrections
+    or params.max_corrections or DEFAULT_TOOL_CALL_CORRECTIONS
+  if type(max_tool_call_corrections) ~= "number" or max_tool_call_corrections < 0
+      or max_tool_call_corrections % 1 ~= 0 then
+    return nil, string.format("%s '%s': tool-call correction limit must be a non-negative integer",
+      factory_name, tostring(id))
+  end
   local conversation_created = conversation.is_root
   local seed_recorded = false
   local submission_ids = params.submission_ids
@@ -128,6 +199,7 @@ function M.construct(id, params, emit, options)
       seed_recorded = true
     end
     facts:start_turn()
+    tool_call_corrections = 0
     streamed_message_id = nil
     streamed_text = ""
     terminal_metadata = {}
@@ -278,20 +350,13 @@ function M.construct(id, params, emit, options)
     end
   end
 
-  local function emit_tool_calls(result)
-    local calls, wire_calls = {}, {}
-    for i, tc in ipairs(result.tool_calls) do
-      tc = tc or {}
-      local fn = type(tc["function"]) == "table" and tc["function"] or {}
-      calls[i] = {
-        id = tc.id,
-        name = tc.name or fn.name,
-        args = tc.args or tc.arguments or fn.arguments,
-      }
+  local function emit_tool_calls(result, calls)
+    local wire_calls = {}
+    for i, call in ipairs(calls) do
       wire_calls[i] = {
-        id = calls[i].id,
+        id = call.id,
         type = "function",
-        ["function"] = { name = calls[i].name, arguments = encode_args(calls[i].args) },
+        ["function"] = { name = call.name, arguments = encode_args(call.args) },
       }
     end
     state:append({
@@ -328,8 +393,24 @@ function M.construct(id, params, emit, options)
         return nil
       end
       if type(result) == "table" and type(result.tool_calls) == "table" and #result.tool_calls > 0 then
+        local calls, invalid = inspect_tool_calls(result.tool_calls)
+        if #invalid > 0 then
+          if streamed_message_id then
+            interrupt_stream("invalid_tool_call")
+          elseif type(result.text) == "string" and result.text ~= "" then
+            state:append({ role = "assistant", content = result.text })
+          end
+          if tool_call_corrections >= max_tool_call_corrections then
+            emit_failure("tool-call correction limit reached: " .. correction_message(invalid))
+            return nil
+          end
+          tool_call_corrections = tool_call_corrections + 1
+          state:append({ role = "user", content = correction_message(invalid) })
+          state:retry("invalid_tool_call_arguments")
+          return nil
+        end
         if options.on_tool_calls then options.on_tool_calls(state, result) end
-        emit_tool_calls(result)
+        emit_tool_calls(result, calls)
         return nil
       end
       if options.steerable and #steered_messages > 0 then
