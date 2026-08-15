@@ -344,7 +344,14 @@ function M.spawn_spec(name, command, opts)
         end
       end
 
-      if type(env.body) == "table" and env.body.kind == kinds.model_set_ack then
+      if type(env.body) == "table"
+          and env.body.kind == kinds.model_set_ack
+          and pending_model_set ~= nil
+          and env.body.model == pending_model_set.model then
+        -- A superseded model.set may acknowledge after a newer request. Only
+        -- the matching ack settles the request this compositor still owns;
+        -- otherwise a later rejection would lose its correlation and surface
+        -- as an unrelated provider error.
         pending_model_set = nil
       elseif type(env.body) == "table"
           and env.body.kind == kinds.turn_error

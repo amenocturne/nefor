@@ -398,6 +398,45 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
 }
 
 #[test]
+fn provider_adapter_keeps_newer_model_selection_pending_after_a_stale_ack() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local spec = require("libs.compositors.provider").spawn_spec(
+          "openrouter", { "/bin/true" }, {
+            agentic_loop = {},
+            conversations = { context = function() return { messages = {} } end },
+          })
+        spec.to_plugin({{ type = "event", from = "chat", body = {
+          kind = "chat.model.set", provider = "openrouter", model = "older",
+        } }})
+        spec.to_plugin({{ type = "event", from = "chat", body = {
+          kind = "chat.model.set", provider = "openrouter", model = "newer",
+        } }})
+        _test.delivered()
+
+        spec.from_plugin({{ type = "event", from = "openrouter", body = {
+          kind = "openrouter.model.set_ack", model = "older",
+        } }})
+        _test.sent()
+        spec.from_plugin({{ type = "event", from = "openrouter", body = {
+          kind = "openrouter.turn.error", message = "newer was rejected",
+        } }})
+        local sent = _test.sent()
+        assert(#sent == 1)
+        assert(sent[1].kind == "chat.model.set_failed")
+        assert(sent[1].body.provider == "openrouter")
+        assert(sent[1].body.model == "newer")
+        assert(sent[1].body.error == "newer was rejected")
+        "#,
+    )
+    .exec()
+    .expect("correlate stale model acknowledgement");
+}
+
+#[test]
 fn provider_adapter_cancels_private_request_without_publishing_native_control() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
