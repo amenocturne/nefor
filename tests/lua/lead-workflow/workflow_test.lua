@@ -2180,12 +2180,53 @@ do
   feed("mag", { kind = "mag.run_result", run_id = run_id,
     status = "killed", error = "terminated" })
   local terminal = tool_result("terminate-eval")
-  assert_true(terminal ~= nil and terminal.body.error_code == "await_run_killed",
-    "terminate-graph returns the exact canonical terminal outcome")
+  assert_true(terminal ~= nil and terminal.body.output ~= nil,
+    "terminate-graph returns killed confirmation as a normal success")
+  assert_eq(terminal.body.output.canceled, true,
+    "terminate success confirms cancellation")
+  assert_eq(terminal.body.output.run_id, run_id,
+    "terminate success preserves exact run correlation")
+  assert_eq(terminal.body.output.status, "killed",
+    "terminate success reports the canonical killed status")
+  feed("mag", { kind = "mag.run_result", run_id = run_id,
+    status = "killed", error = "duplicate" })
+  assert_eq(#find_calls(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "terminate-eval"
+  end), 1, "terminate-graph settles killed confirmation exactly once")
   assert_eq(has_relayed_lead_turn(), false,
     "synchronous terminate confirmation suppresses redundant owner completion")
   assert_eq(lw._internals.state.active_runs[run_id], nil,
     "canonical killed result closes the terminating eval")
+
+  for _, incompatible in ipairs({
+    { status = "completed", result = { text = "too late" } },
+    { status = "failed", error = "shutdown failed" },
+  }) do
+    run_id = dispatch_lead_eval("gate-incompatible-" .. incompatible.status,
+      "r7/cap-incompatible-" .. incompatible.status)
+    _test.calls_clear()
+    local firing_id = "terminate-incompatible-" .. incompatible.status
+    invoke_tool(firing_id, "terminate-graph", { run_id = run_id })
+    feed("mag", {
+      kind = "mag.run_result",
+      run_id = run_id,
+      status = incompatible.status,
+      result = incompatible.result,
+      error = incompatible.error,
+    })
+    local incompatible_result = tool_result(firing_id)
+    assert_true(incompatible_result ~= nil and incompatible_result.body.output == nil
+        and incompatible_result.body.error:find(
+          "incompatible canonical terminal status", 1, true) ~= nil,
+      "terminate-graph rejects canonical " .. incompatible.status .. " as an ordinary tool failure")
+    assert_eq(#find_calls(decode_calls(), function(c)
+      return c.body.kind == "tool.result" and c.body.id == firing_id
+    end), 1, "incompatible " .. incompatible.status .. " settles terminate exactly once")
+    assert_eq(has_relayed_lead_turn(), false,
+      "incompatible synchronous confirmation still suppresses owner completion")
+    assert_eq(lw._internals.state.active_runs[run_id], nil,
+      "incompatible " .. incompatible.status .. " still cleans up the run")
+  end
 
   run_id = dispatch_lead_eval("gate-timeout", "r7/cap-22-timeout")
   local timeout_callback

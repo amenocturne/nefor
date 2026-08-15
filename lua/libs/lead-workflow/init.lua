@@ -305,6 +305,28 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
+local TERMINATION_CONFIRMATION_STATUSES = {
+  terminated = true,
+  killed = true,
+  cancelled = true,
+}
+
+local function emit_termination_outcome(firing_id, run, terminal)
+  local status = type(terminal) == "table" and terminal.status or nil
+  if TERMINATION_CONFIRMATION_STATUSES[status] then
+    emit_tool_result_ok(firing_id, {
+      canceled = true,
+      run_id = run.run_id,
+      status = status,
+      notice = "canonical termination confirmed",
+    })
+    return
+  end
+  emit_tool_result_err(firing_id,
+    "terminate-graph: incompatible canonical terminal status for " .. run.run_id ..
+    ": " .. tostring(status or "unknown"))
+end
+
 -- The kernel's foreign-contract registry is the source of truth for actor
 -- capabilities. Library validation already checks the complete contracts;
 -- this control-plane pass keeps its pre-execute error localized.
@@ -1178,7 +1200,7 @@ local function handle_mag_run_result(body)
 
   local termination_waiters = take_termination_waiters(run_id)
   for _, waiter in ipairs(termination_waiters or {}) do
-    emit_await_outcome(waiter.firing_id, settled.outcome)
+    emit_termination_outcome(waiter.firing_id, run, body)
   end
 
   if not run_registry:claim_delivery(run_id) then return end
