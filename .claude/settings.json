@@ -1,0 +1,7 @@
+{
+  "sandbox": {
+    "filesystem": {
+      "denyRead": [".env"]
+    }
+  }
+}

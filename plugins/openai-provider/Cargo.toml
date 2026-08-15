@@ -15,6 +15,14 @@ path = "src/lib.rs"
 name = "openai-provider"
 path = "src/main.rs"
 
+[[test]]
+name = "live_openai_compatible"
+path = "tests/live_openai_compatible.rs"
+required-features = ["live-openai-test"]
+
+[features]
+live-openai-test = []
+
 [dependencies]
 nefor-protocol = { path = "../../crates/nefor-protocol" }
 nefor-plugin-sdk = { path = "../../crates/nefor-plugin-sdk" }

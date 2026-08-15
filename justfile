@@ -58,11 +58,35 @@ test-example:
 
 # Provider/API translation tests; may need local socket binding permissions.
 test-provider:
-    cargo test -p openai-provider
+    cargo test -p openai-provider --lib
+    cargo test -p openai-provider --test stream_integration
     cargo test -p chatgpt-provider
     cargo test -p generic-provider
     cargo test -p nefor --test openai_provider_lib_test
     cargo test -p nefor --test starter_openai_provider_test
+
+# Explicit live check of the OpenAI-compatible HTTP/SSE client using repository-root .env inputs.
+test-provider-live:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repo="{{justfile_directory()}}"
+    env_file="$repo/.env"
+    if [ ! -f "$env_file" ]; then
+      echo "live provider test requires $env_file; copy .env.example and fill every value" >&2
+      exit 2
+    fi
+    set -a
+    source "$env_file"
+    set +a
+    required=(NEFOR_LIVE_OPENAI_BASE_URL NEFOR_LIVE_OPENAI_API_KEY NEFOR_LIVE_OPENAI_MODEL)
+    for name in "${required[@]}"; do
+      if [ -z "${!name:-}" ]; then
+        echo "live provider test requires non-empty $name in $env_file" >&2
+        exit 2
+      fi
+    done
+    cd "$repo"
+    cargo test -p openai-provider --features live-openai-test --test live_openai_compatible -- --exact live_openai_compatible_client_streams_to_a_terminal_outcome
 
 # TUI rendering, layout, input, scrolling, and widget unit tests.
 test-tui:
