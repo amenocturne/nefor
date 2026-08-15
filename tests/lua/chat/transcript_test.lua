@@ -193,4 +193,40 @@ shifted.in_flight = 2
 local reindexed = transcript.discard_message(shifted, "gone")
 eq(reindexed.in_flight, 1, "removing an earlier entry keeps the in-flight index aligned")
 
+-- Canonical identity, rather than equal content or the global live slot,
+-- distinguishes a rejected structured-output attempt from its correction.
+local corrected = { entries = {}, pending = true }
+corrected = transcript.append_assistant_delta(
+  corrected, "same answer", "attempt-a", "turn-corrected")
+corrected = transcript.discard_message(corrected, "attempt-a")
+corrected = transcript.append_assistant_delta(
+  corrected, "same answer", "attempt-b", "turn-corrected")
+corrected = transcript.finalize_assistant(
+  corrected, "same answer", "model", 10, "attempt-b", "turn-corrected")
+eq(#corrected.entries, 1, "only the accepted assistant lifecycle remains")
+eq(corrected.entries[1].message_id, "attempt-b")
+eq(corrected.entries[1].text, "same answer")
+eq(corrected.entries[1].streaming, false)
+
+-- Concurrent canonical lifecycles may interleave. Completing one must neither
+-- absorb nor clear another message's live reasoning entry.
+local overlapping = { entries = {}, pending = true }
+overlapping = transcript.append_assistant_delta(
+  overlapping, "lead response", "lead-message", "lead-turn")
+overlapping = transcript.append_reasoning_delta(
+  overlapping, "child thinking", "child-message", "child-turn")
+eq(#overlapping.entries, 2, "a different message gets a distinct live entry")
+eq(overlapping.entries[1].message_id, "lead-message")
+eq(overlapping.entries[2].message_id, "child-message")
+overlapping = transcript.finalize_assistant(
+  overlapping, "lead response", "lead-model", 12, "lead-message", "lead-turn")
+eq(overlapping.entries[1].streaming, false, "the completed lead entry settles")
+eq(overlapping.entries[2].reasoning.streaming, true,
+  "completing the lead does not settle the child reasoning lifecycle")
+eq(overlapping.in_flight, 2, "the overlapping lifecycle retains its live ownership")
+overlapping = transcript.discard_message(overlapping, "child-message")
+eq(#overlapping.entries, 1, "closing the child lifecycle leaves no orphan reasoning entry")
+eq(overlapping.entries[1].message_id, "lead-message")
+eq(overlapping.in_flight, nil)
+
 print("transcript_test: all assertions passed")

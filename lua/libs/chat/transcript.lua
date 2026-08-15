@@ -21,6 +21,34 @@ local function append_entry(entries, entry)
   return new_list
 end
 
+local function message_entry_index(state, message_id)
+  if type(message_id) ~= "string" or message_id == "" then return nil end
+  for index = #(state.entries or {}), 1, -1 do
+    local entry = state.entries[index]
+    if type(entry) == "table" and entry.message_id == message_id then return index end
+  end
+  return nil
+end
+
+local function live_entry_index(entries)
+  for index = #(entries or {}), 1, -1 do
+    local entry = entries[index]
+    if type(entry) == "table" and entry.role == "assistant"
+        and (entry.streaming == true
+          or (type(entry.reasoning) == "table" and entry.reasoning.streaming == true)) then
+      return index
+    end
+  end
+  return nil
+end
+
+local function target_entry_index(state, message_id)
+  if type(message_id) == "string" and message_id ~= "" then
+    return message_entry_index(state, message_id)
+  end
+  return state.in_flight
+end
+
 function M.push_entry(state, entry)
   local new_entries = append_entry(state.entries, entry)
   log.log("transcript", "push role=%s kind=%s v=%d count=%d",
@@ -69,13 +97,18 @@ function M.flush_graph_results_if_stable(state)
 end
 
 function M.append_assistant_delta(state, delta, message_id, turn_id)
-  if state.in_flight ~= nil and state.entries[state.in_flight] then
-    local e = state.entries[state.in_flight]
+  local idx = target_entry_index(state, message_id)
+  if idx ~= nil and state.entries[idx] then
+    local e = state.entries[idx]
     local new_entry = Entry.append_text(e, delta)
-    local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
+    local new_entries = replace_entry(state.entries, idx, new_entry)
     log.log("transcript", "delta in_flight=%d len=%d new_v=%d",
-      state.in_flight, #delta, new_entry.v)
-    return shallow_merge(state, { entries = new_entries, pending = false })
+      idx, #delta, new_entry.v)
+    return shallow_merge(state, {
+      entries = new_entries,
+      in_flight = live_entry_index(new_entries) or NIL_SENTINEL,
+      pending = false,
+    })
   end
   local new_entry = Entry.bind_canonical(Entry.assistant_stream(), message_id, turn_id)
   new_entry = Entry.append_text(new_entry, delta)
@@ -90,7 +123,7 @@ function M.append_assistant_delta(state, delta, message_id, turn_id)
 end
 
 function M.append_reasoning_delta(state, delta, message_id, turn_id)
-  local idx = state.in_flight
+  local idx = target_entry_index(state, message_id)
   if idx == nil then
     local new_entry = Entry.bind_canonical(Entry.assistant_stream(), message_id, turn_id)
     new_entry = Entry.append_reasoning(new_entry, delta)
@@ -107,7 +140,11 @@ function M.append_reasoning_delta(state, delta, message_id, turn_id)
   local new_entries = replace_entry(state.entries, idx, new_entry)
   log.log("transcript", "reasoning_delta in_flight=%d new_v=%d",
     idx, new_entry.v)
-  return shallow_merge(state, { entries = new_entries, pending = false })
+  return shallow_merge(state, {
+    entries = new_entries,
+    in_flight = live_entry_index(new_entries) or NIL_SENTINEL,
+    pending = false,
+  })
 end
 
 function M.finalize_assistant(state, final_text, model, duration_ms, message_id, turn_id)
@@ -115,8 +152,9 @@ function M.finalize_assistant(state, final_text, model, duration_ms, message_id,
   local turn_dur = duration_ms
     or (state.turn_started_at and (now - state.turn_started_at))
     or nil
+  local idx = target_entry_index(state, message_id)
 
-  if state.in_flight == nil then
+  if idx == nil then
     if (final_text and #final_text > 0) or model ~= nil or duration_ms ~= nil then
       local new_entry = Entry.bind_canonical(Entry.assistant_stream(), message_id, turn_id)
       new_entry = Entry.finalize(new_entry, {
@@ -139,7 +177,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms, message_id,
     })
   end
 
-  local e = state.entries[state.in_flight]
+  local e = state.entries[idx]
   if e then
     if e.reasoning ~= nil and e.reasoning.streaming == true then
       e = Entry.finalize_reasoning(e)
@@ -148,12 +186,12 @@ function M.finalize_assistant(state, final_text, model, duration_ms, message_id,
     if final_text and #final_text > 0 then opts.text = final_text end
     if message_id ~= nil then e = Entry.bind_canonical(e, message_id, turn_id) end
     local new_entry = Entry.finalize(e, opts)
-    local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
+    local new_entries = replace_entry(state.entries, idx, new_entry)
     log.log("transcript", "finalize_assistant in_flight=%d new_v=%d",
-      state.in_flight, new_entry.v)
+      idx, new_entry.v)
     return shallow_merge(state, {
       entries              = new_entries,
-      in_flight            = NIL_SENTINEL,
+      in_flight            = live_entry_index(new_entries) or NIL_SENTINEL,
       pending              = false,
       turn_started_at      = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
@@ -161,7 +199,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms, message_id,
   end
 
   return shallow_merge(state, {
-    in_flight            = NIL_SENTINEL,
+    in_flight            = live_entry_index(state.entries) or NIL_SENTINEL,
     pending              = false,
     turn_started_at      = NIL_SENTINEL,
     last_turn_duration_ms = turn_dur,
