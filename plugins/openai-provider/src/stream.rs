@@ -79,6 +79,18 @@ pub enum StreamError {
     Http { status: u16, body: String },
     #[error("read error mid-stream: {0}")]
     Body(String),
+    #[error("malformed streamed response: {0}")]
+    Malformed(String),
+    #[error("provider stream error: {message}")]
+    Provider {
+        message: String,
+        kind: Option<String>,
+        code: Option<String>,
+    },
+    #[error("provider refused the request: {0}")]
+    Refusal(String),
+    #[error("incomplete streamed tool call at index {index}: missing {missing}")]
+    IncompleteToolCall { index: usize, missing: String },
 }
 
 /// Heuristic: does this error body match the "model does not support
@@ -381,7 +393,7 @@ where
         tokio::select! {
             _ = cancel.cancelled() => {
                 outcome.interrupted = true;
-                outcome.tool_calls = tc_acc.finalize();
+                outcome.tool_calls = tc_acc.finalize().unwrap_or_default();
                 maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
                 return Ok(outcome);
             }
@@ -418,7 +430,7 @@ where
         &mut on_delta,
         &mut on_reasoning,
     )?;
-    outcome.tool_calls = tc_acc.finalize();
+    outcome.tool_calls = tc_acc.finalize()?;
     maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
     Ok(outcome)
 }
@@ -433,7 +445,11 @@ fn stream_error_is_retriable(err: &StreamError) -> bool {
         StreamError::Http { status, .. } => *status == 429 || (500..600).contains(status),
         StreamError::Unauthorized { .. }
         | StreamError::ToolsUnsupported { .. }
-        | StreamError::Body(_) => false,
+        | StreamError::Body(_)
+        | StreamError::Malformed(_)
+        | StreamError::Provider { .. }
+        | StreamError::Refusal(_)
+        | StreamError::IncompleteToolCall { .. } => false,
     }
 }
 
@@ -590,121 +606,116 @@ where
 {
     for frame in buffer.drain() {
         let frame = frame.map_err(|err| StreamError::Body(err.to_string()))?;
-        match parse_sse_chunk(&frame.data) {
-            SseEvent::Delta(text) => {
-                // Boundary: first content chunk closes the reasoning
-                // stream. The chat plugin uses this to flip the
-                // live reasoning preview into its collapsed form.
-                if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
-                    *reasoning_ended = true;
-                    on_reasoning(ReasoningEvent::End {
-                        text: &outcome.reasoning_text,
-                    });
-                }
-                // Defensive strip: when Qwen-style chat templates close
-                // reasoning on a literal `</think>` written inside the
-                // model's monologue, the literal close-tag character
-                // sequence frequently leads the first content chunk
-                // (Ollama emits the matched tag itself onto the content
-                // channel after the reasoning split). The user shouldn't
-                // see `</think>` rendered as the start of an answer.
-                // Strip a single leading `</think>` (with optional
-                // surrounding whitespace) from the content stream.
-                // Only fires when reasoning was non-empty AND we have
-                // not yet emitted any content — covers the leak shape
-                // without disturbing legitimate uses of the literal
-                // string later in the answer.
-                let emit_text: &str =
-                    if outcome.full_text.is_empty() && !outcome.reasoning_text.is_empty() {
-                        let trimmed = text.trim_start();
-                        if let Some(rest) = trimmed.strip_prefix("</think>") {
-                            rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
-                        } else {
-                            text.as_str()
-                        }
-                    } else {
-                        text.as_str()
-                    };
-                if !emit_text.is_empty() {
-                    on_delta(emit_text);
-                    outcome.full_text.push_str(emit_text);
-                }
-            }
-            SseEvent::ReasoningDelta(text) => {
-                outcome.reasoning_text.push_str(&text);
-                on_reasoning(ReasoningEvent::Delta(&text));
-            }
-            SseEvent::Finish { reason, usage } => {
-                outcome.finish_reason = Some(reason);
-                if usage.is_some() {
-                    outcome.usage = usage;
-                }
-                // Reasoning-only turn (Gemma 3 edge case): finish
-                // arrives without any content. Still close the
-                // reasoning channel so the chat plugin renders the
-                // collapsed/expanded row instead of leaving the
-                // assistant entry stuck on "streaming".
-                if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
-                    *reasoning_ended = true;
-                    on_reasoning(ReasoningEvent::End {
-                        text: &outcome.reasoning_text,
-                    });
-                }
-            }
-            SseEvent::Usage(u) => {
-                outcome.usage = Some(u);
-            }
-            SseEvent::ToolCallStart {
-                index,
-                id,
-                name,
-                args,
-            } => {
-                tc_acc.start(index, id, name, args);
-            }
-            SseEvent::ToolCallArgsDelta { index, delta } => {
-                tc_acc.append_args(index, &delta);
-            }
-            SseEvent::ToolCallBatch(events) => {
-                for event in events {
-                    match event {
-                        SseEvent::ToolCallStart {
-                            index,
-                            id,
-                            name,
-                            args,
-                        } => {
-                            tc_acc.start(index, id, name, args);
-                        }
-                        SseEvent::ToolCallArgsDelta { index, delta } => {
-                            tc_acc.append_args(index, &delta);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            SseEvent::Done | SseEvent::Empty => {}
-        }
+        apply_sse_event(
+            parse_sse_chunk(&frame.data),
+            outcome,
+            tc_acc,
+            reasoning_ended,
+            on_delta,
+            on_reasoning,
+        )?;
     }
     Ok(())
 }
 
-/// Per-stream accumulator for tool-call deltas. Indexed by the model's
-/// `tool_calls[*].index` so parallel calls don't interleave.
-///
-/// `BTreeMap` so `finalize` returns calls in stable index order — the
-/// model occasionally inserts call 1 before call 0 in the SSE stream
-/// and we want the final list to read 0,1,2,…
+fn apply_sse_event<F, R>(
+    event: SseEvent,
+    outcome: &mut StreamOutcome,
+    tc_acc: &mut ToolCallAccumulator,
+    reasoning_ended: &mut bool,
+    on_delta: &mut F,
+    on_reasoning: &mut R,
+) -> Result<(), StreamError>
+where
+    F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
+{
+    match event {
+        SseEvent::Batch(events) => {
+            for event in events {
+                apply_sse_event(
+                    event,
+                    outcome,
+                    tc_acc,
+                    reasoning_ended,
+                    on_delta,
+                    on_reasoning,
+                )?;
+            }
+        }
+        SseEvent::Delta(text) => {
+            if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
+                *reasoning_ended = true;
+                on_reasoning(ReasoningEvent::End {
+                    text: &outcome.reasoning_text,
+                });
+            }
+            let emit_text = if outcome.full_text.is_empty() && !outcome.reasoning_text.is_empty() {
+                let trimmed = text.trim_start();
+                trimmed
+                    .strip_prefix("</think>")
+                    .map(|rest| rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace()))
+                    .unwrap_or(text.as_str())
+            } else {
+                text.as_str()
+            };
+            if !emit_text.is_empty() {
+                on_delta(emit_text);
+                outcome.full_text.push_str(emit_text);
+            }
+        }
+        SseEvent::Refusal(message) => return Err(StreamError::Refusal(message)),
+        SseEvent::ReasoningDelta(text) => {
+            outcome.reasoning_text.push_str(&text);
+            on_reasoning(ReasoningEvent::Delta(&text));
+        }
+        SseEvent::ToolCallFragment {
+            index,
+            id,
+            kind,
+            name,
+            arguments,
+        } => {
+            tc_acc.apply(index, id, kind, name, arguments);
+        }
+        SseEvent::Finish(reason) => {
+            outcome.finish_reason = Some(reason.as_str().to_owned());
+            if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
+                *reasoning_ended = true;
+                on_reasoning(ReasoningEvent::End {
+                    text: &outcome.reasoning_text,
+                });
+            }
+        }
+        SseEvent::Usage(usage) => outcome.usage = Some(usage),
+        SseEvent::Error {
+            message,
+            kind,
+            code,
+        } => {
+            return Err(StreamError::Provider {
+                message,
+                kind,
+                code,
+            });
+        }
+        SseEvent::Malformed(message) => return Err(StreamError::Malformed(message)),
+        SseEvent::Done | SseEvent::Empty => {}
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct ToolCallAccumulator {
     by_index: BTreeMap<usize, ToolCallBuilder>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ToolCallBuilder {
-    id: String,
-    name: String,
-    arguments: String,
+    id: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 impl ToolCallAccumulator {
@@ -712,49 +723,79 @@ impl ToolCallAccumulator {
         Self::default()
     }
 
-    fn start(&mut self, index: usize, id: String, name: String, initial_args: String) {
-        self.by_index.insert(
+    #[cfg(test)]
+    fn start(&mut self, index: usize, id: String, name: String, arguments: String) {
+        self.apply(
             index,
-            ToolCallBuilder {
-                id,
-                name,
-                arguments: initial_args,
-            },
+            Some(id),
+            Some("function".to_owned()),
+            Some(name),
+            Some(arguments),
         );
     }
 
-    fn append_args(&mut self, index: usize, delta: &str) {
-        if let Some(b) = self.by_index.get_mut(&index) {
-            b.arguments.push_str(delta);
-        } else {
-            // Args delta arrived before start — providers we've seen
-            // never do this, but be defensive: stash a partial entry
-            // so the args don't get lost. id/name will be empty; the
-            // dispatcher will skip empty-id entries.
-            self.by_index.insert(
-                index,
-                ToolCallBuilder {
-                    id: String::new(),
-                    name: String::new(),
-                    arguments: delta.to_owned(),
-                },
-            );
+    #[cfg(test)]
+    fn append_args(&mut self, index: usize, arguments: &str) {
+        self.apply(index, None, None, None, Some(arguments.to_owned()));
+    }
+
+    fn apply(
+        &mut self,
+        index: usize,
+        id: Option<String>,
+        kind: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    ) {
+        let builder = self.by_index.entry(index).or_default();
+        if let Some(id) = id {
+            builder.id = Some(id);
+        }
+        if let Some(kind) = kind {
+            builder.kind = Some(kind);
+        }
+        if let Some(name) = name {
+            builder.name = Some(name);
+        }
+        if let Some(arguments) = arguments {
+            builder
+                .arguments
+                .get_or_insert_with(String::new)
+                .push_str(&arguments);
         }
     }
 
-    /// Drain the accumulator into a sorted list of `ToolCall`s. Drops
-    /// entries with empty `id` (the dispatcher can't address them).
-    fn finalize(self) -> Vec<ToolCall> {
+    fn finalize(self) -> Result<Vec<ToolCall>, StreamError> {
         self.by_index
-            .into_values()
-            .filter(|b| !b.id.is_empty())
-            .map(|b| ToolCall {
-                id: b.id,
-                kind: "function".into(),
-                function: ToolCallFunction {
-                    name: b.name,
-                    arguments: b.arguments,
-                },
+            .into_iter()
+            .map(|(index, builder)| {
+                let mut missing = Vec::new();
+                if builder.id.is_none() {
+                    missing.push("id");
+                }
+                if builder.kind.as_deref() != Some("function") {
+                    missing.push("type=function");
+                }
+                if builder.name.is_none() {
+                    missing.push("function.name");
+                }
+                if builder.arguments.is_none() {
+                    missing.push("function.arguments");
+                }
+                if !missing.is_empty() {
+                    return Err(StreamError::IncompleteToolCall {
+                        index,
+                        missing: missing.join(", "),
+                    });
+                }
+                Ok(ToolCall {
+                    id: builder.id.unwrap_or_default(),
+                    kind: builder.kind.unwrap_or_else(|| "function".to_owned()),
+                    function: ToolCallFunction {
+                        name: builder.name.unwrap_or_default(),
+                        arguments: builder.arguments.unwrap_or_default(),
+                    },
+                })
             })
             .collect()
     }
@@ -833,7 +874,10 @@ mod tests {
         let u = outcome.usage.expect("usage");
         assert_eq!(u.prompt_tokens, 3);
         assert_eq!(u.completion_tokens, 2);
-        assert!(tc.finalize().is_empty(), "no tool calls");
+        assert!(
+            tc.finalize().expect("complete calls").is_empty(),
+            "no tool calls"
+        );
         assert!(outcome.reasoning_text.is_empty(), "no reasoning seen");
     }
 
@@ -968,7 +1012,7 @@ mod tests {
         tc.start(0, "call_a".into(), "read_file".into(), String::new());
         tc.append_args(0, "{\"path\":");
         tc.append_args(0, "\"/tmp/foo.txt\"}");
-        let calls = tc.finalize();
+        let calls = tc.finalize().expect("complete calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[0].kind, "function");
@@ -986,7 +1030,7 @@ mod tests {
             "spawn_graph".into(),
             r#"{"graph":{"nodes":[]}}"#.into(),
         );
-        let calls = tc.finalize();
+        let calls = tc.finalize().expect("complete calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.arguments, r#"{"graph":{"nodes":[]}}"#);
     }
@@ -1001,7 +1045,7 @@ mod tests {
         tc.append_args(1, "{\"path\":\"/x\",");
         tc.append_args(0, "{\"path\":\"/y\"}");
         tc.append_args(1, "\"content\":\"hi\"}");
-        let calls = tc.finalize();
+        let calls = tc.finalize().expect("complete calls");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"/y\"}");
@@ -1042,7 +1086,7 @@ mod tests {
         .expect("drain ok");
         assert!(deltas.is_empty(), "no text deltas in a tool-call turn");
         assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
-        let calls = tc.finalize();
+        let calls = tc.finalize().expect("complete calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_x");
         assert_eq!(calls[0].function.name, "read_file");
@@ -1071,7 +1115,7 @@ mod tests {
         )
         .expect("drain ok");
         assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
-        let calls = tc.finalize();
+        let calls = tc.finalize().expect("complete calls");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[0].function.name, "read_file");

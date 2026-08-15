@@ -1492,3 +1492,165 @@ async fn http_400_with_unrelated_message_falls_through_to_http_error() {
         other => panic!("expected generic Http, got {other:?}"),
     }
 }
+
+async fn run_scripted_stream(
+    body: String,
+) -> (
+    Result<openai_provider::stream::StreamOutcome, StreamError>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let (listener, addr) = bind_local().await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut stream).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+    let mut deltas = Vec::new();
+    let mut reasoning = Vec::new();
+    let result = run_chat_stream(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/v1/chat/completions"),
+        None,
+        "Authorization",
+        "fixture-model",
+        &[Message::user("fixture")],
+        None,
+        None,
+        CancellationToken::new(),
+        |text| deltas.push(text.to_owned()),
+        |event| {
+            if let openai_provider::stream::ReasoningEvent::Delta(text) = event {
+                reasoning.push(text.to_owned());
+            }
+        },
+    )
+    .await;
+    server.await.expect("server");
+    (result, deltas, reasoning)
+}
+
+#[tokio::test]
+async fn mixed_frames_preserve_content_reasoning_tools_finish_and_usage() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"reasoning\":\"thought\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
+        "data: [DONE]\n\n"
+    ).to_owned();
+    let (result, deltas, reasoning) = run_scripted_stream(body).await;
+    let outcome = result.expect("valid mixed stream");
+    assert_eq!(deltas, ["answer"]);
+    assert_eq!(reasoning, ["thought"]);
+    assert_eq!(outcome.full_text, "answer");
+    assert_eq!(outcome.reasoning_text, "thought");
+    assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(outcome.usage.expect("usage").total_tokens, 5);
+    assert_eq!(outcome.tool_calls.len(), 1);
+    assert_eq!(outcome.tool_calls[0].function.arguments, "{}");
+}
+
+#[tokio::test]
+async fn pairwise_mixed_frames_reach_downstream_accumulators() {
+    let frames = [
+        (
+            r#"{"choices":[{"delta":{"content":"c"},"finish_reason":"stop"}]}"#,
+            "content_finish",
+        ),
+        (
+            r#"{"choices":[{"delta":{"content":"c","tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            "content_tool",
+        ),
+        (
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "tool_finish",
+        ),
+        (
+            r#"{"choices":[{"delta":{"reasoning":"r","tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            "reasoning_tool",
+        ),
+        (
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+            "finish_usage",
+        ),
+        (
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+            "usage_only",
+        ),
+    ];
+    for (json, name) in frames {
+        let body = format!("data: {json}\n\n");
+        let (result, deltas, reasoning) = run_scripted_stream(body).await;
+        let outcome = result.expect(name);
+        match name {
+            "content_finish" => {
+                assert_eq!(deltas, ["c"]);
+                assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+            }
+            "content_tool" => {
+                assert_eq!(deltas, ["c"]);
+                assert_eq!(outcome.tool_calls.len(), 1);
+            }
+            "tool_finish" => {
+                assert_eq!(outcome.tool_calls.len(), 1);
+                assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
+            }
+            "reasoning_tool" => {
+                assert_eq!(reasoning, ["r"]);
+                assert_eq!(outcome.tool_calls.len(), 1);
+            }
+            "finish_usage" => {
+                assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+                assert_eq!(outcome.usage.expect("usage").total_tokens, 3);
+            }
+            "usage_only" => assert_eq!(outcome.usage.expect("usage").total_tokens, 3),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_fields_accumulate_independently_by_interleaved_index() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"b\\\":\"}},{\"index\":0,\"id\":\"a\"}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"b\",\"type\":\"function\"}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"second\",\"arguments\":\"2}\"}},{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"first\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+    ).to_owned();
+    let (result, _, _) = run_scripted_stream(body).await;
+    let calls = result.expect("complete calls").tool_calls;
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(calls[0].function.name, "first");
+    assert_eq!(calls[1].function.arguments, r#"{"b":2}"#);
+}
+
+#[tokio::test]
+async fn incomplete_tool_refusal_malformed_and_in_band_error_are_typed_failures() {
+    let cases = [
+        ("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n", "incomplete"),
+        ("data: {\"choices\":[{\"delta\":{\"refusal\":\"cannot comply\"},\"finish_reason\":\"stop\"}]}\n\n", "refusal"),
+        ("data: {bad\n\n", "malformed"),
+        ("data: {\"error\":{\"message\":\"quota exhausted\",\"type\":\"insufficient_quota\"}}\n\n", "provider"),
+    ];
+    for (body, expected) in cases {
+        let (result, _, _) = run_scripted_stream(body.to_owned()).await;
+        let error = result.expect_err(expected);
+        match (expected, error) {
+            ("incomplete", StreamError::IncompleteToolCall { index: 0, .. })
+            | ("refusal", StreamError::Refusal(_))
+            | ("malformed", StreamError::Malformed(_))
+            | ("provider", StreamError::Provider { .. }) => {}
+            (_, other) => panic!("unexpected {expected} error: {other:?}"),
+        }
+    }
+}

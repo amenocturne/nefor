@@ -796,6 +796,20 @@ async fn dispatch_event(
                         StreamError::ToolsUnsupported { body } => {
                             format!("HTTP 400: {}", snippet(body))
                         }
+                        StreamError::Malformed(message) => {
+                            format!("malformed streamed response: {message}")
+                        }
+                        StreamError::Provider { message, .. } => {
+                            format!("provider stream error: {message}")
+                        }
+                        StreamError::Refusal(message) => {
+                            format!("provider refused the request: {message}")
+                        }
+                        StreamError::IncompleteToolCall { index, missing } => {
+                            format!(
+                                "incomplete streamed tool call at index {index}: missing {missing}"
+                            )
+                        }
                     };
                     if matches!(e, StreamError::Unauthorized { .. }) {
                         let snap = auth.mark_auth_error(HTTP_401_MESSAGE.to_owned()).await;
@@ -1795,6 +1809,20 @@ fn spawn_turn(
                         // listed for exhaustiveness.
                         StreamError::ToolsUnsupported { body } => {
                             format!("HTTP 400: {}", extract_error_message(body))
+                        }
+                        StreamError::Malformed(message) => {
+                            format!("malformed streamed response: {message}")
+                        }
+                        StreamError::Provider { message, .. } => {
+                            format!("provider stream error: {message}")
+                        }
+                        StreamError::Refusal(message) => {
+                            format!("provider refused the request: {message}")
+                        }
+                        StreamError::IncompleteToolCall { index, missing } => {
+                            format!(
+                                "incomplete streamed tool call at index {index}: missing {missing}"
+                            )
                         }
                     };
                     tracing::warn!(error = %e, "turn failed");

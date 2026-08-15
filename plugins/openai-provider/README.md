@@ -120,7 +120,7 @@ data: [DONE]
 
 ```
 
-Some servers ride `usage` on the same chunk that closes the choices array; the parser handles both.
+Some servers ride multiple semantic fields on the same chunk. The parser preserves content, refusal, reasoning extensions, every tool-call fragment, finish reason, and usage in deterministic order. Standard streamed refusal, malformed JSON, in-band error envelopes, unknown finish reasons, and incomplete tool calls terminate the turn explicitly instead of becoming empty success.
 
 ## Events emitted (with `<prefix> = --name .`)
 
