@@ -63,7 +63,7 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "Read file",
+        "label": "read file",
         "primary": { "arg": "path", "cwd_arg": "cwd" },
         "arguments": [
             { "label": "offset", "arg": "offset" },

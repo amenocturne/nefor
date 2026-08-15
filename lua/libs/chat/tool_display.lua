@@ -25,9 +25,13 @@ end
 function M.validate(c)
   if type(c) ~= "table" then return nil, "display must be a table" end
   for k, _ in pairs(c) do
-    if k ~= "label" and k ~= "primary" and k ~= "arguments" and k ~= "result" then
+    if k ~= "label" and k ~= "primary" and k ~= "arguments" and k ~= "result"
+        and k ~= "lifecycle" then
       return nil, "display has unknown field `" .. tostring(k) .. "`"
     end
+  end
+  if c.lifecycle ~= nil and c.lifecycle ~= "delayed" then
+    return nil, "display.lifecycle must be `delayed` when present"
   end
   if not nonempty(c.label) then
     local ok, err = selector(c.label, "display.label")

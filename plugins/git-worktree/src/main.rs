@@ -148,7 +148,7 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
                 "parameters": create_schema(),
                 "context": {},
                 "display": {
-                    "label": "Create worktree",
+                    "label": "create worktree",
                     "primary": { "arg": "path" },
                     "arguments": [
                         { "label": "branch", "arg": "branch" },
@@ -163,7 +163,7 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
                 "parameters": open_schema(),
                 "context": {},
                 "display": {
-                    "label": "Open worktree",
+                    "label": "open worktree",
                     "primary": { "arg": "path" },
                     "arguments": [
                         { "label": "branch", "arg": "branch" },

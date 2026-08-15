@@ -30,7 +30,7 @@ pub fn schema() -> Value {
 
 pub fn display() -> Value {
     json!({
-        "label": "Execute shell script",
+        "label": "execute shell script",
         "primary": { "arg": "script" },
         "arguments": [
             { "label": "cwd", "arg": "cwd" },

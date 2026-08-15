@@ -71,6 +71,9 @@ local function fresh()
     callback()
     return function() end
   end)
+  lw._internals.set_termination_scheduler(function(_, _)
+    return function() end
+  end)
   agentic_loop._internals.reset()
   sessions._internals.reset_state()
   sessions.init()
@@ -141,9 +144,9 @@ do
   assert_true(graph_status_schema.description:find("when your next step depends", 1, true) == nil
       and graph_status_schema.description:find("Block until", 1, true) == nil,
     "graph-status carries no dependency-wait affordance")
-  assert_eq(await_schema.display.label, "Await run", "await-run has semantic display metadata")
+  assert_eq(await_schema.display.label, "await run", "await-run has semantic display metadata")
   assert_eq(await_schema.display.primary.arg, "run_id", "await-run displays its stable handle")
-  assert_eq(mag_eval_schema.display.label, "mag-eval", "mag-eval display keeps stable tool identity")
+  assert_eq(mag_eval_schema.display.label, "mag eval", "mag-eval has explicit display label")
   assert_eq(mag_eval_schema.display.primary.arg, "intent", "mag-eval display uses exact intent")
   assert_true(mag_eval_schema.description:find("Commands run until process exit", 1, true) ~= nil
       and mag_eval_schema.description:find("Never launch a server as a normal run", 1, true) ~= nil,
@@ -2165,6 +2168,8 @@ do
   _test.calls_clear()
   invoke_tool("terminate-eval", "terminate-graph", { run_id = run_id })
   calls = decode_calls()
+  assert_eq(tool_result("terminate-eval"), nil,
+    "terminate-graph remains open until exact canonical confirmation")
   assert_true(find_call(calls, function(c)
     return c.body.kind == "mag.kill_run" and c.body.run_id == run_id
   end) ~= nil, "terminate-graph kills the eval by its stable handle")
@@ -2174,8 +2179,30 @@ do
     "terminate-graph marks the eval terminating")
   feed("mag", { kind = "mag.run_result", run_id = run_id,
     status = "killed", error = "terminated" })
+  local terminal = tool_result("terminate-eval")
+  assert_true(terminal ~= nil and terminal.body.error_code == "await_run_killed",
+    "terminate-graph returns the exact canonical terminal outcome")
+  assert_eq(has_relayed_lead_turn(), false,
+    "synchronous terminate confirmation suppresses redundant owner completion")
   assert_eq(lw._internals.state.active_runs[run_id], nil,
     "canonical killed result closes the terminating eval")
+
+  run_id = dispatch_lead_eval("gate-timeout", "r7/cap-22-timeout")
+  local timeout_callback
+  lw._internals.set_termination_scheduler(function(delay_ms, callback)
+    assert_eq(delay_ms, lw._internals.termination_confirm_timeout_ms,
+      "terminate uses the named defensive timeout")
+    timeout_callback = callback
+    return function() end
+  end)
+  _test.calls_clear()
+  invoke_tool("terminate-timeout", "terminate-graph", { run_id = run_id })
+  assert_eq(tool_result("terminate-timeout"), nil, "timeout waiter begins open")
+  timeout_callback()
+  local timeout_result = tool_result("terminate-timeout")
+  assert_true(timeout_result ~= nil and timeout_result.body.error:find(
+      "timed out awaiting canonical terminal confirmation", 1, true) ~= nil,
+    "defensive terminate timeout is an ordinary tool failure")
 
   run_id = dispatch_lead_eval("gate-cancel", "r7/cap-23")
   _test.calls_clear()

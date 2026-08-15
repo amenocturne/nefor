@@ -56,9 +56,13 @@ before a request reaches the user.
 ## Tool display contract
 
 Every advertised tool includes a declarative display contract beside its schema.
-It declares a label (literal or selected argument), optional primary/argument
-fields, and whether successful results render as content or a receipt. The gate
-rejects missing or malformed contracts. Ctrl+O expands tool receipts using this
+It declares an explicit lower-case, space-separated display label (literal or
+selected argument), optional primary/argument fields, and whether successful
+results render as content or a receipt. Labels are presentation metadata only:
+wire names remain unchanged, punctuation is never auto-transformed, and a
+consumer falls back to the wire name only when metadata is absent. The optional
+`lifecycle = "delayed"` marker lets a surface suppress an invocation until its
+source settles the grace decision. The gate rejects missing or malformed contracts. Ctrl+O expands tool receipts using this
 semantic projection. Press Ctrl+R to toggle raw input/output for the latest
 expanded tool receipt, or use `/raw <tool-call-id>` to toggle a specific entry.
 Raw reveal is presentation-only and does not change persisted or model-facing

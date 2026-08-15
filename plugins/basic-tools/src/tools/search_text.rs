@@ -86,7 +86,7 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "Search text",
+        "label": "search text",
         "primary": { "arg": "pattern" },
         "arguments": [
             { "label": "in", "arg": "path", "cwd_arg": "cwd", "default": "." },

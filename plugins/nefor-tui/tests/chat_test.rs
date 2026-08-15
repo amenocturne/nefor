@@ -1054,7 +1054,7 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
 
     let out = render_str(&mut engine);
     let before = out.find("answer before status").expect("first answer");
-    let status = out.find("mag workflow").expect("graph status");
+    let status = out.find("mag result [async]").expect("graph status");
     let after = out.find("answer after status").expect("second answer");
     assert!(
         before < status && status < after,
@@ -1097,7 +1097,7 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
     }
     let open = render_str(&mut engine);
     assert!(
-        open.contains("lead answer") && !open.contains("mag workflow"),
+        open.contains("lead answer") && !open.contains("mag result [async]"),
         "results must remain hidden while the lead stream is open:\n{open}"
     );
 
@@ -1428,12 +1428,11 @@ fn tool_start_closes_empty_provider_round_before_text_answer_projection() {
     fixture_message(&mut engine, "assistant", "final answer");
 
     let out = render_str(&mut engine);
-    let tool = out.find("mag-eval").expect("tool entry");
-    let answer = out.find("final answer").expect("final answer");
     assert!(
-        tool < answer,
-        "final answer attached to the tool-call round:\n{out}"
+        out.contains("mag eval [sync]") && out.contains("interrupted"),
+        "terminally interrupted delayed invocation must render once: {out}"
     );
+    assert!(out.contains("final answer"), "{out}");
 }
 
 #[test]
@@ -2698,12 +2697,12 @@ fn mag_failed_run_member_row_reads_failed() {
     let out = render_str(&mut engine);
 
     assert!(
-        out.contains("writer.draft"),
+        out.contains("  ⊗ 00s draft"),
         "unfolded member row should expose the failed actor id: {out:?}"
     );
     assert!(
-        out.contains("failed"),
-        "a run_failed member must read `failed`: {out:?}"
+        out.contains("⊗"),
+        "a run_failed member must carry the failed glyph/style without an outcome word: {out:?}"
     );
     assert!(
         !out.contains("killed"),
@@ -3365,7 +3364,7 @@ fn ctrl_o_toggles_expanded_details() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains('▸') && out.contains("shell.script · ls -la /tmp"),
+        out.contains('▸') && out.contains("Run command · ls -la /tmp"),
         "collapsed tool header missing: {out:?}"
     );
     assert!(!out.contains("SECRET RAW OUTPUT"), "{out:?}");
@@ -3373,7 +3372,7 @@ fn ctrl_o_toggles_expanded_details() {
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
     let semantic = render_str(&mut engine);
     assert!(
-        semantic.contains("▼ shell.script · ls -la /tmp"),
+        semantic.contains("▼ Run command · ls -la /tmp"),
         "{semantic:?}"
     );
     assert!(
@@ -3430,7 +3429,7 @@ fn collapsed_read_file_snapshot(width: u16, running: bool) -> String {
         json!({ "kind": "tool.register", "tools": [{
             "name": "read_file",
             "display": {
-                "label": "Read file",
+                "label": "read file",
                 "primary": { "arg": "path" },
                 "result": { "kind": "content" }
             }
@@ -3452,7 +3451,7 @@ fn collapsed_read_file_header(width: u16, running: bool) -> String {
     let snapshot = collapsed_read_file_snapshot(width, running);
     snapshot
         .lines()
-        .find(|line| line.contains("▸ read_file · "))
+        .find(|line| line.contains("▸ read file · "))
         .unwrap_or_else(|| panic!("tool prefix must survive at width {width}: {snapshot:?}"))
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -3464,11 +3463,11 @@ fn collapsed_completed_path_marks_only_actual_clipping() {
     let full = collapsed_read_file_header(80, false);
     assert_eq!(
         full,
-        "▸ read_file · /workspace/very/long/component/src/important.lua"
+        "▸ read file · /workspace/very/long/component/src/important.lua"
     );
 
     let clipped = collapsed_read_file_header(49, false);
-    assert_eq!(clipped, "▸ read_file · …/long/component/src/important.lua");
+    assert_eq!(clipped, "▸ read file · …/long/component/src/important.lua");
 }
 
 #[test]
@@ -3476,20 +3475,89 @@ fn collapsed_running_path_marks_clipping_before_reserved_marker() {
     let full = collapsed_read_file_header(80, true);
     assert_eq!(
         full,
-        "▸ read_file · /workspace/very/long/component/src/important.lua …"
+        "▸ read file · /workspace/very/long/component/src/important.lua …"
     );
 
     let clipped = collapsed_read_file_header(51, true);
     assert_eq!(
         clipped,
-        "▸ read_file · …/long/component/src/important.lua …"
+        "▸ read file · …/long/component/src/important.lua …"
     );
 }
 
 #[test]
 fn collapsed_path_with_one_display_column_shows_only_clipping_indicator() {
     let header = collapsed_read_file_header(16, false);
-    assert_eq!(header, "▸ read_file · …");
+    assert_eq!(header, "▸ read file · …");
+}
+
+#[test]
+fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+        { "name": "mag", "display": { "label": "mag", "primary": { "arg": "file" }, "result": { "kind": "content" }, "lifecycle": "delayed" } },
+        { "name": "mag-eval", "display": { "label": "mag eval", "primary": { "arg": "intent" }, "result": { "kind": "content" }, "lifecycle": "delayed" } }
+    ] }),
+    );
+
+    fixture_tool_started(
+        &mut engine,
+        "hidden",
+        "mag",
+        json!({ "action": "execute", "file": "hidden.mag" }),
+    );
+    let grace = render_snapshot(&mut engine);
+    assert!(
+        !grace.contains("hidden.mag"),
+        "no row is painted during grace: {grace}"
+    );
+
+    fixture_tool_completed(
+        &mut engine,
+        "hidden",
+        json!({ "status": "completed" }),
+        false,
+    );
+    fixture_tool_started(
+        &mut engine,
+        "async",
+        "mag",
+        json!({ "action": "execute", "file": "ship.mag" }),
+    );
+    fixture_tool_completed(
+        &mut engine,
+        "async",
+        json!({ "status": "executing" }),
+        false,
+    );
+    fixture_tool_started(
+        &mut engine,
+        "eval",
+        "mag-eval",
+        json!({ "intent": "Inspect workspace" }),
+    );
+    fixture_tool_completed(&mut engine, "eval", json!({ "status": "completed" }), false);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append", "run_id": "run-ship",
+            "invocation_label": "ship.mag", "status": "failed", "duration_ms": 4321,
+        }),
+    );
+    fixture_assistant_completed(&mut engine, None, json!({}));
+    let out = render_snapshot(&mut engine);
+    assert!(out.contains("mag execute [sync] · hidden.mag"), "{out}");
+    assert!(out.contains("mag execute [async] · ship.mag"), "{out}");
+    assert!(out.contains("mag eval [sync] · Inspect workspace"), "{out}");
+    assert!(out.contains("mag result [async] · ship.mag · 4s"), "{out}");
+    assert!(
+        !out.contains("FAILED"),
+        "outcome word must stay absent: {out}"
+    );
 }
 
 #[test]
@@ -3529,7 +3597,7 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
     for expected in [
         "▸ mag write · draft.mag",
         "▸ mag compile · check.mag",
-        "▸ mag execute · ship.mag",
+        "▸ mag execute [sync] · ship.mag",
     ] {
         assert!(
             collapsed.contains(expected),
@@ -3539,10 +3607,10 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
 
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
     let expanded = render_str(&mut engine);
-    assert!(expanded.contains("▼ mag · draft.mag"), "{expanded:?}");
+    assert!(expanded.contains("▼ MAG · draft.mag"), "{expanded:?}");
     assert!(expanded.contains("  action: write"), "{expanded:?}");
     assert!(
-        !expanded.contains("▼ mag write · draft.mag"),
+        !expanded.contains("▼ MAG write · draft.mag"),
         "expanded MAG header must keep the shared tool-header shape: {expanded:?}"
     );
 }
@@ -8922,7 +8990,7 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(
-        out.contains("explorer.entry") && out.contains("explorer.loop-c…"),
+        out.contains("  ○ 00s entry") && out.contains("  ○ 00s loop-counter"),
         "Enter on the group row must unfold its member rows: {out:?}"
     );
 
@@ -8933,7 +9001,7 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        snap.contains("explorer.entry"),
+        snap.contains("  ○ 00s entry"),
         "fold state must survive focus changes:\n{snap}"
     );
 
@@ -8944,7 +9012,7 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     assert!(
-        !snap.contains("explorer.entry"),
+        !snap.contains("  ○ 00s entry"),
         "Enter on the unfolded group row must fold it again:\n{snap}"
     );
 }
@@ -9710,7 +9778,7 @@ fn short_sidebar_has_no_scroll_extent_and_keeps_content_width() {
 
 // ── Run-result (mag workflow) rendering ──────────────────────────────────
 
-/// The collapsed run-result entry reads as a `mag workflow` line carrying
+/// The collapsed run-result entry reads as a `mag result [async]` line carrying
 /// the human-readable run name and wall-clock duration — nothing else.
 /// The machine detail (exact run_id, node count) only appears once the
 /// entry is unfolded (Ctrl+O), matching the reasoning/tool fold vocabulary.
@@ -9739,8 +9807,8 @@ fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
     assert!(
-        out.contains("mag workflow") && out.contains("nefor_bughunt") && out.contains("34s"),
-        "collapsed run-result must show `mag workflow · <name> · <duration>`: {out:?}"
+        out.contains("mag result [async]") && out.contains("nefor_bughunt") && out.contains("34s"),
+        "collapsed run-result must show `mag result [async] · <name> · <duration>`: {out:?}"
     );
     assert!(
         !out.contains("mag-nefor_bughunt-2026") && !out.contains("2 nodes"),
@@ -9765,7 +9833,7 @@ fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
     );
 }
 
-/// A failed run keeps the `mag workflow` framing but appends a FAILED tail
+/// A failed run keeps the `mag result [async]` framing but appends a FAILED tail
 /// so a failure is unmistakable in the collapsed view.
 #[test]
 fn graph_result_failed_collapsed_reads_failed() {
@@ -9789,8 +9857,8 @@ fn graph_result_failed_collapsed_reads_failed() {
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
     assert!(
-        out.contains("mag workflow") && out.contains("broken_run") && out.contains("FAILED"),
-        "failed run-result must read `mag workflow · <name> · … · FAILED`: {out:?}"
+        out.contains("mag result [async]") && out.contains("broken_run") && !out.contains("FAILED"),
+        "failed run-result keeps outcome in glyph/style without an outcome word: {out:?}"
     );
 }
 
@@ -10016,7 +10084,7 @@ fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
 
 #[test]
 fn tool_path_summary_keeps_tail_collapsed_and_wraps_full_path_expanded() {
-    for (name, arg, label) in [("read_file", "path", "Read file"), ("mag", "file", "MAG")] {
+    for (name, arg, label) in [("read_file", "path", "read file"), ("mag", "file", "MAG")] {
         let mut engine = Engine::new(80, 30).expect("engine");
         load_chat_scenario(&mut engine);
         let _ = render_str(&mut engine);
@@ -10095,7 +10163,7 @@ fn tool_display_projection_preserves_entry_payload_identity() {
     engine.handle_key(key("ctrl_o")).expect("expand");
     let semantic = render_snapshot(&mut engine);
     assert!(
-        semantic.contains("loader · secret.txt (cwd: /exact/root)"),
+        semantic.contains("Load · secret.txt (cwd: /exact/root)"),
         "{semantic}"
     );
     assert!(!semantic.contains("EXACT INPUT TOKEN"), "{semantic}");

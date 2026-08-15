@@ -98,7 +98,7 @@ local state = {
 
 M.schema = {
   name        = "mag-eval",
-  display = { label = "mag-eval", primary = { arg = "intent" }, result = { kind = "content" } },
+  display = { label = "mag eval", primary = { arg = "intent" }, result = { kind = "content" }, lifecycle = "delayed" },
   description =
     "Evaluate one MAG node expression on the actor kernel. The tool submits a run and " ..
     "waits briefly for that exact run's canonical terminal result. A quick success or " ..
@@ -290,6 +290,8 @@ function M.handle(firing_id, args, metadata)
     firing_id  = firing_id,
     run_id     = run_id,
     run_name   = run_name,
+    invocation_kind = "eval",
+    invocation_label = intent,
     session_id = session_id,
     dispatcher_id = provenance.dispatcher_id,
     conversation_id = provenance.conversation_id,

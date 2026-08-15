@@ -357,9 +357,18 @@ fn validate_display_contract(display: &Value) -> Result<(), String> {
         .as_object()
         .ok_or_else(|| "display must be an object".to_owned())?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "label" | "primary" | "arguments" | "result") {
+        if !matches!(
+            key.as_str(),
+            "label" | "primary" | "arguments" | "result" | "lifecycle"
+        ) {
             return Err("display has unknown field".to_owned());
         }
+    }
+    if object
+        .get("lifecycle")
+        .is_some_and(|value| value.as_str() != Some("delayed"))
+    {
+        return Err("display.lifecycle must be delayed when present".into());
     }
     let valid_selector = |value: &Value| {
         value.as_str().is_some_and(|s| !s.is_empty())

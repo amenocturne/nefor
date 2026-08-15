@@ -138,15 +138,37 @@ local function semantic_projection(entry)
   local projected = display.project(entry.display, args, entry.output, entry.error, entry.name)
   return projected
 end
+local function invocation_mode(entry)
+  if type(entry.output) == "table" and entry.output.status == "executing" then return "async" end
+  return "sync"
+end
+
+local function delayed_header(entry)
+  local p = semantic_projection(entry)
+  local args = entry.raw_input or entry.input_table or {}
+  local kind = entry.name == "mag" and tostring(args.action or "compile") or nil
+  if entry.name == "mag" and kind == "execute" then
+    return "▸ mag execute [" .. invocation_mode(entry) .. "]"
+      .. ((p and p.primary and p.primary ~= "") and (" · " .. p.primary) or "")
+  end
+  if entry.name == "mag-eval" then
+    return "▸ mag eval [" .. invocation_mode(entry) .. "]"
+      .. ((p and p.primary and p.primary ~= "") and (" · " .. p.primary) or "")
+  end
+  return nil
+end
+
 local function tool_header(entry, glyph)
   local p = semantic_projection(entry)
-  local label = entry.name or (p and p.label) or "?"
+  local label = (p and p.label) or entry.name or "?"
   local header = glyph .. label
   if p and p.primary and p.primary ~= "" then header = header .. " · " .. p.primary end
   if entry.output == nil and not entry.error then header = header .. " …" end
   return header
 end
 local function collapsed_tool_header(entry)
+  local delayed = delayed_header(entry)
+  if delayed then return delayed end
   if entry.name ~= "mag" then return tool_header(entry, "▸ ") end
   local args = entry.raw_input
   if args == nil then args = entry.input_table or entry.input end
@@ -160,7 +182,7 @@ local function collapsed_tool_header(entry)
 end
 local function collapsed_path_tool_header(entry, projection)
   local style = entry.error and STYLE.tool_error or STYLE.tool_name
-  local label = entry.name or projection.label or "?"
+  local label = projection.label or entry.name or "?"
   local children = {
     tui.text { content = "▸ " .. label .. " · ", style = style, wrap = "none" },
     tui.expanded { child = tui.text {
@@ -269,17 +291,16 @@ local function graph_result_ident(entry)
   return tostring(entry.run_id or "?")
 end
 
--- Collapsed header: `◆ mag workflow · <run_name> · <duration>`. Machine
--- detail (exact run_id, node count, status/output) lives in the unfolded
--- state — this line is the at-a-glance summary only. A failed run appends
--- a FAILED tail so a failure is unmistakable in the collapsed view.
+-- Collapsed header: `◆ mag result [async] · <original label> · <duration>`.
+-- The terminal outcome is carried only by the existing glyph/style; no outcome
+-- word is appended. Machine detail lives in the unfolded state.
 local function graph_result_header(entry, glyph)
   local failed = (entry.status == "failed")
   local style = failed and STYLE.graph_result_error or STYLE.graph_result_name
-  local parts = { glyph .. "mag workflow", graph_result_ident(entry) }
+  local label = entry.invocation_label or graph_result_ident(entry)
+  local parts = { glyph .. "mag result [async]", label }
   local dur = humanize_duration_ms(entry.duration_ms)
   if dur then parts[#parts + 1] = dur end
-  if failed then parts[#parts + 1] = "FAILED" end
   return tui.text { content = table.concat(parts, " · "), style = style, wrap = "none" }
 end
 
@@ -536,6 +557,10 @@ local function compaction_expanded(entry)
 end
 
 function M.render(entry, _i, expanded, queued, raw_tool_id)
+  if entry.kind == "tool_call" and type(entry.display) == "table"
+      and entry.display.lifecycle == "delayed" and entry.output == nil then
+    return tui.text { content = "", wrap = "none" }
+  end
   if entry.kind == "error" then
     return render_error_entry(entry)
   end

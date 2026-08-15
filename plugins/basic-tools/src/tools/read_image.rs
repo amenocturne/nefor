@@ -51,7 +51,7 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "Read image",
+        "label": "read image",
         "primary": { "arg": "path", "cwd_arg": "cwd" },
         "result": { "kind": "receipt", "text": "image loaded" }
     })

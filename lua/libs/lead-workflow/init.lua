@@ -84,6 +84,11 @@ local replay_window  = require("core.replay_window")
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
 
+local monotonic_now_ms = function()
+  if type(nefor.now_ms) == "function" then return nefor.now_ms() end
+  return nil
+end
+
 local run_registry = RunRegistry.new({
   terminal_limit = 64,
   tombstone_limit = 256,
@@ -97,7 +102,7 @@ local run_registry = RunRegistry.new({
     return os.date("!%Y-%m-%dT%H:%M:%SZ")
   end,
   monotonic_ms = function()
-    return nil
+    return monotonic_now_ms()
   end,
 })
 
@@ -105,7 +110,9 @@ local dependency_module_roots = {}
 local agent_defaults = nil
 
 local SYNC_COMPLETION_GRACE_MS = 3000
+local TERMINATION_CONFIRM_TIMEOUT_MS = 30000
 local grace_scheduler
+local termination_scheduler
 
 local function default_grace_scheduler(delay_ms, callback)
   local seconds = math.max(delay_ms, 1) / 1000
@@ -204,6 +211,10 @@ local state = {
   -- terminal settlement claims the same slot for synchronous delivery.
   completion_grace_waiters = {},
 
+  -- Exact-run synchronous terminate calls, keyed by run_id. Each entry owns
+  -- its firing and defensive timeout until canonical terminal settlement.
+  termination_waiters = {},
+
   -- Kernel runs are concurrent: every kernel lifecycle event
   -- (`mag.actor_spawned` / `mag.actor_ready` / `mag.actor_killed` /
   -- `mag.run_complete`) carries its run_id, and the tracker keys straight
@@ -226,6 +237,8 @@ local emit_verdict_discarded
 local begin_completion_grace
 local cancel_completion_grace
 local expire_completion_grace
+local take_termination_waiters
+local expire_termination_waiter
 
 local function orchestration_profiles()
   local ok, cfg = pcall(require, "config")
@@ -1073,6 +1086,8 @@ local function emit_mag_result_block(run, status, output_path, err)
     run_name = run.run_name,
     status   = status,
     nodes    = ordered_node_summaries(run),
+    invocation_label = run.invocation_label,
+    invocation_kind = run.invocation_kind,
   }
   if status == "success" then
     if type(output_path) == "string" and #output_path > 0 then
@@ -1161,8 +1176,13 @@ local function handle_mag_run_result(body)
     emit_await_outcome(grace_waiter.firing_id, settled.outcome)
   end
 
+  local termination_waiters = take_termination_waiters(run_id)
+  for _, waiter in ipairs(termination_waiters or {}) do
+    emit_await_outcome(waiter.firing_id, settled.outcome)
+  end
+
   if not run_registry:claim_delivery(run_id) then return end
-  if grace_waiter then return end
+  if grace_waiter or termination_waiters then return end
   local root_owned = run.dispatcher_id == nil
   if failed then
     if root_owned then
@@ -1306,6 +1326,35 @@ await_run = function(firing_id, args, metadata)
   if result.immediate then emit_await_outcome(firing_id, result.immediate) end
 end
 
+local function schedule_timer(scheduler, delay_ms, callback)
+  return (scheduler or default_grace_scheduler)(delay_ms, callback)
+end
+
+take_termination_waiters = function(run_id)
+  local waiters = state.termination_waiters[run_id]
+  if not waiters then return nil end
+  state.termination_waiters[run_id] = nil
+  for _, waiter in ipairs(waiters) do
+    if type(waiter.cancel_timer) == "function" then waiter.cancel_timer() end
+  end
+  return waiters
+end
+
+expire_termination_waiter = function(run_id, firing_id)
+  local waiters = state.termination_waiters[run_id]
+  if not waiters then return false end
+  for index, waiter in ipairs(waiters) do
+    if waiter.firing_id == firing_id then
+      table.remove(waiters, index)
+      if #waiters == 0 then state.termination_waiters[run_id] = nil end
+      emit_tool_result_err(firing_id,
+        "terminate-graph: timed out awaiting canonical terminal confirmation for " .. run_id)
+      return true
+    end
+  end
+  return false
+end
+
 terminate_graph = function(firing_id, args, metadata)
   local run_id = args and args.run_id
   if type(run_id) ~= "string" or run_id == "" then
@@ -1337,14 +1386,14 @@ terminate_graph = function(firing_id, args, metadata)
   if first_request then
     emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
   end
-  emit_tool_result_ok(firing_id, {
-    canceled = true,
-    run_id = run_id,
-    status = "terminating",
-    notice = first_request and "termination requested; awaiting canonical MAG terminal confirmation"
-      or "termination was already requested; awaiting canonical MAG terminal confirmation",
-    run = summarize_run(run),
-  })
+  local waiter = { firing_id = firing_id }
+  local waiters = state.termination_waiters[run_id] or {}
+  state.termination_waiters[run_id] = waiters
+  waiters[#waiters + 1] = waiter
+  waiter.cancel_timer = schedule_timer(termination_scheduler,
+    TERMINATION_CONFIRM_TIMEOUT_MS, function()
+      expire_termination_waiter(run_id, firing_id)
+    end)
 end
 
 local GRAPH_STATUS_COOLDOWN_SECONDS = 60
@@ -1455,6 +1504,13 @@ local function terminate_active_graph(session_id)
   for run_id in pairs(state.completion_grace_waiters) do
     cancel_completion_grace(run_id)
   end
+  for run_id, waiters in pairs(state.termination_waiters) do
+    take_termination_waiters(run_id)
+    for _, waiter in ipairs(waiters) do
+      emit_tool_result_err(waiter.firing_id,
+        "terminate-graph: session ended before canonical terminal confirmation")
+    end
+  end
   state.active_plan = nil
   state.graph_status_cooldowns = {}
 
@@ -1484,7 +1540,7 @@ local function lead_workflow_tool_schemas()
   return {
     {
       name        = "graph-status",
-      display = { label = "Graph status", primary = { arg = "run_id" }, result = { kind = "content" } },
+      display = { label = "graph status", primary = { arg = "run_id" }, result = { kind = "content" } },
       description =
         "Report active graph runs, or one active/recent completed run " ..
         "when run_id is provided. One-shot snapshot for when you or the " ..
@@ -1503,7 +1559,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "await-run",
-      display = { label = "Await run", primary = { arg = "run_id" }, result = { kind = "content" } },
+      display = { label = "await run", primary = { arg = "run_id" }, result = { kind = "content" } },
       description =
         "Block until a previously acknowledged detached MAG run reaches its canonical " ..
         "terminal result. The root lead may address same-session runs globally; a non-root " ..
@@ -1526,8 +1582,8 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "terminate-graph",
-      display = { label = "Terminate graph", primary = { arg = "run_id" }, result = { kind = "content" } },
-      description = "Request termination of exactly one active graph run by explicit run_id; the run remains terminating until canonical MAG confirmation.",
+      display = { label = "terminate graph", primary = { arg = "run_id" }, result = { kind = "content" } },
+      description = "Request termination of exactly one active graph run by explicit run_id and block until its exact canonical terminal confirmation. The confirmation is returned synchronously and the redundant owner completion is suppressed; a defensive named timeout returns an ordinary tool failure.",
       parameters  = {
         type = "object",
         properties = {
@@ -1541,7 +1597,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "write-review",
-      display = { label = "Review plan", primary = { arg = "view" }, result = { kind = "content" } },
+      display = { label = "write review", primary = { arg = "view" }, result = { kind = "content" } },
       description =
         "Submit a plan for user review. BLOCKING — the call does not " ..
         "return until the user responds. /approve resolves it with " ..
@@ -1562,7 +1618,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "mag",
-      display = { label = "MAG", primary = { arg = "file" }, arguments = { { label = "action", arg = "action" } }, result = { kind = "content" } },
+      display = { label = "mag", primary = { arg = "file" }, arguments = { { label = "action", arg = "action" } }, result = { kind = "content" }, lifecycle = "delayed" },
       description =
         "Write, compile, and execute MAG programs on the actor kernel. " ..
         "Use action='write' to create/update a .mag file in the workspace. " ..
@@ -1655,6 +1711,8 @@ local function begin_mag_load(firing_id, action, args, ws, provenance)
     file       = args.file,
     run_id     = run_id,
     run_name   = graph_name,
+    invocation_kind = "execute",
+    invocation_label = args.file,
     session_id = provenance.session_id,
     dispatcher_id = provenance.dispatcher_id,
     conversation_id = provenance.conversation_id,
@@ -1778,12 +1836,16 @@ submit_loaded_run = function(pending, body, error_prefix)
     run_name = pending.run_name,
     session_id = pending.session_id,
     principal = "subagent",
+    invocation_kind = pending.invocation_kind,
+    invocation_label = pending.invocation_label,
     conversation_id = pending.conversation_id,
     artifact = artifact,
   }
   if next(overlay) ~= nil then exec.params_overlay = overlay end
   local run = register_active_run(pending.run_id, actors, terminal_id,
     pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id)
+  run.invocation_label = pending.invocation_label or pending.run_name
+  run.invocation_kind = pending.invocation_kind
   begin_completion_grace(run, async_run_ack(pending, body))
   emit_as(SOURCE_NAME, "mag", exec)
   return true
@@ -1998,6 +2060,16 @@ local function receive_msg(entry)
       clear_pending_plan(plan)
     end
     if run_registry:detach_waiter(body.id) then return end
+    for run_id, waiters in pairs(state.termination_waiters) do
+      for index, waiter in ipairs(waiters) do
+        if waiter.firing_id == body.id then
+          if type(waiter.cancel_timer) == "function" then waiter.cancel_timer() end
+          table.remove(waiters, index)
+          if #waiters == 0 then state.termination_waiters[run_id] = nil end
+          return
+        end
+      end
+    end
     cancel_completion_grace_by_firing(body.id)
     mag_eval.cancel(body.id)
     invalidate_pending_mag_loads(body.id)
@@ -2181,6 +2253,17 @@ local M = {
     set_grace_scheduler = function(scheduler)
       grace_scheduler = scheduler
     end,
+    termination_confirm_timeout_ms = TERMINATION_CONFIRM_TIMEOUT_MS,
+    expire_termination_waiter = expire_termination_waiter,
+    set_termination_scheduler = function(scheduler)
+      termination_scheduler = scheduler
+    end,
+    set_monotonic_now_ms = function(now_fn)
+      monotonic_now_ms = now_fn or function()
+        if type(nefor.now_ms) == "function" then return nefor.now_ms() end
+        return nil
+      end
+    end,
     set_graph_status_now = function(now_fn)
       graph_status_now = now_fn or os.time
     end,
@@ -2200,6 +2283,15 @@ local M = {
       end
       state.completion_grace_waiters = {}
       grace_scheduler = nil
+      for run_id in pairs(state.termination_waiters) do
+        take_termination_waiters(run_id)
+      end
+      state.termination_waiters = {}
+      termination_scheduler = nil
+      monotonic_now_ms = function()
+        if type(nefor.now_ms) == "function" then return nefor.now_ms() end
+        return nil
+      end
       dependency_module_roots = {}
       agent_defaults = nil
       mag_eval._internals.reset()

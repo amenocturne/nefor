@@ -346,7 +346,7 @@ local function base_schemas()
   return {
     {
       name = "list_dir",
-      display = { label = "List directory", primary = { arg = "path" }, result = { kind = "content" } },
+      display = { label = "list directory", primary = { arg = "path" }, result = { kind = "content" } },
       description =
         "List the immediate children of a directory. Returns one entry " ..
         "per line, prefixed with `(d)` for directories and `(f)` for " ..
@@ -367,7 +367,7 @@ local function base_schemas()
     },
     {
       name = "search_text",
-      display = { label = "Search text", primary = { arg = "pattern" }, arguments = { { label = "in", arg = "path" } }, result = { kind = "content" } },
+      display = { label = "search text", primary = { arg = "pattern" }, arguments = { { label = "in", arg = "path" } }, result = { kind = "content" } },
       description =
         "Search for a regex pattern in files under a path (recursively). " ..
         "Returns matching lines as `path:line:match`. Uses ripgrep when " ..
@@ -392,7 +392,7 @@ local function base_schemas()
     },
     {
       name = "python-read",
-      display = { label = "Analyze workspace", primary = { arg = "task" }, result = { kind = "content" } },
+      display = { label = "analyze workspace", primary = { arg = "task" }, result = { kind = "content" } },
       description =
         "Run complex read-only Python analysis over workspace files. " ..
         "Prefer Bash/read tools for simple inspection. Do not use raw " ..
@@ -410,7 +410,7 @@ local function base_schemas()
     },
     {
       name = "instructions",
-      display = { label = "Load instructions", primary = { arg = "name" }, result = { kind = "receipt", text = "instructions loaded" } },
+      display = { label = "load instructions", primary = { arg = "name" }, result = { kind = "receipt", text = "instructions loaded" } },
       description =
         "Read one or more instruction files by name. When the " ..
         "system prompt says to read instructions (e.g. 'instruction:dev-mode.md'), " ..
@@ -432,7 +432,7 @@ local function base_schemas()
     },
     {
       name = "discover_instruction_files",
-      display = { label = "Discover instructions", primary = { arg = "path" }, arguments = { { label = "scope", arg = "scope" }, { label = "unread only", arg = "unread_only" } }, result = { kind = "content" } },
+      display = { label = "discover instructions", primary = { arg = "path" }, arguments = { { label = "scope", arg = "scope" }, { label = "unread only", arg = "unread_only" } }, result = { kind = "content" } },
       description =
         "List AGENTS.md and CLAUDE.md instruction files available near " ..
         "a path. Does not read file contents. Use ordinary read_file on " ..
@@ -460,7 +460,7 @@ local function base_schemas()
     },
     {
       name = "skill",
-      display = { label = "Load skill", primary = { arg = "name" }, result = { kind = "receipt", text = "skill loaded" } },
+      display = { label = "load skill", primary = { arg = "name" }, result = { kind = "receipt", text = "skill loaded" } },
       description =
         "Load a workflow skill by name from the config's skills directory " ..
         "(" .. SKILLS_DIR .. "/<name>/skill.md). Read the skill BEFORE acting on a " ..

@@ -73,10 +73,11 @@ local function loading_widget(state)
 end
 
 local function transcript_entries(state)
-  if type(state.queued_entry_id) ~= "string" then return state.entries or {} end
   local visible = {}
   for _, entry in ipairs(state.entries or {}) do
-    if not queued_input.is_queued_entry(state, entry) then
+    local delayed_running = entry.kind == "tool_call" and type(entry.display) == "table"
+      and entry.display.lifecycle == "delayed" and entry.output == nil
+    if not delayed_running and not queued_input.is_queued_entry(state, entry) then
       visible[#visible + 1] = entry
     end
   end

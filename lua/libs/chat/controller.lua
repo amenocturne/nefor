@@ -918,7 +918,9 @@ local function handle_graph_result_append(msg, state)
       msg.output,
       msg.error,
       msg.duration_ms,
-      msg.run_name)
+      msg.run_name,
+      msg.invocation_label,
+      msg.invocation_kind)
   ), {}
 end
 
