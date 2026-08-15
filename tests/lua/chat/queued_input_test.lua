@@ -21,6 +21,11 @@ local observed_interactive = queued_input.observe_external_submit(
   direct, "first", "submit-first")
 eq(#observed_interactive.entries, 1, "interactive optimistic entry is not duplicated")
 
+eq(queued_input.is_queued_entry({ queued_entry_id = nil }, { role = "assistant" }), false,
+  "entries without local identity cannot match an absent queue owner")
+eq(queued_input.is_queued_entry({ queued_entry_id = "queued-owner" },
+  { local_id = "queued-owner" }), true, "queue ownership requires matching string identities")
+
 local interleaved = {
   entries = { direct.entries[1], { role = "system", text = "result" } },
   pending_submission_ids = direct.pending_submission_ids,

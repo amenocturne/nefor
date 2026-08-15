@@ -39,7 +39,9 @@ local function join_with_one_space(left, right)
 end
 
 function M.is_queued_entry(state, entry)
-  return type(entry) == "table" and entry.local_id == state.queued_entry_id
+  return type(state.queued_entry_id) == "string"
+    and type(entry) == "table"
+    and entry.local_id == state.queued_entry_id
 end
 
 function M.submit(state, text, busy, submission_id)

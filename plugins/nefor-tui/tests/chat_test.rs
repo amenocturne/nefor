@@ -4443,6 +4443,28 @@ fn mag_approval_cancel_only_retracts_its_correlated_popup() {
 }
 
 #[test]
+fn completed_short_turn_renders_once_in_tall_viewport() {
+    let mut engine = Engine::new(160, 120).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "test");
+    let _ = engine.take_emit_queue();
+    fixture_assistant_completed(
+        &mut engine,
+        Some("Test received successfully.".into()),
+        json!({ "model": "gpt-5.6-sol", "duration_ms": 2000 }),
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert_eq!(
+        out.matches("Test received successfully.").count(),
+        1,
+        "one semantic assistant entry must occupy the rendered grid once:\n{out}"
+    );
+}
+
+#[test]
 fn canonical_turn_completion_reconciles_pending_before_mag_result() {
     let mut engine = Engine::new(100, 30).expect("engine");
     load_chat_scenario(&mut engine);

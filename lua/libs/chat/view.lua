@@ -73,7 +73,7 @@ local function loading_widget(state)
 end
 
 local function transcript_entries(state)
-  if state.queued_entry_id == nil then return state.entries or {} end
+  if type(state.queued_entry_id) ~= "string" then return state.entries or {} end
   local visible = {}
   for _, entry in ipairs(state.entries or {}) do
     if not queued_input.is_queued_entry(state, entry) then
