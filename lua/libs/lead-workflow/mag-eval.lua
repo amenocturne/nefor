@@ -20,6 +20,7 @@
 local mag = require("libs.mag-workspace")
 local sessions = require("libs.sessions")
 local envelope = require("core.envelope")
+local tool_display = require("libs.chat.tool_display")
 
 local emit_as = envelope.emit_as
 
@@ -100,13 +101,13 @@ M.schema = {
   name        = "mag-eval",
   display = {
     compact = { label = "mag eval", primary = { label = "intent", select = { source = "args", path = "intent" }, kind = "scalar" } },
-    expanded = { label = "mag eval", fields = {} },
-    result = { kind = "receipt", text = "MAG run submitted", fields = {
+    expanded = { label = "mag eval", fields = tool_display.fields() },
+    result = { kind = "receipt", text = "MAG run submitted", fields = tool_display.fields({
       { label = "status", select = { source = "result", path = "status" }, kind = "status", omit = "missing" },
       { label = "run", select = { source = "result", path = "run_id" }, kind = "scalar", omit = "missing" },
       { label = "source path", select = { source = "result", path = "source_path" }, kind = "path", omit = "missing" },
       { label = "output path", select = { source = "result", path = "output_path" }, kind = "path", omit = "missing" },
-    } },
+    }) },
     lifecycle = "delayed",
   },
   description =

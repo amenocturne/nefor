@@ -2,6 +2,16 @@
 -- every compact/expanded choice; the renderer only interprets this data.
 local M = {}
 
+function M.fields(values)
+  values = values or {}
+  if type(values) ~= "table" then error("tool_display.fields: values must be a table", 2) end
+  if type(nefor) == "table" and type(nefor.json) == "table"
+      and type(nefor.json.mark_array) == "function" then
+    nefor.json.mark_array(values)
+  end
+  return values
+end
+
 local FIELD_KINDS = {
   text = true, scalar = true, status = true, path = true, bytes = true,
   list = true, structured = true,

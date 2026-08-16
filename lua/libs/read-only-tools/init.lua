@@ -65,8 +65,8 @@ end
 local function display(label, primary, fields, result_kind, result_text, result_fields, lifecycle)
   return {
     compact = { label = label, primary = primary },
-    expanded = { label = label, fields = fields or {} },
-    result = { kind = result_kind, text = result_text, fields = result_fields or {} },
+    expanded = { label = label, fields = tool_display.fields(fields) },
+    result = { kind = result_kind, text = result_text, fields = tool_display.fields(result_fields) },
     lifecycle = lifecycle,
   }
 end

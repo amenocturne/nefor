@@ -1108,7 +1108,10 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), Transpo
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use mlua::{Function, Lua, Table, Value as LuaValue};
     use serde_json::json;
 
     fn make_state() -> GateState {
@@ -1141,6 +1144,201 @@ mod tests {
         .as_object()
         .expect("obj")
         .clone()
+    }
+
+    fn production_lua() -> Lua {
+        let lua = Lua::new();
+        let nefor = lua.create_table().expect("nefor table");
+        nefor::lua::bindings::install_json(&lua, &nefor).expect("real json binding");
+
+        let log = lua.create_table().expect("log table");
+        let no_op: Function = lua
+            .create_function(|_, _: mlua::Variadic<LuaValue>| Ok(()))
+            .expect("no-op logger");
+        for level in ["info", "warn", "error", "debug"] {
+            log.set(level, no_op.clone()).expect("logger level");
+        }
+        nefor.set("log", log).expect("install logger");
+
+        let engine = lua.create_table().expect("engine table");
+        let calls = lua.create_table().expect("calls table");
+        lua.globals()
+            .set("_engine_calls", calls)
+            .expect("calls global");
+        engine
+            .set(
+                "send",
+                lua.create_function(|lua, args: mlua::Variadic<LuaValue>| {
+                    let payload = match args.first() {
+                        Some(LuaValue::String(value)) => value.to_str()?.to_owned(),
+                        _ => return Ok(()),
+                    };
+                    let calls: Table = lua.globals().get("_engine_calls")?;
+                    calls.set(calls.len()? + 1, payload)?;
+                    Ok(())
+                })
+                .expect("send function"),
+            )
+            .expect("install send");
+        engine
+            .set(
+                "now",
+                lua.create_function(|_, _: ()| Ok("2026-06-01T00:00:00.000Z"))
+                    .expect("now function"),
+            )
+            .expect("install now");
+        engine
+            .set(
+                "plugins",
+                lua.create_function(|lua, _: ()| lua.create_table())
+                    .expect("plugins function"),
+            )
+            .expect("install plugins");
+        engine
+            .set(
+                "exit",
+                lua.create_function(|_, _: mlua::Variadic<LuaValue>| Ok(()))
+                    .expect("exit function"),
+            )
+            .expect("install exit");
+        nefor.set("engine", engine).expect("install engine");
+
+        let bus = lua.create_table().expect("bus table");
+        bus.set(
+            "on_event",
+            lua.create_function(|_, _: mlua::Variadic<LuaValue>| Ok(()))
+                .expect("on_event function"),
+        )
+        .expect("install on_event");
+        nefor.set("bus", bus).expect("install bus");
+
+        let fs = lua.create_table().expect("fs table");
+        fs.set(
+            "data_root",
+            lua.create_function(|_, _: ()| Ok("/var/empty/nefor-tool-advertise-test"))
+                .expect("data_root function"),
+        )
+        .expect("install data_root");
+        nefor.set("fs", fs).expect("install fs");
+        lua.globals().set("nefor", nefor).expect("nefor global");
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repository root")
+            .to_path_buf();
+        let starter = root.join("examples/nefor-agent");
+        let shared = root.join("lua");
+        let tool_gate = root.join("plugins/tool-gate/lua");
+        lua.load(format!(
+            r#"package.path = table.concat({{
+              "{}/?.lua", "{}/?/init.lua",
+              "{}/?.lua", "{}/?/init.lua",
+              "{}/?.lua", "{}/?/init.lua", package.path
+            }}, ";")"#,
+            starter.display(),
+            starter.display(),
+            shared.display(),
+            shared.display(),
+            tool_gate.display(),
+            tool_gate.display(),
+        ))
+        .exec()
+        .expect("package path");
+        lua
+    }
+
+    fn take_advertisement(lua: &Lua) -> Map<String, Value> {
+        let payload: String = lua
+            .load(
+                r#"
+                local calls = _engine_calls
+                local payload = calls[#calls]
+                _engine_calls = {}
+                return payload
+                "#,
+            )
+            .eval()
+            .expect("captured advertisement");
+        serde_json::from_str::<Value>(&payload)
+            .expect("advertisement JSON")
+            .get("body")
+            .and_then(Value::as_object)
+            .expect("advertisement body")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn production_lua_advertisements_cross_json_into_strict_catalog() {
+        let lua = production_lua();
+        lua.load(
+            r#"
+            local lead = require("libs.lead-workflow")
+            lead.receive_msg({
+              origin = "tool-gate",
+              payload = nefor.json.encode({ body = { kind = "tool-gate.hello" } }),
+            })
+            "#,
+        )
+        .exec()
+        .expect("lead advertisement");
+        let lead = take_advertisement(&lua);
+
+        lua.load(
+            r#"
+            local spec = require("libs.read-only-tools").build({
+              include = { "list_dir", "skill" },
+            })
+            spec.receive_msg({
+              origin = "tool-gate",
+              payload = nefor.json.encode({ body = { kind = "tool-gate.hello" } }),
+            })
+            "#,
+        )
+        .exec()
+        .expect("read-only advertisement");
+        let read_only = take_advertisement(&lua);
+
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        for advertisement in [lead, read_only] {
+            handle_tools_advertise(&tx, &advertisement, &mut state)
+                .await
+                .expect("strict advertisement handling");
+            let event: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+            assert_eq!(event["body"]["kind"], "tool.register", "{event}");
+        }
+
+        for name in [
+            "graph-status",
+            "await-run",
+            "terminate-graph",
+            "write-review",
+            "mag",
+            "mag-eval",
+            "list_dir",
+            "skill",
+        ] {
+            assert!(state.tool_owner.contains_key(name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn display_fields_marks_empty_table_as_json_array() {
+        let lua = production_lua();
+        let encoded: String = lua
+            .load(
+                r#"
+                local display = require("libs.chat.tool_display")
+                return nefor.json.encode({ fields = display.fields() })
+                "#,
+            )
+            .eval()
+            .expect("encode marked fields");
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap()["fields"],
+            json!([])
+        );
     }
 
     #[test]
