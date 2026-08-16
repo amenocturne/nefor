@@ -63,13 +63,14 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "read file",
-        "primary": { "arg": "path", "cwd_arg": "cwd" },
-        "arguments": [
-            { "label": "offset", "arg": "offset" },
-            { "label": "max bytes", "arg": "max_bytes" }
-        ],
-        "result": { "kind": "receipt", "text": "content loaded" }
+        "compact": { "label": "read file", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
+        "expanded": { "label": "read file", "fields": [
+            { "label": "offset", "select": { "source": "args", "path": "offset" }, "kind": "scalar", "omit": "missing" },
+            { "label": "max bytes", "select": { "source": "args", "path": "max_bytes" }, "kind": "bytes", "omit": "missing" }
+        ] },
+        "result": { "kind": "content", "fields": [
+            { "label": "content", "select": { "source": "result", "path": "$" }, "kind": "text", "max_lines": 20, "max_bytes": 1600 }
+        ] }
     })
 }
 

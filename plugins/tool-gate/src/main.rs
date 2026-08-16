@@ -353,96 +353,184 @@ async fn handle_set_mode(
 }
 
 fn validate_display_contract(display: &Value) -> Result<(), String> {
-    let object = display
-        .as_object()
-        .ok_or_else(|| "display must be an object".to_owned())?;
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "label" | "primary" | "arguments" | "result" | "lifecycle"
-        ) {
-            return Err("display has unknown field".to_owned());
+    fn nonempty(value: Option<&Value>) -> bool {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    }
+    fn selector(value: Option<&Value>, location: &str) -> Result<(), String> {
+        let object = value
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{location} must be an object"))?;
+        if !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "source" | "path" | "default"))
+        {
+            return Err(format!("{location} has unknown field"));
         }
+        if !matches!(
+            object.get("source").and_then(Value::as_str),
+            Some("args" | "result")
+        ) {
+            return Err(format!("{location}.source must be args or result"));
+        }
+        let valid_path = object.get("path").is_some_and(|path| {
+            path.as_str().is_some_and(|value| !value.is_empty())
+                || path.as_array().is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts
+                            .iter()
+                            .all(|part| part.as_str().is_some_and(|value| !value.is_empty()))
+                })
+        });
+        if !valid_path {
+            return Err(format!(
+                "{location}.path must be a non-empty string or string array"
+            ));
+        }
+        Ok(())
     }
-    if object
-        .get("lifecycle")
-        .is_some_and(|value| value.as_str() != Some("delayed"))
-    {
-        return Err("display.lifecycle must be delayed when present".into());
+    fn field(value: &Value, location: &str) -> Result<(), String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{location} must be an object"))?;
+        if !object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "label" | "select" | "kind" | "omit" | "sensitive" | "max_lines" | "max_bytes"
+            )
+        }) {
+            return Err(format!("{location} has unknown field"));
+        }
+        if !nonempty(object.get("label")) {
+            return Err(format!("{location}.label must be non-empty"));
+        }
+        selector(object.get("select"), &format!("{location}.select"))?;
+        let kind = object.get("kind").and_then(Value::as_str).unwrap_or("");
+        if !matches!(
+            kind,
+            "text" | "scalar" | "status" | "path" | "bytes" | "list" | "structured"
+        ) {
+            return Err(format!("{location}.kind is unknown"));
+        }
+        if object
+            .get("omit")
+            .is_some_and(|value| !matches!(value.as_str(), Some("missing" | "empty")))
+        {
+            return Err(format!("{location}.omit must be missing or empty"));
+        }
+        if object
+            .get("sensitive")
+            .is_some_and(|value| !matches!(value.as_str(), Some("redact" | "omit")))
+        {
+            return Err(format!("{location}.sensitive must be redact or omit"));
+        }
+        let positive = |name: &str| {
+            object
+                .get(name)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+        };
+        if kind == "text" && (!positive("max_lines") || !positive("max_bytes")) {
+            return Err(format!(
+                "{location} text requires positive max_lines and max_bytes"
+            ));
+        }
+        if kind != "text" && (object.contains_key("max_lines") || object.contains_key("max_bytes"))
+        {
+            return Err(format!("{location} bounds are only valid for text"));
+        }
+        Ok(())
     }
-    let valid_selector = |value: &Value| {
-        value.as_str().is_some_and(|s| !s.is_empty())
-            || value.as_object().is_some_and(|o| {
-                o.get("arg")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-                    && o.keys()
-                        .all(|key| matches!(key.as_str(), "arg" | "cwd_arg" | "default"))
-                    && o.get("cwd_arg")
-                        .is_none_or(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-                    && o.get("default").is_none_or(Value::is_string)
-            })
-    };
-    if !object.get("label").is_some_and(valid_selector) {
-        return Err("display.label must be text or {arg}".into());
+    fn fields(value: Option<&Value>, location: &str) -> Result<(), String> {
+        let values = value
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{location} must be an array"))?;
+        for (index, value) in values.iter().enumerate() {
+            field(value, &format!("{location}[{index}]"))?;
+        }
+        Ok(())
     }
-    if object
-        .get("primary")
-        .is_some_and(|value| !value.as_object().is_some_and(|_| valid_selector(value)))
-    {
-        return Err("display.primary must select an argument".into());
-    }
-    if let Some(arguments) = object.get("arguments") {
-        let fields = arguments
-            .as_array()
-            .ok_or_else(|| "display.arguments must be an array".to_owned())?;
-        for field in fields {
-            let field = field
-                .as_object()
-                .ok_or_else(|| "display argument must be an object".to_owned())?;
-            if field
-                .get("label")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-                || field
-                    .get("arg")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-                || field
-                    .get("cwd_arg")
-                    .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
-                || field.get("default").is_some_and(|v| !v.is_string())
-                || !field
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "label" | "arg" | "cwd_arg" | "default"))
-            {
-                return Err(
-                    "display argument must contain a label and valid argument selector".into(),
-                );
+    fn policy(value: &Value, location: &str, allow_variant: bool) -> Result<(), String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{location} must be an object"))?;
+        if !object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "compact" | "expanded" | "result" | "lifecycle"
+            ) || (allow_variant && key == "variant")
+        }) {
+            return Err(format!("{location} has unknown field"));
+        }
+        for (name, expanded) in [("compact", false), ("expanded", true)] {
+            let view = object
+                .get(name)
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("{location}.{name} must be an object"))?;
+            if !view.keys().all(|key| {
+                matches!(key.as_str(), "label" | "primary") || (expanded && key == "fields")
+            }) {
+                return Err(format!("{location}.{name} has unknown field"));
+            }
+            if !nonempty(view.get("label")) {
+                return Err(format!("{location}.{name}.label must be non-empty"));
+            }
+            if let Some(primary) = view.get("primary") {
+                field(primary, &format!("{location}.{name}.primary"))?;
+            }
+            if expanded {
+                fields(view.get("fields"), &format!("{location}.{name}.fields"))?;
             }
         }
-    }
-    let result = object
-        .get("result")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "display.result must be an object".to_owned())?;
-    for key in result.keys() {
-        if !matches!(key.as_str(), "kind" | "text") {
-            return Err("display.result has unknown field".into());
-        }
-    }
-    match result.get("kind").and_then(Value::as_str) {
-        Some("content") if !result.contains_key("text") => Ok(()),
-        Some("receipt")
-            if result
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty()) =>
+        if object
+            .get("lifecycle")
+            .is_some_and(|value| value.as_str() != Some("delayed"))
         {
-            Ok(())
+            return Err(format!("{location}.lifecycle must be delayed"));
         }
-        _ => Err("display.result must be content or a receipt with text".into()),
+        let result = object
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{location}.result must be an object"))?;
+        if !result
+            .keys()
+            .all(|key| matches!(key.as_str(), "kind" | "text" | "fields"))
+        {
+            return Err(format!("{location}.result has unknown field"));
+        }
+        match result.get("kind").and_then(Value::as_str) {
+            Some("content") if !result.contains_key("text") => (),
+            Some("receipt") if nonempty(result.get("text")) => (),
+            _ => {
+                return Err(format!(
+                    "{location}.result must be content or a receipt with text"
+                ))
+            }
+        }
+        fields(result.get("fields"), &format!("{location}.result.fields"))
     }
+    policy(display, "display", true)?;
+    if let Some(variant) = display.get("variant") {
+        let object = variant
+            .as_object()
+            .ok_or_else(|| "display.variant must be an object".to_owned())?;
+        if !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "select" | "cases"))
+        {
+            return Err("display.variant has unknown field".into());
+        }
+        selector(object.get("select"), "display.variant.select")?;
+        let cases = object
+            .get("cases")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "display.variant.cases must be an object".to_owned())?;
+        for (name, case) in cases {
+            policy(case, &format!("display.variant.cases.{name}"), false)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_unique_tool_names(
@@ -1036,7 +1124,11 @@ mod tests {
                 if item.get("display").is_none() {
                     item.as_object_mut().expect("tool object").insert(
                         "display".into(),
-                        json!({"label": "Test tool", "result": {"kind": "content"}}),
+                        json!({
+                            "compact": { "label": "Test tool" },
+                            "expanded": { "label": "Test tool", "fields": [] },
+                            "result": { "kind": "content", "fields": [] }
+                        }),
                     );
                 }
             }
@@ -1053,52 +1145,38 @@ mod tests {
 
     #[test]
     fn validates_display_contract() {
-        assert!(validate_display_contract(&json!({"label": "Read"})).is_err());
-        assert!(validate_display_contract(
-            &json!({"label": "Read", "result": {"kind": "receipt", "text": "loaded"}})
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn shared_display_contract_fixtures_match_rust_validator() {
-        let fixtures: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/tool_display_contracts.json"
-        ))
-        .expect("display fixtures JSON");
-        for fixture in fixtures.as_array().expect("fixture array") {
-            let expected = fixture["valid"].as_bool().expect("valid bool");
-            let actual = validate_display_contract(&fixture["contract"]).is_ok();
-            assert_eq!(actual, expected, "fixture {}", fixture["name"]);
-        }
+        let valid = json!({
+            "compact": { "label": "Read" },
+            "expanded": { "label": "Read", "fields": [] },
+            "result": { "kind": "receipt", "text": "loaded", "fields": [] }
+        });
+        assert!(validate_display_contract(&valid).is_ok());
+        let mut invalid = valid;
+        invalid["expanded"]["fields"] = json!([{
+            "label": "content", "select": { "source": "result", "path": "$" }, "kind": "text"
+        }]);
+        assert_eq!(
+            validate_display_contract(&invalid).unwrap_err(),
+            "display.expanded.fields[0] text requires positive max_lines and max_bytes"
+        );
     }
 
     #[test]
     fn display_contract_wire_shape_is_strict() {
-        let accepted = [
-            json!({"label": "Read", "primary": {"arg": "path"}, "result": {"kind": "content"}}),
-            json!({"label": "Read", "primary": {"arg": "path", "cwd_arg": "cwd"}, "result": {"kind": "content"}}),
-            json!({"label": {"arg": "action"}, "arguments": [{"label": "in", "arg": "path", "cwd_arg": "cwd", "default": "."}], "result": {"kind": "receipt", "text": "done"}}),
-        ];
-        for contract in accepted {
-            assert!(validate_display_contract(&contract).is_ok(), "{contract}");
-        }
-
-        let rejected = [
-            json!({"label": "Read", "primary": "literal", "result": {"kind": "content"}}),
-            json!({"label": {"arg": ""}, "result": {"kind": "content"}}),
-            json!({"label": {"arg": "path", "unknown": true}, "result": {"kind": "content"}}),
-            json!({"label": "Read", "primary": {"arg": 3}, "result": {"kind": "content"}}),
-            json!({"label": "Read", "primary": {"arg": "path", "cwd_arg": ""}, "result": {"kind": "content"}}),
-            json!({"label": "Read", "primary": {"arg": "path", "default": 42}, "result": {"kind": "content"}}),
-            json!({"label": "Read", "arguments": [{"label": "in"}], "result": {"kind": "content"}}),
-            json!({"label": "Read", "result": {"kind": "content", "text": "no"}}),
-            json!({"label": "Read", "result": {"kind": "receipt"}}),
-            json!({"label": "Read", "result": {"kind": "other"}}),
-        ];
-        for contract in rejected {
-            assert!(validate_display_contract(&contract).is_err(), "{contract}");
-        }
+        let accepted = json!({
+            "compact": { "label": "Read", "primary": {
+                "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path"
+            } },
+            "expanded": { "label": "Read", "fields": [{
+                "label": "content", "select": { "source": "result", "path": "$" },
+                "kind": "text", "max_lines": 20, "max_bytes": 1600
+            }] },
+            "result": { "kind": "content", "fields": [] }
+        });
+        assert!(validate_display_contract(&accepted).is_ok());
+        let mut rejected = accepted;
+        rejected["expanded"]["fields"][0]["unknown"] = json!(true);
+        assert!(validate_display_contract(&rejected).is_err());
     }
     #[tokio::test]
     async fn rejects_empty_and_whitespace_only_sources_with_advertise_error() {

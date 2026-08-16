@@ -138,6 +138,13 @@ fn hello_body() -> Map<String, Value> {
 }
 
 fn tools_advertise_body(gate: &str) -> Map<String, Value> {
+    let compact = |label: &str, primary: &str, receipt: &str| {
+        json!({
+            "compact": { "label": label, "primary": { "label": primary, "select": { "source": "args", "path": primary }, "kind": "path" } },
+            "expanded": { "label": label, "fields": [] },
+            "result": { "kind": "receipt", "text": receipt, "fields": [] }
+        })
+    };
     object(json!({
         "kind": format!("{gate}.tools.advertise"),
         "source": PLUGIN_NAME,
@@ -147,30 +154,14 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
                 "description": "Create a fresh Git worktree; existing paths or branches are errors.",
                 "parameters": create_schema(),
                 "context": {},
-                "display": {
-                    "label": "create worktree",
-                    "primary": { "arg": "path" },
-                    "arguments": [
-                        { "label": "branch", "arg": "branch" },
-                        { "label": "base", "arg": "base" }
-                    ],
-                    "result": { "kind": "receipt", "text": "worktree created" }
-                }
+                "display": compact("create worktree", "path", "worktree created")
             },
             {
                 "name": OPEN_TOOL,
                 "description": "Open and validate an explicitly named existing Git worktree.",
                 "parameters": open_schema(),
                 "context": {},
-                "display": {
-                    "label": "open worktree",
-                    "primary": { "arg": "path" },
-                    "arguments": [
-                        { "label": "branch", "arg": "branch" },
-                        { "label": "repository", "arg": "repository" }
-                    ],
-                    "result": { "kind": "receipt", "text": "worktree opened" }
-                }
+                "display": compact("open worktree", "path", "worktree opened")
             }
         ]
     }))
@@ -248,8 +239,11 @@ mod tests {
             Some(OPEN_TOOL)
         );
         for tool in tools {
-            assert!(tool.pointer("/display/label").is_some());
-            assert!(tool.pointer("/display/primary/arg").is_some());
+            assert!(tool.pointer("/display/compact/label").is_some());
+            assert!(tool
+                .pointer("/display/compact/primary/select/path")
+                .is_some());
+            assert!(tool.pointer("/display/expanded/fields").is_some());
             assert!(tool.pointer("/display/result/kind").is_some());
         }
     }

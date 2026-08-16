@@ -135,58 +135,28 @@ local function semantic_projection(entry)
   local display = require("libs.chat.tool_display")
   local args = entry.raw_input
   if args == nil then args = entry.input_table or entry.input end
-  local projected = display.project(entry.display, args, entry.output, entry.error, entry.name)
+  local projected, err = display.project(entry.display, args, entry.output, entry.error)
+  if not projected then error("tool display invariant: " .. tostring(err)) end
   if projected and type(entry.display_primary) == "string" and entry.display_primary ~= "" then
     projected.primary = entry.display_primary
     projected.primary_is_path = false
   end
   return projected
 end
-local function invocation_mode(entry)
-  if type(entry.output) == "table" and entry.output.status == "executing" then return "async" end
-  return "sync"
-end
-
-local function delayed_header(entry)
-  local p = semantic_projection(entry)
-  local args = entry.raw_input or entry.input_table or {}
-  local kind = entry.name == "mag" and tostring(args.action or "compile") or nil
-  if entry.name == "mag" and kind == "execute" then
-    return "▸ mag execute [" .. invocation_mode(entry) .. "]"
-      .. ((p and p.primary and p.primary ~= "") and (" · " .. p.primary) or "")
-  end
-  if entry.name == "mag-eval" then
-    return "▸ mag eval [" .. invocation_mode(entry) .. "]"
-      .. ((p and p.primary and p.primary ~= "") and (" · " .. p.primary) or "")
-  end
-  return nil
-end
-
 local function tool_header(entry, glyph)
-  local p = semantic_projection(entry)
-  local label = (p and p.label) or entry.name or "?"
+  local p = assert(semantic_projection(entry))
+  local label = p.label
   local header = glyph .. label
   if p and p.primary and p.primary ~= "" then header = header .. " · " .. p.primary end
   if entry.output == nil and not entry.error then header = header .. " …" end
   return header
 end
 local function collapsed_tool_header(entry)
-  local delayed = delayed_header(entry)
-  if delayed then return delayed end
-  if entry.name ~= "mag" then return tool_header(entry, "▸ ") end
-  local args = entry.raw_input
-  if args == nil then args = entry.input_table or entry.input end
-  local action = type(args) == "table" and args.action or nil
-  if action == nil then action = "compile" end
-  local p = semantic_projection(entry)
-  local header = "▸ mag " .. tostring(action)
-  if p and p.primary and p.primary ~= "" then header = header .. " · " .. p.primary end
-  if entry.output == nil and not entry.error then header = header .. " …" end
-  return header
+  return tool_header(entry, "▸ ")
 end
 local function collapsed_path_tool_header(entry, projection)
   local style = entry.error and STYLE.tool_error or STYLE.tool_name
-  local label = projection.label or entry.name or "?"
+  local label = projection.label
   local children = {
     tui.text { content = "▸ " .. label .. " · ", style = style, wrap = "none" },
     tui.expanded { child = tui.text {
@@ -227,16 +197,7 @@ local function tool_collapsed(entry)
   return tui.column { gap = 0, children = rows }
 end
 local function tool_expanded(entry, raw)
-  local p = semantic_projection(entry)
-  if not p then
-    p = {
-      label = entry.name or "?",
-      arguments = {},
-      result = entry.error
-        and { kind = "content", text = entry.output or "", error = true }
-        or { kind = entry.output == nil and "running" or "receipt", text = "completed" },
-    }
-  end
+  local p = assert(semantic_projection(entry))
   local rows = { tui.text { content = tool_header(entry, "▼ "), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = p.primary_is_path and "char" or "word" } }
   for _, field in ipairs(p.arguments) do
     rows[#rows + 1] = tui.text { content = "  " .. field.label .. ": " .. field.value, style = STYLE.footer, wrap = "word" }
@@ -250,6 +211,9 @@ local function tool_expanded(entry, raw)
     if p.result.text ~= "" then
       rows[#rows + 1] = tui.text { content = pad_block("  " .. p.result.text:gsub("\n", "\n  ")), style = { fg = C.md_code_fg, bg = C.md_code_block_bg }, wrap = "word" }
     end
+  end
+  for _, field in ipairs(p.result_fields or {}) do
+    rows[#rows + 1] = tui.text { content = "  " .. field.label .. ": " .. field.value, style = STYLE.footer, wrap = "word" }
   end
   rows[#rows + 1] = tui.text {
     content = raw

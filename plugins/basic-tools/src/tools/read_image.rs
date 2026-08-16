@@ -51,9 +51,13 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "read image",
-        "primary": { "arg": "path", "cwd_arg": "cwd" },
-        "result": { "kind": "receipt", "text": "image loaded" }
+        "compact": { "label": "read image", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
+        "expanded": { "label": "read image", "fields": [] },
+        "result": { "kind": "receipt", "text": "image loaded", "fields": [
+            { "label": "media type", "select": { "source": "result", "path": "media_type" }, "kind": "scalar", "omit": "missing" },
+            { "label": "filename", "select": { "source": "result", "path": "filename" }, "kind": "path", "omit": "missing" },
+            { "label": "encoded bytes", "select": { "source": "result", "path": "data" }, "kind": "bytes", "omit": "missing" }
+        ] }
     })
 }
 

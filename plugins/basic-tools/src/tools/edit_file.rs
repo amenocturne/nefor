@@ -52,9 +52,9 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "edit file",
-        "primary": { "arg": "path", "cwd_arg": "cwd" },
-        "result": { "kind": "receipt", "text": "file edited" }
+        "compact": { "label": "edit file", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
+        "expanded": { "label": "edit file", "fields": [] },
+        "result": { "kind": "receipt", "text": "file edited", "fields": [] }
     })
 }
 

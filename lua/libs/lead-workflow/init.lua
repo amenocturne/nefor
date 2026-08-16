@@ -81,6 +81,22 @@ local sessions       = require("libs.sessions")
 local envelope       = require("core.envelope")
 local replay_window  = require("core.replay_window")
 local results_lib    = require("libs.agentic-loop.results")
+local tool_display   = require("libs.chat.tool_display")
+
+local function display_field(label, source, path, kind, extra)
+  local value = { label = label, select = { source = source, path = path }, kind = kind }
+  for key, item in pairs(extra or {}) do value[key] = item end
+  return value
+end
+
+local function display_contract(label, primary, fields, result_kind, result_text, result_fields, lifecycle)
+  return {
+    compact = { label = label, primary = primary },
+    expanded = { label = label, fields = fields or {} },
+    result = { kind = result_kind, text = result_text, fields = result_fields or {} },
+    lifecycle = lifecycle,
+  }
+end
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
@@ -1610,7 +1626,7 @@ local function lead_workflow_tool_schemas()
   return {
     {
       name        = "graph-status",
-      display = { label = "graph status", primary = { arg = "run_id" }, result = { kind = "content" } },
+      display = display_contract("graph status", display_field("run", "args", "run_id", "scalar", { omit = "missing" }), {}, "content", nil, { display_field("state", "result", "$", "structured") }),
       description =
         "Report active graph runs, or one active/recent completed run " ..
         "when run_id is provided. One-shot snapshot for when you or the " ..
@@ -1629,7 +1645,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "await-run",
-      display = { label = "await run", primary = { arg = "run_id" }, result = { kind = "content" } },
+      display = display_contract("await run", display_field("run", "args", "run_id", "scalar"), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
         "Block until a previously acknowledged detached MAG run reaches its canonical " ..
         "terminal result. The root lead may address same-session runs globally; a non-root " ..
@@ -1652,7 +1668,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "terminate-graph",
-      display = { label = "terminate graph", primary = { arg = "run_id" }, result = { kind = "content" } },
+      display = display_contract("terminate graph", display_field("run", "args", "run_id", "scalar"), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description = "Request termination of exactly one active graph run by explicit run_id and block until its exact canonical terminal confirmation. The confirmation is returned synchronously and the redundant owner completion is suppressed; a defensive named timeout returns an ordinary tool failure.",
       parameters  = {
         type = "object",
@@ -1667,7 +1683,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "write-review",
-      display = { label = "write review", primary = { arg = "view" }, result = { kind = "content" } },
+      display = display_contract("write review", display_field("view", "args", "view", "scalar"), {}, "receipt", "AWAITING USER REVIEW", { display_field("status", "result", "$", "status", { sensitive = "omit" }) }),
       description =
         "Submit a plan for user review. BLOCKING — the call does not " ..
         "return until the user responds. /approve resolves it with " ..
@@ -1688,7 +1704,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "mag",
-      display = { label = "mag", primary = { arg = "file" }, arguments = { { label = "action", arg = "action" } }, result = { kind = "content" }, lifecycle = "delayed" },
+      display = (function() local c = display_contract("mag compile", display_field("file", "args", "file", "path"), { display_field("action", "args", "action", "scalar", { omit = "missing" }) }, "content", nil, { display_field("status", "result", "status", "status", { omit = "missing" }), display_field("preview", "result", "preview", "text", { omit = "missing", max_lines = 80, max_bytes = 8000 }), display_field("source path", "result", "source_path", "path", { omit = "missing" }), display_field("output path", "result", "output_path", "path", { omit = "missing" }) }, "delayed"); c.variant = { select = { source = "args", path = "action", default = "compile" }, cases = { write = display_contract("mag write", display_field("file", "args", "file", "path"), {}, "receipt", "MAG source written", { display_field("source path", "result", "source_path", "path", { omit = "missing" }) }, "delayed"), execute = display_contract("mag execute", display_field("file", "args", "file", "path"), {}, "receipt", "MAG run submitted", { display_field("status", "result", "status", "status", { omit = "missing" }), display_field("run", "result", "run_id", "scalar", { omit = "missing" }), display_field("output path", "result", "output_path", "path", { omit = "missing" }) }, "delayed") } }; return c end)(),
       description =
         "Write, compile, and execute MAG programs on the actor kernel. " ..
         "Use action='write' to create/update a .mag file in the workspace. " ..
@@ -1746,10 +1762,17 @@ end
 local function advertise_tools(gate_name)
   if advertised then return end
   advertised = true
-  emit_as(SOURCE_NAME, nil, {
+    local schemas = lead_workflow_tool_schemas()
+    for _, schema in ipairs(schemas) do
+      local ok, err = tool_display.validate(schema.display)
+      if not ok then
+        error("lead-workflow: tool '" .. tostring(schema.name) .. "' has invalid display: " .. tostring(err))
+      end
+    end
+    emit_as(SOURCE_NAME, nil, {
     kind   = (gate_name or "tool-gate") .. ".tools.advertise",
     source = SOURCE_NAME,
-    tools  = lead_workflow_tool_schemas(),
+    tools  = schemas,
   })
 end
 
@@ -2035,7 +2058,7 @@ local function mag_handler(firing_id, args, metadata)
     emit_tool_result_ok(firing_id, {
       status  = "written",
       file    = args.file,
-      path    = file_path,
+      source_path = file_path,
       message = "File written: " .. args.file,
     })
     return

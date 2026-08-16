@@ -188,7 +188,8 @@ mod tests {
         );
         for descriptor in TOOLS {
             let display = (descriptor.display)();
-            assert!(display.get("label").is_some(), "{}", descriptor.name);
+            assert!(display.get("compact").is_some(), "{}", descriptor.name);
+            assert!(display.get("expanded").is_some(), "{}", descriptor.name);
             assert!(display.get("result").is_some(), "{}", descriptor.name);
         }
     }

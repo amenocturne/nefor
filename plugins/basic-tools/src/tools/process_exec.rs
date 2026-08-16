@@ -36,13 +36,9 @@ pub fn schema() -> Value {
 
 pub fn display() -> Value {
     json!({
-        "label": "execute process",
-        "primary": { "arg": "argv" },
-        "arguments": [
-            { "label": "cwd", "arg": "cwd" },
-            { "label": "timeout", "arg": "timeout" }
-        ],
-        "result": { "kind": "content" }
+        "compact": { "label": "execute process", "primary": { "label": "argv", "select": { "source": "args", "path": "argv" }, "kind": "scalar" } },
+        "expanded": { "label": "execute process", "fields": [] },
+        "result": { "kind": "content", "fields": [] }
     })
 }
 

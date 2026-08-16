@@ -56,6 +56,21 @@ local emit_as  = envelope.emit_as
 local instruction_files = require("libs.instruction-files")
 local tool_display = require("libs.chat.tool_display")
 
+local function field(label, source, path, kind, extra)
+  local value = { label = label, select = { source = source, path = path }, kind = kind }
+  for key, item in pairs(extra or {}) do value[key] = item end
+  return value
+end
+
+local function display(label, primary, fields, result_kind, result_text, result_fields, lifecycle)
+  return {
+    compact = { label = label, primary = primary },
+    expanded = { label = label, fields = fields or {} },
+    result = { kind = result_kind, text = result_text, fields = result_fields or {} },
+    lifecycle = lifecycle,
+  }
+end
+
 local INSTRUCTIONS_DIR = (rawget(_G, "NEFOR_CONFIG_DIR") or ".") .. "/instructions"
 
 local SOURCE_NAME = "read-only-tools"
@@ -346,7 +361,7 @@ local function base_schemas()
   return {
     {
       name = "list_dir",
-      display = { label = "list directory", primary = { arg = "path" }, result = { kind = "content" } },
+      display = display("list directory", field("path", "args", "path", "path"), {}, "content", nil, { field("entries", "result", "$", "text", { max_lines = 80, max_bytes = 6400 }) }),
       description =
         "List the immediate children of a directory. Returns one entry " ..
         "per line, prefixed with `(d)` for directories and `(f)` for " ..
@@ -367,7 +382,7 @@ local function base_schemas()
     },
     {
       name = "search_text",
-      display = { label = "search text", primary = { arg = "pattern" }, arguments = { { label = "in", arg = "path" } }, result = { kind = "content" } },
+      display = display("search text", field("pattern", "args", "pattern", "scalar"), { field("in", "args", "path", "path", { omit = "missing" }) }, "content", nil, { field("matches", "result", "$", "text", { max_lines = 80, max_bytes = 8000 }) }),
       description =
         "Search for a regex pattern in files under a path (recursively). " ..
         "Returns matching lines as `path:line:match`. Uses ripgrep when " ..
@@ -392,7 +407,7 @@ local function base_schemas()
     },
     {
       name = "python-read",
-      display = { label = "analyze workspace", primary = { arg = "task" }, result = { kind = "content" } },
+      display = display("analyze workspace", field("task", "args", "task", "scalar"), {}, "content", nil, { field("analysis", "result", "$", "text", { max_lines = 80, max_bytes = 8000 }) }),
       description =
         "Run complex read-only Python analysis over workspace files. " ..
         "Prefer Bash/read tools for simple inspection. Do not use raw " ..
@@ -410,7 +425,7 @@ local function base_schemas()
     },
     {
       name = "instructions",
-      display = { label = "load instructions", primary = { arg = "name" }, result = { kind = "receipt", text = "instructions loaded" } },
+      display = display("load instructions", field("source", "args", "name", "list"), {}, "receipt", "instructions loaded", { field("status", "result", "$", "status", { sensitive = "omit" }) }),
       description =
         "Read one or more instruction files by name. When the " ..
         "system prompt says to read instructions (e.g. 'instruction:dev-mode.md'), " ..
@@ -432,7 +447,7 @@ local function base_schemas()
     },
     {
       name = "discover_instruction_files",
-      display = { label = "discover instructions", primary = { arg = "path" }, arguments = { { label = "scope", arg = "scope" }, { label = "unread only", arg = "unread_only" } }, result = { kind = "content" } },
+      display = display("discover instructions", field("path", "args", "path", "path", { omit = "missing" }), { field("scope", "args", "scope", "scalar", { omit = "missing" }), field("unread only", "args", "unread_only", "scalar", { omit = "missing" }) }, "content", nil, { field("status", "result", "$", "text", { max_lines = 80, max_bytes = 6400 }) }),
       description =
         "List AGENTS.md and CLAUDE.md instruction files available near " ..
         "a path. Does not read file contents. Use ordinary read_file on " ..
@@ -460,7 +475,7 @@ local function base_schemas()
     },
     {
       name = "skill",
-      display = { label = "load skill", primary = { arg = "name" }, result = { kind = "receipt", text = "skill loaded" } },
+      display = display("load skill", field("source", "args", "name", "list"), {}, "receipt", "skill loaded", { field("status", "result", "$", "status", { sensitive = "omit" }) }),
       description =
         "Load a workflow skill by name from the config's skills directory " ..
         "(" .. SKILLS_DIR .. "/<name>/skill.md). Read the skill BEFORE acting on a " ..

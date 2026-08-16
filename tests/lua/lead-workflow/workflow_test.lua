@@ -144,10 +144,10 @@ do
   assert_true(graph_status_schema.description:find("when your next step depends", 1, true) == nil
       and graph_status_schema.description:find("Block until", 1, true) == nil,
     "graph-status carries no dependency-wait affordance")
-  assert_eq(await_schema.display.label, "await run", "await-run has semantic display metadata")
-  assert_eq(await_schema.display.primary.arg, "run_id", "await-run displays its stable handle")
-  assert_eq(mag_eval_schema.display.label, "mag eval", "mag-eval has explicit display label")
-  assert_eq(mag_eval_schema.display.primary.arg, "intent", "mag-eval display uses exact intent")
+  assert_eq(await_schema.display.compact.label, "await run", "await-run has semantic display metadata")
+  assert_eq(await_schema.display.compact.primary.select.path, "run_id", "await-run displays its stable handle")
+  assert_eq(mag_eval_schema.display.compact.label, "mag eval", "mag-eval has explicit display label")
+  assert_eq(mag_eval_schema.display.compact.primary.select.path, "intent", "mag-eval display uses exact intent")
   assert_true(mag_eval_schema.description:find("Commands run until process exit", 1, true) ~= nil
       and mag_eval_schema.description:find("Never launch a server as a normal run", 1, true) ~= nil,
     "mag-eval canonically warns that persistent commands cannot be awaited to completion")

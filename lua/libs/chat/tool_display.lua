@@ -1,119 +1,17 @@
+-- Strict declarative presentation contract for chat tools. The catalog owns
+-- every compact/expanded choice; the renderer only interprets this data.
 local M = {}
 
-local function nonempty(v)
-  return type(v) == "string" and v ~= ""
+local FIELD_KINDS = {
+  text = true, scalar = true, status = true, path = true, bytes = true,
+  list = true, structured = true,
+}
+
+local function nonempty(value)
+  return type(value) == "string" and value ~= ""
 end
 
-local function selector(v, where)
-  if type(v) ~= "table" or not nonempty(v.arg) then
-    return nil, where .. " must contain a non-empty `arg` string"
-  end
-  for k, _ in pairs(v) do
-    if k ~= "arg" and k ~= "cwd_arg" and k ~= "default" then
-      return nil, where .. " has unknown field `" .. tostring(k) .. "`"
-    end
-  end
-  if v.cwd_arg ~= nil and not nonempty(v.cwd_arg) then
-    return nil, where .. ".cwd_arg must be a non-empty string"
-  end
-  if v.default ~= nil and type(v.default) ~= "string" then
-    return nil, where .. ".default must be a string"
-  end
-  return true
-end
-
-function M.validate(c)
-  if type(c) ~= "table" then return nil, "display must be a table" end
-  for k, _ in pairs(c) do
-    if k ~= "label" and k ~= "primary" and k ~= "arguments" and k ~= "result"
-        and k ~= "lifecycle" then
-      return nil, "display has unknown field `" .. tostring(k) .. "`"
-    end
-  end
-  if c.lifecycle ~= nil and c.lifecycle ~= "delayed" then
-    return nil, "display.lifecycle must be `delayed` when present"
-  end
-  if not nonempty(c.label) then
-    local ok, err = selector(c.label, "display.label")
-    if not ok then return nil, err end
-  end
-  if c.primary ~= nil then
-    local ok, err = selector(c.primary, "display.primary")
-    if not ok then return nil, err end
-  end
-  if c.arguments ~= nil then
-    if type(c.arguments) ~= "table" then
-      return nil, "display.arguments must be a JSON array"
-    end
-    local is_json_array = type(nefor) == "table"
-      and type(nefor.json) == "table"
-      and type(nefor.json.is_array) == "function"
-      and nefor.json.is_array(c.arguments)
-    local count = 0
-    for key, _ in pairs(c.arguments) do
-      if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
-        return nil, "display.arguments must contain only list entries"
-      end
-      count = count + 1
-    end
-    if count == 0 and not is_json_array then
-      return nil, "display.arguments must be a JSON array"
-    end
-    for i = 1, count do
-      if c.arguments[i] == nil then
-        return nil, "display.arguments must not contain holes"
-      end
-    end
-    for i, f in ipairs(c.arguments) do
-      if type(f) ~= "table" or not nonempty(f.label) then
-        return nil, "display.arguments[" .. i .. "] needs label and arg strings"
-      end
-      if not nonempty(f.arg) then
-        return nil, "display.arguments[" .. i .. "] needs label and arg strings"
-      end
-      if f.cwd_arg ~= nil and not nonempty(f.cwd_arg) then
-        return nil, "display.arguments[" .. i .. "].cwd_arg must be a non-empty string"
-      end
-      if f.default ~= nil and type(f.default) ~= "string" then
-        return nil, "display.arguments[" .. i .. "].default must be a string"
-      end
-      for k, _ in pairs(f) do
-        if k ~= "label" and k ~= "arg" and k ~= "cwd_arg" and k ~= "default" then
-          return nil, "display.arguments[" .. i .. "] has unknown field `" .. tostring(k) .. "`"
-        end
-      end
-    end
-  end
-  if type(c.result) ~= "table" then
-    return nil, "display.result must be a table"
-  end
-  for k, _ in pairs(c.result) do
-    if k ~= "kind" and k ~= "text" then
-      return nil, "display.result has unknown field `" .. tostring(k) .. "`"
-    end
-  end
-  if c.result.kind ~= "content" and c.result.kind ~= "receipt" then
-    return nil, "display.result.kind must be `content` or `receipt`"
-  end
-  if c.result.kind == "receipt" and not nonempty(c.result.text) then
-    return nil, "display.result.text must be non-empty for a receipt"
-  end
-  if c.result.kind == "content" and c.result.text ~= nil then
-    return nil, "display.result.text is only valid for a receipt"
-  end
-  return true
-end
-
-local function sorted_keys(value)
-  local keys = {}
-  for key, _ in pairs(value or {}) do
-    if type(key) == "string" then keys[#keys + 1] = key end
-  end
-  table.sort(keys)
-  return keys
-end
-
-local function is_dense_array(value)
+local function dense_list(value)
   if type(value) ~= "table" then return false end
   local count = 0
   for key, _ in pairs(value) do
@@ -121,66 +19,202 @@ local function is_dense_array(value)
     count = count + 1
   end
   if count == 0 then
-    return type(nefor) == "table" and type(nefor.json) == "table"
-      and type(nefor.json.is_array) == "function" and nefor.json.is_array(value)
+    return next(value) == nil
   end
-  for i = 1, count do
-    if value[i] == nil then return false end
+  for index = 1, count do if value[index] == nil then return false end end
+  return true
+end
+
+local function validate_path(path, where)
+  if type(path) == "string" then
+    if nonempty(path) then return true end
+    return nil, where .. " must be non-empty"
+  end
+  if not dense_list(path) or #path == 0 then
+    return nil, where .. " must be a non-empty string or string list"
+  end
+  for index, part in ipairs(path) do
+    if not nonempty(part) then return nil, where .. "[" .. index .. "] must be a non-empty string" end
   end
   return true
 end
 
-local function display_value(value)
-  local kind = type(value)
-  if kind == "string" then return value end
-  if kind == "number" or kind == "boolean" then return tostring(value) end
-  if kind ~= "table" then return nil end
-  if is_dense_array(value) then
-    local items = {}
-    for i = 1, #value do
-      local rendered = display_value(value[i])
-      items[#items + 1] = rendered or "<complex value>"
-    end
-    return table.concat(items, " · ")
-  end
-  return nil
-end
-
-local function is_absolute_path(value)
-  return type(value) == "string"
-    and (value:sub(1, 1) == "/" or value:match("^%a:[/\\]") ~= nil)
-end
-
-local function pick(selector_value, args)
-  if type(selector_value) == "string" then return selector_value end
-  if type(selector_value) ~= "table" or type(args) ~= "table" then return nil end
-  local value = args[selector_value.arg]
-  if value == nil then value = selector_value.default end
-  local rendered = display_value(value)
-  if rendered == nil then return nil end
-  if selector_value.cwd_arg ~= nil and not is_absolute_path(value) then
-    local cwd = display_value(args[selector_value.cwd_arg])
-    if nonempty(cwd) then
-      return rendered .. " (cwd: " .. cwd .. ")"
+local function validate_selector(selector, where)
+  if type(selector) ~= "table" then return nil, where .. " must be a table" end
+  for key, _ in pairs(selector) do
+    if key ~= "source" and key ~= "path" and key ~= "default" then
+      return nil, where .. " has unknown field `" .. tostring(key) .. "`"
     end
   end
+  if selector.source ~= "args" and selector.source ~= "result" then
+    return nil, where .. ".source must be `args` or `result`"
+  end
+  local ok, err = validate_path(selector.path, where .. ".path")
+  if not ok then return nil, err end
+  return true
+end
+
+local function validate_field(field, where)
+  if type(field) ~= "table" then return nil, where .. " must be a table" end
+  for key, _ in pairs(field) do
+    if key ~= "label" and key ~= "select" and key ~= "kind"
+        and key ~= "omit" and key ~= "sensitive" and key ~= "max_lines"
+        and key ~= "max_bytes" then
+      return nil, where .. " has unknown field `" .. tostring(key) .. "`"
+    end
+  end
+  if not nonempty(field.label) then return nil, where .. ".label must be non-empty" end
+  local ok, err = validate_selector(field.select, where .. ".select")
+  if not ok then return nil, err end
+  if not FIELD_KINDS[field.kind] then return nil, where .. ".kind is unknown" end
+  if field.omit ~= nil and field.omit ~= "missing" and field.omit ~= "empty" then
+    return nil, where .. ".omit must be `missing` or `empty`"
+  end
+  if field.sensitive ~= nil and field.sensitive ~= "redact" and field.sensitive ~= "omit" then
+    return nil, where .. ".sensitive must be `redact` or `omit`"
+  end
+  if field.kind == "text" then
+    if type(field.max_lines) ~= "number" or field.max_lines < 1 or field.max_lines % 1 ~= 0 then
+      return nil, where .. ".max_lines must be a positive integer for text"
+    end
+    if type(field.max_bytes) ~= "number" or field.max_bytes < 1 or field.max_bytes % 1 ~= 0 then
+      return nil, where .. ".max_bytes must be a positive integer for text"
+    end
+  elseif field.max_lines ~= nil or field.max_bytes ~= nil then
+    return nil, where .. " bounds are only valid for text"
+  end
+  return true
+end
+
+local function validate_fields(fields, where)
+  if not dense_list(fields) then return nil, where .. " must be a JSON array" end
+  for index, field in ipairs(fields) do
+    local ok, err = validate_field(field, where .. "[" .. index .. "]")
+    if not ok then return nil, err end
+  end
+  return true
+end
+
+local function validate_view(view, where, expanded)
+  if type(view) ~= "table" then return nil, where .. " must be a table" end
+  for key, _ in pairs(view) do
+    if key ~= "label" and key ~= "primary" and (not expanded or key ~= "fields") then
+      return nil, where .. " has unknown field `" .. tostring(key) .. "`"
+    end
+  end
+  if not nonempty(view.label) then return nil, where .. ".label must be non-empty" end
+  if view.primary ~= nil then
+    local ok, err = validate_field(view.primary, where .. ".primary")
+    if not ok then return nil, err end
+  end
+  if expanded then return validate_fields(view.fields, where .. ".fields") end
+  return true
+end
+
+local function validate_policy(policy, where)
+  if type(policy) ~= "table" then return nil, where .. " must be a table" end
+  for key, _ in pairs(policy) do
+    if key ~= "compact" and key ~= "expanded" and key ~= "result" and key ~= "lifecycle" and key ~= "variant" then
+      return nil, where .. " has unknown field `" .. tostring(key) .. "`"
+    end
+  end
+  local ok, err = validate_view(policy.compact, where .. ".compact", false)
+  if not ok then return nil, err end
+  ok, err = validate_view(policy.expanded, where .. ".expanded", true)
+  if not ok then return nil, err end
+  if policy.lifecycle ~= nil and policy.lifecycle ~= "delayed" then
+    return nil, where .. ".lifecycle must be `delayed` when present"
+  end
+  if type(policy.result) ~= "table" then return nil, where .. ".result must be a table" end
+  for key, _ in pairs(policy.result) do
+    if key ~= "kind" and key ~= "text" and key ~= "fields" then
+      return nil, where .. ".result has unknown field `" .. tostring(key) .. "`"
+    end
+  end
+  if policy.result.kind ~= "content" and policy.result.kind ~= "receipt" then
+    return nil, where .. ".result.kind must be `content` or `receipt`"
+  end
+  if policy.result.kind == "receipt" and not nonempty(policy.result.text) then
+    return nil, where .. ".result.text must be non-empty for a receipt"
+  end
+  if policy.result.kind == "content" and policy.result.text ~= nil then
+    return nil, where .. ".result.text is only valid for a receipt"
+  end
+  return validate_fields(policy.result.fields, where .. ".result.fields")
+end
+
+function M.validate(contract)
+  if type(contract) ~= "table" then return nil, "display must be a table" end
+  for key, _ in pairs(contract) do
+    if key ~= "compact" and key ~= "expanded" and key ~= "result"
+        and key ~= "lifecycle" and key ~= "variant" then
+      return nil, "display has unknown field `" .. tostring(key) .. "`"
+    end
+  end
+  local ok, err = validate_policy(contract, "display")
+  if not ok then return nil, err end
+  if contract.variant ~= nil then
+    local variant = contract.variant
+    if type(variant) ~= "table" then return nil, "display.variant must be a table" end
+    for key, _ in pairs(variant) do
+      if key ~= "select" and key ~= "cases" then return nil, "display.variant has unknown field `" .. tostring(key) .. "`" end
+    end
+    ok, err = validate_selector(variant.select, "display.variant.select")
+    if not ok then return nil, err end
+    if type(variant.cases) ~= "table" or dense_list(variant.cases) then return nil, "display.variant.cases must be an object" end
+    for name, policy in pairs(variant.cases) do
+      if not nonempty(name) then return nil, "display.variant case name must be non-empty" end
+      ok, err = validate_policy(policy, "display.variant.cases." .. name)
+      if not ok then return nil, err end
+    end
+  end
+  return true
+end
+
+local function get_path(root, path)
+  if path == "$" then return root end
+  local value = root
+  local parts = type(path) == "table" and path or { path }
+  for _, part in ipairs(parts) do
+    if type(value) ~= "table" then return nil end
+    value = value[part]
+  end
+  return value
+end
+
+local function selected(selector, args, result)
+  local root = selector.source == "args" and args or result
+  local value = get_path(root, selector.path)
+  if value == nil then value = selector.default end
+  return value
+end
+
+local function json_text(value)
+  if type(value) ~= "table" then return tostring(value) end
+  local ok, encoded = pcall(nefor.json.encode, value)
+  return ok and encoded or tostring(value)
+end
+
+local function utf8_prefix(value, cap)
+  if #value <= cap then return value, false end
+  local finish = cap
+  while finish > 0 and value:byte(finish + 1) and value:byte(finish + 1) >= 0x80
+      and value:byte(finish + 1) <= 0xBF do finish = finish - 1 end
+  return value:sub(1, finish), true
+end
+
+local function bounded_text(value, lines, bytes)
+  local text = tostring(value)
+  local kept, count = {}, 0
+  for line in (text .. "\n"):gmatch("(.-)\n") do
+    count = count + 1
+    if count <= lines then kept[#kept + 1] = line end
+  end
+  local rendered = table.concat(kept, "\n")
+  local clipped_lines = count > lines
+  rendered, clipped_bytes = utf8_prefix(rendered, bytes)
+  if clipped_lines or clipped_bytes then rendered = rendered .. "\n…" end
   return rendered
-end
-
-local function selector_is_path(selector_value)
-  return type(selector_value) == "table"
-    and (selector_value.arg == "path" or selector_value.arg == "file")
-end
-
-local function byte_count(value)
-  if value == nil then return 0 end
-  if type(value) == "string" then return #value end
-  if type(nefor) == "table" and type(nefor.json) == "table"
-      and type(nefor.json.encode) == "function" then
-    local ok, encoded = pcall(nefor.json.encode, value)
-    if ok and type(encoded) == "string" then return #encoded end
-  end
-  return #tostring(value)
 end
 
 local function size_text(bytes)
@@ -188,81 +222,75 @@ local function size_text(bytes)
   return string.format("%.1f KiB", bytes / 1024)
 end
 
-local function value_shape(value)
-  local kind = type(value)
-  if kind == "nil" then return "null · 0 B" end
-  local bytes = size_text(byte_count(value))
-  if kind == "string" then return "string · " .. bytes end
-  if kind == "number" then return "number · " .. bytes end
-  if kind == "boolean" then return "boolean · " .. bytes end
-  if kind ~= "table" then return kind .. " · " .. bytes end
-  if is_dense_array(value) then
-    return "array · " .. tostring(#value) .. (#value == 1 and " item · " or " items · ") .. bytes
+local function render_value(field, value)
+  if field.sensitive == "omit" then return nil end
+  if field.sensitive == "redact" then return "[redacted]" end
+  if value == nil and field.omit == "missing" then return nil end
+  if (value == "" or (type(value) == "table" and next(value) == nil)) and field.omit == "empty" then return nil end
+  if field.kind == "text" then return bounded_text(value or "", field.max_lines, field.max_bytes) end
+  if field.kind == "bytes" then
+    if type(value) == "number" then return size_text(value) end
+    return size_text(#json_text(value or ""))
   end
-  return "object · " .. tostring(#sorted_keys(value)) .. " fields · " .. bytes
+  if field.kind == "list" and type(value) == "table" then
+    local values = {}
+    for _, item in ipairs(value) do values[#values + 1] = json_text(item) end
+    return table.concat(values, " · ")
+  end
+  if field.kind == "structured" then return json_text(value or {}) end
+  return value == nil and "" or tostring(value)
 end
 
-local function fallback(name, args)
-  local projection = { label = name or "?", arguments = {} }
-  if type(args) ~= "table" or is_dense_array(args) then
-    projection.arguments[1] = { label = "input", value = value_shape(args) }
-    return projection
-  end
-  for _, key in ipairs(sorted_keys(args)) do
-    projection.arguments[#projection.arguments + 1] = {
-      label = key,
-      value = value_shape(args[key]),
-    }
-  end
-  return projection
+local function project_field(field, args, result)
+  local value = selected(field.select, args, result)
+  local rendered = render_value(field, value)
+  if rendered == nil then return nil end
+  return { label = field.label, value = rendered, kind = field.kind }
 end
 
-function M.project(c, args, output, is_error, name)
-  local raw_args = args
-  local ok, err = M.validate(c)
+local function active_policy(contract, args, result)
+  local variant = contract.variant
+  if variant == nil then return contract end
+  local name = selected(variant.select, args, result)
+  return variant.cases[tostring(name)] or contract
+end
+
+function M.project(contract, args, result, is_error)
+  local ok, err = M.validate(contract)
+  if not ok then return nil, err end
   args = type(args) == "table" and args or {}
-  local projection
-  if ok then
-    projection = {
-      label = pick(c.label, args),
-      primary = pick(c.primary, args),
-      primary_is_path = selector_is_path(c.primary),
-      arguments = {},
-    }
-    if not nonempty(projection.label) then
-      return nil, "display label could not be derived from invocation"
+  local policy = active_policy(contract, args, result)
+  local compact, expanded = policy.compact, policy.expanded
+  local projection = {
+    label = compact.label,
+    expanded_label = expanded.label,
+    arguments = {}, result_fields = {},
+  }
+  if compact.primary then
+    local primary = project_field(compact.primary, args, result)
+    if primary then
+      projection.primary = primary.value
+      projection.primary_is_path = primary.kind == "path"
     end
-    for _, field in ipairs(c.arguments or {}) do
-      local rendered = pick(field, args)
-      if rendered ~= nil then
-        projection.arguments[#projection.arguments + 1] = {
-          label = field.label,
-          value = rendered,
-        }
-      end
-    end
-  else
-    projection = fallback(name, raw_args)
-    projection.fallback_error = err
   end
-
+  for _, field in ipairs(expanded.fields) do
+    local projected = project_field(field, args, result)
+    if projected then projection.arguments[#projection.arguments + 1] = projected end
+  end
+  for _, field in ipairs(policy.result.fields) do
+    local projected = project_field(field, args, result)
+    if projected then projection.result_fields[#projection.result_fields + 1] = projected end
+  end
   if is_error then
-    local text = type(output) == "string" and output or display_value(output)
-    if text == nil and type(output) == "table" and type(nefor) == "table"
-        and type(nefor.json) == "table" and type(nefor.json.encode) == "function" then
-      local encoded_ok, encoded = pcall(nefor.json.encode, output)
-      if encoded_ok then text = encoded end
-    end
-    projection.result = { kind = "content", text = text or tostring(output or ""), error = true }
-  elseif output == nil then
+    projection.result = { kind = "content", text = json_text(result or ""), error = true }
+  elseif result == nil then
     projection.result = { kind = "running" }
+  elseif policy.result.kind == "receipt" then
+    projection.result = { kind = "receipt", text = policy.result.text }
   else
-    local receipt = ok and c.result.text or nil
-    if not nonempty(receipt) then receipt = "completed" end
-    projection.result = {
-      kind = "receipt",
-      text = receipt .. " · " .. size_text(byte_count(output)) .. " hidden",
-    }
+    local text = ""
+    if #projection.result_fields == 0 then text = json_text(result) end
+    projection.result = { kind = "content", text = text }
   end
   return projection
 end

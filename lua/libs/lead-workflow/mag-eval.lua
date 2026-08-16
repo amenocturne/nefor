@@ -98,7 +98,17 @@ local state = {
 
 M.schema = {
   name        = "mag-eval",
-  display = { label = "mag eval", primary = { arg = "intent" }, result = { kind = "content" }, lifecycle = "delayed" },
+  display = {
+    compact = { label = "mag eval", primary = { label = "intent", select = { source = "args", path = "intent" }, kind = "scalar" } },
+    expanded = { label = "mag eval", fields = {} },
+    result = { kind = "receipt", text = "MAG run submitted", fields = {
+      { label = "status", select = { source = "result", path = "status" }, kind = "status", omit = "missing" },
+      { label = "run", select = { source = "result", path = "run_id" }, kind = "scalar", omit = "missing" },
+      { label = "source path", select = { source = "result", path = "source_path" }, kind = "path", omit = "missing" },
+      { label = "output path", select = { source = "result", path = "output_path" }, kind = "path", omit = "missing" },
+    } },
+    lifecycle = "delayed",
+  },
   description =
     "Evaluate one MAG node expression on the actor kernel. The tool submits a run and " ..
     "waits briefly for that exact run's canonical terminal result. A quick success or " ..

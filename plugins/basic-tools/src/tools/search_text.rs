@@ -86,15 +86,9 @@ pub fn schema() -> Value {
 /// Declarative presentation metadata advertised with this tool.
 pub fn display() -> Value {
     json!({
-        "label": "search text",
-        "primary": { "arg": "pattern" },
-        "arguments": [
-            { "label": "in", "arg": "path", "cwd_arg": "cwd", "default": "." },
-            { "label": "type", "arg": "file_type" },
-            { "label": "glob", "arg": "glob" },
-            { "label": "limit", "arg": "max_results" }
-        ],
-        "result": { "kind": "content" }
+        "compact": { "label": "search text", "primary": { "label": "pattern", "select": { "source": "args", "path": "pattern" }, "kind": "scalar" } },
+        "expanded": { "label": "search text", "fields": [] },
+        "result": { "kind": "content", "fields": [] }
     })
 }
 

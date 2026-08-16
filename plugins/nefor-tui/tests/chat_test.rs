@@ -359,6 +359,43 @@ fn fixture_message_with_submissions(
 }
 
 fn fixture_tool_started(engine: &mut Engine, id: &str, name: &str, input: JsonValue) {
+    let primary = input.as_object().and_then(|args| {
+        [
+            "path", "file", "run_id", "intent", "name", "action", "command",
+        ]
+        .into_iter()
+        .find(|key| args.contains_key(*key))
+    });
+    let primary = primary.map(|path| {
+        json!({
+            "label": path,
+            "select": { "source": "args", "path": path },
+            "kind": if path == "path" || path == "file" { "path" } else { "scalar" }
+        })
+    });
+    let label = match name {
+        "shell.script" => "Run command",
+        "mag" => "MAG",
+        "mag-eval" => "mag eval",
+        "terminate-graph" => "terminate graph",
+        "read_file" => "Read file",
+        _ => name,
+    };
+    let mut compact = json!({ "label": label });
+    if let Some(primary) = primary {
+        compact["primary"] = primary;
+    }
+    dispatch_event(
+        engine,
+        json!({ "kind": "tool.register", "tools": [{
+        "name": name,
+        "display": {
+            "compact": compact,
+            "expanded": { "label": label, "fields": [] },
+            "result": { "kind": "content", "fields": [] }
+        }
+    }] }),
+    );
     let turn = fixture_turn(engine);
     dispatch_event(
         engine,
@@ -3347,11 +3384,7 @@ fn ctrl_o_toggles_expanded_details() {
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
             "name": "shell.script",
-            "display": {
-                "label": "Run command",
-                "primary": { "arg": "command" },
-                "result": { "kind": "content" }
-            }
+            "display": {"compact":{"label":"Run command","primary":{"label":"command","select":{"source":"args","path":"command"},"kind":"scalar"}},"expanded":{"label":"Run command","fields":[]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
     fixture_tool_started(
@@ -3428,11 +3461,7 @@ fn collapsed_read_file_snapshot(width: u16, running: bool) -> String {
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
             "name": "read_file",
-            "display": {
-                "label": "read file",
-                "primary": { "arg": "path" },
-                "result": { "kind": "content" }
-            }
+            "display": {"compact":{"label":"read file","primary":{"label":"path","select":{"source":"args","path":"path"},"kind":"path"}},"expanded":{"label":"read file","fields":[]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
     fixture_tool_started(
@@ -3499,8 +3528,8 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-        { "name": "mag", "display": { "label": "mag", "primary": { "arg": "file" }, "result": { "kind": "content" }, "lifecycle": "delayed" } },
-        { "name": "mag-eval", "display": { "label": "mag eval", "primary": { "arg": "intent" }, "result": { "kind": "content" }, "lifecycle": "delayed" } }
+        { "name": "mag", "display": {"compact":{"label":"mag","primary":{"label":"file","select":{"source":"args","path":"file"},"kind":"path"}},"expanded":{"label":"mag","fields":[]},"result":{"kind":"content","fields":[]},"lifecycle":"delayed"} },
+        { "name": "mag-eval", "display": {"compact":{"label":"mag eval","primary":{"label":"intent","select":{"source":"args","path":"intent"},"kind":"scalar"}},"expanded":{"label":"mag eval","fields":[]},"result":{"kind":"content","fields":[]},"lifecycle":"delayed"} }
     ] }),
     );
 
@@ -3570,12 +3599,7 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
             "name": "mag",
-            "display": {
-                "label": "MAG",
-                "primary": { "arg": "file" },
-                "arguments": [{ "label": "action", "arg": "action" }],
-                "result": { "kind": "content" }
-            }
+            "display": {"compact":{"label":"MAG","primary":{"label":"file","select":{"source":"args","path":"file"},"kind":"path"}},"expanded":{"label":"MAG","fields":[{"label":"action","select":{"source":"args","path":"action"},"kind":"scalar","omit":"missing"}]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
     for (id, input) in [
@@ -4132,10 +4156,7 @@ fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_re
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
-            "name": "terminate-graph", "display": {
-                "label": "terminate graph", "primary": { "arg": "run_id" },
-                "result": { "kind": "content" }
-            }
+            "name": "terminate-graph", "display": {"compact":{"label":"terminate graph","primary":{"label":"run_id","select":{"source":"args","path":"run_id"},"kind":"scalar"}},"expanded":{"label":"terminate graph","fields":[]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
 
@@ -4197,10 +4218,7 @@ fn terminate_graph_unknown_and_mismatched_projection_keep_raw_run_id() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
-            "name": "terminate-graph", "display": {
-                "label": "terminate graph", "primary": { "arg": "run_id" },
-                "result": { "kind": "content" }
-            }
+            "name": "terminate-graph", "display": {"compact":{"label":"terminate graph","primary":{"label":"run_id","select":{"source":"args","path":"run_id"},"kind":"scalar"}},"expanded":{"label":"terminate graph","fields":[]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
 
@@ -10242,11 +10260,7 @@ fn tool_display_projection_preserves_entry_payload_identity() {
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
             "name": "loader",
-            "display": {
-                "label": "Load",
-                "primary": { "arg": "path", "cwd_arg": "cwd" },
-                "result": { "kind": "receipt", "text": "loaded" }
-            }
+            "display": {"compact":{"label":"Load","primary":{"label":"path","select":{"source":"args","path":"path"},"kind":"path"}},"expanded":{"label":"Load","fields":[]},"result":{"kind":"receipt","fields":[],"text":"loaded"}}
         }] }),
     );
     fixture_tool_started(
@@ -10530,22 +10544,22 @@ fn personal_extension_behavior_uses_canonical_tui() {
     let current = json!({
         "kind": "tool.register",
         "tools": [
-            { "name": "loader", "display": { "label": "Load current", "primary": { "arg": "path" }, "result": { "kind": "receipt", "text": "content loaded" } } },
-            { "name": "content", "display": { "label": "Show content", "result": { "kind": "content" } } },
-            { "name": "removed", "display": { "label": "Old removed label", "result": { "kind": "content" } } }
+            { "name": "loader", "display": { "compact": { "label": "Load current", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } }, "expanded": { "label": "Load current", "fields": [] }, "result": { "kind": "receipt", "text": "content loaded", "fields": [] } } },
+            { "name": "content", "display": {"compact":{"label":"Show content"},"expanded":{"label":"Show content","fields":[]},"result":{"kind":"content","fields":[]}} },
+            { "name": "removed", "display": {"compact":{"label":"Old removed label"},"expanded":{"label":"Old removed label","fields":[]},"result":{"kind":"content","fields":[]}} }
         ]
     });
     dispatch_event(&mut engine, current);
     dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
     dispatch_event(
         &mut engine,
-        json!({ "kind": "tool.register", "tools": [{ "name": "loader", "display": { "label": "STALE LABEL", "result": { "kind": "content" } } }] }),
+        json!({ "kind": "tool.register", "tools": [{ "name": "loader", "display": {"compact":{"label":"STALE LABEL"},"expanded":{"label":"STALE LABEL","fields":[]},"result":{"kind":"content","fields":[]}} }] }),
     );
     dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
 
     // A malformed live aggregate fails atomically and leaves the current
     // catalog intact.
-    let malformed = json!({ "kind": "tool.register", "tools": [{ "name": "loader", "display": { "label": "Broken", "arguments": {}, "result": { "kind": "content" } } }] });
+    let malformed = json!({ "kind": "tool.register", "tools": [{ "name": "loader", "display": {"compact":{"label":"Broken"},"expanded":{"label":"Broken","fields":[]},"result":{"kind":"content","fields":[]}} }] });
     let malformed_map = malformed.as_object().unwrap().clone();
     assert!(engine.dispatch_envelope_body(&malformed_map).is_err());
 
@@ -10553,8 +10567,8 @@ fn personal_extension_behavior_uses_canonical_tui() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-        { "name": "loader", "display": { "label": "Load current", "primary": { "arg": "path" }, "result": { "kind": "receipt", "text": "content loaded" } } },
-        { "name": "content", "display": { "label": "Show content", "result": { "kind": "content" } } }
+        { "name": "loader", "display": { "compact": { "label": "Load current", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } }, "expanded": { "label": "Load current", "fields": [] }, "result": { "kind": "receipt", "text": "content loaded", "fields": [] } } },
+        { "name": "content", "display": {"compact":{"label":"Show content"},"expanded":{"label":"Show content","fields":[]},"result":{"kind":"content","fields":[]}} }
     ] }),
     );
     fixture_tool_started(&mut engine, "removed-id", "removed", json!({}));
@@ -10805,14 +10819,17 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
         let state = engine.state_table().unwrap();
         let displays: mlua::Table = state.get("tool_displays").unwrap();
         let display: Option<mlua::Table> = displays.get(name).unwrap();
-        display.and_then(|d| d.get("label").ok())
+        display.and_then(|d| {
+            let compact: mlua::Table = d.get("compact").ok()?;
+            compact.get("label").ok()
+        })
     };
 
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-        { "name": "current", "display": { "label": "Current catalog", "arguments": [], "result": { "kind": "content" } } },
-        { "name": "removed", "display": { "label": "Will be removed", "result": { "kind": "content" } } }
+        { "name": "current", "display": {"compact":{"label":"Current catalog"},"expanded":{"label":"Current catalog","fields":[]},"result":{"kind":"content","fields":[]}} },
+        { "name": "removed", "display": {"compact":{"label":"Will be removed"},"expanded":{"label":"Will be removed","fields":[]},"result":{"kind":"content","fields":[]}} }
     ] }),
     );
     assert_eq!(
@@ -10824,7 +10841,7 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-        { "name": "current", "display": { "label": "Stale catalog", "result": { "kind": "content" } } }
+        { "name": "current", "display": {"compact":{"label":"Stale catalog"},"expanded":{"label":"Stale catalog","fields":[]},"result":{"kind":"content","fields":[]}} }
     ] }),
     );
     dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
@@ -10840,7 +10857,7 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     // Validation builds a fresh local catalog and only swaps state after the
     // whole aggregate succeeds.
     let malformed = json!({ "kind": "tool.register", "tools": [
-        { "name": "current", "display": { "label": "Broken", "arguments": {}, "result": { "kind": "content" } } }
+        { "name": "current", "display": {"compact":{"label":"Broken"},"expanded":{"label":"Broken","fields":[{"label":"bad","select":{"source":"args","path":"x"},"kind":"text"}]},"result":{"kind":"content","fields":[]}} }
     ] });
     assert!(engine
         .dispatch_envelope_body(&malformed.as_object().unwrap().clone())
@@ -10853,7 +10870,7 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-        { "name": "current", "display": { "label": "Replacement catalog", "result": { "kind": "content" } } }
+        { "name": "current", "display": {"compact":{"label":"Replacement catalog"},"expanded":{"label":"Replacement catalog","fields":[]},"result":{"kind":"content","fields":[]}} }
     ] }),
     );
     assert_eq!(
@@ -10869,7 +10886,7 @@ fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
     dispatch_event(
         &mut cold,
         json!({ "kind": "tool.register", "tools": [
-        { "name": "late", "display": { "label": "Late attach catalog", "result": { "kind": "content" } } }
+        { "name": "late", "display": {"compact":{"label":"Late attach catalog"},"expanded":{"label":"Late attach catalog","fields":[]},"result":{"kind":"content","fields":[]}} }
     ] }),
     );
     dispatch_event(&mut cold, json!({ "kind": "sessions.replay.end" }));
@@ -11076,9 +11093,9 @@ fn consumer_projection_keeps_raw_tool_payloads_behind_details() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-            { "name": "skill", "display": { "label": "Load skill", "primary": { "arg": "name" }, "result": { "kind": "receipt", "text": "skill loaded" } } },
-            { "name": "list_dir", "display": { "label": "List directory", "primary": { "arg": "path" }, "result": { "kind": "content" } } },
-            { "name": "run_tool", "display": { "label": "Run tool", "primary": { "arg": "name" }, "result": { "kind": "content" } } }
+            { "name": "skill", "display": { "compact": { "label": "Load skill", "primary": { "label": "name", "select": { "source": "args", "path": "name" }, "kind": "scalar" } }, "expanded": { "label": "Load skill", "fields": [] }, "result": { "kind": "receipt", "text": "skill loaded", "fields": [] } } },
+            { "name": "list_dir", "display": { "compact": { "label": "List directory", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } }, "expanded": { "label": "List directory", "fields": [] }, "result": { "kind": "content", "fields": [] } } },
+            { "name": "run_tool", "display": { "compact": { "label": "Run tool", "primary": { "label": "name", "select": { "source": "args", "path": "name" }, "kind": "scalar" } }, "expanded": { "label": "Run tool", "fields": [] }, "result": { "kind": "content", "fields": [] } } }
         ] }),
     );
     open_single_node(&mut engine, "transcriptish", "agent.node");

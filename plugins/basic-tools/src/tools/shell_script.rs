@@ -30,13 +30,9 @@ pub fn schema() -> Value {
 
 pub fn display() -> Value {
     json!({
-        "label": "execute shell script",
-        "primary": { "arg": "script" },
-        "arguments": [
-            { "label": "cwd", "arg": "cwd" },
-            { "label": "timeout", "arg": "timeout" }
-        ],
-        "result": { "kind": "content" }
+        "compact": { "label": "execute shell script", "primary": { "label": "script", "select": { "source": "args", "path": "script" }, "kind": "scalar" } },
+        "expanded": { "label": "execute shell script", "fields": [] },
+        "result": { "kind": "content", "fields": [] }
     })
 }
 

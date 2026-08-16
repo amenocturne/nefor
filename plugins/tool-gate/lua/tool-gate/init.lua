@@ -107,6 +107,8 @@ function M.maybe_dump_output(body, chat_id)
     local rewritten = {}
     for k, v in pairs(body) do rewritten[k] = v end
     rewritten.output = summary
+    rewritten.output_path = path
+    rewritten.source_path = body.source_path
     return rewritten, path
   end
 
