@@ -65,6 +65,11 @@ fn starter_mag_kernel_llm_factory() {
 }
 
 #[test]
+fn starter_mag_kernel_provider_round_metadata() {
+    run_lua_test("tests/lua/mag-kernel/provider_round_metadata_test.lua");
+}
+
+#[test]
 fn starter_mag_kernel_structured_output_factory() {
     run_lua_test("tests/lua/mag-kernel/structured_output_test.lua");
 }

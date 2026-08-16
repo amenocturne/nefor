@@ -155,6 +155,8 @@ function M.construct(id, params, emit, options)
   local streamed_message_id = nil
   local streamed_text = ""
   local terminal_metadata = {}
+  local provider_round_metadata = {}
+  local provider_round_completion = {}
   local facts = nil
   local firing_sequence = 0
   local tool_call_corrections = 0
@@ -244,6 +246,9 @@ function M.construct(id, params, emit, options)
   end
 
   function state:append(message, completion)
+    if message.role == "assistant" and completion == nil then
+      completion = provider_round_completion
+    end
     if message.role == "assistant" and streamed_message_id then
       local content = message.content
       if type(content) == "string" and content ~= "" then
@@ -388,6 +393,13 @@ function M.construct(id, params, emit, options)
         return nil
       end
       local result = activation.result
+      local round_detail = {}
+      for key, value in pairs(provider_round_metadata) do round_detail[key] = value end
+      for key, value in pairs(type(result) == "table" and result or {}) do
+        round_detail[key] = value
+      end
+      provider_round_completion = merge_terminal(round_detail)
+      provider_round_metadata = {}
       if type(result) == "table" and result.finish_reason == "error" then
         local detail = result.error
         if type(detail) ~= "string" or detail == "" then
@@ -471,6 +483,7 @@ function M.construct(id, params, emit, options)
       if value.kind == "retry" then
         facts:retry(value.error or value.message or "provider_retry", value)
       elseif value.kind == "usage" then
+        provider_round_metadata = value
         terminal_metadata.usage = value.usage or value.result or value
         terminal_metadata.context_input_tokens = value.context_input_tokens
           or (type(value.usage) == "table" and value.usage.context_input_tokens)

@@ -174,9 +174,14 @@ function M.new(options)
         })
       end
     end
+    completion = completion or {}
     emit("message_completed", {
       message_id = message_id,
-      completion = completion or {},
+      completion = completion.completion or {},
+      model = completion.model,
+      duration_ms = completion.duration_ms,
+      usage = completion.usage,
+      finish_reason = completion.finish_reason,
       visibility = visibility_of(message),
     })
   end
