@@ -68,10 +68,14 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 
 ## Commands
 
-- During development, run only targeted tests for the code and behavior that changed. The full workspace suite takes substantial time, so reserve it for final integration or release validation rather than each iterative change.
+- Verification breadth is part of this repository's workflow, not a generic completion ritual. During development, run only tests targeted at the code and behavior that changed.
+- For an ordinary scoped code commit, run the relevant targeted tests and then `just check` once. This is the repository-defined completion lane; do not add broader suites merely because the work is being committed. Documentation-only changes need only their relevant documentation checks.
+- Run subsystem recipes such as `just test-example`, `just test-tui-chat`, or targeted package Clippy only when the affected behavior requires them. Run `just test-integration` only for changes crossing the process-level integration boundaries it covers. Reserve `just test-all` and workspace-wide `just lint` for changes with an actual cross-workspace blast radius, release validation, or an explicit assignment naming that breadth. Reaching the end of a work unit, verification phase, or commit is not itself a trigger for any broader check. Do not run multiple broad recipes as cumulative reassurance.
 - `just run` — launch engine with `./examples/nefor-agent` config (debug build). Sets `NEFOR_DEV_DIR` so Lua files load from the repo, not the installed copy.
-- `just test` — workspace tests.
-- `just lint` — clippy with `-D warnings`.
+- `just check` — formatting, documentation, and the fast default confidence set; the ordinary scoped pre-commit check.
+- `just test` — fast default confidence set, not the full workspace suite.
+- `just test-all` — full local suite for cross-cutting or release-level validation.
+- `just lint` — workspace-wide Clippy with `-D warnings`; use targeted package Clippy for scoped Rust changes.
 - `just fmt` — rustfmt.
 - `just build` — release build into `target/release/`.
 
