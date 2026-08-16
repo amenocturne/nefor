@@ -90,6 +90,20 @@ preview = preview_state.spawn(preview, "run", "worker.llm", "llm", {
 }, 100)
 eq(preview_state.node(preview, "run", "worker.llm").started_at_ms, nil,
   "preview spawn does not start active time")
+preview = preview_state.arrival(preview, {
+  run_id = "run", arrival_id = "agent-result", from = "worker.llm",
+  wire = "nefor.agent.Result", semantic_type_id = "sha256:answer",
+  semantic_type = { kind = "named", name = "nefor.contracts.FinalAnswer" },
+  constructor_id = "sha256:answer", value = { content = "Canonical answer" },
+}, 900)
+local typed_result = preview_state.agent_result(preview, "run", "worker")
+eq(typed_result.value.content, "Canonical answer", "agent typed result is retained")
+eq(typed_result.arrival_id, "agent-result", "agent result keeps provenance")
+preview = preview_state.run_failure(preview, "run", {
+  from = "worker.llm", failure = "actor", error = "late run failure",
+}, 950)
+eq(preview_state.agent_result(preview, "run", "worker").value.content, "Canonical answer",
+  "typed output takes precedence over retained run failure")
 preview = preview_state.lifecycle(preview, "run", "worker.llm", "working", 1000)
 preview = preview_state.lifecycle(preview, "run", "worker.llm", "idle", 1500)
 preview = preview_state.finish_run(preview, "run", "done", 10000)
@@ -122,6 +136,36 @@ eq(assignment, "Analyze the session.", "source agent assignment comes from its u
 is_agent, assignment = preview_state.agent_assignment(source, "run", "plain")
 eq(is_agent, false, "arbitrary MAG nodes do not get an agent assignment section")
 eq(assignment, nil)
+
+local task = {
+  node_previews = {}, mag_arrivals = {}, scope_to_run = {}, capability_owners = {},
+}
+task = preview_state.spawn(task, "task-run", "task", "source", {
+  params = { value = { prompt = "Full human task prompt" }, value_type = "sha256:task" },
+}, 0)
+local authored_task = preview_state.node(task, "task-run", "task").source_fact
+eq(authored_task.value.prompt, "Full human task prompt", "typed Task is retained before firing")
+eq(authored_task.semantic_type_id, "sha256:task")
+task = preview_state.arrival(task, {
+  run_id = "task-run", arrival_id = "task-arrival", from = "task",
+  wire = "nefor.graph.Value", semantic_type_id = "sha256:task",
+  semantic_type = { kind = "named", name = "nefor.contracts.Task" },
+  constructor_id = "sha256:task", value = { prompt = "Full human task prompt" },
+}, 1)
+task = preview_state.finish_run(task, "task-run", "done", 2)
+local emitted_task = preview_state.node(task, "task-run", "task").source_fact
+eq(emitted_task.value.prompt, "Full human task prompt", "typed Task survives arrival and finish")
+eq(emitted_task.arrival_id, "task-arrival", "source keeps exact emitted provenance")
+
+local failed_agent = {
+  node_previews = {}, mag_arrivals = {}, scope_to_run = {}, capability_owners = {},
+}
+failed_agent = preview_state.spawn(failed_agent, "failed", "worker.llm", "llm", {}, 0)
+failed_agent = preview_state.run_failure(failed_agent, "failed", {
+  from = "worker.llm", failure = "actor", error = "provider disconnected",
+}, 1)
+eq(preview_state.agent_result(failed_agent, "failed", "worker").value,
+  "provider disconnected", "run failure is the no-result fallback")
 
 local function capability_values(projected)
   return preview_state.node(projected, "run", "worker.run-tool").streams.capability or {}

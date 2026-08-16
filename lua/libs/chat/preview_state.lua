@@ -76,6 +76,19 @@ function M.spawn(state, run_id, actor_id, factory, spec, now_ms)
     next.factory, next.status = factory, "pending"
     next.spec = type(spec) == "table" and spec or {}
     next.params = next.spec.params or {}
+    if factory == "source" or factory == "nefor.factory.source" then
+      next.source_fact = {
+        value = next.params.value,
+        semantic_type_id = next.params.value_type,
+        semantic_type = next.spec.semantic_type or next.spec.output_type
+          or (type(next.params.value) == "table" and type(next.params.value.prompt) == "string"
+            and { kind = "named", name = "nefor.contracts.Task" } or nil),
+        constructor_id = next.params.value_type,
+        wire = "nefor.graph.Value",
+        from = actor_id,
+        provenance = "authored source value",
+      }
+    end
     next.spawned_at_ms, next.last_activity_ms = now_ms, now_ms
     next.active_ms = next.active_ms or 0
     return next
@@ -140,6 +153,19 @@ function M.arrival(state, msg, now_ms)
     node.outputs = copy_map(prev.outputs)
     local binding = type(msg.wire) == "string" and msg.wire or msg.semantic_type_id or "output"
     node.outputs[binding], node.outputs.last = msg.value, msg.value
+    node.output_facts = copy_map(prev.output_facts)
+    local fact = {
+      value = msg.value,
+      semantic_type_id = msg.semantic_type_id,
+      semantic_type = msg.semantic_type,
+      constructor_id = msg.constructor_id,
+      wire = msg.wire,
+      from = msg.from,
+      arrival_id = msg.arrival_id,
+      at_ms = now_ms,
+    }
+    node.output_facts[binding], node.output_facts.last = fact, fact
+    if node.source_fact then node.source_fact = fact end
     node.last_activity_ms, node.last_activity_kind = now_ms, "output"
     return node
   end)
@@ -266,6 +292,51 @@ end
 
 function M.node(state, run_id, actor_id)
   return (((state.node_previews or {})[run_id] or {})[actor_id])
+end
+
+function M.run_failure(state, run_id, msg, now_ms)
+  if type(run_id) ~= "string" then return state end
+  local nodes = (state.node_previews or {})[run_id] or {}
+  local actor_id = type(msg.from) == "string" and msg.from or nil
+  if not actor_id or not nodes[actor_id] then return state end
+  return put_node(state, run_id, actor_id, function(prev)
+    local node = copy_map(prev)
+    node.terminal_failure = {
+      value = msg.error or msg.failure or "Run failed",
+      from = actor_id,
+      failure = msg.failure,
+      at_ms = now_ms,
+      provenance = "mag.run_failed",
+    }
+    return node
+  end)
+end
+
+function M.group_members(state, run_id, group)
+  local members = {}
+  for actor_id in pairs((state.node_previews or {})[run_id] or {}) do
+    if actor_id == group or actor_id:sub(1, #group + 1) == group .. "." then
+      members[#members + 1] = actor_id
+    end
+  end
+  table.sort(members)
+  return members
+end
+
+function M.agent_result(state, run_id, group)
+  local nodes = (state.node_previews or {})[run_id] or {}
+  local typed
+  for _, suffix in ipairs({ ".llm", ".structured-output" }) do
+    local node = nodes[group .. suffix]
+    local fact = node and node.output_facts and node.output_facts.last
+    if fact and fact.wire == "nefor.agent.Result" then typed = fact end
+  end
+  if typed then return typed end
+  for _, actor_id in ipairs(M.group_members(state, run_id, group)) do
+    local failure = nodes[actor_id] and nodes[actor_id].terminal_failure
+    if failure then return failure end
+  end
+  return nil
 end
 
 function M.active_elapsed_ms(node, now_ms)

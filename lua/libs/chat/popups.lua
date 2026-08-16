@@ -501,6 +501,8 @@ local function aggregate_inspector(state, p, now_ms)
     label = "group · " .. p.group
   else label = "run · " .. run_ident_of(run, p.run_id) end
   local items, last_ms, last_kind = preview_state.merged(state, p.run_id, predicate)
+  local group_members = p.group and preview_state.group_members(state, p.run_id, p.group) or {}
+  local single_node = #group_members == 1 and preview_state.node(state, p.run_id, group_members[1]) or nil
   local member_parts = {}
   for actor_id, node in pairs((state.node_previews or {})[p.run_id] or {}) do
     if not predicate or predicate(actor_id) then
@@ -524,6 +526,13 @@ local function aggregate_inspector(state, p, now_ms)
   end
   local assignment = p.group and assignment_widget(state, p.run_id, p.group) or nil
   if assignment then table.insert(children, 1, assignment) end
+  if single_node and tostring(single_node.factory):gsub("^nefor%.factory%.", "") == "source" then
+    children = { preview_view.node(state, p.run_id, group_members[1]) }
+  elseif is_agent then
+    local result = preview_state.agent_result(state, p.run_id, p.group)
+    local result_widget = preview_view.fact("Result", result, state.expanded_details == true)
+    if result_widget then children[#children + 1] = result_widget end
+  end
   if #children == 0 then children[1] = tui.text { content = "No observed activity yet.", style = STYLE.status_dim } end
   local header = tui.column { gap = 0, children = {
     tui.text { content = "run " .. run_ident_of(run, p.run_id) .. " · chronological activity", style = STYLE.footer },
@@ -538,6 +547,42 @@ end
 function M.node_inspector(state)
   if not state.popup or state.popup.variant ~= "node_inspector" then return nil end
   local p, now_ms = state.popup, tui.now_ms()
+  if p.completed_archive and state.expanded_details ~= true then
+    local semantic, agent_groups = {}, {}
+    for actor_id, node in pairs((state.node_previews or {})[p.run_id] or {}) do
+      local kind = tostring(node.factory or ""):gsub("^nefor%.factory%.", "")
+      if kind == "source" or kind == "process-exec" or kind == "shell-script" then
+        semantic[#semantic + 1] = actor_id
+      end
+      local group = actor_id:match("^(.*)%.llm$")
+      if group then agent_groups[#agent_groups + 1] = group end
+    end
+    table.sort(semantic)
+    table.sort(agent_groups)
+    if #semantic > 0 or #agent_groups > 0 then
+      local children = {}
+      for _, actor_id in ipairs(semantic) do
+        children[#children + 1] = tui.text {
+          content = "· " .. actor_id, style = STYLE.popup_user, wrap = "none" }
+        children[#children + 1] = preview_view.node(state, p.run_id, actor_id)
+      end
+      for _, group in ipairs(agent_groups) do
+        local assignment = assignment_widget(state, p.run_id, group)
+        if assignment then children[#children + 1] = assignment end
+        local result = preview_view.fact("Result",
+          preview_state.agent_result(state, p.run_id, group), false)
+        if result then children[#children + 1] = result end
+      end
+      local run = (state.runs or {})[p.run_id]
+      local header = tui.column { gap = 0, children = {
+        tui.text { content = "run " .. run_ident_of(run, p.run_id)
+          .. " · completed preview", style = STYLE.footer },
+        tui.text { content = string.rep("─", 48), style = STYLE.footer },
+      } }
+      return popup_shell("── run · " .. run_ident_of(run, p.run_id)
+        .. " ──", header, tui.column { gap = 1, children = children }, p.unseen)
+    end
+  end
   if p.completed_archive and state.expanded_details == true then
     local run_nodes = (state.node_previews or {})[p.run_id] or {}
     local ids = {}

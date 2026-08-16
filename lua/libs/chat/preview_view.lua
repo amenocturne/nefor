@@ -106,6 +106,48 @@ end
 
 M.format_value = encode
 
+local function semantic_name(semantic_type, semantic_type_id)
+  if type(semantic_type) == "table" then
+    return semantic_type.name or encode(semantic_type)
+  end
+  return semantic_type_id
+end
+
+local function readable_value(value, _semantic_type)
+  if type(value) == "table" and type(value.prompt) == "string" then return value.prompt end
+  if type(value) == "table" and type(value.content) == "string" then return value.content end
+  if type(value) == "table" and type(value.text) == "string" then return value.text end
+  return encode(value)
+end
+
+local function fact_widget(title, fact, expanded)
+  if type(fact) ~= "table" then return nil end
+  local children = {
+    tui.text { content = title, style = STYLE.popup_user, wrap = "none" },
+    tui.text { content = readable_value(fact.value, fact.semantic_type), style = STYLE.status, wrap = "word" },
+  }
+  if expanded then
+    local details = {}
+    local function add(label, value)
+      if value ~= nil and value ~= "" then details[#details + 1] = label .. ": " .. encode(value) end
+    end
+    add("Semantic type", semantic_name(fact.semantic_type, fact.semantic_type_id))
+    add("Type id", fact.semantic_type_id)
+    add("Constructor", fact.constructor_id)
+    add("Wire", fact.wire)
+    add("Actor", fact.from)
+    add("Arrival", fact.arrival_id)
+    add("Observed at", fact.at_ms and (tostring(fact.at_ms) .. " ms") or nil)
+    add("Provenance", fact.provenance)
+    if #details > 0 then children[#children + 1] = tui.text {
+      content = table.concat(details, "\n"), style = STYLE.status_dim, wrap = "word" }
+    end
+  end
+  return tui.column { gap = 1, children = children }
+end
+
+M.fact = fact_widget
+
 local function section(title, values, options)
   local keys = {}
   for key in pairs(values or {}) do
@@ -156,13 +198,13 @@ function M.node(state, run_id, actor_id, options)
   }
   local sections
   if profile.source then
-    sections = { section("Value", { value = (node.params or {}).value }, { hide_keys = true }),
-      section("Input", node.inputs), section("Output", node.outputs) }
+    local source = fact_widget("Content", node.source_fact, state.expanded_details == true)
+    sections = { source, section("Input", node.inputs) }
   else
-    sections = { section("Params", node.params), section("Input", node.inputs),
-      section("Output", node.outputs) }
+    local output = profile.terminal and nil or section("Output", node.outputs)
+    sections = { section("Params", node.params), section("Input", node.inputs), output }
   end
-  for index = 1, 3 do
+  for index = 1, #sections do
     local candidate = sections[index]
     if candidate then children[#children + 1] = candidate end
   end

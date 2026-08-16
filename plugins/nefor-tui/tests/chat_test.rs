@@ -11426,6 +11426,176 @@ fn node_inspector_keeps_ordinary_keys_inert_and_escape_restores_sidebar_focus() 
 }
 
 #[test]
+fn task_source_group_shows_readable_prompt_and_details_without_duplication() {
+    let mut engine = Engine::new(140, 38).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "task-run", "run_name": "task-preview"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "task-run", "id": "task", "factory": "source",
+            "spec": { "params": { "value": { "prompt": "Explain the complete migration plan." },
+                "value_type": "sha256:task" } }
+        }),
+    );
+
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select task group");
+    engine.handle_key(key("space")).expect("open task group");
+    let concise = render_snapshot(&mut engine);
+    assert!(
+        concise.contains("Explain the complete migration plan."),
+        "{concise}"
+    );
+    assert!(
+        !concise.contains("prompt:") && !concise.contains("Value"),
+        "{concise}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.arrival", "run_id": "task-run", "arrival_id": "task-arrival",
+            "from": "task", "wire": "nefor.graph.Value", "semantic_type_id": "sha256:task",
+            "semantic_type": { "kind": "named", "name": "nefor.contracts.Task" },
+            "constructor_id": "sha256:task", "value": { "prompt": "Explain the complete migration plan." }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_complete", "run_id": "task-run", "status": "success"
+        }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("show task details");
+    let detailed = render_snapshot(&mut engine);
+    assert_eq!(
+        detailed
+            .matches("Explain the complete migration plan.")
+            .count(),
+        1,
+        "{detailed}"
+    );
+    for expected in [
+        "nefor.contracts.Task",
+        "sha256:task",
+        "nefor.graph.Value",
+        "task-arrival",
+    ] {
+        assert!(
+            detailed.contains(expected),
+            "task details lost {expected}: {detailed}"
+        );
+    }
+}
+
+#[test]
+fn agent_group_appends_canonical_result_after_existing_activity() {
+    let mut engine = Engine::new(140, 44).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "result-run", "run_name": "delegated"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.actor_spawned", "run_id": "result-run", "id": "worker.llm", "factory": "llm",
+            "spec": { "params": { "system": "base\n\n---\n\nInspect the migration." } }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mock.completion.request", "request_id": "result-provider",
+            "invocation": { "run_id": "result-run", "actor_id": "worker.llm" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mock.completion.event", "request_id": "result-provider",
+            "event": "text_delta", "text": "Existing activity summary"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.arrival", "run_id": "result-run", "arrival_id": "result-arrival",
+            "from": "worker.llm", "wire": "nefor.agent.Result", "semantic_type_id": "sha256:answer",
+            "semantic_type": { "kind": "named", "name": "nefor.contracts.FinalAnswer" },
+            "constructor_id": "sha256:answer", "value": { "content": "Exact canonical result" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_complete", "run_id": "result-run", "status": "success"
+        }),
+    );
+
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("select agent group");
+    engine
+        .handle_key(key("space"))
+        .expect("open agent inspector");
+    let frame = render_snapshot(&mut engine);
+    let assignment = frame.find("Initial assignment").expect("assignment");
+    let activity = frame.find("Existing activity summary").expect("activity");
+    let result = frame.find("Result").expect("result");
+    let value = frame.find("Exact canonical result").expect("result value");
+    assert!(
+        assignment < activity && activity < result && result < value,
+        "{frame}"
+    );
+}
+
+#[test]
+fn process_preview_renders_streams_without_channel_labels() {
+    let mut engine = Engine::new(120, 36).expect("engine");
+    load_chat_scenario(&mut engine);
+    open_single_node(&mut engine, "process-exec", "process.node");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mock.completion.request", "request_id": "process-cap",
+            "invocation": { "run_id": "preview-run", "actor_id": "process.node" }
+        }),
+    );
+    for (stream, text) in [
+        ("stdout", "plain output line"),
+        ("stderr", "plain warning line"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "tool.stream", "id": "process-cap", "stream": stream, "text": text
+            }),
+        );
+    }
+    let frame = render_snapshot(&mut engine);
+    assert!(
+        frame.contains("plain output line") && frame.contains("plain warning line"),
+        "{frame}"
+    );
+    assert!(
+        !frame.contains("stdout") && !frame.contains("stderr"),
+        "{frame}"
+    );
+}
+
+#[test]
 fn agent_group_inspector_shows_its_initial_assignment() {
     let mut engine = Engine::new(120, 32).expect("engine");
     load_chat_scenario(&mut engine);

@@ -1392,7 +1392,8 @@ local function handle_mag_run_failed(msg, state)
   local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
   local now = tui.now_ms()
-  local next = preview_state.finish_run(run_panel.mag_run_failed(state, run_id, "failed", now), run_id, "failed", now)
+  local projected = preview_state.run_failure(state, run_id, msg, now)
+  local next = preview_state.finish_run(run_panel.mag_run_failed(projected, run_id, "failed", now), run_id, "failed", now)
   return retract_mag_approvals(next, run_id), {}
 end
 
