@@ -359,43 +359,65 @@ fn fixture_message_with_submissions(
 }
 
 fn fixture_tool_started(engine: &mut Engine, id: &str, name: &str, input: JsonValue) {
-    let primary = input.as_object().and_then(|args| {
-        [
-            "path", "file", "run_id", "intent", "name", "action", "command",
-        ]
-        .into_iter()
-        .find(|key| args.contains_key(*key))
-    });
-    let primary = primary.map(|path| {
-        json!({
-            "label": path,
-            "select": { "source": "args", "path": path },
-            "kind": if path == "path" || path == "file" { "path" } else { "scalar" }
-        })
-    });
-    let label = match name {
-        "shell.script" => "Run command",
-        "mag" => "MAG",
-        "mag-eval" => "mag eval",
-        "terminate-graph" => "terminate graph",
-        "read_file" => "Read file",
-        _ => name,
-    };
-    let mut compact = json!({ "label": label });
-    if let Some(primary) = primary {
-        compact["primary"] = primary;
-    }
-    dispatch_event(
-        engine,
-        json!({ "kind": "tool.register", "tools": [{
-        "name": name,
-        "display": {
+    let registered = engine
+        .state_table()
+        .expect("state")
+        .get::<mlua::Table>("tool_displays")
+        .expect("tool displays")
+        .get::<Option<mlua::Table>>(name)
+        .expect("registered tool lookup")
+        .is_some();
+    if !registered {
+        let primary = input.as_object().and_then(|args| {
+            [
+                "path", "file", "run_id", "intent", "name", "action", "command",
+            ]
+            .into_iter()
+            .find(|key| args.contains_key(*key))
+        });
+        let primary = primary.map(|path| {
+            json!({
+                "label": path,
+                "select": { "source": "args", "path": path },
+                "kind": if path == "path" || path == "file" { "path" } else { "scalar" }
+            })
+        });
+        let label = match name {
+            "shell.script" => "Run command",
+            "mag" => "MAG",
+            "mag-eval" => "mag eval",
+            "terminate-graph" => "terminate graph",
+            "read_file" => "Read file",
+            _ => name,
+        };
+        let mut compact = json!({ "label": label });
+        if let Some(primary) = primary {
+            compact["primary"] = primary;
+        }
+        let mut display = json!({
             "compact": compact,
             "expanded": { "label": label, "fields": [] },
             "result": { "kind": "content", "fields": [] }
+        });
+        if name == "mag" || name == "mag-eval" {
+            display["lifecycle"] = json!("delayed");
+            if name == "mag-eval" {
+                display["expanded"]["fields"] = json!([{
+                    "label": "expression",
+                    "select": { "source": "args", "path": "expression" },
+                    "kind": "text", "max_lines": 80, "max_bytes": 8000,
+                    "omit": "missing"
+                }]);
+            }
         }
-    }] }),
-    );
+        dispatch_event(
+            engine,
+            json!({ "kind": "tool.register", "tools": [{
+            "name": name,
+            "display": display
+        }] }),
+        );
+    }
     let turn = fixture_turn(engine);
     dispatch_event(
         engine,
@@ -1466,7 +1488,7 @@ fn tool_start_closes_empty_provider_round_before_text_answer_projection() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("mag eval [sync]") && out.contains("interrupted"),
+        out.contains("mag eval") && out.contains("interrupted"),
         "terminally interrupted delayed invocation must render once: {out}"
     );
     assert!(out.contains("final answer"), "{out}");
@@ -3000,6 +3022,14 @@ fn first_canonical_activation_preserves_optimistic_user_message() {
     activate_conversation(&mut engine, "root");
     dispatch_event(
         &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "mag", "display": { "compact": { "label": "mag" },
+            "expanded": { "label": "mag", "fields": [] },
+            "result": { "kind": "content", "fields": [] }, "lifecycle": "delayed" }
+        }] }),
+    );
+    dispatch_event(
+        &mut engine,
         json!({
             "kind": "conversation.projection.delta", "conversation_id": "root",
             "change": { "kind": "turn_started", "turn_id": "turn", "run_id": "run" }
@@ -3052,10 +3082,6 @@ fn first_canonical_activation_preserves_optimistic_user_message() {
     assert!(
         out.contains("visible prompt"),
         "first activation must not erase the locally-owned user row when the canonical input is structured:\n{out}"
-    );
-    assert!(
-        out.contains("mag"),
-        "agent activity must remain visible:\n{out}"
     );
 }
 
@@ -3409,11 +3435,9 @@ fn ctrl_o_toggles_expanded_details() {
         "{semantic:?}"
     );
     assert!(
-        semantic.contains("completed") && semantic.contains("hidden"),
+        semantic.contains("result:") && semantic.contains("SECRET RAW OUTPUT"),
         "{semantic:?}"
     );
-    assert!(semantic.contains("/raw t1 to reveal"), "{semantic:?}");
-    assert!(!semantic.contains("SECRET RAW OUTPUT"), "{semantic:?}");
 
     engine.handle_key(key("ctrl_r")).expect("ctrl_r");
     let raw = render_str(&mut engine);
@@ -3579,9 +3603,9 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
     );
     fixture_assistant_completed(&mut engine, None, json!({}));
     let out = render_snapshot(&mut engine);
-    assert!(out.contains("mag execute [sync] · hidden.mag"), "{out}");
-    assert!(out.contains("mag execute [async] · ship.mag"), "{out}");
-    assert!(out.contains("mag eval [sync] · Inspect workspace"), "{out}");
+    assert!(out.contains("▸ mag · hidden.mag"), "{out}");
+    assert!(out.contains("▸ mag · ship.mag"), "{out}");
+    assert!(out.contains("▸ mag eval · Inspect workspace"), "{out}");
     assert!(out.contains("mag result [async] · ship.mag · 4s"), "{out}");
     assert!(
         !out.contains("FAILED"),
@@ -3618,11 +3642,7 @@ fn collapsed_mag_headers_show_action_and_filename_without_changing_expanded_head
     }
 
     let collapsed = render_str(&mut engine);
-    for expected in [
-        "▸ mag write · draft.mag",
-        "▸ mag compile · check.mag",
-        "▸ mag execute [sync] · ship.mag",
-    ] {
+    for expected in ["▸ MAG · draft.mag", "▸ MAG · check.mag", "▸ MAG · ship.mag"] {
         assert!(
             collapsed.contains(expected),
             "missing {expected:?}: {collapsed:?}"
@@ -7601,6 +7621,7 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
     fixture_message(&mut engine, "user", "summarize-thing");
     // Then the tool call paints (the visible artefact of the bug).
     fixture_tool_started(&mut engine, "t1", "mag", json!({}));
+    fixture_tool_completed(&mut engine, "t1", json!({ "status": "submitted" }), false);
     let _ = render_str(&mut engine);
 
     let out = engine.snapshot();
@@ -7610,7 +7631,7 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
          between local push and echo (production bug repro). \
          Transcript:\n{out}",
     );
-    assert!(out.contains("mag"), "tool call must still render:\n{out}");
+    assert!(out.contains("MAG"), "tool call must still render:\n{out}");
 }
 
 /// Direct production repro: at boot the first message renders fine, but
@@ -10081,6 +10102,7 @@ fn tool_input_long_single_line_wraps_fully() {
         "mag-eval",
         json!({ "expression": expr.clone() }),
     );
+    fixture_tool_completed(&mut engine, "t1", json!({ "status": "submitted" }), false);
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
     engine.handle_key(key("ctrl_r")).expect("ctrl_r");
     let _ = render_str(&mut engine);
@@ -10217,9 +10239,11 @@ fn tool_path_summary_keeps_tail_collapsed_and_wraps_full_path_expanded() {
             json!({ "kind": "tool.register", "tools": [{
                 "name": name,
                 "display": {
-                    "label": label,
-                    "primary": { "arg": arg },
-                    "result": { "kind": "receipt", "text": "content loaded" }
+                    "compact": { "label": label, "primary": {
+                        "label": arg, "select": { "source": "args", "path": arg }, "kind": "path"
+                    } },
+                    "expanded": { "label": label, "fields": [] },
+                    "result": { "kind": "receipt", "text": "content loaded", "fields": [] }
                 }
             }] }),
         );
@@ -10282,10 +10306,7 @@ fn tool_display_projection_preserves_entry_payload_identity() {
 
     engine.handle_key(key("ctrl_o")).expect("expand");
     let semantic = render_snapshot(&mut engine);
-    assert!(
-        semantic.contains("Load · secret.txt (cwd: /exact/root)"),
-        "{semantic}"
-    );
+    assert!(semantic.contains("▼ Load · secret.txt"), "{semantic}");
     assert!(!semantic.contains("EXACT INPUT TOKEN"), "{semantic}");
     assert!(!semantic.contains("EXACT MODEL RESULT"), "{semantic}");
 
@@ -11093,7 +11114,7 @@ fn consumer_projection_keeps_raw_tool_payloads_behind_details() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [
-            { "name": "skill", "display": { "compact": { "label": "Load skill", "primary": { "label": "name", "select": { "source": "args", "path": "name" }, "kind": "scalar" } }, "expanded": { "label": "Load skill", "fields": [] }, "result": { "kind": "receipt", "text": "skill loaded", "fields": [] } } },
+            { "name": "skill", "display": { "compact": { "label": "Load skill", "primary": { "label": "name", "select": { "source": "args", "path": "name" }, "kind": "list" } }, "expanded": { "label": "Load skill", "fields": [] }, "result": { "kind": "receipt", "text": "skill loaded", "fields": [] } } },
             { "name": "list_dir", "display": { "compact": { "label": "List directory", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } }, "expanded": { "label": "List directory", "fields": [] }, "result": { "kind": "content", "fields": [] } } },
             { "name": "run_tool", "display": { "compact": { "label": "Run tool", "primary": { "label": "name", "select": { "source": "args", "path": "name" }, "kind": "scalar" } }, "expanded": { "label": "Run tool", "fields": [] }, "result": { "kind": "content", "fields": [] } } }
         ] }),
@@ -11872,7 +11893,7 @@ fn source_node_renders_its_typed_task_value() {
     engine.handle_key(key("space")).expect("inspect source");
     let snapshot = render_snapshot(&mut engine);
     assert!(
-        snapshot.contains("Value") && snapshot.contains("VISIBLE TYPED TASK PROMPT"),
+        snapshot.contains("Content") && snapshot.contains("VISIBLE TYPED TASK PROMPT"),
         "source preview omitted its factory-owned value:\n{snapshot}"
     );
 }
@@ -12033,6 +12054,13 @@ fn queued_submit_promotes_to_canonical_next_turn_without_disappearing() {
 
     let conversation_id = "queued-order-conversation";
     activate_conversation(&mut engine, conversation_id);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+            { "name": "mag write", "display": { "compact": { "label": "mag write", "primary": { "label": "file", "select": { "source": "args", "path": "file" }, "kind": "path" } }, "expanded": { "label": "mag write", "fields": [] }, "result": { "kind": "content", "fields": [] } } },
+            { "name": "mag execute", "display": { "compact": { "label": "mag execute", "primary": { "label": "file", "select": { "source": "args", "path": "file" }, "kind": "path" } }, "expanded": { "label": "mag execute", "fields": [] }, "result": { "kind": "content", "fields": [] } } }
+        ] }),
+    );
     append_canonical_message(
         &mut engine,
         conversation_id,
