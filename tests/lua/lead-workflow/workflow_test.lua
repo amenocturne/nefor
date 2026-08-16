@@ -2168,17 +2168,21 @@ do
   -- terminate row; the raw run_id remains the control argument.
   run_id = dispatch_lead_eval("gate-terminate", "r7/cap-22")
   _test.calls_clear()
-  invoke_tool_with_metadata("terminate-eval", "terminate-graph", { run_id = run_id },
-    { caller_id = "r7/cap-terminate" })
+  -- Production topology keeps three distinct ids: provider call id ->
+  -- capability id -> provider-facing gate firing id. The workflow receives
+  -- gate-6 as its result correlation and r3/cap-4 as caller_id.
+  invoke_tool_with_metadata("gate-6", "terminate-graph", { run_id = run_id },
+    { caller_id = "r3/cap-4" })
   calls = decode_calls()
   local display = find_call(calls, function(c)
-    return c.body.kind == "chat.tool.display_primary" and c.body.id == "r7/cap-terminate"
+    return c.body.kind == "chat.tool.display_primary"
+      and c.body.id == nil and c.body.run_id == run_id
   end)
   assert_true(display ~= nil, "known eval termination projects a canonical display label")
   assert_eq(display.body.run_id, run_id, "display projection preserves exact run correlation")
   assert_eq(display.body.primary, "Inspect lifecycle",
     "known eval termination reuses the original intent label")
-  assert_eq(tool_result("terminate-eval"), nil,
+  assert_eq(tool_result("gate-6"), nil,
     "terminate-graph remains open until exact canonical confirmation")
   assert_true(find_call(calls, function(c)
     return c.body.kind == "mag.kill_run" and c.body.run_id == run_id
@@ -2189,7 +2193,7 @@ do
     "terminate-graph marks the eval terminating")
   feed("mag", { kind = "mag.run_result", run_id = run_id,
     status = "killed", error = "terminated" })
-  local terminal = tool_result("terminate-eval")
+  local terminal = tool_result("gate-6")
   assert_true(terminal ~= nil and terminal.body.output ~= nil,
     "terminate-graph returns killed confirmation as a normal success")
   assert_eq(terminal.body.output.canceled, true,
@@ -2201,7 +2205,7 @@ do
   feed("mag", { kind = "mag.run_result", run_id = run_id,
     status = "killed", error = "duplicate" })
   assert_eq(#find_calls(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "terminate-eval"
+    return c.body.kind == "tool.result" and c.body.id == "gate-6"
   end), 1, "terminate-graph settles killed confirmation exactly once")
   assert_eq(has_relayed_lead_turn(), false,
     "synchronous terminate confirmation suppresses redundant owner completion")
@@ -2219,7 +2223,8 @@ do
   invoke_tool_with_metadata("terminate-file", "terminate-graph", { run_id = file_run.run_id },
     { caller_id = "r7/cap-file" })
   local file_display = find_call(decode_calls(), function(c)
-    return c.body.kind == "chat.tool.display_primary" and c.body.id == "r7/cap-file"
+    return c.body.kind == "chat.tool.display_primary"
+      and c.body.id == nil and c.body.run_id == file_run.run_id
   end)
   assert_eq(file_display.body.primary, "ship.mag",
     "known execute termination reuses the original file label")

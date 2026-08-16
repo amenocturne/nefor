@@ -270,11 +270,11 @@ function M.discard_message(state, message_id)
   return shallow_merge(state, { entries = entries, in_flight = in_flight })
 end
 
-function M.attach_tool_display_primary(state, id, run_id, primary)
+function M.attach_tool_display_primary(state, run_id, primary)
   for i = #state.entries, 1, -1 do
     local entry = state.entries[i]
     local args = entry.raw_input or entry.input_table
-    if entry.kind == "tool_call" and entry.id == id
+    if entry.kind == "tool_call"
         and entry.name == "terminate-graph" and type(args) == "table"
         and args.run_id == run_id then
       return shallow_merge(state, {

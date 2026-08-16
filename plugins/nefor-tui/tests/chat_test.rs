@@ -4140,8 +4140,8 @@ fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_re
     );
 
     for (id, run_id) in [
-        ("terminate-eval", "mag-run-eval"),
-        ("terminate-file", "mag-run-file"),
+        ("call_GBKLOyI8aHHVVpP7mrv0xh8d", "mag-run-eval"),
+        ("call_file_provider_id", "mag-run-file"),
     ] {
         fixture_tool_started(
             &mut engine,
@@ -4154,7 +4154,7 @@ fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_re
         &mut engine,
         "lead-workflow",
         json!({
-            "kind": "chat.tool.display_primary", "id": "terminate-file",
+            "kind": "chat.tool.display_primary",
             "run_id": "mag-run-file", "primary": "ship.mag",
         }),
     );
@@ -4162,19 +4162,19 @@ fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_re
         &mut engine,
         "lead-workflow",
         json!({
-            "kind": "chat.tool.display_primary", "id": "terminate-eval",
+            "kind": "chat.tool.display_primary",
             "run_id": "mag-run-eval", "primary": "Start sleep process",
         }),
     );
     fixture_tool_completed(
         &mut engine,
-        "terminate-eval",
+        "call_GBKLOyI8aHHVVpP7mrv0xh8d",
         json!({ "status": "killed" }),
         false,
     );
     fixture_tool_completed(
         &mut engine,
-        "terminate-file",
+        "call_file_provider_id",
         json!({ "status": "killed" }),
         false,
     );

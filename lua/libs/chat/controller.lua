@@ -911,13 +911,12 @@ end
 
 local function handle_tool_display_primary(msg, state)
   if msg._event_source ~= "lead-workflow"
-      or type(msg.id) ~= "string" or msg.id == ""
       or type(msg.run_id) ~= "string" or msg.run_id == ""
       or type(msg.primary) ~= "string" or msg.primary == "" then
     return state, {}
   end
   return transcript.attach_tool_display_primary(
-    state, msg.id, msg.run_id, msg.primary), {}
+    state, msg.run_id, msg.primary), {}
 end
 
 local function handle_graph_result_append(msg, state)
