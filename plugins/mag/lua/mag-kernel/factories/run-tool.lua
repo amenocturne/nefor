@@ -158,6 +158,7 @@ function M.construct(id, params, emit, deps)
       id = ref.call_id,
       name = ref.name,
       output = activation.result,
+      output_path = activation.output_path,
       error = activation.error,
     }
     if batch.received >= batch.expected then

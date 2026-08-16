@@ -237,7 +237,10 @@ do
     inventory = inv,
     registry = reg,
     log = silent_log(),
-    persist_output = function(node_id, output) persisted[node_id] = output end,
+    persist_output = function(node_id, output)
+      persisted[node_id] = nefor.json.decode(nefor.json.encode(output))
+      return { output_path = "/runs/test/nodes/" .. node_id .. "/output.json" }
+    end,
   })
 
   inv.apply({ actors = { actor_spec("W", "worker", {}, {}) } })
@@ -246,6 +249,8 @@ do
 
   assert_true(persisted["W"] ~= nil, "the actor's declared output landed, keyed by node id")
   assert_eq(persisted["W"].payload, "the-output", "the persisted output is the emitted message")
+  assert_eq(persisted["W"].output_path, nil,
+    "canonical persisted output is not mutated with projection metadata")
 
   -- Kernel-synthesized status types are NOT actor outputs and must not persist:
   -- apply_completion routes mag.Unit directly, bypassing the persistence seam.

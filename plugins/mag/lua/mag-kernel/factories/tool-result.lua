@@ -22,18 +22,17 @@
 --     { kind="generic-provider.ProviderOut", from=id,
 --       messages = { { role="tool", tool_call_id=<id>, name=<tool>,
 --                      content=<string|structured>, error=<e?> }, … } }
---   `content` is the tool output: a string passes through; a structured output
---   passes through verbatim for the provider layer to serialize (the kernel VM
---   has no json binding — the mag host ships only nefor.log — so this factory
---   stays pure and does not stringify); an errored call carries a readable
---   `[tool error] …` content plus the raw `error`. No shape sniffing: the
---   per-field handling is output FORMATTING, not input SELECTION.
+--   `content` is the tool output projected as bounded provider text: strings pass
+--   through unchanged while structured output is JSON-encoded. An errored call
+--   carries a readable `[tool error] …` content plus the raw `error`. No shape
+--   sniffing: the per-field handling is output FORMATTING, not input SELECTION.
 --
 -- No signal handlers: adaptation is synchronous over an already-arrived batch;
 -- the node holds no in-flight external work to abort or flush (actor-model.md,
 -- Signals: "explicit signal handlers only where meaningful").
 
 local kinds = require("kinds")
+local model_context = require("model-context")
 
 local M = {}
 
@@ -104,10 +103,29 @@ function M.construct(id, params, emit, deps)
     local message = ((activation.messages or {})[1] or {}).message or {}
     local value = type(message.value) == "table" and message.value or {}
     local results = message.results or value.results or {}
+    local entries = {}
+    for i, r in ipairs(results) do
+      r = r or {}
+      local value
+      if type(r.error) == "string" and r.error ~= "" then
+        value = "[tool error] " .. r.error
+      elseif r.output ~= nil then
+        value = r.output
+      else
+        value = ""
+      end
+      entries[i] = { value = value, output_path = r.output_path }
+    end
+    local contents = model_context.project(entries)
     local messages = {}
     for i, r in ipairs(results) do
-      messages[i] = to_message(r)
+      local message = to_message(r)
+      message.content = contents[i]
+      messages[i] = message
     end
+    -- Keep the canonical ProviderInput value and routing messages aligned. The
+    -- provider boundary consumes only `messages` when recording model context,
+    -- so this persisted transport envelope is not a second wire copy.
     emit(sign({ kind = "generic-provider.ProviderOut",
       value = { content = messages }, messages = messages }))
     return { status = "ok" }

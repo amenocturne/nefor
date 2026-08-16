@@ -224,7 +224,9 @@ local function new_run_context(meta)
       output)
     if type(persisted) == "table" and type(persisted.output_path) == "string" then
       ctx.last_output_path = persisted.output_path
+      return persisted
     end
+    return nil
   end
 
   -- The sole terminal linearization point. Persistence and completion become

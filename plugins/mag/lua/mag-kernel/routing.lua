@@ -351,7 +351,14 @@ function M:on_emit(id, message, generation)
       end
       if not self.settle_result(id, observed) then return false end
     else
-      self.persist_output(id, observed)
+      local persisted = self.persist_output(id, observed)
+      if type(persisted) == "table" and type(persisted.output_path) == "string" then
+        -- Persistence owns the canonical location. Carry that authority as
+        -- transport metadata to any downstream model-context projection; the
+        -- semantic value and the already-written artifact remain unchanged.
+        observed.output_path = persisted.output_path
+        arrival.payload.output_path = persisted.output_path
+      end
     end
     self:publish_arrival(arrival)
     if self.observe_output(id, kind, observed) == false then return false end
@@ -985,6 +992,7 @@ function M:bus_response(response)
     kind = "reply",
     ref = entry.ref,
     result = response.result,
+    output_path = response.output_path,
     error = response.error,
   })
   self:apply_completion(entry.requester, completion)

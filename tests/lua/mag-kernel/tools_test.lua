@@ -14,6 +14,7 @@
 local Registry    = require("registry")
 local run_tool    = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
+local adapter     = require("factories.adapter")
 local llm         = require("factories.llm")
 
 -- ------------------------------------------------------------------
@@ -262,12 +263,118 @@ do
   assert_eq(out.messages[1].tool_call_id, "call-1", "message keeps the tool_call_id for provider pairing")
   assert_eq(out.messages[1].content, "match at line 3", "string output passes through as content")
 
-  -- structured output passes through verbatim (no json binding in the kernel VM)
-  assert_eq(out.messages[2].content.bytes, 12, "structured output passes through verbatim")
+  -- structured output is serialized only in the provider-facing projection.
+  local structured = nefor.json.decode(out.messages[2].content)
+  assert_eq(structured.bytes, 12, "structured output becomes bounded provider text")
 
   -- an errored result becomes readable content plus the raw error
   assert_eq(out.messages[3].content, "[tool error] exit 1", "an error becomes readable content")
   assert_eq(out.messages[3].error, "exit 1", "the raw error is preserved on the message")
+end
+
+-- ==================================================================
+-- model-context projection: byte ceilings, UTF-8, markers, and fair batches
+-- ==================================================================
+
+do
+  local function project(results)
+    local msgs, emit = capture()
+    local inst = tool_result.construct("tr", {}, emit)
+    inst.deliver(single("run-tool", "generic-tool.ToolHandle", { results = results }))
+    return find_kind(msgs, "generic-provider.ProviderOut")
+  end
+
+  local below = string.rep("a", 16383)
+  local exact = string.rep("b", 16384)
+  local unchanged = project({
+    { id = "below", name = "read", output = below },
+    { id = "exact", name = "read", output = exact },
+  })
+  assert_eq(unchanged.messages[1].content, below, "below-limit output is unchanged")
+  assert_eq(unchanged.messages[2].content, exact, "the exact 16384-byte boundary is unchanged")
+
+  local path = "/runs/r1/nodes/read/output.json"
+  local huge = string.rep("H", 20000) .. string.rep("T", 20000)
+  local bounded = project({ { id = "huge", name = "read", output = huge, output_path = path } })
+  local content = bounded.messages[1].content
+  assert_true(#content <= 16384, "single-line output including marker and path stays within 16 KiB")
+  assert_true(content:sub(1, 100) == string.rep("H", 100), "projection preserves a useful head")
+  assert_true(content:sub(-100) == string.rep("T", 100), "projection preserves a useful tail")
+  assert_true(content:find("original 40000 bytes", 1, true) ~= nil,
+    "marker states the original byte size")
+  assert_true(content:find(path, 1, true) ~= nil, "marker points to the canonical output path")
+  local omitted = tonumber(content:match("omitted (%d+) bytes"))
+  local marker_start, marker_end = content:find("\n\n%[output truncated:.-%]\n\n")
+  assert_true(marker_start ~= nil and omitted == 40000 - (#content - (marker_end - marker_start + 1)),
+    "marker omission accounting matches retained source bytes")
+
+  local missing = project({ { id = "missing", name = "read", output = huge } })
+  assert_true(#missing.messages[1].content <= 16384, "missing-path projection still obeys the item cap")
+  assert_true(missing.messages[1].content:find("Full output is unavailable", 1, true) ~= nil,
+    "missing canonical path is explicit")
+
+  local unicode = string.rep("🙂", 5000)
+  local unicode_out = project({ { id = "utf8", name = "read", output = unicode, output_path = path } })
+  assert_true(#unicode_out.messages[1].content <= 16384, "multibyte projection obeys the byte cap")
+  local quoted = nefor.json.encode(unicode_out.messages[1].content)
+  assert_true(type(nefor.json.decode(quoted)) == "string", "multibyte projection preserves UTF-8 boundaries")
+
+  local smalls = {}
+  for i = 1, 6 do smalls[i] = { id = "small-" .. i, name = "read", output = string.rep("s", 100) } end
+  local under = project(smalls)
+  for i = 1, 6 do assert_eq(under.messages[i].content, smalls[i].output,
+    "under-limit aggregate keeps result " .. i .. " unchanged") end
+
+  local mixed = { { id = "huge", name = "read", output = string.rep("x", 200000), output_path = path } }
+  for i = 1, 8 do
+    mixed[#mixed + 1] = { id = "small-" .. i, name = "read", output = "small-result-" .. i }
+  end
+  local mixed_out = project(mixed)
+  local total = 0
+  for i, message in ipairs(mixed_out.messages) do
+    total = total + #message.content
+    assert_eq(message.tool_call_id, mixed[i].id, "aggregate preserves result identity " .. i)
+  end
+  assert_true(total <= 98304, "huge plus small aggregate stays within 96 KiB")
+  for i = 2, #mixed do assert_eq(mixed_out.messages[i].content, mixed[i].output,
+    "a huge result does not starve small sibling " .. i) end
+
+  local many = {}
+  for i = 1, 8 do
+    many[i] = { id = "huge-" .. i, name = "read", output = string.rep(tostring(i), 30000), output_path = path }
+  end
+  local first, second = project(many), project(many)
+  local many_total = 0
+  for i = 1, #many do
+    many_total = many_total + #first.messages[i].content
+    assert_eq(first.messages[i].content, second.messages[i].content,
+      "fair aggregate allocation is deterministic for result " .. i)
+    assert_true(#first.messages[i].content > 1000, "every huge sibling receives a useful preview")
+  end
+  assert_true(many_total <= 98304, "several huge results stay within the aggregate cap")
+
+  assert_eq(#bounded.value.content, 1,
+    "canonical ProviderInput retains the bounded semantic content")
+  assert_eq(bounded.value.content[1], bounded.messages[1],
+    "value.content references the same logical message rather than a second projection")
+  assert_eq(#bounded.messages, 1, "provider input carries one logical tool message")
+
+  local relay_msgs, relay_emit = capture()
+  local relay = adapter.construct("relay.entry", { schema = {
+    version = 1,
+    root = { kind = "named", name = "nefor.contracts.TextAnswer", body = {
+      kind = "record", fields = { { name = "content", schema = { kind = "string" } } },
+    } },
+  } }, relay_emit)
+  relay.deliver(single("worker.llm", "nefor.agent.Result", {
+    value = { content = string.rep("r", 30000) },
+    output_path = "/runs/r1/nodes/worker/output.json",
+  }))
+  local relayed = find_kind(relay_msgs, "generic-provider.ProviderOut")
+  assert_true(#relayed.messages[1].content <= 16384,
+    "agent/worker relay is bounded at the shared provider-input boundary")
+  assert_true(relayed.messages[1].content:find("/runs/r1/nodes/worker/output.json", 1, true) ~= nil,
+    "agent/worker relay marker retains its canonical path")
 end
 
 -- ==================================================================
@@ -306,7 +413,12 @@ end
 do
   -- Drive an llm to a tool-calls reply so it emits a real ToolCalls message.
   local lm, lemit = capture()
-  local linst = llm.construct("dx.llm", { provider = "p" }, lemit, {
+  local linst = llm.construct("dx.llm", {
+    provider = "p",
+    output_type = "nefor.contracts.TextAnswer",
+    error_type = "nefor.contracts.AgentError",
+    provider_error_type = "nefor.contracts.ProviderError",
+  }, lemit, {
     conversation = { id = "dx:conversation", turn_id = "dx:turn", emit = function(_) end },
   })
   linst.deliver({

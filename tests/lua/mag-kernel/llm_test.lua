@@ -459,6 +459,8 @@ do
     "canonical arguments stay structured")
   assert_eq(replay[3].role, "tool", "the tool result follows the call")
   assert_eq(replay[3].tool_call_id, "call-1", "the tool result pairs with the call id")
+  assert_eq(replay[3].content, "dir-listing", "one logical tool message reaches canonical provider context")
+  assert_eq(#replay, 3, "the provider-context boundary does not duplicate value.content")
   assert_true(r2.request.input == nil,
     "round 2 does not replay the transcript on the bus")
 end

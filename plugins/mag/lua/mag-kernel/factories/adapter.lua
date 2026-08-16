@@ -58,6 +58,7 @@
 -- Signals: explicit handlers only where meaningful — cf. factories/tool-result.lua).
 
 local kinds = require("kinds")
+local model_context = require("model-context")
 
 local M = {}
 
@@ -151,11 +152,18 @@ local function to_provider_input(activation, schema)
   if #inputs == 1 and inputs[1].tag == PROVIDER_INPUT then return inputs[1].message end
 
   local messages = {}
+  local projectable = {}
   for position, input in ipairs(inputs) do
     local input_schema = activation.whole and schema or component_schema(schema, position)
-    messages[position] = turn_message(
-      input.tag, input.message, input_schema, input.arrival)
+    local message = turn_message(input.tag, input.message, input_schema, input.arrival)
+    messages[position] = message
+    projectable[position] = {
+      value = message.content,
+      output_path = type(input.message) == "table" and input.message.output_path or nil,
+    }
   end
+  local projected = model_context.project(projectable, true)
+  for position, content in ipairs(projected) do messages[position].content = content end
   return {
     kind = "generic-provider.ProviderOut",
     value = { content = messages[1] and messages[1].content.value },
