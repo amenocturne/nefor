@@ -712,6 +712,17 @@ return {
     return ctx.router:steer(id, message)
   end,
 
+  resume_actor = function(run_id, id, message)
+    local ctx = runs[run_id]
+    if not ctx then return false end
+    local record = ctx.inventory.get(id)
+    if not record or record.state ~= "alive" then return false end
+    ctx.router:activate(id, {
+      messages = { { from = "mag.owner-result", message = message } },
+    })
+    return true
+  end,
+
   -- Interrupt a live run's in-flight work. Two shapes, selected by `terminate`:
   --
   -- GRACEFUL (`terminate` falsy — the lead's OWN turn): settle every in-flight

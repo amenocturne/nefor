@@ -2097,6 +2097,40 @@ do
   end), 0, "worker-owned completion stays out of the root transcript")
   assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0,
     "worker-owned completion is not relayed into the root lead conversation")
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.resume_actor"
+  end), nil, "an explicit waiter suppresses automatic owner wakeup")
+
+  -- Without an await-run waiter, the terminal result resumes exactly the
+  -- dispatching model and still never enters the root transcript.
+  fresh()
+  agent_invocation = invocation(sessions.current_id(), "subagent",
+    "r9/cap-auto", "worker.run-tool", "parent-run")
+  invoke_tool_with_metadata("gate-auto", "mag-eval",
+    { intent = "Inspect owner", expr = "(nefor.shell.script \"x\" \"pwd\")" },
+    { caller_id = "r9/cap-auto", invocation = agent_invocation })
+  load = latest_mag_load()
+  _test.calls_clear()
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:auto", foreign_contracts = foreign_contracts(), artifact = artifact })
+  exec = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
+  local owner_run_id = exec.body.run_id
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = owner_run_id,
+    status = "completed", result = { text = "owner-only output" } })
+  local resume = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.resume_actor"
+  end)
+  assert_true(resume ~= nil, "worker-owned completion automatically wakes its owner")
+  assert_eq(resume.body.run_id, "parent-run", "owner wake targets the exact parent run")
+  assert_eq(resume.body.actor_id, "worker.llm", "owner wake targets the dispatching model")
+  assert_true(resume.body.message.content:find("owner-only output", 1, true) ~= nil,
+    "owner wake carries the formatted terminal result")
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append"
+  end), nil, "automatic worker wake remains isolated from the root transcript")
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0,
+    "automatic worker wake never queues a root turn")
 
   -- Canceling the already-acknowledged dispatch uses the standard detached-run
   -- path and does not emit a second result for the source firing.
@@ -2912,7 +2946,7 @@ do
 end
 
 -- await-run blocks on the canonical terminal event without polling. Multiple
--- waiters receive one canonical result each and the normal relay remains once.
+-- waiters receive one canonical result each and suppress automatic delivery.
 local function dispatch_awaitable(tag)
   fresh()
   write_mag_file(tag .. "-write", tag .. ".mag", READ_ONLY_MAG)
@@ -2951,12 +2985,12 @@ do
     assert_eq(replies[1].body.output.gate_metadata.source, "gate",
       id .. " receives terminal metadata pass-through")
   end
-  assert_eq(relays, 1, "normal asynchronous relay remains independent")
+  assert_eq(relays, 0, "explicit waiters suppress automatic asynchronous delivery")
   _test.calls_clear()
   feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed" })
   agentic_loop.relay_run_completion = original
   assert_eq(#decode_calls(), 0, "duplicate terminal event is a total no-op")
-  assert_eq(relays, 1, "duplicate terminal event cannot relay twice")
+  assert_eq(relays, 0, "duplicate terminal event cannot trigger automatic delivery")
 
   invoke_tool("already-done", "await-run", { run_id = run_id })
   local immediate = find_call(decode_calls(), function(c)

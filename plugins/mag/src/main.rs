@@ -126,6 +126,8 @@ const KILL_RUN_KIND: &str = "mag.kill_run";
 const KILL_ALL_RUNS_KIND: &str = "mag.kill_all_runs";
 const STEER_RUN_KIND: &str = "mag.steer_run";
 const RUN_STEERED_KIND: &str = "mag.run_steered";
+const RESUME_ACTOR_KIND: &str = "mag.resume_actor";
+const ACTOR_RESUMED_KIND: &str = "mag.actor_resumed";
 
 /// Interrupt a live run — the control plane's graceful-interrupt surface. Carries an
 /// optional `terminate` flag selecting the semantics (see `handle_interrupt_run`):
@@ -571,6 +573,9 @@ async fn handle_event(
         KILL_RUN_KIND => handle_kill_run(out_tx, body, host, active, bridge).await,
         KILL_ALL_RUNS_KIND => handle_kill_all_runs(out_tx, host, active, bridge).await,
         STEER_RUN_KIND => handle_steer_run(out_tx, body, host, active).await,
+        RESUME_ACTOR_KIND => {
+            handle_resume_actor(out_tx, body, program.as_deref(), host, active, bridge).await
+        }
         INTERRUPT_RUN_KIND => {
             handle_interrupt_run(out_tx, body, program.as_deref(), host, active, bridge).await
         }
@@ -1173,6 +1178,32 @@ async fn handle_steer_run(
         ack.insert("in_reply_to".into(), Value::String(id.to_owned()));
     }
     ack.insert("run_id".into(), Value::String(run_id.to_owned()));
+    ack.insert("accepted".into(), Value::Bool(accepted));
+    send_event(out_tx, ack).await
+}
+
+async fn handle_resume_actor(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    program: Option<&LoadedProgram>,
+    host: &LuaHost,
+    active: &mut ActiveExecutes,
+    bridge: &mut CapabilityBridge,
+) -> Result<(), MagError> {
+    let run_id = body.get("run_id").and_then(Value::as_str).unwrap_or("");
+    let actor_id = body.get("actor_id").and_then(Value::as_str).unwrap_or("");
+    let message = body.get("message").cloned().unwrap_or(Value::Null);
+    let accepted = active.contains_key(run_id)
+        && !actor_id.is_empty()
+        && host.resume_actor(run_id, actor_id, &message)?;
+    if accepted {
+        flush_emits(out_tx, host, bridge).await?;
+        settle_run(out_tx, host, active, bridge, program, run_id).await?;
+    }
+    let mut ack = Map::new();
+    ack.insert("kind".into(), Value::String(ACTOR_RESUMED_KIND.into()));
+    ack.insert("run_id".into(), Value::String(run_id.to_owned()));
+    ack.insert("actor_id".into(), Value::String(actor_id.to_owned()));
     ack.insert("accepted".into(), Value::Bool(accepted));
     send_event(out_tx, ack).await
 }

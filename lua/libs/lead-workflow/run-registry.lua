@@ -149,6 +149,7 @@ function M:register(spec)
     terminal = spec.terminal,
     dispatch_firing_id = spec.dispatch_firing_id,
     dispatcher_id = spec.dispatcher_id,
+    owner_resume = spec.owner_resume and copy(spec.owner_resume) or nil,
     nodes_order = spec.nodes_order or {},
     nodes = spec.nodes or {},
     waiters = {},

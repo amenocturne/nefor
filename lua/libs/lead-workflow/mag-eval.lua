@@ -295,6 +295,7 @@ function M.handle(firing_id, args, metadata)
     session_id = session_id,
     dispatcher_id = provenance.dispatcher_id,
     conversation_id = provenance.conversation_id,
+    owner_run_id = provenance.owner_run_id,
     wrapper = wrapper,
   }
   emit_as(SOURCE_NAME, "mag", {

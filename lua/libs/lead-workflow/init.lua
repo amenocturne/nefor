@@ -80,6 +80,7 @@ local chat_emitter   = require("libs.chat-emitter")
 local sessions       = require("libs.sessions")
 local envelope       = require("core.envelope")
 local replay_window  = require("core.replay_window")
+local results_lib    = require("libs.agentic-loop.results")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
@@ -878,7 +879,7 @@ end
 -- `reasoner` key, matching what the chat surface renders (chat/run_panel.lua
 -- maps kernel factory → reasoner the same way).
 register_active_run = function(run_id, actors, terminal, firing_id, run_name, session_id,
-    dispatcher_id)
+    dispatcher_id, owner_resume)
   local nodes_order, nodes = {}, {}
   for _, actor in ipairs(actors or {}) do
     local id = tostring(actor.id or "")
@@ -899,6 +900,7 @@ register_active_run = function(run_id, actors, terminal, firing_id, run_name, se
     terminal = terminal,
     dispatch_firing_id = firing_id,
     dispatcher_id = dispatcher_id,
+    owner_resume = owner_resume,
     nodes_order = nodes_order,
     nodes = nodes,
   })
@@ -1085,26 +1087,49 @@ end
 -- (agentic-loop's deferred-queue + flush → new user-role turn).
 -- `format_deferred` frames the sink content. The output path stays on the
 -- visible graph-result block instead of being duplicated in the model input.
+local function completion_payload(run_id, run_name, ok, content, err)
+  if ok then
+    local content_available = type(content) == "string" and content:find("%S") ~= nil
+    return {
+      run_id = run_id,
+      run_name = run_name,
+      status = "success",
+      content_available = content_available,
+      output = content_available and content or nil,
+    }
+  end
+  return {
+    run_id = run_id,
+    run_name = run_name,
+    status = "failed",
+    error = err,
+  }
+end
+
 local function relay_kernel_completion(run_id, run_name, ok, content, err)
   local al = require("libs.agentic-loop")
   if type(al.relay_run_completion) ~= "function" then return end
-  if ok then
-    local content_available = type(content) == "string" and content:find("%S") ~= nil
-    al.relay_run_completion({
-      run_id            = run_id,
-      run_name          = run_name,
-      status            = "success",
-      content_available = content_available,
-      output            = content_available and content or nil,
-    })
-  else
-    al.relay_run_completion({
-      run_id = run_id,
-      run_name = run_name,
-      status = "failed",
-      error  = err,
-    })
+  al.relay_run_completion(completion_payload(run_id, run_name, ok, content, err))
+end
+
+local function resume_run_owner(run, completion)
+  local owner = run.owner_resume
+  if type(owner) ~= "table" or type(owner.run_id) ~= "string"
+      or type(owner.actor_id) ~= "string" then
+    return false
   end
+  emit_as(SOURCE_NAME, "mag", {
+    kind = "mag.resume_actor",
+    run_id = owner.run_id,
+    actor_id = owner.actor_id,
+    conversation_id = owner.conversation_id,
+    message = {
+      role = "user",
+      content = results_lib.format_deferred(completion),
+      input_cause = "internal_async_completion",
+    },
+  })
+  return true
 end
 
 -- Append the transcript run-result block (`chat.graph_result.append`) for a
@@ -1216,25 +1241,34 @@ local function handle_mag_run_result(body)
   end
 
   if not run_registry:claim_delivery(run_id) then return end
-  if grace_waiter or termination_waiters then return end
   local root_owned = run.dispatcher_id == nil
-  if failed then
-    if root_owned then
-      emit_mag_result_block(run, "failed", nil, err)
-      -- A TUI termination is already a user decision. Settlement and visibility
-      -- still happen, but feeding the kill back as a task would restart the lead.
-      if run.terminate_reason ~= "user-tui-termination" then
-        relay_kernel_completion(run_id, run.run_name, false, nil, err)
-      end
+  if root_owned then
+    emit_mag_result_block(run, failed and "failed" or "success",
+      failed and nil or body.output_path, failed and err or nil)
+  end
+  if grace_waiter or termination_waiters or #settled.waiters > 0 then return end
+  local content = not failed and (mag_result_text(body.result)
+    or read_output_file(body.output_path)) or nil
+  local completion = completion_payload(run_id, run.run_name, not failed, content, err)
+  if not root_owned then
+    if not resume_run_owner(run, completion) then
+      nefor.log.warn("lead-workflow: detached result owner is no longer resumable", {
+        run_id = run_id,
+        owner_run_id = run.owner_resume and run.owner_resume.run_id,
+        owner_actor_id = run.owner_resume and run.owner_resume.actor_id,
+      })
     end
     return
   end
-  if root_owned then
-    emit_mag_result_block(run, "success", body.output_path, nil)
-    local content = mag_result_text(body.result)
-      or read_output_file(body.output_path)
-    relay_kernel_completion(run_id, run.run_name, true, content, nil)
+  if failed then
+    -- A TUI termination is already a user decision. Settlement and visibility
+    -- still happen, but feeding the kill back as a task would restart the lead.
+    if run.terminate_reason ~= "user-tui-termination" then
+      relay_kernel_completion(run_id, run.run_name, false, nil, err)
+    end
+    return
   end
+  relay_kernel_completion(run_id, run.run_name, true, content, nil)
 end
 
 -- Double-Esc entry point (`chat.interrupt_all`). The `mag` execute tool is
@@ -1318,6 +1352,7 @@ local function resolve_invocation(metadata, direct_default_principal)
     invocation = invocation,
     dispatcher_id = invocation.principal == "subagent" and invocation.actor_id or nil,
     conversation_id = invocation.conversation_id,
+    owner_run_id = invocation.principal == "subagent" and invocation.run_id or nil,
   }
 end
 
@@ -1751,6 +1786,7 @@ local function begin_mag_load(firing_id, action, args, ws, provenance)
     session_id = provenance.session_id,
     dispatcher_id = provenance.dispatcher_id,
     conversation_id = provenance.conversation_id,
+    owner_run_id = provenance.owner_run_id,
   }
 
   emit_as(SOURCE_NAME, "mag", {
@@ -1877,8 +1913,18 @@ submit_loaded_run = function(pending, body, error_prefix)
     artifact = artifact,
   }
   if next(overlay) ~= nil then exec.params_overlay = overlay end
+  local owner_resume
+  if pending.dispatcher_id ~= nil then
+    local owner_actor_id, replacements = pending.dispatcher_id:gsub("%.run%-tool$", ".llm")
+    owner_resume = {
+      run_id = pending.owner_run_id,
+      actor_id = replacements == 1 and owner_actor_id or nil,
+      conversation_id = pending.conversation_id,
+    }
+  end
   local run = register_active_run(pending.run_id, actors, terminal_id,
-    pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id)
+    pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id,
+    owner_resume)
   run.invocation_label = pending.invocation_label or pending.run_name
   run.invocation_kind = pending.invocation_kind
   begin_completion_grace(run, async_run_ack(pending, body))
@@ -2192,6 +2238,13 @@ local function receive_msg(entry)
   end
   if kind == "mag.run_result" then
     handle_mag_run_result(body)
+    return
+  end
+  if kind == "mag.actor_resumed" and body.accepted == false then
+    nefor.log.warn("lead-workflow: detached result owner was not resumable", {
+      owner_run_id = body.run_id,
+      owner_actor_id = body.actor_id,
+    })
     return
   end
   -- Kernel actor lifecycle: keep the tracked run's node statuses at the same
