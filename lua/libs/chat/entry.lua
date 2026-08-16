@@ -190,6 +190,12 @@ function M.set_output(entry, output, err_flag)
   return new
 end
 
+function M.set_display_primary(entry, primary)
+  local new = copy(entry)
+  new.display_primary = primary
+  return new
+end
+
 function M.set_status(entry, status)
   local new = copy(entry)
   new.status = status

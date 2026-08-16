@@ -4125,6 +4125,112 @@ fn triple_escape_immediately_kills_every_workflow_including_lead() {
 }
 
 #[test]
+fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_replay() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "terminate-graph", "display": {
+                "label": "terminate graph", "primary": { "arg": "run_id" },
+                "result": { "kind": "content" }
+            }
+        }] }),
+    );
+
+    for (id, run_id) in [
+        ("terminate-eval", "mag-run-eval"),
+        ("terminate-file", "mag-run-file"),
+    ] {
+        fixture_tool_started(
+            &mut engine,
+            id,
+            "terminate-graph",
+            json!({ "run_id": run_id }),
+        );
+    }
+    dispatch_event_from(
+        &mut engine,
+        "lead-workflow",
+        json!({
+            "kind": "chat.tool.display_primary", "id": "terminate-file",
+            "run_id": "mag-run-file", "primary": "ship.mag",
+        }),
+    );
+    dispatch_event_from(
+        &mut engine,
+        "lead-workflow",
+        json!({
+            "kind": "chat.tool.display_primary", "id": "terminate-eval",
+            "run_id": "mag-run-eval", "primary": "Start sleep process",
+        }),
+    );
+    fixture_tool_completed(
+        &mut engine,
+        "terminate-eval",
+        json!({ "status": "killed" }),
+        false,
+    );
+    fixture_tool_completed(
+        &mut engine,
+        "terminate-file",
+        json!({ "status": "killed" }),
+        false,
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("terminate graph · Start sleep process"),
+        "{out}"
+    );
+    assert!(out.contains("terminate graph · ship.mag"), "{out}");
+    assert!(!out.contains("terminate graph · mag-run-eval"), "{out}");
+    assert!(!out.contains("terminate graph · mag-run-file"), "{out}");
+}
+
+#[test]
+fn terminate_graph_unknown_and_mismatched_projection_keep_raw_run_id() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "terminate-graph", "display": {
+                "label": "terminate graph", "primary": { "arg": "run_id" },
+                "result": { "kind": "content" }
+            }
+        }] }),
+    );
+
+    fixture_tool_started(
+        &mut engine,
+        "terminate-unknown",
+        "terminate-graph",
+        json!({ "run_id": "mag-run-unknown" }),
+    );
+    dispatch_event_from(
+        &mut engine,
+        "lead-workflow",
+        json!({
+            "kind": "chat.tool.display_primary", "id": "terminate-unknown",
+            "run_id": "mag-run-other", "primary": "Wrong concurrent label",
+        }),
+    );
+    fixture_tool_completed(
+        &mut engine,
+        "terminate-unknown",
+        json!({ "status": "not_active" }),
+        false,
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(out.contains("terminate graph · mag-run-unknown"), "{out}");
+    assert!(!out.contains("Wrong concurrent label"), "{out}");
+}
+
+#[test]
 fn selected_workflow_termination_emits_classification_before_kill() {
     let mut engine = Engine::new(100, 24).expect("engine");
     load_chat_scenario(&mut engine);

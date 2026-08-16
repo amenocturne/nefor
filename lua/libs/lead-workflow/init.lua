@@ -305,6 +305,20 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
+local function emit_tool_display_primary(caller_id, run)
+  if type(caller_id) ~= "string" or caller_id == ""
+      or type(run) ~= "table"
+      or type(run.invocation_label) ~= "string" or run.invocation_label == "" then
+    return
+  end
+  emit_as(SOURCE_NAME, nil, {
+    kind = "chat.tool.display_primary",
+    id = caller_id,
+    run_id = run.run_id,
+    primary = run.invocation_label,
+  })
+end
+
 local TERMINATION_CONFIRMATION_STATUSES = {
   terminated = true,
   killed = true,
@@ -1393,6 +1407,7 @@ terminate_graph = function(firing_id, args, metadata)
     return
   end
   local run, lookup_err = authorize_control_target(context, run_id)
+  if run then emit_tool_display_primary(metadata and metadata.caller_id, run) end
   if not run or run.phase == "terminal" then
     emit_tool_result_ok(firing_id, {
       canceled = false,

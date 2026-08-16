@@ -2163,11 +2163,21 @@ do
   end) ~= nil, "killed eval closes through the standard failure channel")
   assert_eq(lw._internals.state.active_runs[run_id], nil, "killed eval leaves no active owner")
 
-  -- Standard control surfaces address the exact acknowledged handle.
+  -- Standard control surfaces address the exact acknowledged handle. The
+  -- canonical run registry also owns the invocation label projected onto the
+  -- terminate row; the raw run_id remains the control argument.
   run_id = dispatch_lead_eval("gate-terminate", "r7/cap-22")
   _test.calls_clear()
-  invoke_tool("terminate-eval", "terminate-graph", { run_id = run_id })
+  invoke_tool_with_metadata("terminate-eval", "terminate-graph", { run_id = run_id },
+    { caller_id = "r7/cap-terminate" })
   calls = decode_calls()
+  local display = find_call(calls, function(c)
+    return c.body.kind == "chat.tool.display_primary" and c.body.id == "r7/cap-terminate"
+  end)
+  assert_true(display ~= nil, "known eval termination projects a canonical display label")
+  assert_eq(display.body.run_id, run_id, "display projection preserves exact run correlation")
+  assert_eq(display.body.primary, "Inspect lifecycle",
+    "known eval termination reuses the original intent label")
   assert_eq(tool_result("terminate-eval"), nil,
     "terminate-graph remains open until exact canonical confirmation")
   assert_true(find_call(calls, function(c)
@@ -2197,6 +2207,31 @@ do
     "synchronous terminate confirmation suppresses redundant owner completion")
   assert_eq(lw._internals.state.active_runs[run_id], nil,
     "canonical killed result closes the terminating eval")
+
+  -- File execution uses the same canonical owner and cannot cross-label a
+  -- concurrent eval. Unknown ids emit no projection, preserving raw fallback.
+  local registry = lw._internals.run_registry
+  local file_run = lw._internals.register_active_run(
+    registry:mint_run_id(), {}, "worker", "dispatch-file", "ship",
+    sessions.current_id())
+  file_run.invocation_label = "ship.mag"
+  _test.calls_clear()
+  invoke_tool_with_metadata("terminate-file", "terminate-graph", { run_id = file_run.run_id },
+    { caller_id = "r7/cap-file" })
+  local file_display = find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.tool.display_primary" and c.body.id == "r7/cap-file"
+  end)
+  assert_eq(file_display.body.primary, "ship.mag",
+    "known execute termination reuses the original file label")
+  assert_eq(file_display.body.run_id, file_run.run_id,
+    "concurrent execute projection retains its exact run identity")
+
+  _test.calls_clear()
+  invoke_tool_with_metadata("terminate-unknown", "terminate-graph",
+    { run_id = "mag-run-unknown-label" }, { caller_id = "r7/cap-unknown" })
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.tool.display_primary"
+  end), nil, "unknown run ids preserve the raw display fallback")
 
   for _, incompatible in ipairs({
     { status = "completed", result = { text = "too late" } },

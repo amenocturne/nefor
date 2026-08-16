@@ -136,6 +136,10 @@ local function semantic_projection(entry)
   local args = entry.raw_input
   if args == nil then args = entry.input_table or entry.input end
   local projected = display.project(entry.display, args, entry.output, entry.error, entry.name)
+  if projected and type(entry.display_primary) == "string" and entry.display_primary ~= "" then
+    projected.primary = entry.display_primary
+    projected.primary_is_path = false
+  end
   return projected
 end
 local function invocation_mode(entry)

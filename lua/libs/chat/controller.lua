@@ -909,6 +909,17 @@ local function handle_tool_end(msg, state)
   return transcript.flush_graph_results_if_stable(next_state), {}
 end
 
+local function handle_tool_display_primary(msg, state)
+  if msg._event_source ~= "lead-workflow"
+      or type(msg.id) ~= "string" or msg.id == ""
+      or type(msg.run_id) ~= "string" or msg.run_id == ""
+      or type(msg.primary) ~= "string" or msg.primary == "" then
+    return state, {}
+  end
+  return transcript.attach_tool_display_primary(
+    state, msg.id, msg.run_id, msg.primary), {}
+end
+
 local function handle_graph_result_append(msg, state)
   return transcript.append_graph_result(state,
     Entry.graph_result(
@@ -1731,6 +1742,7 @@ local default_handlers = {
   ["chat.usage.updated"]          = handle_usage_updated,
   ["chat.usage.error"]            = handle_usage_error,
   ["tool.register"]               = handle_tool_register,
+  ["chat.tool.display_primary"]   = handle_tool_display_primary,
   ["chat.graph_result.append"]    = handle_graph_result_append,
   ["chat.plan.append"]            = handle_plan_append,
   ["lead-workflow.plan.approved"] = handle_plan_approved,
