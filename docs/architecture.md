@@ -108,6 +108,10 @@ no certificates and reports errors, provider startup fails visibly. Hostname
 and certificate-chain validation remain enabled. This is provider mechanism,
 not engine or Lua policy, and there is no custom-PEM configuration surface.
 
+### Asynchronous engine callbacks
+
+Detached runtime tasks never invoke Lua directly. Process stdout, stderr, and exit observations are serialized per process onto a broker-owned callback channel. Channel readiness is an explicit broker wake source: one broker turn invokes a bounded callback batch under the same single-task Lua ownership as inbound dispatch, then drains every bus event those callbacks appended before returning to the idle select loop. A queued callback is itself retained readiness, so arrivals immediately before select cannot lose their wake; dropping the broker receiver during shutdown prevents later tasks from entering a torn-down VM.
+
 ## Control plane
 
 The lead operates on run statuses and results, not by inspecting every internal message in a graph. MAG run results are delivered inline on bus events, and the lead-workflow tools expose graph status and output lookup as control-plane conveniences.

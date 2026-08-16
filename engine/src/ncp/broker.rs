@@ -269,6 +269,8 @@ struct ConnectionRecord {
 pub struct Broker {
     shared: Arc<Mutex<BrokerShared>>,
     host: LuaHost,
+    /// Detached runtime work is received here and executed only by this loop.
+    runtime_callbacks: crate::lua::bindings::process::RuntimeCallbackReceiver,
     /// Handle to the engine-internal lifecycle bus. The broker emits
     /// [`SHUTDOWN`] on this bus inside [`Broker::begin_shutdown`] so Lua
     /// subscribers (`sessions.handle_shutdown` in starter) fire
@@ -344,9 +346,12 @@ impl Broker {
         }
 
         let events_bus = host.events_bus();
+        let mut host = host;
+        let runtime_callbacks = host.take_runtime_callbacks();
         Self {
             shared,
             host,
+            runtime_callbacks,
             events_bus,
             conns_by_id: HashMap::new(),
             inbound_tx,
@@ -619,6 +624,9 @@ impl Broker {
             };
 
             tokio::select! {
+                Some(callback) = self.runtime_callbacks.recv(), if shutdown_deadline.is_none() => {
+                    self.handle_runtime_callbacks(callback);
+                }
                 Some((conn_id, msg)) = self.inbound_rx.recv() => {
                     self.handle_inbound_tick(conn_id, msg).await;
                 }
@@ -636,6 +644,18 @@ impl Broker {
                 }
             }
         }
+    }
+
+    fn handle_runtime_callbacks(&mut self, first: crate::lua::bindings::process::RuntimeCallback) {
+        self.host.invoke_runtime_callback(first);
+        const MAX_CALLBACKS_PER_TURN: usize = 256;
+        for _ in 1..MAX_CALLBACKS_PER_TURN {
+            let Ok(callback) = self.runtime_callbacks.try_recv() else {
+                break;
+            };
+            self.host.invoke_runtime_callback(callback);
+        }
+        self.drain_pending_dispatch();
     }
 
     // ---- inbound dispatch -------------------------------------------------
@@ -1197,6 +1217,138 @@ mod tests {
         assert!(
             len >= 1,
             "dispatch fired on the appended tail; got len {len}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_process_callback_wakes_broker_and_routes_grace_ack() {
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            function dispatch(current)
+                for i = dispatched_count or 1, #current do
+                    local entry = current[i]
+                    if entry.origin == "step" then
+                        nefor.engine.deliver("tool-gate", entry.payload)
+                    end
+                end
+                dispatched_count = #current + 1
+            end
+            timer = nefor.process.spawn({
+                cmd = "sh",
+                args = { "-c", "sleep 0.05" },
+                on_exit = function()
+                    nefor.engine.send('{"type":"event","body":{"kind":"tool.result","firing_id":"gate-5"}}')
+                    nefor.engine.send('{"type":"event","body":{"kind":"after-grace"}}')
+                end,
+            })
+            "#,
+        );
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut recipient, transport) = make_transport();
+        broker.attach_transport(transport, pn("tool-gate"));
+        let shutdown = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), recv_line(&mut recipient))
+            .await
+            .expect("callback-induced wake must route without unrelated inbound traffic")
+            .expect("recipient remains connected");
+        assert!(ack.contains("tool.result"));
+        assert!(ack.contains("gate-5"));
+        let second = tokio::time::timeout(Duration::from_secs(1), recv_line(&mut recipient))
+            .await
+            .expect("all callback emissions must drain in the same broker turn")
+            .expect("recipient remains connected");
+        assert!(second.contains("after-grace"));
+
+        shutdown.shutdown(0).await;
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_callback_queued_before_run_is_not_lost() {
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            function dispatch(current)
+                local entry = current[#current]
+                if entry and entry.origin == "step" then
+                    nefor.engine.deliver("recipient", entry.payload)
+                end
+            end
+            timer = nefor.process.spawn({
+                cmd = "sh",
+                args = { "-c", "exit 0" },
+                on_exit = function() nefor.engine.send("queued-before-select") end,
+            })
+            "#,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut recipient, transport) = make_transport();
+        broker.attach_transport(transport, pn("recipient"));
+        let shutdown = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        let line = tokio::time::timeout(Duration::from_secs(1), recv_line(&mut recipient))
+            .await
+            .expect("queued callback must make the first select immediately ready")
+            .expect("recipient remains connected");
+        assert_eq!(line, "queued-before-select");
+        shutdown.shutdown(0).await;
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn callback_without_send_does_not_spin_and_shutdown_discards_late_callbacks() {
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            callback_count = 0
+            function dispatch(current) end
+            timer = nefor.process.spawn({
+                cmd = "sh",
+                args = { "-c", "sleep 0.02" },
+                on_exit = function() callback_count = callback_count + 1 end,
+            })
+            late = nefor.process.spawn({
+                cmd = "sh",
+                args = { "-c", "sleep 1" },
+                on_exit = function() callback_count = callback_count + 100 end,
+            })
+            "#,
+        );
+        let lua = host.lua().clone();
+        let mut broker = Broker::new(shared, host);
+        let (_recipient, transport) = make_transport();
+        broker.attach_transport(transport, pn("recipient"));
+        let shutdown = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(lua.globals().get::<i64>("callback_count").unwrap(), 1);
+
+        shutdown.shutdown(0).await;
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("callback with no send must not keep the broker busy")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            lua.globals().get::<i64>("callback_count").unwrap(),
+            1,
+            "callbacks arriving after broker teardown must not enter Lua"
         );
     }
 

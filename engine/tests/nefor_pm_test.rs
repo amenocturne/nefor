@@ -33,7 +33,8 @@ fn lua_dir() -> PathBuf {
 fn install_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor::lua::bindings::install_json(lua, &nefor)?;
-    nefor::lua::bindings::install_process(lua, &nefor)?;
+    let (runtime_callback_tx, _runtime_callback_rx) = tokio::sync::mpsc::unbounded_channel();
+    nefor::lua::bindings::install_process(lua, &nefor, runtime_callback_tx)?;
     // pm's data_root() now delegates to `nefor.fs.data_root()` — capture
     // the resolved value from NEFOR_DATA_DIR (the DataDirGuard sets it
     // before constructing this VM). When unset, the resolver falls back

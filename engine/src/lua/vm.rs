@@ -72,6 +72,8 @@ pub struct LuaHost {
     /// The broker executes at most one per event-loop turn, giving long
     /// operations a cooperative boundary without moving the VM off-thread.
     cooperative_tasks: bindings::CooperativeTasks,
+    /// Broker-owned receiver for callbacks produced by detached runtime tasks.
+    runtime_callbacks: Option<bindings::process::RuntimeCallbackReceiver>,
 }
 
 impl LuaHost {
@@ -97,6 +99,7 @@ impl LuaHost {
         let subscriptions: SharedSubscriptions = Arc::new(Mutex::new(EventSubscriptions::new()));
         let stdin_pump: SharedStdinPump = Arc::new(Mutex::new(StdinPump::empty()));
         let cooperative_tasks = Arc::new(Mutex::new(VecDeque::new()));
+        let (runtime_callback_tx, runtime_callback_rx) = tokio::sync::mpsc::unbounded_channel();
         install_nefor_surface(
             &lua,
             Arc::clone(&bus),
@@ -107,6 +110,7 @@ impl LuaHost {
             Arc::clone(&stdin_pump),
             data_dir,
             Arc::clone(&cooperative_tasks),
+            runtime_callback_tx,
         )
         .map_err(LuaError::VmInit)?;
         Ok(Self {
@@ -121,6 +125,7 @@ impl LuaHost {
             subscriptions,
             stdin_pump,
             cooperative_tasks,
+            runtime_callbacks: Some(runtime_callback_rx),
         })
     }
 
@@ -207,6 +212,17 @@ impl LuaHost {
             tracing::error!(error = %error, "cooperative Lua task failed");
         }
         Ok(true)
+    }
+
+    pub fn take_runtime_callbacks(&mut self) -> bindings::process::RuntimeCallbackReceiver {
+        self.runtime_callbacks.take().unwrap_or_else(|| {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            rx
+        })
+    }
+
+    pub fn invoke_runtime_callback(&self, callback: bindings::process::RuntimeCallback) {
+        bindings::process::invoke_runtime_callback(&self.lua, callback);
     }
 
     pub fn has_cooperative_tasks(&self) -> bool {
@@ -547,6 +563,7 @@ fn install_nefor_surface(
     stdin_pump: SharedStdinPump,
     data_dir: crate::paths::DataDir,
     cooperative_tasks: bindings::CooperativeTasks,
+    runtime_callbacks: bindings::process::RuntimeCallbackSender,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor.set("version", env!("NEFOR_VERSION"))?;
@@ -555,7 +572,7 @@ fn install_nefor_surface(
     bindings::fs::install_fs(lua, &nefor, data_dir)?;
     bindings::install_json(lua, &nefor)?;
     bindings::install_log(lua, &nefor)?;
-    bindings::install_process(lua, &nefor)?;
+    bindings::install_process(lua, &nefor, runtime_callbacks)?;
     bindings::install_plugins(lua, &nefor, plugins)?;
     bindings::install_bus(lua, &nefor, subscriptions)?;
     bindings::install_io(lua, &nefor, mode, stdin_pump)?;

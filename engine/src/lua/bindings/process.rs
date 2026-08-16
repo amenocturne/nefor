@@ -1,18 +1,17 @@
 //! `nefor.process.spawn` — subprocess spawning.
 //!
 //! Spawns a child process via `tokio::process::Command`. Stdout/stderr are
-//! line-buffered into mpsc channels which feed a serialization task that
-//! invokes the Lua handlers (`on_stdout`, `on_stderr`, `on_exit`).
+//! line-buffered into an mpsc channel. A per-process serializer preserves
+//! stdout/stderr/exit order and forwards callbacks to the broker-owned Lua
+//! callback queue.
 //!
 //! ## Serialization story
 //!
-//! Lua is single-threaded in spirit (mlua's `send` feature serializes it
-//! behind an internal mutex, but two tasks hammering the VM still take
-//! turns). To keep handler invocation predictable we drain stdout/stderr
-//! lines onto an mpsc, and a single `tokio::spawn`-ed task awaits messages
-//! from that channel and calls the handlers one at a time. Widget renders
-//! and event-bus handlers also go through mlua's internal mutex — they
-//! don't fight for a separate lock here.
+//! Async tasks never enter Lua. They enqueue [`RuntimeCallback`] values on
+//! an unbounded channel whose receiver is polled by the broker. Channel
+//! readiness wakes the broker's idle `select!`; the broker invokes callbacks
+//! and drains any bus events they emit before selecting again. This preserves
+//! single-owner Lua ordering rather than relying on mlua's internal mutex.
 //!
 //! ## Process userdata
 //!
@@ -44,15 +43,36 @@ use tokio::task::JoinHandle;
 /// with "process ran and exited non-zero".
 const SPAWN_FAILURE_CODE: i32 = -1;
 
+/// Lua work produced by an asynchronous runtime source. The broker is the
+/// only consumer and therefore the only task which invokes these handlers.
+pub enum RuntimeCallback {
+    ProcessLine {
+        handler: Arc<RegistryKey>,
+        line: String,
+        stream: &'static str,
+    },
+    ProcessExit {
+        handler: Arc<RegistryKey>,
+        code: i32,
+    },
+}
+
+pub type RuntimeCallbackSender = mpsc::UnboundedSender<RuntimeCallback>;
+pub type RuntimeCallbackReceiver = mpsc::UnboundedReceiver<RuntimeCallback>;
+
 /// Install `nefor.process.spawn` onto `nefor_tbl`.
-pub fn install_process(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
+pub fn install_process(
+    lua: &Lua,
+    nefor_tbl: &Table,
+    runtime_callbacks: RuntimeCallbackSender,
+) -> mlua::Result<()> {
     let process = lua.create_table()?;
 
-    // Clone the Lua handle for the handler-dispatch task. mlua's `send`
-    // feature makes this safe; the dispatcher just needs somewhere to
-    // invoke registered functions from.
+    // This clone is used only while registering handler functions. Detached
+    // tasks retain registry keys but never use the Lua handle itself.
     let spawn_lua = lua.clone();
     let spawn_fn = lua.create_function(move |_, opts: Table| {
+        let runtime_callbacks = runtime_callbacks.clone();
         let cmd_name: String = opts.get("cmd").map_err(|e| {
             mlua::Error::runtime(format!(
                 "nefor.process.spawn: missing or invalid 'cmd' field: {e}"
@@ -214,26 +234,36 @@ pub fn install_process(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
         // Stash an Option<KillSignal> in the ProcessHandle; if Some, the
         // waiter task listens. See ProcessHandle.
 
-        // Serialization task: drain the dispatch channel, invoke Lua
-        // handlers one at a time. Drops registry keys when done so Lua GC
-        // can collect the handler closures.
-        let dispatch_lua = spawn_lua.clone();
+        // Serialization task: preserve the process stream order while
+        // forwarding handler invocations to the broker-owned callback queue.
+        // Registry keys drop when this task and the queued callback release them.
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     DispatchMsg::Stdout(line) => {
                         if let Some(k) = &on_stdout_key {
-                            invoke_line_handler(&dispatch_lua, k, &line, "on_stdout");
+                            let _ = runtime_callbacks.send(RuntimeCallback::ProcessLine {
+                                handler: Arc::clone(k),
+                                line,
+                                stream: "on_stdout",
+                            });
                         }
                     }
                     DispatchMsg::Stderr(line) => {
                         if let Some(k) = &on_stderr_key {
-                            invoke_line_handler(&dispatch_lua, k, &line, "on_stderr");
+                            let _ = runtime_callbacks.send(RuntimeCallback::ProcessLine {
+                                handler: Arc::clone(k),
+                                line,
+                                stream: "on_stderr",
+                            });
                         }
                     }
                     DispatchMsg::Exit(code) => {
                         if let Some(k) = &on_exit_key {
-                            invoke_exit_handler(&dispatch_lua, k, code);
+                            let _ = runtime_callbacks.send(RuntimeCallback::ProcessExit {
+                                handler: Arc::clone(k),
+                                code,
+                            });
                         }
                         // Exit is terminal — drain any remaining messages
                         // then stop.
@@ -375,6 +405,19 @@ fn stash_fn(lua: &Lua, f: Option<Function>) -> mlua::Result<Option<Arc<RegistryK
     }
 }
 
+pub fn invoke_runtime_callback(lua: &Lua, callback: RuntimeCallback) {
+    match callback {
+        RuntimeCallback::ProcessLine {
+            handler,
+            line,
+            stream,
+        } => invoke_line_handler(lua, &handler, &line, stream),
+        RuntimeCallback::ProcessExit { handler, code } => {
+            invoke_exit_handler(lua, &handler, code);
+        }
+    }
+}
+
 fn invoke_line_handler(lua: &Lua, key: &RegistryKey, line: &str, which: &str) {
     let func: Function = match lua.registry_value(key) {
         Ok(f) => f,
@@ -472,17 +515,18 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    fn setup() -> Lua {
+    fn setup() -> (Lua, RuntimeCallbackReceiver) {
         let lua = Lua::new();
         let nefor = lua.create_table().unwrap();
-        install_process(&lua, &nefor).unwrap();
+        let (callback_tx, callback_rx) = mpsc::unbounded_channel();
+        install_process(&lua, &nefor, callback_tx).unwrap();
         lua.globals().set("nefor", nefor).unwrap();
-        lua
+        (lua, callback_rx)
     }
 
     #[tokio::test]
     async fn echo_emits_stdout_line_and_zero_exit() {
-        let lua = setup();
+        let (lua, mut callback_rx) = setup();
 
         let lines = Arc::new(StdMutex::new(Vec::<String>::new()));
         let exit = Arc::new(StdMutex::new(None::<i32>));
@@ -519,8 +563,11 @@ mod tests {
         .await
         .expect("wait ok");
 
-        // Small yield to let the serialization task drain before asserting.
+        // Let the serializer enqueue, then invoke callbacks as the broker would.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(callback) = callback_rx.try_recv() {
+            invoke_runtime_callback(&lua, callback);
+        }
 
         let lines = lines.lock().unwrap().clone();
         let exit = *exit.lock().unwrap();
@@ -530,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_cmd_errors() {
-        let lua = setup();
+        let (lua, _callback_rx) = setup();
         let err = lua
             .load(r#"nefor.process.spawn({ cmd = "" })"#)
             .exec_async()
@@ -541,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn nonexistent_binary_errors() {
-        let lua = setup();
+        let (lua, _callback_rx) = setup();
         let err = lua
             .load(r#"nefor.process.spawn({ cmd = "definitely-not-a-real-binary-xxxyyyzzz" })"#)
             .exec_async()
@@ -552,7 +599,7 @@ mod tests {
 
     #[test]
     fn run_captures_stdout_and_zero_exit() {
-        let lua = setup();
+        let (lua, _callback_rx) = setup();
         let (code, stdout): (i32, String) = lua
             .load(
                 r#"
@@ -568,7 +615,7 @@ mod tests {
 
     #[test]
     fn run_propagates_non_zero_exit_as_data() {
-        let lua = setup();
+        let (lua, _callback_rx) = setup();
         let code: i32 = lua
             .load(
                 r#"
@@ -585,7 +632,7 @@ mod tests {
     fn run_pipes_stdin_to_child() {
         // `cat` echoes stdin to stdout; if the stdin pipe + EOF wiring is
         // right, the captured stdout contains the input verbatim.
-        let lua = setup();
+        let (lua, _callback_rx) = setup();
         let (code, stdout): (i32, String) = lua
             .load(
                 r#"
@@ -604,7 +651,7 @@ mod tests {
 
     #[test]
     fn run_spawn_failure_returns_data_not_error() {
-        let lua = setup();
+        let (lua, _callback_rx) = setup();
         let (code, stderr): (i32, String) = lua
             .load(
                 r#"
