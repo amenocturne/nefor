@@ -134,6 +134,7 @@ local function snapshot_actions(state, projection, actions)
       exchange_id = exchange.id,
       output = exchange.result or exchange.error,
       error = exchange.status == "error",
+      completion_delivery = exchange.completion_delivery,
     })
   end
 
@@ -303,6 +304,7 @@ function M.reduce(previous, body)
       exchange_id = exchange.id,
       output = exchange.result or exchange.error,
       error = kind == "tool_error_recorded",
+      completion_delivery = exchange.completion_delivery,
       turn_id = change.turn_id,
     })
   elseif kind == "retry_started" then

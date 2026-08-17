@@ -225,7 +225,7 @@ local state = {
 
   -- Invocations awaiting the short terminal-result grace deadline, keyed by
   -- exact run_id. Timeout emits the unchanged detached acknowledgment;
-  -- terminal settlement claims the same slot for synchronous delivery.
+  -- terminal settlement claims the same slot for inline delivery.
   completion_grace_waiters = {},
 
   -- Exact-run synchronous terminate calls, keyed by run_id. Each entry owns
@@ -289,16 +289,19 @@ local function orchestration_profiles()
   return profiles, nil
 end
 
-local function emit_tool_result_ok(firing_id, output)
-  emit_as(SOURCE_NAME, nil, {
+local function emit_tool_result_ok(firing_id, output, completion_delivery)
+  local body = {
     kind   = "tool.result",
     id     = firing_id,
     output = output,
-  })
+  }
+  if completion_delivery ~= nil then body.completion_delivery = completion_delivery end
+  emit_as(SOURCE_NAME, nil, body)
 end
 
-local function emit_await_outcome(firing_id, outcome)
+local function emit_await_outcome(firing_id, outcome, completion_delivery)
   local body = { kind = "tool.result", id = firing_id }
+  if completion_delivery ~= nil then body.completion_delivery = completion_delivery end
   if type(outcome) == "table" and outcome.output ~= nil then
     body.output = outcome.output
   else
@@ -1250,7 +1253,7 @@ local function handle_mag_run_result(body)
 
   local grace_waiter = cancel_completion_grace(run_id)
   if grace_waiter then
-    emit_await_outcome(grace_waiter.firing_id, settled.outcome)
+    emit_await_outcome(grace_waiter.firing_id, settled.outcome, "inline")
   end
 
   local termination_waiters = take_termination_waiters(run_id)
@@ -1865,7 +1868,7 @@ local function expire_completion_grace(run_id)
   local waiter = state.completion_grace_waiters[run_id]
   if not waiter then return false end
   state.completion_grace_waiters[run_id] = nil
-  emit_tool_result_ok(waiter.firing_id, waiter.ack)
+  emit_tool_result_ok(waiter.firing_id, waiter.ack, "detached")
   return true
 end
 

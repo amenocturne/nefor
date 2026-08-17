@@ -182,10 +182,11 @@ function M.set_turn_terminal(entry, terminal)
   return new
 end
 
-function M.set_output(entry, output, err_flag)
+function M.set_output(entry, output, err_flag, completion_delivery)
   local new = copy(entry)
   new.output = output
   new.error = err_flag
+  new.completion_delivery = completion_delivery
   log.log("entry", "mutate fn=set_output old_v=%d new_v=%d", entry.v, new.v)
   return new
 end

@@ -956,7 +956,7 @@ do
     "synchronous result preserves canonical payload")
   assert_true(timers[1].canceled, "terminal settlement cancels its deadline")
   assert_eq(has_relayed_lead_turn(), false,
-    "synchronously delivered completion is not relayed as a second lead turn")
+    "inline-delivered completion is not relayed as a second lead turn")
 end
 
 do
@@ -973,9 +973,9 @@ do
   assert_true(timers[1].canceled, "failed settlement cancels its deadline")
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
-  end), nil, "synchronous mag-eval has no duplicate terminal result projection")
+  end), nil, "inline mag-eval has no duplicate terminal result projection")
   assert_eq(has_relayed_lead_turn(), false,
-    "synchronously delivered failure is not relayed a second time")
+    "inline-delivered failure is not relayed a second time")
 end
 
 do
@@ -989,6 +989,8 @@ do
     "deadline returns the existing asynchronous acknowledgment")
   assert_eq(ack.body.output.run_id, run_id, "acknowledgment preserves the exact run id")
   assert_eq(ack.body.output.engine, "mag-kernel", "acknowledgment preserves the engine")
+  assert_eq(ack.body.completion_delivery, "detached",
+    "grace acknowledgment marks completion for later owner delivery")
   _test.calls_clear()
   feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
     result = { value = "late result" } })
@@ -1006,8 +1008,11 @@ do
   local run_id = start_eval_run("grace-timeout-eval")
   _test.calls_clear()
   timers[1].callback()
-  assert_eq(tool_result("grace-timeout-eval").body.output.status, "executing",
-    "mag-eval identifies the asynchronous grace outcome")
+  local eval_ack = tool_result("grace-timeout-eval")
+  assert_eq(eval_ack.body.output.status, "executing",
+    "mag-eval identifies the detached grace outcome")
+  assert_eq(eval_ack.body.completion_delivery, "detached",
+    "mag-eval grace acknowledgment marks detached delivery")
   clock = clock + 432000
   _test.calls_clear()
   feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
@@ -1015,7 +1020,7 @@ do
   local block = find_call(decode_calls(), function(c)
     return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
   end)
-  assert_true(block ~= nil, "asynchronous mag-eval emits the standard terminal result block")
+  assert_true(block ~= nil, "ainline mag-eval emits the standard terminal result block")
   assert_eq(block.body.invocation_kind, "eval",
     "terminal result keeps the canonical eval invocation kind")
   assert_eq(block.body.invocation_label, "Print value",

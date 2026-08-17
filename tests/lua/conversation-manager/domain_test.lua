@@ -42,7 +42,10 @@ do
   append(store, fact("xc", "lead", "tool_call_completed", {
     exchange_id = "exchange:1", call = { id = "provider-call-7", name = "read", arguments = { path = "x" } },
   }))
-  append(store, fact("xr", "lead", "tool_result_recorded", { exchange_id = "exchange:1", result = { text = "data" } }))
+  append(store, fact("xr", "lead", "tool_result_recorded", {
+    exchange_id = "exchange:1", result = { text = "data" },
+    completion_delivery = "inline",
+  }))
   append(store, fact("retry", "lead", "retry_started", { retry_id = "retry:1", message_id = "assistant:1", reason = "rate_limit", provenance = { model = "three" } }))
   append(store, fact("mc", "lead", "message_completed", { message_id = "assistant:1", completion = { finish_reason = "stop" } }))
   local done = append(store, fact("done", "lead", "conversation_completed", { detail = { usage = 12 } }))
@@ -50,6 +53,8 @@ do
   eq(#done.messages[1].chunks, 5, "universal content chunks remain individual")
   for index, chunk in ipairs(chunks) do eq(done.messages[1].chunks[index], chunk, "chunk order preserved") end
   eq(done.exchanges[1].tool_call_id, "provider-call-7"); eq(done.exchanges[1].arguments.path, "x")
+  eq(done.exchanges[1].completion_delivery, "inline",
+    "completion delivery is canonical exchange metadata")
   eq(done.exchanges[1].status, "result"); eq(#done.retries, 1)
   rejects(store, fact("late", "lead", "provenance_updated", { provenance = { model = "late" } }), "conversation_terminal")
 end
@@ -90,6 +95,22 @@ do
   }))
   append(store, fact("xe", "error-chat", "tool_error_recorded", { exchange_id = "x", error = { code = "exit", message = "1" } }))
   rejects(store, fact("xr", "error-chat", "tool_result_recorded", { exchange_id = "x", result = {} }), "tool_exchange_terminal")
+end
+
+-- Completion delivery is a closed optional value: old records may omit it,
+-- while new delayed-tool settlements must use one of the canonical variants.
+do
+  local store = manager.new(); create(store, "delivery", "agent")
+  append(store, fact("m", "delivery", "message_started", { message_id = "m", role = "assistant" }))
+  append(store, fact("x", "delivery", "tool_exchange_started", {
+    exchange_id = "x", message_id = "m", tool_name = "mag",
+  }))
+  append(store, fact("xc", "delivery", "tool_call_completed", {
+    exchange_id = "x", call = { id = "external-x", name = "mag", arguments = {} },
+  }))
+  rejects(store, fact("xr", "delivery", "tool_result_recorded", {
+    exchange_id = "x", result = {}, completion_delivery = "async",
+  }), "invalid_completion_delivery")
 end
 
 -- Invalid transitions are table-driven and failed facts never consume sequence.

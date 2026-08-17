@@ -137,8 +137,10 @@ local function delayed_mag_delivery(entry, args)
   local is_execute = entry.name == "mag-eval"
     or (entry.name == "mag" and type(args) == "table" and args.action == "execute")
   if not is_execute or entry.output == nil then return nil end
-  if type(entry.output) == "table" and entry.output.status == "executing" then return "async" end
-  return "sync"
+  if entry.completion_delivery == "inline" or entry.completion_delivery == "detached" then
+    return entry.completion_delivery
+  end
+  return nil
 end
 
 local function semantic_projection(entry)
@@ -271,14 +273,14 @@ local function graph_result_ident(entry)
   return tostring(entry.run_id or "?")
 end
 
--- Collapsed header: `◆ mag result [async] · <original label> · <duration>`.
+-- Collapsed header: `◆ mag result [detached] · <original label> · <duration>`.
 -- The terminal outcome is carried only by the existing glyph/style; no outcome
 -- word is appended. Machine detail lives in the unfolded state.
 local function graph_result_header(entry, glyph)
   local failed = (entry.status == "failed")
   local style = failed and STYLE.graph_result_error or STYLE.graph_result_name
   local label = entry.invocation_label or graph_result_ident(entry)
-  local parts = { glyph .. "mag result [async]", label }
+  local parts = { glyph .. "mag result [detached]", label }
   local dur = format_wall_clock_duration_ms(entry.duration_ms)
   if dur then parts[#parts + 1] = dur end
   return tui.text { content = table.concat(parts, " · "), style = style, wrap = "none" }

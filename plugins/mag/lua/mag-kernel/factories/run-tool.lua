@@ -160,6 +160,7 @@ function M.construct(id, params, emit, deps)
       output = activation.result,
       output_path = activation.output_path,
       error = activation.error,
+      completion_delivery = activation.completion_delivery,
     }
     if batch.received >= batch.expected then
       complete_batch(ref.batch, batch)

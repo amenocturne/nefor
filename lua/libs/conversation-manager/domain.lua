@@ -7,6 +7,7 @@ local json_data = require("core.json_data")
 local terminal_conversation = { completed = true, interrupted = true, failed = true }
 local chunk_kinds = { text = true, reasoning = true, structured = true, native = true }
 local roles = { system = true, user = true, assistant = true, tool = true }
+local completion_deliveries = { inline = true, detached = true }
 -- A message's transcript disposition. "transcript" is ordinary conversation;
 -- "diagnostic" is model context that no surface renders as conversation (a
 -- rejected structured-output attempt and its correction prompt). Both remain in
@@ -201,7 +202,16 @@ local function finish_exchange(c, event, status, field)
     local code = terminal and "tool_exchange_terminal" or "tool_call_incomplete"
     return err(code, { exchange_id = event.exchange_id, status = exchange.status })
   end
-  exchange.status = status; exchange[field] = copy(event[field])
+  if event.completion_delivery ~= nil
+      and not completion_deliveries[event.completion_delivery] then
+    return err("invalid_completion_delivery", {
+      exchange_id = event.exchange_id,
+      completion_delivery = event.completion_delivery,
+    })
+  end
+  exchange.status = status
+  exchange[field] = copy(event[field])
+  exchange.completion_delivery = event.completion_delivery
   c.open_exchanges = c.open_exchanges - 1
   return c
 end

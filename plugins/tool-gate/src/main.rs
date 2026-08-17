@@ -2178,7 +2178,8 @@ mod tests {
         let source_result = json!({
             "kind": "tool.result",
             "id": "gate-1",
-            "output": {"status": "executing", "run_id": "mag-eval-1"}
+            "output": {"status": "executing", "run_id": "mag-eval-1"},
+            "completion_delivery": "detached"
         })
         .as_object()
         .unwrap()
@@ -2190,6 +2191,7 @@ mod tests {
         assert_eq!(returned["body"]["id"], "r7/cap-3");
         assert_eq!(returned["body"]["name"], "write_file");
         assert_eq!(returned["body"]["output"]["run_id"], "mag-eval-1");
+        assert_eq!(returned["body"]["completion_delivery"], "detached");
     }
 
     #[tokio::test]

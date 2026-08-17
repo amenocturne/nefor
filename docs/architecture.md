@@ -39,6 +39,8 @@ The example deliberately separates durable meaning from transient execution:
 
 This split keeps replay authoritative without making the conversation manager responsible for live workflow scheduling. Surface reducers render conversation-manager projections and separately observe transient workflow state.
 
+Tool exchanges may carry optional `completion_delivery` metadata. The lead workflow assigns `inline` when a delayed MAG invocation settles through its original tool exchange, or `detached` when that exchange settles with the grace acknowledgment and completion reaches the owner later. The MAG tool boundary preserves the value into the canonical tool-result fact; conversation-manager validates the closed representation and projects it unchanged. The TUI renders it directly rather than interpreting serialized tool output. Older canonical facts without the field remain valid and render without a delivery label.
+
 #### Transcript disposition
 
 Not every recorded message is conversation. A message fact carries an explicit

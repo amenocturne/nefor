@@ -13,6 +13,7 @@ local function projected_exchange(exchange)
     arguments = domain.copy(exchange.arguments),
     result = domain.copy(exchange.result),
     error = domain.copy(exchange.error),
+    completion_delivery = exchange.completion_delivery,
   }
 end
 

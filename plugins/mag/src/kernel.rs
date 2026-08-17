@@ -358,6 +358,7 @@ impl LuaHost {
         id: &str,
         result: Option<&JsonValue>,
         error: Option<&str>,
+        completion_delivery: Option<&str>,
     ) -> Result<Option<String>, MagError> {
         let resp = self.lua.create_table()?;
         resp.set("id", id)?;
@@ -366,6 +367,9 @@ impl LuaHost {
         }
         if let Some(e) = error {
             resp.set("error", e)?;
+        }
+        if let Some(delivery) = completion_delivery {
+            resp.set("completion_delivery", delivery)?;
         }
         let f: Function = self.kernel.get("bus_response")?;
         Ok(f.call::<Option<String>>(resp)?)
@@ -1149,7 +1153,8 @@ mod tests {
                     "stdout": "output", "stderr": "warning",
                     "termination": {"kind": "code", "code": 9}
                 })),
-                None
+                None,
+                Some("detached")
             )
             .expect("structured response"),
             Some("shell-script".into())

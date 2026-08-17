@@ -79,6 +79,7 @@ local function to_message(r)
     name = r.name,
     content = content,
     error = r.error,
+    completion_delivery = r.completion_delivery,
   }
 end
 

@@ -905,7 +905,8 @@ end
 
 local function handle_tool_end(msg, state)
   local next_state = transcript.attach_tool_end(
-    state, msg.id or "", msg.output or "", msg.error == true)
+    state, msg.id or "", msg.output or "", msg.error == true,
+    msg.completion_delivery)
   return transcript.flush_graph_results_if_stable(next_state), {}
 end
 
@@ -1595,7 +1596,8 @@ local function apply_conversation_action(state, item)
   end
   if item.kind == "tool_completed" then
     return transcript.attach_tool_end(
-      state, item.exchange_id, item.output, item.error == true)
+      state, item.exchange_id, item.output, item.error == true,
+      item.completion_delivery)
   end
   if item.kind == "retry_started" then
     local retry = item.retry or {}

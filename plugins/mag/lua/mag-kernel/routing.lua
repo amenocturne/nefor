@@ -994,6 +994,7 @@ function M:bus_response(response)
     result = response.result,
     output_path = response.output_path,
     error = response.error,
+    completion_delivery = response.completion_delivery,
   })
   self:apply_completion(entry.requester, completion)
   return true

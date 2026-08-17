@@ -1327,7 +1327,8 @@ async fn handle_tool_result(
     // Providers/tools reply with `output`; some producers use `result`.
     let result = body.get("output").or_else(|| body.get("result"));
     let error = body.get("error").and_then(Value::as_str);
-    let advanced = host.bus_response(id, result, error)?;
+    let completion_delivery = body.get("completion_delivery").and_then(Value::as_str);
+    let advanced = host.bus_response(id, result, error, completion_delivery)?;
     flush_emits(out_tx, host, bridge).await?;
     match advanced {
         Some(run_id) => settle_run(out_tx, host, active, bridge, program, &run_id).await,
@@ -1350,6 +1351,7 @@ async fn handle_provider_reply(
         &reply.request_id,
         reply.result.as_ref(),
         reply.error.as_deref(),
+        None,
     )?;
     flush_emits(out_tx, host, bridge).await?;
     match advanced {

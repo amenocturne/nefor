@@ -219,9 +219,11 @@ delta = append_fact("tool-call", "tool_call_completed", {
   call = { id = "provider-call-42", name = "read_file", arguments = { path = "x" } },
 })
 eq(delta.change.exchange.id, "call-1", "universal projections preserve the exchange identity")
-append_fact("tool-result", "tool_result_recorded", {
-  exchange_id = "call-1", result = { text = "data" },
+delta = append_fact("tool-result", "tool_result_recorded", {
+  exchange_id = "call-1", result = { text = "data" }, completion_delivery = "detached",
 })
+eq(delta.change.exchange.completion_delivery, "detached",
+  "canonical projection preserves explicit completion delivery")
 delta = append_fact("assistant-done", "message_completed", {
   message_id = "assistant", model = "universal-model", duration_ms = 42,
   usage = { input_tokens = 7, output_tokens = 3 }, finish_reason = "tool_calls",

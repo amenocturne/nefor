@@ -288,11 +288,11 @@ function M.attach_tool_display_primary(state, firing_id, run_id, primary)
   return state
 end
 
-function M.attach_tool_end(state, id, output, error_flag)
+function M.attach_tool_end(state, id, output, error_flag, completion_delivery)
   for i = #state.entries, 1, -1 do
     local e = state.entries[i]
     if e.kind == "tool_call" and e.id == id then
-      local new_entry = Entry.set_output(e, output or "", error_flag)
+      local new_entry = Entry.set_output(e, output or "", error_flag, completion_delivery)
       local new_entries = replace_entry(state.entries, i, new_entry)
       log.log("transcript", "attach_tool_end id=%s idx=%d new_v=%d",
         id or "?", i, new_entry.v)
