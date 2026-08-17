@@ -21,7 +21,7 @@
 --   <prefix>.reasoning.set_ack     → chat.reasoning.set_ack (+ provider)
 --   <prefix>.turn.error            → chat.message.append (system)
 --   <prefix>.turn.error {chat_id}  → <prefix>.chat.error
---   <prefix>.hello                 → chat.model.set_ack (model fanout)
+--   <prefix>.hello                 → forwarded + chat.model.set_ack when model is present
 --   <prefix>.ready                 → drop (after auth.set injection)
 --   <prefix>.goodbye               → drop
 --
@@ -624,11 +624,8 @@ function M.spawn_spec(name, command, opts)
     return true
   end
 
-  -- from_plugin (binary → bus) — four steps per envelope:
-  --   1. translator.maybe_inject_static_token: bus-quiet auth.set
-  --      injection on first ready (no-op otherwise).
-  --   2. translator.outbound: kind rename, or nil for ready/goodbye.
-  --   3. publish via translator.publish (preserves env.from).
+  -- from_plugin (binary → bus) — provider lifecycle/usage handling followed
+  -- by translator-owned public event projection.
   local function from_plugin(envs)
     for _, env in ipairs(envs) do
       -- Static-token injection runs even when outbound drops the body
@@ -700,6 +697,13 @@ function M.spawn_spec(name, command, opts)
       end
 
       local translated = translator.outbound(env)
+      -- Hello is process liveness, not a model-selection event. Preserve the
+      -- provider-owned announcement even when the translator cannot derive a
+      -- public acknowledgement from it (for example ChatGPT's model-less
+      -- hello while its catalog is fetched asynchronously).
+      if type(env.body) == "table" and env.body.kind == kinds.hello then
+        translator.publish(env.from or name, clone_table(env.body))
+      end
       if type(translated) == "table" and translated.kind == kinds.completion_event then
         local request_id = translated.request_id
         if type(request_id) == "string"

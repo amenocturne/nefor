@@ -436,6 +436,35 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         end
 
         local spec = provider.spawn_spec("meter", { "/bin/true" }, options())
+
+        -- A provider hello remains independently observable when it cannot
+        -- produce a model acknowledgement. Usage initialization may follow
+        -- on ready and through the provider-native snapshot without consuming
+        -- or standing in for that liveness event.
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.hello", name = "meter", version = "test" } }})
+        local hello = _test.sent()
+        assert(#hello == 1 and hello[1].kind == "meter.hello")
+        assert(hello[1].body.name == "meter")
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.ready" } }})
+        local startup_usage = _test.sent()
+        assert(#startup_usage == 1)
+        assert(startup_usage[1].kind == "conversation.usage.expose")
+        assert(startup_usage[1].body.usage_ids[1] == "meter/a")
+        assert(startup_usage[1].body.usage_ids[3] == "meter/native")
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.native.updated", remaining = 84 } }})
+        assert(spec._internals.usage_value("meter/native").remaining == 84)
+        assert(#_test.sent() == 0)
+        local readiness = require("libs.startup-readiness")._new {
+          required_plugins = { "meter" }, required_tools = {},
+        }
+        readiness.observe(hello[1].body, hello[1].from)
+        assert(readiness.snapshot().ready)
+        spec.to_plugin({{ type = "event", from = "sessions", body = {
+          kind = "sessions.session_start", session_id = "fixture" } }})
+
         -- Exercise the actual generic completion-event shape emitted by the Rust
         -- provider: token facts and opaque extensions live under `usage`.
         spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
