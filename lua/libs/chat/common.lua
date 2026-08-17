@@ -138,6 +138,24 @@ function M.humanize_duration_ms(ms)
   return table.concat(parts)
 end
 
+function M.format_wall_clock_duration_ms(ms)
+  if ms == nil then return nil end
+  local total_seconds = math.max(0, math.floor(ms / 1000))
+  if total_seconds < 60 then return tostring(total_seconds) .. "s" end
+
+  local days = math.floor(total_seconds / 86400)
+  local hours = math.floor(total_seconds / 3600) % 24
+  local minutes = math.floor(total_seconds / 60) % 60
+  local seconds = total_seconds % 60
+  if days > 0 then
+    return string.format("%02dd %02dh %02dm %02ds", days, hours, minutes, seconds)
+  end
+  if hours > 0 then
+    return string.format("%02dh %02dm %02ds", hours, minutes, seconds)
+  end
+  return string.format("%02dm %02ds", minutes, seconds)
+end
+
 function M.humanize_tokens(n)
   if n == nil then return nil end
   if n < 1000 then return tostring(n) end

@@ -32,6 +32,17 @@ for _, case in ipairs(durations) do
   eq(run_panel.fmt_elapsed_ms(case[1]), case[2], "fixed-width sidebar duration")
 end
 
+local wall_clock_durations = {
+  { 0, "0s" }, { 2999, "2s" }, { 42000, "42s" },
+  { 7 * 60000 + 12000, "07m 12s" },
+  { 3600000 + 5000, "01h 00m 05s" },
+  { 86400000 + 3 * 3600000 + 10 * 60000 + 15000, "01d 03h 10m 15s" },
+}
+for _, case in ipairs(wall_clock_durations) do
+  eq(require("libs.chat.common").format_wall_clock_duration_ms(case[1]), case[2],
+    "detailed wall-clock duration")
+end
+
 eq(run_panel.member_label("lead", "lead.entry"), "entry",
   "member label is relative to its exact parent")
 eq(run_panel.member_label("lead", "leader.entry"), "leader.entry",

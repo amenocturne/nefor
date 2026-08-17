@@ -3598,7 +3598,8 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
         &mut engine,
         json!({
             "kind": "chat.graph_result.append", "run_id": "run-ship",
-            "invocation_label": "ship.mag", "status": "failed", "duration_ms": 4321,
+            "invocation_label": "ship.mag", "status": "failed",
+            "duration_ms": 97_815_000,
         }),
     );
     fixture_assistant_completed(&mut engine, None, json!({}));
@@ -3606,7 +3607,10 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
     assert!(out.contains("▸ mag · hidden.mag"), "{out}");
     assert!(out.contains("▸ mag · ship.mag"), "{out}");
     assert!(out.contains("▸ mag eval · Inspect workspace"), "{out}");
-    assert!(out.contains("mag result [async] · ship.mag · 4s"), "{out}");
+    assert!(
+        out.contains("mag result [async] · ship.mag · 01d 03h 10m 15s"),
+        "{out}"
+    );
     assert!(
         !out.contains("FAILED"),
         "outcome word must stay absent: {out}"
