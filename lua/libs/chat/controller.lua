@@ -843,8 +843,10 @@ local function handle_usage_values(msg, state)
     end
   end
   local popup = state.popup
-  if popup and (popup.usage_request_id == msg.request_id
-      or popup.usage_subscription_id == msg.subscription_id) then
+  if popup and ((popup.usage_request_id ~= nil
+        and popup.usage_request_id == msg.request_id)
+      or (popup.usage_subscription_id ~= nil
+        and popup.usage_subscription_id == msg.subscription_id)) then
     local values = {}
     for usage_id, value in pairs(usage) do
       if type(value) == "table" and value.kind ~= "unknown" then
@@ -879,8 +881,12 @@ local function handle_usage_unavailable(msg, state)
 end
 
 local function handle_usage_error(msg, state)
-  if not (state.popup and (state.popup.usage_request_id == msg.request_id
-      or state.popup.usage_subscription_id == msg.subscription_id)) then return state, {} end
+  if not (state.popup and ((state.popup.usage_request_id ~= nil
+        and state.popup.usage_request_id == msg.request_id)
+      or (state.popup.usage_subscription_id ~= nil
+        and state.popup.usage_subscription_id == msg.subscription_id))) then
+    return state, {}
+  end
   return shallow_merge(state, { popup = { variant = "error", title = "usage",
     body = msg.message or "Could not refresh usage." } }), {}
 end

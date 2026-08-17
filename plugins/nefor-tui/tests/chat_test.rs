@@ -6284,6 +6284,58 @@ fn usage_snapshot_updates_independent_footer_segments_and_common_command() {
 }
 
 #[test]
+fn uncorrelated_usage_updates_do_not_open_or_replace_popups() {
+    let mut engine = Engine::new(120, 28).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+
+    for ch in "/help".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let before = render_snapshot(&mut engine);
+    assert!(
+        before.contains("── help ──") && before.contains("Keys:"),
+        "{before}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.usage.update",
+            "values": [{ "usage_id": "chatgpt/subscription", "usage": {
+                "kind": "subscription", "windows": [{
+                    "used_percent": 50, "reset_at": 1770000000
+                }]
+            }}]
+        }),
+    );
+    let after_update = render_snapshot(&mut engine);
+    assert!(
+        after_update.contains("── help ──") && after_update.contains("Keys:"),
+        "automatic usage update replaced the existing popup: {after_update}"
+    );
+    assert!(!after_update.contains("5-hour window"), "{after_update}");
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.usage.publish.rejected",
+            "message": "automatic usage failure"
+        }),
+    );
+    let after_error = render_snapshot(&mut engine);
+    assert!(
+        after_error.contains("── help ──") && after_error.contains("Keys:"),
+        "uncorrelated usage error replaced the existing popup: {after_error}"
+    );
+    assert!(
+        !after_error.contains("automatic usage failure"),
+        "{after_error}"
+    );
+}
+
+#[test]
 fn command_and_statusline_usage_ids_are_independent_and_context_bar_coexists() {
     let mut engine = Engine::new(120, 28).expect("engine");
     load_chat_scenario(&mut engine);
