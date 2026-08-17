@@ -123,7 +123,7 @@ This guide describes the chat interface shipped in `examples/nefor-agent/`. It i
 
 ## The screen
 
-The main pane is a Markdown transcript above a multiline prompt. The status line reports the active provider/model, reasoning effort, permission mode, context use, and runtime state. `Ctrl+B` opens a sidebar for live MAG workflows; `Tab` moves focus between the prompt and that sidebar.
+The main pane is a Markdown transcript above a multiline prompt. The status line reports the active provider/model, reasoning effort, permission mode, context use, configured provider quota/cost values, and runtime state. `/usage` opens the configured provider-owned account values. Those values are separate from the context bar: quota and cost describe provider accounts or the current session, while context use describes the active model request. `Ctrl+B` opens a sidebar for live MAG workflows; `Tab` moves focus between the prompt and that sidebar.
 
 Send with `Enter`; insert a newline with `Shift+Enter`. While a turn is running, another submission is kept as one queued message. Repeated submissions coalesce into that queued entry rather than becoming separate pending turns. See [commands and keys](../../examples/nefor-agent/chat/slash.lua) for steering and interruption.
 
