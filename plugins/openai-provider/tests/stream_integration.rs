@@ -1576,15 +1576,32 @@ async fn run_scripted_stream(
 }
 
 #[tokio::test]
-async fn duplicate_usage_payloads_are_rejected() {
-    let body = concat!(
+async fn repeated_identical_usage_payloads_dedupe_but_conflicts_fail() {
+    let identical = concat!(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
+        "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let (result, _, _) = run_scripted_stream(identical).await;
+    assert_eq!(
+        result
+            .expect("identical usage dedupes")
+            .usage
+            .expect("usage")
+            .prompt_tokens,
+        Some(1)
+    );
+
+    let conflicting = concat!(
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
         "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n"
     )
     .to_owned();
-    let (result, _, _) = run_scripted_stream(body).await;
+    let (result, _, _) = run_scripted_stream(conflicting).await;
     assert!(
-        matches!(result, Err(StreamError::Malformed(message)) if message.contains("more than one usage"))
+        matches!(result, Err(StreamError::Malformed(message)) if message.contains("conflicting usage"))
     );
 }
 

@@ -912,14 +912,15 @@ where
                 });
             }
         }
-        SseEvent::Usage(usage) => {
-            if outcome.usage.is_some() {
+        SseEvent::Usage(usage) => match &outcome.usage {
+            Some(existing) if existing != &usage => {
                 return Err(StreamError::Malformed(
-                    "provider emitted more than one usage payload".to_owned(),
+                    "provider emitted conflicting usage payloads".to_owned(),
                 ));
             }
-            outcome.usage = Some(usage);
-        }
+            Some(_) => {}
+            None => outcome.usage = Some(usage),
+        },
         SseEvent::Error {
             message,
             kind,
