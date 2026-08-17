@@ -1219,7 +1219,14 @@ local function handle_mag_run_result(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
   turn.result_body = deep_clone(body)
-  if turn.manager_terminal then finish_mag_run_result(turn.result_body) end
+  -- A lead entry can fail before any provider or conversation-manager activity,
+  -- so no terminal projection will arrive to release this exact run. Terminal
+  -- failures are already canonical kernel outcomes; settle them immediately.
+  if body.status ~= "completed" and body.status ~= "killed" then
+    finish_mag_run_result(turn.result_body)
+  elseif turn.manager_terminal then
+    finish_mag_run_result(turn.result_body)
+  end
 end
 
 local terminal_turn_changes = {

@@ -149,6 +149,48 @@ do
 end
 
 -- ==================================================================
+-- typed task projection boundaries preserve envelopes or yield bounded text
+-- ==================================================================
+
+do
+  local task_schema = { version = 1, root = {
+    kind = "named", name = "nefor.contracts.Task", body = {
+      kind = "record", fields = { { name = "prompt", schema = { kind = "string" } } },
+    },
+  } }
+  local function deliver_at_size(target_size)
+    local value = { prompt = "" }
+    local envelope = { mag_type = task_schema, value = value }
+    local overhead = #nefor.json.encode(envelope)
+    value.prompt = string.rep("x", target_size - overhead)
+    assert_eq(#nefor.json.encode(envelope), target_size, "fixture reaches the exact projected size")
+    local canonical = { value = value, output_path = "/runs/task/output.json" }
+    local msgs, emit = capture()
+    local inst = adapter.construct("lead.entry", { schema = task_schema }, emit)
+    inst.deliver(single("lead.source", "task", canonical))
+    return find_kind(msgs, "generic-provider.ProviderOut"), canonical
+  end
+
+  for _, size in ipairs({ 32767, 32768 }) do
+    local out, canonical = deliver_at_size(size)
+    assert_true(type(out.value.content) == "table",
+      "a typed Task at or below 32768 bytes remains a typed provider value")
+    assert_eq(out.value.content.prompt, canonical.value.prompt,
+      "the preserved typed Task supplies valid ProviderInput content")
+  end
+
+  local above, canonical = deliver_at_size(32769)
+  assert_true(type(above.value.content) == "string",
+    "an oversized typed Task supplies bounded text as ProviderInput content")
+  assert_true(#above.value.content <= 32768, "oversized Task projection obeys the 32 KiB cap")
+  assert_true(above.value.content:find("output truncated", 1, true) ~= nil,
+    "oversized Task projection carries a truncation marker")
+  assert_eq(#canonical.value.prompt, 32769 - (#nefor.json.encode({
+    mag_type = task_schema, value = { prompt = "" },
+  })), "the canonical upstream Task remains unchanged")
+end
+
+-- ==================================================================
 -- TextAnswer in -> ProviderInput out (upstream agent hand-off)
 -- ==================================================================
 
@@ -266,7 +308,12 @@ do
   } } }
   local provider_messages, provider_emit = capture()
   local facts = {}
-  local provider = assert(llm.construct("fan-in.llm", { provider = "fake-provider" }, provider_emit, {
+  local provider = assert(llm.construct("fan-in.llm", {
+    provider = "fake-provider",
+    output_type = "final-id",
+    error_type = "error-id",
+    provider_error_type = "provider-error-id",
+  }, provider_emit, {
     conversation = {
       id = "fan-in:conversation",
       turn_id = "fan-in:turn",

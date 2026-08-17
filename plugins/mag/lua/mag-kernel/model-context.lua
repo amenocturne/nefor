@@ -4,10 +4,10 @@
 
 local M = {}
 
-M.ITEM_LIMIT = 16 * 1024
+M.ITEM_LIMIT = 32 * 1024
 M.TURN_LIMIT = 96 * 1024
-M.HEAD_TARGET = 12 * 1024
-M.TAIL_TARGET = 4 * 1024
+M.HEAD_TARGET = 24 * 1024
+M.TAIL_TARGET = 8 * 1024
 
 local function utf8_head(value, limit)
   if #value <= limit then return value end

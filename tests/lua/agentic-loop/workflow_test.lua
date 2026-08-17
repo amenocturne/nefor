@@ -417,6 +417,36 @@ local function begin_bound_turn(text, scope)
   return exec
 end
 
+-- A terminal entry failure can precede every provider/conversation-manager
+-- event. It releases only that exact run and promotes queued input once.
+do
+  fresh_loop()
+  local first = begin_turn("fails at entry")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued after failure" })
+  _test.calls_clear()
+  raw_send_to_loop("mag", {
+    kind = "mag.run_result", run_id = first.body.run_id,
+    status = "failed", error = "lead.entry typed-output validation failed",
+  })
+  local calls = decode_calls()
+  local promoted = find_kind(calls, "mag.execute")
+  assert(promoted ~= nil, "early lead.entry failure promotes queued input")
+  assert_eq(task_prompt(promoted.body.artifact.data), "queued after failure",
+    "the promoted run carries the queued user input")
+  assert_eq(agentic_loop._internals.state.current_run_id, promoted.body.run_id,
+    "the promoted run becomes the active lead run")
+
+  _test.calls_clear()
+  raw_send_to_loop("mag", {
+    kind = "mag.run_result", run_id = first.body.run_id,
+    status = "failed", error = "duplicate stale failure",
+  })
+  assert_eq(agentic_loop._internals.state.current_run_id, promoted.body.run_id,
+    "a stale terminal result cannot clear the newer healthy run")
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil,
+    "the stale terminal result does not promote input twice")
+end
+
 -- Conversation-manager is the only durable transcript projection. The TUI
 -- owns its optimistic local echo; agentic-loop emits no parallel chat message.
 do

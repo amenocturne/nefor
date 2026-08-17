@@ -284,20 +284,20 @@ do
     return find_kind(msgs, "generic-provider.ProviderOut")
   end
 
-  local below = string.rep("a", 16383)
-  local exact = string.rep("b", 16384)
+  local below = string.rep("a", 32767)
+  local exact = string.rep("b", 32768)
   local unchanged = project({
     { id = "below", name = "read", output = below },
     { id = "exact", name = "read", output = exact },
   })
   assert_eq(unchanged.messages[1].content, below, "below-limit output is unchanged")
-  assert_eq(unchanged.messages[2].content, exact, "the exact 16384-byte boundary is unchanged")
+  assert_eq(unchanged.messages[2].content, exact, "the exact 32768-byte boundary is unchanged")
 
   local path = "/runs/r1/nodes/read/output.json"
   local huge = string.rep("H", 20000) .. string.rep("T", 20000)
   local bounded = project({ { id = "huge", name = "read", output = huge, output_path = path } })
   local content = bounded.messages[1].content
-  assert_true(#content <= 16384, "single-line output including marker and path stays within 16 KiB")
+  assert_true(#content <= 32768, "single-line output including marker and path stays within 32 KiB")
   assert_true(content:sub(1, 100) == string.rep("H", 100), "projection preserves a useful head")
   assert_true(content:sub(-100) == string.rep("T", 100), "projection preserves a useful tail")
   assert_true(content:find("original 40000 bytes", 1, true) ~= nil,
@@ -309,13 +309,13 @@ do
     "marker omission accounting matches retained source bytes")
 
   local missing = project({ { id = "missing", name = "read", output = huge } })
-  assert_true(#missing.messages[1].content <= 16384, "missing-path projection still obeys the item cap")
+  assert_true(#missing.messages[1].content <= 32768, "missing-path projection still obeys the item cap")
   assert_true(missing.messages[1].content:find("Full output is unavailable", 1, true) ~= nil,
     "missing canonical path is explicit")
 
   local unicode = string.rep("🙂", 5000)
   local unicode_out = project({ { id = "utf8", name = "read", output = unicode, output_path = path } })
-  assert_true(#unicode_out.messages[1].content <= 16384, "multibyte projection obeys the byte cap")
+  assert_true(#unicode_out.messages[1].content <= 32768, "multibyte projection obeys the byte cap")
   local quoted = nefor.json.encode(unicode_out.messages[1].content)
   assert_true(type(nefor.json.decode(quoted)) == "string", "multibyte projection preserves UTF-8 boundaries")
 
@@ -367,11 +367,11 @@ do
     } },
   } }, relay_emit)
   relay.deliver(single("worker.llm", "nefor.agent.Result", {
-    value = { content = string.rep("r", 30000) },
+    value = { content = string.rep("r", 40000) },
     output_path = "/runs/r1/nodes/worker/output.json",
   }))
   local relayed = find_kind(relay_msgs, "generic-provider.ProviderOut")
-  assert_true(#relayed.messages[1].content <= 16384,
+  assert_true(#relayed.messages[1].content <= 32768,
     "agent/worker relay is bounded at the shared provider-input boundary")
   assert_true(relayed.messages[1].content:find("/runs/r1/nodes/worker/output.json", 1, true) ~= nil,
     "agent/worker relay marker retains its canonical path")

@@ -1041,7 +1041,8 @@ do
   -- carrying the sink output content read from the path.
   local out_path = os.tmpname()
   local ofh = io.open(out_path, "w")
-  ofh:write("SINK OUTPUT CONTENT")
+  local oversized_output = string.rep("S", 40000)
+  ofh:write(oversized_output)
   ofh:close()
   _test.calls_clear()
   feed("mag", {
@@ -1058,8 +1059,10 @@ do
   local prompt = relayed_lead_prompt()
   assert_true(type(prompt) == "string",
     "mag.run_result relays a fresh lead turn; got " .. json.encode(_test.calls()))
-  assert_true(prompt:find("SINK OUTPUT CONTENT", 1, true) ~= nil,
-    "the relayed turn carries the sink output content read from the path")
+  assert_true(prompt:find(string.rep("S", 1000), 1, true) ~= nil,
+    "the relayed turn carries the oversized sink output content")
+  assert_eq(#prompt:match("S+"), #oversized_output,
+    "the async relay constructs the full canonical Task before model-context projection")
   assert_true(prompt:find(out_path, 1, true) == nil,
     "the relayed turn does not duplicate the sink output path")
 
@@ -1077,7 +1080,7 @@ do
   assert_true(type(block.body.output) == "string"
               and block.body.output:find(out_path, 1, true) ~= nil,
     "result block surfaces the sink output path")
-  assert_true(block.body.output:find("SINK OUTPUT CONTENT", 1, true) == nil,
+  assert_true(block.body.output:find(string.rep("S", 1000), 1, true) == nil,
     "result block must NOT duplicate the relayed output content")
 
   os.remove(out_path)

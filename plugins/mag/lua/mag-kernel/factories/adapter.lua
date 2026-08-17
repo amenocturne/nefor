@@ -164,9 +164,12 @@ local function to_provider_input(activation, schema)
   end
   local projected = model_context.project(projectable, true)
   for position, content in ipairs(projected) do messages[position].content = content end
+  local first_content = messages[1] and messages[1].content
   return {
     kind = "generic-provider.ProviderOut",
-    value = { content = messages[1] and messages[1].content.value },
+    value = {
+      content = type(first_content) == "table" and first_content.value or first_content,
+    },
     messages = messages,
   }
 end
