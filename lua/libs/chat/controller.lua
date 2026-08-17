@@ -916,7 +916,7 @@ local function handle_tool_display_primary(msg, state)
     return state, {}
   end
   return transcript.attach_tool_display_primary(
-    state, msg.run_id, msg.primary), {}
+    state, msg.id, msg.run_id, msg.primary), {}
 end
 
 local function handle_graph_result_append(msg, state)

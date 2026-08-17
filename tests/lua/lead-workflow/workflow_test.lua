@@ -399,6 +399,52 @@ end
 do
   fresh()
   lw._internals.set_graph_status_now(function() return 100 end)
+  local registry = lw._internals.run_registry
+  local alpha = registry:register({
+    run_id = "mag-run-status-alpha",
+    run_name = "alpha",
+    session_id = sessions.current_id(),
+    terminal = "worker",
+  })
+  alpha.invocation_label = "Inspect alpha"
+  local beta = registry:register({
+    run_id = "mag-run-status-beta",
+    run_name = "beta",
+    session_id = sessions.current_id(),
+    terminal = "worker",
+  })
+  beta.invocation_label = "Inspect beta"
+
+  invoke_tool("status-alpha-label", "graph-status", { run_id = alpha.run_id })
+  invoke_tool("status-beta-label", "graph-status", { run_id = beta.run_id })
+  local calls = decode_calls()
+  local alpha_display = find_call(calls, function(call)
+    return call.body.kind == "chat.tool.display_primary"
+      and call.body.id == "status-alpha-label"
+  end)
+  local beta_display = find_call(calls, function(call)
+    return call.body.kind == "chat.tool.display_primary"
+      and call.body.id == "status-beta-label"
+  end)
+  assert_eq(alpha_display.body.primary, "Inspect alpha",
+    "known graph-status uses the first run's canonical invocation label")
+  assert_eq(alpha_display.body.run_id, alpha.run_id,
+    "first graph-status label retains exact run correlation")
+  assert_eq(beta_display.body.primary, "Inspect beta",
+    "concurrent graph-status calls do not cross-label runs")
+  assert_eq(beta_display.body.run_id, beta.run_id,
+    "second graph-status label retains exact run correlation")
+
+  _test.calls_clear()
+  invoke_tool("status-raw-fallback", "graph-status", { run_id = "mag-run-not-known" })
+  assert_eq(find_call(decode_calls(), function(call)
+    return call.body.kind == "chat.tool.display_primary"
+  end), nil, "unknown graph-status run ids retain the schema-derived raw label")
+end
+
+do
+  fresh()
+  lw._internals.set_graph_status_now(function() return 100 end)
   local completed = lw._internals.run_registry:register({
     run_id = "mag-run-completed-A",
     run_name = "completed A",
@@ -2213,7 +2259,7 @@ do
   calls = decode_calls()
   local display = find_call(calls, function(c)
     return c.body.kind == "chat.tool.display_primary"
-      and c.body.id == nil and c.body.run_id == run_id
+      and c.body.id == "gate-6" and c.body.run_id == run_id
   end)
   assert_true(display ~= nil, "known eval termination projects a canonical display label")
   assert_eq(display.body.run_id, run_id, "display projection preserves exact run correlation")
@@ -2264,7 +2310,7 @@ do
     { caller_id = "r7/cap-file" })
   local file_display = find_call(decode_calls(), function(c)
     return c.body.kind == "chat.tool.display_primary"
-      and c.body.id == nil and c.body.run_id == file_run.run_id
+      and c.body.id == "terminate-file" and c.body.run_id == file_run.run_id
   end)
   assert_eq(file_display.body.primary, "ship.mag",
     "known execute termination reuses the original file label")

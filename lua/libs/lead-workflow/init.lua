@@ -322,13 +322,15 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
-local function emit_tool_display_primary(run)
-  if type(run) ~= "table"
+local function emit_tool_display_primary(firing_id, run)
+  if type(firing_id) ~= "string" or firing_id == ""
+      or type(run) ~= "table"
       or type(run.invocation_label) ~= "string" or run.invocation_label == "" then
     return
   end
   emit_as(SOURCE_NAME, nil, {
     kind = "chat.tool.display_primary",
+    id = firing_id,
     run_id = run.run_id,
     primary = run.invocation_label,
   })
@@ -1456,7 +1458,7 @@ terminate_graph = function(firing_id, args, metadata)
     return
   end
   local run, lookup_err = authorize_control_target(context, run_id)
-  if run then emit_tool_display_primary(run) end
+  if run then emit_tool_display_primary(firing_id, run) end
   if not run or run.phase == "terminal" then
     emit_tool_result_ok(firing_id, {
       canceled = false,
@@ -1526,6 +1528,7 @@ graph_status = function(firing_id, args, metadata)
   local lookup_err
   if type(run_id) == "string" and run_id ~= "" then
     authorized_run, lookup_err = authorize_control_target(context, run_id)
+    if authorized_run then emit_tool_display_primary(firing_id, authorized_run) end
     if lookup_err and (lookup_err.error_code == "run_control_unauthorized"
         or lookup_err.error_code == "run_control_self") then
       emit_tool_result_ok(firing_id, {

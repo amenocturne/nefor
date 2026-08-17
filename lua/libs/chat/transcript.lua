@@ -270,13 +270,16 @@ function M.discard_message(state, message_id)
   return shallow_merge(state, { entries = entries, in_flight = in_flight })
 end
 
-function M.attach_tool_display_primary(state, run_id, primary)
+function M.attach_tool_display_primary(state, firing_id, run_id, primary)
   for i = #state.entries, 1, -1 do
     local entry = state.entries[i]
     local args = entry.raw_input or entry.input_table
-    if entry.kind == "tool_call"
-        and entry.name == "terminate-graph" and type(args) == "table"
-        and args.run_id == run_id then
+    local exact_firing = type(firing_id) == "string" and firing_id ~= ""
+      and entry.id == firing_id and type(args) == "table" and args.run_id == run_id
+    local legacy_termination = (firing_id == nil or firing_id == "")
+      and entry.name == "terminate-graph" and type(args) == "table"
+      and args.run_id == run_id
+    if entry.kind == "tool_call" and (exact_firing or legacy_termination) then
       return shallow_merge(state, {
         entries = replace_entry(state.entries, i, Entry.set_display_primary(entry, primary)),
       })
