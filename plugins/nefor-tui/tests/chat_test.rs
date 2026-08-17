@@ -3640,11 +3640,11 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
         "{out}"
     );
     assert!(
-        out.contains("mag result [async] · ship.mag · 01d 03h 10m 15s"),
+        out.contains("mag result [async] · ship.mag · 1d3h"),
         "{out}"
     );
     assert!(
-        out.contains("mag result [async] · Probe dependencies · 07m 12s"),
+        out.contains("mag result [async] · Probe dependencies · 7m12s"),
         "{out}"
     );
     assert_eq!(
