@@ -25,8 +25,8 @@ The current API is chat-scoped:
 
 1. `<prefix>.chat.create` creates an in-memory chat with a model.
 2. `<prefix>.chat.append` appends user/assistant/tool context to that chat.
-3. `<prefix>.chat.complete` POSTs `{base_url}/v1/chat/completions` with streaming enabled.
-4. SSE frames become `<prefix>.stream.delta` and `<prefix>.stream.end`; token accounting becomes `<prefix>.session.stats`.
+3. `<prefix>.chat.complete` POSTs `{base_url}/v1/chat/completions` with streaming enabled. Direct `<prefix>.completion.request` calls may include `request_additions`, an object merged into the top-level upstream request; collisions with canonical request fields are rejected. This richer passthrough belongs to direct completions only; chat-scoped aggregate usage remains the separate legacy summary described below.
+4. Successful completion responses must be SSE (`Content-Type: text/event-stream`); non-stream JSON fails explicitly rather than being mistaken for an empty stream. SSE frames become `<prefix>.stream.delta` and `<prefix>.stream.end`; token accounting becomes `<prefix>.session.stats`. Direct completion usage preserves optional standard token fields, nests every unknown upstream usage member under `usage.extensions`, rejects malformed or duplicate usage payloads, and carries the upstream completion ID when one was supplied.
 5. `<prefix>.chat.delete` drops the in-memory chat.
 
 The provider consumes `tool.register`, sends model `tool_calls` to the registered tool's `<plugin>.tool.invoke` endpoint, waits for matching `tool.result`, emits `chat.tool.start` / `chat.tool.end`, and loops until the model returns final text. This works with gated tools because `tool-gate` advertises itself as the tool entry point.

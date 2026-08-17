@@ -61,7 +61,8 @@ use openai_provider::state::{
     ChatId, ChatRestore, ChatStats, Chats, ChatsError, CompletionRuns, TurnToken,
 };
 use openai_provider::stream::{
-    list_models, run_chat_stream_with_retry_progress_and_format, ReasoningEvent, RetryProgress,
+    list_models, run_chat_stream_with_retry_progress_and_format,
+    run_chat_stream_with_retry_progress_and_format_and_additions, ReasoningEvent, RetryProgress,
     StreamError, StreamOutcome,
 };
 use serde_json::{Map, Value};
@@ -1068,6 +1069,23 @@ async fn dispatch_completion_request(
         tools.extend(extra.iter().cloned());
     }
     let tools = if tools.is_empty() { None } else { Some(tools) };
+    let request_additions = match body.get("request_additions") {
+        Some(Value::Object(additions)) => Some(additions.clone()),
+        Some(_) => {
+            completions.finish(&request_id, &run).await;
+            send_event(
+                out_tx,
+                completion_error_body(
+                    config,
+                    &request_id,
+                    "completion.request `request_additions` must be an object",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        None => None,
+    };
 
     let completions = Arc::clone(completions);
     let auth = Arc::clone(auth);
@@ -1093,6 +1111,7 @@ async fn dispatch_completion_request(
             },
             reasoning_effort.as_deref(),
             response_format.as_ref(),
+            request_additions.as_ref(),
             cancel.clone(),
             &out_tx,
             &request_id,
@@ -1113,6 +1132,7 @@ async fn dispatch_completion_request(
                 None,
                 reasoning_effort.as_deref(),
                 response_format.as_ref(),
+                request_additions.as_ref(),
                 cancel.clone(),
                 &out_tx,
                 &request_id,
@@ -1121,29 +1141,33 @@ async fn dispatch_completion_request(
         }
 
         completions.finish(&request_id, &run).await;
-        if cancel.is_cancelled() {
+        let cancelled = cancel.is_cancelled();
+        if cancelled && !matches!(&result, Ok(outcome) if outcome.usage.is_some()) {
             return;
         }
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(outcome) => {
-                if let Some(usage) = outcome.usage {
+                if let Some(usage) = outcome.usage.clone() {
+                    let mut fields = vec![
+                        ("usage", usage.into_ncp_value()),
+                        ("model", Value::String(model.clone())),
+                        ("duration_ms", Value::Number(elapsed_ms.into())),
+                    ];
+                    if let Some(completion_id) = &outcome.completion_id {
+                        fields.push(("completion_id", Value::String(completion_id.clone())));
+                    }
                     let _ = out_tx
-                        .send(PluginOutgoing::event(completion_event_body(
+                        .send(PluginOutgoing::event(completion_event_body_from_iter(
                             &event_prefix,
                             &request_id,
                             "usage",
-                            [
-                                ("prompt_tokens", Value::Number(usage.prompt_tokens.into())),
-                                (
-                                    "completion_tokens",
-                                    Value::Number(usage.completion_tokens.into()),
-                                ),
-                                ("model", Value::String(model.clone())),
-                                ("duration_ms", Value::Number(elapsed_ms.into())),
-                            ],
+                            fields,
                         )))
                         .await;
+                }
+                if cancelled {
+                    return;
                 }
                 for call in &outcome.tool_calls {
                     let arguments = serde_json::from_str(&call.function.arguments)
@@ -1161,24 +1185,28 @@ async fn dispatch_completion_request(
                         )))
                         .await;
                 }
+                let mut fields = vec![
+                    ("text", Value::String(outcome.full_text)),
+                    ("reasoning", Value::String(outcome.reasoning_text)),
+                    (
+                        "finish_reason",
+                        outcome
+                            .finish_reason
+                            .map(Value::String)
+                            .unwrap_or(Value::Null),
+                    ),
+                    ("model", Value::String(model.clone())),
+                    ("duration_ms", Value::Number(elapsed_ms.into())),
+                ];
+                if let Some(completion_id) = outcome.completion_id {
+                    fields.push(("completion_id", Value::String(completion_id)));
+                }
                 let _ = out_tx
-                    .send(PluginOutgoing::event(completion_event_body(
+                    .send(PluginOutgoing::event(completion_event_body_from_iter(
                         &event_prefix,
                         &request_id,
                         "completed",
-                        [
-                            ("text", Value::String(outcome.full_text)),
-                            ("reasoning", Value::String(outcome.reasoning_text)),
-                            (
-                                "finish_reason",
-                                outcome
-                                    .finish_reason
-                                    .map(Value::String)
-                                    .unwrap_or(Value::Null),
-                            ),
-                            ("model", Value::String(model.clone())),
-                            ("duration_ms", Value::Number(elapsed_ms.into())),
-                        ],
+                        fields,
                     )))
                     .await;
             }
@@ -1211,6 +1239,7 @@ async fn run_completion_attempt(
     tools: Option<&[Value]>,
     reasoning_effort: Option<&str>,
     response_format: Option<&Value>,
+    request_additions: Option<&Map<String, Value>>,
     cancel: CancellationToken,
     out_tx: &mpsc::Sender<PluginOutgoing>,
     request_id: &str,
@@ -1228,7 +1257,7 @@ async fn run_completion_attempt(
     let tx_for_retry = out_tx.clone();
     let mut reasoning_started_at: Option<Instant> = None;
 
-    run_chat_stream_with_retry_progress_and_format(
+    run_chat_stream_with_retry_progress_and_format_and_additions(
         client,
         &config.chat_endpoint(),
         token,
@@ -1238,6 +1267,7 @@ async fn run_completion_attempt(
         tools,
         reasoning_effort,
         response_format,
+        request_additions,
         cancel,
         move |text| {
             if !suppress_text_deltas {
@@ -1306,6 +1336,15 @@ fn completion_event_body<const N: usize>(
     request_id: &str,
     event: &str,
     fields: [(&str, Value); N],
+) -> Map<String, Value> {
+    completion_event_body_from_iter(prefix, request_id, event, fields)
+}
+
+fn completion_event_body_from_iter<'a>(
+    prefix: &str,
+    request_id: &str,
+    event: &str,
+    fields: impl IntoIterator<Item = (&'a str, Value)>,
 ) -> Map<String, Value> {
     let mut body = Map::new();
     body.insert(
@@ -1620,9 +1659,10 @@ fn spawn_turn(
                 Ok(outcome) => {
                     if let Some(u) = outcome.usage {
                         observed_usage = true;
-                        total_prompt_tokens = total_prompt_tokens.saturating_add(u.prompt_tokens);
-                        total_completion_tokens =
-                            total_completion_tokens.saturating_add(u.completion_tokens);
+                        total_prompt_tokens =
+                            total_prompt_tokens.saturating_add(u.prompt_tokens.unwrap_or_default());
+                        total_completion_tokens = total_completion_tokens
+                            .saturating_add(u.completion_tokens.unwrap_or_default());
                     }
 
                     if outcome.interrupted {
@@ -1864,10 +1904,10 @@ fn spawn_turn(
             .record_turn(
                 &chat_id,
                 Some(&active_model),
-                if interrupted && !observed_usage {
-                    None
-                } else {
+                if observed_usage {
                     Some((total_prompt_tokens, total_completion_tokens))
+                } else {
+                    None
                 },
                 elapsed_ms,
             )
@@ -1924,8 +1964,7 @@ fn spawn_turn(
                 &final_text,
                 &final_tool_calls,
                 final_finish_reason.as_deref(),
-                total_prompt_tokens,
-                total_completion_tokens,
+                observed_usage.then_some((total_prompt_tokens, total_completion_tokens)),
                 &active_model,
                 &final_reasoning,
             );
@@ -2664,8 +2703,7 @@ fn chat_complete_result_body(
     text: &str,
     tool_calls: &[ToolCall],
     finish_reason: Option<&str>,
-    prompt_tokens: u64,
-    completion_tokens: u64,
+    token_usage: Option<(u64, u64)>,
     model: &str,
     reasoning: &str,
 ) -> Map<String, Value> {
@@ -2692,14 +2730,16 @@ fn chat_complete_result_body(
     if let Some(r) = finish_reason {
         output.insert("finish_reason".into(), Value::String(r.to_owned()));
     }
-    let mut usage = Map::new();
-    usage.insert("prompt_tokens".into(), Value::Number(prompt_tokens.into()));
-    usage.insert(
-        "completion_tokens".into(),
-        Value::Number(completion_tokens.into()),
-    );
-    usage.insert("model".into(), Value::String(model.to_owned()));
-    output.insert("usage".into(), Value::Object(usage));
+    if let Some((prompt_tokens, completion_tokens)) = token_usage {
+        let mut usage = Map::new();
+        usage.insert("prompt_tokens".into(), Value::Number(prompt_tokens.into()));
+        usage.insert(
+            "completion_tokens".into(),
+            Value::Number(completion_tokens.into()),
+        );
+        usage.insert("model".into(), Value::String(model.to_owned()));
+        output.insert("usage".into(), Value::Object(usage));
+    }
 
     let mut m = Map::new();
     m.insert(
@@ -5829,6 +5869,22 @@ mod tests {
     }
 
     #[test]
+    fn chat_complete_result_omits_unmeasured_usage() {
+        let body = chat_complete_result_body(
+            &cfg("ollama"),
+            &ChatId::new("no-usage"),
+            "Done.",
+            &[],
+            Some("stop"),
+            None,
+            "qwen",
+            "",
+        );
+        let output = body["output"].as_object().expect("output");
+        assert!(output.get("usage").is_none());
+    }
+
+    #[test]
     fn chat_complete_result_body_carries_completion_event_shaped_output() {
         let cid = ChatId::new("c-1");
         let calls = vec![ToolCall {
@@ -5845,8 +5901,7 @@ mod tests {
             "Done.",
             &calls,
             Some("tool_calls"),
-            10,
-            5,
+            Some((10, 5)),
             "qwen",
             "",
         );

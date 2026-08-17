@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use nefor_sse::SseBuffer;
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, RETRY_AFTER};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::openai::{
@@ -48,6 +48,7 @@ const CHAT_STREAM_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// dedicated reasoning callback or read this field at end-of-turn.
 #[derive(Debug, Clone, Default)]
 pub struct StreamOutcome {
+    pub completion_id: Option<String>,
     pub full_text: String,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
@@ -247,7 +248,7 @@ where
     R: FnMut(ReasoningEvent<'_>),
     P: FnMut(RetryProgress),
 {
-    run_chat_stream_with_retry_progress_and_format_and_wire(
+    run_chat_stream_with_retry_progress_and_format_and_additions(
         client,
         endpoint,
         api_key,
@@ -257,6 +258,48 @@ where
         tools,
         reasoning_effort,
         response_format,
+        None,
+        cancel,
+        on_delta,
+        on_reasoning,
+        on_retry_progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_chat_stream_with_retry_progress_and_format_and_additions<F, R, P>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    auth_header: &str,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    reasoning_effort: Option<&str>,
+    response_format: Option<&serde_json::Value>,
+    request_additions: Option<&serde_json::Map<String, serde_json::Value>>,
+    cancel: CancellationToken,
+    on_delta: F,
+    on_reasoning: R,
+    on_retry_progress: P,
+) -> Result<StreamOutcome, StreamError>
+where
+    F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
+    P: FnMut(RetryProgress),
+{
+    run_chat_stream_with_retry_progress_and_format_and_additions_and_wire(
+        client,
+        endpoint,
+        api_key,
+        auth_header,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        response_format,
+        request_additions,
         cancel,
         on_delta,
         on_reasoning,
@@ -277,6 +320,49 @@ pub async fn run_chat_stream_with_retry_progress_and_format_and_wire<F, R, P>(
     tools: Option<&[serde_json::Value]>,
     reasoning_effort: Option<&str>,
     response_format: Option<&serde_json::Value>,
+    cancel: CancellationToken,
+    on_delta: F,
+    on_reasoning: R,
+    on_retry_progress: P,
+    wire: WireTrace,
+) -> Result<StreamOutcome, StreamError>
+where
+    F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
+    P: FnMut(RetryProgress),
+{
+    run_chat_stream_with_retry_progress_and_format_and_additions_and_wire(
+        client,
+        endpoint,
+        api_key,
+        auth_header,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        response_format,
+        None,
+        cancel,
+        on_delta,
+        on_reasoning,
+        on_retry_progress,
+        wire,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_chat_stream_with_retry_progress_and_format_and_additions_and_wire<F, R, P>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    auth_header: &str,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    reasoning_effort: Option<&str>,
+    response_format: Option<&serde_json::Value>,
+    request_additions: Option<&serde_json::Map<String, serde_json::Value>>,
     cancel: CancellationToken,
     mut on_delta: F,
     mut on_reasoning: R,
@@ -300,8 +386,11 @@ where
         response_format,
     };
 
-    let body_json =
-        serde_json::to_string(&req).unwrap_or_else(|e| format!("<serialize-error: {e}>"));
+    let request_value = req
+        .into_value_with_additions(request_additions)
+        .map_err(|error| StreamError::Request(error.to_string()))?;
+    let body_json = serde_json::to_string(&request_value)
+        .map_err(|error| StreamError::Request(error.to_string()))?;
     if tracing::enabled!(tracing::Level::INFO) {
         tracing::info!(
             target: "openai_provider::http",
@@ -323,7 +412,7 @@ where
                 .post(endpoint)
                 .header(ACCEPT, "text/event-stream")
                 .header(ACCEPT_ENCODING, "identity")
-                .json(&req);
+                .json(&request_value);
             if let Some(k) = api_key {
                 builder = apply_auth(builder, auth_header, k);
             }
@@ -383,6 +472,29 @@ where
             let status = response.status().as_u16();
             wire.response(attempt, status, response.headers());
             if response.status().is_success() {
+                let content_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("<missing>")
+                    .to_owned();
+                if !content_type.split(';').next().is_some_and(|media_type| {
+                    media_type.trim().eq_ignore_ascii_case("text/event-stream")
+                }) {
+                    let body_bytes = response
+                        .bytes()
+                        .await
+                        .map(|bytes| bytes.to_vec())
+                        .unwrap_or_else(|_| b"<unreadable response body>".to_vec());
+                    wire.response_body(attempt, &body_bytes);
+                    let body = String::from_utf8_lossy(&body_bytes);
+                    let error = StreamError::Malformed(format!(
+                        "expected streaming SSE response with Content-Type text/event-stream, got {content_type:?}: {}",
+                        response_snippet(&body)
+                    ));
+                    wire.error(Some(attempt), error.to_string());
+                    return Err(error);
+                }
                 break (response, attempt);
             }
 
@@ -513,6 +625,15 @@ where
 
 fn stream_semantically_complete(outcome: &StreamOutcome) -> bool {
     outcome.finish_reason.is_some()
+}
+
+fn response_snippet(body: &str) -> String {
+    const LIMIT: usize = 240;
+    let mut snippet = body.chars().take(LIMIT).collect::<String>();
+    if body.chars().count() > LIMIT {
+        snippet.push('…');
+    }
+    snippet
 }
 
 fn stream_error_is_retriable(err: &StreamError) -> bool {
@@ -738,6 +859,15 @@ where
                 )?;
             }
         }
+        SseEvent::CompletionId(id) => match &outcome.completion_id {
+            Some(existing) if existing != &id => {
+                return Err(StreamError::Malformed(format!(
+                    "provider completion id changed from {existing:?} to {id:?}"
+                )));
+            }
+            Some(_) => {}
+            None => outcome.completion_id = Some(id),
+        },
         SseEvent::Delta(text) => {
             if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
                 *reasoning_ended = true;
@@ -782,7 +912,14 @@ where
                 });
             }
         }
-        SseEvent::Usage(usage) => outcome.usage = Some(usage),
+        SseEvent::Usage(usage) => {
+            if outcome.usage.is_some() {
+                return Err(StreamError::Malformed(
+                    "provider emitted more than one usage payload".to_owned(),
+                ));
+            }
+            outcome.usage = Some(usage);
+        }
         SseEvent::Error {
             message,
             kind,
@@ -967,8 +1104,8 @@ mod tests {
         assert_eq!(outcome.full_text, "Hi there");
         assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
         let u = outcome.usage.expect("usage");
-        assert_eq!(u.prompt_tokens, 3);
-        assert_eq!(u.completion_tokens, 2);
+        assert_eq!(u.prompt_tokens, Some(3));
+        assert_eq!(u.completion_tokens, Some(2));
         assert!(
             tc.finalize().expect("complete calls").is_empty(),
             "no tool calls"

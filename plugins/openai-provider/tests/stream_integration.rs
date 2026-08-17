@@ -28,6 +28,44 @@ async fn bind_local() -> (TcpListener, SocketAddr) {
     (listener, addr)
 }
 
+#[tokio::test]
+async fn successful_non_sse_json_response_fails_clearly() {
+    let (listener, addr) = bind_local().await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut stream).await;
+        let body = r#"{"id":"nonstream-completion","choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+    });
+
+    let error = run_chat_stream(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/v1/chat/completions"),
+        None,
+        "Authorization",
+        "fixture-model",
+        &[Message::user("fixture")],
+        None,
+        None,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect_err("non-SSE success response must not be accepted as an empty stream");
+    server.await.expect("server");
+    assert!(
+        matches!(error, StreamError::Malformed(message) if message.contains("expected streaming SSE response") && message.contains("application/json"))
+    );
+}
+
 /// Read the request headers off a single connection and return what
 /// followed (the body, if any). We only need enough to drain the
 /// request before sending our scripted response.
@@ -487,8 +525,8 @@ async fn streaming_emits_deltas_then_end() {
     assert_eq!(outcome.full_text, "Hi there");
     assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
     let u = outcome.usage.expect("usage");
-    assert_eq!(u.prompt_tokens, 7);
-    assert_eq!(u.completion_tokens, 2);
+    assert_eq!(u.prompt_tokens, Some(7));
+    assert_eq!(u.completion_tokens, Some(2));
     assert!(!outcome.interrupted);
 }
 
@@ -1538,6 +1576,124 @@ async fn run_scripted_stream(
 }
 
 #[tokio::test]
+async fn duplicate_usage_payloads_are_rejected() {
+    let body = concat!(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n"
+    )
+    .to_owned();
+    let (result, _, _) = run_scripted_stream(body).await;
+    assert!(
+        matches!(result, Err(StreamError::Malformed(message)) if message.contains("more than one usage"))
+    );
+}
+
+#[tokio::test]
+async fn conflicting_completion_ids_are_rejected() {
+    let body = concat!(
+        "data: {\"id\":\"first\",\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\n",
+        "data: {\"id\":\"second\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+    )
+    .to_owned();
+    let (result, _, _) = run_scripted_stream(body).await;
+    assert!(matches!(result, Err(StreamError::Malformed(_))));
+}
+
+#[tokio::test]
+async fn cancellation_before_usage_does_not_fabricate_accounting() {
+    let (listener, addr) = bind_local().await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut stream).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("headers");
+        stream.write_all(
+            b"data: {\"id\":\"completion-before\",\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\n",
+        ).await.expect("delta");
+        stream.flush().await.expect("flush");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    });
+    let cancel = CancellationToken::new();
+    let cancel_after_delta = cancel.clone();
+    let outcome = run_chat_stream(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/v1/chat/completions"),
+        None,
+        "Authorization",
+        "fixture-model",
+        &[Message::user("fixture")],
+        None,
+        None,
+        cancel,
+        move |_| cancel_after_delta.cancel(),
+        |_| {},
+    )
+    .await
+    .expect("cancelled stream outcome");
+    server.abort();
+    assert!(outcome.interrupted);
+    assert!(outcome.usage.is_none());
+}
+
+#[tokio::test]
+async fn terminal_usage_and_completion_id_survive_cancellation_before_done() {
+    let (listener, addr) = bind_local().await;
+    let (usage_sent, usage_visible) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut stream).await;
+        let headers =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+        stream.write_all(headers.as_bytes()).await.expect("headers");
+        stream
+            .write_all(concat!(
+                "data: {\"id\":\"completion-cancel\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"id\":\"completion-cancel\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"provider_marker\":{\"retained\":true}}}\n\n"
+            ).as_bytes())
+            .await
+            .expect("terminal frames");
+        stream.flush().await.expect("flush");
+        let _ = usage_sent.send(());
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    });
+    let cancel = CancellationToken::new();
+    let cancel_after_usage = cancel.clone();
+    tokio::spawn(async move {
+        usage_visible.await.expect("usage sent");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel_after_usage.cancel();
+    });
+    let outcome = run_chat_stream(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/v1/chat/completions"),
+        None,
+        "Authorization",
+        "fixture-model",
+        &[Message::user("fixture")],
+        None,
+        None,
+        cancel,
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect("cancelled stream outcome");
+    server.abort();
+
+    assert!(outcome.interrupted);
+    assert_eq!(outcome.completion_id.as_deref(), Some("completion-cancel"));
+    let usage = outcome
+        .usage
+        .expect("authoritative usage survives cancellation");
+    assert_eq!(usage.prompt_tokens, Some(7));
+    assert_eq!(usage.extensions["provider_marker"]["retained"], true);
+}
+
+#[tokio::test]
 async fn mixed_frames_preserve_content_reasoning_tools_finish_and_usage() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"reasoning\":\"thought\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
@@ -1550,7 +1706,7 @@ async fn mixed_frames_preserve_content_reasoning_tools_finish_and_usage() {
     assert_eq!(outcome.full_text, "answer");
     assert_eq!(outcome.reasoning_text, "thought");
     assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
-    assert_eq!(outcome.usage.expect("usage").total_tokens, 5);
+    assert_eq!(outcome.usage.expect("usage").total_tokens, Some(5));
     assert_eq!(outcome.tool_calls.len(), 1);
     assert_eq!(outcome.tool_calls[0].function.arguments, "{}");
 }
@@ -1606,9 +1762,9 @@ async fn pairwise_mixed_frames_reach_downstream_accumulators() {
             }
             "finish_usage" => {
                 assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
-                assert_eq!(outcome.usage.expect("usage").total_tokens, 3);
+                assert_eq!(outcome.usage.expect("usage").total_tokens, Some(3));
             }
-            "usage_only" => assert_eq!(outcome.usage.expect("usage").total_tokens, 3),
+            "usage_only" => assert_eq!(outcome.usage.expect("usage").total_tokens, Some(3)),
             _ => unreachable!(),
         }
     }

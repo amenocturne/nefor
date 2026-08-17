@@ -17,7 +17,10 @@
 //!   subsequent chunks carry incremental `function.arguments` string
 //!   fragments. The terminating chunk's `finish_reason` is `"tool_calls"`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// One assistant tool call as the model returned it. Used both in the
 /// outgoing assistant message (when feeding the model's prior call back
@@ -215,6 +218,38 @@ pub struct ChatRequest<'a> {
     pub response_format: Option<&'a serde_json::Value>,
 }
 
+impl ChatRequest<'_> {
+    pub fn into_value_with_additions(
+        &self,
+        additions: Option<&Map<String, Value>>,
+    ) -> Result<Value, RequestAdditionsError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| RequestAdditionsError::Serialize(error.to_string()))?;
+        let object = value
+            .as_object_mut()
+            .ok_or(RequestAdditionsError::CanonicalRequestNotObject)?;
+        if let Some(additions) = additions {
+            if let Some(field) = additions.keys().find(|field| object.contains_key(*field)) {
+                return Err(RequestAdditionsError::CanonicalFieldCollision(
+                    field.clone(),
+                ));
+            }
+            object.extend(additions.clone());
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RequestAdditionsError {
+    #[error("failed to serialize canonical request: {0}")]
+    Serialize(String),
+    #[error("canonical request did not serialize to a JSON object")]
+    CanonicalRequestNotObject,
+    #[error("request addition collides with canonical field `{0}`")]
+    CanonicalFieldCollision(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
@@ -224,6 +259,7 @@ pub struct StreamOptions {
 /// several items; `Batch` preserves their deterministic wire-semantic order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseEvent {
+    CompletionId(String),
     Delta(String),
     Refusal(String),
     ReasoningDelta(String),
@@ -279,14 +315,35 @@ impl FinishReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct Usage {
-    #[serde(default)]
-    pub prompt_tokens: u64,
-    #[serde(default)]
-    pub completion_tokens: u64,
-    #[serde(default)]
-    pub total_tokens: u64,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl Usage {
+    pub fn into_ncp_value(self) -> Value {
+        let mut usage = Map::new();
+        if let Some(tokens) = self.prompt_tokens {
+            usage.insert("prompt_tokens".into(), Value::Number(tokens.into()));
+        }
+        if let Some(tokens) = self.completion_tokens {
+            usage.insert("completion_tokens".into(), Value::Number(tokens.into()));
+        }
+        if let Some(tokens) = self.total_tokens {
+            usage.insert("total_tokens".into(), Value::Number(tokens.into()));
+        }
+        if !self.extensions.is_empty() {
+            usage.insert(
+                "extensions".into(),
+                Value::Object(self.extensions.into_iter().collect()),
+            );
+        }
+        Value::Object(usage)
+    }
 }
 
 /// Parsed model info from `/v1/models`.
@@ -399,6 +456,11 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
     let delta = first_choice.and_then(|choice| choice.get("delta"));
     let mut events = Vec::new();
 
+    if let Some(id) = value.get("id").and_then(Value::as_str) {
+        if !id.is_empty() {
+            events.push(SseEvent::CompletionId(id.to_owned()));
+        }
+    }
     if let Some(content) = delta
         .and_then(|delta| delta.get("content"))
         .and_then(|v| v.as_str())
@@ -456,11 +518,16 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
         };
         events.push(SseEvent::Finish(reason));
     }
-    if let Some(usage) = value
-        .get("usage")
-        .and_then(|usage| serde_json::from_value::<Usage>(usage.clone()).ok())
-    {
-        events.push(SseEvent::Usage(usage));
+    if let Some(raw_usage) = value.get("usage") {
+        if !raw_usage.is_object() {
+            return SseEvent::Malformed("usage must be a JSON object".to_owned());
+        }
+        match serde_json::from_value::<Usage>(raw_usage.clone()) {
+            Ok(usage) => events.push(SseEvent::Usage(usage)),
+            Err(error) => {
+                return SseEvent::Malformed(format!("invalid usage payload: {error}"));
+            }
+        }
     }
 
     match events.len() {
@@ -474,6 +541,102 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn request<'a>(messages: &'a [Message]) -> ChatRequest<'a> {
+        ChatRequest {
+            model: "test-model",
+            messages,
+            stream: true,
+            reasoning_effort: None,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            tools: None,
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn request_additions_merge_without_overwriting_canonical_fields() {
+        let messages = vec![Message::user("answer")];
+        let additions = Map::from_iter([
+            ("provider_preference".into(), json!({"mode": "balanced"})),
+            ("metadata".into(), json!({"trace": false})),
+        ]);
+        let value = request(&messages)
+            .into_value_with_additions(Some(&additions))
+            .expect("non-colliding additions");
+        assert_eq!(value["model"], "test-model");
+        assert_eq!(value["provider_preference"]["mode"], "balanced");
+        assert_eq!(value["metadata"]["trace"], false);
+    }
+
+    #[test]
+    fn request_additions_reject_canonical_field_collision() {
+        let messages = vec![Message::user("answer")];
+        let additions = Map::from_iter([("model".into(), json!("replacement"))]);
+        assert_eq!(
+            request(&messages).into_value_with_additions(Some(&additions)),
+            Err(RequestAdditionsError::CanonicalFieldCollision(
+                "model".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn usage_preserves_extensions_and_keeps_missing_standard_fields_absent() {
+        let event = parse_sse_chunk(include_str!("../tests/fixtures/terminal_usage_chunk.json"));
+        let SseEvent::Batch(events) = event else {
+            panic!("fixture should contain id, finish, and usage");
+        };
+        assert_eq!(
+            events[0],
+            SseEvent::CompletionId("completion-fixture".into())
+        );
+        let usage = events
+            .into_iter()
+            .find_map(|event| match event {
+                SseEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.prompt_tokens, Some(11));
+        assert_eq!(usage.completion_tokens, None);
+        assert_eq!(usage.total_tokens, None);
+        assert_eq!(usage.extensions["vendor_detail"]["cached"], 4);
+        assert_eq!(usage.extensions["charged_units"], "0.0042");
+        assert_eq!(
+            usage.into_ncp_value(),
+            json!({
+                "prompt_tokens": 11,
+                "extensions": {
+                    "vendor_detail": {"cached": 4},
+                    "charged_units": "0.0042"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_usage_is_rejected_instead_of_disappearing() {
+        for payload in [
+            r#"{"choices":[],"usage":"unknown"}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":"eleven"}}"#,
+        ] {
+            assert!(
+                matches!(parse_sse_chunk(payload), SseEvent::Malformed(_)),
+                "payload should fail: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_completion_id_is_optional_and_not_synthesized() {
+        assert_eq!(
+            parse_sse_chunk(r#"{"choices":[{"finish_reason":"stop"}]}"#),
+            SseEvent::Finish(FinishReason::Stop)
+        );
+    }
 
     #[test]
     fn chat_request_serializes_native_json_schema_response_format() {
@@ -521,9 +684,10 @@ mod tests {
                 },
                 SseEvent::Finish(FinishReason::ToolCalls),
                 SseEvent::Usage(Usage {
-                    prompt_tokens: 1,
-                    completion_tokens: 2,
-                    total_tokens: 3
+                    prompt_tokens: Some(1),
+                    completion_tokens: Some(2),
+                    total_tokens: Some(3),
+                    extensions: BTreeMap::new(),
                 }),
             ])
         );

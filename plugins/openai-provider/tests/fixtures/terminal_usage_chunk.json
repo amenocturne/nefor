@@ -1,0 +1,17 @@
+{
+  "id": "completion-fixture",
+  "choices": [
+    {
+      "delta": {},
+      "finish_reason": "stop",
+      "index": 0
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 11,
+    "vendor_detail": {
+      "cached": 4
+    },
+    "charged_units": "0.0042"
+  }
+}
