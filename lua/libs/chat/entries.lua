@@ -12,6 +12,7 @@ local compact  = common.compact
 local pad_block = common.pad_block
 local pretty_json = common.pretty_json
 local humanize_duration_ms = common.humanize_duration_ms
+local format_wall_clock_duration_ms = common.format_wall_clock_duration_ms
 local bordered_box = common.bordered_box
 
 local M = {}
@@ -278,7 +279,7 @@ local function graph_result_header(entry, glyph)
   local style = failed and STYLE.graph_result_error or STYLE.graph_result_name
   local label = entry.invocation_label or graph_result_ident(entry)
   local parts = { glyph .. "mag result [async]", label }
-  local dur = humanize_duration_ms(entry.duration_ms)
+  local dur = format_wall_clock_duration_ms(entry.duration_ms)
   if dur then parts[#parts + 1] = dur end
   return tui.text { content = table.concat(parts, " · "), style = style, wrap = "none" }
 end

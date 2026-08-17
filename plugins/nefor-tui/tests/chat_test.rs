@@ -3640,11 +3640,11 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
         "{out}"
     );
     assert!(
-        out.contains("mag result [async] · ship.mag · 1d3h"),
+        out.contains("mag result [async] · ship.mag · 01d 03h 10m 15s"),
         "{out}"
     );
     assert!(
-        out.contains("mag result [async] · Probe dependencies · 7m12s"),
+        out.contains("mag result [async] · Probe dependencies · 07m 12s"),
         "{out}"
     );
     assert_eq!(
@@ -12103,7 +12103,7 @@ fn running_and_completed_workflow_rows_use_compact_durations() {
 }
 
 #[test]
-fn assistant_and_workflow_result_footers_share_compact_durations() {
+fn assistant_footer_stays_compact_while_async_result_uses_full_wall_clock() {
     let mut engine = Engine::new(120, 30).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
@@ -12123,10 +12123,13 @@ fn assistant_and_workflow_result_footers_share_compact_durations() {
 
     let _ = render_str(&mut engine);
     let snapshot = engine.snapshot();
-    assert_eq!(
-        snapshot.matches("5h10m").count(),
-        2,
-        "assistant and workflow result footers must share the formatter:\n{snapshot}"
+    assert!(
+        snapshot.contains("▣ test · 5h10m"),
+        "assistant footer must keep the compact formatter:\n{snapshot}"
+    );
+    assert!(
+        snapshot.contains("mag result [async] · long-result · 05h 10m 15s"),
+        "terminal async result must keep the full wall-clock formatter:\n{snapshot}"
     );
 }
 
