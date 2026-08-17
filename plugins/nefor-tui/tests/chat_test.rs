@@ -11828,8 +11828,17 @@ fn agent_previews_hide_tool_streams_but_keep_conversation_activity() {
 }
 
 #[test]
+fn exact_run_tool_node_shows_explicit_empty_state() {
+    let mut engine = Engine::new(100, 28).expect("engine");
+    load_chat_scenario(&mut engine);
+    open_single_node(&mut engine, "nefor.factory.run-tool", "worker.run-tool");
+    let snapshot = render_snapshot(&mut engine);
+    assert!(snapshot.contains("No tools run"), "{snapshot}");
+}
+
+#[test]
 fn exact_run_tool_node_uses_full_factory_preview_without_agent_siblings() {
-    let mut engine = Engine::new(120, 44).expect("engine");
+    let mut engine = Engine::new(120, 56).expect("engine");
     load_chat_scenario(&mut engine);
     dispatch_event(
         &mut engine,
@@ -11860,6 +11869,21 @@ fn exact_run_tool_node_uses_full_factory_preview_without_agent_siblings() {
     dispatch_event(
         &mut engine,
         json!({
+            "kind": "mag.arrival", "run_id": "tool-run", "arrival_id": "tool-batch-1",
+            "from": "worker.llm", "wire": "generic-tool.ToolCalls", "value": { "calls": [] }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.firing", "run_id": "tool-run", "id": "worker.run-tool",
+            "port": "calls", "shape": "single",
+            "arrivals": [{ "arrival_id": "tool-batch-1", "wire": "generic-tool.ToolCalls" }]
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
             "kind": "tool-gate.tool.invoke", "id": "exact-call", "name": "process.exec",
             "args": { "argv": ["printf", "FULL INVOCATION"] },
             "invocation": { "run_id": "tool-run", "actor_id": "worker.run-tool" }
@@ -11877,6 +11901,18 @@ fn exact_run_tool_node_uses_full_factory_preview_without_agent_siblings() {
             "kind": "tool.result", "id": "exact-call", "result": "FULL RESULT"
         }),
     );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke", "id": "second-call", "name": "read_file",
+            "args": { "path": "SECOND INVOCATION" },
+            "invocation": { "run_id": "tool-run", "actor_id": "worker.run-tool" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.result", "id": "second-call", "error": "SECOND ERROR" }),
+    );
 
     engine.handle_key(key("tab")).expect("focus sidebar");
     let _ = render_str(&mut engine);
@@ -11892,6 +11928,9 @@ fn exact_run_tool_node_uses_full_factory_preview_without_agent_siblings() {
         "streamed output",
         "FULL RESULT",
         "exact-call",
+        "SECOND INVOCATION",
+        "SECOND ERROR",
+        "second-call",
     ] {
         assert!(
             snapshot.contains(expected),

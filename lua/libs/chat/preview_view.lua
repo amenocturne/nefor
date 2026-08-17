@@ -208,7 +208,12 @@ function M.node(state, run_id, actor_id, options)
     local candidate = sections[index]
     if candidate then children[#children + 1] = candidate end
   end
-  local items = preview_state.merged(state, run_id, function(id) return id == actor_id end)
+  local items
+  if factory_kind(node.factory) == "run-tool" then
+    items = preview_state.latest_tool_batch(state, run_id, actor_id)
+  else
+    items = preview_state.merged(state, run_id, function(id) return id == actor_id end)
+  end
   local activity = {}
   for index, item in ipairs(items) do
     local widget = M.activity(item, state, node, index == #items, profile)
@@ -217,6 +222,8 @@ function M.node(state, run_id, actor_id, options)
   if #activity > 0 then
     children[#children + 1] = tui.text { content = "Activity", style = STYLE.popup_user, wrap = "none" }
     for _, widget in ipairs(activity) do children[#children + 1] = widget end
+  elseif factory_kind(node.factory) == "run-tool" then
+    children[#children + 1] = tui.text { content = "No tools run", style = STYLE.status_dim, wrap = "none" }
   end
   return tui.column { gap = 1, children = children }
 end

@@ -36,7 +36,7 @@ local function put_node(state, run_id, actor_id, fn)
   return shallow_merge(state, { node_previews = all })
 end
 
-local function append_stream(state, run_id, actor_id, binding, value, now_ms)
+local function append_stream(state, run_id, actor_id, binding, value, now_ms, metadata)
   local seq = (state.projection_seq or 0) + 1
   local next_state = put_node(state, run_id, actor_id, function(prev)
     local next = copy_map(prev)
@@ -49,12 +49,17 @@ local function append_stream(state, run_id, actor_id, binding, value, now_ms)
         and previous_value.kind == value.kind
         and (value.kind == "reasoning" or value.kind == "assistant"
           or value.kind == "stdout" or value.kind == "stderr")
+        and previous.batch_id == (metadata or {}).batch_id
+        and previous.capability_id == (metadata or {}).capability_id
         and type(previous_value.text) == "string" and type(value.text) == "string" then
       local joined = copy_map(previous_value)
       joined.text = previous_value.text .. value.text
-      values[#values] = { value = joined, seq = previous.seq, at_ms = now_ms }
+      values[#values] = { value = joined, seq = previous.seq, at_ms = now_ms,
+        batch_id = previous.batch_id, capability_id = previous.capability_id }
     else
-      values[#values + 1] = { value = value, seq = seq, at_ms = now_ms }
+      local item = { value = value, seq = seq, at_ms = now_ms }
+      for key, detail in pairs(metadata or {}) do item[key] = detail end
+      values[#values + 1] = item
     end
     next.streams[binding] = values
     return next
@@ -190,6 +195,15 @@ function M.firing(state, msg, now_ms)
     end
     if #values == 1 then node.inputs.last = values[1]
     elseif #values > 1 then node.inputs.last = values end
+    if tostring(node.factory or ""):gsub("^nefor%.factory%.", "") == "run-tool" then
+      local identity = {}
+      for _, ref in ipairs(msg.arrivals or {}) do
+        if type(ref.arrival_id) == "string" then identity[#identity + 1] = ref.arrival_id end
+      end
+      -- The firing's canonical input arrivals identify the ToolCalls activation.
+      -- Results may arrive after a newer firing, so only this event selects a batch.
+      node.latest_tool_batch = table.concat(identity, "\0")
+    end
     node.last_activity_ms, node.last_activity_kind = now_ms, "firing"
     return node
   end)
@@ -207,8 +221,9 @@ local function owner_from_invocation(state, msg)
   if type(invocation) ~= "table" or type(invocation.run_id) ~= "string"
       or type(invocation.actor_id) ~= "string" then return nil end
   if not (((state.node_previews or {})[invocation.run_id] or {})[invocation.actor_id]) then return nil end
+  local node = ((state.node_previews or {})[invocation.run_id] or {})[invocation.actor_id]
   return { run_id = invocation.run_id, actor_id = invocation.actor_id,
-    name = msg.name or msg.tool }
+    name = msg.name or msg.tool, batch_id = node.latest_tool_batch }
 end
 
 local function causal_capability_id(msg)
@@ -253,7 +268,8 @@ function M.observe_capability(state, msg, now_ms)
       if kind:match("%.tool%.invoke$") or kind == "tool.invoke" then
         state = append_stream(state, owner.run_id, owner.actor_id, "capability",
           { kind = "tool_call", value = { id = id, name = msg.name or msg.tool,
-            arguments = msg.args or msg.arguments } }, now_ms)
+            arguments = msg.args or msg.arguments } }, now_ms,
+          { batch_id = owner.batch_id, capability_id = id })
       end
     end
     return state
@@ -275,7 +291,8 @@ function M.observe_capability(state, msg, now_ms)
     end
   elseif kind == "tool.stream" then
     return append_stream(state, owner.run_id, owner.actor_id, "capability",
-      { kind = msg.stream or msg.channel or "stdout", text = msg.text or msg.delta or "" }, now_ms)
+      { kind = msg.stream or msg.channel or "stdout", text = msg.text or msg.delta or "" }, now_ms,
+      { batch_id = owner.batch_id, capability_id = id })
   elseif kind == "tool.result" or kind:match("%.tool%.result$") then
     local admitted
     state, admitted = mark_capability_phase(state, id, "terminal")
@@ -285,13 +302,40 @@ function M.observe_capability(state, msg, now_ms)
     if failed then result.error = msg.error
     else result.output = present(msg.result) and msg.result or msg.output end
     return append_stream(state, owner.run_id, owner.actor_id, "capability",
-      { kind = failed and "error" or "tool_result", value = result }, now_ms)
+      { kind = failed and "error" or "tool_result", value = result }, now_ms,
+      { batch_id = owner.batch_id, capability_id = id })
   end
   return state
 end
 
 function M.node(state, run_id, actor_id)
   return (((state.node_previews or {})[run_id] or {})[actor_id])
+end
+
+function M.latest_tool_batch(state, run_id, actor_id)
+  local node = M.node(state, run_id, actor_id)
+  if not node then return {} end
+  local calls, related = {}, {}
+  for _, item in ipairs((node.streams or {}).capability or {}) do
+    if item.batch_id == node.latest_tool_batch then
+      local value = item.value
+      if type(value) == "table" and value.kind == "tool_call" then
+        calls[#calls + 1] = item
+      elseif item.capability_id ~= nil then
+        local values = related[item.capability_id] or {}
+        values[#values + 1] = item
+        related[item.capability_id] = values
+      end
+    end
+  end
+  local items = {}
+  for _, call in ipairs(calls) do
+    items[#items + 1] = { actor_id = actor_id, binding = "capability", item = call }
+    for _, item in ipairs(related[call.capability_id] or {}) do
+      items[#items + 1] = { actor_id = actor_id, binding = "capability", item = item }
+    end
+  end
+  return items
 end
 
 function M.run_failure(state, run_id, msg, now_ms)

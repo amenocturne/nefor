@@ -263,4 +263,55 @@ eq(#capability_values(capabilities), 7,
 eq(capability_values(capabilities)[6].value.kind, "stderr")
 eq(capability_values(capabilities)[7].value.text, "tail")
 
+
+local batches = {
+  node_previews = {}, mag_arrivals = {}, scope_to_run = {}, capability_owners = {},
+  capability_phases = {},
+}
+batches = preview_state.spawn(batches, "run", "worker.run-tool", "nefor.factory.run-tool", {}, 0)
+local function fire_batch(projected, arrival_id, at_ms)
+  projected = preview_state.arrival(projected, {
+    run_id = "run", arrival_id = arrival_id, from = "worker.llm",
+    wire = "generic-tool.ToolCalls", value = { calls = {} },
+  }, at_ms)
+  return preview_state.firing(projected, {
+    run_id = "run", id = "worker.run-tool", port = "calls", shape = "single",
+    arrivals = { { arrival_id = arrival_id, wire = "generic-tool.ToolCalls" } },
+  }, at_ms)
+end
+local function observe(projected, body, at_ms)
+  body.invocation = body.invocation or invocation(body.id)
+  return preview_state.observe_capability(projected, body, at_ms)
+end
+
+eq(#preview_state.latest_tool_batch(batches, "run", "worker.run-tool"), 0,
+  "never-fired run-tool has an explicit empty latest batch")
+batches = fire_batch(batches, "tool-calls:1", 1)
+batches = observe(batches, {
+  kind = "tool-gate.tool.invoke", id = "old-1", name = "old-tool", args = {},
+}, 2)
+eq(#preview_state.latest_tool_batch(batches, "run", "worker.run-tool"), 1,
+  "one invocation renders normally")
+batches = fire_batch(batches, "tool-calls:2", 4)
+batches = observe(batches, {
+  kind = "tool-gate.tool.invoke", id = "new-1", name = "first", args = {},
+}, 5)
+batches = observe(batches, {
+  kind = "tool-gate.tool.invoke", id = "new-2", name = "second", args = {},
+}, 6)
+batches = observe(batches, {
+  kind = "tool.stream", id = "new-2", stream = "stdout", text = "second-stream",
+}, 7)
+batches = observe(batches, { kind = "tool.result", id = "new-2", output = "second-result" }, 8)
+local latest = preview_state.latest_tool_batch(batches, "run", "worker.run-tool")
+eq(#latest, 4, "latest batch includes every invocation and matching activity")
+eq(latest[1].item.value.value.id, "new-1", "invocation order selects the first call")
+eq(latest[2].item.value.value.id, "new-2", "invocation order selects the second call")
+eq(latest[3].item.value.text, "second-stream", "stream follows its invocation")
+eq(latest[4].item.value.value.output, "second-result", "result follows its invocation")
+batches = observe(batches, { kind = "tool.result", id = "old-1", output = "late-old" }, 9)
+latest = preview_state.latest_tool_batch(batches, "run", "worker.run-tool")
+eq(#latest, 4, "late prior result cannot change the selected latest batch")
+eq(latest[1].item.value.value.id, "new-1", "prior batch remains hidden after late result")
+
 print("mag_runtime_projection_test: all assertions passed")
