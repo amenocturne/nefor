@@ -224,16 +224,19 @@ function M.spawn_spec(name, command, opts)
   end
 
   local function publish_context_usage(body)
-    if type(body) ~= "table" or body.event ~= "usage"
-        or type(body.context_input_tokens) ~= "number" then return end
+    if type(body) ~= "table" or body.event ~= "usage" then return end
+    local usage = type(body.usage) == "table" and body.usage or {}
+    local context_input_tokens = body.context_input_tokens
+      or usage.context_input_tokens or usage.input_tokens or usage.prompt_tokens
+    if type(context_input_tokens) ~= "number" then return end
     emit_synthetic(name, {
       kind = "conversation.provider.context_usage",
       provider = name,
       request_id = body.request_id,
       conversation_id = pending_requests[body.request_id]
         and pending_requests[body.request_id].conversation_id or nil,
-      context_input_tokens = body.context_input_tokens,
-      accuracy = body.context_input_accuracy or "authoritative",
+      context_input_tokens = context_input_tokens,
+      accuracy = body.context_input_accuracy or usage.context_input_accuracy or "authoritative",
     })
   end
 
@@ -470,11 +473,11 @@ function M.spawn_spec(name, command, opts)
     return true
   end
 
-  -- Completion identity is scoped to a contribution rule. Different rules may
-  -- intentionally account for the same completion through distinct ledgers.
+  -- Completion identity is scoped to a contribution rule, so distinct exposed
+  -- ledgers may independently account for the same completion.
   local function record_configured_usage(body)
-    local usage = type(body) == "table" and body.event == "usage" and body or nil
-    local extensions = usage and usage.extensions or nil
+    local usage = type(body) == "table" and body.event == "usage" and body.usage or nil
+    local extensions = type(usage) == "table" and usage.extensions or nil
     for _, rule in ipairs((usage_config and usage_config.contributions) or {}) do
       local usage_id = rule.usage_id
       if usage ~= nil and poisoned_usage[usage_id] == nil then
@@ -744,11 +747,13 @@ function M.spawn_spec(name, command, opts)
     for _, env in ipairs(envs) do
       local kind = type(env.body) == "table" and env.body.kind or nil
       if env.replay then
-        -- Provider calls remain inert during replay, but the Lua compositor
-        -- reconstructs its provider-owned usage ledger from durable records.
-        suppress_usage_notifications = true
-        fold_recorded_contribution(env.body)
-        suppress_usage_notifications = false
+        -- Provider calls remain inert during replay. Only this actor's durable
+        -- records may reconstruct the ledger it owns.
+        if env.from == name then
+          suppress_usage_notifications = true
+          fold_recorded_contribution(env.body)
+          suppress_usage_notifications = false
+        end
       elseif kind == "sessions.replay.end" then
         for _, rule in ipairs((usage_config and usage_config.contributions) or {}) do
           if contribution_totals[rule.usage_id] ~= nil then notify_usage(rule.usage_id) end
@@ -880,6 +885,7 @@ function M.spawn_spec(name, command, opts)
       error("provider.spawn_spec: invalid subscription usage rule")
     end
   end
+  local contribution_rules_by_usage_id = {}
   for _, rule in ipairs((usage_config and usage_config.contributions) or {}) do
     if type(rule) ~= "table" or usage_values[rule.usage_id] == nil
         or type(rule.extension) ~= "string" or rule.extension == ""
@@ -892,7 +898,11 @@ function M.spawn_spec(name, command, opts)
     if contribution_rules_by_kind[rule.event_kind] ~= nil then
       error("provider.spawn_spec: duplicate contribution event_kind")
     end
+    if contribution_rules_by_usage_id[rule.usage_id] ~= nil then
+      error("provider.spawn_spec: duplicate contribution usage_id")
+    end
     contribution_rules_by_kind[rule.event_kind] = rule
+    contribution_rules_by_usage_id[rule.usage_id] = rule
   end
   if #exposed_ids > 0 then pending_usage_exposure = exposed_ids end
 

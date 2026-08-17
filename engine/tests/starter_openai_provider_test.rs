@@ -436,31 +436,40 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         end
 
         local spec = provider.spawn_spec("meter", { "/bin/true" }, options())
-        -- BYOK is optional per rule; tiny numeric costs are canonical plain decimals.
-        spec._internals.record_configured_usage({ event = "usage", request_id = "r1",
-          completion_id = "same-completion",
-          extensions = { cost_a = 1e-7, cost_b = 2e-7, byok_b = false } })
+        -- Exercise the actual generic completion-event shape emitted by the Rust
+        -- provider: token facts and opaque extensions live under `usage`.
+        spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
+          kind = "conversation.provider.invoke", provider = "meter",
+          request_id = "r1", conversation_id = "c", watermark = 0 } }})
+        _test.delivered()
+        _test.sent()
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.completion.event", event = "usage", request_id = "r1",
+          completion_id = "same-completion", usage = { prompt_tokens = 11,
+            extensions = { cost_a = 1e-7, cost_b = 2e-7, byok_b = false } } } }})
         assert(spec._internals.usage_value("meter/a").amount == "0.0000001")
         assert(spec._internals.usage_value("meter/b").amount == "0.0000002")
         local sent = _test.sent()
-        local saw_a, saw_b = false, false
+        local saw_a, saw_b, saw_context = false, false, false
         for _, event in ipairs(sent) do
           if event.kind == "meter.usage.a.recorded" then
             saw_a = event.body.amount == "0.0000001" and event.body.currency == "USD"
           elseif event.kind == "meter.usage.b.recorded" then
             saw_b = event.body.amount == "0.0000002" and event.body.currency == "EUR"
+          elseif event.kind == "conversation.provider.context_usage" then
+            saw_context = event.body.context_input_tokens == 11
           end
         end
-        assert(saw_a and saw_b)
+        assert(saw_a and saw_b and saw_context)
 
         -- A contradiction permanently poisons only its ledger until session reset.
         spec._internals.record_configured_usage({ event = "usage", request_id = "r2",
           completion_id = "same-completion",
-          extensions = { cost_a = 0.5, cost_b = 2e-7, byok_b = false } })
+          usage = { extensions = { cost_a = 0.5, cost_b = 2e-7, byok_b = false } } })
         assert(spec._internals.usage_value("meter/a").reason == "completion_id_conflict")
         spec._internals.record_configured_usage({ event = "usage", request_id = "r3",
           completion_id = "later-valid",
-          extensions = { cost_a = 1, cost_b = 3e-7, byok_b = false } })
+          usage = { extensions = { cost_a = 1, cost_b = 3e-7, byok_b = false } } })
         assert(spec._internals.usage_value("meter/a").kind == "unknown")
         assert(spec._internals.usage_value("meter/b").amount == "0.0000005")
 
@@ -494,12 +503,16 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         end
         spec._internals.record_configured_usage({ event = "usage", request_id = "reset",
           completion_id = "valid-after-reset",
-          extensions = { cost_a = 1, cost_b = 2, byok_b = false } })
+          usage = { extensions = { cost_a = 1, cost_b = 2, byok_b = false } } })
         assert(spec._internals.usage_value("meter/a").amount == "1")
 
         -- Malformed durable data poisons replay and later valid records cannot heal it.
         local replayed = provider.spawn_spec("meter", { "/bin/true" }, options())
         _test.sent()
+        replayed.to_plugin({{ type = "event", replay = true, from = "foreign", body = {
+          kind = "meter.usage.a.recorded", usage_id = "meter/a",
+          contribution_id = "foreign", amount = "9", currency = "USD" } }})
+        assert(replayed._internals.usage_value("meter/a").kind == "unknown")
         replayed.to_plugin({{ type = "event", replay = true, from = "meter", body = {
           kind = "meter.usage.a.recorded", usage_id = "meter/a",
           contribution_id = "bad", amount = "1e-7", currency = "USD" } }})
@@ -514,6 +527,10 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         local invalid = options()
         invalid.usage.contributions[1].event_kind = nil
         local ok = pcall(provider.spawn_spec, "meter", { "/bin/true" }, invalid)
+        assert(not ok)
+        local duplicate_ledger = options()
+        duplicate_ledger.usage.contributions[2].usage_id = "meter/a"
+        ok = pcall(provider.spawn_spec, "meter", { "/bin/true" }, duplicate_ledger)
         assert(not ok)
         "#,
     )
