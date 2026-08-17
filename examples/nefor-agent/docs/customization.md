@@ -124,7 +124,8 @@ local tools = require("libs.compositors.tools")
 local chat_bridge = require("libs.compositors.chat_bridge")
 
 local gate = tools.gate_spec("tool-gate", { config.bin("tool-gate") })
-local basic = tools.basic_actor_spec()
+local policy = require("libs.model-context-policy")
+local basic = tools.basic_actor_spec { max_read_bytes = policy.item_limit }
 local worktrees = tools.git_worktree_actor_spec()
 local bridge = chat_bridge.spawn_spec({ config.bin("nefor-tui"), chat_root })
 ```

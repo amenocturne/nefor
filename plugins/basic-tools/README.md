@@ -33,7 +33,9 @@ public registrations strip that context before tools are exposed to models.
 ### `read_file`
 
 Reads the contents of a UTF-8 text file. Arguments: `path` (required), optional
-`cwd`, optional `offset`, and optional `max_bytes` (default/cap: 1 MiB). Returns
+`cwd`, optional `offset`, and optional `max_bytes`. The composition supplies
+the default/cap through `--read-file-max-bytes`; requests above it are rejected
+rather than silently clamped. Returns
 the requested UTF-8 slice on success or a human-readable error. If the file has
 more data after the returned slice, the output includes a continuation marker
 with the next offset to request.
@@ -42,7 +44,7 @@ Rejects:
 
 - Missing file → `file not found: <path>`
 - Path is a directory → `path is a directory: <path>`
-- File larger than 1 MiB → `file too large (<N> bytes; cap is 1 MiB): <path>`
+- Unsliced file larger than the configured maximum → `file too large (<N> bytes; ...): <path>`
 - Binary content (NUL byte in first 8 KiB) → `file appears to be binary: <path>`
 - Invalid UTF-8 → `file is not valid UTF-8: <path>`
 - IO error → `io error reading <path>: <message>`

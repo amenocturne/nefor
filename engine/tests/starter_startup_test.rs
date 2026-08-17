@@ -79,7 +79,7 @@ fn starter_startup_parser_and_mode_application() {
         .find(r#"actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))"#)
         .expect("tool gate registration");
     let basic_tools = init
-        .find("actor.spawn(tools.basic_actor_spec())")
+        .find("actor.spawn(tools.basic_actor_spec { max_read_bytes = model_context_policy.item_limit })")
         .expect("basic tools registration");
     let mode = init
         .find("startup_args.apply_mode(startup, agentic_loop)")

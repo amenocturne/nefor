@@ -134,7 +134,9 @@ pub const TOOLS: &[ToolDescriptor] = &[
 /// panic.
 pub async fn run_tool(name: &str, args: &Value) -> Result<Value, ToolError> {
     match name {
-        read_file::NAME => read_file::run(args).await.map(Value::String),
+        read_file::NAME => read_file::run(args, read_file::configured_max_bytes())
+            .await
+            .map(Value::String),
         read_image::NAME => read_image::run(args).await,
         write_file::NAME => write_file::run(args).await.map(Value::String),
         edit_file::NAME => edit_file::run(args).await.map(Value::String),

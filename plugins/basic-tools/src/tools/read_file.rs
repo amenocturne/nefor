@@ -4,7 +4,7 @@
 //!
 //! - Path is missing → [`ToolError::NotFound`].
 //! - Path is a directory → [`ToolError::IsDirectory`].
-//! - Unsliced file larger than 1 MiB → [`ToolError::TooLarge`].
+//! - Unsliced file larger than the configured maximum → [`ToolError::TooLarge`].
 //! - First 8 KiB contains a NUL byte (binary heuristic) → [`ToolError::BinaryContent`].
 //! - Contents are not valid UTF-8 → [`ToolError::NotUtf8`].
 //! - Any other IO error → [`ToolError::Io`].
@@ -13,6 +13,8 @@
 //! passes whatever path they want, and basic-tools is trusted on the bus.
 //! Sandboxing lands with the permission-gating story alongside `write_file`
 //! and the process capabilities.
+
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -26,16 +28,31 @@ pub const NAME: &str = "read_file";
 pub const DESCRIPTION: &str =
     "Read the contents of a file. Returns the file's text content or an error.";
 
-/// 1 MiB cap on a single read. Unsliced files larger than this are
-/// rejected; sliced reads may target larger files but never return more
-/// than this many bytes at once.
-pub const MAX_BYTES: u64 = 1024 * 1024;
+/// The maximum is supplied by composition at process startup.
+static CONFIGURED_MAX_BYTES: OnceLock<u64> = OnceLock::new();
+
+pub fn configure_max_bytes(max_read_bytes: u64) -> Result<(), String> {
+    if max_read_bytes == 0 {
+        return Err("read_file maximum must be positive".into());
+    }
+    CONFIGURED_MAX_BYTES
+        .set(max_read_bytes)
+        .map_err(|_| "read_file maximum was configured more than once".into())
+}
+
+pub(crate) fn configured_max_bytes() -> Option<u64> {
+    CONFIGURED_MAX_BYTES.get().copied()
+}
 
 /// First N bytes inspected for a NUL byte to flag binary content.
 pub const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
 /// JSON Schema (OpenAI tool-call format) for `read_file`'s parameters.
 pub fn schema() -> Value {
+    schema_with_limit(configured_max_bytes())
+}
+
+pub fn schema_with_limit(max_read_bytes: Option<u64>) -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -53,7 +70,10 @@ pub fn schema() -> Value {
             },
             "max_bytes": {
                 "type": "integer",
-                "description": "Maximum bytes to read. Optional; capped at 1 MiB."
+                "description": max_read_bytes
+                    .map(|limit| format!("Maximum bytes to read. Optional; maximum {limit} bytes."))
+                    .unwrap_or_else(|| "Maximum bytes to read. Optional; bounded by tool configuration.".into()),
+                "maximum": max_read_bytes
             }
         },
         "required": ["path"]
@@ -76,9 +96,13 @@ pub fn display() -> Value {
 
 /// Execute `read_file` with the given args. See module docs for rejection
 /// rules.
-pub async fn run(args: &Value) -> Result<String, ToolError> {
-    let request = parse_args(args)?;
-    read_text_file(request).await
+pub async fn run(args: &Value, max_read_bytes: Option<u64>) -> Result<String, ToolError> {
+    let max_read_bytes = max_read_bytes.ok_or_else(|| ToolError::BadArgs {
+        tool: NAME.into(),
+        message: "read_file maximum is not configured".into(),
+    })?;
+    let request = parse_args(args, max_read_bytes)?;
+    read_text_file(request, max_read_bytes).await
 }
 
 #[derive(Debug)]
@@ -89,7 +113,7 @@ struct ReadRequest {
     sliced: bool,
 }
 
-fn parse_args(args: &Value) -> Result<ReadRequest, ToolError> {
+fn parse_args(args: &Value, max_read_bytes: u64) -> Result<ReadRequest, ToolError> {
     let obj = args.as_object().ok_or_else(|| ToolError::BadArgs {
         tool: NAME.into(),
         message: "args must be a JSON object".into(),
@@ -127,20 +151,34 @@ fn parse_args(args: &Value) -> Result<ReadRequest, ToolError> {
     };
 
     let max_bytes = match obj.get("max_bytes") {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| ToolError::BadArgs {
+        Some(Value::Number(n)) => {
+            let requested = n.as_u64().ok_or_else(|| ToolError::BadArgs {
                 tool: NAME.into(),
                 message: "`max_bytes` must be a positive integer".into(),
-            })?
-            .clamp(4, MAX_BYTES),
+            })?;
+            if requested == 0 {
+                return Err(ToolError::BadArgs {
+                    tool: NAME.into(),
+                    message: "`max_bytes` must be a positive integer".into(),
+                });
+            }
+            if requested > max_read_bytes {
+                return Err(ToolError::BadArgs {
+                    tool: NAME.into(),
+                    message: format!(
+                        "`max_bytes` must not exceed the configured maximum of {max_read_bytes} bytes (requested {requested})"
+                    ),
+                });
+            }
+            requested
+        }
         Some(_) => {
             return Err(ToolError::BadArgs {
                 tool: NAME.into(),
                 message: "`max_bytes` must be an integer".into(),
             });
         }
-        None => MAX_BYTES,
+        None => max_read_bytes,
     };
 
     Ok(ReadRequest {
@@ -165,7 +203,7 @@ fn resolve_path(path: &str, cwd: Option<&str>) -> String {
     }
 }
 
-async fn read_text_file(request: ReadRequest) -> Result<String, ToolError> {
+async fn read_text_file(request: ReadRequest, max_read_bytes: u64) -> Result<String, ToolError> {
     let path = request.path;
     let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
@@ -185,8 +223,12 @@ async fn read_text_file(request: ReadRequest) -> Result<String, ToolError> {
     }
 
     let size = meta.len();
-    if !request.sliced && size > MAX_BYTES {
-        return Err(ToolError::TooLarge { size, path });
+    if !request.sliced && size > max_read_bytes {
+        return Err(ToolError::TooLarge {
+            size,
+            cap: max_read_bytes,
+            path,
+        });
     }
 
     let mut file = tokio::fs::File::open(&path)
@@ -262,7 +304,7 @@ async fn read_text_file(request: ReadRequest) -> Result<String, ToolError> {
     if end < size {
         out.push_str(&format!(
             "\n[... file continues; next offset: {end}; max_bytes cap: {}]",
-            MAX_BYTES
+            max_read_bytes
         ));
     }
     Ok(out)
@@ -325,12 +367,16 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    const TEST_MAX_BYTES: u64 = 1024 * 1024;
+
     #[tokio::test]
     async fn reads_utf8_contents() {
         let mut f = NamedTempFile::new().expect("tempfile");
         write!(f, "hello world").expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
-        let out = run(&json!({ "path": path })).await.expect("ok");
+        let out = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .expect("ok");
         assert_eq!(out, "hello world");
     }
 
@@ -338,15 +384,20 @@ mod tests {
     async fn reads_empty_file() {
         let f = NamedTempFile::new().expect("tempfile");
         let path = f.path().to_str().expect("utf8 path").to_owned();
-        let out = run(&json!({ "path": path })).await.expect("ok");
+        let out = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .expect("ok");
         assert_eq!(out, "");
     }
 
     #[tokio::test]
     async fn rejects_missing_path() {
-        let err = run(&json!({ "path": "/definitely/does/not/exist/abcxyz" }))
-            .await
-            .unwrap_err();
+        let err = run(
+            &json!({ "path": "/definitely/does/not/exist/abcxyz" }),
+            Some(1024 * 1024),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }), "got {err:?}");
     }
 
@@ -354,7 +405,9 @@ mod tests {
     async fn rejects_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_str().expect("utf8 path").to_owned();
-        let err = run(&json!({ "path": path })).await.unwrap_err();
+        let err = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::IsDirectory { .. }), "got {err:?}");
     }
 
@@ -364,7 +417,9 @@ mod tests {
         // Write a NUL in the first 8 KiB.
         f.write_all(b"hello\0world").expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
-        let err = run(&json!({ "path": path })).await.unwrap_err();
+        let err = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ToolError::BinaryContent { .. }),
             "got {err:?}"
@@ -375,13 +430,15 @@ mod tests {
     async fn rejects_too_large() {
         let mut f = NamedTempFile::new().expect("tempfile");
         // 1 MiB + 1 byte of ASCII 'a'.
-        let big = vec![b'a'; (MAX_BYTES as usize) + 1];
+        let big = vec![b'a'; (TEST_MAX_BYTES as usize) + 1];
         f.write_all(&big).expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
-        let err = run(&json!({ "path": path })).await.unwrap_err();
+        let err = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .unwrap_err();
         match err {
             ToolError::TooLarge { size, .. } => {
-                assert_eq!(size, MAX_BYTES + 1);
+                assert_eq!(size, TEST_MAX_BYTES + 1);
             }
             other => panic!("expected TooLarge, got {other:?}"),
         }
@@ -390,25 +447,30 @@ mod tests {
     #[tokio::test]
     async fn accepts_exactly_max_bytes() {
         let mut f = NamedTempFile::new().expect("tempfile");
-        let buf = vec![b'a'; MAX_BYTES as usize];
+        let buf = vec![b'a'; TEST_MAX_BYTES as usize];
         f.write_all(&buf).expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
-        let out = run(&json!({ "path": path })).await.expect("ok");
-        assert_eq!(out.len(), MAX_BYTES as usize);
+        let out = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .expect("ok");
+        assert_eq!(out.len(), TEST_MAX_BYTES as usize);
     }
 
     #[tokio::test]
     async fn sliced_read_allows_large_file_in_bounded_chunks() {
         let mut f = NamedTempFile::new().expect("tempfile");
-        let big = format!("{}END", "a".repeat((MAX_BYTES as usize) + 10));
+        let big = format!("{}END", "a".repeat((TEST_MAX_BYTES as usize) + 10));
         f.write_all(big.as_bytes()).expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
 
-        let out = run(&json!({
-            "path": path,
-            "offset": MAX_BYTES + 5,
-            "max_bytes": 16
-        }))
+        let out = run(
+            &json!({
+                "path": path,
+                "offset": TEST_MAX_BYTES + 5,
+                "max_bytes": 16
+            }),
+            Some(1024 * 1024),
+        )
         .await
         .expect("slice ok");
 
@@ -423,11 +485,14 @@ mod tests {
         f.write_all(b"0123456789abcdef").expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
 
-        let out = run(&json!({
-            "path": path,
-            "offset": 2,
-            "max_bytes": 5
-        }))
+        let out = run(
+            &json!({
+                "path": path,
+                "offset": 2,
+                "max_bytes": 5
+            }),
+            Some(1024 * 1024),
+        )
         .await
         .expect("slice ok");
 
@@ -442,21 +507,27 @@ mod tests {
         f.write_all("aa€b".as_bytes()).expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
 
-        let first = run(&json!({
-            "path": path,
-            "offset": 0,
-            "max_bytes": 4
-        }))
+        let first = run(
+            &json!({
+                "path": path,
+                "offset": 0,
+                "max_bytes": 4
+            }),
+            Some(1024 * 1024),
+        )
         .await
         .expect("first slice ok");
         assert!(first.contains("\naa"));
         assert!(first.contains("next offset: 2"));
 
-        let second = run(&json!({
-            "path": path,
-            "offset": 3,
-            "max_bytes": 4
-        }))
+        let second = run(
+            &json!({
+                "path": path,
+                "offset": 3,
+                "max_bytes": 4
+            }),
+            Some(1024 * 1024),
+        )
         .await
         .expect("second slice ok");
         assert!(second.contains("[read_file slice: bytes 5..6 of 6]"));
@@ -470,26 +541,73 @@ mod tests {
         // No NUL so it doesn't trip the binary heuristic.
         f.write_all(&[b'h', b'i', 0xC3, 0x28]).expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
-        let err = run(&json!({ "path": path })).await.unwrap_err();
+        let err = run(&json!({ "path": path }), Some(1024 * 1024))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::NotUtf8 { .. }), "got {err:?}");
     }
 
     #[tokio::test]
     async fn rejects_bad_args_no_path() {
-        let err = run(&json!({})).await.unwrap_err();
+        let err = run(&json!({}), Some(1024 * 1024)).await.unwrap_err();
         assert!(matches!(err, ToolError::BadArgs { .. }), "got {err:?}");
     }
 
     #[tokio::test]
     async fn rejects_bad_args_empty_path() {
-        let err = run(&json!({ "path": "" })).await.unwrap_err();
+        let err = run(&json!({ "path": "" }), Some(1024 * 1024))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::BadArgs { .. }), "got {err:?}");
     }
 
     #[tokio::test]
     async fn rejects_bad_args_non_object() {
-        let err = run(&json!("just a string")).await.unwrap_err();
+        let err = run(&json!("just a string"), Some(1024 * 1024))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::BadArgs { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn configured_boundary_accepts_limit_rejects_above_and_reads_offset() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        f.write_all(&vec![b'x'; 40000]).expect("write");
+        let path = f.path().to_str().expect("utf8 path").to_owned();
+
+        let exact = run(
+            &json!({
+                "path": path,
+                "offset": 1000,
+                "max_bytes": 32768
+            }),
+            Some(32768),
+        )
+        .await
+        .expect("exact configured maximum accepted");
+        assert!(exact.contains("[read_file slice: bytes 1000..33768 of 40000]"));
+        assert!(exact.contains(&"x".repeat(32768)));
+
+        let err = run(
+            &json!({
+                "path": path,
+                "offset": 1000,
+                "max_bytes": 32769
+            }),
+            Some(32768),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains(
+            "`max_bytes` must not exceed the configured maximum of 32768 bytes (requested 32769)"
+        ), "got {err}");
+    }
+
+    #[test]
+    fn display_preview_remains_twenty_lines_and_1600_bytes() {
+        let result = display()["result"]["fields"][0].clone();
+        assert_eq!(result["max_lines"], 20);
+        assert_eq!(result["max_bytes"], 1600);
     }
 
     #[test]

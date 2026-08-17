@@ -30,6 +30,10 @@ local function assert_excludes(text, fragment, msg)
   assert_true(normalized(text):find(normalized(fragment), 1, true) == nil, msg or ("unexpected domain-specific contract: " .. fragment))
 end
 
+local policy = require("libs.model-context-policy")
+assert_eq(policy.item_limit, 32 * 1024, "canonical policy retains the agreed item limit")
+assert_eq(policy.continuation_limit, 96 * 1024, "canonical policy retains the agreed aggregate limit")
+
 -- Module loads without error.
 local lead_role = require("libs.lead-workflow.role")
 
@@ -44,6 +48,16 @@ assert_true(
   lead_role.LEAD_SYSTEM_PROMPT:find("lead orchestrator", 1, true) ~= nil,
   "LEAD_SYSTEM_PROMPT carries the root lead role"
 )
+
+assert_true(
+  lead_role.LEAD_SYSTEM_PROMPT:find("Bounded model context", 1, true)
+    < lead_role.LEAD_SYSTEM_PROMPT:find("## Tools", 1, true),
+  "generated model-context policy precedes lead tool descriptions"
+)
+assert_contains(lead_role.LEAD_SYSTEM_PROMPT, "32768 bytes per result", "lead policy renders canonical item limit")
+assert_contains(lead_role.LEAD_SYSTEM_PROMPT, "98304 bytes combined", "lead policy renders canonical continuation limit")
+assert_contains(lead_role.LEAD_SYSTEM_PROMPT, "zero-based half-open byte range", "lead policy documents range convention")
+assert_contains(lead_role.LEAD_SYSTEM_PROMPT, "read_file(path=<canonical path>, offset=start, max_bytes=end-start)", "lead policy documents retrieval syntax")
 
 -- WORKER_SYSTEM_PROMPT is the complete delegated-agent file, read verbatim.
 -- It is a full standalone prompt and does not claim the root role.

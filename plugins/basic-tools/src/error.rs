@@ -31,11 +31,13 @@ pub enum ToolError {
         path: String,
     },
 
-    /// The file is larger than the 1 MiB cap.
-    #[error("file too large ({size} bytes; cap is 1 MiB): {path}")]
+    /// The file is larger than the composition-supplied cap.
+    #[error("file too large ({size} bytes; cap is {cap} bytes): {path}")]
     TooLarge {
         /// Actual size in bytes.
         size: u64,
+        /// Configured maximum size in bytes.
+        cap: u64,
         /// Path the caller asked for.
         path: String,
     },

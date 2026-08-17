@@ -16,6 +16,8 @@ local run_tool    = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
 local adapter     = require("factories.adapter")
 local llm         = require("factories.llm")
+local model_context = require("model-context")
+local policy = require("libs.model-context-policy")
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -32,6 +34,11 @@ end
 local function assert_true(cond, msg)
   if not cond then error("assertion failed: " .. (msg or "(no message)"), 2) end
 end
+
+assert_eq(model_context.ITEM_LIMIT, policy.item_limit,
+  "canonical Lua policy drives the per-result projection limit")
+assert_eq(model_context.TURN_LIMIT, policy.continuation_limit,
+  "canonical Lua policy drives the aggregate continuation limit")
 
 local function capture()
   local out = {}
@@ -303,21 +310,38 @@ do
   assert_true(content:find("original 40000 bytes", 1, true) ~= nil,
     "marker states the original byte size")
   assert_true(content:find(path, 1, true) ~= nil, "marker points to the canonical output path")
-  local omitted = tonumber(content:match("omitted (%d+) bytes"))
+  local omitted, range_start, range_end = content:match(
+    "omitted (%d+) bytes at zero%-based half%-open range %[(%d+), (%d+)%)")
+  omitted, range_start, range_end = tonumber(omitted), tonumber(range_start), tonumber(range_end)
   local marker_start, marker_end = content:find("\n\n%[output truncated:.-%]\n\n")
-  assert_true(marker_start ~= nil and omitted == 40000 - (#content - (marker_end - marker_start + 1)),
-    "marker omission accounting matches retained source bytes")
+  assert_true(marker_start ~= nil and omitted == range_end - range_start,
+    "marker omitted count matches its exact range")
+  local reconstructed = content:sub(1, marker_start - 1)
+    .. huge:sub(range_start + 1, range_end)
+    .. content:sub(marker_end + 1)
+  assert_eq(reconstructed, huge,
+    "ASCII omitted range reconstructs the canonical persisted output")
 
   local missing = project({ { id = "missing", name = "read", output = huge } })
   assert_true(#missing.messages[1].content <= 32768, "missing-path projection still obeys the item cap")
   assert_true(missing.messages[1].content:find("Full output is unavailable", 1, true) ~= nil,
     "missing canonical path is explicit")
 
-  local unicode = string.rep("🙂", 5000)
+  local unicode = string.rep("🙂", 10000)
   local unicode_out = project({ { id = "utf8", name = "read", output = unicode, output_path = path } })
   assert_true(#unicode_out.messages[1].content <= 32768, "multibyte projection obeys the byte cap")
   local quoted = nefor.json.encode(unicode_out.messages[1].content)
   assert_true(type(nefor.json.decode(quoted)) == "string", "multibyte projection preserves UTF-8 boundaries")
+  local unicode_content = unicode_out.messages[1].content
+  local unicode_start, unicode_end = unicode_content:match(
+    "zero%-based half%-open range %[(%d+), (%d+)%)")
+  unicode_start, unicode_end = tonumber(unicode_start), tonumber(unicode_end)
+  local unicode_marker_start, unicode_marker_end = unicode_content:find("\n\n%[output truncated:.-%]\n\n")
+  local unicode_reconstructed = unicode_content:sub(1, unicode_marker_start - 1)
+    .. unicode:sub(unicode_start + 1, unicode_end)
+    .. unicode_content:sub(unicode_marker_end + 1)
+  assert_eq(unicode_reconstructed, unicode,
+    "multibyte omitted range uses actual UTF-8-safe boundaries and reconstructs output")
 
   local smalls = {}
   for i = 1, 6 do smalls[i] = { id = "small-" .. i, name = "read", output = string.rep("s", 100) } end

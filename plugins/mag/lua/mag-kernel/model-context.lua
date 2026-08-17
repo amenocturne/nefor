@@ -2,12 +2,13 @@
 -- Canonical typed values and persisted node outputs stay untouched; only the
 -- provider-facing content produced by adapter factories passes through here.
 
+local policy = require("libs.model-context-policy")
 local M = {}
 
-M.ITEM_LIMIT = 32 * 1024
-M.TURN_LIMIT = 96 * 1024
-M.HEAD_TARGET = 24 * 1024
-M.TAIL_TARGET = 8 * 1024
+M.ITEM_LIMIT = policy.item_limit
+M.TURN_LIMIT = policy.continuation_limit
+M.HEAD_TARGET = math.floor(M.ITEM_LIMIT * 3 / 4)
+M.TAIL_TARGET = M.ITEM_LIMIT - M.HEAD_TARGET
 
 local function utf8_head(value, limit)
   if #value <= limit then return value end
@@ -44,10 +45,10 @@ local function location(path)
   return "Full output is unavailable (no persisted output path)."
 end
 
-local function marker(original, retained, path)
+local function marker(original, omitted_start, omitted_end, path)
   return string.format(
-    "\n\n[output truncated: original %d bytes; omitted %d bytes. %s]\n\n",
-    original, original - retained, location(path))
+    "\n\n[output truncated: original %d bytes; omitted %d bytes at zero-based half-open range [%d, %d). %s]\n\n",
+    original, omitted_end - omitted_start, omitted_start, omitted_end, location(path))
 end
 
 local function render(value, budget, path)
@@ -57,10 +58,12 @@ local function render(value, budget, path)
 
   local retained = math.min(original, budget)
   local text
-  -- Marker digits depend on retained bytes. Recompute until the rendered byte
-  -- count and the stated omission agree; the sequence stabilizes quickly.
+  -- Marker digits depend on the actual UTF-8-safe boundaries. Recompute until
+  -- the rendered byte count and stated omitted range agree.
   for _ = 1, 8 do
-    local note = marker(original, retained, path)
+    local nominal_start = math.min(original, retained)
+    local nominal_end = original
+    local note = marker(original, nominal_start, nominal_end, path)
     local room = math.max(0, budget - #note)
     local head_room = math.min(M.HEAD_TARGET, math.floor(room * 3 / 4))
     local tail_room = math.min(M.TAIL_TARGET, room - head_room)
@@ -68,13 +71,15 @@ local function render(value, budget, path)
     head_room = head_room + spare
     local head = utf8_head(value, head_room)
     local tail = utf8_tail(value, tail_room)
+    local omitted_start = #head
+    local omitted_end = original - #tail
     retained = #head + #tail
-    text = head .. marker(original, retained, path) .. tail
+    text = head .. marker(original, omitted_start, omitted_end, path) .. tail
     if #text <= budget then return text end
   end
   -- Defensive convergence fallback for unusually long paths: preserve a
   -- UTF-8-safe marker prefix rather than exceeding the hard byte ceiling.
-  return utf8_head(text or marker(original, 0, path), budget)
+  return utf8_head(text or marker(original, 0, original, path), budget)
 end
 
 local function textual(value)

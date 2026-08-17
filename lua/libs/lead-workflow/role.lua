@@ -68,7 +68,9 @@ local function load_or_placeholder(name)
   return "[lead-workflow.role: prompt '" .. name .. "' missing — " .. tostring(err) .. "]"
 end
 
-M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
-M.WORKER_SYSTEM_PROMPT = load_or_placeholder("worker")
+local policy = require("libs.model-context-policy")
+
+M.LEAD_SYSTEM_PROMPT = policy.inject_before_tools(load_or_placeholder("lead"))
+M.WORKER_SYSTEM_PROMPT = policy.inject_before_tools(load_or_placeholder("worker"))
 
 return M

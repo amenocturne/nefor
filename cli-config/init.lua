@@ -195,6 +195,7 @@ actor.spawn(actor.identity_spec("mag", {
 }))
 
 local tools = require("libs.compositors.tools")
+local model_context_policy = require("libs.model-context-policy")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
@@ -213,7 +214,7 @@ actor.spawn(require("libs.lead-workflow"))
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
-actor.spawn(tools.basic_actor_spec())
+actor.spawn(tools.basic_actor_spec { max_read_bytes = model_context_policy.item_limit })
 
 -- ------------------------------------------------------------------
 -- Virtual agentic-cli plugin — calls nefor.plugins.spawn directly to

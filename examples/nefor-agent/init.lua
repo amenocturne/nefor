@@ -233,6 +233,7 @@ actor.spawn(actor.identity_spec("mag", {
 }))
 
 local tools = require("libs.compositors.tools")
+local model_context_policy = require("libs.model-context-policy")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.auto_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--auto"
@@ -271,7 +272,7 @@ actor.spawn(require("tool-validator"))
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.git_worktree_actor_spec())
-actor.spawn(tools.basic_actor_spec())
+actor.spawn(tools.basic_actor_spec { max_read_bytes = model_context_policy.item_limit })
 startup_args.apply_mode(startup, agentic_loop)
 
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({

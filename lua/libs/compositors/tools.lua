@@ -6,9 +6,9 @@
 --     translation primitives with the dump-to-file swap and AGENTS.md
 --     emission ordering.
 --
---   tools.basic_actor_spec
---     Default actor spec for the basic-tools Rust binary. Sources the
---     plugin lib directly — no orchestrator coupling.
+--   tools.basic_actor_spec { max_read_bytes = N }
+--     Actor spec for the basic-tools Rust binary. The composition must supply
+--     the read_file maximum explicitly.
 --
 --   tools.git_worktree_actor_spec
 --     Git worktree capability provider used by MAG's worktree factories.
@@ -136,11 +136,17 @@ end
 -- binary speaks the canonical tool contract directly (no translation
 -- needed), so the spec is the generic identity-passthrough shape from
 -- core.actor.
-function M.basic_actor_spec()
+function M.basic_actor_spec(options)
   local config = require("config")
+  options = options or {}
+  local max_read_bytes = options.max_read_bytes
+  if type(max_read_bytes) ~= "number" or max_read_bytes < 1 or max_read_bytes % 1 ~= 0 then
+    error("tools.basic_actor_spec: max_read_bytes must be a positive integer")
+  end
   return actor.identity_spec("basic-tools", {
     config.bin("basic-tools"),
     "--gate", "tool-gate",
+    "--read-file-max-bytes", tostring(max_read_bytes),
   })
 end
 

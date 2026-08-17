@@ -64,9 +64,9 @@ async fn main() {
         )
         .init();
 
-    let gate = parse_gate_arg();
+    let gate = parse_args();
 
-    if let Err(e) = run(gate).await {
+    if let Err(e) = run(gate.gate).await {
         tracing::error!(error = %e, "basic-tools exited with error");
         eprintln!("basic-tools: {e}");
         std::process::exit(1);
@@ -81,17 +81,34 @@ async fn main() {
 /// Parse `--gate <name>` (optional). When set, registration is routed
 /// through the named gate plugin via `<gate>.tools.advertise` rather than
 /// a public `tool.register` broadcast.
-fn parse_gate_arg() -> Option<String> {
+struct Args {
+    gate: Option<String>,
+}
+
+fn parse_args() -> Args {
     use clap::{Arg, Command};
-    Command::new("basic-tools")
+    let matches = Command::new("basic-tools")
         .arg(
             Arg::new("gate")
                 .long("gate")
                 .help("Tool-gate plugin name to advertise to (suppresses public tool.register)."),
         )
-        .get_matches()
-        .get_one::<String>("gate")
-        .cloned()
+        .arg(
+            Arg::new("read-file-max-bytes")
+                .long("read-file-max-bytes")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .required(true)
+                .help("Composition-supplied maximum bytes returned by read_file."),
+        )
+        .get_matches();
+    let max_read_bytes = *matches
+        .get_one::<u64>("read-file-max-bytes")
+        .expect("clap requires read-file-max-bytes");
+    crate::tools::read_file::configure_max_bytes(max_read_bytes)
+        .expect("read_file maximum configured once at startup");
+    Args {
+        gate: matches.get_one::<String>("gate").cloned(),
+    }
 }
 
 async fn run(gate: Option<String>) -> Result<(), TransportError> {
@@ -568,6 +585,7 @@ mod tests {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
+        crate::tools::read_file::configure_max_bytes(1024 * 1024).ok();
         let mut f = NamedTempFile::new().expect("tempfile");
         write!(f, "abc").expect("write");
         let path = f.path().to_str().expect("utf8 path").to_owned();
