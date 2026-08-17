@@ -25,11 +25,19 @@ function M.gauge(available)
   return "○"
 end
 
-function M.reset_time(window)
+local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+
+function M.reset_time(window, now)
   if type(window) ~= "table" then return nil end
   local timestamp = tonumber(window.reset_at)
   if timestamp == nil or timestamp <= 0 then return nil end
-  return os.date("%H:%M", timestamp)
+  local reset = os.date("*t", timestamp)
+  local current = os.date("*t", tonumber(now) or os.time())
+  local time = string.format("%02d:%02d", reset.hour, reset.min)
+  if reset.year == current.year and reset.yday == current.yday then return time end
+  local date = string.format("%s %d", MONTHS[reset.month], reset.day)
+  if reset.year == current.year then return date .. " " .. time end
+  return string.format("%s, %d %s", date, reset.year, time)
 end
 
 function M.primary(snapshot)

@@ -147,6 +147,11 @@ fn context_usage_projection_contract() {
 }
 
 #[test]
+fn usage_reset_display_contract() {
+    run_pure_chat_fixture("usage_test.lua");
+}
+
+#[test]
 fn conversation_projection_surface_contract() {
     let lua = Lua::new();
     let root = repo_root();
