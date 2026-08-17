@@ -2236,6 +2236,9 @@ do
     "terminate success preserves exact run correlation")
   assert_eq(terminal.body.output.status, "killed",
     "terminate success reports the canonical killed status")
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
+  end), nil, "synchronous terminate confirmation suppresses its redundant graph notification")
   feed("mag", { kind = "mag.run_result", run_id = run_id,
     status = "killed", error = "duplicate" })
   assert_eq(#find_calls(decode_calls(), function(c)
@@ -2318,6 +2321,14 @@ do
   assert_true(timeout_result ~= nil and timeout_result.body.error:find(
       "timed out awaiting canonical terminal confirmation", 1, true) ~= nil,
     "defensive terminate timeout is an ordinary tool failure")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id,
+    status = "killed", error = "terminated after timeout" })
+  assert_true(find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
+  end) ~= nil, "a timed-out terminate keeps ordinary asynchronous completion delivery")
+  assert_eq(has_relayed_lead_turn(), true,
+    "a timed-out terminate still relays its eventual completion to the owner")
 
   run_id = dispatch_lead_eval("gate-cancel", "r7/cap-23")
   _test.calls_clear()
