@@ -48,7 +48,7 @@ Slash commands:
   /model       browse every provider's catalog and pick a model
   /model <provider> <model>  switch provider and model together
   /model <model>             switch when one catalog offers that model
-  /usage       account quota and reset times
+  /usage       configured provider usage
   /resume      resume a previous session]]
 
 function M.help(state)

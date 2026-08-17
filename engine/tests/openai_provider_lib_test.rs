@@ -650,53 +650,20 @@ fn static_token_no_op_when_kind_not_ready() {
 }
 
 #[test]
-fn chatgpt_usage_outbound_becomes_provider_neutral() {
+fn chatgpt_native_usage_is_hidden_from_the_public_translator_output() {
     let lua = lua_with_lib();
-    let (kind, provider_name, used): (String, String, f64) = lua
+    let outbound: Value = lua
         .load(
             r#"
-            local chatgpt = require("chatgpt-provider")
-            local t = chatgpt.translator("chatgpt")
-            local b = t.outbound({
-                type = "event", from = "chatgpt",
-                body = {
-                    kind = "chatgpt.usage.updated",
-                    rate_limit = { primary_window = { used_percent = 66 } },
-                },
-            })
-            return b.kind, b.provider, b.rate_limit.primary_window.used_percent
+            local t = require("chatgpt-provider").translator("chatgpt")
+            return t.outbound({ type = "event", from = "chatgpt", body = {
+              kind = "chatgpt.usage.updated", rate_limit = {}
+            }})
             "#,
         )
         .eval()
         .expect("eval");
-    assert_eq!(kind, "chat.usage.updated");
-    assert_eq!(provider_name, "chatgpt");
-    assert_eq!(used, 66.0);
-}
-
-#[test]
-fn chatgpt_usage_request_filters_by_provider() {
-    let lua = lua_with_lib();
-    let (accepted_kind, rejected): (String, Value) = lua
-        .load(
-            r#"
-            local chatgpt = require("chatgpt-provider")
-            local t = chatgpt.translator("chatgpt")
-            local accepted = t.inbound({
-                type = "event", from = "engine",
-                body = { kind = "chat.usage.requested", provider = "chatgpt" },
-            })
-            local rejected = t.inbound({
-                type = "event", from = "engine",
-                body = { kind = "chat.usage.requested", provider = "other" },
-            })
-            return accepted.kind, rejected
-            "#,
-        )
-        .eval()
-        .expect("eval");
-    assert_eq!(accepted_kind, "chatgpt.usage.requested");
-    assert!(matches!(rejected, Value::Nil));
+    assert!(matches!(outbound, Value::Nil));
 }
 
 #[test]

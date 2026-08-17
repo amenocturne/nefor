@@ -19,8 +19,9 @@ flag. Users pick via `/model` in the chat surface.
 
 Account quota is read from the ChatGPT usage endpoint at startup, every five
 minutes, and on `usage.requested`. Successful Responses headers also refresh
-the same snapshot without another request. The Lua translator exposes these as
-provider-neutral `chat.usage.updated` / `chat.usage.error` events.
+the same snapshot without another request. The starter compositor maps these
+native events to `chatgpt/subscription` through conversation-manager's common
+usage interface without changing the provider's polling behavior.
 
 ## Wire contract
 

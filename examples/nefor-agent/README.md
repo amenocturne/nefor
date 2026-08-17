@@ -63,7 +63,7 @@ Installed distributions set `NEFOR_RUNTIME_ROOT` to their immutable, installer-m
 - **Resume a prior session**: emit `sessions.resume_request { session_id = "<uuid>" }` on the bus (the chat slash-command surface does this for you).
 - **Switch provider/model**: edit the `providers` list in `config/init.lua`. `mock-plugin` is spawned out of the box and is the default provider for deterministic startup. `chatgpt` and `ollama` are opt-in via `NEFOR_ENABLE_CHATGPT=1` and `NEFOR_ENABLE_OLLAMA=1` (or by editing `config/init.lua`). Pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.
 - **Compact ChatGPT context**: `/compact` asks ChatGPT’s native Responses compaction endpoint to seal the conversation so far. Later turns restore that compacted context into their fresh provider chats; switching provider or model falls back to the full local transcript.
-- **Inspect ChatGPT quota**: `/usage` shows both quota windows and reset times. When the active provider advertises usage support, the footer keeps a compact available-capacity gauge such as `◔ 34% until 14:30`.
+- **Inspect provider usage**: `/usage` queries the configured exact usage IDs through conversation-manager. ChatGPT contributes live subscription windows; optional OpenRouter contributes a session-local USD total only after authoritative non-BYOK cost evidence. The footer renders each present value independently.
 
 ## Example guides
 

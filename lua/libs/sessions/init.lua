@@ -247,6 +247,7 @@ local function persist_envelope(entry)
         and decoded.body.duplicate ~= true
       if not canonical then return end
     end
+    if type(kind) == "string" and kind:match("^conversation%.usage%.") then return end
   end
 
   local is_user_submit = ok

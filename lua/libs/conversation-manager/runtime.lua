@@ -22,6 +22,9 @@ function M.build(options)
   local session_id = nil
   local active_conversation_id = nil
   local active_invocations = {}
+  local usage_owners = {}
+  local usage_queries = {}
+  local usage_subscriptions = {}
 
   local function send(body)
     emit(json.encode({
@@ -56,6 +59,7 @@ function M.build(options)
   local function reset(next_session_id)
     store:reset()
     active_invocations = {}
+    usage_queries = {}
     session_id = next_session_id
     active_conversation_id = nil
   end
@@ -361,6 +365,257 @@ function M.build(options)
     if terminal_provider_events[body.event] then active_invocations[body.request_id] = nil end
   end
 
+  local function usage_id(value)
+    return type(value) == "string" and #value <= 256
+      and value:match("^[%w_.-]+/[%w_.-]+$") ~= nil
+  end
+
+  local function usage_ids(value)
+    if type(value) ~= "table" then return nil end
+    local out, seen = {}, {}
+    for _, id in ipairs(value) do
+      if not usage_id(id) or seen[id] then return nil end
+      seen[id] = true
+      out[#out + 1] = id
+    end
+    return out
+  end
+
+  local function ids_for_owner(ids, owner)
+    local out = {}
+    for _, id in ipairs(ids) do
+      if usage_owners[id] == owner then out[#out + 1] = id end
+    end
+    return out
+  end
+
+  local function route_usage(kind, correlation_id, requester, ids)
+    local by_owner = {}
+    for _, id in ipairs(ids) do
+      local owner = usage_owners[id]
+      if owner then
+        by_owner[owner] = by_owner[owner] or {}
+        by_owner[owner][#by_owner[owner] + 1] = id
+      end
+    end
+    local owners = {}
+    for owner in pairs(by_owner) do owners[#owners + 1] = owner end
+    table.sort(owners)
+    for _, owner in ipairs(owners) do
+      local owned = by_owner[owner]
+      table.sort(owned)
+      send({
+        kind = "conversation.usage." .. kind .. ".forwarded",
+        request_id = kind == "query" and correlation_id or nil,
+        subscription_id = kind == "subscribe" and correlation_id or nil,
+        requester = requester,
+        owner = owner,
+        usage_ids = owned,
+      })
+    end
+    return by_owner
+  end
+
+  local function handle_usage_expose(body, owner)
+    if replay_active() or owner == "conversation-manager" then return end
+    local ids = usage_ids(body.usage_ids)
+    if not nonempty(owner) or not ids or #ids == 0 then
+      send({ kind = "conversation.usage.exposure.rejected", owner = owner,
+        code = "invalid_usage_exposure" })
+      return
+    end
+    for _, id in ipairs(ids) do
+      if id:sub(1, #owner + 1) ~= owner .. "/" then
+        send({ kind = "conversation.usage.exposure.rejected", owner = owner,
+          usage_id = id, code = "usage_id_namespace_mismatch" })
+        return
+      end
+      local existing = usage_owners[id]
+      if existing and existing ~= owner then
+        send({ kind = "conversation.usage.exposure.rejected", owner = owner,
+          usage_id = id, existing_owner = existing, code = "usage_id_collision" })
+        return
+      end
+    end
+    table.sort(ids)
+    local newly_exposed = {}
+    for _, id in ipairs(ids) do
+      if not usage_owners[id] then newly_exposed[#newly_exposed + 1] = id end
+      usage_owners[id] = owner
+    end
+    send({ kind = "conversation.usage.exposed", owner = owner, usage_ids = ids })
+    if #newly_exposed > 0 then
+      local subscription_ids = {}
+      for subscription_id in pairs(usage_subscriptions) do
+        subscription_ids[#subscription_ids + 1] = subscription_id
+      end
+      table.sort(subscription_ids)
+      for _, subscription_id in ipairs(subscription_ids) do
+        local subscription = usage_subscriptions[subscription_id]
+        local late = ids_for_owner(newly_exposed, owner)
+        local requested = {}
+        for _, id in ipairs(late) do
+          if subscription.usage_ids[id] then requested[#requested + 1] = id end
+        end
+        if #requested > 0 then
+          route_usage("subscribe", subscription_id, subscription.requester, requested)
+        end
+      end
+    end
+  end
+
+  local function requested_by_owner(ids)
+    local out = {}
+    for _, id in ipairs(ids) do
+      local owner = usage_owners[id]
+      if owner then
+        out[owner] = out[owner] or {}
+        out[owner][id] = true
+      end
+    end
+    return out
+  end
+
+  local function handle_usage_query(body, requester)
+    if replay_active() or requester == "conversation-manager"
+        or body.kind ~= "conversation.usage.query" then return end
+    if nonempty(body.request_id) and usage_queries[body.request_id] then
+      send({ kind = "conversation.usage.query.rejected", request_id = body.request_id,
+        code = "usage_request_id_conflict" })
+      return
+    end
+    local ids = usage_ids(body.usage_ids)
+    if not nonempty(body.request_id) or not nonempty(requester) or not ids or #ids == 0 then
+      send({ kind = "conversation.usage.query.rejected", request_id = body.request_id,
+        code = "invalid_usage_query" })
+      return
+    end
+    table.sort(ids)
+    local exposed = {}
+    for _, id in ipairs(ids) do if usage_owners[id] then exposed[#exposed + 1] = id end end
+    if #exposed < #ids then
+      local missing = {}
+      for _, id in ipairs(ids) do if not usage_owners[id] then missing[#missing + 1] = id end end
+      send({ kind = "conversation.usage.query.unavailable", request_id = body.request_id,
+        requester = requester, usage_ids = missing, reason = "usage_id_not_exposed" })
+    end
+    if #exposed == 0 then return end
+    route_usage("query", body.request_id, requester, exposed)
+    usage_queries[body.request_id] = {
+      requester = requester,
+      requested = requested_by_owner(exposed),
+    }
+  end
+
+  local function handle_usage_subscribe(body, requester)
+    if replay_active() or requester == "conversation-manager"
+        or body.kind ~= "conversation.usage.subscribe" then return end
+    local existing = nonempty(body.subscription_id)
+      and usage_subscriptions[body.subscription_id] or nil
+    if existing and existing.requester ~= requester then
+      send({ kind = "conversation.usage.subscription.rejected",
+        subscription_id = body.subscription_id, code = "usage_subscription_id_conflict" })
+      return
+    end
+    local ids = usage_ids(body.usage_ids)
+    if not nonempty(body.subscription_id) or not nonempty(requester) or not ids or #ids == 0 then
+      send({ kind = "conversation.usage.subscription.rejected",
+        subscription_id = body.subscription_id, code = "invalid_usage_subscription" })
+      return
+    end
+    table.sort(ids)
+    local wanted = {}
+    if existing then
+      for id in pairs(existing.usage_ids) do wanted[id] = true end
+    end
+    for _, id in ipairs(ids) do wanted[id] = true end
+    usage_subscriptions[body.subscription_id] = { requester = requester, usage_ids = wanted }
+    route_usage("subscribe", body.subscription_id, requester, ids)
+  end
+
+  local valid_usage_kinds = { subscription = true, monetary = true, free = true, unknown = true }
+
+  local function published_values(body, owner)
+    local values = type(body.values) == "table" and body.values or nil
+    if not values then return nil end
+    local out, seen = {}, {}
+    for _, value in ipairs(values) do
+      if type(value) ~= "table" or not usage_id(value.usage_id)
+          or seen[value.usage_id] or usage_owners[value.usage_id] ~= owner
+          or type(value.usage) ~= "table"
+          or not valid_usage_kinds[value.usage.kind] then return nil end
+      seen[value.usage_id] = true
+      if value.usage.kind == "monetary"
+          and (type(value.usage.amount) ~= "string"
+            or not value.usage.amount:match("^%d+%.?%d*$")
+            or type(value.usage.currency) ~= "string") then return nil end
+      out[#out + 1] = domain.copy(value)
+    end
+    table.sort(out, function(a, b) return a.usage_id < b.usage_id end)
+    return out
+  end
+
+  local function handle_usage_snapshot(body, owner)
+    if replay_active() or owner == "conversation-manager" then return end
+    local query = nonempty(body.request_id) and usage_queries[body.request_id] or nil
+    local requested = query and query.requested[owner] or nil
+    local values = requested and published_values(body, owner) or nil
+    if not values then
+      send({ kind = "conversation.usage.publish.rejected", request_id = body.request_id,
+        owner = owner, code = "usage_snapshot_mismatch" })
+      return
+    end
+    local seen = {}
+    for _, value in ipairs(values or {}) do
+      if not requested[value.usage_id] or seen[value.usage_id] then
+        send({ kind = "conversation.usage.publish.rejected", request_id = body.request_id,
+          owner = owner, code = "usage_snapshot_id_mismatch" })
+        return
+      end
+      seen[value.usage_id] = true
+    end
+    for id in pairs(requested or {}) do
+      if not seen[id] then
+        send({ kind = "conversation.usage.publish.rejected", request_id = body.request_id,
+          owner = owner, code = "incomplete_usage_snapshot" })
+        return
+      end
+    end
+    query.requested[owner] = nil
+    send({ kind = "conversation.usage.snapshot", request_id = body.request_id,
+      requester = query.requester, values = values })
+    if next(query.requested) == nil then usage_queries[body.request_id] = nil end
+  end
+
+  local function handle_usage_update(body, owner)
+    if replay_active() or owner == "conversation-manager" then return end
+    local subscription = nonempty(body.subscription_id)
+      and usage_subscriptions[body.subscription_id] or nil
+    local values = subscription and published_values(body, owner) or nil
+    if not values then
+      send({ kind = "conversation.usage.publish.rejected",
+        subscription_id = body.subscription_id, owner = owner,
+        code = "usage_update_mismatch" })
+      return
+    end
+    if #values == 0 then
+      send({ kind = "conversation.usage.publish.rejected",
+        subscription_id = body.subscription_id, owner = owner,
+        code = "empty_usage_update" })
+      return
+    end
+    for _, value in ipairs(values) do
+      if not subscription.usage_ids[value.usage_id] then
+        send({ kind = "conversation.usage.publish.rejected",
+          subscription_id = body.subscription_id, owner = owner,
+          code = "usage_update_not_subscribed", usage_id = value.usage_id })
+        return
+      end
+    end
+    send({ kind = "conversation.usage.update", subscription_id = body.subscription_id,
+      requester = subscription.requester, values = values })
+  end
+
   local function receive_msg(entry)
     if type(entry.payload) ~= "string" or entry.payload == "" then return end
     local ok, decoded = pcall(json.decode, entry.payload)
@@ -368,7 +623,25 @@ function M.build(options)
     local body = decoded.body
 
     if body.kind == "sessions.session_end" then reset(nil); return end
-    if body.kind == "sessions.session_start" then reset(body.session_id); return end
+    if body.kind == "sessions.session_start" then
+      reset(body.session_id)
+      local subscription_ids = {}
+      for subscription_id in pairs(usage_subscriptions) do
+        subscription_ids[#subscription_ids + 1] = subscription_id
+      end
+      table.sort(subscription_ids)
+      for _, subscription_id in ipairs(subscription_ids) do
+        local subscription = usage_subscriptions[subscription_id]
+        route_usage("subscribe", subscription_id, subscription.requester,
+          (function()
+            local ids = {}
+            for id in pairs(subscription.usage_ids) do ids[#ids + 1] = id end
+            table.sort(ids)
+            return ids
+          end)())
+      end
+      return
+    end
     if body.kind == "conversation.fact.append" then handle_append(body); return end
     if body.kind == "conversation.fact.recorded" then
       if decoded.from ~= "conversation-manager" then
@@ -395,6 +668,11 @@ function M.build(options)
     if body.kind == "conversation.provider.invoke.request" then handle_provider_invoke(body); return end
     if body.kind == "conversation.provider.cancel.request" then handle_provider_cancel(body); return end
     if body.kind == "conversation.provider.event.reported" then handle_provider_event(body); return end
+    if body.kind == "conversation.usage.expose" then handle_usage_expose(body, decoded.from); return end
+    if body.kind == "conversation.usage.query" then handle_usage_query(body, decoded.from); return end
+    if body.kind == "conversation.usage.subscribe" then handle_usage_subscribe(body, decoded.from); return end
+    if body.kind == "conversation.usage.snapshot.reported" then handle_usage_snapshot(body, decoded.from); return end
+    if body.kind == "conversation.usage.update.reported" then handle_usage_update(body, decoded.from); return end
   end
 
   return {

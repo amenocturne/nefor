@@ -456,3 +456,83 @@ receive({
 receive({ kind = "sessions.session_end", session_id = "session-2" })
 eq(actor._internals.active_invocations()["provider-3"], nil,
   "session end releases every active provider correlation")
+
+-- Usage values remain provider-owned; the manager owns only exact-ID routing.
+receive({ kind = "conversation.usage.expose",
+  usage_ids = { "chatgpt/subscription" } }, "chatgpt")
+eq(last_body().kind, "conversation.usage.exposed")
+receive({ kind = "conversation.usage.expose",
+  usage_ids = { "chatgpt/subscription" } }, "other")
+eq(last_body().kind, "conversation.usage.exposure.rejected")
+eq(last_body().code, "usage_id_namespace_mismatch")
+receive({ kind = "conversation.usage.expose",
+  usage_ids = { "chatgpt/subscription" } }, "chatgpt-second")
+eq(last_body().kind, "conversation.usage.exposure.rejected")
+
+receive({ kind = "conversation.usage.query", request_id = "usage-unavailable",
+  usage_ids = { "missing/value" } }, "chat-surface")
+eq(last_body().kind, "conversation.usage.query.unavailable")
+eq(last_body().usage_ids[1], "missing/value")
+eq(last_body().reason, "usage_id_not_exposed")
+
+receive({ kind = "conversation.usage.query", request_id = "usage-query",
+  usage_ids = { "chatgpt/subscription" } }, "chat-surface")
+eq(last_body().kind, "conversation.usage.query.forwarded")
+eq(last_body().owner, "chatgpt")
+eq(last_body().requester, "chat-surface")
+receive({ kind = "conversation.usage.snapshot.reported", request_id = "usage-query",
+  values = { { usage_id = "chatgpt/subscription",
+    usage = { kind = "subscription", windows = {} } } } }, "chatgpt")
+eq(last_body().kind, "conversation.usage.snapshot")
+eq(last_body().requester, "chat-surface")
+eq(last_body().values[1].usage.kind, "subscription")
+
+receive({ kind = "conversation.usage.expose",
+  usage_ids = { "chatgpt/other" } }, "chatgpt")
+eq(last_body().kind, "conversation.usage.exposed")
+receive({ kind = "conversation.usage.query", request_id = "usage-exact",
+  usage_ids = { "chatgpt/subscription" } }, "chat-surface")
+eq(last_body().kind, "conversation.usage.query.forwarded")
+receive({ kind = "conversation.usage.snapshot.reported", request_id = "usage-exact",
+  values = { { usage_id = "chatgpt/other", usage = { kind = "free" } } } }, "chatgpt")
+eq(last_body().kind, "conversation.usage.publish.rejected")
+eq(last_body().code, "usage_snapshot_id_mismatch")
+
+receive({ kind = "conversation.usage.subscribe", subscription_id = "usage-status",
+  usage_ids = { "openrouter/session-total" } }, "chat-surface")
+local before_late_exposure = #emitted
+receive({ kind = "conversation.usage.expose",
+  usage_ids = { "openrouter/session-total" } }, "openrouter")
+eq(body_at(before_late_exposure + 1).kind, "conversation.usage.exposed")
+eq(last_body().kind, "conversation.usage.subscribe.forwarded")
+eq(last_body().subscription_id, "usage-status")
+receive({ kind = "conversation.usage.update.reported", subscription_id = "usage-status",
+  values = { { usage_id = "openrouter/session-total",
+    usage = { kind = "monetary", amount = "0.1", currency = "USD" } } } }, "openrouter")
+eq(last_body().kind, "conversation.usage.update")
+eq(last_body().values[1].usage.amount, "0.1")
+receive({ kind = "conversation.usage.update.reported", subscription_id = "usage-status",
+  values = {
+    { usage_id = "openrouter/session-total", usage = { kind = "free" } },
+    { usage_id = "openrouter/session-total", usage = { kind = "free" } },
+  } }, "openrouter")
+eq(last_body().kind, "conversation.usage.publish.rejected")
+eq(last_body().code, "usage_update_mismatch")
+receive({ kind = "conversation.usage.update.reported", subscription_id = "usage-status",
+  values = { { usage_id = "openrouter/session-total",
+    usage = { kind = "not-a-variant" } } } }, "openrouter")
+eq(last_body().kind, "conversation.usage.publish.rejected")
+
+-- Re-exposure after a process-level reconnect is idempotent and restores forwarding.
+receive({ kind = "conversation.usage.expose",
+  usage_ids = { "openrouter/session-total" } }, "openrouter")
+eq(last_body().kind, "conversation.usage.exposed")
+receive({ kind = "conversation.usage.subscribe", subscription_id = "usage-status",
+  usage_ids = { "chatgpt/subscription" } }, "chat-surface")
+eq(last_body().kind, "conversation.usage.subscribe.forwarded")
+local before_session_usage_reroute = #emitted
+receive({ kind = "sessions.session_start", session_id = "session-3" })
+eq(last_body().kind, "conversation.usage.subscribe.forwarded")
+eq(last_body().subscription_id, "usage-status")
+assert(#emitted > before_session_usage_reroute,
+  "session start re-forwards live subscriptions without provider interpretation")

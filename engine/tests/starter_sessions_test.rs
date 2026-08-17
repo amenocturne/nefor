@@ -114,6 +114,20 @@ fn jsonl_excludes_session_control_events() {
             request_id = "req-1",
             event = "completed",
         }))
+        sessions_test._persist_envelope(entry("chat", {
+            kind = "conversation.usage.query", request_id = "usage-1",
+            usage_ids = { "chatgpt/subscription" },
+        }))
+        sessions_test._persist_envelope(entry("conversation-manager", {
+            kind = "conversation.usage.snapshot", request_id = "usage-1", values = {},
+        }))
+        -- The provider-namespaced accounting contribution is the one durable
+        -- usage event. Runtime query/subscription traffic above remains absent.
+        sessions_test._persist_envelope(entry("openrouter", {
+            kind = "openrouter.usage.cost_contribution.recorded",
+            usage_id = "openrouter/session-total", contribution_id = "completion-1",
+            amount = "0.125", currency = "USD",
+        }))
         sessions_test._persist_envelope(entry("other", { kind = "conversation.fact.recorded", event = {} }))
         sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.fact.recorded", duplicate = true, event = {} }))
         sessions_test._persist_envelope(entry("conversation-manager", { kind = "conversation.fact.recorded", event = { sequence = 1 } }))
@@ -125,11 +139,11 @@ fn jsonl_excludes_session_control_events() {
     // Read the file back and assert the filter behaviour.
     let body = std::fs::read_to_string(&session_path).expect("read jsonl");
     let lines: Vec<&str> = body.lines().collect();
-    // Header + 2 normal entries + the one canonical conversation fact.
+    // Header + 2 normal entries + canonical conversation fact + durable usage contribution.
     assert_eq!(
         lines.len(),
-        4,
-        "expected header + 3 entries, got {}: {body}",
+        5,
+        "expected header + 4 entries, got {}: {body}",
         lines.len()
     );
     // Header line carries `_session: true`.
@@ -151,9 +165,14 @@ fn jsonl_excludes_session_control_events() {
         lines[2]
     );
     assert!(
-        lines[3].contains("conversation.fact.recorded"),
-        "only the manager-authored canonical fact should persist: {}",
+        lines[3].contains("openrouter.usage.cost_contribution.recorded"),
+        "provider-namespaced usage contribution should persist: {}",
         lines[3]
+    );
+    assert!(
+        lines[4].contains("conversation.fact.recorded"),
+        "only the manager-authored canonical conversation fact should persist: {}",
+        lines[4]
     );
     // Belt-and-braces: confirm no sessions.* string snuck through.
     for line in lines.iter().skip(1) {
@@ -162,7 +181,7 @@ fn jsonl_excludes_session_control_events() {
             "sessions.* control event leaked into jsonl: {line}",
         );
         assert!(
-            !line.contains("conversation.provider"),
+            !line.contains("conversation.provider") && !line.contains("conversation.usage"),
             "provider runtime event leaked into jsonl: {line}",
         );
     }

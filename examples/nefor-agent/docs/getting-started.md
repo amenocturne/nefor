@@ -68,15 +68,17 @@ The two main entry points are:
 ```
 
 `init.lua` owns wiring; `config/init.lua` owns the starter's provider and policy
-settings. The starter keeps ChatGPT and local Ollama opt-in. To expose them
+settings. The starter keeps ChatGPT, local Ollama, and OpenRouter opt-in. To expose them
 without editing the config:
 
 ```sh
 NEFOR_ENABLE_CHATGPT=1 nefor
 NEFOR_ENABLE_OLLAMA=1 nefor
+OPENAI_PROVIDER_API_KEY=... NEFOR_ENABLE_OPENROUTER=1 nefor
 ```
 
-ChatGPT additionally requires the provider's OAuth login, and Ollama requires a
+ChatGPT additionally requires the provider's OAuth login, OpenRouter uses the generic
+provider key input shown above, and Ollama requires a
 running OpenAI-compatible endpoint at `http://localhost:11434`. These are not
 part of the credential-free verification path. Use the TUI's `/model` command
 to select among enabled providers and models.

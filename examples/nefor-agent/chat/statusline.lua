@@ -8,6 +8,10 @@ local STYLE   = common.STYLE
 local humanize_tokens = common.humanize_tokens
 local usage_view = require("libs.chat.usage")
 local extensions = require("libs.chat.extensions")
+local ok_config, config = pcall(require, "config")
+local usage_config = ok_config and config.active and config.active.usage or {
+  statusline_ids = { "chatgpt/subscription", "openrouter/session-total" },
+}
 
 local M = {}
 
@@ -93,17 +97,16 @@ local function build_segments(state)
     if cb then segs[#segs + 1] = cb end
   end
 
-  if s.cost_usd ~= nil then
-    segs[#segs + 1] = { spans = { { text = string.format("$%.2f", s.cost_usd), fg = C.system } } }
-  end
-  local active_usage = type(state.usage) == "table" and state.usage[state.provider] or nil
-  local usage_text, available = usage_view.footer(active_usage)
-  if usage_text ~= nil then
+  local function add_usage(usage_id)
+    local value = type(state.usage) == "table" and state.usage[usage_id] or nil
+    local usage_text, available = usage_view.footer(value)
+    if usage_text == nil then return end
     local fg = C.system
-    if available <= 10 then fg = C.status_danger
-    elseif available <= 25 then fg = C.status_warn end
+    if available ~= nil and available <= 10 then fg = C.status_danger
+    elseif available ~= nil and available <= 25 then fg = C.status_warn end
     segs[#segs + 1] = { spans = { { text = usage_text, fg = fg } } }
   end
+  for _, usage_id in ipairs(usage_config.statusline_ids or {}) do add_usage(usage_id) end
 
   return segs
 end

@@ -33,6 +33,15 @@ local format_args   = common.format_args
 local M = {}
 local run_bindings = mag_run_bindings.new()
 local transition_sequence = 0
+local usage_policy = { account_ids = {}, session_ids = {} }
+
+local function clear_session_usage(state)
+  local kept = {}
+  for usage_id, value in pairs(state.usage or {}) do
+    if usage_policy.account_ids[usage_id] then kept[usage_id] = value end
+  end
+  return kept
+end
 
 local function next_transition_id()
   transition_sequence = transition_sequence + 1
@@ -577,6 +586,7 @@ local function handle_session_end(msg, state)
     active_turn_entry_start = NIL_SENTINEL,
     stats = {},
     current_context_tokens = NIL_SENTINEL,
+    usage = clear_session_usage(state),
     pending_plan_status = NIL_SENTINEL,
     raw_tool_id = NIL_SENTINEL,
     popup = NIL_SENTINEL,
@@ -634,6 +644,7 @@ local function handle_session_start(msg, state)
     conversation_id = NIL_SENTINEL,
     conversation_projection = conversation_projection.new(),
     instruction_notice_ids = {},
+    usage = clear_session_usage(state),
   }), effects
 end
 
@@ -824,51 +835,54 @@ local function handle_context_usage(msg, state)
   return shallow_merge(state, { current_context_tokens = tokens }), {}
 end
 
-local function handle_usage_updated(msg, state)
-  local provider = msg.provider or ""
-  if provider == "" then return state, {} end
-  local function merge_usage_table(base, incoming)
-    local merged = shallow_merge(type(base) == "table" and base or {}, {})
-    for key, value in pairs(incoming or {}) do
-      if type(value) == "table" and type(merged[key]) == "table" then
-        merged[key] = merge_usage_table(merged[key], value)
-      else
-        merged[key] = value
+local function handle_usage_values(msg, state)
+  local usage = shallow_merge(state.usage or {}, {})
+  for _, value in ipairs(msg.values or {}) do
+    if type(value.usage_id) == "string" and type(value.usage) == "table" then
+      usage[value.usage_id] = value.usage
+    end
+  end
+  local popup = state.popup
+  if popup and (popup.usage_request_id == msg.request_id
+      or popup.usage_subscription_id == msg.subscription_id) then
+    local values = {}
+    for usage_id, value in pairs(usage) do
+      if type(value) == "table" and value.kind ~= "unknown" then
+        values[#values + 1] = { usage_id = usage_id, usage = value }
       end
     end
-    return merged
-  end
-  local usage = {}
-  for k, v in pairs(state.usage or {}) do usage[k] = v end
-  local previous = usage[provider] or {}
-  local snapshot = merge_usage_table(previous, msg)
-  snapshot.kind = nil
-  snapshot.provider = nil
-  usage[provider] = snapshot
-  local popup = state.popup
-  if popup and popup.usage_provider == provider then
-    popup = {
-      variant = "info",
-      title = "usage",
-      body = usage_view.markdown(snapshot),
-      usage_provider = provider,
-    }
+    table.sort(values, function(a, b) return a.usage_id < b.usage_id end)
+    local body = usage_view.markdown(values)
+    local unavailable = popup.usage_unavailable or {}
+    if #unavailable > 0 then
+      body = body .. "\n\nUnavailable: `" .. table.concat(unavailable, "`, `") .. "`."
+    end
+    popup = { variant = "info", title = "usage", body = body,
+      usage_request_id = msg.request_id, usage_subscription_id = msg.subscription_id,
+      usage_unavailable = unavailable }
   end
   return shallow_merge(state, { usage = usage, popup = popup }), {}
 end
 
-local function handle_usage_error(msg, state)
-  local provider = msg.provider or ""
-  if not (state.popup and state.popup.usage_provider == provider) then
+local function handle_usage_unavailable(msg, state)
+  if not (state.popup and state.popup.usage_request_id == msg.request_id) then
     return state, {}
   end
-  return shallow_merge(state, {
-    popup = {
-      variant = "error",
-      title = "usage",
-      body = msg.message or "Could not refresh usage.",
-    },
-  }), {}
+  local ids = {}
+  for _, usage_id in ipairs(msg.usage_ids or {}) do ids[#ids + 1] = tostring(usage_id) end
+  table.sort(ids)
+  local detail = #ids > 0 and ("\n\nUnavailable: `" .. table.concat(ids, "`, `") .. "`.") or ""
+  return shallow_merge(state, { popup = shallow_merge(state.popup, {
+    body = state.popup.body .. detail,
+    usage_unavailable = ids,
+  }) }), {}
+end
+
+local function handle_usage_error(msg, state)
+  if not (state.popup and (state.popup.usage_request_id == msg.request_id
+      or state.popup.usage_subscription_id == msg.subscription_id)) then return state, {} end
+  return shallow_merge(state, { popup = { variant = "error", title = "usage",
+    body = msg.message or "Could not refresh usage." } }), {}
 end
 
 local function handle_tool_start(msg, state)
@@ -1145,14 +1159,8 @@ local function handle_auth_status(msg, state)
   if msg.supports_login ~= nil then
     supports[provider] = msg.supports_login and true or false
   end
-  local supports_usage = {}
-  for k, v in pairs(state.supports_usage or {}) do supports_usage[k] = v end
-  if msg.supports_usage ~= nil then
-    supports_usage[provider] = msg.supports_usage and true or false
-  end
   local usage = {}
   for k, v in pairs(state.usage or {}) do usage[k] = v end
-  if status ~= "connected" then usage[provider] = nil end
   local new_popup = state.popup
   if state.popup and state.popup.variant == "model_picker"
      and state.popup.providers then
@@ -1180,7 +1188,6 @@ local function handle_auth_status(msg, state)
   local next_state = shallow_merge(state, {
     auth = auth,
     supports_login = supports,
-    supports_usage = supports_usage,
     usage = usage,
     popup = new_popup,
   })
@@ -1741,8 +1748,11 @@ local default_handlers = {
   ["conversation.projection.delta"] = handle_conversation_event,
   ["conversation.snapshot"]       = handle_conversation_event,
   ["conversation.provider.context_usage"] = handle_context_usage,
-  ["chat.usage.updated"]          = handle_usage_updated,
-  ["chat.usage.error"]            = handle_usage_error,
+  ["conversation.usage.snapshot"] = handle_usage_values,
+  ["conversation.usage.update"]   = handle_usage_values,
+  ["conversation.usage.query.unavailable"] = handle_usage_unavailable,
+  ["conversation.usage.query.rejected"] = handle_usage_error,
+  ["conversation.usage.publish.rejected"] = handle_usage_error,
   ["tool.register"]               = handle_tool_register,
   ["chat.tool.display_primary"]   = handle_tool_display_primary,
   ["chat.graph_result.append"]    = handle_graph_result_append,
@@ -2136,6 +2146,13 @@ end
 
 function M.build(options)
   options = options or {}
+  usage_policy = { account_ids = {}, session_ids = {} }
+  for _, usage_id in ipairs((options.usage_policy or {}).account_ids or {}) do
+    usage_policy.account_ids[usage_id] = true
+  end
+  for _, usage_id in ipairs((options.usage_policy or {}).session_ids or {}) do
+    usage_policy.session_ids[usage_id] = true
+  end
   local groups = {
     dispatch.group("chat controller", default_handlers),
   }

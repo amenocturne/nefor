@@ -10,6 +10,12 @@ The starter supports three provider descriptor kinds:
 - `openai` for an OpenAI-compatible endpoint;
 - `chatgpt` for the bundled ChatGPT provider.
 
+OpenRouter is an optional `openai` instance, not another descriptor kind. Enable it with `NEFOR_ENABLE_OPENROUTER=1` and provide its key through the generic provider's `OPENAI_PROVIDER_API_KEY` input.
+
+Providers may expose exact namespaced usage values through conversation-manager. The starter wires `chatgpt/subscription` and `openrouter/session-total` into `/usage` and independent statusline segments; either list can be configured without changing the other. OpenRouter begins unknown, records only authoritative non-BYOK USD contributions in the session JSONL, and rebuilds the total on replay without another provider request. On a session switch the surface retains the account-level ChatGPT snapshot but clears the session-local OpenRouter total until its owner reconstructs it.
+
+These values are deliberately separate from completion token usage. Provider completion `usage` and `conversation.provider.context_usage` drive the context-window bar and turn statistics; they do not imply subscription quota, price, or an exposed `usage_id`.
+
 Configure those through [`config.active.providers`](customization.md#starter-settings). A new provider kind requires composition code. Prefer `libs.compositors.provider.spawn_spec` when the provider can satisfy the canonical translator interface; see [Configuration and composition](customization.md#providers).
 
 A provider subprocess speaks NCP, but provider request/history/stream types are a higher-level contract. `generic-provider` owns canonical type declarations and concrete providers translate to them. Do not treat those event kinds as NCP itself.

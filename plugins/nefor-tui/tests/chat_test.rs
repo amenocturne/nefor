@@ -6227,7 +6227,7 @@ fn statusline_omits_scroll_marker_when_transcript_overflows() {
 }
 
 #[test]
-fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
+fn usage_snapshot_updates_independent_footer_segments_and_common_command() {
     let mut engine = Engine::new(120, 28).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
@@ -6235,53 +6235,37 @@ fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.auth.status",
-            "provider": "mock-plugin",
-            "state": "connected",
-            "supports_usage": true,
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "chat.usage.updated",
-            "provider": "mock-plugin",
-            "plan_type": "pro",
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 66,
-                    "limit_window_seconds": 18000,
+            "kind": "conversation.usage.update", "subscription_id": "status",
+            "values": [{ "usage_id": "chatgpt/subscription", "usage": {
+                "kind": "subscription", "plan": "pro", "windows": [{
+                    "id": "primary", "used_percent": 66, "window_seconds": 18000,
                     "reset_at": 1770000000
-                },
-                "secondary_window": {
-                    "used_percent": 20,
-                    "limit_window_seconds": 604800,
+                }, {
+                    "id": "secondary", "used_percent": 20, "window_seconds": 604800,
                     "reset_at": 1770500000
-                }
-            }
+                }]
+            }}]
         }),
     );
-    let snapshot = render_snapshot(&mut engine);
+    let subscription = render_snapshot(&mut engine);
     assert!(
-        snapshot.contains("◔ 34% until"),
-        "compact available-quota widget missing: {snapshot}"
+        subscription.contains("◔ 34% until"),
+        "subscription segment missing: {subscription}"
     );
 
-    // Per-turn response headers only carry the primary percentage.
-    // Merging that sparse event must retain reset time and weekly data
-    // from the last full endpoint response.
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.usage.updated",
-            "provider": "mock-plugin",
-            "rate_limit": { "primary_window": { "used_percent": 70 } }
+            "kind": "conversation.usage.update", "subscription_id": "status",
+            "values": [{ "usage_id": "openrouter/session-total", "usage": {
+                "kind": "monetary", "amount": "0.125", "currency": "USD"
+            }}]
         }),
     );
-    let sparse_snapshot = render_snapshot(&mut engine);
+    let mixed = render_snapshot(&mut engine);
     assert!(
-        sparse_snapshot.contains("◔ 30% until"),
-        "sparse usage refresh should retain the reset time: {sparse_snapshot}"
+        mixed.contains("◔ 34% until") && mixed.contains("$0.125"),
+        "mixed independent usage segments missing: {mixed}"
     );
 
     for ch in "/usage".chars() {
@@ -6290,17 +6274,126 @@ fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
     assert!(emits.iter().any(|(_, body)| {
-        body.get("kind").and_then(|v| v.as_str()) == Some("chat.usage.requested")
-            && body.get("provider").and_then(|v| v.as_str()) == Some("mock-plugin")
+        body.get("kind").and_then(|v| v.as_str()) == Some("conversation.usage.query")
     }));
     let popup = render_snapshot(&mut engine);
     assert!(
-        popup.contains("5-hour window"),
-        "primary usage details missing: {popup}"
+        popup.contains("5-hour window") && popup.contains("Weekly window"),
+        "common usage details missing: {popup}"
+    );
+}
+
+#[test]
+fn command_and_statusline_usage_ids_are_independent_and_context_bar_coexists() {
+    let mut engine = Engine::new(120, 28).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.models.listed", "provider": "mock-plugin",
+            "models": ["mock-model"], "context_windows": { "mock-model": 1000 } }),
+    );
+    fixture_assistant_completed(
+        &mut engine,
+        None,
+        json!({ "model": "mock-model", "usage": {
+            "input_tokens": 500, "output_tokens": 10 } }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.usage.update", "subscription_id": "status",
+            "values": [{ "usage_id": "chatgpt/subscription", "usage": { "kind": "free" } }]
+        }),
+    );
+    let footer = render_snapshot(&mut engine);
+    assert!(
+        footer.contains("50%") && footer.contains("free"),
+        "{footer}"
+    );
+
+    for ch in "/usage".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    let query = emits
+        .iter()
+        .find(|(_, body)| {
+            body.get("kind").and_then(|v| v.as_str()) == Some("conversation.usage.query")
+        })
+        .expect("usage query");
+    assert_eq!(
+        query
+            .1
+            .get("usage_ids")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(2),
+        "command IDs stay independent from the one currently rendered statusline value"
+    );
+}
+
+#[test]
+fn session_transition_clears_session_usage_but_keeps_account_usage() {
+    let mut engine = Engine::new(120, 28).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.usage.update", "subscription_id": "status",
+            "values": [
+              { "usage_id": "chatgpt/subscription", "usage": { "kind": "free" } },
+              { "usage_id": "openrouter/session-total", "usage": {
+                  "kind": "monetary", "amount": "0.75", "currency": "USD" } }
+            ]
+        }),
+    );
+    let before = render_snapshot(&mut engine);
+    assert!(
+        before.contains("free") && before.contains("$0.75"),
+        "{before}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    let after = render_snapshot(&mut engine);
+    assert!(
+        after.contains("free"),
+        "account usage should survive session switch: {after}"
     );
     assert!(
-        popup.contains("Weekly window"),
-        "weekly usage details missing: {popup}"
+        !after.contains("$0.75"),
+        "session usage must stay absent until its provider reconstructs it: {after}"
+    );
+}
+
+#[test]
+fn free_usage_renders_while_unknown_usage_stays_absent() {
+    let mut engine = Engine::new(120, 28).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.usage.update", "subscription_id": "status",
+            "values": [
+              { "usage_id": "chatgpt/subscription", "usage": { "kind": "free" } },
+              { "usage_id": "openrouter/session-total", "usage": { "kind": "unknown" } }
+            ]
+        }),
+    );
+    let snapshot = render_snapshot(&mut engine);
+    assert!(
+        !snapshot.contains("$0") && !snapshot.contains("usage ?") && snapshot.contains("free"),
+        "free should render independently while unknown stays absent: {snapshot}"
     );
 }
 

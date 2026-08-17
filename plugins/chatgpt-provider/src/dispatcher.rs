@@ -141,7 +141,6 @@ fn auth_status_body(args: &ServeArgs, snap: &AuthSnapshot) -> Map<String, Value>
     // filter them out — picking "log in" on an authless provider is a
     // no-op the surface shouldn't offer.
     m.insert("supports_login".into(), Value::Bool(true));
-    m.insert("supports_usage".into(), Value::Bool(true));
     make_event(format!("{}auth.status", args.event_prefix()), m)
 }
 

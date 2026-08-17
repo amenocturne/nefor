@@ -180,6 +180,8 @@ for _, p in ipairs(cfg.providers or {}) do
         static_token = p.static_token,
         agentic_loop = agentic_loop,
         conversations = conversation_reader,
+        request_additions = p.request_additions,
+        usage = p.usage,
       }
     ))
   elseif p.kind == "chatgpt" then
@@ -203,6 +205,7 @@ for _, p in ipairs(cfg.providers or {}) do
         translator_lib = "chatgpt-provider",
         agentic_loop = agentic_loop,
         conversations = conversation_reader,
+        usage = p.usage,
       }
     ))
   else

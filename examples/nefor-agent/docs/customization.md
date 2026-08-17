@@ -69,7 +69,7 @@ M.active = {
 return M
 ```
 
-`providers` in the shipped starter accepts `mock`, `openai`, and `chatgpt`. A different provider kind is not a data-only setting: add its compositor call in `init.lua`. Likewise, prompt startup waits for a starter-owned inventory; changing actors may require changing its readiness declaration.
+`providers` in the shipped starter accepts descriptor kinds `mock`, `openai`, and `chatgpt`. OpenRouter is an `openai` instance, not a fourth provider kind; its request additions and usage extraction semantics live in that instance's provider table. A genuinely different provider kind is not a data-only setting: add its compositor call in `init.lua`. `usage.command_ids` and `usage.statusline_ids` independently choose the exact provider-owned values the example surface renders. `usage.account_ids` remain visible across an in-process session switch; `usage.session_ids` are cleared until their owner reconstructs or reports the new session. Likewise, prompt startup waits for a starter-owned inventory; changing actors may require changing its readiness declaration.
 
 `log_level` exists in the current starter settings but has no runtime consumer. Do not rely on it as a behavior switch.
 

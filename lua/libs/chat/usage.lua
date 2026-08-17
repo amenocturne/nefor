@@ -11,8 +11,7 @@ end
 function M.available_percent(window)
   if type(window) ~= "table" then return nil end
   local used = clamp_percent(window.used_percent)
-  if used == nil then return nil end
-  return 100 - used
+  return used and (100 - used) or nil
 end
 
 function M.gauge(available)
@@ -28,78 +27,96 @@ end
 local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
 
 function M.reset_time(window, now)
-  if type(window) ~= "table" then return nil end
-  local timestamp = tonumber(window.reset_at)
+  local timestamp = type(window) == "table" and tonumber(window.reset_at) or nil
   if timestamp == nil or timestamp <= 0 then return nil end
-  local reset = os.date("*t", timestamp)
-  local current = os.date("*t", tonumber(now) or os.time())
+  local reset, current = os.date("*t", timestamp), os.date("*t", tonumber(now) or os.time())
   local time = string.format("%02d:%02d", reset.hour, reset.min)
   if reset.year == current.year and reset.yday == current.yday then return time end
   local date = string.format("%s %d", MONTHS[reset.month], reset.day)
-  if reset.year == current.year then return date .. " " .. time end
-  return string.format("%s, %d %s", date, reset.year, time)
+  return reset.year == current.year and (date .. " " .. time)
+    or string.format("%s, %d %s", date, reset.year, time)
 end
 
 function M.primary(snapshot)
-  local limit = type(snapshot) == "table" and snapshot.rate_limit or nil
+  if type(snapshot) ~= "table" then return nil end
+  if snapshot.kind == "subscription" then return (snapshot.windows or {})[1] end
+  local limit = snapshot.rate_limit
   return type(limit) == "table" and limit.primary_window or nil
 end
 
 function M.footer(snapshot)
-  local window = M.primary(snapshot)
-  local available = M.available_percent(window)
+  if type(snapshot) ~= "table" then return nil end
+  if snapshot.kind == "monetary" and type(snapshot.amount) == "string"
+      and snapshot.amount:match("^%d+%.?%d*$") then
+    if snapshot.currency == "USD" then return "$" .. tostring(snapshot.amount) end
+    return tostring(snapshot.amount) .. " " .. tostring(snapshot.currency or "")
+  end
+  if snapshot.kind == "free" then return "free" end
+  if snapshot.kind ~= nil and snapshot.kind ~= "subscription" then return nil end
+  local available = M.available_percent(M.primary(snapshot))
   if available == nil then return nil end
   local text = string.format("%s %d%%", M.gauge(available), available)
-  local reset = M.reset_time(window)
-  if reset ~= nil then text = text .. " until " .. reset end
+  local reset = M.reset_time(M.primary(snapshot))
+  if reset then text = text .. " until " .. reset end
   return text, available
 end
 
 local function window_title(window, fallback)
-  local seconds = type(window) == "table" and tonumber(window.limit_window_seconds) or nil
+  local seconds = type(window) == "table" and tonumber(window.window_seconds or window.limit_window_seconds) or nil
   if seconds == 18000 then return "5-hour window" end
   if seconds == 604800 then return "Weekly window" end
-  if seconds ~= nil and seconds > 0 and seconds % 3600 == 0 then
-    return tostring(seconds / 3600) .. "-hour window"
-  end
+  if seconds and seconds > 0 and seconds % 3600 == 0 then return tostring(seconds / 3600) .. "-hour window" end
   return fallback
 end
 
 local function window_markdown(window, fallback)
-  if type(window) ~= "table" then return nil end
-  local used = clamp_percent(window.used_percent)
-  local available = M.available_percent(window)
+  local used, available = clamp_percent(window and window.used_percent), M.available_percent(window)
   if used == nil or available == nil then return nil end
-  local lines = {
-    "**" .. window_title(window, fallback) .. "**",
-    string.format("%d%% used · %d%% available", used, available),
-  }
+  local lines = { "**" .. window_title(window, fallback) .. "**",
+    string.format("%d%% used · %d%% available", used, available) }
   local reset = M.reset_time(window)
-  if reset ~= nil then lines[#lines + 1] = "Resets at " .. reset end
+  if reset then lines[#lines + 1] = "Resets at " .. reset end
   return table.concat(lines, "\n")
+end
+
+-- Provider constants are rendered independently; this module never folds
+-- providers or currencies.
+function M.markdown_value(value)
+  if type(value) ~= "table" then return "Usage data is unavailable." end
+  if value.kind == "monetary" then
+    local text = select(1, M.footer(value))
+    return text and ("**Cost**\n" .. text) or "Usage data is unavailable."
+  elseif value.kind == "free" then return "**Free**"
+  elseif value.kind == "unknown" then return "Usage data is unavailable."
+  end
+  local sections = {}
+  local windows = value.kind == "subscription" and value.windows or {
+    value.rate_limit and value.rate_limit.primary_window,
+    value.rate_limit and value.rate_limit.secondary_window,
+  }
+  for index, window in ipairs(windows or {}) do
+    local section = window_markdown(window, index == 1 and "Primary window" or "Secondary window")
+    if section then sections[#sections + 1] = section end
+  end
+  local plan = value.plan or value.plan_type
+  if type(plan) == "string" and plan ~= "" then sections[#sections + 1] = "Plan: `" .. plan .. "`" end
+  if #sections == 0 then return "Usage data is unavailable." end
+  return table.concat(sections, "\n\n")
 end
 
 function M.markdown(snapshot)
   if type(snapshot) ~= "table" then return "Usage data is unavailable." end
-  local limit = snapshot.rate_limit or {}
+  if snapshot.usage_id then return M.markdown_value(snapshot.usage) end
   local sections = {}
-  local primary = window_markdown(limit.primary_window, "Primary window")
-  local secondary = window_markdown(limit.secondary_window, "Secondary window")
-  if primary ~= nil then sections[#sections + 1] = primary end
-  if secondary ~= nil then sections[#sections + 1] = secondary end
-  if type(snapshot.plan_type) == "string" and snapshot.plan_type ~= "" then
-    sections[#sections + 1] = "Plan: `" .. snapshot.plan_type .. "`"
-  end
-  local credits = snapshot.credits
-  if type(credits) == "table" then
-    if credits.unlimited == true then
-      sections[#sections + 1] = "Credits: unlimited"
-    elseif credits.balance ~= nil then
-      sections[#sections + 1] = "Credits: " .. tostring(credits.balance)
+  for _, value in ipairs(snapshot) do
+    if type(value) == "table" and type(value.usage) == "table"
+        and value.usage.kind ~= "unknown" then
+      sections[#sections + 1] = "### " .. value.usage_id .. "\n\n" .. M.markdown_value(value.usage)
     end
   end
-  if #sections == 0 then return "Usage data is unavailable." end
-  return table.concat(sections, "\n\n")
+  if #sections > 0 then return table.concat(sections, "\n\n") end
+  if #snapshot > 0 then return "Usage data is unavailable." end
+  return M.markdown_value(snapshot)
 end
 
 return M

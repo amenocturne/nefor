@@ -195,6 +195,7 @@ local view = require("libs.chat.view").build {
 local input_submit = require("chat.commands")
 local dispatch = require("libs.chat.dispatch")
 local update = require("libs.chat.controller").build {
+  usage_policy = active_config().usage,
   handler_groups = {
     dispatch.group("starter commands", { ["input.submit"] = input_submit }),
   },
@@ -269,8 +270,8 @@ local function initial_state()
     max_tokens       = nil,
     gate_mode        = "safe",
     auth             = {},
-    supports_usage   = {},
     usage            = {},
+    usage_request_seq = 0,
     expanded_details = false,
     raw_tool_id     = nil,
     tool_displays   = {},

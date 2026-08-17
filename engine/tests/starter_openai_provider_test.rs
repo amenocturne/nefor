@@ -317,6 +317,7 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
         }]])
         local spec = op.spawn_spec("ollama", { "/bin/true" }, {
           agentic_loop = {},
+          request_additions = { usage = { include = true } },
           conversations = {
             context = function(_, conversation_id)
               assert(conversation_id == "conversation-1")
@@ -346,6 +347,7 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
         assert(delivered[1].kind == "ollama.completion.request")
         assert(delivered[1].body.request_id == "request-1")
         assert(delivered[1].body.model == "qwen")
+        assert(delivered[1].body.request_additions.usage.include == true)
         assert(nefor.json.is_array(delivered[1].body.tools))
         assert(#delivered[1].body.tools == 0)
         assert(nefor.json.is_array(delivered[1].body.output_schema.required))
@@ -395,6 +397,128 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
     )
     .exec()
     .expect("drive private provider request lifecycle");
+}
+
+#[test]
+fn provider_usage_compositor_preserves_generic_ledger_invariants() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(
+        r#"
+        local provider = require("libs.compositors.provider")
+        local function options()
+          return {
+            agentic_loop = {},
+            conversations = { context = function() return { messages = {} } end,
+              watermark = function() return 0 end },
+            usage = {
+              exposures = {
+                { usage_id = "meter/native", initial = { kind = "unknown" } },
+                { usage_id = "meter/a", initial = { kind = "unknown" } },
+                { usage_id = "meter/b", initial = { kind = "unknown" } },
+              },
+              subscription = {
+                usage_id = "meter/native", request_kind = "meter.native.request",
+                updated_kind = "meter.native.updated", error_kind = "meter.native.error",
+                extract = function(snapshot)
+                  return { kind = "subscription", remaining = snapshot.remaining }
+                end,
+              },
+              contributions = {
+                { usage_id = "meter/a", extension = "cost_a", currency = "USD",
+                  event_kind = "meter.usage.a.recorded" },
+                { usage_id = "meter/b", extension = "cost_b", byok_extension = "byok_b",
+                  currency = "EUR", event_kind = "meter.usage.b.recorded" },
+              },
+            },
+          }
+        end
+
+        local spec = provider.spawn_spec("meter", { "/bin/true" }, options())
+        -- BYOK is optional per rule; tiny numeric costs are canonical plain decimals.
+        spec._internals.record_configured_usage({ event = "usage", request_id = "r1",
+          completion_id = "same-completion",
+          extensions = { cost_a = 1e-7, cost_b = 2e-7, byok_b = false } })
+        assert(spec._internals.usage_value("meter/a").amount == "0.0000001")
+        assert(spec._internals.usage_value("meter/b").amount == "0.0000002")
+        local sent = _test.sent()
+        local saw_a, saw_b = false, false
+        for _, event in ipairs(sent) do
+          if event.kind == "meter.usage.a.recorded" then
+            saw_a = event.body.amount == "0.0000001" and event.body.currency == "USD"
+          elseif event.kind == "meter.usage.b.recorded" then
+            saw_b = event.body.amount == "0.0000002" and event.body.currency == "EUR"
+          end
+        end
+        assert(saw_a and saw_b)
+
+        -- A contradiction permanently poisons only its ledger until session reset.
+        spec._internals.record_configured_usage({ event = "usage", request_id = "r2",
+          completion_id = "same-completion",
+          extensions = { cost_a = 0.5, cost_b = 2e-7, byok_b = false } })
+        assert(spec._internals.usage_value("meter/a").reason == "completion_id_conflict")
+        spec._internals.record_configured_usage({ event = "usage", request_id = "r3",
+          completion_id = "later-valid",
+          extensions = { cost_a = 1, cost_b = 3e-7, byok_b = false } })
+        assert(spec._internals.usage_value("meter/a").kind == "unknown")
+        assert(spec._internals.usage_value("meter/b").amount == "0.0000005")
+
+        -- A same-owner mixed query is one complete snapshot, not partial responses.
+        _test.sent()
+        spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
+          kind = "conversation.usage.query.forwarded", owner = "meter", request_id = "mixed",
+          usage_ids = { "meter/native", "meter/b" } } }})
+        assert(#_test.sent() == 0)
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.native.updated", remaining = 42 } }})
+        local snapshot = _test.sent()[1]
+        assert(snapshot.kind == "conversation.usage.snapshot.reported")
+        assert(snapshot.body.request_id == "mixed" and #snapshot.body.values == 2)
+
+        -- Pending native correlations do not cross session boundaries.
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.native.error", message = "temporarily unavailable" } }})
+        _test.sent()
+        spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
+          kind = "conversation.usage.query.forwarded", owner = "meter", request_id = "stale",
+          usage_ids = { "meter/native" } } }})
+        assert(#_test.sent() == 0)
+        spec.to_plugin({{ type = "event", from = "sessions", body = {
+          kind = "sessions.session_start", session_id = "next" } }})
+        _test.sent()
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.native.updated", remaining = 10 } }})
+        for _, event in ipairs(_test.sent()) do
+          assert(event.body.request_id ~= "stale")
+        end
+        spec._internals.record_configured_usage({ event = "usage", request_id = "reset",
+          completion_id = "valid-after-reset",
+          extensions = { cost_a = 1, cost_b = 2, byok_b = false } })
+        assert(spec._internals.usage_value("meter/a").amount == "1")
+
+        -- Malformed durable data poisons replay and later valid records cannot heal it.
+        local replayed = provider.spawn_spec("meter", { "/bin/true" }, options())
+        _test.sent()
+        replayed.to_plugin({{ type = "event", replay = true, from = "meter", body = {
+          kind = "meter.usage.a.recorded", usage_id = "meter/a",
+          contribution_id = "bad", amount = "1e-7", currency = "USD" } }})
+        replayed.to_plugin({{ type = "event", replay = true, from = "meter", body = {
+          kind = "meter.usage.a.recorded", usage_id = "meter/a",
+          contribution_id = "good", amount = "0.5", currency = "USD" } }})
+        assert(replayed._internals.usage_value("meter/a").reason
+          == "malformed_contribution_record")
+        assert(#_test.sent() == 0)
+
+        -- Config errors are rejected while constructing the compositor.
+        local invalid = options()
+        invalid.usage.contributions[1].event_kind = nil
+        local ok = pcall(provider.spawn_spec, "meter", { "/bin/true" }, invalid)
+        assert(not ok)
+        "#,
+    )
+    .exec()
+    .expect("provider-owned usage fold");
 }
 
 #[test]

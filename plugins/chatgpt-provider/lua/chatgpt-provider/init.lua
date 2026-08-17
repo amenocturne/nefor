@@ -110,10 +110,6 @@ local function translator(name)
     local body = type(env) == "table" and env.body or nil
     if type(body) == "table" and (body.kind == t.kinds.completion_request
         or body.kind == "ProviderRequest") then return nil end
-    if type(body) == "table" and body.kind == "chat.usage.requested" then
-      if body.provider ~= name then return nil end
-      return { kind = t.kinds.usage_requested }
-    end
     return base_inbound(env)
   end
 
@@ -128,10 +124,7 @@ local function translator(name)
     end
 
     if kind == t.kinds.usage_updated or kind == t.kinds.usage_error then
-      local translated = copy(body)
-      translated.kind = kind == t.kinds.usage_updated and "chat.usage.updated" or "chat.usage.error"
-      translated.provider = name
-      return translated
+      return nil
     end
 
     local request_id = body.request_id or body.chat_id

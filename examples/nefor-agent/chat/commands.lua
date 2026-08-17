@@ -9,6 +9,10 @@ local at_path = require("libs.chat.at_path")
 local history = require("libs.chat.history")
 local transcript = require("libs.chat.transcript")
 local usage_view = require("libs.chat.usage")
+local ok_config, config = pcall(require, "config")
+local usage_config = ok_config and config.active and config.active.usage or {
+  command_ids = { "chatgpt/subscription", "openrouter/session-total" },
+}
 local Entry = require("libs.chat.entry")
 local height_cache = require("libs.chat.height_cache")
 local queued_input = require("libs.chat.queued_input")
@@ -78,30 +82,35 @@ return function(msg, state)
     }), {}
   end
   if cmd == "usage" then
-    local provider = state.provider
-    if type(provider) ~= "string" or provider == ""
-        or not (state.supports_usage or {})[provider] then
-      return shallow_merge(state, {
-        input_value = "", completion = NIL_SENTINEL,
-        popup = {
-          variant = "warning",
-          title = "/usage",
-          body = "The active provider does not expose account usage.",
-        },
-      }), {}
+    local ids = {}
+    for _, usage_id in ipairs(usage_config.command_ids or {}) do ids[#ids + 1] = usage_id end
+    if #ids == 0 then
+      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL,
+        popup = { variant = "warning", title = "/usage",
+          body = "No configured provider exposes usage." } }), {}
     end
-    local cached = (state.usage or {})[provider]
+    local cached = {}
+    for _, usage_id in ipairs(ids) do
+      if type(state.usage) == "table" and type(state.usage[usage_id]) == "table"
+          and state.usage[usage_id].kind ~= "unknown" then
+        cached[#cached + 1] = { usage_id = usage_id, usage = state.usage[usage_id] }
+      end
+    end
+    local usage_request_seq = (state.usage_request_seq or 0) + 1
+    local request_id = "chat-usage:" .. tostring(usage_request_seq)
     return shallow_merge(state, {
       input_value = "", completion = NIL_SENTINEL,
+      usage_request_seq = usage_request_seq,
       popup = {
         variant = "info",
         title = "usage",
-        body = cached and usage_view.markdown(cached) or "Fetching usage…",
-        usage_provider = provider,
+        body = #cached > 0 and usage_view.markdown(cached) or "Fetching usage…",
+        usage_request_id = request_id,
       },
     }), {
       { kind = "send_to", target = "engine",
-        body = { kind = "chat.usage.requested", provider = provider } },
+        body = { kind = "conversation.usage.query", request_id = request_id,
+          usage_ids = ids } },
     }
   end
   if cmd == "safe" or cmd == "auto" or cmd == "yolo" then

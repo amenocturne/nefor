@@ -99,6 +99,24 @@ surfaces as that provider's rejection (rollback) rather than as a pre-flight
 error. Adding such a seam would be a separate design with its own authority and
 lifecycle questions.
 
+### Provider usage
+
+Provider usage is a public composition contract separate from context-window token occupancy. Provider completion `usage` and `conversation.provider.context_usage` describe tokens for a request/model context and feed the context bar; they are not `p.usage` values and are never inferred into quota or money.
+
+The public `p.usage` compositor contract is:
+
+- `usage.exposures = { { usage_id, initial } }` registers exact IDs. Every ID must be `<actor-name>/<local-name>`; duplicate IDs in one actor are invalid, same-owner re-exposure is idempotent after reconnect, and another actor cannot claim the namespace or collide with an existing exact ID.
+- `usage.subscription = { usage_id, request_kind, updated_kind, error_kind, extract }` adapts a provider-native account snapshot. The compositor owns requests and extraction.
+- `usage.contributions = { { usage_id, extension, byok_extension, currency, event_kind } }` adapts authoritative completion metadata into a provider-owned session value, including deduplication and replay reconstruction.
+- `usage.subscribe = { subscription_id, usage_ids }` asks conversation-manager to forward live updates to the named surface. This is composition wiring, not a stored value.
+- Values are `{ kind = "subscription", ... }`, `{ kind = "monetary", amount, currency }`, `{ kind = "free" }`, or `{ kind = "unknown", reason? }`. The manager never authors one of these values.
+
+The public manager events are `conversation.usage.expose`/`exposed`/`exposure.rejected`, `query`/`query.forwarded`/`query.unavailable`/`query.rejected`, `subscribe`/`subscribe.forwarded`/`subscription.rejected`, provider reports `snapshot.reported` and `update.reported`, surface results `snapshot` and `update`, and `publish.rejected`. Queries and reports carry `request_id`; subscriptions and updates carry `subscription_id`; forwarded events also carry `requester`, `owner`, and the exact `usage_ids`. Unexposed query IDs produce `query.unavailable { usage_ids, reason }`, not manager-synthesized values. Reports must contain each requested exact ID once, belong to the reporting owner, and use a valid value variant.
+
+Runtime `conversation.usage.*` traffic is live control-plane state and sessions do not persist it. A provider needing reconstruction records only its provider-namespaced durable contribution event in the normal session JSONL. On replay the owning compositor folds those records without contacting the provider or re-emitting contributions. A new session clears that compositor ledger. Account snapshots such as ChatGPT subscription quota remain live provider state rather than reconstructed history. Public surfaces must state the same policy: the starter keeps configured `account_ids` across an in-process session switch and clears configured `session_ids` until their owner reconstructs or reports the new session.
+
+The generic OpenAI-compatible Rust plugin only parses transport facts. Standard token fields remain optional; unknown upstream usage members are preserved under `usage.extensions`, and the upstream completion ID is carried when present. Lua instance configuration supplies additional request-body members and the semantics that interpret extensions. Missing usage or completion identity is not turned into authoritative zero accounting.
+
 ## Provider HTTPS trust
 
 Network-owning Rust providers construct HTTPS clients through the
