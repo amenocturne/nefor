@@ -44,7 +44,7 @@ do
   }))
   append(store, fact("xr", "lead", "tool_result_recorded", {
     exchange_id = "exchange:1", result = { text = "data" },
-    completion_delivery = "inline",
+    completion_delivery = "sync",
   }))
   append(store, fact("retry", "lead", "retry_started", { retry_id = "retry:1", message_id = "assistant:1", reason = "rate_limit", provenance = { model = "three" } }))
   append(store, fact("mc", "lead", "message_completed", { message_id = "assistant:1", completion = { finish_reason = "stop" } }))
@@ -53,7 +53,7 @@ do
   eq(#done.messages[1].chunks, 5, "universal content chunks remain individual")
   for index, chunk in ipairs(chunks) do eq(done.messages[1].chunks[index], chunk, "chunk order preserved") end
   eq(done.exchanges[1].tool_call_id, "provider-call-7"); eq(done.exchanges[1].arguments.path, "x")
-  eq(done.exchanges[1].completion_delivery, "inline",
+  eq(done.exchanges[1].completion_delivery, "sync",
     "completion delivery is canonical exchange metadata")
   eq(done.exchanges[1].status, "result"); eq(#done.retries, 1)
   rejects(store, fact("late", "lead", "provenance_updated", { provenance = { model = "late" } }), "conversation_terminal")
@@ -109,7 +109,7 @@ do
     exchange_id = "x", call = { id = "external-x", name = "mag", arguments = {} },
   }))
   rejects(store, fact("xr", "delivery", "tool_result_recorded", {
-    exchange_id = "x", result = {}, completion_delivery = "async",
+    exchange_id = "x", result = {}, completion_delivery = "legacy",
   }), "invalid_completion_delivery")
 end
 

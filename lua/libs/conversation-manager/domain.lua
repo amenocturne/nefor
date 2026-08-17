@@ -7,7 +7,7 @@ local json_data = require("core.json_data")
 local terminal_conversation = { completed = true, interrupted = true, failed = true }
 local chunk_kinds = { text = true, reasoning = true, structured = true, native = true }
 local roles = { system = true, user = true, assistant = true, tool = true }
-local completion_deliveries = { inline = true, detached = true }
+local completion_deliveries = { sync = true, async = true }
 -- A message's transcript disposition. "transcript" is ordinary conversation;
 -- "diagnostic" is model context that no surface renders as conversation (a
 -- rejected structured-output attempt and its correction prompt). Both remain in

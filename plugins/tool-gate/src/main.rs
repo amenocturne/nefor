@@ -2179,7 +2179,7 @@ mod tests {
             "kind": "tool.result",
             "id": "gate-1",
             "output": {"status": "executing", "run_id": "mag-eval-1"},
-            "completion_delivery": "detached"
+            "completion_delivery": "async"
         })
         .as_object()
         .unwrap()
@@ -2191,7 +2191,7 @@ mod tests {
         assert_eq!(returned["body"]["id"], "r7/cap-3");
         assert_eq!(returned["body"]["name"], "write_file");
         assert_eq!(returned["body"]["output"]["run_id"], "mag-eval-1");
-        assert_eq!(returned["body"]["completion_delivery"], "detached");
+        assert_eq!(returned["body"]["completion_delivery"], "async");
     }
 
     #[tokio::test]

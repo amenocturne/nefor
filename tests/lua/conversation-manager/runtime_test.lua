@@ -220,9 +220,9 @@ delta = append_fact("tool-call", "tool_call_completed", {
 })
 eq(delta.change.exchange.id, "call-1", "universal projections preserve the exchange identity")
 delta = append_fact("tool-result", "tool_result_recorded", {
-  exchange_id = "call-1", result = { text = "data" }, completion_delivery = "detached",
+  exchange_id = "call-1", result = { text = "data" }, completion_delivery = "async",
 })
-eq(delta.change.exchange.completion_delivery, "detached",
+eq(delta.change.exchange.completion_delivery, "async",
   "canonical projection preserves explicit completion delivery")
 delta = append_fact("assistant-done", "message_completed", {
   message_id = "assistant", model = "universal-model", duration_ms = 42,

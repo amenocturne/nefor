@@ -167,7 +167,7 @@ do
 
   -- reply to the FIRST call: batch completes → one aggregated ToolHandle + complete
   local r1 = inst.deliver(reply(invokes[1].ref,
-    { output = "match at line 3" }, nil, "detached"))
+    { output = "match at line 3" }, nil, "async"))
   assert_true(r1 == nil, "the completing reply returns nil — completion arrives via mag.complete")
 
   assert_eq(count_kind(msgs, "generic-tool.ToolHandle"), 1, "exactly one aggregated handle for the batch")
@@ -179,7 +179,7 @@ do
   assert_eq(handle.results[1].id, "call-1", "result 1 keeps the first call's tool_call_id")
   assert_eq(handle.results[1].name, "grep", "result 1 keeps the first tool name")
   assert_eq(handle.results[1].output.output, "match at line 3", "result 1 carries the first call's output")
-  assert_eq(handle.results[1].completion_delivery, "detached",
+  assert_eq(handle.results[1].completion_delivery, "async",
     "run-tool preserves explicit completion delivery")
   assert_eq(handle.results[2].id, "call-2", "result 2 keeps the second call's tool_call_id")
   assert_eq(handle.results[2].output.output, "file body", "result 2 carries the second call's output")
@@ -260,7 +260,7 @@ do
   local c = inst.deliver(single("run-tool", "generic-tool.ToolHandle", {
     results = {
       { id = "call-1", name = "grep", output = "match at line 3",
-        completion_delivery = "inline" },
+        completion_delivery = "sync" },
       { id = "call-2", name = "fs/read", output = { path = "a.txt", bytes = 12 } },
       { id = "call-3", name = "shell.script", error = "exit 1" },
     },
@@ -276,7 +276,7 @@ do
   assert_eq(out.messages[1].role, "tool", "adapted messages are tool-role")
   assert_eq(out.messages[1].tool_call_id, "call-1", "message keeps the tool_call_id for provider pairing")
   assert_eq(out.messages[1].content, "match at line 3", "string output passes through as content")
-  assert_eq(out.messages[1].completion_delivery, "inline",
+  assert_eq(out.messages[1].completion_delivery, "sync",
     "tool-result preserves completion delivery for canonical recording")
 
   -- structured output is serialized only in the provider-facing projection.

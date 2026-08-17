@@ -224,8 +224,8 @@ local state = {
   pending_mag_load = {},
 
   -- Invocations awaiting the short terminal-result grace deadline, keyed by
-  -- exact run_id. Timeout emits the unchanged detached acknowledgment;
-  -- terminal settlement claims the same slot for inline delivery.
+  -- exact run_id. Timeout emits the unchanged async acknowledgment;
+  -- terminal settlement claims the same slot for sync delivery.
   completion_grace_waiters = {},
 
   -- Exact-run synchronous terminate calls, keyed by run_id. Each entry owns
@@ -1253,7 +1253,7 @@ local function handle_mag_run_result(body)
 
   local grace_waiter = cancel_completion_grace(run_id)
   if grace_waiter then
-    emit_await_outcome(grace_waiter.firing_id, settled.outcome, "inline")
+    emit_await_outcome(grace_waiter.firing_id, settled.outcome, "sync")
   end
 
   local termination_waiters = take_termination_waiters(run_id)
@@ -1868,7 +1868,7 @@ local function expire_completion_grace(run_id)
   local waiter = state.completion_grace_waiters[run_id]
   if not waiter then return false end
   state.completion_grace_waiters[run_id] = nil
-  emit_tool_result_ok(waiter.firing_id, waiter.ack, "detached")
+  emit_tool_result_ok(waiter.firing_id, waiter.ack, "async")
   return true
 end
 

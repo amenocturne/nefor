@@ -102,12 +102,8 @@ function M.new(options)
   -- Authored history is initial conversation state, not part of the live turn
   -- that follows it. Record it without a turn id so a provider can rebuild the
   -- same context from canonical facts without MAG retaining another transcript.
-  local completion_deliveries = { inline = true, detached = true }
-
   local function completion_delivery_of(message)
-    local delivery = type(message) == "table" and message.completion_delivery or nil
-    if completion_deliveries[delivery] then return delivery end
-    return nil
+    return type(message) == "table" and message.completion_delivery or nil
   end
 
   function recorder:seed_message(message)

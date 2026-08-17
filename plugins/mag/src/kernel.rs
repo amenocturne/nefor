@@ -1154,7 +1154,7 @@ mod tests {
                     "termination": {"kind": "code", "code": 9}
                 })),
                 None,
-                Some("detached")
+                Some("async")
             )
             .expect("structured response"),
             Some("shell-script".into())

@@ -78,12 +78,12 @@ actions = reduce({
     kind = "tool_result_recorded", turn_id = "turn-1",
     exchange = {
       id = "exchange-1", name = "read_file", status = "result", result = "ok",
-      completion_delivery = "detached",
+      completion_delivery = "async",
     },
   },
 })
 eq(actions[1].output, "ok", "tool result survives projection")
-eq(actions[1].completion_delivery, "detached",
+eq(actions[1].completion_delivery, "async",
   "completion delivery survives the surface projection")
 
 actions = reduce({

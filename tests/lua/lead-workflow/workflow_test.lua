@@ -953,10 +953,10 @@ do
   assert_eq(result.body.output.status, "completed",
     "completion before grace returns the canonical terminal result")
   assert_eq(result.body.output.result.value, "fast result",
-    "synchronous result preserves canonical payload")
+    "sync result preserves canonical payload")
   assert_true(timers[1].canceled, "terminal settlement cancels its deadline")
   assert_eq(has_relayed_lead_turn(), false,
-    "inline-delivered completion is not relayed as a second lead turn")
+    "sync-delivered completion is not relayed as a second lead turn")
 end
 
 do
@@ -973,9 +973,9 @@ do
   assert_true(timers[1].canceled, "failed settlement cancels its deadline")
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
-  end), nil, "inline mag-eval has no duplicate terminal result projection")
+  end), nil, "sync mag-eval has no duplicate terminal result projection")
   assert_eq(has_relayed_lead_turn(), false,
-    "inline-delivered failure is not relayed a second time")
+    "sync-delivered failure is not relayed a second time")
 end
 
 do
@@ -986,10 +986,10 @@ do
   timers[1].callback()
   local ack = tool_result("grace-timeout")
   assert_eq(ack.body.output.status, "executing",
-    "deadline returns the existing asynchronous acknowledgment")
+    "deadline returns the existing async acknowledgment")
   assert_eq(ack.body.output.run_id, run_id, "acknowledgment preserves the exact run id")
   assert_eq(ack.body.output.engine, "mag-kernel", "acknowledgment preserves the engine")
-  assert_eq(ack.body.completion_delivery, "detached",
+  assert_eq(ack.body.completion_delivery, "async",
     "grace acknowledgment marks completion for later owner delivery")
   _test.calls_clear()
   feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
@@ -1010,9 +1010,9 @@ do
   timers[1].callback()
   local eval_ack = tool_result("grace-timeout-eval")
   assert_eq(eval_ack.body.output.status, "executing",
-    "mag-eval identifies the detached grace outcome")
-  assert_eq(eval_ack.body.completion_delivery, "detached",
-    "mag-eval grace acknowledgment marks detached delivery")
+    "mag-eval identifies the async grace outcome")
+  assert_eq(eval_ack.body.completion_delivery, "async",
+    "mag-eval grace acknowledgment marks async delivery")
   clock = clock + 432000
   _test.calls_clear()
   feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
@@ -1020,7 +1020,7 @@ do
   local block = find_call(decode_calls(), function(c)
     return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
   end)
-  assert_true(block ~= nil, "ainline mag-eval emits the standard terminal result block")
+  assert_true(block ~= nil, "async mag-eval emits the standard terminal result block")
   assert_eq(block.body.invocation_kind, "eval",
     "terminal result keeps the canonical eval invocation kind")
   assert_eq(block.body.invocation_label, "Print value",

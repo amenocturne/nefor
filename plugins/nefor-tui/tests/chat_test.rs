@@ -1155,7 +1155,7 @@ fn structured_answers_keep_provider_order_and_footer_across_graph_status() {
 
     let out = render_str(&mut engine);
     let before = out.find("answer before status").expect("first answer");
-    let status = out.find("mag result [detached]").expect("graph status");
+    let status = out.find("mag result [async]").expect("graph status");
     let after = out.find("answer after status").expect("second answer");
     assert!(
         before < status && status < after,
@@ -1198,7 +1198,7 @@ fn graph_results_wait_for_stream_and_open_tool_then_flush_fifo() {
     }
     let open = render_str(&mut engine);
     assert!(
-        open.contains("lead answer") && !open.contains("mag result [detached]"),
+        open.contains("lead answer") && !open.contains("mag result [async]"),
         "results must remain hidden while the lead stream is open:\n{open}"
     );
 
@@ -3587,7 +3587,7 @@ fn collapsed_path_with_one_display_column_shows_only_clipping_indicator() {
 }
 
 #[test]
-fn delayed_mag_lifecycle_renders_required_inline_detached_and_result_rows() {
+fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
     let mut engine = Engine::new(120, 30).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
@@ -3607,11 +3607,11 @@ fn delayed_mag_lifecycle_renders_required_inline_detached_and_result_rows() {
         "mag",
         json!({ "action": "execute", "file": "hidden.mag" }),
         json!({ "status": "completed" }),
-        "inline",
+        "sync",
     );
     let canonical = render_snapshot(&mut engine);
     assert!(
-        canonical.contains("▸ mag [inline] · hidden.mag"),
+        canonical.contains("▸ mag [sync] · hidden.mag"),
         "{canonical}"
     );
 
@@ -3638,7 +3638,7 @@ fn delayed_mag_lifecycle_renders_required_inline_detached_and_result_rows() {
         "async",
         json!({ "status": "executing" }),
         false,
-        Some("detached"),
+        Some("async"),
     );
     fixture_tool_started(
         &mut engine,
@@ -3651,7 +3651,7 @@ fn delayed_mag_lifecycle_renders_required_inline_detached_and_result_rows() {
         "eval-sync",
         json!({ "status": "completed" }),
         false,
-        Some("inline"),
+        Some("sync"),
     );
     fixture_tool_started(
         &mut engine,
@@ -3664,7 +3664,7 @@ fn delayed_mag_lifecycle_renders_required_inline_detached_and_result_rows() {
         "eval-async",
         json!({ "status": "executing" }),
         false,
-        Some("detached"),
+        Some("async"),
     );
     dispatch_event(
         &mut engine,
@@ -3686,30 +3686,30 @@ fn delayed_mag_lifecycle_renders_required_inline_detached_and_result_rows() {
     let out = render_snapshot(&mut engine);
     assert!(out.contains("▸ mag · legacy.mag"), "{out}");
     assert!(
-        !out.contains("mag [inline] · legacy.mag") && !out.contains("mag [detached] · legacy.mag"),
+        !out.contains("mag [sync] · legacy.mag") && !out.contains("mag [async] · legacy.mag"),
         "older records without metadata remain unlabeled: {out}"
     );
-    assert!(out.contains("▸ mag [detached] · ship.mag"), "{out}");
+    assert!(out.contains("▸ mag [async] · ship.mag"), "{out}");
     assert!(
-        out.contains("▸ mag eval [inline] · Inspect workspace"),
+        out.contains("▸ mag eval [sync] · Inspect workspace"),
         "{out}"
     );
     assert!(
-        out.contains("▸ mag eval [detached] · Probe dependencies"),
+        out.contains("▸ mag eval [async] · Probe dependencies"),
         "{out}"
     );
     assert!(
-        out.contains("mag result [detached] · ship.mag · 01d 03h 10m 15s"),
+        out.contains("mag result [async] · ship.mag · 01d 03h 10m 15s"),
         "{out}"
     );
     assert!(
-        out.contains("mag result [detached] · Probe dependencies · 07m 12s"),
+        out.contains("mag result [async] · Probe dependencies · 07m 12s"),
         "{out}"
     );
     assert_eq!(
         out.matches("Inspect workspace").count(),
         1,
-        "inline mag-eval must remain represented by only its invocation row: {out}"
+        "sync mag-eval must remain represented by only its invocation row: {out}"
     );
     assert!(
         !out.contains("FAILED"),
@@ -10027,7 +10027,7 @@ fn short_sidebar_has_no_scroll_extent_and_keeps_content_width() {
 
 // ── Run-result (mag workflow) rendering ──────────────────────────────────
 
-/// The collapsed run-result entry reads as a `mag result [detached]` line carrying
+/// The collapsed run-result entry reads as a `mag result [async]` line carrying
 /// the human-readable run name and wall-clock duration — nothing else.
 /// The machine detail (exact run_id, node count) only appears once the
 /// entry is unfolded (Ctrl+O), matching the reasoning/tool fold vocabulary.
@@ -10056,10 +10056,8 @@ fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
     assert!(
-        out.contains("mag result [detached]")
-            && out.contains("nefor_bughunt")
-            && out.contains("34s"),
-        "collapsed run-result must show `mag result [detached] · <name> · <duration>`: {out:?}"
+        out.contains("mag result [async]") && out.contains("nefor_bughunt") && out.contains("34s"),
+        "collapsed run-result must show `mag result [async] · <name> · <duration>`: {out:?}"
     );
     assert!(
         !out.contains("mag-nefor_bughunt-2026") && !out.contains("2 nodes"),
@@ -10084,7 +10082,7 @@ fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
     );
 }
 
-/// A failed run keeps the `mag result [detached]` framing but appends a FAILED tail
+/// A failed run keeps the `mag result [async]` framing but appends a FAILED tail
 /// so a failure is unmistakable in the collapsed view.
 #[test]
 fn graph_result_failed_collapsed_reads_failed() {
@@ -10108,9 +10106,7 @@ fn graph_result_failed_collapsed_reads_failed() {
     let _ = render_str(&mut engine);
     let out = engine.snapshot();
     assert!(
-        out.contains("mag result [detached]")
-            && out.contains("broken_run")
-            && !out.contains("FAILED"),
+        out.contains("mag result [async]") && out.contains("broken_run") && !out.contains("FAILED"),
         "failed run-result keeps outcome in glyph/style without an outcome word: {out:?}"
     );
 }
@@ -12191,7 +12187,7 @@ fn assistant_footer_stays_compact_while_async_result_uses_full_wall_clock() {
         "assistant footer must keep the compact formatter:\n{snapshot}"
     );
     assert!(
-        snapshot.contains("mag result [detached] · long-result · 05h 10m 15s"),
+        snapshot.contains("mag result [async] · long-result · 05h 10m 15s"),
         "terminal async result must keep the full wall-clock formatter:\n{snapshot}"
     );
 }
