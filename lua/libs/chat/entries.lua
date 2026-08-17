@@ -132,12 +132,23 @@ local function raw_tool_expanded(entry)
   end
   return tui.column { gap = 0, children = rows }
 end
+local function delayed_mag_delivery(entry, args)
+  if type(entry.display) ~= "table" or entry.display.lifecycle ~= "delayed" then return nil end
+  local is_execute = entry.name == "mag-eval"
+    or (entry.name == "mag" and type(args) == "table" and args.action == "execute")
+  if not is_execute or entry.output == nil then return nil end
+  if type(entry.output) == "table" and entry.output.status == "executing" then return "async" end
+  return "sync"
+end
+
 local function semantic_projection(entry)
   local display = require("libs.chat.tool_display")
   local args = entry.raw_input
   if args == nil then args = entry.input_table or entry.input end
   local projected, err = display.project(entry.display, args, entry.output, entry.error)
   if not projected then error("tool display invariant: " .. tostring(err)) end
+  local delivery = delayed_mag_delivery(entry, args)
+  if delivery then projected.label = projected.label .. " [" .. delivery .. "]" end
   if projected and type(entry.display_primary) == "string" and entry.display_primary ~= "" then
     projected.primary = entry.display_primary
     projected.primary_is_path = false

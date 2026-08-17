@@ -971,6 +971,9 @@ do
     "failure before grace returns the canonical terminal failure")
   assert_eq(result.body.status, "failed", "terminal failure keeps failed status")
   assert_true(timers[1].canceled, "failed settlement cancels its deadline")
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
+  end), nil, "synchronous mag-eval has no duplicate terminal result projection")
   assert_eq(has_relayed_lead_turn(), false,
     "synchronously delivered failure is not relayed a second time")
 end
@@ -993,6 +996,32 @@ do
     "completion after timeout follows the normal owner-scoped notification path")
   assert_eq(tool_result("grace-timeout"), nil,
     "late completion does not deliver the tool result twice")
+end
+
+do
+  fresh()
+  local clock = 10000
+  lw._internals.set_monotonic_now_ms(function() return clock end)
+  local timers = controlled_grace()
+  local run_id = start_eval_run("grace-timeout-eval")
+  _test.calls_clear()
+  timers[1].callback()
+  assert_eq(tool_result("grace-timeout-eval").body.output.status, "executing",
+    "mag-eval identifies the asynchronous grace outcome")
+  clock = clock + 432000
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed",
+    result = { text = "late eval result" } })
+  local block = find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
+  end)
+  assert_true(block ~= nil, "asynchronous mag-eval emits the standard terminal result block")
+  assert_eq(block.body.invocation_kind, "eval",
+    "terminal result keeps the canonical eval invocation kind")
+  assert_eq(block.body.invocation_label, "Print value",
+    "terminal result keeps the canonical human-facing intent")
+  assert_eq(block.body.duration_ms, 432000,
+    "terminal result reuses the run registry's elapsed duration")
 end
 
 do

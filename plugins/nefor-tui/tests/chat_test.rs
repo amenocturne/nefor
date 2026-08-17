@@ -3589,11 +3589,28 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
     );
     fixture_tool_started(
         &mut engine,
-        "eval",
+        "eval-sync",
         "mag-eval",
         json!({ "intent": "Inspect workspace" }),
     );
-    fixture_tool_completed(&mut engine, "eval", json!({ "status": "completed" }), false);
+    fixture_tool_completed(
+        &mut engine,
+        "eval-sync",
+        json!({ "status": "completed" }),
+        false,
+    );
+    fixture_tool_started(
+        &mut engine,
+        "eval-async",
+        "mag-eval",
+        json!({ "intent": "Probe dependencies" }),
+    );
+    fixture_tool_completed(
+        &mut engine,
+        "eval-async",
+        json!({ "status": "executing" }),
+        false,
+    );
     dispatch_event(
         &mut engine,
         json!({
@@ -3602,14 +3619,38 @@ fn delayed_mag_lifecycle_renders_required_sync_async_and_result_rows() {
             "duration_ms": 97_815_000,
         }),
     );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append", "run_id": "run-eval",
+            "invocation_label": "Probe dependencies", "invocation_kind": "eval",
+            "status": "success", "duration_ms": 432_000,
+        }),
+    );
     fixture_assistant_completed(&mut engine, None, json!({}));
     let out = render_snapshot(&mut engine);
-    assert!(out.contains("▸ mag · hidden.mag"), "{out}");
-    assert!(out.contains("▸ mag · ship.mag"), "{out}");
-    assert!(out.contains("▸ mag eval · Inspect workspace"), "{out}");
+    assert!(out.contains("▸ mag [sync] · hidden.mag"), "{out}");
+    assert!(out.contains("▸ mag [async] · ship.mag"), "{out}");
+    assert!(
+        out.contains("▸ mag eval [sync] · Inspect workspace"),
+        "{out}"
+    );
+    assert!(
+        out.contains("▸ mag eval [async] · Probe dependencies"),
+        "{out}"
+    );
     assert!(
         out.contains("mag result [async] · ship.mag · 01d 03h 10m 15s"),
         "{out}"
+    );
+    assert!(
+        out.contains("mag result [async] · Probe dependencies · 07m 12s"),
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("Inspect workspace").count(),
+        1,
+        "synchronous mag-eval must remain represented by only its invocation row: {out}"
     );
     assert!(
         !out.contains("FAILED"),

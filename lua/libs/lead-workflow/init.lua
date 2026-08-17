@@ -1260,7 +1260,7 @@ local function handle_mag_run_result(body)
 
   if not run_registry:claim_delivery(run_id) then return end
   local root_owned = run.dispatcher_id == nil
-  if root_owned and not termination_waiters then
+  if root_owned and not grace_waiter and not termination_waiters then
     emit_mag_result_block(run, failed and "failed" or "success",
       failed and nil or body.output_path, failed and err or nil)
   end
