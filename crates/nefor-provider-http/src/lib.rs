@@ -4,12 +4,40 @@ use rustls_pki_types::CertificateDer;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderHttpError {
-    #[error("native system trust store contained no usable certificates ({errors} entries failed to load)")]
-    UnusableNativeRoots { errors: usize },
+    #[error("native system trust store contained no usable certificates: {errors}")]
+    UnusableNativeRoots { errors: NativeRootErrors },
     #[error("native system trust store certificate could not be added to the HTTPS client: {0}")]
     InvalidNativeRoot(#[source] reqwest::Error),
     #[error("provider HTTPS client could not be built: {0}")]
     ClientBuild(#[source] reqwest::Error),
+}
+
+#[derive(Debug)]
+pub struct NativeRootErrors(Vec<rustls_native_certs::Error>);
+
+impl NativeRootErrors {
+    pub fn as_slice(&self) -> &[rustls_native_certs::Error] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NativeRootErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_slice() {
+            [] => f.write_str("no loader errors were reported"),
+            [error] => write!(f, "one entry failed to load: {error}"),
+            errors => {
+                write!(f, "{} entries failed to load: ", errors.len())?;
+                for (index, error) in errors.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{error}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +69,7 @@ fn builder_from_native_roots(
     };
     if roots.certs.is_empty() {
         return Err(ProviderHttpError::UnusableNativeRoots {
-            errors: roots.errors.len(),
+            errors: NativeRootErrors(roots.errors),
         });
     }
 
@@ -83,9 +111,43 @@ mod tests {
     fn empty_native_store_is_rejected_without_loader_errors() {
         let error = builder_from_native_roots(CertificateResult::default())
             .expect_err("empty native store must not fall back to bundled roots only");
-        assert!(matches!(
-            error,
-            ProviderHttpError::UnusableNativeRoots { errors: 0 }
-        ));
+        let ProviderHttpError::UnusableNativeRoots { errors } = &error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(errors.as_slice().is_empty());
+        assert_eq!(
+            error.to_string(),
+            "native system trust store contained no usable certificates: no loader errors were reported"
+        );
+    }
+
+    #[test]
+    fn unusable_native_store_preserves_and_displays_loader_errors() {
+        let mut roots = CertificateResult::default();
+        roots.errors.push(rustls_native_certs::Error {
+            context: "failed to load certificate file",
+            kind: rustls_native_certs::ErrorKind::Io {
+                inner: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+                path: "/private/cert.pem".into(),
+            },
+        });
+        roots.errors.push(rustls_native_certs::Error {
+            context: "failed to load certificate directory",
+            kind: rustls_native_certs::ErrorKind::Io {
+                inner: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+                path: "/private/certs".into(),
+            },
+        });
+
+        let error = builder_from_native_roots(roots)
+            .expect_err("native store with only loader errors must be rejected");
+        let ProviderHttpError::UnusableNativeRoots { errors } = &error else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(errors.as_slice().len(), 2);
+        assert_eq!(
+            error.to_string(),
+            "native system trust store contained no usable certificates: 2 entries failed to load: failed to load certificate file: access denied at '/private/cert.pem'; failed to load certificate directory: missing at '/private/certs'"
+        );
     }
 }
