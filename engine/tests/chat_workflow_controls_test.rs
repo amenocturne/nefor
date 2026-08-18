@@ -147,6 +147,11 @@ fn context_usage_projection_contract() {
 }
 
 #[test]
+fn provider_quota_presentation_policy() {
+    run_pure_chat_fixture("quota_policy_test.lua");
+}
+
+#[test]
 fn usage_reset_display_contract() {
     run_pure_chat_fixture("usage_test.lua");
 }

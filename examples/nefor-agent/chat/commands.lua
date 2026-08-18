@@ -9,6 +9,7 @@ local at_path = require("libs.chat.at_path")
 local history = require("libs.chat.history")
 local transcript = require("libs.chat.transcript")
 local usage_view = require("libs.chat.usage")
+local quota_policy = require("libs.chat.quota_policy")
 local ok_config, config = pcall(require, "config")
 local usage_config = ok_config and config.active and config.active.usage or {
   command_ids = { "chatgpt/subscription", "openrouter/session-total" },
@@ -82,6 +83,9 @@ return function(msg, state)
     }), {}
   end
   if cmd == "usage" then
+    if not quota_policy.surfaces_enabled(usage_config) then
+      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {}
+    end
     local ids = {}
     for _, usage_id in ipairs(usage_config.command_ids or {}) do ids[#ids + 1] = usage_id end
     if #ids == 0 then

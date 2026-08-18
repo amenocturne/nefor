@@ -101,7 +101,7 @@ lifecycle questions.
 
 ### Provider usage
 
-Provider usage is a public composition contract separate from context-window token occupancy. Provider completion `usage` and `conversation.provider.context_usage` describe tokens for a request/model context and feed the context bar; they are not `p.usage` values and are never inferred into quota or money.
+Provider usage is a public composition contract separate from context-window token occupancy. Provider completion `usage` and `conversation.provider.context_usage` describe tokens for a request/model context and feed the context bar; they are not `p.usage` values and are never inferred into quota or money. A surface may set `config.active.usage.quota = "none"` to state that its configured providers have no user quota at all; the starter then omits quota commands and status values while leaving completion token parsing and accounting unchanged. Missing usage data, including an upstream `usage: null`, never implies this policy.
 
 The public `p.usage` compositor contract is:
 

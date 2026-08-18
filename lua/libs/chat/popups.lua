@@ -11,6 +11,9 @@ local preview_state = require("libs.chat.preview_state")
 local preview_view  = require("libs.chat.preview_view")
 local run_panel     = require("libs.chat.run_panel")
 local model_selection = require("libs.chat.model_selection")
+local quota_policy = require("libs.chat.quota_policy")
+local ok_config, config = pcall(require, "config")
+local usage_config = ok_config and config.active and config.active.usage or nil
 
 local STYLE         = common.STYLE
 local C             = common.C
@@ -48,8 +51,14 @@ Slash commands:
   /model       browse every provider's catalog and pick a model
   /model <provider> <model>  switch provider and model together
   /model <model>             switch when one catalog offers that model
-  /usage       configured provider usage
   /resume      resume a previous session]]
+
+local function help_body()
+  if not quota_policy.surfaces_enabled(usage_config) then return HELP_BODY end
+  return HELP_BODY:gsub(
+    "  /resume      resume a previous session",
+    "  /usage       configured provider usage\n  /resume      resume a previous session")
+end
 
 function M.help(state)
   if not state.popup or state.popup.variant ~= "help" then return nil end
@@ -62,7 +71,7 @@ function M.help(state)
     title        = "── help ──",
     title_style  = STYLE.popup_user,
     child        = tui.column { gap = 1, children = {
-      tui.text { content = HELP_BODY, wrap = "word" },
+      tui.text { content = help_body(), wrap = "word" },
       tui.text { content = "(Esc / Q / Enter to close)", style = STYLE.status_dim },
     }},
   })

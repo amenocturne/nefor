@@ -7,6 +7,7 @@ local C       = common.C
 local STYLE   = common.STYLE
 local humanize_tokens = common.humanize_tokens
 local usage_view = require("libs.chat.usage")
+local quota_policy = require("libs.chat.quota_policy")
 local extensions = require("libs.chat.extensions")
 local ok_config, config = pcall(require, "config")
 local usage_config = ok_config and config.active and config.active.usage or {
@@ -106,7 +107,9 @@ local function build_segments(state)
     elseif available ~= nil and available <= 25 then fg = C.status_warn end
     segs[#segs + 1] = { spans = { { text = usage_text, fg = fg } } }
   end
-  for _, usage_id in ipairs(usage_config.statusline_ids or {}) do add_usage(usage_id) end
+  if quota_policy.surfaces_enabled(usage_config) then
+    for _, usage_id in ipairs(usage_config.statusline_ids or {}) do add_usage(usage_id) end
+  end
 
   return segs
 end

@@ -5,6 +5,12 @@
 
 local M = {}
 local extensions = require("libs.chat.extensions")
+local quota_policy = require("libs.chat.quota_policy")
+
+local function active_usage_config()
+  local ok, config = pcall(require, "config")
+  return ok and config.active and config.active.usage or nil
+end
 
 M.BASE_COMMANDS = {
   { name = "new",     aliases = { "clear" }, hint = "start a fresh chat (clears transcript)", takes_args = false },
@@ -26,7 +32,8 @@ M.BASE_COMMANDS = {
 }
 
 local function commands()
-  return extensions.commands(M.BASE_COMMANDS)
+  return quota_policy.filter_commands(
+    extensions.commands(M.BASE_COMMANDS), active_usage_config())
 end
 
 local function command_matches(cmd, q)
