@@ -645,6 +645,13 @@ async fn handle_load(
             if let Err(error) = nefor_mag::validate_loaded_rules(&loaded) {
                 return send_event(out_tx, mag_error_body(in_reply_to, &error)).await;
             }
+            let modification = match artifact_modification(&artifact) {
+                Ok(modification) => modification,
+                Err(error) => return send_event(out_tx, error_body(in_reply_to, &error)).await,
+            };
+            if let Err(error) = preflight_provider_schemas(&modification) {
+                return send_event(out_tx, error_body(in_reply_to, &error)).await;
+            }
             // The registry's factory names ride along so the control plane can
             // validate reasoner/factory types against the kernel's source of
             // truth instead of a hand-synced allowlist.
@@ -937,11 +944,39 @@ fn preflight_provider_schemas(modification: &Value) -> Result<(), String> {
             .map_err(|error| {
                 format!("structured-output {id:?}: invalid MAG type schema: {error}")
             })?;
-        schema
-            .to_provider_schema()
-            .map_err(|error| format!("structured-output {id:?}: {error}"))?;
+        schema.to_provider_schema().map_err(|error| {
+            let correction = if schema_contains_named(&schema.root, "nefor.contracts.AgentError") {
+                "nefor.actors.agent adds nefor.contracts.AgentError automatically; pass only the success output type to the agent and use (| SuccessType nefor.contracts.AgentError) only at the agent result/output boundary"
+            } else {
+                "replace the unsupported semantic field/type with a concrete strict-JSON shape before using it as structured output"
+            };
+            format!(
+                "structured-output actor {id:?}: output schema cannot be lowered for the provider: {error}; correction: {correction}"
+            )
+        })?;
     }
     Ok(())
+}
+
+fn schema_contains_named(schema: &nefor_mag::schema::SchemaType, expected: &str) -> bool {
+    use nefor_mag::schema::SchemaType;
+    match schema {
+        SchemaType::List { item } => schema_contains_named(item, expected),
+        SchemaType::Map { value } => schema_contains_named(value, expected),
+        SchemaType::Record { fields } => fields
+            .iter()
+            .any(|field| schema_contains_named(&field.schema, expected)),
+        SchemaType::Union { variants } => variants
+            .iter()
+            .any(|variant| schema_contains_named(&variant.schema, expected)),
+        SchemaType::Product { components } => components
+            .iter()
+            .any(|component| schema_contains_named(component, expected)),
+        SchemaType::Named { name, body } => {
+            name == expected || schema_contains_named(body, expected)
+        }
+        _ => false,
+    }
 }
 
 /// Merge a per-actor params overlay into a modification's actors before spawn.
@@ -1707,6 +1742,201 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_agent_error_output_rejects_during_load_before_run_registration() {
+        let root =
+            std::env::temp_dir().join(format!("mag-malformed-agent-output-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(
+            root.join("main.mag"),
+            r#"
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(let [start (nefor.actors.task-source "task" "test")
+      worker (nefor.actors.agent
+        (as nefor.actors.AgentConfig {:id "worker"
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.no-identifier)
+         :provider "mock-provider"
+         :system "Answer."
+         :tools (as (List String) [])
+         :da-policy (nefor.contracts.no-da-policy)
+         :max-corrections 0})
+        (type-tag nefor.contracts.Task) "task"
+        (type-tag (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))
+      result (nefor.graph.output "result"
+        (type-tag (| (| nefor.contracts.TextAnswer nefor.contracts.AgentError)
+                     nefor.contracts.AgentError)))]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start worker)
+         (nefor.graph.edge worker result)]))))
+"#,
+        )
+        .expect("program");
+        let module_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/nefor-agent/mag/lib");
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let host = LuaHost::load_kernel(
+            &manifest.join("lua/mag-kernel/init.lua"),
+            Some(&manifest.join("../../lua")),
+        )
+        .expect("kernel");
+        let body = serde_json::json!({
+            "id": "load-malformed",
+            "source_dir": root,
+            "module_roots": [module_root],
+            "entry": "main.mag"
+        });
+        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
+        let mut program = None;
+        handle_load(
+            &out_tx,
+            body.as_object().expect("load body"),
+            Some("load-malformed"),
+            &mut program,
+            &host,
+        )
+        .await
+        .expect("load rejection is a protocol response");
+
+        let outgoing = out_rx.try_recv().expect("load rejection");
+        let Body::Event(body) = outgoing.body else {
+            panic!("expected event response")
+        };
+        assert_eq!(body["kind"], ERROR_KIND);
+        let message = body["message"].as_str().expect("actionable error");
+        assert!(message.contains("worker.llm"), "{message}");
+        assert!(message.contains("nefor.contracts.AgentError"), "{message}");
+        assert!(message.contains("last_output"), "{message}");
+        assert!(
+            message.contains("pass only the success output type"),
+            "{message}"
+        );
+        assert!(program.is_none(), "invalid program is not installed");
+        assert!(
+            host.drain_emits().expect("kernel emits").is_empty(),
+            "load rejection cannot emit mag.run_started"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn valid_text_answer_agent_loads_through_existing_path() {
+        let root =
+            std::env::temp_dir().join(format!("mag-valid-text-agent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(
+            root.join("main.mag"),
+            r#"
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(let [start (nefor.actors.task-source "task" "test")
+      worker (nefor.actors.agent
+        (as nefor.actors.AgentConfig {:id "worker"
+         :model (nefor.contracts.no-identifier)
+         :profile (nefor.contracts.no-identifier)
+         :provider "mock-provider"
+         :system "Answer."
+         :tools (as (List String) [])
+         :da-policy (nefor.contracts.no-da-policy)
+         :max-corrections 0})
+        (type-tag nefor.contracts.Task) "task"
+        (type-tag nefor.contracts.TextAnswer))
+      result (nefor.graph.output "result"
+        (type-tag (| nefor.contracts.TextAnswer nefor.contracts.AgentError)))]
+  (nefor.artifact.compile
+    (fn [[graph nefor.graph.Graph]] -> nefor.graph.Graph
+      (nefor.graph.add-edges graph
+        [(nefor.graph.edge start worker)
+         (nefor.graph.edge worker result)]))))
+"#,
+        )
+        .expect("program");
+        let module_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/nefor-agent/mag/lib");
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let host = LuaHost::load_kernel(
+            &manifest.join("lua/mag-kernel/init.lua"),
+            Some(&manifest.join("../../lua")),
+        )
+        .expect("kernel");
+        let body = serde_json::json!({
+            "id": "load-valid",
+            "source_dir": root,
+            "module_roots": [module_root],
+            "entry": "main.mag"
+        });
+        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
+        let mut program = None;
+        handle_load(
+            &out_tx,
+            body.as_object().expect("load body"),
+            Some("load-valid"),
+            &mut program,
+            &host,
+        )
+        .await
+        .expect("load succeeds");
+
+        let outgoing = out_rx.try_recv().expect("load response");
+        let Body::Event(body) = outgoing.body else {
+            panic!("expected event response")
+        };
+        assert_eq!(body["kind"], LOADED_KIND);
+        assert!(program.is_some(), "valid program becomes resident");
+
+        let execute = serde_json::json!({
+            "id": "execute-valid",
+            "run_id": "valid-text-agent",
+            "run_name": "valid-text-agent",
+            "session_id": "session-1"
+        });
+        let mut active = ActiveExecutes::new();
+        let mut bridge = CapabilityBridge::new("tool-gate");
+        handle_execute(
+            &out_tx,
+            "direct",
+            execute.as_object().expect("execute body"),
+            Some("execute-valid"),
+            &program,
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .expect("valid execution starts");
+        let emitted = std::iter::from_fn(|| out_rx.try_recv().ok())
+            .filter_map(|outgoing| match outgoing.body {
+                Body::Event(body) => Some(body),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            emitted.iter().any(|body| {
+                body.get("kind").and_then(Value::as_str) == Some("mag.run_started")
+                    && body.get("run_id").and_then(Value::as_str) == Some("valid-text-agent")
+            }),
+            "valid execution follows the normal run-start lifecycle"
+        );
+        assert!(
+            emitted.iter().any(|body| {
+                body.get("kind").and_then(Value::as_str)
+                    == Some("conversation.provider.invoke.request")
+            }),
+            "valid TextAnswer agent reaches the provider path"
+        );
+        assert!(active.contains_key("valid-text-agent"));
+        host.end_run("valid-text-agent", TeardownReason::Killed)
+            .expect("cleanup run");
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn provider_schema_preflight_rejects_unsupported_types_before_activation() {
         let modification = serde_json::json!({
@@ -1719,7 +1949,10 @@ mod tests {
             }]
         });
         let error = preflight_provider_schemas(&modification).expect_err("JsonValue rejected");
-        assert!(error.contains("structured-output \"answer\""), "{error}");
+        assert!(
+            error.contains("structured-output actor \"answer\""),
+            "{error}"
+        );
         assert!(error.contains("no faithful"), "{error}");
     }
 

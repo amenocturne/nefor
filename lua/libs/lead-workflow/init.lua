@@ -1294,6 +1294,20 @@ local function handle_mag_run_result(body)
   relay_kernel_completion(run_id, run.run_name, true, content, nil)
 end
 
+local function handle_mag_pre_start_error(body)
+  local run_id = body.in_reply_to
+  local run = type(run_id) == "string" and state.active_runs[run_id] or nil
+  if not run or run.phase ~= "queued" or run.dispatch_firing_id == nil then return false end
+  handle_mag_run_result({
+    kind = "mag.run_result",
+    in_reply_to = run_id,
+    run_id = run_id,
+    status = "failed",
+    error = tostring(body.message or "MAG rejected the run before it started"),
+  })
+  return true
+end
+
 -- Double-Esc entry point (`chat.interrupt_all`). The `mag` execute tool is
 -- FIRE-AND-FORGET: it dispatches a detached sub-run into state.active_runs and
 -- acks "executing" at once, so the lead's turn completes and goes idle while
@@ -2266,8 +2280,12 @@ local function receive_msg(entry)
     resume_pending_load(body)
     return
   end
-  -- mag.error correlated to an in-flight load is a compile failure.
+  -- mag.error may reject either an in-flight load or a submitted execute
+  -- before begin_run. The load owners consume their correlations first; a
+  -- queued registry entry is settled canonically as a failed run so its grace
+  -- timer cannot emit a false executing acknowledgment.
   if kind == "mag.error" then
+    if handle_mag_pre_start_error(body) then return end
     fail_pending_load(body)
     return
   end

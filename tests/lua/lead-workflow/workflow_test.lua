@@ -1051,6 +1051,44 @@ do
     "the remaining run keeps its own asynchronous acknowledgment")
 end
 
+do
+  fresh()
+  local timers = controlled_grace()
+  local run_id = start_file_run("grace-pre-start-failure", "grace-pre-start-failure.mag")
+  _test.calls_clear()
+  feed("mag", {
+    kind = "mag.error",
+    in_reply_to = run_id,
+    message = "structured-output actor \"worker.llm\": JsonValue at $.last_output has no faithful OpenAI strict structured-output representation; correction: pass only the success output type",
+  })
+  local result = tool_result("grace-pre-start-failure")
+  assert_true(result ~= nil and type(result.body.error) == "string",
+    "pre-start mag.error synchronously fails the invoking tool")
+  assert_true(result.body.error:find("worker.llm", 1, true) ~= nil
+      and result.body.error:find("$.last_output", 1, true) ~= nil
+      and result.body.error:find("pass only the success output type", 1, true) ~= nil,
+    "pre-start failure preserves the concrete actionable schema error")
+  assert_eq(result.body.output, nil,
+    "pre-start failure cannot degrade into an executing acknowledgment")
+  assert_true(timers[1].canceled,
+    "pre-start failure cancels the asynchronous acknowledgment deadline")
+  assert_eq(lw._internals.state.active_runs[run_id], nil,
+    "pre-start failure leaves no queued active registry entry")
+  assert_eq(lw._internals.run_registry:get(run_id).phase, "terminal",
+    "pre-start failure is retained only as a canonical failed terminal outcome")
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.run_started" and c.body.run_id == run_id
+  end), nil, "lead-workflow does not fabricate mag.run_started for a rejected run")
+  _test.calls_clear()
+  timers[1].callback()
+  assert_eq(tool_result("grace-pre-start-failure"), nil,
+    "a stale grace callback cannot emit status=executing after failure")
+  invoke_tool("status-after-pre-start-failure", "graph-status", { run_id = run_id })
+  local status = tool_result("status-after-pre-start-failure")
+  assert_eq(status.body.output.run.status, "failed",
+    "graph-status reports the canonical failure, never a queued ghost")
+end
+
 -- ------------------------------------------------------------------
 -- Run close: terminal mag.run_result closes the run, relays a fresh
 -- model turn, and appends the visible run-result block.

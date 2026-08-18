@@ -77,13 +77,19 @@ relative roots resolve beneath `source_dir` and may not escape it. The plugin
 does not infer library locations from its installation or configuration.
 
 MAG is a scripting language for the runtime hosted by this plugin. A program
-is loaded once — parsed, definitions evaluated, initial modification
-validated — and its environment stays resident for the session. The shipped
+is loaded once — parsed, definitions evaluated, initial modification validated,
+and every concrete structured-output schema lowered through the provider's
+strict schema subset — before the resident environment is installed. Provider
+schema lowering is repeated defensively at execute after control-plane overlays
+and before `begin_run`; a failure at either boundary emits `mag.error`. A load
+failure has no run lifecycle. The execute backstop can only reject before
+`begin_run`, so it likewise emits no `mag.run_started`; its correlated control
+plane must settle any pre-registered invocation as failed. The shipped
 control-plane can explicitly call resident functions with `mag.eval`, and the
-host automatically evaluates registered rule bindings. The IR is the data the
-evaluator produces and the kernel folds: a **graph modification**. It is
-minimal, carries only basic operations, and must never grow domain concepts or
-logic primitives — logic lives in MAG, reached through the evaluator.
+The IR is the data the evaluator produces and the kernel folds: a **graph
+modification**. It is minimal, carries only basic operations, and must never
+grow domain concepts or logic primitives — logic lives in MAG, reached through
+the evaluator.
 
 ## The modification
 

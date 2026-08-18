@@ -242,11 +242,15 @@ fn schema_root_is_record(schema: &SchemaType) -> bool {
 }
 
 fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
+    provider_schema_at_path(schema, "$")
+}
+
+fn provider_schema_at_path(schema: &SchemaType, path: &str) -> Result<Value, MagError> {
     Ok(match schema {
         SchemaType::JsonValue => {
-            return Err(MagError::Type(
-                "JsonValue has no faithful OpenAI strict structured-output representation".into(),
-            ));
+            return Err(MagError::Type(format!(
+                "JsonValue at {path} has no faithful OpenAI strict structured-output representation"
+            )));
         }
         SchemaType::Unit => serde_json::json!({"type": "null"}),
         SchemaType::Bool => serde_json::json!({"type": "boolean"}),
@@ -263,7 +267,7 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
         SchemaType::String => serde_json::json!({"type": "string"}),
         SchemaType::List { item } => serde_json::json!({
             "type": "array",
-            "items": provider_schema_at(item)?,
+            "items": provider_schema_at_path(item, &format!("{path}[]"))?,
         }),
         SchemaType::Map { value } => serde_json::json!({
             "type": "array",
@@ -271,7 +275,7 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
                 "type": "object",
                 "properties": {
                     "key": {"type": "string"},
-                    "value": provider_schema_at(value)?,
+                    "value": provider_schema_at_path(value, &format!("{path}.*"))?,
                 },
                 "required": ["key", "value"],
                 "additionalProperties": false,
@@ -280,7 +284,12 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
         SchemaType::Record { fields } => {
             let properties = fields
                 .iter()
-                .map(|field| Ok((field.name.clone(), provider_schema_at(&field.schema)?)))
+                .map(|field| {
+                    Ok((
+                        field.name.clone(),
+                        provider_schema_at_path(&field.schema, &field_path(path, &field.name))?,
+                    ))
+                })
                 .collect::<Result<serde_json::Map<_, _>, MagError>>()?;
             let required = fields
                 .iter()
@@ -298,7 +307,10 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
                 "type": "object",
                 "properties": {
                     "type": { "type": "string", "enum": [variant.tag.clone()] },
-                    "value": provider_schema_at(&variant.schema)?,
+                    "value": provider_schema_at_path(
+                        &variant.schema,
+                        &format!("{path}<{}>", variant.tag),
+                    )?,
                 },
                 "required": ["type", "value"],
                 "additionalProperties": false,
@@ -308,7 +320,12 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
             let properties = components
                 .iter()
                 .enumerate()
-                .map(|(index, component)| Ok((index.to_string(), provider_schema_at(component)?)))
+                .map(|(index, component)| {
+                    Ok((
+                        index.to_string(),
+                        provider_schema_at_path(component, &format!("{path}[{index}]"))?,
+                    ))
+                })
                 .collect::<Result<serde_json::Map<_, _>, MagError>>()?;
             let required = (0..components.len())
                 .map(|index| Value::String(index.to_string()))
@@ -321,7 +338,7 @@ fn provider_schema_at(schema: &SchemaType) -> Result<Value, MagError> {
             })
         }
         SchemaType::Named { name, body } => {
-            let mut value = provider_schema_at(body)?;
+            let mut value = provider_schema_at_path(body, &format!("{path}({name})"))?;
             if let Some(object) = value.as_object_mut() {
                 object.insert("title".into(), Value::String(name.clone()));
             }
@@ -1197,6 +1214,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no faithful"));
+    }
+
+    #[test]
+    fn provider_schema_error_reports_nested_semantic_path() {
+        let schema = TypeSchema {
+            version: SCHEMA_VERSION,
+            root: SchemaType::Named {
+                name: "nefor.contracts.AgentError".into(),
+                body: Box::new(SchemaType::Record {
+                    fields: vec![SchemaField {
+                        name: "last_output".into(),
+                        schema: SchemaType::JsonValue,
+                    }],
+                }),
+            },
+        };
+        let error = schema.to_provider_schema().unwrap_err().to_string();
+        assert!(
+            error.contains("$(nefor.contracts.AgentError).last_output"),
+            "{error}"
+        );
     }
 
     #[test]
