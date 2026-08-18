@@ -4273,54 +4273,38 @@ fn triple_escape_immediately_kills_every_workflow_including_lead() {
 }
 
 #[test]
-fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_replay() {
+fn run_aware_tools_render_result_owned_labels_with_distinct_provider_ids() {
     let mut engine = Engine::new(120, 30).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
-            "name": "terminate-graph", "display": {"compact":{"label":"terminate graph","primary":{"label":"run_id","select":{"source":"args","path":"run_id"},"kind":"scalar"}},"expanded":{"label":"terminate graph","fields":[]},"result":{"kind":"content","fields":[]}}
+            "name": "terminate-graph", "display": {"compact":{"label":"terminate graph","primary":{"label":"run","select":{"source":"result","path":"invocation_label","fallback":{"source":"args","path":"run_id"}},"kind":"scalar"}},"expanded":{"label":"terminate graph","fields":[]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
 
-    for (id, run_id) in [
-        ("call_GBKLOyI8aHHVVpP7mrv0xh8d", "mag-run-eval"),
-        ("call_file_provider_id", "mag-run-file"),
+    for (provider_id, run_id) in [
+        ("call_provider_eval", "mag-run-eval"),
+        ("call_provider_file", "mag-run-file"),
     ] {
         fixture_tool_started(
             &mut engine,
-            id,
+            provider_id,
             "terminate-graph",
             json!({ "run_id": run_id }),
         );
     }
-    dispatch_event_from(
-        &mut engine,
-        "lead-workflow",
-        json!({
-            "kind": "chat.tool.display_primary",
-            "run_id": "mag-run-file", "primary": "ship.mag",
-        }),
-    );
-    dispatch_event_from(
-        &mut engine,
-        "lead-workflow",
-        json!({
-            "kind": "chat.tool.display_primary",
-            "run_id": "mag-run-eval", "primary": "Start sleep process",
-        }),
-    );
     fixture_tool_completed(
         &mut engine,
-        "call_GBKLOyI8aHHVVpP7mrv0xh8d",
-        json!({ "status": "killed" }),
+        "call_provider_eval",
+        json!({ "status": "killed", "run_id": "mag-run-eval", "invocation_label": "Start sleep process" }),
         false,
     );
     fixture_tool_completed(
         &mut engine,
-        "call_file_provider_id",
-        json!({ "status": "killed" }),
+        "call_provider_file",
+        json!({ "status": "killed", "run_id": "mag-run-file", "invocation_label": "ship.mag" }),
         false,
     );
 
@@ -4335,41 +4319,32 @@ fn terminate_graph_renders_canonical_run_labels_without_cross_labeling_and_on_re
 }
 
 #[test]
-fn terminate_graph_unknown_and_mismatched_projection_keep_raw_run_id() {
+fn run_aware_tool_unknown_result_keeps_raw_run_id() {
     let mut engine = Engine::new(120, 24).expect("engine");
     load_chat_scenario(&mut engine);
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
         json!({ "kind": "tool.register", "tools": [{
-            "name": "terminate-graph", "display": {"compact":{"label":"terminate graph","primary":{"label":"run_id","select":{"source":"args","path":"run_id"},"kind":"scalar"}},"expanded":{"label":"terminate graph","fields":[]},"result":{"kind":"content","fields":[]}}
+            "name": "terminate-graph", "display": {"compact":{"label":"terminate graph","primary":{"label":"run","select":{"source":"result","path":"invocation_label","fallback":{"source":"args","path":"run_id"}},"kind":"scalar"}},"expanded":{"label":"terminate graph","fields":[]},"result":{"kind":"content","fields":[]}}
         }] }),
     );
 
     fixture_tool_started(
         &mut engine,
-        "terminate-unknown",
+        "call_provider_unknown",
         "terminate-graph",
         json!({ "run_id": "mag-run-unknown" }),
     );
-    dispatch_event_from(
-        &mut engine,
-        "lead-workflow",
-        json!({
-            "kind": "chat.tool.display_primary", "id": "terminate-unknown",
-            "run_id": "mag-run-other", "primary": "Wrong concurrent label",
-        }),
-    );
     fixture_tool_completed(
         &mut engine,
-        "terminate-unknown",
-        json!({ "status": "not_active" }),
+        "call_provider_unknown",
+        json!({ "status": "not_active", "run_id": "mag-run-unknown" }),
         false,
     );
 
     let out = render_snapshot(&mut engine);
     assert!(out.contains("terminate graph · mag-run-unknown"), "{out}");
-    assert!(!out.contains("Wrong concurrent label"), "{out}");
 }
 
 #[test]

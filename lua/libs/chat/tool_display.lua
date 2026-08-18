@@ -52,7 +52,7 @@ end
 local function validate_selector(selector, where)
   if type(selector) ~= "table" then return nil, where .. " must be a table" end
   for key, _ in pairs(selector) do
-    if key ~= "source" and key ~= "path" and key ~= "default" then
+    if key ~= "source" and key ~= "path" and key ~= "default" and key ~= "fallback" then
       return nil, where .. " has unknown field `" .. tostring(key) .. "`"
     end
   end
@@ -61,6 +61,20 @@ local function validate_selector(selector, where)
   end
   local ok, err = validate_path(selector.path, where .. ".path")
   if not ok then return nil, err end
+  if selector.fallback ~= nil then
+    local fallback = selector.fallback
+    if type(fallback) ~= "table" then return nil, where .. ".fallback must be a selector" end
+    for key, _ in pairs(fallback) do
+      if key ~= "source" and key ~= "path" then
+        return nil, where .. ".fallback has unknown field `" .. tostring(key) .. "`"
+      end
+    end
+    if fallback.source ~= "args" and fallback.source ~= "result" then
+      return nil, where .. ".fallback.source must be `args` or `result`"
+    end
+    ok, err = validate_path(fallback.path, where .. ".fallback.path")
+    if not ok then return nil, err end
+  end
   return true
 end
 
@@ -195,6 +209,10 @@ end
 local function selected(selector, args, result)
   local root = selector.source == "args" and args or result
   local value = get_path(root, selector.path)
+  if value == nil and selector.fallback ~= nil then
+    local fallback_root = selector.fallback.source == "args" and args or result
+    value = get_path(fallback_root, selector.fallback.path)
+  end
   if value == nil then value = selector.default end
   return value
 end

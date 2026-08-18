@@ -89,6 +89,19 @@ local function display_field(label, source, path, kind, extra)
   return value
 end
 
+local function run_label_field(required)
+  return {
+    label = "run",
+    select = {
+      source = "result",
+      path = "invocation_label",
+      fallback = { source = "args", path = "run_id" },
+    },
+    kind = "scalar",
+    omit = required and nil or "missing",
+  }
+end
+
 local function display_contract(label, primary, fields, result_kind, result_text, result_fields, lifecycle)
   return {
     compact = { label = label, primary = primary },
@@ -311,6 +324,7 @@ local function emit_await_outcome(firing_id, outcome, completion_delivery)
       body.run_id = outcome.run_id
       body.status = outcome.status
       body.run_name = outcome.run_name
+      body.invocation_label = outcome.invocation_label
       body.terminal = outcome.terminal
     end
   end
@@ -322,20 +336,6 @@ local function emit_tool_result_err(firing_id, err)
     kind  = "tool.result",
     id    = firing_id,
     error = tostring(err),
-  })
-end
-
-local function emit_tool_display_primary(firing_id, run)
-  if type(firing_id) ~= "string" or firing_id == ""
-      or type(run) ~= "table"
-      or type(run.invocation_label) ~= "string" or run.invocation_label == "" then
-    return
-  end
-  emit_as(SOURCE_NAME, nil, {
-    kind = "chat.tool.display_primary",
-    id = firing_id,
-    run_id = run.run_id,
-    primary = run.invocation_label,
   })
 end
 
@@ -351,6 +351,7 @@ local function emit_termination_outcome(firing_id, run, terminal)
     emit_tool_result_ok(firing_id, {
       canceled = true,
       run_id = run.run_id,
+      invocation_label = run.invocation_label,
       status = status,
       notice = "canonical termination confirmed",
     })
@@ -957,6 +958,7 @@ local function summarize_run(run)
   if type(run) ~= "table" then return nil end
   return {
     run_id = run.run_id,
+    invocation_label = run.invocation_label,
     run_name = run.run_name,
     status = run.status,
     dispatched_at = run.dispatched_at,
@@ -1461,11 +1463,11 @@ terminate_graph = function(firing_id, args, metadata)
     return
   end
   local run, lookup_err = authorize_control_target(context, run_id)
-  if run then emit_tool_display_primary(firing_id, run) end
   if not run or run.phase == "terminal" then
     emit_tool_result_ok(firing_id, {
       canceled = false,
       run_id = run_id,
+      invocation_label = run and run.invocation_label or nil,
       status = lookup_err and lookup_err.error_code or "not_active",
       notice = lookup_err and lookup_err.error or "graph run is already terminal",
     })
@@ -1531,7 +1533,6 @@ graph_status = function(firing_id, args, metadata)
   local lookup_err
   if type(run_id) == "string" and run_id ~= "" then
     authorized_run, lookup_err = authorize_control_target(context, run_id)
-    if authorized_run then emit_tool_display_primary(firing_id, authorized_run) end
     if lookup_err and (lookup_err.error_code == "run_control_unauthorized"
         or lookup_err.error_code == "run_control_self") then
       emit_tool_result_ok(firing_id, {
@@ -1561,7 +1562,12 @@ graph_status = function(firing_id, args, metadata)
 
   if type(run_id) == "string" and run_id ~= "" then
     if authorized_run then
-      emit_tool_result_ok(firing_id, { active = authorized_run.phase ~= "terminal", run = summarize_run(authorized_run) })
+      emit_tool_result_ok(firing_id, {
+        active = authorized_run.phase ~= "terminal",
+        run_id = authorized_run.run_id,
+        invocation_label = authorized_run.invocation_label,
+        run = summarize_run(authorized_run),
+      })
       return
     end
     emit_tool_result_ok(firing_id, {
@@ -1632,7 +1638,7 @@ local function lead_workflow_tool_schemas()
   return {
     {
       name        = "graph-status",
-      display = display_contract("graph status", display_field("run", "args", "run_id", "scalar", { omit = "missing" }), {}, "content", nil, { display_field("state", "result", "$", "structured") }),
+      display = display_contract("graph status", run_label_field(false), {}, "content", nil, { display_field("state", "result", "$", "structured") }),
       description =
         "Report active graph runs, or one active/recent completed run " ..
         "when run_id is provided. One-shot snapshot for when you or the " ..
@@ -1651,7 +1657,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "await-run",
-      display = display_contract("await run", display_field("run", "args", "run_id", "scalar"), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
+      display = display_contract("await run", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
         "Block until a previously acknowledged detached MAG run reaches its canonical " ..
         "terminal result. The root lead may address same-session runs globally; a non-root " ..
@@ -1674,7 +1680,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "terminate-graph",
-      display = display_contract("terminate graph", display_field("run", "args", "run_id", "scalar"), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
+      display = display_contract("terminate graph", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description = "Request termination of exactly one active graph run by explicit run_id and block until its exact canonical terminal confirmation. The confirmation is returned synchronously and the redundant owner completion is suppressed; a defensive named timeout returns an ordinary tool failure.",
       parameters  = {
         type = "object",

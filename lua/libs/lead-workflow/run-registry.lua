@@ -48,6 +48,7 @@ local function canonical_outcome(body, run)
     output.in_reply_to = nil
     output.run_id = run.run_id
     output.run_name = output.run_name or run.run_name
+    output.invocation_label = output.invocation_label or run.invocation_label
     output.status = "completed"
     return { output = output }
   end
@@ -55,6 +56,7 @@ local function canonical_outcome(body, run)
   local fallback = status == "killed" and "run was killed" or "run failed"
   local outcome = typed_error(code, tostring(body.error or fallback), run.run_id, status)
   outcome.run_name = run.run_name
+  outcome.invocation_label = run.invocation_label
   outcome.terminal = copy(body)
   return outcome
 end

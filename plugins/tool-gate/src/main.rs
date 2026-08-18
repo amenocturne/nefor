@@ -364,7 +364,7 @@ fn validate_display_contract(display: &Value) -> Result<(), String> {
             .ok_or_else(|| format!("{location} must be an object"))?;
         if !object
             .keys()
-            .all(|key| matches!(key.as_str(), "source" | "path" | "default"))
+            .all(|key| matches!(key.as_str(), "source" | "path" | "default" | "fallback"))
         {
             return Err(format!("{location} has unknown field"));
         }
@@ -387,6 +387,9 @@ fn validate_display_contract(display: &Value) -> Result<(), String> {
             return Err(format!(
                 "{location}.path must be a non-empty string or string array"
             ));
+        }
+        if object.get("fallback").is_some() {
+            selector(object.get("fallback"), &format!("{location}.fallback"))?;
         }
         Ok(())
     }

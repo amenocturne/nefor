@@ -145,7 +145,12 @@ do
       and graph_status_schema.description:find("Block until", 1, true) == nil,
     "graph-status carries no dependency-wait affordance")
   assert_eq(await_schema.display.compact.label, "await run", "await-run has semantic display metadata")
-  assert_eq(await_schema.display.compact.primary.select.path, "run_id", "await-run displays its stable handle")
+  assert_eq(await_schema.display.compact.primary.select.path, "invocation_label",
+    "await-run prefers the registry-owned presentation label")
+  assert_eq(await_schema.display.compact.primary.select.fallback.source, "args",
+    "await-run falls back to its stable raw handle")
+  assert_eq(await_schema.display.compact.primary.select.fallback.path, "run_id",
+    "await-run raw fallback is the exact addressed handle")
   assert_eq(mag_eval_schema.display.compact.label, "mag eval", "mag-eval has explicit display label")
   assert_eq(mag_eval_schema.display.compact.primary.select.path, "intent", "mag-eval display uses exact intent")
   assert_true(mag_eval_schema.description:find("Commands run until process exit", 1, true) ~= nil
@@ -415,31 +420,27 @@ do
   })
   beta.invocation_label = "Inspect beta"
 
-  invoke_tool("status-alpha-label", "graph-status", { run_id = alpha.run_id })
-  invoke_tool("status-beta-label", "graph-status", { run_id = beta.run_id })
-  local calls = decode_calls()
-  local alpha_display = find_call(calls, function(call)
-    return call.body.kind == "chat.tool.display_primary"
-      and call.body.id == "status-alpha-label"
-  end)
-  local beta_display = find_call(calls, function(call)
-    return call.body.kind == "chat.tool.display_primary"
-      and call.body.id == "status-beta-label"
-  end)
-  assert_eq(alpha_display.body.primary, "Inspect alpha",
-    "known graph-status uses the first run's canonical invocation label")
-  assert_eq(alpha_display.body.run_id, alpha.run_id,
-    "first graph-status label retains exact run correlation")
-  assert_eq(beta_display.body.primary, "Inspect beta",
-    "concurrent graph-status calls do not cross-label runs")
-  assert_eq(beta_display.body.run_id, beta.run_id,
-    "second graph-status label retains exact run correlation")
+  invoke_tool("gate-status-alpha", "graph-status", { run_id = alpha.run_id })
+  invoke_tool("gate-status-beta", "graph-status", { run_id = beta.run_id })
+  assert_eq(tool_result("gate-status-alpha").body.output.invocation_label, "Inspect alpha",
+    "known graph-status returns the registry-owned invocation label")
+  assert_eq(tool_result("gate-status-alpha").body.output.run_id, alpha.run_id,
+    "first graph-status result retains exact run identity")
+  assert_eq(tool_result("gate-status-beta").body.output.invocation_label, "Inspect beta",
+    "concurrent graph-status results do not cross-label runs")
+  assert_eq(tool_result("gate-status-beta").body.output.run_id, beta.run_id,
+    "second graph-status result retains exact run identity")
 
   _test.calls_clear()
-  invoke_tool("status-raw-fallback", "graph-status", { run_id = "mag-run-not-known" })
+  invoke_tool("gate-status-raw", "graph-status", { run_id = "mag-run-not-known" })
+  local unknown = tool_result("gate-status-raw").body.output
+  assert_eq(unknown.run_id, "mag-run-not-known",
+    "unknown graph-status run ids retain the raw run identity")
+  assert_eq(unknown.invocation_label, nil,
+    "unknown graph-status run ids cannot acquire a trusted label")
   assert_eq(find_call(decode_calls(), function(call)
     return call.body.kind == "chat.tool.display_primary"
-  end), nil, "unknown graph-status run ids retain the schema-derived raw label")
+  end), nil, "run-aware labels require no invocation-id display side channel")
 end
 
 do
@@ -2291,14 +2292,9 @@ do
   invoke_tool_with_metadata("gate-6", "terminate-graph", { run_id = run_id },
     { caller_id = "r3/cap-4" })
   calls = decode_calls()
-  local display = find_call(calls, function(c)
+  assert_eq(find_call(calls, function(c)
     return c.body.kind == "chat.tool.display_primary"
-      and c.body.id == "gate-6" and c.body.run_id == run_id
-  end)
-  assert_true(display ~= nil, "known eval termination projects a canonical display label")
-  assert_eq(display.body.run_id, run_id, "display projection preserves exact run correlation")
-  assert_eq(display.body.primary, "Inspect lifecycle",
-    "known eval termination reuses the original intent label")
+  end), nil, "termination does not correlate presentation through gate firing ids")
   assert_eq(tool_result("gate-6"), nil,
     "terminate-graph remains open until exact canonical confirmation")
   assert_true(find_call(calls, function(c)
@@ -2317,6 +2313,8 @@ do
     "terminate success confirms cancellation")
   assert_eq(terminal.body.output.run_id, run_id,
     "terminate success preserves exact run correlation")
+  assert_eq(terminal.body.output.invocation_label, "Inspect lifecycle",
+    "terminate success carries the registry-owned presentation label")
   assert_eq(terminal.body.output.status, "killed",
     "terminate success reports the canonical killed status")
   assert_eq(find_call(decode_calls(), function(c)
@@ -2342,14 +2340,9 @@ do
   _test.calls_clear()
   invoke_tool_with_metadata("terminate-file", "terminate-graph", { run_id = file_run.run_id },
     { caller_id = "r7/cap-file" })
-  local file_display = find_call(decode_calls(), function(c)
+  assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "chat.tool.display_primary"
-      and c.body.id == "terminate-file" and c.body.run_id == file_run.run_id
-  end)
-  assert_eq(file_display.body.primary, "ship.mag",
-    "known execute termination reuses the original file label")
-  assert_eq(file_display.body.run_id, file_run.run_id,
-    "concurrent execute projection retains its exact run identity")
+  end), nil, "concurrent termination also avoids invocation-id presentation correlation")
 
   _test.calls_clear()
   invoke_tool_with_metadata("terminate-unknown", "terminate-graph",

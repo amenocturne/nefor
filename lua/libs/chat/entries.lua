@@ -151,10 +151,6 @@ local function semantic_projection(entry)
   if not projected then error("tool display invariant: " .. tostring(err)) end
   local delivery = delayed_mag_delivery(entry, args)
   if delivery then projected.label = projected.label .. " [" .. delivery .. "]" end
-  if projected and type(entry.display_primary) == "string" and entry.display_primary ~= "" then
-    projected.primary = entry.display_primary
-    projected.primary_is_path = false
-  end
   return projected
 end
 local function tool_header(entry, glyph)
