@@ -519,13 +519,17 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
         events.push(SseEvent::Finish(reason));
     }
     if let Some(raw_usage) = value.get("usage") {
-        if !raw_usage.is_object() {
-            return SseEvent::Malformed("usage must be a JSON object".to_owned());
-        }
-        match serde_json::from_value::<Usage>(raw_usage.clone()) {
-            Ok(usage) => events.push(SseEvent::Usage(usage)),
-            Err(error) => {
-                return SseEvent::Malformed(format!("invalid usage payload: {error}"));
+        if raw_usage.is_null() {
+            // OpenAI-compatible streams may carry usage: null on every
+            // non-terminal chunk when usage reporting is enabled.
+        } else if !raw_usage.is_object() {
+            return SseEvent::Malformed("usage must be a JSON object or null".to_owned());
+        } else {
+            match serde_json::from_value::<Usage>(raw_usage.clone()) {
+                Ok(usage) => events.push(SseEvent::Usage(usage)),
+                Err(error) => {
+                    return SseEvent::Malformed(format!("invalid usage payload: {error}"));
+                }
             }
         }
     }
@@ -618,7 +622,15 @@ mod tests {
     }
 
     #[test]
-    fn malformed_usage_is_rejected_instead_of_disappearing() {
+    fn null_usage_is_absent_while_non_null_malformed_usage_is_rejected() {
+        assert_eq!(
+            parse_sse_chunk(r#"{"choices":[{"delta":{"content":"hello"}}],"usage":null}"#),
+            SseEvent::Delta("hello".into())
+        );
+        assert_eq!(
+            parse_sse_chunk(r#"{"choices":[],"usage":null}"#),
+            SseEvent::Empty
+        );
         for payload in [
             r#"{"choices":[],"usage":"unknown"}"#,
             r#"{"choices":[],"usage":{"prompt_tokens":"eleven"}}"#,
