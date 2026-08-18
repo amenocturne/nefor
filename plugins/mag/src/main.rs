@@ -2062,6 +2062,9 @@ mod tests {
         let provider_input = named("nefor.contracts.ProviderInput");
         let tool_calls = named("nefor.contracts.ToolCalls");
         let text_answer = named("nefor.contracts.TextAnswer");
+        let agent_error = named("nefor.contracts.AgentError");
+        let result =
+            serde_json::json!({"kind":"union","items":[text_answer.clone(),agent_error.clone()]});
         let modification = serde_json::json!({
             "actors": [{
                 "id": "answer",
@@ -2074,10 +2077,15 @@ mod tests {
                 "input": {"wire":"generic-provider.ProviderOut","type":provider_input},
                 "outputs": [
                     {"wire":"generic-tool.ToolCalls","type":tool_calls},
-                    {"wire":"generic-provider.TextAnswer","type":text_answer}
+                    {"wire":"nefor.agent.Result","type":result.clone()}
                 ],
-                "params": {"provider":"provider-a"},
-                "routes": {"generic-tool.ToolCalls":[],"generic-provider.TextAnswer":[]}
+                "params": {
+                    "provider":"provider-a",
+                    "output_type":"text-answer",
+                    "error_type":"agent-error",
+                    "provider_error_type":"provider-error"
+                },
+                "routes": {"generic-tool.ToolCalls":[],"nefor.agent.Result":[]}
             }],
             "messages": [{
                 "to": "answer",
@@ -2087,8 +2095,8 @@ mod tests {
             "rules": [],
             "result": {"from": {
                 "actor":"answer",
-                "type":"generic-provider.TextAnswer",
-                "wire":"generic-provider.TextAnswer"
+                "type":"nefor.agent.Result",
+                "wire":"nefor.agent.Result"
             }}
         });
 
@@ -2103,10 +2111,11 @@ mod tests {
                 .expect("begin")
                 .ok
         );
+        let started = host.start("provider-events", &modification).expect("start");
         assert!(
-            host.start("provider-events", &modification)
-                .expect("start")
-                .ok
+            started.ok,
+            "{}",
+            started.error.as_deref().unwrap_or("unknown error")
         );
 
         let mut bridge = CapabilityBridge::new("tool-gate");
@@ -2187,8 +2196,8 @@ mod tests {
         }
 
         let result = terminal_result.expect("durable terminal result");
-        assert_eq!(result["value"]["content"], "semantic-only");
-        assert_eq!(result["text_answer"], "semantic-only");
+        assert_eq!(result["value"], "semantic-only");
+        assert_eq!(result["result"]["text_answer"], "semantic-only");
     }
 
     #[test]

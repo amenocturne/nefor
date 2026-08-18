@@ -92,6 +92,8 @@ async fn spawn_basic_tools() -> Child {
     tokio::process::Command::new(basic_tools_binary())
         .arg("--gate")
         .arg("tool-gate")
+        .arg("--read-file-max-bytes")
+        .arg("32768")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -314,7 +316,7 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
             )
             .await;
         } else {
-            let answer = r#"{"content":"done after read_file"}"#;
+            let answer = "done after read_file";
             send(
                 &mut mag_in,
                 "conversation-manager",
@@ -408,7 +410,7 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
 
     let result = next_kind(&mut mag_out, "mag.run_result").await;
     assert_eq!(result["status"], "completed");
-    assert_eq!(result["result"]["value"]["content"], "done after read_file");
+    assert_eq!(result["result"]["value"], "done after read_file");
 
     mag.kill().await.ok();
     gate.kill().await.ok();

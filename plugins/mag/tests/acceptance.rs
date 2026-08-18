@@ -131,7 +131,7 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 
 /// Build the two-agent modification. Each agent `aN` is a full provider loop:
 /// `aN.llm → aN.run-tool → aN.tool-result → aN.llm`. `a1.llm` is the declared
-/// result on `generic-provider.TextAnswer`. Both `llm`s are seeded with a
+/// result on `nefor.agent.Result`. Both `llm`s are seeded with a
 /// `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
     fn named(name: &str) -> Value {
@@ -144,6 +144,8 @@ fn two_agent_modification() -> Value {
         let provider_input = named("nefor.contracts.ProviderInput");
         let tool_calls = named("nefor.contracts.ToolCalls");
         let text_answer = named("nefor.contracts.TextAnswer");
+        let agent_error = named("nefor.contracts.AgentError");
+        let result = json!({"kind":"union","items":[text_answer.clone(),agent_error]});
         let tool_handle = named("nefor.contracts.ToolHandle");
         vec![
             json!({
@@ -151,14 +153,18 @@ fn two_agent_modification() -> Value {
                 "factory": "llm",
                 "evidence": evidence("nefor.factory.llm",provider_input.clone(),json!({"kind":"union","items":[tool_calls.clone(),text_answer.clone()]})),
                 "input":{"wire":"generic-provider.ProviderOut","type":provider_input.clone()},
-                "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"generic-provider.TextAnswer","type":text_answer}],
-                "params": { "model": "opus", "provider": PROVIDER, "system": "work" },
+                "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"nefor.agent.Result","type":result}],
+                "params": {
+                    "model": "opus", "provider": PROVIDER, "system": "work",
+                    "output_type": "text-answer", "error_type": "agent-error",
+                    "provider_error_type": "provider-error"
+                },
                 "routes": {
                     "generic-tool.ToolCalls": [{
                         "actor": format!("{prefix}.run-tool"),
                         "wire": "generic-tool.ToolCalls"
                     }],
-                    "generic-provider.TextAnswer": []
+                    "nefor.agent.Result": []
                 }
             }),
             json!({
@@ -201,8 +207,8 @@ fn two_agent_modification() -> Value {
         "result": {
             "from": {
                 "actor": "a1.llm",
-                "type": "generic-provider.TextAnswer",
-                "wire": "generic-provider.TextAnswer"
+                "type": "nefor.agent.Result",
+                "wire": "nefor.agent.Result"
             }
         }
     })
@@ -553,7 +559,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     }
 
     // ── SIX STEPS #3: the survivor's every node output persisted, typed per
-    //    the declared contracts (llm ToolCalls/TextAnswer, run-tool ToolHandle,
+    //    the declared contracts (llm ToolCalls/Result, run-tool ToolHandle,
     //    tool-result ProviderInput). ─────────────────────────────────────────────
     for node in ["a1.llm", "a1.run-tool", "a1.tool-result"] {
         assert!(
@@ -602,7 +608,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     assert_eq!(
         run_result
             .get("result")
-            .and_then(|result| result.get("text"))
+            .and_then(|result| result.get("value"))
             .and_then(Value::as_str),
         Some("final-a1"),
         "run_result carries the surviving agent's result inline"

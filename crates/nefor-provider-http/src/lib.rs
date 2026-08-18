@@ -5,7 +5,10 @@ use rustls_pki_types::CertificateDer;
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderHttpError {
     #[error("native system trust store contained no usable certificates: {errors}")]
-    UnusableNativeRoots { errors: NativeRootErrors },
+    UnusableNativeRoots {
+        #[source]
+        errors: NativeRootErrors,
+    },
     #[error("native system trust store certificate could not be added to the HTTPS client: {0}")]
     InvalidNativeRoot(#[source] reqwest::Error),
     #[error("provider HTTPS client could not be built: {0}")]
@@ -15,9 +18,9 @@ pub enum ProviderHttpError {
 #[derive(Debug)]
 pub struct NativeRootErrors(Vec<rustls_native_certs::Error>);
 
-impl NativeRootErrors {
-    pub fn as_slice(&self) -> &[rustls_native_certs::Error] {
-        &self.0
+impl std::error::Error for NativeRootErrors {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.first().map(|error| error as _)
     }
 }
 
@@ -114,7 +117,7 @@ mod tests {
         let ProviderHttpError::UnusableNativeRoots { errors } = &error else {
             panic!("unexpected error: {error}");
         };
-        assert!(errors.as_slice().is_empty());
+        assert!(errors.0.is_empty());
         assert_eq!(
             error.to_string(),
             "native system trust store contained no usable certificates: no loader errors were reported"
@@ -144,7 +147,13 @@ mod tests {
         let ProviderHttpError::UnusableNativeRoots { errors } = &error else {
             panic!("unexpected error: {error}");
         };
-        assert_eq!(errors.as_slice().len(), 2);
+        assert_eq!(errors.0.len(), 2);
+        assert_eq!(
+            std::error::Error::source(errors)
+                .expect("first loader error remains in the source chain")
+                .to_string(),
+            "failed to load certificate file: access denied at '/private/cert.pem'"
+        );
         assert_eq!(
             error.to_string(),
             "native system trust store contained no usable certificates: 2 entries failed to load: failed to load certificate file: access denied at '/private/cert.pem'; failed to load certificate directory: missing at '/private/certs'"
