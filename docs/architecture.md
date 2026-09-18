@@ -7,13 +7,16 @@ nefor runs as a small engine plus user-owned Lua composition. The shipped starte
 | Engine / bus                  | Spawning the exact plugin commands registered by Lua, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp, and reporting typed process-termination facts.               | Parsing NCP bodies for routing, owning sessions or selecting their root, writing session jsonl, discovering plugin directories/inventory, deciding whether a plugin exit shuts down the runtime, or owning TLS policy. |
 | Plugins                       | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors. Provider plugins own HTTPS policy and construct clients through `nefor-provider-http`, which adds native system roots to bundled WebPKI roots. | Cross-plugin policy or hard-coded knowledge of how another plugin is used.                                                                                                                                             |
 | Lua composition and libraries | Dispatch, NCP handshake/routing semantics, explicit plugin commands and distribution resolution, actor spawning, sessions and their root, lifecycle/shutdown policy, approvals, UI reducers, CLI/TUI surfaces.                                             | Heavy provider/tool implementation that belongs in a process plugin.                                                                                                                                                   |
-| MAG                           | Pure namespaced evaluation; libraries define ordinary typed graph data, validation, and lowering into a generic `Artifact`. Nefor's library/runtime boundary uses immutable inline `nefor.mag` v1 program and delta envelopes.                             | Knowing actors, factories, shell, sinks, or Nefor wire types; those live in libraries and runtime contracts. The runtime retains no artifact cache or callable compiler environment.                                   |
+| MAG                           | Pure namespaced evaluation; libraries define ordinary typed graph data, validation, and lowering into a generic `Artifact`. Nefor's library/runtime boundary uses immutable inline `nefor.mag` v3 program and delta envelopes.                             | Knowing actors, factories, shell, sinks, or Nefor wire types; those live in libraries and runtime contracts. The runtime retains no artifact cache or callable compiler environment.                                   |
 
-At the MAG protocol boundary, `mag.execute` accepts only a versioned program
-envelope and `mag.apply` accepts only a versioned delta envelope. Programs may
-carry the single closed `InstantiateDeltaTemplate` operation with its five
-expression forms; raw modifications, a general runtime expression language,
-and post-compilation function application are not part of version 2.
+At the MAG protocol boundary, `mag.execute` accepts only a version-3 program
+envelope and `mag.apply` accepts only a version-3 delta envelope. Capability
+actors and pure structural junctions are distinct definitions; typed ports use
+nominal actor/junction endpoints, routes live at the modification top level,
+and `result.from` selects either endpoint kind without a synthetic output actor.
+Programs may carry the single closed `InstantiateDeltaTemplate` operation with
+its five expression forms; raw modifications, a general runtime expression
+language, and post-compilation function application are not part of version 3.
 
 ## MAG authoring and runtime protocol ownership
 

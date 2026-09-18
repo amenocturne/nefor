@@ -434,309 +434,72 @@ end
 -- modification are skipped, as before.
 --
 -- Returns { ok = true } or { ok = false, errors = { <msg>, ... } }.
-function registry:validate_modification(modification, resolve, existing_specs)
+function registry:validate_modification(modification)
   local errors = {}
   local actors = (modification and modification.actors) or {}
   local declarations = modification and modification.types or nil
-  local semantic_host = nefor and nefor.semantic_type
-
-  local function validate_type_reference(reference, label)
-    if type(reference) ~= "table" or type(reference.type) ~= "table" or
-        type(reference.type_id) ~= "string" then
-      table.insert(errors, label .. ": missing semantic descriptor identity")
-      return
-    end
-    local declared = declarations and declarations[reference.type_id] or nil
-    if not declared or not type_node.equal(declared, reference.type) then
-      table.insert(errors, label .. ": semantic descriptor identity is absent or mismatched")
-    end
-  end
-
   if declarations ~= nil then
-    if type(declarations) ~= "table" or type(semantic_host) ~= "table" or
-        type(semantic_host.validate_declarations) ~= "function" then
-      table.insert(errors, "modification semantic declarations cannot be verified")
-    else
-      local ok, valid_or_error = pcall(semantic_host.validate_declarations, declarations)
-      if not ok or valid_or_error ~= true then
-        table.insert(errors, "modification semantic declarations are invalid: " ..
-          tostring(valid_or_error))
+    local host = nefor and nefor.semantic_type
+    local ok, valid = pcall(host and host.validate_declarations, declarations)
+    if not ok or valid ~= true then
+      errors[#errors + 1] = "modification semantic declarations are invalid: " .. tostring(valid)
+    end
+    local function reference(value, label)
+      local declared = type(value)=="table" and declarations[value.type_id]
+      if type(value)~="table" or type(value.type)~="table" or type(value.type_id)~="string"
+          or not declared or not type_node.equal(declared,value.type) then
+        errors[#errors+1]=label..": semantic descriptor identity is absent or mismatched"
       end
-      for _, spec in ipairs(actors) do
-        validate_type_reference(spec.input, string.format("actor %q input", tostring(spec.id)))
-        for index, output in ipairs(spec.outputs or {}) do
-          validate_type_reference(output, string.format(
-            "actor %q output %d", tostring(spec.id), index))
-        end
-      end
-      for index, message in ipairs(modification.messages or {}) do
-        validate_type_reference(
-          { type = message.semantic_type, type_id = message.semantic_type_id },
-          string.format("message %d", index))
-      end
-      if modification.result ~= nil then
-        validate_type_reference(modification.result.from, "result boundary")
-      end
+    end
+    for _,actor in ipairs(actors) do
+      reference(actor.input,string.format("actor %q input",tostring(actor.id)))
+      for index,output in ipairs(actor.outputs or {}) do reference(output,string.format("actor %q output %d",tostring(actor.id),index)) end
+    end
+    for index,message in ipairs(modification.messages or {}) do
+      reference({type=message.semantic_type,type_id=message.semantic_type_id},string.format("message %d",index))
     end
   end
-
-  -- id -> factory name, for destination wiring checks.
-  local factory_of = {}
-  local spec_of = {}
-  for _, spec in ipairs(actors) do
-    if type(spec.id) == "string" then
-      factory_of[spec.id] = spec.factory
-      spec_of[spec.id] = spec
-    end
-  end
-
-  -- Resolve a route destination to a factory name (or nil + skip/error).
-  -- Same-modification spawns win; then the caller's inventory via `resolve`.
-  local function dest_factory_of(spec, tag, dest_id)
-    local dest_factory = factory_of[dest_id]
-    if dest_factory then
-      return dest_factory, spec_of[dest_id]
-    end
-    if not resolve then
-      return nil -- no resolver: outside-the-modification dests are skipped
-    end
-    local factory, state, resolved_spec = resolve(dest_id)
-    if factory == nil then
-      table.insert(errors, string.format(
-        "actor %q: route %q destination %q does not exist "
-        .. "(not in the inventory, not spawned in this modification)",
-        tostring(spec.id), tag, tostring(dest_id)))
-      return nil
-    end
-    if state == "dead" then
-      return nil -- race artifact; delivery drops these as logged no-ops
-    end
-    return factory, resolved_spec
-  end
-
-  for _, spec in ipairs(actors) do
-    local decl = self:declaration(spec.factory)
+  for _,spec in ipairs(actors) do
+    local decl=self:declaration(spec.factory)
     if not decl then
-      table.insert(errors, string.format(
-        "actor %q: unknown factory %q", tostring(spec.id), tostring(spec.factory)))
+      errors[#errors+1]=string.format("actor %q: unknown factory %q",tostring(spec.id),tostring(spec.factory))
     else
-      local variables = decl.type_variables or {}
-      local arguments = spec.type_arguments
-      if not is_dense_list(arguments) then
-        table.insert(errors, string.format(
-          "actor %q: type_arguments must be a dense list", tostring(spec.id)))
-      elseif #arguments ~= #variables then
-        table.insert(errors, string.format(
-          "actor %q: factory %q expects %d type argument(s), got %d",
-          tostring(spec.id), spec.factory, #variables, #arguments))
+      local variables=decl.type_variables or {}
+      if not is_dense_list(spec.type_arguments) then
+        errors[#errors+1]=string.format("actor %q: type_arguments must be a dense list",tostring(spec.id))
+      elseif #spec.type_arguments~=#variables then
+        errors[#errors+1]=string.format("actor %q: factory %q expects %d type argument(s), got %d",tostring(spec.id),spec.factory,#variables,#spec.type_arguments)
       else
-        local arguments_ok=true
-        for index, argument in ipairs(arguments) do
-          local ok,err=type_node.validate(argument)
-          if not ok then arguments_ok=false; table.insert(errors,string.format(
-            "actor %q: type argument %d: %s",tostring(spec.id),index,err)) end
+        local bindings={}
+        for index,variable in ipairs(variables) do
+          bindings[variable]=spec.type_arguments[index]
+          local ok,err=type_node.validate(spec.type_arguments[index])
+          if not ok then errors[#errors+1]=string.format("actor %q: type argument %d: %s",tostring(spec.id),index,err) end
         end
-        local input = spec.input
-        local input_type=type(input)=="table" and input.type or nil
-        local spec_input_ok=true
         if decl.semantic then
-          spec_input_ok=type_node.validate(input_type)
-          if not spec_input_ok then
-            table.insert(errors, string.format("actor %q: semantic input is not a valid structural type", tostring(spec.id)))
+          local expected_input
+          for _,input in ipairs(decl.semantic.inputs or {}) do
+            if type(spec.input)=="table" and input.wire==spec.input.wire then expected_input=type_node.substitute(input.type,bindings) end
           end
-        end
-        if decl.semantic and arguments_ok and spec_input_ok then
-          local bindings={}; for index,variable in ipairs(variables) do bindings[variable]=arguments[index] end
-          local semantic_output=type_node.substitute(decl.semantic.output,bindings)
-          for name,scheme in pairs(decl.semantic.params or {}) do
-            local expected=type_node.substitute(scheme,bindings)
-            if type(spec.params) ~= "table" or not type_node.equal(spec.params[name],expected) then
-              table.insert(errors,string.format(
-                "actor %q: semantic param %q has the wrong type descriptor",tostring(spec.id),name))
-            end
+          if not expected_input or not type_node.equal(spec.input.type,expected_input) then
+            errors[#errors+1]=string.format("actor %q: semantic input wire has the wrong type",tostring(spec.id))
           end
-          local expected_input=nil
-          for _,endpoint in ipairs(decl.semantic.inputs) do
-            if endpoint.wire==input.wire then expected_input=type_node.substitute(endpoint.type,bindings) end
-          end
-          local expected_outputs={}
-          local optional_outputs={}
-          for _,endpoint in ipairs(decl.semantic.outputs) do
-            expected_outputs[endpoint.wire]=type_node.substitute(endpoint.type,bindings)
-            optional_outputs[endpoint.wire]=endpoint.required==false
-          end
-          if not expected_input or not type_node.equal(input.type,expected_input) then
-            table.insert(errors,string.format("actor %q: semantic input wire has the wrong type",tostring(spec.id)))
-          end
-          local actual={}
+          local expected={}
+          for _,output in ipairs(decl.semantic.outputs or {}) do expected[output.wire]={type=type_node.substitute(output.type,bindings),required=output.required~=false} end
           for _,output in ipairs(spec.outputs or {}) do
-            local ok,err=type_node.validate(output.type)
-            if not ok then table.insert(errors,string.format("actor %q output type: %s",tostring(spec.id),err))
-            elseif actual[output.wire] then table.insert(errors,string.format("actor %q: duplicate semantic output wire %q",tostring(spec.id),output.wire))
-            else actual[output.wire]=output.type end
+            local item=expected[output.wire]
+            if not item or not compatible_output_type(item.type,output.type) then errors[#errors+1]=string.format("actor %q: undeclared semantic output wire %q",tostring(spec.id),tostring(output.wire)) else expected[output.wire]=nil end
           end
-          for wire,expected in pairs(expected_outputs) do
-            if (not actual[wire] and not optional_outputs[wire])
-                or (actual[wire] and not compatible_output_type(expected,actual[wire])) then
-              table.insert(errors,string.format("actor %q: semantic output for wire %q is missing or has the wrong type",tostring(spec.id),wire))
-            end
-            actual[wire]=nil
-          end
-          if next(actual) then table.insert(errors,string.format("actor %q: undeclared semantic output wire",tostring(spec.id))) end
-          end
-        end
-      local declared_output = {}
-      for _, tag in ipairs(decl.outputs) do
-        declared_output[tag] = true
-      end
-
-      for tag, dests in pairs(spec.routes or {}) do
-        if not declared_output[tag] and not RESERVED_ROUTE_KEYS[tag] then
-          table.insert(errors, string.format(
-            "actor %q: route key %q is not a declared output of factory %q",
-            tostring(spec.id), tostring(tag), spec.factory))
-        else
-          local source_endpoint = nil
-          for _, output in ipairs(spec.outputs or {}) do
-            if output.wire == tag then
-              if source_endpoint then source_endpoint = false else source_endpoint = output end
-            end
-          end
-          for _, destination in ipairs(dests) do
-            local dest_id = destination.actor
-            local dest_wire = destination.wire
-            local dest_factory,dest_spec = dest_factory_of(spec, tag, dest_id)
-            if dest_factory then
-              local dest_decl = self:declaration(dest_factory)
-              if not dest_decl then
-                table.insert(errors, string.format(
-                  "actor %q: destination %q uses unknown factory %q",
-                  tostring(spec.id), tostring(dest_id), tostring(dest_factory)))
-              else
-                local accepted = false
-                for _, in_shape in pairs(dest_decl.inputs) do
-                  if shape.accepts(in_shape, dest_wire) then
-                    accepted = true
-                    break
-                  end
-                end
-                if not accepted then
-                  table.insert(errors, string.format(
-                    "wiring %q -%s-> %q/%s: no input of factory %q accepts the destination wire",
-                    tostring(spec.id), tag, tostring(dest_id), tostring(dest_wire), dest_factory))
-                elseif dest_spec and decl.semantic and dest_decl.semantic then
-                  local source_semantic=nil
-                  for _,output in ipairs(spec.outputs or {}) do
-                    if output.wire==tag then
-                      if source_semantic then source_semantic=false else source_semantic=output.type end
-                    end
-                  end
-                  local dest_semantic=type(dest_spec.input)=="table" and dest_spec.input.type or nil
-                  if not source_semantic or not dest_semantic or
-                      not accepts_semantic(dest_semantic, source_semantic) then
-                    table.insert(errors,string.format(
-                      "wiring %q -%s-> %q: semantic endpoint types differ",
-                      tostring(spec.id),tag,tostring(dest_id)))
-                  end
-                end
-                if declarations ~= nil then
-                  local route_source = declarations[destination.source_type_id]
-                  local route_destination = declarations[destination.destination_type_id]
-                  if not source_endpoint or type(dest_spec.input) ~= "table" or
-                      not route_source or not route_destination or
-                      not accepts_semantic(source_endpoint.type, route_source) or
-                      not accepts_semantic(dest_spec.input.type, route_destination) or
-                      not accepts_semantic(route_destination, route_source) then
-                    table.insert(errors, string.format(
-                      "wiring %q -%s-> %q: route semantic descriptors are incompatible with endpoints",
-                      tostring(spec.id), tag, tostring(dest_id)))
-                  end
-                end
-              end
-            end
+          for wire,item in pairs(expected) do if item.required then errors[#errors+1]=string.format("actor %q: semantic output for wire %q is missing",tostring(spec.id),wire) end end
+          for name,scheme in pairs(decl.semantic.params or {}) do
+            local expected_type=type_node.substitute(scheme,bindings)
+            if type(spec.params)~="table" or not type_node.equal(spec.params[name],expected_type) then errors[#errors+1]=string.format("actor %q: semantic param %q has the wrong type descriptor",tostring(spec.id),name) end
           end
         end
       end
     end
   end
-
-  -- Product firing is an all-of contract over the complete post-apply route
-  -- topology. Per-edge compatibility is insufficient: repeated components
-  -- need repeated sender-bound edges, and both underfill and overfill must be
-  -- rejected before actors are registered.
-  local post_specs = {}
-  for _, spec in ipairs(existing_specs or {}) do post_specs[spec.id] = spec end
-  for _, spec in ipairs(actors) do
-    local _, prior_state = nil, nil
-    if resolve then _, prior_state = resolve(spec.id) end
-    -- Inventory lifecycles are monotone: a spawn at a tombstoned id is a
-    -- no-op, so its proposed routes cannot participate in post-apply product
-    -- coverage. A live id is already represented by existing_specs and also
-    -- wins over a duplicate spawn.
-    if prior_state ~= "dead" and not post_specs[spec.id] then
-      post_specs[spec.id] = spec
-    end
-  end
-  for _, id in ipairs((modification and modification.kills) or {}) do
-    post_specs[id] = nil
-  end
-  local incoming = {}
-  for _, source in pairs(post_specs) do
-    for wire, destinations in pairs(source.routes or {}) do
-      local source_type = nil
-      for _, output in ipairs(source.outputs or {}) do
-        if output.wire == wire then
-          if source_type then source_type = false else source_type = output.type end
-        end
-      end
-      for _, destination in ipairs(destinations) do
-        if source_type then
-          incoming[destination.actor] = incoming[destination.actor] or {}
-          table.insert(incoming[destination.actor], source_type)
-        end
-      end
-    end
-  end
-  -- Initial typed messages are real input sources, including whole products.
-  -- Validate newly authored/affected boundaries, not previously activated
-  -- message-only actors whose one-shot input is no longer in this delta.
-  local affected = {}
-  for _, actor in ipairs((modification and modification.actors) or {}) do
-    affected[actor.id] = true
-    for _, destinations in pairs(actor.routes or {}) do
-      for _, destination in ipairs(destinations) do affected[destination.actor] = true end
-    end
-  end
-  for _, id in ipairs((modification and modification.kills) or {}) do
-    for _, actor in ipairs(existing_specs or {}) do
-      if actor.id == id then
-        for _, destinations in pairs(actor.routes or {}) do
-          for _, destination in ipairs(destinations) do affected[destination.actor] = true end
-        end
-      end
-    end
-  end
-  for _, message in ipairs((modification and modification.messages) or {}) do
-    affected[message.to] = true
-    if message.semantic_type then
-      incoming[message.to] = incoming[message.to] or {}
-      table.insert(incoming[message.to], message.semantic_type)
-    end
-  end
-  for id, target in pairs(post_specs) do
-    local input_type = type(target.input) == "table" and target.input.type or nil
-    if affected[id] and type(input_type) == "table" and input_type.kind == "product" and
-        not product_input_covered(input_type, incoming[id] or {}) then
-      table.insert(errors, string.format(
-        "actor %q: product input incoming route types must exactly cover its component multiset",
-        tostring(id)))
-    end
-  end
-
-  if #errors == 0 then
-    return { ok = true }
-  end
-  return { ok = false, errors = errors }
+  return #errors==0 and {ok=true} or {ok=false,errors=errors}
 end
 
 return registry

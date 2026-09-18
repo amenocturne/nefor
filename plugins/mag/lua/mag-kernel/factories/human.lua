@@ -67,6 +67,8 @@ local function approval_reply_type()
   }
 end
 
+M.approval_reply_type = approval_reply_type
+
 M.declaration = {
   name = "human",
   type_variables = { "R" },

@@ -1075,6 +1075,21 @@ fn infer_builtin(
             .map_err(MagError::Type)?;
             Ok(MagType::String)
         }
+        "adt_constructor_payload" => {
+            exact(2)?;
+            let descriptor = infer(env, locals, &args[0])?;
+            compatible(
+                env,
+                &descriptor,
+                &MagType::TypeDescriptor,
+                &mut HashMap::new(),
+            )
+            .map_err(MagError::Type)?;
+            let name = infer(env, locals, &args[1])?;
+            compatible(env, &name, &MagType::String, &mut HashMap::new())
+                .map_err(MagError::Type)?;
+            Ok(MagType::TypeDescriptor)
+        }
         "type_arguments" | "type_components" => {
             exact(1)?;
             let descriptor = infer(env, locals, &args[0])?;
@@ -1524,6 +1539,7 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "artifact",
     "type_schema",
     "type_constructor",
+    "adt_constructor_payload",
     "type_arguments",
     "type_components",
     "list_type",
@@ -1635,7 +1651,11 @@ fn builtin_overload_types(name: &str, candidate: Option<&MagType>) -> Vec<MagTyp
         )],
         "type_evidence" => vec![function(vec![tag(var("value"))], descriptor)],
         "type_schema" => vec![function(vec![tag(var("value"))], MagType::TypeSchema)],
-        "type_constructor" => vec![function(vec![descriptor], MagType::String)],
+        "type_constructor" => vec![function(vec![descriptor.clone()], MagType::String)],
+        "adt_constructor_payload" => vec![function(
+            vec![descriptor.clone(), MagType::String],
+            descriptor,
+        )],
         "type_arguments" | "type_components" => {
             vec![function(vec![descriptor], list(MagType::TypeDescriptor))]
         }

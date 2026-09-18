@@ -1,3 +1,5 @@
+mod topology_lua;
+
 pub mod bridge {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge.rs"));
 }
@@ -106,12 +108,14 @@ pub mod kernel {
         }
 
         #[test]
-        fn nefor_mag_in_five_minutes_satisfies_runtime_factory_contracts() {
+        fn nefor_mag_in_five_minutes_satisfies_v3_runtime_contracts() {
             let host = shipped_host();
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let repository = manifest.join("../..");
-            let book = repository.join("mag/book/02. nefor/00. Nefor MAG in Five Minutes.md");
-            let markdown = std::fs::read_to_string(&book).expect("read Nefor guide");
+            let markdown = std::fs::read_to_string(
+                repository.join("mag/book/02. nefor/00. Nefor MAG in Five Minutes.md"),
+            )
+            .expect("read Nefor guide");
             let source = markdown
                 .split("```mag\n")
                 .nth(2)
@@ -124,27 +128,22 @@ pub mod kernel {
             std::fs::create_dir_all(&workspace).expect("create guide host workspace");
             std::fs::write(workspace.join("main.mag"), source).expect("write guide program");
 
-            let contracts = host.registry_contracts().expect("runtime contracts");
-            let artifact =
-                nefor_mag::compile_file_with_inputs_and_module_roots_and_options_and_syntax(
-                    &workspace,
-                    "main.mag",
-                    serde_json::json!({"factory_contracts": contracts}),
-                    &[
-                        repository.join("mag/lib"),
-                        repository.join("examples/nefor-agent/mag/lib"),
-                    ],
-                    nefor_mag::CompilerOptions::default(),
-                    nefor_mag::SyntaxMode::New,
-                )
-                .expect("compile Nefor guide with runtime contracts");
+            let artifact = nefor_mag::compile_file_with_inputs_and_module_roots_and_options_and_syntax(
+                &workspace,
+                "main.mag",
+                serde_json::json!({"factory_contracts": host.registry_contracts().expect("runtime contracts")}),
+                &[
+                    repository.join("mag/lib"),
+                    repository.join("examples/nefor-agent/mag/lib"),
+                ],
+                nefor_mag::CompilerOptions::default(),
+                nefor_mag::SyntaxMode::New,
+            )
+            .expect("compile Nefor guide with runtime contracts");
             let decoded = crate::artifact_program(&artifact).expect("decode guide program");
-            let initial = decoded.initial;
-
-            let actors = initial["actors"].as_array().expect("guide actors");
+            let actors = decoded.initial["actors"].as_array().expect("guide actors");
             for factory in [
                 "nefor.factory.shell-script",
-                "nefor.factory.discard",
                 "nefor.factory.dynamic-each",
                 "nefor.factory.dynamic-output",
                 "nefor.factory.dynamic-all",
@@ -154,23 +153,44 @@ pub mod kernel {
                     "guide must exercise {factory}"
                 );
             }
+            for retired in [
+                "nefor.factory.discard",
+                "nefor.factory.output",
+                "nefor.factory.product-first",
+                "nefor.factory.product-join",
+                "nefor.factory.product-split",
+                "nefor.factory.collector",
+                "nefor.factory.sequence-empty",
+                "nefor.factory.adt-pack",
+                "nefor.factory.adt-unpack",
+            ] {
+                assert!(
+                    !actors.iter().any(|actor| actor["factory"] == retired),
+                    "guide must not restore retired scaffolding actor {retired}"
+                );
+            }
             assert!(
-                !decoded.operations.is_empty(),
-                "guide declares runtime operations"
-            );
-            assert!(decoded
-                .operations
-                .iter()
-                .any(|operation| operation["template"]["actors"]
+                decoded.initial["junctions"]
                     .as_array()
-                    .is_some_and(|actors| !actors.is_empty())));
-
-            let build_params = actor_params(&initial, "verification.build");
-            assert_eq!(build_params["script"], "cargo build");
-            assert_eq!(build_params["cwd"], ".");
-            let test_params = actor_params(&initial, "verification.test");
-            assert_eq!(test_params["script"], "cargo test");
-            assert_eq!(test_params["cwd"], ".");
+                    .is_some_and(|junctions| !junctions.is_empty()),
+                "guide fixed composition lowers to junctions"
+            );
+            assert!(
+                decoded.operations.iter().any(|operation| {
+                    operation["template"]["actors"]
+                        .as_array()
+                        .is_some_and(|actors| !actors.is_empty())
+                }),
+                "guide declares a runtime-sized worker operation"
+            );
+            assert_eq!(
+                actor_params(&decoded.initial, "verification.build")["script"],
+                "cargo build"
+            );
+            assert_eq!(
+                actor_params(&decoded.initial, "verification.test")["script"],
+                "cargo test"
+            );
 
             assert!(
                 host.begin_run("mag-book-contracts", "mag-book-contracts", None)
@@ -178,119 +198,81 @@ pub mod kernel {
                     .ok
             );
             let started = host
-                .start_program("mag-book-contracts", &initial, &decoded.operations)
+                .start_program("mag-book-contracts", &decoded.initial, &decoded.operations)
                 .expect("start guide modification");
             assert!(
                 started.ok,
                 "guide host validation failed: {:?}",
                 started.error
             );
-
             host.end_run("mag-book-contracts", TeardownReason::RunComplete)
                 .expect("end guide host run");
             std::fs::remove_dir_all(workspace).expect("remove guide host workspace");
         }
 
         #[test]
-        fn ordinary_deterministic_workers_execute_as_traversal_templates() {
+        fn zero_actor_workers_execute_as_isolated_v3_traversal_templates() {
             let host = shipped_host();
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let source_dir = std::env::temp_dir().join(format!(
-                "mag-kernel-traverse-workers-{}",
+                "mag-kernel-v3-traverse-workers-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&source_dir);
             std::fs::create_dir_all(&source_dir).expect("create traversal test workspace");
 
-            for (name, worker, output_type, expected_factory) in [
+            let cases = [
+                (
+                    "identity-empty",
+                    "nefor.graph.identity<String>(\"worker\")",
+                    "String",
+                    "String",
+                    serde_json::json!([]),
+                    serde_json::json!([]),
+                ),
                 (
                     "identity",
                     "nefor.graph.identity<String>(\"worker\")",
                     "String",
-                    "nefor.factory.output",
-                ),
-                (
-                    "record-input",
-                    "nefor.graph.identity<Payload>(\"worker\")",
-                    "Payload",
-                    "nefor.factory.output",
-                ),
-                (
-                    "product-input",
-                    "nefor.graph.identity<(String, Int)>(\"worker\")",
-                    "(String, Int)",
-                    "nefor.factory.output",
-                ),
-                (
-                    "sum-input",
-                    "nefor.graph.identity<Choice>(\"worker\")",
-                    "Choice",
-                    "nefor.factory.output",
-                ),
-                (
-                    "unit-input",
-                    "nefor.graph.identity<Unit>(\"worker\")",
-                    "Unit",
-                    "nefor.factory.output",
-                ),
-                (
-                    "composed",
-                    "nefor.node.compose(\"worker\", nefor.graph.identity<String>(\"first\"), nefor.graph.identity<String>(\"second\"))",
                     "String",
-                    "nefor.factory.output",
+                    serde_json::json!(["alpha", "beta"]),
+                    serde_json::json!(["alpha", "beta"]),
                 ),
                 (
-                    "product",
+                    "fanout",
                     "nefor.node.fanout(\"worker\", nefor.graph.identity<String>(\"left\"), nefor.graph.identity<String>(\"right\"))",
+                    "String",
                     "(String, String)",
-                    "nefor.factory.product-join",
+                    serde_json::json!(["alpha", "beta"]),
+                    serde_json::json!([["alpha", "alpha"], ["beta", "beta"]]),
                 ),
                 (
                     "choose",
                     "nefor.node.choose(\"worker\", nefor.graph.identity<String>(\"left\"), nefor.graph.identity<Int>(\"right\"))",
                     "core.types.Either<String, Int>",
-                    "nefor.factory.adt-unpack",
+                    "core.types.Either<String, Int>",
+                    serde_json::json!([{"constructor":"Left","value":"alpha"},{"constructor":"Right","value":9}]),
+                    serde_json::json!([{"constructor":"Left","value":"alpha"},{"constructor":"Right","value":9}]),
                 ),
                 (
                     "result-bind",
                     "nefor.result.and_then(\"worker\", nefor.graph.identity<core.types.Result<String, Int>>(\"input\"), nefor.result.lift<Int, String, Int>(\"lift\", nefor.graph.identity<Int>(\"value\")))",
                     "core.types.Result<String, Int>",
-                    "nefor.factory.adt-unpack",
-                ),
-                (
-                    "result-map-error",
-                    "nefor.result.map_error(nefor.graph.identity<core.types.Result<String, Int>>(\"input\"), nefor.graph.identity<String>(\"error\"))",
                     "core.types.Result<String, Int>",
-                    "nefor.factory.adt-unpack",
+                    serde_json::json!([{"constructor":"Error","value":"failed"},{"constructor":"Ok","value":9}]),
+                    serde_json::json!([{"constructor":"Error","value":"failed"},{"constructor":"Ok","value":9}]),
                 ),
                 (
                     "sequence",
                     "nefor.node.sequence([nefor.graph.identity<String>(\"first\"), nefor.graph.identity<String>(\"second\")])",
+                    "String",
                     "List<String>",
-                    "nefor.factory.collector",
+                    serde_json::json!(["alpha", "beta"]),
+                    serde_json::json!([["alpha", "alpha"], ["beta", "beta"]]),
                 ),
-            ] {
-                let input_type = match name {
-                    "choose" => "core.types.Either<String, Int>",
-                    "result-bind" | "result-map-error" => "core.types.Result<String, Int>",
-                    "record-input" => "Payload",
-                    "product-input" => "(String, Int)",
-                    "sum-input" => "Choice",
-                    "unit-input" => "Unit",
-                    _ => "String",
-                };
-                let input_values = match name {
-                    "choose" => serde_json::json!([{"constructor":"Left","value":"alpha"},{"constructor":"Right","value":9}]),
-                    "result-bind" | "result-map-error" => serde_json::json!([{"constructor":"Error","value":"alpha"},{"constructor":"Ok","value":9}]),
-                    "record-input" => serde_json::json!([{"text":"alpha","nested":[1,2]}, {"text":"beta","nested":[]}]),
-                    "product-input" => serde_json::json!([["alpha",7],["beta",9]]),
-                    "sum-input" => serde_json::json!([{"constructor":"Text","value":"alpha"},{"constructor":"Count","value":9}]),
-                    "unit-input" => serde_json::json!([null,null]),
-                    _ => serde_json::json!(["alpha","beta"]),
-                };
-                let provider_values = if name == "product-input" {
-                    serde_json::json!([{"0":"alpha","1":7},{"0":"beta","1":9}])
-                } else { input_values.clone() };
+            ];
+
+            for (name, worker, input_type, output_type, provider_values, expected) in cases {
                 let source = format!(
                     r#"
 import core.types.{{}}
@@ -302,15 +284,12 @@ import nefor.graph.{{}}
 import nefor.node.{{}}
 import nefor.result.{{}}
 type InvestigationInput {{prompt: String}}
-type Payload {{text: String, nested: List<Int>}}
-type Choice = Text(String) | Count(Int)
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
 let configured_model = nefor.actors.ResolvedModel {{provider: "test-provider", model: "test-model", reasoning_effort: nefor.actors.no_reasoning_effort}}
-let start = nefor.graph.source("task", InvestigationInput {{prompt: "produce strings"}})
-let planner = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.dynamic.DynamicList<{input_type}>>("planner", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {{model: configured_model, system: "Return strings.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0}})
+let start = nefor.graph.source("task", InvestigationInput {{prompt: "produce values"}})
+let planner = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.dynamic.DynamicList<{input_type}>>("planner", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {{model: configured_model, system: "Return values.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0}})
 let planned = nefor.node.`>>>`(start, planner)
-let worker = {worker}
-let traversal = nefor.dynamic.traverse("traversal", worker)
+let traversal = nefor.dynamic.traverse("traversal", {worker})
 let lifted = nefor.result.lift<nefor.dynamic.DynamicList<{input_type}>, nefor.contracts.AgentError, nefor.dynamic.DynamicList<{output_type}>>("lifted", traversal)
 let completed = nefor.result.`>=>`(planned, lifted)
 let contextual = nefor.result.map(completed, nefor.dynamic.context<{output_type}>("completed-context"))
@@ -319,20 +298,18 @@ nefor.artifact.compile_graph(contextual)
                 );
                 std::fs::write(source_dir.join("main.mag"), source)
                     .expect("write traversal test program");
-                let contracts = host.registry_contracts().expect("runtime contracts");
-                let artifact =
-                    nefor_mag::compile_file_with_inputs_and_module_roots_and_options_and_syntax(
-                        &source_dir,
-                        "main.mag",
-                        serde_json::json!({"factory_contracts": contracts}),
-                        &[
-                            manifest.join("../../mag/lib"),
-                            manifest.join("../../examples/nefor-agent/mag/lib"),
-                        ],
-                        nefor_mag::CompilerOptions::default(),
-                        nefor_mag::SyntaxMode::New,
-                    )
-                    .unwrap_or_else(|error| panic!("compile {name} traversal worker: {error}"));
+                let artifact = nefor_mag::compile_file_with_inputs_and_module_roots_and_options_and_syntax(
+                    &source_dir,
+                    "main.mag",
+                    serde_json::json!({"factory_contracts": host.registry_contracts().expect("runtime contracts")}),
+                    &[
+                        manifest.join("../../mag/lib"),
+                        manifest.join("../../examples/nefor-agent/mag/lib"),
+                    ],
+                    nefor_mag::CompilerOptions::default(),
+                    nefor_mag::SyntaxMode::New,
+                )
+                .unwrap_or_else(|error| panic!("compile {name} traversal worker: {error}"));
                 let decoded = crate::artifact_program(&artifact)
                     .unwrap_or_else(|error| panic!("decode {name} traversal program: {error}"));
                 let operation = decoded
@@ -343,131 +320,353 @@ nefor.artifact.compile_graph(contextual)
                 let template_actors = operation["template"]["actors"]
                     .as_array()
                     .expect("traversal template actors");
+                assert_eq!(
+                    template_actors.len(),
+                    1,
+                    "{name}: only the dynamic index actor remains"
+                );
+                assert_eq!(template_actors[0]["factory"], "nefor.factory.dynamic-index");
+                let junctions = operation["template"]["junctions"]
+                    .as_array()
+                    .expect("traversal template junctions");
                 assert!(
-                    template_actors
-                        .iter()
-                        .any(|actor| actor["factory"] == expected_factory),
-                    "{name} traversal must lower its ordinary worker, not a hand-authored empty template: {template_actors:?}"
+                    !junctions.is_empty(),
+                    "{name}: structural worker must be retained"
                 );
                 assert!(
-                    !operation["template"]["routes"]
-                        .as_array()
-                        .expect("traversal template routes")
-                        .is_empty(),
-                    "{name} traversal must connect the ordinary worker to its indexed result"
+                    junctions.iter().all(|junction| {
+                        junction["inputs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .chain(junction["outputs"].as_array().into_iter().flatten())
+                            .all(|port| port["endpoint"]["constructor"] == "LocalJunctionRef")
+                    }),
+                    "{name}: worker junctions must remain occurrence-local"
                 );
+
                 assert!(host.begin_run(name, name, None).unwrap().ok);
                 host.drain_emits().unwrap();
-                let started = host.start_program(name, &decoded.initial, &decoded.operations).unwrap();
+                let started = host
+                    .start_program(name, &decoded.initial, &decoded.operations)
+                    .unwrap();
                 assert!(started.ok, "{name} start: {:?}", started.error);
                 let emitted = host.drain_emits().unwrap();
                 let request = tool_invoke(&emitted, "test-provider");
-                host.bus_response(request["id"].as_str().unwrap(),
-                    Some(&serde_json::json!({"text":serde_json::json!({"value":provider_values}).to_string()})), None, Some("async")).unwrap();
-                let completion = host.take_run_complete(name).unwrap();
+                host.bus_response(
+                    request["id"].as_str().unwrap(),
+                    Some(&serde_json::json!({"text": serde_json::json!({"value":provider_values}).to_string()})),
+                    None,
+                    Some("async"),
+                ).unwrap();
                 let failure = host.take_run_failed(name).unwrap();
-                let _events = host.drain_emits().unwrap();
+                let completion = host.take_run_complete(name).unwrap();
                 assert!(completion.is_some(), "{name} did not complete: {failure:?}");
                 let result = completion.unwrap().result.unwrap();
-                let ordered = &result["value"]["value"]["content"]["value"];
-                let expected = if name == "product" || name == "sequence" {
-                    serde_json::json!([["alpha", "alpha"], ["beta", "beta"]])
-                } else { input_values };
-                assert_eq!(ordered, &expected, "{name}: {result}");
+                assert_eq!(
+                    result["value"]["value"]["content"]["value"], expected,
+                    "{name}: {result}"
+                );
                 host.end_run(name, TeardownReason::RunComplete).unwrap();
+                host.drain_emits().unwrap();
             }
 
             std::fs::remove_dir_all(source_dir).expect("remove traversal test workspace");
         }
 
         #[test]
-        fn inline_actor_type_arguments_must_be_dense_lists() {
-            let host = shipped_host();
-            for (run_id, type_arguments) in [
-                ("missing-type-arguments", None),
+        fn actor_free_and_actor_backed_junction_terminals_preserve_absence_values() {
+            for (run_id, source, expected, expected_actor_count) in [
                 (
-                    "keyed-type-arguments",
-                    Some(serde_json::json!({"named": {"kind":"primitive","name":"String"}})),
+                    "actor-free-unit-terminal",
+                    r#"import nefor.artifact.{}
+import nefor.graph.{}
+nefor.artifact.compile_graph(nefor.graph.identity<Unit>("unit"))"#,
+                    JsonValue::Null,
+                    0,
+                ),
+                (
+                    "actor-backed-false-terminal",
+                    r#"import nefor.artifact.{}
+import nefor.graph.{}
+import nefor.node.{}
+let start = nefor.graph.source("start", false)
+let terminal = nefor.graph.identity<Bool>("terminal")
+nefor.artifact.compile_graph(nefor.node.compose("root", start, terminal))"#,
+                    serde_json::json!(false),
+                    1,
                 ),
             ] {
-                assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
-                let mut actor = serde_json::json!({
-                    "id": "inline",
-                    "factory": "nefor.factory.stub",
-                    "params": {},
-                    "routes": {}
-                });
-                if let Some(type_arguments) = type_arguments {
-                    actor["type_arguments"] = type_arguments;
-                }
-                let modification = serde_json::json!({
-                    "actors": [actor],
-                    "messages": [],
-                    "kills": [],
-                    "result": {"from": {"actor": "inline", "wire": "stub.Out", "type": "String"}}
-                });
-                let outcome = host.start(run_id, &modification).expect("start");
-                assert!(!outcome.ok, "{run_id} unexpectedly accepted");
-                assert!(
-                    outcome
-                        .error
-                        .as_deref()
-                        .is_some_and(|error| error.contains("type_arguments must be a dense list")),
-                    "{run_id}: {:?}",
-                    outcome.error
+                let host = shipped_host();
+                let mut modification = compile_mag_source(&host, run_id, source);
+                assert_eq!(
+                    modification["actors"].as_array().map(Vec::len),
+                    Some(expected_actor_count)
                 );
-                host.end_run(run_id, TeardownReason::RunFailed)
-                    .expect("end invalid run");
+                if expected_actor_count == 0 {
+                    assert_eq!(
+                        modification["result"]["from"]["endpoint"]["constructor"],
+                        "JunctionEndpoint"
+                    );
+                } else {
+                    let actor_output = modification["actors"][0]["outputs"][0].clone();
+                    modification["result"]["from"] = actor_output;
+                    modification["junctions"] = serde_json::json!([]);
+                    modification["routes"] = serde_json::json!([]);
+                    assert_eq!(
+                        modification["result"]["from"]["endpoint"]["constructor"],
+                        "ActorEndpoint"
+                    );
+                }
+                assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
+                host.drain_emits().unwrap();
+                let started = host.start(run_id, &modification).unwrap();
+                assert!(started.ok, "{run_id}: {:?}", started.error);
+                let completion = host
+                    .take_run_complete(run_id)
+                    .unwrap()
+                    .expect("terminal completion");
+                let result = completion.result.unwrap();
+                assert_eq!(result.get("value").unwrap_or(&result), &expected);
+                let emits = host.drain_emits().unwrap();
+                let junction_ids: Vec<_> = modification["junctions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|junction| junction["id"].as_str())
+                    .collect();
+                assert!(
+                    !emits.iter().any(|event| {
+                        event
+                            .get("id")
+                            .and_then(JsonValue::as_str)
+                            .is_some_and(|id| junction_ids.contains(&id))
+                            && event
+                                .get("kind")
+                                .and_then(JsonValue::as_str)
+                                .is_some_and(|kind| {
+                                    matches!(
+                                        kind,
+                                        "mag.actor_ready"
+                                            | "mag.actor_busy"
+                                            | "mag.actor_idle"
+                                            | "mag.actor_killed"
+                                            | "mag.actor_firing"
+                                            | "mag.actor_emission"
+                                    )
+                                })
+                    }),
+                    "junctions must not fabricate actor lifecycle: {emits:#?}"
+                );
+                host.end_run(run_id, TeardownReason::RunComplete).unwrap();
             }
         }
 
         #[test]
-        fn compile_reuses_shared_nodes_across_a_multi_agent_graph() {
+        fn malformed_v3_topology_is_rejected_before_actor_construction() {
+            let source = r#"import nefor.artifact.{}
+import nefor.graph.{}
+let start = nefor.graph.source("start", "value")
+nefor.artifact.compile_graph(start)"#;
+            for (run_id, mutate, expected) in [
+                ("unknown-junction-endpoint", 0_u8, "unknown"),
+                ("junction-port-owner-mismatch", 1_u8, "belong"),
+                ("unknown-junction-operation", 2_u8, "operation"),
+            ] {
+                let host = shipped_host();
+                let mut modification = compile_mag_source(&host, run_id, source);
+                match mutate {
+                    0 => {
+                        modification["routes"][0]["to"]["endpoint"]["value"]["id"] =
+                            serde_json::json!("missing")
+                    }
+                    1 => {
+                        modification["junctions"][0]["inputs"][0]["endpoint"]["value"]["id"] =
+                            serde_json::json!("different")
+                    }
+                    2 => {
+                        modification["junctions"][0]["operation"] =
+                            serde_json::json!({"constructor":"RetiredFactory","value":null})
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
+                host.drain_emits().unwrap();
+                let outcome = host.start(run_id, &modification).unwrap();
+                assert!(
+                    !outcome.ok,
+                    "{run_id} unexpectedly accepted malformed topology"
+                );
+                assert!(
+                    outcome
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.to_ascii_lowercase().contains(expected)),
+                    "{run_id}: {:?}",
+                    outcome.error
+                );
+                let emits = host.drain_emits().unwrap();
+                assert!(
+                    !emits
+                        .iter()
+                        .any(|event| event["kind"] == "mag.actor_spawned"),
+                    "{run_id} constructed an actor before rejecting topology: {emits:#?}"
+                );
+                host.end_run(run_id, TeardownReason::RunFailed).unwrap();
+            }
+        }
+
+        #[test]
+        fn divergent_junction_payloads_are_rejected_before_activation_without_changing_run_state() {
+            let cases = [
+                (
+                    "divergent-product",
+                    r#"import nefor.artifact.{}
+import nefor.graph.{}
+import nefor.node.{}
+let start = nefor.graph.source("start", ("left", "right"))
+let worker = nefor.node.parallel("worker", nefor.graph.identity<String>("left"), nefor.graph.identity<String>("right"))
+let result = nefor.graph.output_for("result", worker)
+nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
+                    "ProductSplit",
+                    serde_json::json!("not-a-product"),
+                    serde_json::json!(["left", "right"]),
+                ),
+                (
+                    "divergent-adt-payload",
+                    r#"import core.types.{}
+import nefor.artifact.{}
+import nefor.graph.{}
+import nefor.node.{}
+let start = nefor.graph.source("start", named(core.types.Either<String, Int>, Left, "chosen"))
+let worker = nefor.node.choose("worker", nefor.graph.identity<String>("left"), nefor.graph.identity<Int>("right"))
+let result = nefor.graph.output_for("result", worker)
+nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
+                    "AdtUnpack",
+                    serde_json::json!({"constructor":"Left","value":7}),
+                    serde_json::json!({"constructor":"Left","value":"chosen"}),
+                ),
+            ];
+
+            for (run_id, source, operation, raw_value, semantic_value) in cases {
+                let host = shipped_host();
+                let original = compile_mag_source(&host, run_id, source);
+                let mut malformed = original.clone();
+                let input = malformed["junctions"]
+                    .as_array()
+                    .and_then(|junctions| {
+                        junctions
+                            .iter()
+                            .find(|junction| junction["operation"]["constructor"] == operation)
+                    })
+                    .and_then(|junction| junction["inputs"].as_array())
+                    .and_then(|inputs| inputs.first())
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{run_id} has no {operation} input"));
+                malformed["messages"]
+                    .as_array_mut()
+                    .expect("messages")
+                    .push(serde_json::json!({
+                        "to": input,
+                        "semantic_type": input["type"].clone(),
+                        "semantic_type_id": input["type_id"].clone(),
+                        "content": {
+                            "value": raw_value,
+                            "semantic_value": semantic_value,
+                        },
+                    }));
+
+                assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
+                host.drain_emits().unwrap();
+                let rejected = host.start(run_id, &malformed).unwrap();
+                assert!(!rejected.ok, "{run_id} admitted divergent representations");
+                assert!(
+                    rejected
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("malformed raw value")),
+                    "{run_id}: {:?}",
+                    rejected.error
+                );
+                let rejected_emits = host.drain_emits().unwrap();
+                assert!(
+                    !rejected_emits.iter().any(|event| matches!(
+                        event.get("kind").and_then(JsonValue::as_str),
+                        Some("mag.actor_spawned" | "mag.actor_ready" | "mag.actor_busy")
+                    )),
+                    "{run_id} activated an actor before rejection: {rejected_emits:#?}"
+                );
+                assert!(
+                    !rejected_emits
+                        .iter()
+                        .any(|event| event.get("kind")
+                            == Some(&serde_json::json!("capability.request"))),
+                    "{run_id} emitted capability work before rejection: {rejected_emits:#?}"
+                );
+
+                let accepted = host.start(run_id, &original).unwrap();
+                assert!(
+                    accepted.ok,
+                    "{run_id} retained rejected state: {:?}",
+                    accepted.error
+                );
+                assert!(host.take_run_complete(run_id).unwrap().is_some());
+                host.end_run(run_id, TeardownReason::RunComplete).unwrap();
+            }
+        }
+
+        #[test]
+        fn existing_actor_routes_install_atomically_and_rejected_delta_does_not_activate() {
             let host = shipped_host();
-            let source = r#"
-    import core.types.{}
-    import nefor.actors.{}
-    import nefor.artifact.{}
-    import nefor.contracts.{}
-    import nefor.graph.{}
-    type InvestigationInput {prompt: String}
-
-    let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
-    let resolved = nefor.actors.ResolvedModel {
-      provider: "test-provider",
-      model: "test-model",
-      reasoning_effort: nefor.actors.reasoning_effort("medium"),
-    }
-
-    let make_agent<I, O>: fn(String, TypeTag<I>, TypeTag<O>) -> nefor.graph.Node<I, core.types.Result<nefor.contracts.AgentError, O>> = |id, input_type, output_type| =>
-      nefor.actors.agent<nefor.actors.ResolvedModel, I, O>(id, exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2, })
-
-    let left_task = nefor.graph.source("left-task", InvestigationInput {prompt: "left"})
-    let middle_task = nefor.graph.source("middle-task", InvestigationInput {prompt: "middle"})
-    let right_task = nefor.graph.source("right-task", InvestigationInput {prompt: "right"})
-    let left = make_agent("left", type_tag<InvestigationInput>(), type_tag<nefor.contracts.TextAnswer>())
-    let middle = make_agent("middle", type_tag<InvestigationInput>(), type_tag<nefor.contracts.TextAnswer>())
-    let right = make_agent("right", type_tag<InvestigationInput>(), type_tag<nefor.contracts.TextAnswer>())
-    let synthesis = make_agent("synthesis", type_tag<(core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>)>(), type_tag<nefor.contracts.TextAnswer>())
-    let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
-    let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [
-      nefor.graph.edge(left_task, left),
-      nefor.graph.edge(middle_task, middle),
-      nefor.graph.edge(right_task, right),
-      nefor.graph.edge(left, synthesis),
-      nefor.graph.edge(middle, synthesis),
-      nefor.graph.edge(right, synthesis),
-      nefor.graph.edge(synthesis, result),
-    ])
-    nefor.artifact.compile(topology)
-    "#;
-
-            let modification = compile_mag_source(&host, "shared-multi-agent", source);
-            assert_eq!(
-                modification["actors"].as_array().map(Vec::len),
-                Some(20),
-                "each node is lowered once even when it appears at multiple edge boundaries"
+            let mut initial = compile_mag_source(
+                &host,
+                "delta-routes",
+                r#"
+import nefor.artifact.{}
+import nefor.graph.{}
+nefor.artifact.compile_graph(nefor.graph.source("start", false))
+"#,
             );
+            let routes = initial["routes"].take();
+            let messages = initial["messages"].take();
+            initial["routes"] = serde_json::json!([]);
+            initial["messages"] = serde_json::json!([]);
+            assert!(
+                host.begin_run("delta-routes", "delta-routes", None)
+                    .unwrap()
+                    .ok
+            );
+            assert!(host.start("delta-routes", &initial).unwrap().ok);
+            assert!(host.take_run_complete("delta-routes").unwrap().is_none());
+            host.drain_emits().unwrap();
+            let delta = serde_json::json!({
+                "actors":[], "junctions":[], "nodes":[], "kills":[],
+                "types":initial["types"], "routes":routes, "messages":messages
+            });
+            let mut rejected = delta.clone();
+            rejected["routes"][0]["to"]["endpoint"]["value"]["id"] = serde_json::json!("missing");
+            let outcome = host.apply("delta-routes", &rejected).unwrap();
+            assert!(!outcome.ok);
+            assert!(host.take_run_complete("delta-routes").unwrap().is_none());
+            assert!(!host.drain_emits().unwrap().iter().any(|event| {
+                event.get("kind").and_then(JsonValue::as_str) == Some("mag.actor_ready")
+            }));
+            let outcome = host.apply("delta-routes", &delta).unwrap();
+            assert!(outcome.ok, "{:?}", outcome.error);
+            let completion = host.take_run_complete("delta-routes").unwrap().unwrap();
+            assert_eq!(completion.result.unwrap()["value"], false);
+            let mut kill = serde_json::json!({"types":{},"actors":[],"junctions":[],
+                "routes":[],"messages":[],"nodes":[],"kills":["start"]});
+            assert!(host.apply("delta-routes", &kill).unwrap().ok);
+            kill["kills"] = serde_json::json!([]);
+            let after_kill = host.apply("delta-routes", &kill).unwrap();
+            assert!(
+                after_kill.ok,
+                "dead actor routes retain known endpoints: {:?}",
+                after_kill.error
+            );
+            host.end_run("delta-routes", TeardownReason::RunComplete)
+                .unwrap();
         }
 
         #[test]
@@ -1010,58 +1209,6 @@ nefor.artifact.compile_graph(contextual)
         }
 
         #[test]
-        fn fixed_sequence_of_task_sources_bootstraps_once_at_its_outer_unit_boundary() {
-            let host = shipped_host();
-            let source = r#"
-    import core.types.{}
-    import nefor.actors.{}
-    import nefor.artifact.{}
-    import nefor.contracts.{}
-    import nefor.graph.{}
-    import nefor.node.{}
-    type InvestigationInput {prompt: String}
-    let first = nefor.graph.source("first", InvestigationInput {prompt: "first task"})
-    let second = nefor.graph.source("second", InvestigationInput {prompt: "second task"})
-    let tasks = nefor.node.sequence([first, second])
-    let result = nefor.graph.output_for("result", tasks)
-    nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(tasks, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
-    "#;
-            let modification = compile_mag_source(&host, "task-source-sequence", source);
-            assert_eq!(
-                modification["messages"].as_array().map(Vec::len),
-                Some(1),
-                "only the completed sequence root receives initial activation"
-            );
-            assert!(modification["messages"][0]["to"]
-                .as_str()
-                .is_some_and(|target| target.ends_with(".input")));
-
-            let begun = host
-                .begin_run("task-source-sequence", "task-source-sequence", None)
-                .expect("begin source sequence run");
-            assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
-            let outcome = host
-                .start("task-source-sequence", &modification)
-                .expect("start source sequence run");
-            assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let completion = host
-                .take_run_complete("task-source-sequence")
-                .expect("take source sequence completion")
-                .expect("source sequence completed");
-            assert_eq!(
-                completion
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("value")),
-                Some(&serde_json::json!([
-                    {"prompt": "first task"},
-                    {"prompt": "second task"}
-                ]))
-            );
-        }
-
-        #[test]
         fn shared_input_sequence_and_left_sequencing_retain_runtime_values() {
             for (run_id, source, expected) in [
                 (
@@ -1090,16 +1237,6 @@ let operation = nefor.node.`<*`(left, right)
 nefor.artifact.compile_graph(operation)
 "#,
                     serde_json::json!("retained"),
-                ),
-                (
-                    "explicit-empty-sequence",
-                    r#"
-import nefor.artifact.{}
-import nefor.node.{}
-let operation = nefor.node.sequence_empty<Unit, String>("empty")
-nefor.artifact.compile_graph(operation)
-"#,
-                    serde_json::json!([]),
                 ),
             ] {
                 let host = shipped_host();
@@ -1165,172 +1302,6 @@ let params = nefor.shell.ShellScriptParams {{script: "printf root-ok", cwd: ".",
 let result = nefor.graph.output_for("result", operation)
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(operation, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#
             )
-        }
-
-        #[test]
-        fn unit_accepting_roots_lower_only_the_exposed_unfed_boundary() {
-            let host = shipped_host();
-            for (name, definitions, expected) in [
-                (
-                    "unit-root-run",
-                    "let operation = nefor.shell.script(\"command\", params)",
-                    "command",
-                ),
-                (
-                    "unit-root-script",
-                    "let operation = nefor.shell.script(\"command\", params)",
-                    "command",
-                ),
-                (
-                    "unit-root-sequence",
-                    r#"
-let one = nefor.shell.script("one", params)
-let two = nefor.shell.script("two", params)
-let inner = nefor.node.sequence([one, two])
-let sequence = nefor.node.sequence([inner])
-let operation = nefor.node.named("outer", sequence)"#,
-                    ".input",
-                ),
-                (
-                    "unit-root-dependent",
-                    r#"
-let operation = nefor.node.then("ordered", nefor.shell.script("dependency", params), nefor.shell.script("command", params))"#,
-                    "dependency",
-                ),
-            ] {
-                let source = unit_root_program(definitions);
-                let modification = compile_mag_source(&host, name, &source);
-                assert_eq!(
-                    modification,
-                    compile_mag_source(&host, name, &source),
-                    "deterministic lowering"
-                );
-                let messages = modification["messages"].as_array().unwrap();
-                assert_eq!(messages.len(), 1, "{name}: {messages:?}");
-                let target = messages[0]["to"].as_str().unwrap();
-                if expected.starts_with('.') {
-                    assert!(target.ends_with(expected), "{name}: {target}");
-                } else {
-                    assert_eq!(target, expected);
-                }
-                assert_eq!(
-                    messages[0]["semantic_type"],
-                    serde_json::json!({"kind": "primitive", "name": "Unit"})
-                );
-                assert_eq!(messages[0]["content"]["value"], JsonValue::Null);
-            }
-        }
-
-        #[test]
-        fn unit_accepting_roots_respect_explicit_messages_and_reject_missing_inputs() {
-            let host = shipped_host();
-            let explicit = r#"
-import nefor.artifact.{}
-import nefor.graph.{}
-import nefor.shell.{}
-import nefor.contracts.{}
-let command = nefor.shell.script("command", nefor.shell.ShellScriptParams {script: "cat", cwd: ".", timeout: named(nefor.contracts.Timeout, Unlimited, nil)})
-let text = nil
-nefor.artifact.delta(nefor.graph.delta_message(nefor.graph.node_delta(command), get(command, "input"), text))"#;
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let artifact = nefor_mag::compile_with_inputs_and_module_roots_and_options_and_syntax(
-                explicit,
-                &manifest,
-                serde_json::json!({"factory_contracts": host.registry_contracts().unwrap()}),
-                &[manifest.join("../../mag/lib")],
-                nefor_mag::CompilerOptions::default(),
-                nefor_mag::SyntaxMode::New,
-            )
-            .expect("compile explicit delta");
-            let modification = crate::artifact_delta(&artifact).expect("normalize delta envelope");
-            let messages = modification["messages"].as_array().unwrap();
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0]["content"]["value"], JsonValue::Null);
-            assert_eq!(messages[0]["semantic_type"]["name"], "Unit");
-
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            for (name, definitions, expected) in [
-                (
-                    "text",
-                    "let operation = nefor.graph.identity<MessageContent>(\"missing\")",
-                    ["root validation failed", "main.MessageContent"],
-                ),
-                (
-                    "product",
-                    "let operation = nefor.graph.identity<(Unit, Unit)>(\"missing\")",
-                    ["root validation failed", "product"],
-                ),
-                (
-                    "non-unit",
-                    "let operation = nefor.graph.identity<MessageContent>(\"missing\")",
-                    ["root validation failed", "MessageContent"],
-                ),
-                (
-                    "internal",
-                    r#"
-let command = nefor.shell.script("command", params)
-let hidden = nefor.graph.identity<Unit>("hidden")
-let operation = nefor.graph.node_with_operations_and_nodes("wrapper", "ordinary", concat(get(command, "actors"), get(hidden, "actors")), get(command, "routes"), [], [], concat(get(command, "nodes"), get(hidden, "nodes")), get(command, "input"), get(command, "output"))"#,
-                    ["input coverage failed", "hidden.nefor.graph.Value"],
-                ),
-            ] {
-                let error = nefor_mag::compile_with_inputs_and_module_roots_and_options_and_syntax(
-                    &unit_root_program(definitions),
-                    &manifest,
-                    serde_json::json!({"factory_contracts": host.registry_contracts().unwrap()}),
-                    &[manifest.join("../../mag/lib")],
-                    nefor_mag::CompilerOptions::default(),
-                    nefor_mag::SyntaxMode::New,
-                )
-                .expect_err(name)
-                .to_string();
-                for fragment in expected {
-                    assert!(
-                        error.contains(fragment),
-                        "{name}: missing {fragment:?}: {error}"
-                    );
-                }
-            }
-
-            let fixture_root = manifest.join("../../examples/nefor-agent/mag/tests");
-            for (fixture, expected) in [
-                (
-                    "invalid-product-underfill.mag",
-                    [
-                        "input coverage failed",
-                        "join.test.Value",
-                        "left.nefor.graph.Value",
-                        "missing, extra, or ambiguous occurrences",
-                    ],
-                ),
-                (
-                    "invalid-uncovered-sum-arm.mag",
-                    [
-                        "output coverage failed",
-                        "split.nefor.adt.Second",
-                        "main.Right",
-                        "coverage is incomplete",
-                    ],
-                ),
-            ] {
-                let source = std::fs::read_to_string(fixture_root.join(fixture)).unwrap();
-                let error = nefor_mag::compile_with_inputs_and_module_roots_and_options_and_syntax(
-                    &source,
-                    &fixture_root,
-                    serde_json::json!({"factory_contracts": host.registry_contracts().unwrap()}),
-                    &[manifest.join("../../mag/lib")],
-                    nefor_mag::CompilerOptions::default(),
-                    nefor_mag::SyntaxMode::New,
-                )
-                .expect_err(fixture)
-                .to_string();
-                for fragment in expected {
-                    assert!(
-                        error.contains(fragment),
-                        "{fixture}: missing {fragment:?}: {error}"
-                    );
-                }
-            }
         }
 
         // Execute only the harmless command requested by the shipped shell factory;
@@ -1776,7 +1747,7 @@ nefor.artifact.compile_graph(operation)"#
                 .expect("read completion")
                 .expect("ordinary graph completes");
             let result = completion.result.expect("typed output result");
-            assert_eq!(result["kind"], "nefor.graph.Value");
+            assert_eq!(result["kind"], "out");
             assert_eq!(result["value"]["content"], "ordinary");
             assert!(host
                 .take_run_failed("ordinary-source-node-output")
@@ -1858,49 +1829,11 @@ nefor.artifact.compile_graph(operation)"#
                 .expect("read completion")
                 .expect("whole product graph completes");
             let result = completion.result.expect("typed product result");
-            assert_eq!(result["kind"], "nefor.graph.Value");
+            assert_eq!(result["kind"], "out");
             assert_eq!(result["value"][0]["content"], "left");
             assert_eq!(result["value"][1]["content"], "right");
             assert!(result["semantic_type_id"].as_str().is_some());
-            assert!(result["constructor_id"].is_null());
-        }
-
-        #[test]
-        fn component_edges_assemble_an_ordered_product_at_the_output() {
-            let host = shipped_host();
-            let modification = compile_mag_source(
-                &host,
-                "component-product-output",
-                r#"
-    import nefor.artifact.{}
-    import nefor.graph.{}
-
-    type Left {content: String}
-    type Right {count: Int}
-
-    let left = nefor.graph.source("left", Left {content: "first"})
-    let right = nefor.graph.source("right", Right {count: 2})
-    let result = nefor.graph.output<(Left, Right)>("result")
-    nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(left, result), nefor.graph.edge(right, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
-                "#,
-            );
-            let run_id = "component-product-output";
-            assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
-            host.drain_emits().expect("drain begin event");
-            let outcome = host.start(run_id, &modification).expect("start");
-            assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let emits = host.drain_emits().expect("drain product events");
-            let completion = host.take_run_complete(run_id).expect("read completion");
-            assert!(
-                completion.is_some(),
-                "component product graph did not complete: {emits:?}"
-            );
-            let completion = completion.expect("checked above");
-            let result = completion.result.expect("typed product result");
-            assert_eq!(result["value"][0]["content"], "first");
-            assert_eq!(result["value"][1]["count"], 2);
-            assert!(result["semantic_type_id"].as_str().is_some());
-            assert!(result["constructor_id"].is_null());
+            assert_eq!(result["constructor_id"], result["semantic_type_id"]);
         }
 
         #[test]
@@ -1966,7 +1899,11 @@ nefor.artifact.compile_graph(operation)"#
             let result = completion.result.expect("typed ADT result");
             assert_eq!(result["value"]["constructor"], "Left");
             assert_eq!(result["value"]["value"]["value"], "chosen");
-            assert_ne!(result["semantic_type_id"], result["constructor_id"]);
+            let owner = nefor_mag::json::concrete_type_from_json(&result["semantic_type"]).unwrap();
+            assert_eq!(
+                result["constructor_id"],
+                owner.constructor_id("Left").unwrap().as_str()
+            );
             assert!(result["constructor_id"]
                 .as_str()
                 .is_some_and(|id| id.starts_with("sha256:")));
@@ -2011,16 +1948,12 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
                 host.drain_emits().expect("drain begin");
                 let outcome = host.start(run_id, &modification).expect("start");
                 assert!(outcome.ok, "{run_id}: {:?}", outcome.error);
-                let emits = host.drain_emits().expect("drain");
+                host.drain_emits().expect("drain");
                 let completion = host
                     .take_run_complete(run_id)
                     .expect("take")
                     .expect("complete");
                 assert_eq!(completion.result.expect("result")["value"], expected);
-                let right_ran = emits
-                    .iter()
-                    .any(|event| event["kind"] == "mag.actor_ready" && event["id"] == "right");
-                assert_eq!(right_ran, constructor == "Ok");
                 host.end_run(run_id, TeardownReason::RunComplete)
                     .expect("end");
                 host.drain_emits().expect("drain end");
@@ -2097,104 +2030,6 @@ nefor.artifact.compile_graph(operation)"#;
                 "{error}"
             );
         }
-
-        #[test]
-        fn structural_result_boundary_accepts_arbitrary_declared_wire() {
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let path = manifest.join("lua/mag-kernel/init.lua");
-            let lua_root = manifest.join("../../lua");
-            let host = LuaHost::load_kernel(&path, Some(&lua_root)).expect("load shipped kernel");
-            let begun = host
-                .begin_run("custom-result", "custom-result", None)
-                .expect("begin run");
-            assert!(begun.ok, "begin failed: {:?}", begun.error);
-            let modification = serde_json::json!({
-                "actors": [{
-                    "id": "custom",
-                    "factory": "nefor.factory.stub",
-                    "type_arguments": [],
-                    "params": {"greeting": "done"},
-                    "routes": {}
-                }],
-                "messages": [{"to": "custom", "content": {"kind": "stub.In"}}],
-                "kills": [],
-                "result": {"from": {
-                    "actor": "custom",
-                    "type": "example.CustomResult",
-                    "wire": "stub.Out"
-                }}
-            });
-            let outcome = host.start("custom-result", &modification).expect("start");
-            assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let completion = host
-                .take_run_complete("custom-result")
-                .expect("read completion")
-                .expect("custom result completed");
-            assert_eq!(
-                completion.result.as_ref().and_then(|v| v["kind"].as_str()),
-                Some("stub.Out")
-            );
-            assert_eq!(
-                completion
-                    .result
-                    .as_ref()
-                    .and_then(|v| v["greeting"].as_str()),
-                Some("done")
-            );
-        }
-
-        #[test]
-        fn rejected_modifications_leave_no_partial_inventory_changes() {
-            let host = shipped_host();
-            let run_id = "atomic-rejection";
-            assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
-            host.drain_emits().expect("drain begin event");
-
-            let rejected = host
-                .apply(
-                    run_id,
-                    &serde_json::json!({
-                        "types": {},
-                        "actors": [{
-                            "id": "tentative",
-                            "factory": "nefor.factory.stub",
-                            "type_arguments": [],
-                            "params": {},
-                            "routes": {}
-                        }],
-                        "messages": [{"to": "missing", "content": {"kind": "stub.In"}}],
-                        "nodes": [{"path": ["tentative"], "members": ["tentative"]}],
-                        "kills": []
-                    }),
-                )
-                .expect("apply rejected modification");
-            assert!(!rejected.ok);
-            assert!(
-                rejected
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("unknown message target 'missing'")),
-                "{rejected:?}"
-            );
-
-            let probe = host
-                .apply(
-                    run_id,
-                    &serde_json::json!({
-                        "types": {},
-                        "actors": [],
-                        "messages": [{"to": "tentative", "content": {"kind": "stub.In"}}],
-                        "nodes": [],
-                        "kills": []
-                    }),
-                )
-                .expect("probe inventory after rejection");
-            assert!(!probe.ok);
-            assert!(probe
-                .error
-                .as_deref()
-                .is_some_and(|error| { error.contains("unknown message target 'tentative'") }));
-        }
     }
 }
 
@@ -2204,124 +2039,6 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime.rs"));
 mod tests {
     use super::*;
     use std::fs;
-
-    #[tokio::test]
-    async fn unsupported_provider_schema_rejects_before_run_start_or_provider_dispatch() {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let host = LuaHost::load_kernel(
-            &manifest.join("lua/mag-kernel/init.lua"),
-            Some(&manifest.join("../../lua")),
-        )
-        .expect("kernel");
-        let body = serde_json::json!({
-            "run_id": "unsupported-schema",
-            "session_id": "session-1",
-            "artifact": {"format":"nefor.mag","version":2,"kind":"program","program":{
-                "initial": {
-                    "types": {},
-                    "actors": [{
-                        "id": "answer",
-                        "factory": "structured-output",
-                        "params": {"$mag":"packed-value","value":{"schema": {"version": 1, "root": {"kind": "json_value"}}}}
-                    }],
-                    "messages": [], "nodes": [], "kills": [], "result": {}
-                },
-                "operations": []
-            }}
-        });
-        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
-        let mut active = ActiveExecutes::new();
-        let mut bridge = CapabilityBridge::new("tool-gate");
-        handle_execute(
-            &out_tx,
-            "direct",
-            body.as_object().expect("execute body"),
-            Some("execute-1"),
-            (&host, &mut active, &mut bridge),
-        )
-        .await
-        .expect("rejection is a protocol response");
-
-        let outgoing = out_rx.try_recv().expect("one rejection response");
-        let Body::Event(body) = outgoing.body else {
-            panic!("expected event response")
-        };
-        assert_eq!(body["kind"], ERROR_KIND);
-        assert!(body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no faithful")));
-        assert!(
-            out_rx.try_recv().is_err(),
-            "no provider dispatch follows rejection"
-        );
-        assert!(active.is_empty(), "rejected execute never becomes active");
-        assert!(
-            host.drain_emits().expect("kernel emits").is_empty(),
-            "begin_run was never called, so mag.run_started was not emitted"
-        );
-    }
-
-    #[tokio::test]
-    async fn synchronous_execute_publishes_runtime_owned_duration() {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let host = LuaHost::load_kernel(
-            &manifest.join("lua/mag-kernel/init.lua"),
-            Some(&manifest.join("../../lua")),
-        )
-        .expect("kernel");
-        let body = serde_json::json!({
-            "run_id": "synchronous-duration",
-            "session_id": "session-1",
-            "artifact": {"format":"nefor.mag","version":2,"kind":"program","program":{
-                "initial": {
-                    "types": {},
-                    "actors": [{
-                        "id": "sync",
-                        "factory": "nefor.factory.stub",
-                        "type_arguments": [],
-                        "params": {"$mag": "packed-value", "value": {"greeting": "done"}},
-                        "routes": {}
-                    }],
-                    "messages": [{"to": "sync", "content": {"$mag": "packed-value", "value": {"kind": "stub.In"}}}],
-                    "nodes": [{"path": ["sync"], "members": ["sync"]}],
-                    "kills": [],
-                    "result": {"from": {"actor": "sync", "type": "example.Result", "type_id": "sha256:test-result", "wire": "stub.Out"}}
-                },
-                "operations": []
-            }}
-        });
-        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
-        let mut active = ActiveExecutes::new();
-        let mut bridge = CapabilityBridge::new("tool-gate");
-        handle_execute(
-            &out_tx,
-            "direct",
-            body.as_object().expect("execute body"),
-            Some("execute-sync"),
-            (&host, &mut active, &mut bridge),
-        )
-        .await
-        .expect("synchronous execution");
-
-        let mut events = Vec::new();
-        while let Ok(outgoing) = out_rx.try_recv() {
-            let Body::Event(body) = outgoing.body else {
-                continue;
-            };
-            events.push(body);
-        }
-        let result = events
-            .iter()
-            .find(|body| body.get("kind").and_then(Value::as_str) == Some(RUN_RESULT_KIND))
-            .unwrap_or_else(|| panic!("terminal run result missing from {events:?}"));
-        assert_eq!(
-            result.get("status").and_then(Value::as_str),
-            Some("completed"),
-            "{result:?}"
-        );
-        assert!(result.get("duration_ms").and_then(Value::as_u64).is_some());
-        assert!(active.is_empty(), "synchronous execution is never retained");
-    }
 
     #[tokio::test]
     async fn malformed_agent_error_output_rejects_during_load_before_run_registration() {
@@ -2390,218 +2107,5 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
             "load rejection cannot emit mag.run_started"
         );
         fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn provider_events_append_only_deltas_and_preserve_terminal_semantic_result() {
-        fn named(name: &str) -> Value {
-            serde_json::json!({"kind":"named","name":name,"arguments":[]})
-        }
-        fn event(request_id: &str, event: &str, fields: Value) -> Map<String, Value> {
-            let mut body = fields.as_object().expect("event fields").clone();
-            body.insert(
-                "kind".into(),
-                Value::String("conversation.provider.event".into()),
-            );
-            body.insert("provider".into(), Value::String("provider-a".into()));
-            body.insert("request_id".into(), Value::String(request_id.into()));
-            body.insert("event".into(), Value::String(event.into()));
-            body
-        }
-
-        let provider_input = named("nefor.contracts.ProviderInput");
-        let tool_calls = named("nefor.contracts.ToolCalls");
-        let text_answer = named("nefor.contracts.TextAnswer");
-        let agent_error = named("nefor.contracts.AgentError");
-        let result = serde_json::json!({
-            "kind":"adt", "name":"core.types.Result",
-            "arguments":[agent_error.clone(), text_answer.clone()],
-            "constructors":[
-                {"name":"Error","payload":agent_error.clone()},
-                {"name":"Ok","payload":text_answer.clone()}
-            ]
-        });
-        let modification = serde_json::json!({
-            "actors": [{
-                "id": "answer",
-                "factory": "llm",
-                "type_arguments": [result.clone()],
-                "input": {"wire":"generic-provider.ProviderOut","type":provider_input},
-                "outputs": [
-                    {"wire":"generic-tool.ToolCalls","type":tool_calls},
-                    {"wire":"nefor.agent.Result","type":result.clone()}
-                ],
-                "params": {
-                    "provider":"provider-a",
-                    "output_type":"text-answer",
-                    "error_type":"agent-error",
-                    "provider_error_type":"provider-error"
-                },
-                "routes": {"generic-tool.ToolCalls":[],"nefor.agent.Result":[]}
-            }],
-            "messages": [{
-                "to": "answer",
-                "content": {"kind":"generic-provider.ProviderOut","messages":[{"role":"user","content":"go"}]}
-            }],
-            "kills": [],
-            "result": {"from": {
-                "actor":"answer",
-                "type":"nefor.agent.Result",
-                "wire":"nefor.agent.Result"
-            }}
-        });
-
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let host = LuaHost::load_kernel(
-            &manifest.join("lua/mag-kernel/init.lua"),
-            Some(&manifest.join("../../lua")),
-        )
-        .expect("kernel");
-        assert!(
-            host.begin_run("provider-events", "provider-events", None)
-                .expect("begin")
-                .ok
-        );
-        let started = host.start("provider-events", &modification).expect("start");
-        assert!(
-            started.ok,
-            "{}",
-            started.error.as_deref().unwrap_or("unknown error")
-        );
-
-        let mut bridge = CapabilityBridge::new("tool-gate");
-        let request = host
-            .drain_emits()
-            .expect("initial emits")
-            .into_iter()
-            .flat_map(|body| bridge.translate_emit(body))
-            .find(|body| {
-                body.get("kind").and_then(Value::as_str)
-                    == Some("conversation.provider.invoke.request")
-            })
-            .expect("provider request");
-        let request_id = request["request_id"]
-            .as_str()
-            .expect("request id")
-            .to_owned();
-        let (out_tx, mut out_rx) = mpsc::channel(CHANNEL_CAP);
-        let mut active = HashMap::from([(
-            "provider-events".to_owned(),
-            ActiveExecute {
-                in_reply_to: None,
-                started_at: Instant::now(),
-            },
-        )]);
-
-        for body in [
-            event(
-                &request_id,
-                "text_delta",
-                serde_json::json!({"text":"visible"}),
-            ),
-            event(
-                &request_id,
-                "reasoning_delta",
-                serde_json::json!({"text":"thinking"}),
-            ),
-            event(
-                &request_id,
-                "reasoning_end",
-                serde_json::json!({"text":"must-not-append"}),
-            ),
-            event(
-                &request_id,
-                "tool_execution_started",
-                serde_json::json!({
-                    "tool_call_id":"web-1", "name":"web_search",
-                    "arguments":{"action":"search","query":"rust"},
-                    "provider_context":{"encrypted":"must-not-leak"}
-                }),
-            ),
-            event(
-                &request_id,
-                "tool_execution_completed",
-                serde_json::json!({
-                    "tool_call_id":"web-1", "name":"web_search",
-                    "arguments":{"action":"search","query":"rust language"},
-                    "result":{"status":"completed"},
-                    "extra":{"response_body":"must-not-leak"}
-                }),
-            ),
-            event(
-                &request_id,
-                "tool_execution_completed",
-                serde_json::json!({
-                    "tool_call_id":"web-1", "name":"web_search",
-                    "arguments":{"action":"search","query":"duplicate"},
-                    "result":{"status":"completed"}
-                }),
-            ),
-            event(
-                &request_id,
-                "completed",
-                serde_json::json!({
-                    "text":"terminal-aggregate-must-not-append",
-                    "result": {
-                        "text_answer":"semantic-only",
-                        "text":"terminal-result-must-not-append"
-                    }
-                }),
-            ),
-        ] {
-            handle_event(
-                &out_tx,
-                "conversation-manager",
-                &body,
-                &host,
-                &mut active,
-                &mut bridge,
-            )
-            .await
-            .expect("provider event");
-        }
-        drop(out_tx);
-
-        let mut terminal_result = None;
-        let mut facts = Vec::new();
-        while let Some(outgoing) = out_rx.recv().await {
-            let Body::Event(body) = outgoing.body else {
-                continue;
-            };
-            let kind = body.get("kind").and_then(Value::as_str);
-            assert!(
-                !kind
-                    .is_some_and(|value| value == "tool.invoke" || value.ends_with(".tool.invoke")),
-                "provider-executed lifecycle reached tool execution: {body:?}"
-            );
-            if kind == Some("conversation.fact.append") {
-                facts.push(body["fact"].clone());
-            }
-            if kind == Some(RUN_RESULT_KIND) {
-                terminal_result = body.get("result").cloned();
-            }
-        }
-
-        let fact_count = |kind: &str| {
-            facts
-                .iter()
-                .filter(|fact| fact.get("kind").and_then(Value::as_str) == Some(kind))
-                .count()
-        };
-        assert_eq!(fact_count("tool_exchange_started"), 1);
-        assert_eq!(fact_count("tool_call_fragment_appended"), 1);
-        assert_eq!(fact_count("tool_call_completed"), 1);
-        assert_eq!(fact_count("tool_result_recorded"), 1);
-        let wire = serde_json::to_string(&facts).expect("serialize canonical facts");
-        assert!(!wire.contains("must-not-leak"));
-        assert!(!wire.contains("provider_context"));
-        assert!(!wire.contains("response_body"));
-        assert!(wire.contains("rust language"));
-
-        let result = terminal_result.expect("durable terminal result");
-        assert_eq!(result["value"]["constructor"], "Ok");
-        assert_eq!(result["value"]["value"], "semantic-only");
-        assert_eq!(result["result"]["text_answer"], "semantic-only");
-        assert!(result["result"].get("tool_calls").is_none());
     }
 }

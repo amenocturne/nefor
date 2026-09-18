@@ -74,12 +74,12 @@ local function deep_equal(a, b)
   return true
 end
 
--- The comparable core of an actor spec — factory, params, routes. `id` is
+-- The comparable capability spec excludes run-owned topology. `id` is
 -- excluded (it is the key), so this answers "is this the *same* spec?".
 local function spec_of(actor)
   return { factory = actor.factory, type_arguments = actor.type_arguments,
     input = actor.input, outputs = actor.outputs,
-    params = actor.params or {}, routes = actor.routes or {} }
+    params = actor.params or {} }
 end
 
 -- ---------------------------------------------------------------------------

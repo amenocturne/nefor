@@ -158,6 +158,8 @@ function M.new(opts)
     events = opts.events or noop,
     persist_output = opts.persist_output or noop,
     observe_output = opts.observe_output or noop,
+    deliver_endpoint = opts.deliver_endpoint,
+    topology_routes = opts.topology_routes,
     settle_result = opts.settle_result or function(id, result, persist_result, persisted)
       (opts.events or noop)({
         kind = EVT_RUN_COMPLETE,
@@ -354,28 +356,9 @@ function M:on_emit(id, message, generation)
     observed.semantic_type_id = arrival.type_id
     observed.constructor_id = arrival.constructor_id
     observed.arrival_id = arrival.arrival_id
-    local boundary = self.result_boundary
-    local dynamic_protocol = type(arrival.payload) == "table" and arrival.payload.dynamic
-    local dynamic_complete = type(dynamic_protocol) == "table"
-      and dynamic_protocol.kind == "complete"
-    if boundary and boundary.actor == id and boundary.wire == kind
-        and (dynamic_protocol == nil or dynamic_complete) then
-      local host = nefor and nefor.semantic_type
-      if type(boundary.type_id) == "string" and type(boundary.type) == "table" and
-          (type(host) ~= "table" or type(host.accepts) ~= "function"
-            or not host.accepts(boundary.type, arrival.type)) then
-        self.events({
-          kind = EVT_RUN_FAILED,
-          from = id,
-          failure = "typed-result",
-          error = string.format(
-            "result boundary '%s.%s' does not accept emitted semantic type '%s'",
-            tostring(id), tostring(kind), tostring(arrival.type_id)),
-        })
-        return
-      end
-      if not self.settle_result(id, observed) then return false end
-    else
+    local accepted, terminal = self.observe_output(id, kind, observed)
+    if accepted == false then return false end
+    if not terminal then
       local persisted = self.persist_output(id, observed)
       if type(persisted) == "table" and type(persisted.output_path) == "string" then
         -- Persistence owns the canonical location. Carry that authority as
@@ -386,7 +369,6 @@ function M:on_emit(id, message, generation)
       end
     end
     self:publish_arrival(arrival)
-    if self.observe_output(id, kind, observed) == false then return false end
     self:route_output(id, kind, observed, arrival)
   end
 end
@@ -577,6 +559,18 @@ function M:route_output(sender_id, tag, message, source_arrival)
     return
   end
   local dests = (sender.routes or {})[tag]
+  if self.topology_routes then
+    dests = {}
+    for _, route in ipairs(self.topology_routes()) do
+      if route.from.endpoint.constructor == "ActorEndpoint" and route.from.endpoint.value.id == sender_id
+          and route.from.wire == tag then
+        dests[#dests+1] = {endpoint_kind=route.to.endpoint.constructor=="ActorEndpoint" and "actor" or "junction",
+          endpoint=route.to.endpoint,wire=route.to.wire,edge_id=route.id,
+          source_type_id=route.from.type_id,destination_type_id=route.to.type_id,
+          destination_type=route.to.type,product_position=route.product_position}
+      end
+    end
+  end
   if not dests then
     return
   end
@@ -609,7 +603,8 @@ function M:route_output(sender_id, tag, message, source_arrival)
   end
   self:publish_arrival(source)
   for _, destination in ipairs(dests) do
-    local dest = self.inventory.get(destination.actor)
+    local destination_id = destination.endpoint and destination.endpoint.value.id or destination.actor
+    local dest = destination.endpoint_kind ~= "junction" and self.inventory.get(destination_id)
     local input = dest and dest.input
     local accepts = true
     local host = nefor and nefor.semantic_type
@@ -618,8 +613,13 @@ function M:route_output(sender_id, tag, message, source_arrival)
       accepts = host.accepts(input.type, source.type)
     end
     if accepts then
-      self:deliver(destination.actor,
-        typed_value.routed(source, destination, input and input.type or source.type))
+      local routed = typed_value.routed(source, destination, destination.destination_type or (input and input.type) or source.type)
+      if destination.endpoint_kind == "junction" and self.deliver_endpoint then
+        self.deliver_endpoint("junction", destination_id,
+          {wire=destination.wire,type=routed.declared_type,type_id=routed.declared_type_id}, routed)
+      else
+        self:deliver(destination_id, routed)
+      end
     end
   end
 end
@@ -882,6 +882,16 @@ function M:derive_slots(dest_id, arrival)
   local destination_actor = self.inventory.get(dest_id)
   local input_type_id = destination_actor and destination_actor.input
     and destination_actor.input.type_id
+  if self.topology_routes then
+    for _, route in ipairs(self.topology_routes()) do
+      if route.to.endpoint.constructor == "ActorEndpoint" and route.to.endpoint.value.id == dest_id then
+        if route.product_position >= 0 then
+          edges[#edges+1] = {sender=route.from.endpoint.value.id,type=route.to.wire,
+            edge_id=route.id,product_position=route.product_position}
+        else whole_edges=whole_edges+1 end
+      end
+    end
+  else
   for sender_id, actor in self.inventory.pairs() do
     for _, dests in pairs(actor.routes or {}) do
       for _, destination in ipairs(dests) do
@@ -901,6 +911,7 @@ function M:derive_slots(dest_id, arrival)
         end
       end
     end
+  end
   end
   -- Application validation guarantees exact product coverage before the
   -- inventory changes. Reaching this backstop means an internal topology

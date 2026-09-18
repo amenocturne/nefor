@@ -1782,6 +1782,121 @@ fn unpack_operations(operations: &mut [Value]) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActorEndpointValue {
+    id: ActorId,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JunctionEndpointValue {
+    id: JunctionId,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "constructor", content = "value", deny_unknown_fields)]
+enum Endpoint {
+    ActorEndpoint(ActorEndpointValue),
+    JunctionEndpoint(JunctionEndpointValue),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(transparent)]
+struct ActorId(String);
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(transparent)]
+struct JunctionId(String);
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPort {
+    endpoint: Endpoint,
+    #[serde(rename = "type")]
+    semantic_type: Value,
+    type_id: String,
+    wire: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopologyRoute {
+    id: String,
+    from: StoredPort,
+    to: StoredPort,
+    product_position: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopologyJunction {
+    id: JunctionId,
+    operation: Value,
+    inputs: Vec<StoredPort>,
+    outputs: Vec<StoredPort>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopologyMessage {
+    to: StoredPort,
+    semantic_type: Value,
+    semantic_type_id: String,
+    content: Value,
+}
+
+fn validate_topology_shapes(modification: &Value, context: &str) -> Result<(), String> {
+    let object = modification
+        .as_object()
+        .ok_or_else(|| format!("{context} must be an object"))?;
+    let actors = object.get("actors").and_then(Value::as_array)
+        .ok_or_else(|| format!("{context}.actors must be an array"))?;
+    for (index, actor) in actors.iter().enumerate() {
+        let label = format!("{context}.actors[{index}]");
+        let fields = exact_object(actor, &["id", "factory", "type_arguments", "params", "input", "outputs"], &label)?;
+        serde_json::from_value::<StoredPort>(fields["input"].clone())
+            .map_err(|error| format!("{label}.input: {error}"))?;
+        let outputs = fields["outputs"].as_array().ok_or_else(|| format!("{label}.outputs must be an array"))?;
+        for output in outputs {
+            serde_json::from_value::<StoredPort>(output.clone()).map_err(|error| format!("{label}.outputs: {error}"))?;
+        }
+    }
+    if let Some(result) = object.get("result") {
+        let fields = exact_object(result, &["from"], &format!("{context}.result"))?;
+        serde_json::from_value::<StoredPort>(fields["from"].clone())
+            .map_err(|error| format!("{context}.result.from: {error}"))?;
+    }
+    for (field, target) in [
+        ("junctions", "junction definition"),
+        ("routes", "route"),
+        ("messages", "message"),
+    ] {
+        let values = object
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{context}.{field} must be an array"))?;
+        for (index, value) in values.iter().enumerate() {
+            let result = match field {
+                "junctions" => serde_json::from_value::<TopologyJunction>(value.clone()).map(|_| ()),
+                "routes" => serde_json::from_value::<TopologyRoute>(value.clone()).map(|_| ()),
+                _ => serde_json::from_value::<TopologyMessage>(value.clone()).map(|_| ()),
+            };
+            result.map_err(|error| format!("{context}.{field}[{index}] has invalid {target}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 struct DecodedProgram {
     initial: Value,
     operations: Vec<Value>,
@@ -1796,7 +1911,7 @@ fn artifact_program(artifact: &Value) -> Result<DecodedProgram, String> {
     if object.get("format").and_then(Value::as_str) != Some("nefor.mag") {
         return Err("mag.execute artifact has an unsupported format".to_owned());
     }
-    if object.get("version").and_then(Value::as_u64) != Some(2) {
+    if object.get("version").and_then(Value::as_u64) != Some(3) {
         return Err("mag.execute artifact has an unsupported nefor.mag version".to_owned());
     }
     if object.get("kind").and_then(Value::as_str) != Some("program") {
@@ -1814,16 +1929,7 @@ fn artifact_program(artifact: &Value) -> Result<DecodedProgram, String> {
         .get("operations")
         .and_then(Value::as_array)
         .ok_or_else(|| "mag.execute program.operations must be an array".to_owned())?;
-    let operation_fields = [
-        "id",
-        "on_actor",
-        "on_wire",
-        "trigger_type",
-        "trigger_type_id",
-        "captures",
-        "expressions",
-        "template",
-    ];
+    let operation_fields = ["id", "on", "captures", "expressions", "template"];
     for (index, operation) in operations.iter().enumerate() {
         exact_object(
             operation,
@@ -1835,11 +1941,21 @@ fn artifact_program(artifact: &Value) -> Result<DecodedProgram, String> {
         program
             .get("initial")
             .ok_or_else(|| "mag.execute program envelope requires initial".to_owned())?,
-        &["types", "actors", "messages", "nodes", "kills", "result"],
+        &[
+            "types",
+            "actors",
+            "junctions",
+            "routes",
+            "messages",
+            "nodes",
+            "kills",
+            "result",
+        ],
         "mag.execute program initial",
     )?;
     let mut operations = operations.clone();
     unpack_modification(&mut initial, "mag.execute program initial")?;
+    validate_topology_shapes(&initial, "mag.execute program initial")?;
     unpack_operations(&mut operations)?;
     Ok(DecodedProgram {
         initial,
@@ -1856,7 +1972,7 @@ fn artifact_delta(artifact: &Value) -> Result<Value, String> {
     if object.get("format").and_then(Value::as_str) != Some("nefor.mag") {
         return Err("mag.apply artifact has an unsupported format".to_owned());
     }
-    if object.get("version").and_then(Value::as_u64) != Some(2) {
+    if object.get("version").and_then(Value::as_u64) != Some(3) {
         return Err("mag.apply artifact has an unsupported nefor.mag version".to_owned());
     }
     if object.get("kind").and_then(Value::as_str) != Some("delta") {
@@ -1866,10 +1982,19 @@ fn artifact_delta(artifact: &Value) -> Result<Value, String> {
         object
             .get("delta")
             .ok_or_else(|| "mag.apply delta envelope requires delta".to_owned())?,
-        &["types", "actors", "messages", "nodes", "kills"],
+        &[
+            "types",
+            "actors",
+            "junctions",
+            "routes",
+            "messages",
+            "nodes",
+            "kills",
+        ],
         "mag.apply delta",
     )?;
     unpack_modification(&mut delta, "mag.apply delta")?;
+    validate_topology_shapes(&delta, "mag.apply delta")?;
     Ok(delta)
 }
 

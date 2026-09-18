@@ -115,6 +115,7 @@ fn type_descriptor_operations_preserve_nested_arguments_aliases_and_schemas() {
         r#"
         type Box<T> {value: T}
 type Pair<Left, Right> {left: Left, right: Right}
+type Choice = Text(String) | Count(Int)
 type Alias<T> = Box<T>
 let pair = type_evidence(type_tag<Pair<String, Box<Int>>>() )
 let alias = type_evidence(type_tag<Alias<Bool>>())
@@ -125,6 +126,7 @@ artifact {
   alias_constructor: type_constructor(alias),
   alias_arguments: type_arguments(alias),
   primitive_constructor: type_constructor(type_evidence(type_tag<String>())),
+  constructor_payload: adt_constructor_payload(type_evidence(type_tag<Choice>()), "Count"),
   primitive_arguments: type_arguments(type_evidence(type_tag<String>())),
   components: type_components(pair),
   list_components: type_components(listed),
@@ -143,6 +145,7 @@ artifact {
     assert_eq!(artifact["arguments"][1]["name"], "main.Box");
     assert_eq!(artifact["arguments"][1]["arguments"][0]["name"], "Int");
     assert_eq!(artifact["alias_constructor"], "main.Box");
+    assert_eq!(artifact["constructor_payload"]["name"], "Int");
     assert_eq!(artifact["alias_arguments"][0]["name"], "Bool");
     assert_eq!(artifact["primitive_constructor"], "");
     assert_eq!(artifact["primitive_arguments"], json!([]));
@@ -1875,13 +1878,14 @@ artifact(composed)
         program["id"],
         "nefor.node.composite:8:fallible3:>=>19:continuation-result"
     );
-    assert!(program["actors"]
-        .as_array()
-        .is_some_and(|actors| actors.iter().any(|actor| actor["id"]
-            == "nefor.node.composite:8:fallible3:>=>19:continuation-result.error")));
-    assert!(program["actors"].as_array().is_some_and(|actors| actors
+    assert_eq!(program["actors"], json!([]));
+    let junctions = program["junctions"].as_array().unwrap();
+    assert!(junctions
         .iter()
-        .any(|actor| actor["factory"] == "nefor.factory.adt-unpack")));
+        .any(|junction| junction["operation"]["constructor"] == "AdtUnpack"));
+    assert!(junctions
+        .iter()
+        .any(|junction| junction["operation"]["constructor"] == "AdtPack"));
 }
 
 #[test]

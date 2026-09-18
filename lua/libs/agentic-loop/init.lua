@@ -429,32 +429,41 @@ end
 -- in lead-turn.mag and the spawner follows.
 local function derive_program_seams(modification)
   local msg = (modification.messages or {})[1]
-  local source_actor = type(msg) == "table" and msg.to or nil
+  local source_endpoint = type(msg) == "table" and type(msg.to) == "table" and msg.to.endpoint or nil
+  local source_actor = type(source_endpoint) == "table"
+      and source_endpoint.constructor == "ActorEndpoint"
+      and type(source_endpoint.value) == "table" and source_endpoint.value.id or nil
   if type(source_actor) ~= "string" then
     return nil, "turn-program has no initial message (no source actor)"
   end
   local entry_actor
   local llm_actor
   for _, actor in ipairs(modification.actors or {}) do
-    if actor.id == source_actor then
-      local destinations = type(actor.routes) == "table"
-        and actor.routes["nefor.graph.Value"] or nil
-      local destination = type(destinations) == "table" and destinations[1] or nil
-      entry_actor = type(destination) == "table" and destination.actor or nil
-      if type(actor.params) ~= "table" or type(actor.params.value) ~= "table" then
-        return nil, "turn-program source actor has no typed task value"
-      end
+    if actor.id == source_actor
+        and (type(actor.params) ~= "table" or type(actor.params.value) ~= "table") then
+      return nil, "turn-program source actor has no typed task value"
+    end
+  end
+  for _, route in ipairs(modification.routes or {}) do
+    local from, to = route.from or {}, route.to or {}
+    local from_endpoint, to_endpoint = from.endpoint or {}, to.endpoint or {}
+    if from_endpoint.constructor == "ActorEndpoint" and from_endpoint.value.id == source_actor
+        and from.wire == "nefor.graph.Value" and to_endpoint.constructor == "ActorEndpoint" then
+      entry_actor = to_endpoint.value.id
+      break
     end
   end
   if type(entry_actor) ~= "string" then
     return nil, "turn-program source routes no task value (no entry actor)"
   end
-  for _, actor in ipairs(modification.actors or {}) do
-    if actor.id == entry_actor then
-      local dests = type(actor.routes) == "table"
-        and actor.routes["generic-provider.ProviderOut"] or nil
-      local destination = type(dests) == "table" and dests[1] or nil
-      llm_actor = type(destination) == "table" and destination.actor or nil
+  for _, route in ipairs(modification.routes or {}) do
+    local from, to = route.from or {}, route.to or {}
+    local from_endpoint, to_endpoint = from.endpoint or {}, to.endpoint or {}
+    if from_endpoint.constructor == "ActorEndpoint" and from_endpoint.value.id == entry_actor
+        and from.wire == "generic-provider.ProviderOut"
+        and to_endpoint.constructor == "ActorEndpoint" then
+      llm_actor = to_endpoint.value.id
+      break
     end
   end
   if type(llm_actor) ~= "string" then

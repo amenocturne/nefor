@@ -1,35 +1,10 @@
 import core.types.{}
 
 import nefor.graph.{}
-
 import nefor.mag.{}
 
-// Public, node-oriented composition. These functions construct larger Node
-// values from smaller ones; ports and routes remain representation details.
-let sequence_empty_factory = "nefor.factory.sequence-empty"
-
-let collector_factory = "nefor.factory.collector"
-
-let product_split_factory = "nefor.factory.product-split"
-
-let product_first_factory = "nefor.factory.product-first"
-
-let product_join_factory = "nefor.factory.product-join"
-
-let discard_factory = "nefor.factory.discard"
-
-type SequenceEmptyParams {}
-
-type CollectorParams {expected_senders: List<String>}
-
-type ProductSplitParams {}
-
-type ProductFirstParams {}
-
-type ProductJoinParams {expected_senders: List<String>}
-
-type DiscardParams {}
-
+// Public node composition. Fixed combinators are anonymous topology junctions;
+// only capability and dynamic-cardinality work is represented by actors.
 let composite_id: fn(String, String, String) -> String = |left, operator, right| => {
   let left_part = str(str(count(left), ":"), left)
   let operator_part = str(str(count(operator), ":"), operator)
@@ -38,186 +13,105 @@ let composite_id: fn(String, String, String) -> String = |left, operator, right|
 }
 
 let compound_nodes: fn(String, List<nefor.graph.Actor>, List<nefor.graph.LogicalNode>) -> List<nefor.graph.LogicalNode> = |name, owned, children| => concat([nefor.graph.logical_node([name], nefor.graph.actor_ids(owned))], nefor.graph.prefix_logical_nodes(name, children))
-
 let transparent_child_occurrences<I, O>: fn(String, Int, nefor.graph.Node<I, O>) -> List<nefor.graph.DefinitionOccurrence> = |parent, position, child| => nefor.graph.place_occurrences(parent, position, get(child, "occurrences"))
-
 let compound_child_occurrences<I, O>: fn(String, Int, nefor.graph.Node<I, O>) -> List<nefor.graph.DefinitionOccurrence> = |parent, position, child| => nefor.graph.prefix_occurrences(parent, transparent_child_occurrences(parent, position, child))
-
 let transparent_child_executions<I, O>: fn(String, Int, nefor.graph.Node<I, O>) -> List<nefor.graph.ExecutionOccurrence> = |parent, position, child| => nefor.graph.place_executions(parent, position, nefor.graph.node_execution_occurrences(child))
-
 let compound_child_executions<I, O>: fn(String, Int, nefor.graph.Node<I, O>) -> List<nefor.graph.ExecutionOccurrence> = |parent, position, child| => nefor.graph.prefix_executions(parent, transparent_child_executions(parent, position, child))
 
-// Establish one visible abstraction boundary around an existing node. Ordinary
-// composition stays transparent; named functions use this when their returned
-// subgraph should appear as one expandable node. The executable node identity
-// stays unchanged; name is only the new logical path segment.
-let named<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, O> = |name, value| => nefor.graph.node_with_occurrences_and_nodes(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "routes"), get(value, "messages"), get(value, "operations"), compound_nodes(name, [], get(value, "nodes")), nefor.graph.prefix_occurrences(name, get(value, "occurrences")), nefor.graph.prefix_executions(name, get(value, "executions")), get(value, "input"), get(value, "output"))
-
+let named<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, O> = |name, value| => nefor.graph.node_with_occurrences_and_nodes_and_junctions(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "junctions"), get(value, "routes"), get(value, "messages"), get(value, "operations"), compound_nodes(name, [], get(value, "nodes")), nefor.graph.prefix_occurrences(name, get(value, "occurrences")), nefor.graph.prefix_executions(name, get(value, "executions")), get(value, "input"), get(value, "output"))
 let rename_path_root: fn(String, nefor.graph.LogicalNode) -> nefor.graph.LogicalNode = |name, value| => nefor.graph.logical_node(concat([name], remove_at(get(value, "path"), 0)), get(value, "members"))
+let rename<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, O> = |name, value| => nefor.graph.node_with_occurrences_and_nodes_and_junctions(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "junctions"), get(value, "routes"), get(value, "messages"), get(value, "operations"), map(((|candidate| => rename_path_root(name, candidate)) : fn(nefor.graph.LogicalNode) -> nefor.graph.LogicalNode), get(value, "nodes")), nefor.graph.rename_occurrences(name, get(value, "occurrences")), nefor.graph.rename_executions(name, get(value, "executions")), get(value, "input"), get(value, "output"))
 
-// Runtime actor ids and logical names are different identities. Constructors
-// default the logical root to their actor id; rename gives a placed node a
-// concise local name without rewriting any executable actor reference.
-let rename<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, O> = |name, value| => nefor.graph.node_with_occurrences_and_nodes(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "routes"), get(value, "messages"), get(value, "operations"), map(((|candidate| => rename_path_root(name, candidate)) : fn(nefor.graph.LogicalNode) -> nefor.graph.LogicalNode), get(value, "nodes")), nefor.graph.rename_occurrences(name, get(value, "occurrences")), nefor.graph.rename_executions(name, get(value, "executions")), get(value, "input"), get(value, "output"))
-
-// Sequential composition preserves a source constructor boundary on the left
-// so validation can still verify its packed constant. Activation itself is
-// derived later from the completed topology: an unfed Unit input bootstraps,
-// while the same composite behind an incoming edge remains dependency-driven.
 let sequential_role<A, B, C>: fn(nefor.graph.Node<A, B>, nefor.graph.Node<B, C>) -> String = |left, right| => if (=)(get(left, "role"), "source") then "source" else "ordinary"
-
-let compose<A, B, C>: fn(String, nefor.graph.Node<A, B>, nefor.graph.Node<B, C>) -> nefor.graph.Node<A, C> = |id, left, right| => nefor.graph.node_with_occurrences_and_nodes(id, sequential_role(left, right), concat(get(left, "actors"), get(right, "actors")), concat(concat(get(left, "routes"), get(right, "routes")), [nefor.graph.stored_route(get(left, "output"), get(right, "input"))]), concat(get(left, "messages"), get(right, "messages")), concat(get(left, "operations"), get(right, "operations")), concat(get(left, "nodes"), get(right, "nodes")), concat(transparent_child_occurrences(id, 0, left), transparent_child_occurrences(id, 1, right)), concat(transparent_child_executions(id, 0, left), transparent_child_executions(id, 1, right)), get(left, "input"), get(right, "output"))
-
-// Operators use stable structural ids while named functions let callers choose
-// an explicit identity.
+let compose<A, B, C>: fn(String, nefor.graph.Node<A, B>, nefor.graph.Node<B, C>) -> nefor.graph.Node<A, C> = |id, left, right| => nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, sequential_role(left, right), concat(get(left, "actors"), get(right, "actors")), concat(get(left, "junctions"), get(right, "junctions")), concat(concat(get(left, "routes"), get(right, "routes")), [nefor.graph.stored_route(get(left, "output"), get(right, "input"))]), concat(get(left, "messages"), get(right, "messages")), concat(get(left, "operations"), get(right, "operations")), concat(get(left, "nodes"), get(right, "nodes")), concat(transparent_child_occurrences(id, 0, left), transparent_child_occurrences(id, 1, right)), concat(transparent_child_executions(id, 0, left), transparent_child_executions(id, 1, right)), get(left, "input"), get(right, "output"))
 let (>>>)<A, B, C>: fn(nefor.graph.Node<A, B>, nefor.graph.Node<B, C>) -> nefor.graph.Node<A, C> = |left, right| => compose(composite_id(get(left, "id"), ">>>", get(right, "id")), left, right)
 
-// Forget one node's result and retain only its successful completion. This is
-// the ordinary functional void operation expressed as a node.
-let discard<T>: fn(String) -> nefor.graph.Node<T, Unit> = |id| => {
-  let `type` = type_tag<T>()
-  let input = nefor.graph.port(id, `type`, "nefor.node.DiscardInput")
-  let output = nefor.graph.port(id, type_tag<Unit>(), "mag.Unit")
-  nefor.graph.node(id, "ordinary", [nefor.graph.closed_actor(id, discard_factory, [type_evidence(`type`)], DiscardParams {}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], [], [], input, output)
-}
+let unary_junction_node<I, O>: fn(String, nefor.graph.JunctionOperation, nefor.graph.Port<I>, nefor.graph.Port<O>) -> nefor.graph.Node<I, O> = |id, operation, input, output| => nefor.graph.node_with_junctions(id, "ordinary", [], [nefor.graph.junction(id, operation, [nefor.graph.store_port(input)], [nefor.graph.store_port(output)])], [], [], input, output)
 
-// Run right after left succeeds, discarding the left result and keeping
-// the right result. `*>` is the established Applicative spelling.
+let discard<T>: fn(String) -> nefor.graph.Node<T, Unit> = |id| => unary_junction_node(id, nefor.graph.unit_operation, nefor.graph.junction_port(id, type_tag<T>(), "nefor.node.DiscardInput"), nefor.graph.junction_port(id, type_tag<Unit>(), "mag.Unit"))
 let then<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, B> = |id, left, right| => {
-  let bridge = discard<A>(str(id, ".discard"))
-  nefor.graph.node_with_occurrences_and_nodes(id, sequential_role(left, bridge), concat(get(left, "actors"), concat(get(bridge, "actors"), get(right, "actors"))), concat(concat(get(left, "routes"), concat(get(bridge, "routes"), get(right, "routes"))), [nefor.graph.stored_route(get(left, "output"), get(bridge, "input")), nefor.graph.stored_route(get(bridge, "output"), get(right, "input"))]), concat(get(left, "messages"), concat(get(bridge, "messages"), get(right, "messages"))), concat(get(left, "operations"), concat(get(bridge, "operations"), get(right, "operations"))), compound_nodes(id, get(bridge, "actors"), concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), get(left, "input"), get(right, "output"))
+  let discarded: nefor.graph.Node<I, Unit> = compose(str(id, ".discarded"), left, discard<A>(str(id, ".discard")))
+  compose(id, discarded, right)
 }
-
 let (*>)<I, A, B>: fn(nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, B> = |left, right| => then(composite_id(get(left, "id"), "*>", get(right, "id")), left, right)
 
-// Project the first component only after the complete product exists.
-let keep_left<A, B>: fn(String) -> nefor.graph.Node<(A, B), A> = |id| => {
-  let input = nefor.graph.port(id, type_tag<(A, B)>(), "nefor.node.ProductInput")
-  let output = nefor.graph.port(id, type_tag<A>(), "nefor.node.ProductLeft")
-  let actor = nefor.graph.closed_actor(id, product_first_factory, [type_evidence(type_tag<A>()), type_evidence(type_tag<B>())], ProductFirstParams {}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])
-  nefor.graph.node(id, "ordinary", [actor], [], [], input, output)
-}
-
-// Run right after left succeeds, wait for it, and retain the left result.
+let keep_left<A, B>: fn(String) -> nefor.graph.Node<(A, B), A> = |id| => unary_junction_node(id, nefor.graph.product_first_operation, nefor.graph.junction_port(id, type_tag<(A, B)>(), "nefor.node.ProductInput"), nefor.graph.junction_port(id, type_tag<A>(), "nefor.node.ProductLeft"))
 let before<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, A> = |id, left, right| => {
   let retained: nefor.graph.Node<A, A> = nefor.graph.identity<A>(str(id, ".retained"))
   let triggered: nefor.graph.Node<A, B> = then(str(id, ".right"), discard<A>(str(id, ".trigger")), right)
   let completed: nefor.graph.Node<A, (A, B)> = fanout(str(id, ".completed"), retained, triggered)
-  let projected: nefor.graph.Node<(A, B), A> = keep_left<A, B>(str(id, ".result"))
   let after_left: nefor.graph.Node<I, (A, B)> = compose(str(id, ".after-left"), left, completed)
-  let composed: nefor.graph.Node<I, A> = compose(id, after_left, projected)
-  composed
+  compose(id, after_left, keep_left<A, B>(str(id, ".result")))
 }
-
 let (<*)<I, A, B>: fn(nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, A> = |left, right| => before(composite_id(get(left, "id"), "<*", get(right, "id")), left, right)
 
-// Run two nodes from the same input. The product boundary records that both
-// results are required; its ordinary firing semantics waits for both child
-// outputs and preserves left-to-right order.
 let fanout<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<I, B>) -> nefor.graph.Node<I, (A, B)> = |id, left, right| => {
-  let input = nefor.graph.identity<I>(str(id, ".input"))
+  let input_id = str(id, ".input")
+  let input_in = nefor.graph.junction_port(input_id, type_tag<I>(), "input")
+  let input_out = nefor.graph.junction_port(input_id, type_tag<I>(), "output")
+  let input = nefor.graph.junction(input_id, nefor.graph.pass_operation, [nefor.graph.store_port(input_in)], [nefor.graph.store_port(input_out)])
   let output_id = str(id, ".output")
-  let output_input = nefor.graph.port(output_id, type_tag<(A, B)>(), "nefor.node.ProductInput")
-  let output_port = nefor.graph.port(output_id, type_tag<(A, B)>(), "nefor.node.ProductOutput")
-  let output = nefor.graph.closed_actor(output_id, product_join_factory, [type_evidence(type_tag<A>()), type_evidence(type_tag<B>())], ProductJoinParams {expected_senders: [get(get(left, "output"), "actor"), get(get(right, "output"), "actor")]}, nefor.graph.store_port(output_input), [nefor.graph.store_port(output_port)], [nefor.graph.Relocation {path: ["expected_senders"], shape: "actor_id_list"}])
-  nefor.graph.node_with_occurrences_and_nodes(id, "ordinary", concat(get(input, "actors"), concat(get(left, "actors"), concat(get(right, "actors"), [output]))), concat(concat(get(input, "routes"), concat(get(left, "routes"), get(right, "routes"))), [nefor.graph.stored_route(get(input, "output"), get(left, "input")), nefor.graph.stored_route(get(input, "output"), get(right, "input")), nefor.graph.stored_route(get(left, "output"), output_input), nefor.graph.stored_route(get(right, "output"), output_input)]), concat(get(input, "messages"), concat(get(left, "messages"), get(right, "messages"))), concat(get(input, "operations"), concat(get(left, "operations"), get(right, "operations"))), compound_nodes(id, concat(get(input, "actors"), [output]), concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), get(input, "input"), output_port)
+  let left_slot = nefor.graph.junction_port(output_id, type_tag<A>(), "slot:0")
+  let right_slot = nefor.graph.junction_port(output_id, type_tag<B>(), "slot:1")
+  let output = nefor.graph.junction_port(output_id, type_tag<(A, B)>(), "output")
+  let join = nefor.graph.junction(output_id, nefor.graph.product_join_operation, [nefor.graph.store_port(left_slot), nefor.graph.store_port(right_slot)], [nefor.graph.store_port(output)])
+  nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, "ordinary", concat(get(left, "actors"), get(right, "actors")), concat([input, join], concat(get(left, "junctions"), get(right, "junctions"))), concat(concat(get(left, "routes"), get(right, "routes")), [nefor.graph.stored_route(input_out, get(left, "input")), nefor.graph.stored_route(input_out, get(right, "input")), nefor.graph.stored_route(get(left, "output"), left_slot), nefor.graph.stored_route(get(right, "output"), right_slot)]), concat(get(left, "messages"), get(right, "messages")), concat(get(left, "operations"), get(right, "operations")), compound_nodes(id, [], concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), input_in, output)
 }
-
 let (&&&)<I, A, B>: fn(nefor.graph.Node<I, A>, nefor.graph.Node<I, B>) -> nefor.graph.Node<I, (A, B)> = |left, right| => fanout(composite_id(get(left, "id"), "&&&", get(right, "id")), left, right)
 
-// Apply two nodes independently to the ordered components of a product. A
-// small runtime splitter is necessary because an edge carries the whole
-// product value; merely viewing one port under a component type would lose
-// the corresponding runtime projection.
 let parallel<A, B, C, D>: fn(String, nefor.graph.Node<A, B>, nefor.graph.Node<C, D>) -> nefor.graph.Node<(A, C), (B, D)> = |id, left, right| => {
-  let splitter_id = str(id, ".input")
-  let splitter_input = nefor.graph.port(splitter_id, type_tag<(A, C)>(), "nefor.node.ProductInput")
-  let splitter_left = nefor.graph.port(splitter_id, type_tag<A>(), "nefor.node.ProductLeft")
-  let splitter_right = nefor.graph.port(splitter_id, type_tag<C>(), "nefor.node.ProductRight")
-  let splitter = nefor.graph.closed_actor(splitter_id, product_split_factory, [type_evidence(type_tag<A>()), type_evidence(type_tag<C>())], ProductSplitParams {}, nefor.graph.store_port(splitter_input), [nefor.graph.store_port(splitter_left), nefor.graph.store_port(splitter_right)], [])
-  let output_id = str(id, ".output")
-  let output_input = nefor.graph.port(output_id, type_tag<(B, D)>(), "nefor.node.ProductInput")
-  let output_port = nefor.graph.port(output_id, type_tag<(B, D)>(), "nefor.node.ProductOutput")
-  let output = nefor.graph.closed_actor(output_id, product_join_factory, [type_evidence(type_tag<B>()), type_evidence(type_tag<D>())], ProductJoinParams {expected_senders: [get(get(left, "output"), "actor"), get(get(right, "output"), "actor")]}, nefor.graph.store_port(output_input), [nefor.graph.store_port(output_port)], [nefor.graph.Relocation {path: ["expected_senders"], shape: "actor_id_list"}])
-  nefor.graph.node_with_occurrences_and_nodes(id, "ordinary", concat([splitter], concat(get(left, "actors"), concat(get(right, "actors"), [output]))), concat(concat(get(left, "routes"), get(right, "routes")), [nefor.graph.stored_route(splitter_left, get(left, "input")), nefor.graph.stored_route(splitter_right, get(right, "input")), nefor.graph.stored_route(get(left, "output"), output_input), nefor.graph.stored_route(get(right, "output"), output_input)]), concat(get(left, "messages"), get(right, "messages")), concat(get(left, "operations"), get(right, "operations")), compound_nodes(id, [splitter, output], concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), splitter_input, output_port)
+  let split_id = str(id, ".input")
+  let split_input = nefor.graph.junction_port(split_id, type_tag<(A, C)>(), "input")
+  let split_left = nefor.graph.junction_port(split_id, type_tag<A>(), "left")
+  let split_right = nefor.graph.junction_port(split_id, type_tag<C>(), "right")
+  let split = nefor.graph.junction(split_id, nefor.graph.product_split_operation, [nefor.graph.store_port(split_input)], [nefor.graph.store_port(split_left), nefor.graph.store_port(split_right)])
+  let join_id = str(id, ".output")
+  let left_slot = nefor.graph.junction_port(join_id, type_tag<B>(), "slot:0")
+  let right_slot = nefor.graph.junction_port(join_id, type_tag<D>(), "slot:1")
+  let output = nefor.graph.junction_port(join_id, type_tag<(B, D)>(), "output")
+  let join = nefor.graph.junction(join_id, nefor.graph.product_join_operation, [nefor.graph.store_port(left_slot), nefor.graph.store_port(right_slot)], [nefor.graph.store_port(output)])
+  nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, "ordinary", concat(get(left, "actors"), get(right, "actors")), concat([split, join], concat(get(left, "junctions"), get(right, "junctions"))), concat(concat(get(left, "routes"), get(right, "routes")), [nefor.graph.stored_route(split_left, get(left, "input")), nefor.graph.stored_route(split_right, get(right, "input")), nefor.graph.stored_route(get(left, "output"), left_slot), nefor.graph.stored_route(get(right, "output"), right_slot)]), concat(get(left, "messages"), get(right, "messages")), concat(get(left, "operations"), get(right, "operations")), compound_nodes(id, [], concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), split_input, output)
 }
-
 let (***)<A, B, C, D>: fn(nefor.graph.Node<A, B>, nefor.graph.Node<C, D>) -> nefor.graph.Node<(A, C), (B, D)> = |left, right| => parallel(composite_id(get(left, "id"), "***", get(right, "id")), left, right)
 
-// Nominal branches are explicit runtime operations. choose unpacks Either,
-// runs each payload branch, and lifts each result back into the output Either.
-// No route treats an ADT constructor as a transparent structural row.
-let adt_unpack_factory = "nefor.factory.adt-unpack"
-
-let adt_pack_factory = "nefor.factory.adt-pack"
-
-type AdtUnpackParams {owner: TypeDescriptor, left_payload: TypeDescriptor, right_payload: TypeDescriptor, left_constructor: String, right_constructor: String}
-
-type AdtPackParams {owner: TypeDescriptor, payload: TypeDescriptor, constructor: String}
-
 let pack_adt<T, O>: fn(String, String) -> nefor.graph.Node<T, O> = |id, constructor| => {
-  let input_type = type_tag<T>()
-  let owner_type = type_tag<O>()
-  let input = nefor.graph.port(id, input_type, "nefor.adt.Payload")
-  let output = nefor.graph.port(id, owner_type, "nefor.adt.Value")
-  nefor.graph.node(id, "ordinary", [nefor.graph.closed_actor(id, adt_pack_factory, [type_evidence(input_type), type_evidence(owner_type)], AdtPackParams {owner: type_evidence(owner_type), payload: type_evidence(input_type), constructor: constructor}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], [], [], input, output)
+  let input = nefor.graph.junction_port(id, type_tag<T>(), "payload")
+  let output = nefor.graph.junction_port(id, type_tag<O>(), "value")
+  unary_junction_node(id, nefor.graph.adt_pack_operation(nefor.mag.AdtPackSpec {owner: type_evidence(type_tag<O>()), payload: type_evidence(type_tag<T>()), constructor: constructor}), input, output)
 }
 
-let choose<A, B, C, D>: fn(String, nefor.graph.Node<A, C>, nefor.graph.Node<B, D>) -> nefor.graph.Node<core.types.Either<A, B>, core.types.Either<C, D>> = |id, left, right| => {
+let choose_adt<I, O, A, B, C, D>: fn(String, String, String, nefor.graph.Node<A, C>, nefor.graph.Node<B, D>) -> nefor.graph.Node<I, O> = |id, first_constructor, second_constructor, left, right| => {
   let split_id = str(id, ".split")
-  let split_input = nefor.graph.port(split_id, type_tag<core.types.Either<A, B>>(), "nefor.adt.Value")
-  let split_left = nefor.graph.port(split_id, type_tag<A>(), "nefor.adt.First")
-  let split_right = nefor.graph.port(split_id, type_tag<B>(), "nefor.adt.Second")
-  let split = nefor.graph.closed_actor(split_id, adt_unpack_factory, [type_evidence(type_tag<core.types.Either<A, B>>()), type_evidence(type_tag<A>()), type_evidence(type_tag<B>())], AdtUnpackParams {owner: type_evidence(type_tag<core.types.Either<A, B>>()), left_payload: type_evidence(type_tag<A>()), right_payload: type_evidence(type_tag<B>()), left_constructor: "Left", right_constructor: "Right"}, nefor.graph.store_port(split_input), [nefor.graph.store_port(split_left), nefor.graph.store_port(split_right)], [])
-  let lift_left = pack_adt<C, core.types.Either<C, D>>(str(id, ".left"), "Left")
-  let lift_right = pack_adt<D, core.types.Either<C, D>>(str(id, ".right"), "Right")
-  let output = nefor.graph.identity<core.types.Either<C, D>>(str(id, ".output"))
-  nefor.graph.node_with_occurrences_and_nodes(id, "ordinary", concat([split], concat(get(left, "actors"), concat(get(right, "actors"), concat(get(lift_left, "actors"), concat(get(lift_right, "actors"), get(output, "actors")))))), concat(get(left, "routes"), concat(get(right, "routes"), concat(get(lift_left, "routes"), concat(get(lift_right, "routes"), concat(get(output, "routes"), [nefor.graph.stored_route(split_left, get(left, "input")), nefor.graph.stored_route(split_right, get(right, "input")), nefor.graph.stored_route(get(left, "output"), get(lift_left, "input")), nefor.graph.stored_route(get(right, "output"), get(lift_right, "input")), nefor.graph.stored_route(get(lift_left, "output"), get(output, "input")), nefor.graph.stored_route(get(lift_right, "output"), get(output, "input"))]))))), concat(get(left, "messages"), concat(get(right, "messages"), concat(get(lift_left, "messages"), concat(get(lift_right, "messages"), get(output, "messages"))))), concat(get(left, "operations"), concat(get(right, "operations"), concat(get(lift_left, "operations"), concat(get(lift_right, "operations"), get(output, "operations"))))), compound_nodes(id, concat([split], concat(get(lift_left, "actors"), concat(get(lift_right, "actors"), get(output, "actors")))), concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), split_input, get(output, "output"))
+  let input = nefor.graph.junction_port(split_id, type_tag<I>(), "value")
+  let split_left = nefor.graph.junction_port(split_id, type_tag<A>(), first_constructor)
+  let split_right = nefor.graph.junction_port(split_id, type_tag<B>(), second_constructor)
+  let split = nefor.graph.junction(split_id, nefor.graph.adt_unpack_operation(nefor.mag.AdtUnpackSpec {owner: type_evidence(type_tag<I>()), branches: [nefor.mag.AdtBranch {constructor: first_constructor, payload: type_evidence(type_tag<A>()), wire: first_constructor}, nefor.mag.AdtBranch {constructor: second_constructor, payload: type_evidence(type_tag<B>()), wire: second_constructor}]}), [nefor.graph.store_port(input)], [nefor.graph.store_port(split_left), nefor.graph.store_port(split_right)])
+  let lift_left = pack_adt<C, O>(str(id, ".left"), first_constructor)
+  let lift_right = pack_adt<D, O>(str(id, ".right"), second_constructor)
+  let output_node = nefor.graph.identity<O>(str(id, ".output"))
+  nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, "ordinary", concat(get(left, "actors"), get(right, "actors")), concat([split], concat(get(left, "junctions"), concat(get(right, "junctions"), concat(get(lift_left, "junctions"), concat(get(lift_right, "junctions"), get(output_node, "junctions")))))), concat(get(left, "routes"), concat(get(right, "routes"), concat(get(lift_left, "routes"), concat(get(lift_right, "routes"), concat(get(output_node, "routes"), [nefor.graph.stored_route(split_left, get(left, "input")), nefor.graph.stored_route(split_right, get(right, "input")), nefor.graph.stored_route(get(left, "output"), get(lift_left, "input")), nefor.graph.stored_route(get(right, "output"), get(lift_right, "input")), nefor.graph.stored_route(get(lift_left, "output"), get(output_node, "input")), nefor.graph.stored_route(get(lift_right, "output"), get(output_node, "input"))]))))), concat(get(left, "messages"), get(right, "messages")), concat(get(left, "operations"), get(right, "operations")), compound_nodes(id, [], concat(get(left, "nodes"), get(right, "nodes"))), concat(compound_child_occurrences(id, 0, left), compound_child_occurrences(id, 1, right)), concat(compound_child_executions(id, 0, left), compound_child_executions(id, 1, right)), input, get(output_node, "output"))
 }
 
+let choose<A, B, C, D>: fn(String, nefor.graph.Node<A, C>, nefor.graph.Node<B, D>) -> nefor.graph.Node<core.types.Either<A, B>, core.types.Either<C, D>> = |id, left, right| => choose_adt<core.types.Either<A, B>, core.types.Either<C, D>, A, B, C, D>(id, "Left", "Right", left, right)
 let (+++)<A, B, C, D>: fn(nefor.graph.Node<A, C>, nefor.graph.Node<B, D>) -> nefor.graph.Node<core.types.Either<A, B>, core.types.Either<C, D>> = |left, right| => choose(composite_id(get(left, "id"), "+++", get(right, "id")), left, right)
 
-// Empty sequence needs an explicit identity and generic types because no child
-// can establish any of them.
-let sequence_empty<I, O>: fn(String) -> nefor.graph.Node<I, List<O>> = |id| => {
-  let input_type = type_tag<I>()
-  let output_type = type_tag<O>()
-  let actor_id = str(id, ".empty")
-  let input = nefor.graph.port(actor_id, input_type, "nefor.node.SequenceInput")
-  let output = nefor.graph.port(actor_id, type_tag<List<O>>(), "nefor.node.SequenceOutput")
-  let actor = nefor.graph.closed_actor(actor_id, sequence_empty_factory, [type_evidence(input_type), type_evidence(output_type)], SequenceEmptyParams {}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])
-  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [actor], ([]: List<nefor.graph.StoredRoute>), ([]: List<nefor.graph.Message>), ([]: List<nefor.mag.ProgramOperation>), [nefor.graph.logical_node([id], [get(actor, "id")])], input, output)
-}
-
-let sequence_id<I, O>: fn(List<nefor.graph.Node<I, O>>) -> String = |nodes| => fold(
-  ((|id, candidate| => composite_id(id, "sequence", get(candidate, "id"))) : fn(String, nefor.graph.Node<I, O>) -> String),
-  "nefor.node.sequence",
-  nodes,
-)
-
+let sequence_id<I, O>: fn(List<nefor.graph.Node<I, O>>) -> String = |nodes| => fold(((|id, candidate| => composite_id(id, "sequence", get(candidate, "id"))) : fn(String, nefor.graph.Node<I, O>) -> String), "nefor.node.sequence", nodes)
 let sequence_nonempty<I, O>: fn(String, List<nefor.graph.Node<I, O>>) -> nefor.graph.Node<I, List<O>> = |id, nodes| => {
-  // Eager evaluation makes an empty call fail at compile time instead of
-  // manufacturing an identity and types the list cannot determine.
   let first_node = first(nodes)
   let relay = nefor.graph.identity<I>(str(id, ".input"))
   let collector_id = str(id, ".collector")
-  let collector_input = nefor.graph.port(collector_id, type_tag<O>(), "nefor.dynamic.Item")
-  let collector_output = nefor.graph.port(collector_id, type_tag<List<O>>(), "nefor.dynamic.Collected")
-  let expected_senders = map(((|candidate| => get(get(candidate, "output"), "actor")) : fn(nefor.graph.Node<I, O>) -> String), nodes)
-  let collector = nefor.graph.closed_actor(collector_id, collector_factory, [type_evidence(type_tag<O>())], CollectorParams {expected_senders: expected_senders}, nefor.graph.store_port(collector_input), [nefor.graph.store_port(collector_output)], [nefor.graph.Relocation {path: ["expected_senders"], shape: "actor_id_list"}])
+  let slots = indexed_map(((|index, candidate| => nefor.graph.junction_port(collector_id, type_tag<O>(), str("slot:", str(index)))) : fn(Int, nefor.graph.Node<I, O>) -> nefor.graph.Port<O>), nodes)
+  let output = nefor.graph.junction_port(collector_id, type_tag<List<O>>(), "output")
+  let collector = nefor.graph.junction(collector_id, nefor.graph.collect_operation, map(((|slot| => nefor.graph.store_port(slot)) : fn(nefor.graph.Port<O>) -> nefor.graph.StoredPort), slots), [nefor.graph.store_port(output)])
   let child_actors = flat_map(((|candidate| => get(candidate, "actors")) : fn(nefor.graph.Node<I, O>) -> List<nefor.graph.Actor>), nodes)
+  let child_junctions = flat_map(((|candidate| => get(candidate, "junctions")) : fn(nefor.graph.Node<I, O>) -> List<nefor.graph.Junction>), nodes)
   let child_routes = flat_map(((|candidate| => get(candidate, "routes")) : fn(nefor.graph.Node<I, O>) -> List<nefor.graph.StoredRoute>), nodes)
   let child_messages = flat_map(((|candidate| => get(candidate, "messages")) : fn(nefor.graph.Node<I, O>) -> List<nefor.graph.Message>), nodes)
   let child_operations = flat_map(((|candidate| => get(candidate, "operations")) : fn(nefor.graph.Node<I, O>) -> List<nefor.mag.ProgramOperation>), nodes)
-  let child_occurrence_groups = indexed_map(((|index, candidate| => compound_child_occurrences(id, index, candidate)) : fn(Int, nefor.graph.Node<I, O>) -> List<nefor.graph.DefinitionOccurrence>), nodes)
-  let child_occurrences = flat_map(((|group| => group) : fn(List<nefor.graph.DefinitionOccurrence>) -> List<nefor.graph.DefinitionOccurrence>), child_occurrence_groups)
-  let child_execution_groups = indexed_map(((|index, candidate| => compound_child_executions(id, index, candidate)) : fn(Int, nefor.graph.Node<I, O>) -> List<nefor.graph.ExecutionOccurrence>), nodes)
-  let child_executions = flat_map(((|group| => group) : fn(List<nefor.graph.ExecutionOccurrence>) -> List<nefor.graph.ExecutionOccurrence>), child_execution_groups)
+  let child_occurrences = flat_map(((|group| => group) : fn(List<nefor.graph.DefinitionOccurrence>) -> List<nefor.graph.DefinitionOccurrence>), indexed_map(((|index, candidate| => compound_child_occurrences(id, index, candidate)) : fn(Int, nefor.graph.Node<I, O>) -> List<nefor.graph.DefinitionOccurrence>), nodes))
+  let child_executions = flat_map(((|group| => group) : fn(List<nefor.graph.ExecutionOccurrence>) -> List<nefor.graph.ExecutionOccurrence>), indexed_map(((|index, candidate| => compound_child_executions(id, index, candidate)) : fn(Int, nefor.graph.Node<I, O>) -> List<nefor.graph.ExecutionOccurrence>), nodes))
   let input_routes = map(((|candidate| => nefor.graph.stored_route(get(relay, "output"), get(candidate, "input"))) : fn(nefor.graph.Node<I, O>) -> nefor.graph.StoredRoute), nodes)
-  let output_routes = map(((|candidate| => nefor.graph.stored_route(get(candidate, "output"), collector_input)) : fn(nefor.graph.Node<I, O>) -> nefor.graph.StoredRoute), nodes)
-  nefor.graph.node_with_occurrences_and_nodes(id, "ordinary", concat(get(relay, "actors"), concat(child_actors, [collector])), concat(get(relay, "routes"), concat(child_routes, concat(input_routes, output_routes))), concat(get(relay, "messages"), child_messages), concat(get(relay, "operations"), child_operations), compound_nodes(id, concat(get(relay, "actors"), [collector]), flat_map(((|candidate| => get(candidate, "nodes")) : fn(nefor.graph.Node<I, O>) -> List<nefor.graph.LogicalNode>), nodes)), child_occurrences, child_executions, get(relay, "input"), collector_output)
+  let indexed_nodes = indexed_map(((|index, candidate| => nefor.graph.stored_route(get(candidate, "output"), nefor.graph.junction_port(collector_id, type_tag<O>(), str("slot:", str(index))))) : fn(Int, nefor.graph.Node<I, O>) -> nefor.graph.StoredRoute), nodes)
+  nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, "ordinary", child_actors, concat(get(relay, "junctions"), concat(child_junctions, [collector])), concat(get(relay, "routes"), concat(child_routes, concat(input_routes, indexed_nodes))), concat(get(relay, "messages"), child_messages), concat(get(relay, "operations"), child_operations), compound_nodes(id, [], flat_map(((|candidate| => get(candidate, "nodes")) : fn(nefor.graph.Node<I, O>) -> List<nefor.graph.LogicalNode>), nodes)), child_occurrences, child_executions, get(relay, "input"), output)
 }
-
-// A nonempty compile-time List fixes producer count, shared input, result type,
-// result order, and structural identity.
 let sequence<I, O>: fn(List<nefor.graph.Node<I, O>>) -> nefor.graph.Node<I, List<O>> = |nodes| => sequence_nonempty(sequence_id(nodes), nodes)

@@ -77,6 +77,8 @@ Descriptor operations do not forge witnesses or cast values:
 
 - `type_constructor(descriptor)` returns the qualified nominal owner name, or
   an empty string for a non-nominal type.
+- `adt_constructor_payload(descriptor, name)` returns the payload descriptor for
+  a constructor owned by an ADT and rejects non-ADT owners or unknown names.
 - `type_arguments(descriptor)` returns the nominal owner's generic arguments,
   or an empty list for a non-nominal type.
 - `type_components(descriptor)` returns immediate nested descriptors: nominal

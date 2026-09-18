@@ -75,12 +75,25 @@ end
 -- ------------------------------------------------------------------
 
 local function program()
-  local text_answer = {kind="named",name="nefor.contracts.TextAnswer",arguments={}}
-  local agent_error = {kind="named",name="nefor.contracts.AgentError",arguments={}}
+  local function array(values) return nefor.json.mark_array(values) end
+  local function named(name) return {kind="named",name=name,arguments=array({})} end
+  local provider_input = named("nefor.contracts.ProviderInput")
+  local text_answer = named("nefor.contracts.TextAnswer")
+  local agent_error = named("nefor.contracts.AgentError")
+  local tool_calls = named("nefor.contracts.ToolCalls")
   local result_type = {kind="adt",name="core.types.Result",
-    arguments={agent_error,text_answer},constructors={
+    arguments=array({agent_error,text_answer}),constructors=array({
       {name="Error",payload=agent_error},{name="Ok",payload=text_answer},
-    }}
+    })}
+  local function endpoint(id)
+    return {constructor="ActorEndpoint",value={id=id}}
+  end
+  local function port(wire, descriptor)
+    return {endpoint=endpoint("agent"),type=descriptor,
+      type_id=nefor.semantic_type.id(descriptor),wire=wire}
+  end
+  local input = port("generic-provider.ProviderOut", provider_input)
+  local result = port("nefor.agent.Result", result_type)
   return {
     actors = {
       {
@@ -90,24 +103,24 @@ local function program()
         params = { model = "m", provider = "prov", system = "answer",
           output_type = "text-answer-id", error_type = "agent-error-id",
           provider_error_type = "provider-error-id" },
-        evidence={version=2,identity="nefor.factory.llm",arguments={result_type},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output=result_type},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},{type=result_type,wire="nefor.agent.Result"}},
-        routes = {},
+        evidence={version=2,identity="nefor.factory.llm",arguments={result_type},input=provider_input,output=result_type},
+        input=input,
+        outputs={port("generic-tool.ToolCalls",tool_calls),result},
       },
     },
+    junctions = {},
+    routes = {},
     messages = {
-      { to = "agent", content = {
-        kind = "generic-provider.ProviderOut",
-        messages = { { role = "user", content = "hi" } },
-      } },
+      {to=input,semantic_type=provider_input,semantic_type_id=nefor.semantic_type.id(provider_input),content={
+        kind="generic-provider.ProviderOut",
+        value={messages={{role="user",content="hi"}}},
+        semantic_value={messages={{role="user",content="hi"}}},
+        messages={{role="user",content="hi"}},
+      }},
     },
     kills = {},
     nodes = { { path = { "agent" }, members = { "agent" } } },
-    result = { from = {
-      actor = "agent",
-      type = "nefor.agent.Result",
-      wire = "nefor.agent.Result",
-    } },
+    result = {from=result},
   }
 end
 

@@ -620,12 +620,16 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         1,
         "the completed graph must bootstrap exactly one outer Unit root"
     );
-    assert!(source_messages[0]["to"]
+    assert_eq!(
+        source_messages[0]["to"]["endpoint"]["constructor"],
+        "JunctionEndpoint"
+    );
+    assert!(source_messages[0]["to"]["endpoint"]["value"]["id"]
         .as_str()
         .is_some_and(|target| target.ends_with(".input")));
     assert_eq!(
         source_messages[0]["content"]["value"]["kind"],
-        "nefor.graph.Value"
+        source_messages[0]["to"]["wire"]
     );
 
     fs::write(
@@ -656,8 +660,16 @@ nefor.artifact.delta(nefor.graph.node_delta(start))"#,
         .and_then(Value::as_array)
         .expect("source delta initial messages");
     assert_eq!(delta_messages.len(), 1);
-    assert_eq!(delta_messages[0]["to"], "start");
-    assert_eq!(delta_messages[0]["content"]["value"]["kind"], "mag.Unit");
+    assert_eq!(
+        delta_messages[0]["to"]["endpoint"]["constructor"],
+        "ActorEndpoint"
+    );
+    assert_eq!(delta_messages[0]["to"]["endpoint"]["value"]["id"], "start");
+    assert_eq!(delta_messages[0]["to"]["wire"], "mag.Unit");
+    assert_eq!(
+        delta_messages[0]["content"]["value"]["kind"],
+        delta_messages[0]["to"]["wire"]
+    );
 
     fs::write(
         temp_root.join("node-products.mag"),
@@ -709,12 +721,11 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         r#"import nefor.artifact.{}
 import nefor.graph.{}
 import nefor.node.{}
-let start = nefor.graph.source("start", "shared")
-let first = nefor.node.rename("duplicate", nefor.graph.identity<String>("first"))
-let second = nefor.node.rename("duplicate", nefor.graph.identity<String>("second"))
-let workflow = nefor.node.`>>>`(first, second)
+let first = nefor.node.rename("duplicate", nefor.graph.source("first", "one"))
+let second = nefor.node.rename("duplicate", nefor.graph.source("second", "two"))
+let workflow = nefor.node.fanout("pair", first, second)
 let result = nefor.graph.output_for("result", workflow)
-nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, workflow), nefor.graph.edge(workflow, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
+nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(workflow, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
     )
     .expect("write duplicate logical path regression");
     let duplicate_path = load(
@@ -918,6 +929,18 @@ nefor.artifact.compile((|base| => {expression}): fn(nefor.graph.Graph) -> nefor.
             .as_array_mut()
             .expect("artifact actors")
             .sort_by_key(|actor| actor["id"].as_str().unwrap_or_default().to_owned());
+        initial["junctions"]
+            .as_array_mut()
+            .expect("artifact junctions")
+            .sort_by_key(|junction| junction["id"].as_str().unwrap_or_default().to_owned());
+        initial["routes"]
+            .as_array_mut()
+            .expect("artifact routes")
+            .sort_by_key(|route| route["id"].as_str().unwrap_or_default().to_owned());
+        initial["messages"]
+            .as_array_mut()
+            .expect("artifact messages")
+            .sort_by_key(|message| message["to"].to_string());
         initial["nodes"]
             .as_array_mut()
             .expect("artifact nodes")
@@ -943,8 +966,8 @@ nefor.artifact.compile((|base| => {expression}): fn(nefor.graph.Graph) -> nefor.
         .expect("graph algebra artifact actors");
     assert_eq!(
         algebra_actors.len(),
-        3,
-        "duplicate additions collapse and absent removals introduce no nodes"
+        2,
+        "duplicate additions collapse and absent removals introduce no actors"
     );
     assert!(
         algebra_actors
@@ -952,13 +975,12 @@ nefor.artifact.compile((|base| => {expression}): fn(nefor.graph.Graph) -> nefor.
             .all(|actor| actor.get("id").and_then(Value::as_str) != Some("unused")),
         "removing an absent edge must leave the graph unchanged"
     );
-    let route_count = algebra_actors
-        .iter()
-        .filter_map(|actor| actor.get("routes").and_then(Value::as_object))
-        .flat_map(|routes| routes.values())
-        .filter_map(Value::as_array)
+    let route_count = algebra
+        .get("artifact")
+        .and_then(|artifact| artifact.pointer("/program/initial/routes"))
+        .and_then(Value::as_array)
         .map(Vec::len)
-        .sum::<usize>();
+        .expect("graph algebra artifact routes");
     assert_eq!(route_count, 2, "duplicate edges must not lower twice");
 
     fs::write(

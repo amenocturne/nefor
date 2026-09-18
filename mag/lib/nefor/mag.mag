@@ -1,61 +1,55 @@
 // Nefor-owned, versioned immutable execution artifacts. Core MAG treats every
 // value in this module as opaque application data.
+type ActorEndpoint {id: String}
+type JunctionEndpoint {id: String}
+type Endpoint = ActorEndpoint(ActorEndpoint) | JunctionEndpoint(JunctionEndpoint)
+
+type StoredPort {endpoint: Endpoint, `type`: TypeDescriptor, type_id: SemanticTypeId, wire: String}
+
+type AdtBranch {constructor: String, payload: TypeDescriptor, wire: String}
+type AdtPackSpec {owner: TypeDescriptor, payload: TypeDescriptor, constructor: String}
+type AdtUnpackSpec {owner: TypeDescriptor, branches: List<AdtBranch>}
+type JunctionOperation = Pass(Unit) | Unit(Unit) | ProductSplit(Unit) | ProductFirst(Unit) | ProductJoin(Unit) | Collect(Unit) | AdtPack(AdtPackSpec) | AdtUnpack(AdtUnpackSpec)
+
 type TypedCapture {semantic_type: TypeDescriptor, semantic_type_id: SemanticTypeId, value: PackedValue}
 
 type Trigger {id: String, result_type: SemanticTypeId}
-
 type Capture {id: String, result_type: SemanticTypeId, capture: String}
-
 type Field {id: String, result_type: SemanticTypeId, record: String, field: String}
-
 type IntToDecimalString {id: String, result_type: SemanticTypeId, value: String}
-
 type ConcatStrings {id: String, result_type: SemanticTypeId, values: List<String>}
-
 type Expression = Trigger(Trigger) | Capture(Capture) | Field(Field) | IntToDecimalString(IntToDecimalString) | ConcatStrings(ConcatStrings)
 
 type LocalActorRef {slot: String}
-
 type ExistingActorRef {id: String}
+type LocalJunctionRef {slot: String}
+type ExistingJunctionRef {id: String}
+type TemplateEndpoint = LocalActorRef(LocalActorRef) | ExistingActorRef(ExistingActorRef) | LocalJunctionRef(LocalJunctionRef) | ExistingJunctionRef(ExistingJunctionRef)
 
-type ActorRef = LocalActorRef(LocalActorRef) | ExistingActorRef(ExistingActorRef)
-
-type TemplatePort {actor: ActorRef, `type`: TypeDescriptor, type_id: SemanticTypeId, wire: String}
-
+type TemplatePort {endpoint: TemplateEndpoint, `type`: TypeDescriptor, type_id: SemanticTypeId, wire: String}
 type ScalarParameterBinding {path: List<String>, value: String}
-
 type ActorReferenceRelocation {actor: LocalActorRef, path: List<String>, shape: String}
-
 type TemplateActor {slot: String, id: String, factory: String, type_arguments: List<TypeDescriptor>, params: PackedValue, input: TemplatePort, outputs: List<TemplatePort>, parameter_bindings: List<ScalarParameterBinding>}
-
+type TemplateJunction {slot: String, id: String, operation: JunctionOperation, inputs: List<TemplatePort>, outputs: List<TemplatePort>}
 type TemplateRoute {from: TemplatePort, to: TemplatePort, product_position: Int}
 
 type TemplatePayload = Static(PackedValue) | Expression(String)
-
 type TemplateMessage {to: TemplatePort, semantic_type: TypeDescriptor, semantic_type_id: SemanticTypeId, content: TemplatePayload}
 
 type FixedPathSegment {value: String}
-
 type BoundPathSegment {value: String}
-
 type TriggerPathSegment {}
-
 type PathSegment = TriggerPathSegment(TriggerPathSegment) | FixedPathSegment(FixedPathSegment) | BoundPathSegment(BoundPathSegment)
-
 type TemplateLogicalNode {path: List<PathSegment>, members: List<LocalActorRef>}
 
-type DeltaTemplate {types: Map<String, TypeDescriptor>, actors: List<TemplateActor>, routes: List<TemplateRoute>, messages: List<TemplateMessage>, nodes: List<TemplateLogicalNode>, actor_reference_relocations: List<ActorReferenceRelocation>}
+type DeltaTemplate {types: Map<String, TypeDescriptor>, actors: List<TemplateActor>, junctions: List<TemplateJunction>, routes: List<TemplateRoute>, messages: List<TemplateMessage>, nodes: List<TemplateLogicalNode>, actor_reference_relocations: List<ActorReferenceRelocation>}
 
-type InstantiateDeltaTemplate {id: String, on_actor: String, on_wire: String, trigger_type: TypeDescriptor, trigger_type_id: SemanticTypeId, captures: Map<String, TypedCapture>, expressions: List<Expression>, template: DeltaTemplate}
-
-type ProgramOperation {id: String, on_actor: String, on_wire: String, trigger_type: TypeDescriptor, trigger_type_id: SemanticTypeId, captures: Map<String, TypedCapture>, expressions: List<Expression>, template: DeltaTemplate}
+type InstantiateDeltaTemplate {id: String, on: StoredPort, captures: Map<String, TypedCapture>, expressions: List<Expression>, template: DeltaTemplate}
+type ProgramOperation {id: String, on: StoredPort, captures: Map<String, TypedCapture>, expressions: List<Expression>, template: DeltaTemplate}
 
 type Program<Initial> {initial: Initial, operations: List<ProgramOperation>}
-
 type ProgramEnvelope<Initial> {format: String, version: Int, kind: String, program: Program<Initial>}
-
 type DeltaEnvelope<D> {format: String, version: Int, kind: String, delta: D}
 
-let program_envelope<Initial>: fn(Initial, List<ProgramOperation>) -> ProgramEnvelope<Initial> = |initial, operations| => ProgramEnvelope<Initial> {format: "nefor.mag", version: 2, kind: "program", program: Program<Initial> {initial: initial, operations: operations}}
-
-let delta_envelope<D>: fn(D) -> DeltaEnvelope<D> = |delta| => DeltaEnvelope<D> {format: "nefor.mag", version: 2, kind: "delta", delta: delta}
+let program_envelope<Initial>: fn(Initial, List<ProgramOperation>) -> ProgramEnvelope<Initial> = |initial, operations| => ProgramEnvelope<Initial> {format: "nefor.mag", version: 3, kind: "program", program: Program<Initial> {initial: initial, operations: operations}}
+let delta_envelope<D>: fn(D) -> DeltaEnvelope<D> = |delta| => DeltaEnvelope<D> {format: "nefor.mag", version: 3, kind: "delta", delta: delta}

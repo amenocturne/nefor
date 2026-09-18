@@ -1355,13 +1355,9 @@ type FrontierSummary {nodes: Int, edges: Int, roots: Int, outputs: Int}
 type FrontierProof {summary: FrontierSummary, forced: Bool}
 type LowerFrontier {summary: FrontierSummary, lowered: nefor.graph.Modification, forced: String}
 let contracts = host_input("factory_contracts", type_tag<List<nefor.graph.FactoryContract>>())
-let pass: fn(String) -> nefor.graph.Node<Int, Int> = |id| => {
-  let input = nefor.graph.port(id, type_tag<Int>(), "nefor.graph.Value")
-  let output = nefor.graph.port(id, type_tag<Int>(), "nefor.graph.Value")
-  let actor = nefor.graph.actor(id, "nefor.factory.output", [type_evidence(type_tag<Int>())], nefor.graph.OutputParams {}, nefor.graph.store_port(input), [nefor.graph.store_port(output)])
-  nefor.graph.node(id, "ordinary", [actor], ([]: List<nefor.graph.StoredRoute>), ([]: List<nefor.graph.Message>), input, output)
-}
-"#.into()
+let pass: fn(String) -> nefor.graph.Node<Int, Int> = |id| => nefor.graph.identity<Int>(id)
+"#
+    .into()
 }
 fn linear_graph(size: usize, stage: &str) -> String {
     let mut source = graph_prelude();
@@ -1483,10 +1479,10 @@ fn invalid_conflict_graph() -> String {
     let mut source = graph_prelude();
     source.push_str(r#"let start = nefor.graph.source("start", 1)
 let left = pass("same")
-let right_input = nefor.graph.port("same", type_tag<Int>(), "nefor.graph.Value")
-let right_output = nefor.graph.port("same", type_tag<Int>(), "different")
-let right_actor = nefor.graph.actor("same", "nefor.factory.output", [type_evidence(type_tag<Int>())], nefor.graph.OutputParams {}, nefor.graph.store_port(right_input), [nefor.graph.store_port(right_output)])
-let right = nefor.graph.node("same", "ordinary", [right_actor], ([]: List<nefor.graph.StoredRoute>), ([]: List<nefor.graph.Message>), right_input, right_output)
+let right_input = nefor.graph.junction_port("same", type_tag<Int>(), "in")
+let right_output = nefor.graph.junction_port("same", type_tag<Int>(), "different")
+let right_junction = nefor.graph.junction("same", nefor.graph.pass_operation, [nefor.graph.store_port(right_input)], [nefor.graph.store_port(right_output)])
+let right = nefor.graph.node_with_junctions("same", "ordinary", [], [right_junction], [], [], right_input, right_output)
 let out = nefor.graph.output<Int>("out")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, left), nefor.graph.edge(start, right), nefor.graph.edge(left, out)])
 nefor.artifact.compile(topology)"#);

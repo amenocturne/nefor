@@ -155,14 +155,36 @@ local function linearize(children, run)
     edges[index] = {}
     for _, member in ipairs(child.members or {}) do owner[member.id] = index end
   end
-  for actor_id, node in pairs(run.nodes or {}) do
-    local from = owner[actor_id]
-    if from then for _, destinations in pairs(((node.spec or {}).routes) or {}) do
-      for _, destination in ipairs(destinations) do
-        local to = owner[destination.actor]
-        if to and to ~= from then edges[from][to] = true end
+  local function endpoint_key(endpoint)
+    if type(endpoint) ~= "table" or type(endpoint.value) ~= "table" then return nil end
+    local kind = endpoint.constructor == "ActorEndpoint" and "actor"
+        or endpoint.constructor == "JunctionEndpoint" and "junction" or nil
+    if kind == nil or type(endpoint.value.id) ~= "string" then return nil end
+    return kind .. ":" .. endpoint.value.id
+  end
+  local outgoing = {}
+  for _, route in ipairs(run.routes or {}) do
+    local from = endpoint_key(type(route.from) == "table" and route.from.endpoint or nil)
+    local to = endpoint_key(type(route.to) == "table" and route.to.endpoint or nil)
+    if from and to then
+      outgoing[from] = outgoing[from] or {}
+      outgoing[from][#outgoing[from] + 1] = to
+    end
+  end
+  for actor_id, from in pairs(owner) do
+    local frontier, seen = { "actor:" .. actor_id }, {}
+    while #frontier > 0 do
+      local current = table.remove(frontier, 1)
+      if not seen[current] then
+        seen[current] = true
+        for _, destination in ipairs(outgoing[current] or {}) do
+          local target_actor = destination:match("^actor:(.*)$")
+          local to = target_actor and owner[target_actor] or nil
+          if to and to ~= from then edges[from][to] = true end
+          if destination:match("^junction:") then frontier[#frontier + 1] = destination end
+        end
       end
-    end end
+    end
   end
   local remaining, placed, ordered = {}, {}, {}
   for index = 1, #children do remaining[index] = true end

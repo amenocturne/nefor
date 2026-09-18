@@ -19,8 +19,9 @@ let compile: fn(fn(nefor.graph.Graph) -> nefor.graph.Graph) -> Artifact = |trans
 
 let output_id_taken<O>: fn(nefor.graph.Node<Unit, O>, String) -> Bool = |terminal, candidate| => {
   let actor_collision = not((=)(count(filter(((|actor| => (=)(get(actor, "id"), candidate)) : fn(nefor.graph.Actor) -> Bool), get(terminal, "actors"))), 0))
+  let junction_collision = not((=)(count(filter(((|junction| => (=)(get(junction, "id"), candidate)) : fn(nefor.graph.Junction) -> Bool), get(terminal, "junctions"))), 0))
   let path_collision = not((=)(count(filter(((|node| => nefor.graph.serialized_equal(get(node, "path"), [candidate])) : fn(nefor.graph.LogicalNode) -> Bool), get(terminal, "nodes"))), 0))
-  if actor_collision then true else path_collision
+  if actor_collision then true else if junction_collision then true else path_collision
 }
 
 let fresh_output_id<O>: fn(nefor.graph.Node<Unit, O>, String) -> String = |terminal, candidate| =>

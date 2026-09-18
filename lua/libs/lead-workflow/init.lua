@@ -390,10 +390,12 @@ end
 
 local function result_actor(modification)
   local result = type(modification.result) == "table" and modification.result.from or nil
-  if type(result) ~= "table" or type(result.actor) ~= "string" then
+  local endpoint = type(result) == "table" and result.endpoint or nil
+  local value = type(endpoint) == "table" and endpoint.value or nil
+  if type(value) ~= "table" or type(value.id) ~= "string" then
     return nil, "artifact has no structural result boundary"
   end
-  return result.actor, nil
+  return value.id, nil
 end
 
 local function compose_agent_system(base, positional_overlay, session_id)
@@ -2040,6 +2042,7 @@ submit_loaded_run = function(pending, body, error_prefix)
     pending.firing_id, pending.run_name, pending.session_id, pending.dispatcher_id,
     owner_resume, pending.request_ids)
   run.logical_nodes = modification.nodes or {}
+  run.routes = modification.routes or {}
   run.workflow_tree = pending.workflow_tree or mag.workflow_tree(run.logical_nodes)
   run.invocation_label = pending.invocation_label or pending.run_name
   run.invocation_kind = pending.invocation_kind

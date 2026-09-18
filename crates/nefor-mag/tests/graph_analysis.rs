@@ -15,22 +15,13 @@ fn workspace(name: &str) -> std::path::PathBuf {
 }
 
 fn contracts(extra: Value) -> Value {
-    let mut values = vec![
-        json!({
-            "identity": "nefor.factory.source",
-            "type_scheme": {
-                "input_tags": ["mag.Unit"],
-                "outputs": ["nefor.graph.Value"]
-            }
-        }),
-        json!({
-            "identity": "nefor.factory.output",
-            "type_scheme": {
-                "input_tags": ["nefor.graph.Value"],
-                "outputs": ["nefor.graph.Value"]
-            }
-        }),
-    ];
+    let mut values = vec![json!({
+        "identity": "nefor.factory.source",
+        "type_scheme": {
+            "input_tags": ["mag.Unit"],
+            "outputs": ["nefor.graph.Value"]
+        }
+    })];
     values.extend(extra.as_array().unwrap().iter().cloned());
     json!({"factory_contracts": values})
 }
@@ -99,7 +90,7 @@ let test_operation<T>: fn(String, nefor.graph.Port<T>) -> nefor.mag.ProgramOpera
     ([]: List<nefor.mag.Expression>),
     nefor.mag.DeltaTemplate {
       types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>),
-      actors: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []
+      actors: [], junctions: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []
     },
   )
 
@@ -131,7 +122,7 @@ let reordered_definition = nefor.graph.graph([first_edge, nefor.graph.edge(start
 let plain = nefor.graph.graph([first_edge, second_edge])
 let stored_node_id: fn(nefor.graph.StoredNode) -> String = |candidate| => get(candidate, "id")
 let actor_id: fn(nefor.graph.Actor) -> String = |candidate| => get(candidate, "id")
-let message_target: fn(nefor.graph.Message) -> String = |candidate| => get(get(candidate, "to"), "actor")
+let message_target: fn(nefor.graph.Message) -> String = |candidate| => nefor.graph.endpoint_id(get(get(candidate, "to"), "endpoint"))
 let operation_id: fn(nefor.mag.ProgramOperation) -> String = |candidate| => get(candidate, "id")
 artifact {
   edge_count: count(get(analysis, "edges")),
@@ -155,10 +146,7 @@ artifact {
         json!(["z-start", "m-middle", "a-result"])
     );
     assert_eq!(artifact["middle_occurrences"], 2);
-    assert_eq!(
-        artifact["actor_ids"],
-        json!(["z-start", "m-middle", "a-result"])
-    );
+    assert_eq!(artifact["actor_ids"], json!(["z-start"]));
     assert_eq!(artifact["message_targets"], json!(["z-start"]));
     assert_eq!(
         artifact["rule_ids"],
@@ -192,7 +180,7 @@ let result = nefor.graph.output<(Int, Int)>("result")
 let topology = nefor.graph.graph([nefor.graph.edge(branched, result)])
 let analysis = nefor.graph.analyze_graph(topology)
 let actor_id: fn(nefor.graph.Actor) -> String = |candidate| => get(candidate, "id")
-let route_from_shared: fn(nefor.graph.StoredRoute) -> Bool = |candidate| => (=)(get(get(candidate, "from"), "actor"), "shared")
+let route_from_shared: fn(nefor.graph.StoredRoute) -> Bool = |candidate| => (=)(nefor.graph.endpoint_id(get(get(candidate, "from"), "endpoint")), "shared")
 let shared_logical: fn(nefor.graph.LogicalNode) -> Bool = |candidate| => (=)(get(candidate, "path"), ["branched", "shared"])
 artifact {
   actor_ids: map(actor_id, get(analysis, "actors")),
@@ -294,7 +282,7 @@ import core.map.{}
 import nefor.graph.{}
 import nefor.mag.{}
 
-let empty_template = nefor.mag.DeltaTemplate {types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>), actors: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []}
+let empty_template = nefor.mag.DeltaTemplate {types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>), actors: [], junctions: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []}
 let a = nefor.graph.port("a", type_tag<Int>(), "test.Value")
 let b = nefor.graph.port("b", type_tag<Int>(), "test.Value")
 let c = nefor.graph.port("c", type_tag<Int>(), "test.Value")
@@ -326,7 +314,7 @@ artifact {
 
     for (field, entity, differing_field) in [
         ("route", "route", "to"),
-        ("operation", "operation", "on_actor"),
+        ("operation", "operation", "on"),
         ("logical", "logical node", "members"),
         ("node", "stored node", "role"),
     ] {
@@ -459,17 +447,16 @@ let analysis = nefor.graph.analyze_graph(topology)
 let input_key = nefor.graph.port_address_key(nefor.graph.store_port(join_input))
 let sorted_bucket = core.map.get(get(analysis, "routes_by_input"), input_key)
 let lowered = nefor.graph.lower(topology)
-let is_emitter: fn(nefor.graph.LowerActor) -> Bool = |candidate| => (=)(get(candidate, "id"), "emitter")
-let lowered_emitter = first(filter(is_emitter, get(lowered, "actors")))
-let destinations = core.map.get(get(lowered_emitter, "routes"), "test.Value")
+let from_emitter: fn(nefor.graph.LowerRoute) -> Bool = |candidate| => (=)(nefor.graph.endpoint_id(get(get(candidate, "from"), "endpoint")), "emitter")
+let destinations = filter(from_emitter, get(lowered, "routes"))
 let duplicate_first = nefor.graph.StoredRoute {id: "duplicate", from: nefor.graph.store_port(emitter_output), to: nefor.graph.store_port(join_input)}
 let duplicate_same_input = nefor.graph.StoredRoute {id: "duplicate", from: nefor.graph.store_port(join_output), to: nefor.graph.store_port(join_input)}
 let duplicate_other_input = nefor.graph.StoredRoute {id: "duplicate", from: nefor.graph.store_port(join_output), to: nefor.graph.store_port(emitter_input)}
 let duplicate_assignments = nefor.graph.assigned_routes([duplicate_first, duplicate_same_input, duplicate_other_input])
 let route_id: fn(nefor.graph.StoredRoute) -> String = |candidate| => get(candidate, "id")
-let destination_id: fn(nefor.graph.LowerDestination) -> String = |candidate| => get(candidate, "edge_id")
-let destination_position: fn(nefor.graph.LowerDestination) -> Int = |candidate| => get(candidate, "product_position")
-let assignment_actor: fn(nefor.graph.AssignedRoute) -> String = |candidate| => get(get(get(candidate, "route"), "from"), "actor")
+let destination_id: fn(nefor.graph.LowerRoute) -> String = |candidate| => get(candidate, "id")
+let destination_position: fn(nefor.graph.LowerRoute) -> Int = |candidate| => get(candidate, "product_position")
+let assignment_actor: fn(nefor.graph.AssignedRoute) -> String = |candidate| => nefor.graph.endpoint_id(get(get(get(candidate, "route"), "from"), "endpoint"))
 let assignment_position: fn(nefor.graph.AssignedRoute) -> Int = |candidate| => get(candidate, "product_position")
 artifact {
   bucket_ids: map(route_id, sorted_bucket),
@@ -555,7 +542,7 @@ let test_operation<T>: fn(String, nefor.graph.Port<T>) -> nefor.mag.ProgramOpera
     ([]: List<nefor.mag.Expression>),
     nefor.mag.DeltaTemplate {
       types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>),
-      actors: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []
+      actors: [], junctions: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []
     })
 let validation_message: fn(core.validated.Validated<String, nefor.graph.Graph>) -> String = |checked| =>
   match checked {
@@ -630,21 +617,22 @@ let duplicate_actor_graph = nefor.graph.graph([nefor.graph.edge(start, duplicate
 let no_output = nefor.graph.graph([nefor.graph.edge(start, nefor.graph.identity<MessageContent>("ordinary"))])
 let first_contract = nefor.graph.FactoryContract {identity: "nefor.factory.source", type_scheme: nefor.graph.FactoryTypeScheme {input_tags: ["wrong"], outputs: ["nefor.graph.Value"]}}
 let second_contract = nefor.graph.FactoryContract {identity: "nefor.factory.source", type_scheme: nefor.graph.FactoryTypeScheme {input_tags: ["mag.Unit"], outputs: ["nefor.graph.Value"]}}
-let output_contract = nefor.graph.FactoryContract {identity: "nefor.factory.output", type_scheme: nefor.graph.FactoryTypeScheme {input_tags: ["nefor.graph.Value"], outputs: ["nefor.graph.Value"]}}
 let valid_graph = nefor.graph.graph([nefor.graph.edge(start, result)])
 let first_child = nefor.graph.source("first-child", MessageContent {content: "first"})
 let second_child = nefor.graph.source("second-child", MessageContent {content: "second"})
 let sequence = nefor.node.sequence([first_child, second_child])
-let is_collector: fn(nefor.graph.Actor) -> Bool = |candidate| => (=)(get(candidate, "id"), str(get(sequence, "id"), ".collector"))
-let collector = first(filter(is_collector, get(sequence, "actors")))
+let is_collector: fn(nefor.graph.Junction) -> Bool = |candidate| => (=)(get(candidate, "id"), str(get(sequence, "id"), ".collector"))
+let collector = first(filter(is_collector, get(sequence, "junctions")))
 let actor_id: fn(nefor.graph.Actor) -> String = |candidate| => get(candidate, "id")
+let input_wire: fn(nefor.graph.StoredPort) -> String = |candidate| => get(candidate, "wire")
 artifact {
   duplicate_actor: validation_message(nefor.graph.validate(duplicate_actor_graph, host_input("factory_contracts", type_tag<List<nefor.graph.FactoryContract>>()))),
   no_output: validation_message(nefor.graph.validate(no_output, host_input("factory_contracts", type_tag<List<nefor.graph.FactoryContract>>()))),
-  first_contract: validation_message(nefor.graph.validate(valid_graph, [first_contract, second_contract, output_contract])),
+  first_contract: validation_message(nefor.graph.validate(valid_graph, [first_contract, second_contract])),
   sequence_id: get(sequence, "id"),
   sequence_actors: map(actor_id, get(sequence, "actors")),
-  collector_params: get(collector, "params")
+  collector_operation: get(collector, "operation"),
+  collector_inputs: map(input_wire, get(collector, "inputs"))
 }
 "#,
         contracts(json!([])),
@@ -662,20 +650,12 @@ artifact {
         .as_str()
         .unwrap()
         .contains("rejects input wire"));
-    let sequence_id = artifact["sequence_id"].as_str().unwrap();
     assert_eq!(
         artifact["sequence_actors"],
-        json!([
-            format!("{sequence_id}.input"),
-            "first-child",
-            "second-child",
-            format!("{sequence_id}.collector")
-        ])
-    );
-    assert_eq!(
-        artifact["collector_params"]["value"]["expected_senders"],
         json!(["first-child", "second-child"])
     );
+    assert_eq!(artifact["collector_operation"]["constructor"], "Collect");
+    assert_eq!(artifact["collector_inputs"], json!(["slot:0", "slot:1"]));
 }
 
 #[test]
@@ -697,7 +677,7 @@ nefor.artifact.compile(close)
         contracts(json!([])),
     );
     assert_eq!(program["format"], "nefor.mag");
-    assert_eq!(program["version"], 2);
+    assert_eq!(program["version"], 3);
     assert_eq!(program["kind"], "program");
     assert_eq!(program["program"]["operations"], json!([]));
     let initial = &program["program"]["initial"];
@@ -717,7 +697,7 @@ nefor.artifact.delta(nefor.graph.delta([], [], [], []))
         json!({}),
     );
     assert_eq!(delta["format"], "nefor.mag");
-    assert_eq!(delta["version"], 2);
+    assert_eq!(delta["version"], 3);
     assert_eq!(delta["kind"], "delta");
     assert!(delta["delta"].get("result").is_none());
     assert!(delta["delta"].get("operations").is_none());
@@ -756,17 +736,17 @@ nefor.artifact.compile_graph(start)
 
     assert_eq!(convenient, explicit);
     assert_eq!(convenient["format"], "nefor.mag");
-    assert_eq!(convenient["version"], 2);
+    assert_eq!(convenient["version"], 3);
     assert_eq!(convenient["kind"], "program");
     assert_eq!(
         convenient["program"]["initial"]["actors"]
             .as_array()
             .unwrap()
             .len(),
-        2
+        1
     );
     assert_eq!(
-        convenient["program"]["initial"]["result"]["from"]["actor"],
+        convenient["program"]["initial"]["result"]["from"]["endpoint"]["value"]["id"],
         "result"
     );
 
@@ -783,7 +763,7 @@ nefor.artifact.compile_graph(result)
         contracts(json!([])),
     );
     assert_eq!(
-        collision["program"]["initial"]["result"]["from"]["actor"],
+        collision["program"]["initial"]["result"]["from"]["endpoint"]["value"]["id"],
         "result-"
     );
 }
@@ -797,8 +777,7 @@ import nefor
 compile_graph(script("hello", ShellScriptParams {script: "printf 'hello\\n'", cwd: ".", timeout: named(Timeout, Milliseconds, 30000)}))
 "#,
         contracts(json!([
-            {"identity": "nefor.factory.shell-script", "type_scheme": {"input_tags": ["nefor.process.Input"], "outputs": ["nefor.process.Result"]}},
-            {"identity": "nefor.factory.output", "type_scheme": {"input_tags": ["nefor.graph.Value"], "outputs": ["nefor.graph.Value"]}}
+            {"identity": "nefor.factory.shell-script", "type_scheme": {"input_tags": ["nefor.process.Input"], "outputs": ["nefor.process.Result"]}}
         ])),
     );
 
@@ -913,12 +892,16 @@ nefor.artifact.compile(close)
         message["semantic_type"],
         json!({"kind":"primitive","name":"Unit"})
     );
+    assert_eq!(message["content"]["value"]["kind"], "in");
     assert_eq!(message["content"]["value"]["value"], Value::Null);
     assert_eq!(
         initial["types"][message["semantic_type_id"].as_str().unwrap()],
         message["semantic_type"]
     );
-    assert_eq!(initial["actors"][0]["input"]["type"]["kind"], "primitive");
+    assert_eq!(
+        initial["junctions"][0]["inputs"][0]["type"]["kind"],
+        "primitive"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -946,19 +929,24 @@ artifact {
 "#,
         json!({}),
     );
+    // Every unfed exact-Unit delta endpoint activates once. An authored message
+    // or a full-address route suppresses only its exact target.
     assert_eq!(artifact["base"]["messages"].as_array().unwrap().len(), 2);
-    assert_eq!(artifact["base"]["messages"][0]["to"], "unit");
     assert_eq!(
         artifact["authored"]["messages"].as_array().unwrap().len(),
         2
+    );
+    assert_eq!(
+        artifact["authored"]["messages"][0]["to"]["endpoint"]["value"]["id"],
+        "unit"
     );
     assert_eq!(
         artifact["unrelated"]["messages"].as_array().unwrap().len(),
         3
     );
     assert_eq!(
-        artifact["unrelated"]["messages"][2]["content"]["value"]["kind"],
-        "nefor.graph.Value"
+        artifact["unrelated"]["messages"][0]["content"]["value"]["kind"],
+        "other-wire"
     );
     assert_eq!(artifact["routed"]["messages"].as_array().unwrap().len(), 1);
 }
@@ -988,7 +976,7 @@ let operation = nefor.graph.instantiate_delta_template("explicit-arm", on,
   (core.map.empty<String, nefor.mag.TypedCapture>(): Map<String, nefor.mag.TypedCapture>), [],
   nefor.mag.DeltaTemplate {
     types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>),
-    actors: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []
+    actors: [], junctions: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []
   })
 let validation = nefor.graph.validate_with_operations(graph, [operation], [])
 artifact(match validation {
@@ -1028,7 +1016,10 @@ import nefor.graph.{}
 import nefor.contracts.{}
 import core.map.{}
 let start = nefor.graph.source("start", ())
-let target = nefor.graph.identity<(Unit, Unit)>("target")
+let target_input = nefor.graph.port("target", type_tag<(Unit, Unit)>(), "in")
+let target_output = nefor.graph.port("target", type_tag<Unit>(), "out")
+let target_actor = nefor.graph.actor("target", "test.target", [], (), nefor.graph.store_port(target_input), [nefor.graph.store_port(target_output)])
+let target = nefor.graph.node("target", "ordinary", [target_actor], [], [], target_input, target_output)
 let first_route = (assoc(nefor.graph.stored_route(nefor.graph.port("raw-first", type_tag<Unit>(), "out"), get(target, "input")), "id", "z"): nefor.graph.StoredRoute)
 let second = (assoc(nefor.graph.stored_route(nefor.graph.port("raw-second", type_tag<Unit>(), "out"), get(target, "input")), "id", "a"): nefor.graph.StoredRoute)
 let third = (assoc(second, "id", "b"): nefor.graph.StoredRoute)
@@ -1112,7 +1103,6 @@ let repeated_sequence = nefor.node.sequence([first_source, second_source])
 let reordered_sequence = nefor.node.sequence([second_source, first_source])
 let collision_sequence_left = nefor.node.sequence([nefor.graph.source("a", 1), nefor.graph.source("bsequencec", 2)])
 let collision_sequence_right = nefor.node.sequence([nefor.graph.source("asequenceb", 1), nefor.graph.source("c", 2)])
-let empty_sequence = nefor.node.sequence_empty<Unit, Int>("empty-sequence")
 
 let result_input = nefor.graph.identity<core.types.Result<String, Int>>("result-input")
 let result_value = nefor.graph.identity<Int>("result-value")
@@ -1142,7 +1132,6 @@ artifact {
   fanout_ids: [get(explicit_fanout, "id"), get(operator_fanout, "id")],
   parallel_ids: [get(explicit_parallel, "id"), get(operator_parallel, "id")],
   choose_ids: [get(explicit_choose, "id"), get(operator_choose, "id")],
-  sequence_inputs: [type_id(type_evidence(get(get(nonempty_sequence, "input"), "type"))), type_id(type_evidence(get(get(empty_sequence, "input"), "type")))],
   sequence_ids: [get(nonempty_sequence, "id"), get(repeated_sequence, "id"), get(reordered_sequence, "id"), get(collision_sequence_left, "id"), get(collision_sequence_right, "id")],
   result_ids: [get(lifted, "id"), get(mapped, "id"), get(mapped_error, "id"), get(bound, "id"), get(operator_bound, "id")],
   map_error_output_matches: (=)(canonical(type_id(type_evidence(get(get(mapped_error, "output"), "type")))), canonical(type_id(type_evidence(type_tag<core.types.Result<Unit, Int>>())))),
@@ -1179,10 +1168,6 @@ artifact {
     assert_eq!(
         artifact["choose_ids"],
         json!(["choose", "nefor.node.composite:3:int3:+++6:string"])
-    );
-    assert_eq!(
-        artifact["sequence_inputs"][0],
-        artifact["sequence_inputs"][1]
     );
     assert_eq!(artifact["sequence_ids"][0], artifact["sequence_ids"][1]);
     assert_ne!(artifact["sequence_ids"][0], artifact["sequence_ids"][2]);
@@ -1378,7 +1363,7 @@ artifact {
     ] {
         let operation = &artifact[name];
         assert_eq!(operation["id"], format!("{name}-traverse.expand"));
-        assert_eq!(operation["on_wire"], "nefor.dynamic.Indexed");
+        assert_eq!(operation["on"]["wire"], "nefor.dynamic.Indexed");
         assert_eq!(
             operation["template"]["messages"].as_array().unwrap().len(),
             1
@@ -1386,59 +1371,42 @@ artifact {
         assert!(operation["expressions"].as_array().unwrap().len() >= 4);
     }
 
-    let identity_actors = artifact["identity"]["template"]["actors"]
-        .as_array()
-        .unwrap();
-    assert_eq!(identity_actors.len(), 2);
-    assert_eq!(identity_actors[0]["slot"], "identity");
-    assert_eq!(identity_actors[0]["factory"], "nefor.factory.output");
+    let identity = &artifact["identity"]["template"];
+    assert_eq!(identity["actors"].as_array().unwrap().len(), 1);
+    assert_eq!(identity["junctions"].as_array().unwrap().len(), 1);
+    assert_eq!(identity["junctions"][0]["slot"], "identity");
+    assert_eq!(identity["junctions"][0]["operation"]["constructor"], "Pass");
 
     let composition_routes = artifact["composition"]["template"]["routes"]
         .as_array()
         .unwrap();
     assert!(composition_routes.iter().any(|route| {
-        route["from"]["actor"]["value"]["slot"] == "composition-left"
-            && route["to"]["actor"]["value"]["slot"] == "composition-right"
+        route["from"]["endpoint"]["value"]["slot"] == "composition-left"
+            && route["to"]["endpoint"]["value"]["slot"] == "composition-right"
     }));
 
     let fanout = &artifact["fanout"]["template"];
-    let fanout_positions: Vec<i64> = fanout["routes"]
+    let fanout_join = fanout["junctions"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|route| route["to"]["actor"]["value"]["slot"] == "fanout.output")
-        .map(|route| route["product_position"].as_i64().unwrap())
-        .collect();
-    assert_eq!(fanout_positions, vec![0, 1]);
-    assert_eq!(
-        fanout["actor_reference_relocations"],
-        json!([{
-            "actor": {"slot": "fanout.output"},
-            "path": ["expected_senders"],
-            "shape": "actor_id_list"
-        }])
-    );
+        .find(|junction| junction["slot"] == "fanout.output")
+        .unwrap();
+    assert_eq!(fanout_join["operation"]["constructor"], "ProductJoin");
+    assert_eq!(fanout_join["inputs"][0]["wire"], "slot:0");
+    assert_eq!(fanout_join["inputs"][1]["wire"], "slot:1");
+    assert_eq!(fanout["actor_reference_relocations"], json!([]));
 
     let sequence = &artifact["sequence"]["template"];
-    let collector = sequence["actors"]
+    let collector = sequence["junctions"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|actor| actor["factory"] == "nefor.factory.collector")
+        .find(|junction| junction["slot"].as_str().unwrap().ends_with(".collector"))
         .unwrap();
-    assert_eq!(
-        collector["params"]["value"]["expected_senders"],
-        json!(["sequence-left", "sequence-right"])
-    );
-    let collector_slot = collector["slot"].as_str().unwrap();
-    let sequence_positions: Vec<i64> = sequence["routes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|route| route["to"]["actor"]["value"]["slot"] == collector_slot)
-        .map(|route| route["product_position"].as_i64().unwrap())
-        .collect();
-    assert_eq!(sequence_positions, vec![-1, -1]);
+    assert_eq!(collector["operation"]["constructor"], "Collect");
+    assert_eq!(collector["inputs"][0]["wire"], "slot:0");
+    assert_eq!(collector["inputs"][1]["wire"], "slot:1");
 
     let reuse = &artifact["reuse"]["template"];
     let reuse_slots: Vec<&str> = reuse["actors"]
@@ -1557,7 +1525,7 @@ import nefor.dynamic.{}
 import nefor.graph.{}
 let input = nefor.graph.port("raw", type_tag<String>(), "in")
 let output = nefor.graph.port("raw", type_tag<String>(), "out")
-let raw = nefor.graph.node("raw", "ordinary", [nefor.graph.actor("raw", "nefor.factory.output", [type_evidence(type_tag<String>())], nefor.graph.OutputParams {}, nefor.graph.store_port(input), [nefor.graph.store_port(output)])], [], [], input, output)
+let raw = nefor.graph.node("raw", "ordinary", [nefor.graph.actor("raw", "test.raw", [type_evidence(type_tag<String>())], (), nefor.graph.store_port(input), [nefor.graph.store_port(output)])], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", raw))
 "#,
             "arbitrary actor constructor has no closed single-result contract",
@@ -1570,7 +1538,7 @@ import nefor.dynamic.{}
 import nefor.graph.{}
 import nefor.mag.{}
 let worker = nefor.graph.identity<String>("worker")
-let operation = nefor.graph.instantiate_delta_template("nested", get(worker, "output"), (core.map.empty<String, nefor.mag.TypedCapture>(): Map<String, nefor.mag.TypedCapture>), [], nefor.mag.DeltaTemplate {types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>), actors: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []})
+let operation = nefor.graph.instantiate_delta_template("nested", get(worker, "output"), (core.map.empty<String, nefor.mag.TypedCapture>(): Map<String, nefor.mag.TypedCapture>), [], nefor.mag.DeltaTemplate {types: (core.map.empty<String, TypeDescriptor>(): Map<String, TypeDescriptor>), actors: [], junctions: [], routes: [], messages: [], nodes: [], actor_reference_relocations: []})
 artifact(nefor.dynamic.traverse("bad", nefor.graph.with_operation(worker, operation)))
 "#,
             "nested worker operations are unsupported",
@@ -1881,7 +1849,6 @@ fn nefor_facade_exports_exact_authoring_allowlist() {
         "tool_approval_policy",
         "no_tool_approval_policy",
         "pack_adt",
-        "sequence_empty",
         "capture_ref",
         "manifest",
         "compile",

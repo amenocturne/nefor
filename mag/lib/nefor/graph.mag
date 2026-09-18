@@ -10,127 +10,92 @@ import nefor.mag.{}
 
 // A graph is an immutable edge set. The list is a deterministic storage
 // detail: graph/add-edges/remove-edges normalize it to set semantics.
-type Port<T> {actor: String, `type`: TypeTag<T>, wire: String}
+type ActorEndpoint = nefor.mag.ActorEndpoint
+type JunctionEndpoint = nefor.mag.JunctionEndpoint
+type Endpoint = nefor.mag.Endpoint
+type StoredPort = nefor.mag.StoredPort
+type JunctionOperation = nefor.mag.JunctionOperation
+type AdtBranch = nefor.mag.AdtBranch
+type AdtPackSpec = nefor.mag.AdtPackSpec
+type AdtUnpackSpec = nefor.mag.AdtUnpackSpec
 
-type StoredPort {actor: String, `type`: TypeDescriptor, type_id: SemanticTypeId, wire: String}
-
+type Port<T> {endpoint: Endpoint, `type`: TypeTag<T>, wire: String}
 type Relocation {path: List<String>, shape: String}
-
 type Templateability = Unsupported(String) | Closed(List<Relocation>)
-
 type Actor {templateability: Templateability, id: String, factory: String, type_arguments: List<TypeDescriptor>, params: PackedValue, input: StoredPort, outputs: List<StoredPort>}
-
+type Junction {id: String, operation: JunctionOperation, inputs: List<StoredPort>, outputs: List<StoredPort>}
 type StoredRoute {id: String, from: StoredPort, to: StoredPort}
-
 type Message {to: StoredPort, semantic_type: TypeDescriptor, semantic_type_id: SemanticTypeId, content: PackedValue}
-
 type LogicalNode {path: List<String>, members: List<String>}
-
 type ActorLogicalPath {actor: String, path: List<String>}
-
 type CompositionPosition {node: String, position: Int}
-
 type DefinitionField {field: String, value: String}
-
 type DefinitionProvenance {containing_node: String, logical_paths: List<List<String>>, composition_path: List<CompositionPosition>, node_occurrence: Int, entity_occurrence: Int}
-
 type DefinitionOccurrence {kind: String, identity: String, fields: List<DefinitionField>, provenance: DefinitionProvenance}
-
-type ExecutionDefinition {role: String, actors: List<Actor>, routes: List<StoredRoute>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, input: StoredPort, output: StoredPort}
-
+type ExecutionDefinition {role: String, actors: List<Actor>, junctions: List<Junction>, routes: List<StoredRoute>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, input: StoredPort, output: StoredPort}
 type ExecutionOccurrence {identity: String, definition: ExecutionDefinition, provenance: DefinitionProvenance}
-
-type StoredNode {id: String, role: String, actors: List<Actor>, routes: List<StoredRoute>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, nodes: List<LogicalNode>, occurrences: List<DefinitionOccurrence>, executions: List<ExecutionOccurrence>, input: StoredPort, output: StoredPort}
-
-type Node<I, O> {id: String, role: String, actors: List<Actor>, routes: List<StoredRoute>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, nodes: List<LogicalNode>, occurrences: List<DefinitionOccurrence>, executions: List<ExecutionOccurrence>, input: Port<I>, output: Port<O>}
-
+type StoredNode {id: String, role: String, actors: List<Actor>, junctions: List<Junction>, routes: List<StoredRoute>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, nodes: List<LogicalNode>, occurrences: List<DefinitionOccurrence>, executions: List<ExecutionOccurrence>, input: StoredPort, output: StoredPort}
+type Node<I, O> {id: String, role: String, actors: List<Actor>, junctions: List<Junction>, routes: List<StoredRoute>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, nodes: List<LogicalNode>, occurrences: List<DefinitionOccurrence>, executions: List<ExecutionOccurrence>, input: Port<I>, output: Port<O>}
 type Edge {from: StoredNode, to: StoredNode, route: StoredRoute}
-
 type Graph {edges: List<Edge>}
-
-type GraphAnalysis {edges: List<Edge>, all_nodes: List<StoredNode>, nodes: List<StoredNode>, nodes_by_id: Map<String, List<StoredNode>>, actors: List<Actor>, actors_by_id: Map<String, List<Actor>>, input_actors_by_address: Map<String, List<Actor>>, output_ports_by_address: Map<String, List<StoredPort>>, routes: List<StoredRoute>, route_input_addresses: List<String>, diagnostic_routes_by_input: Map<String, List<StoredRoute>>, routes_by_input: Map<String, List<StoredRoute>>, routes_by_output: Map<String, List<StoredRoute>>, routes_by_source_actor: Map<String, List<StoredRoute>>, messages: List<Message>, messages_by_input: Map<String, List<Message>>, graph_operations: List<nefor.mag.ProgramOperation>, graph_operations_by_output: Map<String, List<nefor.mag.ProgramOperation>>, edges_by_from_node: Map<String, List<Edge>>, edges_by_to_node: Map<String, List<Edge>>, roots: List<StoredNode>, outputs: List<StoredNode>, terminal_outputs_by_full_port: Map<String, List<StoredNode>>, identity_conflicts: List<String> }
-
-type GraphProjection {edges: List<Edge>, all_nodes: List<StoredNode>, nodes: List<StoredNode>, actors: List<Actor>, routes: List<StoredRoute>, messages: List<Message>, graph_operations: List<nefor.mag.ProgramOperation>, logical_nodes: List<LogicalNode>, edges_by_from_node: Map<String, List<Edge>>, edges_by_to_node: Map<String, List<Edge>>, roots: List<StoredNode>, outputs: List<StoredNode>, identity_conflicts: List<String> }
-
-type LoweringAnalysis {actors: List<Actor>, routes: List<StoredRoute>, route_input_addresses: List<String>, routes_by_input: Map<String, List<StoredRoute>>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, logical_nodes: List<LogicalNode>, outputs: List<StoredNode>}
-
+type GraphAnalysis {edges: List<Edge>, all_nodes: List<StoredNode>, nodes: List<StoredNode>, nodes_by_id: Map<String, List<StoredNode>>, actors: List<Actor>, actors_by_id: Map<String, List<Actor>>, junctions: List<Junction>, junctions_by_id: Map<String, List<Junction>>, input_ports_by_address: Map<String, List<StoredPort>>, output_ports_by_address: Map<String, List<StoredPort>>, routes: List<StoredRoute>, route_input_addresses: List<String>, diagnostic_routes_by_input: Map<String, List<StoredRoute>>, routes_by_input: Map<String, List<StoredRoute>>, routes_by_output: Map<String, List<StoredRoute>>, routes_by_source_actor: Map<String, List<StoredRoute>>, messages: List<Message>, messages_by_input: Map<String, List<Message>>, graph_operations: List<nefor.mag.ProgramOperation>, graph_operations_by_output: Map<String, List<nefor.mag.ProgramOperation>>, edges_by_from_node: Map<String, List<Edge>>, edges_by_to_node: Map<String, List<Edge>>, roots: List<StoredNode>, outputs: List<StoredNode>, terminal_outputs_by_full_port: Map<String, List<StoredNode>>, identity_conflicts: List<String>}
+type GraphProjection {edges: List<Edge>, all_nodes: List<StoredNode>, nodes: List<StoredNode>, actors: List<Actor>, junctions: List<Junction>, routes: List<StoredRoute>, messages: List<Message>, graph_operations: List<nefor.mag.ProgramOperation>, logical_nodes: List<LogicalNode>, edges_by_from_node: Map<String, List<Edge>>, edges_by_to_node: Map<String, List<Edge>>, roots: List<StoredNode>, outputs: List<StoredNode>, identity_conflicts: List<String>}
+type LoweringAnalysis {actors: List<Actor>, junctions: List<Junction>, routes: List<StoredRoute>, route_input_addresses: List<String>, routes_by_input: Map<String, List<StoredRoute>>, messages: List<Message>, operations: List<nefor.mag.ProgramOperation>, logical_nodes: List<LogicalNode>, outputs: List<StoredNode>}
 type OrderedStrings {seen: Set<String>, values: List<String>}
-
 type OrderedDefinitions<T> {seen: Set<String>, values: List<T>}
-
 type FieldDifference {field: String, first_value: String, conflicting_value: String}
-
 type ConflictDescription {entity: String, identity: String, differences: List<FieldDifference>, first_definition: String, first_provenance: DefinitionProvenance, conflicting_definition: String, conflicting_provenance: DefinitionProvenance}
-
 type NodeOccurrence {value: StoredNode, occurrence: Int}
-
 type ActorOccurrence {value: Actor, provenance: DefinitionProvenance}
-
+type JunctionOccurrence {value: Junction, provenance: DefinitionProvenance}
 type RouteOccurrence {value: StoredRoute, provenance: DefinitionProvenance}
-
 type OperationOccurrence {value: nefor.mag.ProgramOperation, provenance: DefinitionProvenance}
-
 type LogicalNodeOccurrence {value: LogicalNode, provenance: DefinitionProvenance}
-
 type ReachabilityState {visited: Set<String>, frontier: List<String>}
-
 type IndexedPosition {index: String, position: Int}
-
 type FactoryTypeScheme {input_tags: List<String>, outputs: List<String>}
-
 type FactoryContract {identity: String, type_scheme: FactoryTypeScheme}
-
 type SourceParams<T> {value: T, value_type: SemanticTypeId}
-
-type OutputParams {}
-
-type LowerDestination {actor: String, wire: String, edge_id: String, source_type_id: SemanticTypeId, destination_type_id: SemanticTypeId, product_position: Int}
-
+type LowerRoute {id: String, from: StoredPort, to: StoredPort, product_position: Int}
 type AssignedRoute {route: StoredRoute, product_position: Int}
-
-type LowerActor {id: String, factory: String, type_arguments: List<TypeDescriptor>, input: StoredPort, outputs: List<StoredPort>, params: PackedValue, routes: Map<String, List<LowerDestination>>}
-
-type LowerMessage {to: String, semantic_type: TypeDescriptor, semantic_type_id: SemanticTypeId, content: PackedValue}
-
+type LowerActor {id: String, factory: String, type_arguments: List<TypeDescriptor>, input: StoredPort, outputs: List<StoredPort>, params: PackedValue}
+type LowerMessage {to: StoredPort, semantic_type: TypeDescriptor, semantic_type_id: SemanticTypeId, content: PackedValue}
 type ResultBoundary {from: StoredPort}
-
 type RouteIdentity {from: StoredPort, to: StoredPort}
-
 type MessageContent<T> {kind: String, value: T}
-
 type EdgeIdentity {from_node: String, to_node: String, route: StoredRoute}
-
-type PortAddressIdentity {actor: String, wire: String}
-
+type PortAddressIdentity {endpoint: Endpoint, wire: String}
 type RouteSourceDescription {kind: String, from: String, `type`: TypeDescriptor}
-
 type RouteHandlerDescription {kind: String, to: String, `type`: TypeDescriptor}
-
 type OperationDescription {kind: String, id: String, `type`: TypeDescriptor}
-
 type OutputCoverageDescription {actor: String, output: String, output_type: TypeDescriptor, available_handlers: List<String>, reason: String}
-
 type InputCoverageDescription {actor: String, input: String, expected_type: TypeDescriptor, incoming_sources: List<String>, reason: String}
-
 type RouteAssignmentIdentity {input: String, route: String}
-
 type RootValidationDescription {node: String, input: String, input_type: TypeDescriptor, reason: String}
+type Modification {actors: List<LowerActor>, junctions: List<Junction>, routes: List<LowerRoute>, messages: List<LowerMessage>, kills: List<String>, types: Map<String, TypeDescriptor>, nodes: List<LogicalNode>, result: ResultBoundary}
+// Delta artifacts are an operation format over the running actor kernel.
+type Delta {actors: List<Actor>, junctions: List<Junction>, routes: List<StoredRoute>, messages: List<Message>, nodes: List<LogicalNode>, kills: List<String>}
+type LowerDelta {actors: List<LowerActor>, junctions: List<Junction>, routes: List<LowerRoute>, messages: List<LowerMessage>, kills: List<String>, types: Map<String, TypeDescriptor>, nodes: List<LogicalNode>}
 
-type Modification {actors: List<LowerActor>, messages: List<LowerMessage>, kills: List<String>, types: Map<String, TypeDescriptor>, nodes: List<LogicalNode>, result: ResultBoundary}
-
-// Delta artifacts are an operation format over the running actor kernel. They
-// are deliberately not Graph values and are not exposed as graph mutation. Authored graph changes are code changes to a pure Graph -> Graph
-// transformation and execute as a fresh run.
-type Delta {actors: List<Actor>, routes: List<StoredRoute>, messages: List<Message>, nodes: List<LogicalNode>, kills: List<String>}
-
-type LowerDelta {actors: List<LowerActor>, messages: List<LowerMessage>, kills: List<String>, types: Map<String, TypeDescriptor>, nodes: List<LogicalNode>}
-
-let port<T>: fn(String, TypeTag<T>, String) -> Port<T> = |actor, semantic_type, wire_type| => Port<T> {actor: actor, `type`: semantic_type, wire: wire_type}
-
+let actor_endpoint: fn(String) -> Endpoint = |id| => named(nefor.mag.Endpoint, ActorEndpoint, nefor.mag.ActorEndpoint {id: id})
+let junction_endpoint: fn(String) -> Endpoint = |id| => named(nefor.mag.Endpoint, JunctionEndpoint, nefor.mag.JunctionEndpoint {id: id})
+let endpoint_id: fn(Endpoint) -> String = |endpoint| => match endpoint { case ActorEndpoint(value) => get(value, "id"), case JunctionEndpoint(value) => get(value, "id") }
+let endpoint_is_actor: fn(Endpoint) -> Bool = |endpoint| => match endpoint { case ActorEndpoint(value) => true, case JunctionEndpoint(value) => false }
+let port<T>: fn(String, TypeTag<T>, String) -> Port<T> = |actor, semantic_type, wire_type| => Port<T> {endpoint: actor_endpoint(actor), `type`: semantic_type, wire: wire_type}
+let junction_port<T>: fn(String, TypeTag<T>, String) -> Port<T> = |id, semantic_type, wire_type| => Port<T> {endpoint: junction_endpoint(id), `type`: semantic_type, wire: wire_type}
 let store_port<T>: fn(Port<T>) -> StoredPort = |value| => {
   let descriptor = type_evidence(get(value, "type"))
-  StoredPort {actor: get(value, "actor"), `type`: descriptor, type_id: type_id(descriptor), wire: get(value, "wire")}
+  nefor.mag.StoredPort {endpoint: get(value, "endpoint"), `type`: descriptor, type_id: type_id(descriptor), wire: get(value, "wire")}
 }
+let junction: fn(String, JunctionOperation, List<StoredPort>, List<StoredPort>) -> Junction = |id, operation, inputs, outputs| => Junction {id: id, operation: operation, inputs: inputs, outputs: outputs}
+let pass_operation = named(nefor.mag.JunctionOperation, Pass, nil)
+let unit_operation = named(nefor.mag.JunctionOperation, Unit, nil)
+let product_split_operation = named(nefor.mag.JunctionOperation, ProductSplit, nil)
+let product_first_operation = named(nefor.mag.JunctionOperation, ProductFirst, nil)
+let product_join_operation = named(nefor.mag.JunctionOperation, ProductJoin, nil)
+let collect_operation = named(nefor.mag.JunctionOperation, Collect, nil)
+let adt_pack_operation: fn(AdtPackSpec) -> JunctionOperation = |spec| => named(nefor.mag.JunctionOperation, AdtPack, spec)
+let adt_unpack_operation: fn(AdtUnpackSpec) -> JunctionOperation = |spec| => named(nefor.mag.JunctionOperation, AdtUnpack, spec)
 
 let actor<P>: fn(String, String, List<TypeDescriptor>, P, StoredPort, List<StoredPort>) -> Actor = |id, factory, type_arguments, params, input, outputs| => Actor {templateability: Templateability.Unsupported("arbitrary actor constructor has no closed single-result contract"), id: id, factory: factory, type_arguments: type_arguments, params: pack(params), input: input, outputs: outputs}
 
@@ -172,18 +137,20 @@ let actor_definition_fields: fn(Actor) -> List<DefinitionField> = |value| => [de
 
 let route_definition_fields: fn(StoredRoute) -> List<DefinitionField> = |value| => [definition_field("from", canonical(get(value, "from"))), definition_field("to", canonical(get(value, "to")))]
 
-let operation_definition_fields: fn(nefor.mag.ProgramOperation) -> List<DefinitionField> = |value| => [definition_field("on_actor", canonical(get(value, "on_actor"))), definition_field("on_wire", canonical(get(value, "on_wire"))), definition_field("trigger_type", canonical(get(value, "trigger_type"))), definition_field("trigger_type_id", canonical(get(value, "trigger_type_id"))), definition_field("captures", canonical(get(value, "captures"))), definition_field("expressions", canonical(get(value, "expressions"))), definition_field("template", canonical(get(value, "template")))]
+let junction_definition_fields: fn(Junction) -> List<DefinitionField> = |value| => [definition_field("operation", canonical(get(value, "operation"))), definition_field("inputs", canonical(get(value, "inputs"))), definition_field("outputs", canonical(get(value, "outputs")))]
+let operation_definition_fields: fn(nefor.mag.ProgramOperation) -> List<DefinitionField> = |value| => [definition_field("on", canonical(get(value, "on"))), definition_field("captures", canonical(get(value, "captures"))), definition_field("expressions", canonical(get(value, "expressions"))), definition_field("template", canonical(get(value, "template")))]
+let endpoint_logical_paths: fn(List<LogicalNode>, Endpoint) -> List<List<String>> = |nodes, endpoint| => if endpoint_is_actor(endpoint) then occurrence_paths_for_actor(nodes, endpoint_id(endpoint)) else []
+let route_logical_paths: fn(List<LogicalNode>, StoredRoute) -> List<List<String>> = |nodes, route| => unique_definitions(concat(endpoint_logical_paths(nodes, get(get(route, "from"), "endpoint")), endpoint_logical_paths(nodes, get(get(route, "to"), "endpoint"))))
 
-let definition_occurrences: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, StoredPort, StoredPort) -> List<DefinitionOccurrence> = |id, role, actors, routes, messages, operations, nodes, input, output| => {
+let definition_occurrences: fn(String, String, List<Actor>, List<Junction>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, StoredPort, StoredPort) -> List<DefinitionOccurrence> = |id, role, actors, junctions, routes, messages, operations, nodes, input, output| => {
   let actor_occurrences = indexed_map(((|index, actor| => DefinitionOccurrence {kind: "actor", identity: get(actor, "id"), fields: actor_definition_fields(actor), provenance: occurrence_provenance_for(id, occurrence_paths_for_actor(nodes, get(actor, "id")), index)}) : fn(Int, Actor) -> DefinitionOccurrence), actors)
-  let route_occurrences = indexed_map(((|index, route| => DefinitionOccurrence {kind: "route", identity: get(route, "id"), fields: route_definition_fields(route), provenance: occurrence_provenance_for(id, unique_definitions(concat(occurrence_paths_for_actor(nodes, get(get(route, "from"), "actor")), occurrence_paths_for_actor(nodes, get(get(route, "to"), "actor")))), index)}) : fn(Int, StoredRoute) -> DefinitionOccurrence), routes)
-  let operation_occurrences = indexed_map(((|index, operation| => DefinitionOccurrence {kind: "operation", identity: get(operation, "id"), fields: operation_definition_fields(operation), provenance: occurrence_provenance_for(id, occurrence_paths_for_actor(nodes, get(operation, "on_actor")), index)}) : fn(Int, nefor.mag.ProgramOperation) -> DefinitionOccurrence), operations)
+  let junction_occurrences = indexed_map(((|index, value| => DefinitionOccurrence {kind: "junction", identity: get(value, "id"), fields: junction_definition_fields(value), provenance: occurrence_provenance_for(id, [], index)}) : fn(Int, Junction) -> DefinitionOccurrence), junctions)
+  let route_occurrences = indexed_map(((|index, route| => DefinitionOccurrence {kind: "route", identity: get(route, "id"), fields: route_definition_fields(route), provenance: occurrence_provenance_for(id, route_logical_paths(nodes, route), index)}) : fn(Int, StoredRoute) -> DefinitionOccurrence), routes)
+  let operation_occurrences = indexed_map(((|index, operation| => DefinitionOccurrence {kind: "operation", identity: get(operation, "id"), fields: operation_definition_fields(operation), provenance: occurrence_provenance_for(id, endpoint_logical_paths(nodes, get(get(operation, "on"), "endpoint")), index)}) : fn(Int, nefor.mag.ProgramOperation) -> DefinitionOccurrence), operations)
   let logical_occurrences = indexed_map(((|index, logical| => DefinitionOccurrence {kind: "logical node", identity: canonical(get(logical, "path")), fields: [definition_field("members", canonical(get(logical, "members")))], provenance: occurrence_provenance_for(id, [get(logical, "path")], index)}) : fn(Int, LogicalNode) -> DefinitionOccurrence), nodes)
-  concat(actor_occurrences, concat(route_occurrences, concat(operation_occurrences, logical_occurrences)))
+  concat(actor_occurrences, concat(junction_occurrences, concat(route_occurrences, concat(operation_occurrences, logical_occurrences))))
 }
 
-// Membership attachment transforms one existing logical definition, not two
-// conflicting declarations. Update its retained occurrence at the same boundary.
 let attach_logical_occurrences: fn(List<DefinitionOccurrence>, List<LogicalNode>, List<String>) -> List<DefinitionOccurrence> = |values, nodes, members| => if (=)(count(nodes), 0) then values else {
   let old = first(nodes)
   let identity = canonical(get(old, "path"))
@@ -192,7 +159,7 @@ let attach_logical_occurrences: fn(List<DefinitionOccurrence>, List<LogicalNode>
   map(((|candidate| => if (=)(get(candidate, "kind"), "logical node") then if (=)(get(candidate, "identity"), identity) then if serialized_equal(get(candidate, "fields"), old_fields) then assoc(candidate, "fields", new_fields) else candidate else candidate else candidate) : fn(DefinitionOccurrence) -> DefinitionOccurrence), values)
 }
 
-let execution_occurrence: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, StoredPort, StoredPort) -> ExecutionOccurrence = |id, role, actors, routes, messages, operations, nodes, input, output| => ExecutionOccurrence {identity: id, definition: ExecutionDefinition {role: role, actors: actors, routes: routes, messages: messages, operations: operations, input: input, output: output}, provenance: occurrence_provenance_for(id, map(((|logical| => get(logical, "path")) : fn(LogicalNode) -> List<String>), nodes), -1)}
+let execution_occurrence: fn(String, String, List<Actor>, List<Junction>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, StoredPort, StoredPort) -> ExecutionOccurrence = |id, role, actors, junctions, routes, messages, operations, nodes, input, output| => ExecutionOccurrence {identity: id, definition: ExecutionDefinition {role: role, actors: actors, junctions: junctions, routes: routes, messages: messages, operations: operations, input: input, output: output}, provenance: occurrence_provenance_for(id, map(((|logical| => get(logical, "path")) : fn(LogicalNode) -> List<String>), nodes), -1)}
 
 let occurrence_key: fn(DefinitionOccurrence) -> String = |value| => canonical([get(value, "kind"), get(value, "identity"), canonical(get(value, "fields"))])
 
@@ -255,94 +222,63 @@ let rename_execution_paths: fn(String, ExecutionOccurrence) -> ExecutionOccurren
 
 let rename_executions: fn(String, List<ExecutionOccurrence>) -> List<ExecutionOccurrence> = |name, values| => map(((|value| => rename_execution_paths(name, value)) : fn(ExecutionOccurrence) -> ExecutionOccurrence), values)
 
-let node_with_occurrences_and_nodes<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, List<DefinitionOccurrence>, List<ExecutionOccurrence>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, operations, nodes, inherited, inherited_executions, input, output| => {
+let node_with_occurrences_and_nodes_and_junctions<I, O>: fn(String, String, List<Actor>, List<Junction>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, List<DefinitionOccurrence>, List<ExecutionOccurrence>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, junctions, routes, messages, operations, nodes, inherited, inherited_executions, input, output| => {
   let normalized_actors = unique_definitions(actors)
+  let normalized_junctions = unique_definitions(junctions)
   let normalized_routes = unique_definitions(routes)
   let normalized_messages = unique_definitions(messages)
   let normalized_operations = unique_definitions(operations)
   let normalized_nodes = unique_definitions(nodes)
-  let generated = definition_occurrences(id, role, normalized_actors, normalized_routes, normalized_messages, normalized_operations, normalized_nodes, store_port(input), store_port(output))
+  let generated = definition_occurrences(id, role, normalized_actors, normalized_junctions, normalized_routes, normalized_messages, normalized_operations, normalized_nodes, store_port(input), store_port(output))
   let current_keys = group_by(occurrence_key, generated)
   let retained = filter(((|candidate| => core.map.contains_key(current_keys, occurrence_key(candidate))) : fn(DefinitionOccurrence) -> Bool), inherited)
-  Node<I, O> {id: id, role: role, actors: normalized_actors, routes: normalized_routes, messages: normalized_messages, operations: normalized_operations, nodes: normalized_nodes, occurrences: unique_occurrences(concat(retained, generated)), executions: inherited_executions, input: input, output: output}
+  Node<I, O> {id: id, role: role, actors: normalized_actors, junctions: normalized_junctions, routes: normalized_routes, messages: normalized_messages, operations: normalized_operations, nodes: normalized_nodes, occurrences: unique_occurrences(concat(retained, generated)), executions: inherited_executions, input: input, output: output}
 }
-
-let node_with_operations_and_nodes<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, operations, nodes, input, output| => node_with_occurrences_and_nodes(id, role, actors, routes, messages, operations, nodes, [], [], input, output)
-
-// Node carries child execution occurrences. Its own current definition is
-// captured when it becomes a child or stored boundary, never a stale self copy.
-let node_execution_occurrences<I, O>: fn(Node<I, O>) -> List<ExecutionOccurrence> = |value| => concat(get(value, "executions"), [execution_occurrence(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "routes"), get(value, "messages"), get(value, "operations"), get(value, "nodes"), store_port(get(value, "input")), store_port(get(value, "output")))])
-
-let node<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, input, output| => node_with_operations_and_nodes(id, role, actors, routes, messages, [], [logical_node([id], actor_ids(actors))], input, output)
-
-let node_with_operations<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, operations, input, output| => node_with_operations_and_nodes(id, role, actors, routes, messages, operations, [logical_node([id], actor_ids(actors))], input, output)
-
-let with_operation<I, O>: fn(Node<I, O>, nefor.mag.ProgramOperation) -> Node<I, O> = |value, subscription| => node_with_occurrences_and_nodes(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "routes"), get(value, "messages"), concat(get(value, "operations"), [subscription]), get(value, "nodes"), concat(get(value, "occurrences"), [DefinitionOccurrence {kind: "operation", identity: get(subscription, "id"), fields: operation_definition_fields(subscription), provenance: occurrence_provenance_for(get(value, "id"), occurrence_paths_for_actor(get(value, "nodes"), get(subscription, "on_actor")), count(get(value, "operations")))}]), get(value, "executions"), get(value, "input"), get(value, "output"))
-
-let normalize_node<I, O>: fn(Node<I, O>) -> Node<I, O> = |value| => node_with_occurrences_and_nodes(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "routes"), get(value, "messages"), get(value, "operations"), get(value, "nodes"), get(value, "occurrences"), get(value, "executions"), get(value, "input"), get(value, "output"))
-
+let node_with_occurrences_and_nodes<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, List<DefinitionOccurrence>, List<ExecutionOccurrence>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, operations, nodes, inherited, inherited_executions, input, output| => node_with_occurrences_and_nodes_and_junctions(id, role, actors, [], routes, messages, operations, nodes, inherited, inherited_executions, input, output)
+let node_with_operations_and_nodes_and_junctions<I, O>: fn(String, String, List<Actor>, List<Junction>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, junctions, routes, messages, operations, nodes, input, output| => node_with_occurrences_and_nodes_and_junctions(id, role, actors, junctions, routes, messages, operations, nodes, [], [], input, output)
+let node_with_operations_and_nodes<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, List<LogicalNode>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, operations, nodes, input, output| => node_with_operations_and_nodes_and_junctions(id, role, actors, [], routes, messages, operations, nodes, input, output)
+let node_execution_occurrences<I, O>: fn(Node<I, O>) -> List<ExecutionOccurrence> = |value| => concat(get(value, "executions"), [execution_occurrence(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "junctions"), get(value, "routes"), get(value, "messages"), get(value, "operations"), get(value, "nodes"), store_port(get(value, "input")), store_port(get(value, "output")))])
+let node_with_junctions<I, O>: fn(String, String, List<Actor>, List<Junction>, List<StoredRoute>, List<Message>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, junctions, routes, messages, input, output| => node_with_operations_and_nodes_and_junctions(id, role, actors, junctions, routes, messages, [], [logical_node([id], actor_ids(actors))], input, output)
+let node<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, input, output| => node_with_junctions(id, role, actors, [], routes, messages, input, output)
+let node_with_operations<I, O>: fn(String, String, List<Actor>, List<StoredRoute>, List<Message>, List<nefor.mag.ProgramOperation>, Port<I>, Port<O>) -> Node<I, O> = |id, role, actors, routes, messages, operations, input, output| => node_with_operations_and_nodes_and_junctions(id, role, actors, [], routes, messages, operations, [logical_node([id], actor_ids(actors))], input, output)
+let with_operation<I, O>: fn(Node<I, O>, nefor.mag.ProgramOperation) -> Node<I, O> = |value, subscription| => node_with_occurrences_and_nodes_and_junctions(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "junctions"), get(value, "routes"), get(value, "messages"), concat(get(value, "operations"), [subscription]), get(value, "nodes"), get(value, "occurrences"), get(value, "executions"), get(value, "input"), get(value, "output"))
+let normalize_node<I, O>: fn(Node<I, O>) -> Node<I, O> = |value| => node_with_occurrences_and_nodes_and_junctions(get(value, "id"), get(value, "role"), get(value, "actors"), get(value, "junctions"), get(value, "routes"), get(value, "messages"), get(value, "operations"), get(value, "nodes"), get(value, "occurrences"), get(value, "executions"), get(value, "input"), get(value, "output"))
 let store_node<I, O>: fn(Node<I, O>) -> StoredNode = |authored| => {
   let value = normalize_node(authored)
-  StoredNode {id: get(value, "id"), role: get(value, "role"), actors: get(value, "actors"), routes: get(value, "routes"), messages: get(value, "messages"), operations: get(value, "operations"), nodes: get(value, "nodes"), occurrences: get(value, "occurrences"), executions: node_execution_occurrences(value), input: store_port(get(value, "input")), output: store_port(get(value, "output"))}
+  StoredNode {id: get(value, "id"), role: get(value, "role"), actors: get(value, "actors"), junctions: get(value, "junctions"), routes: get(value, "routes"), messages: get(value, "messages"), operations: get(value, "operations"), nodes: get(value, "nodes"), occurrences: get(value, "occurrences"), executions: node_execution_occurrences(value), input: store_port(get(value, "input")), output: store_port(get(value, "output"))}
 }
-
 let stored_route<A, B>: fn(Port<A>, Port<B>) -> StoredRoute = |from, to| => {
   let stored_from = store_port(from)
   let stored_to = store_port(to)
   StoredRoute {id: canonical(RouteIdentity {from: stored_from, to: stored_to}), from: stored_from, to: stored_to}
 }
-
 let edge<I, T, U, O>: fn(Node<I, T>, Node<U, O>) -> Edge = |from, to| => Edge {from: store_node(from), to: store_node(to), route: stored_route(get(from, "output"), get(to, "input"))}
-
 let stored_message<P>: fn(StoredPort, P) -> Message = |to, content| => Message {to: to, semantic_type: get(to, "type"), semantic_type_id: get(to, "type_id"), content: pack(content)}
-
 let message<T, P>: fn(Port<T>, P) -> Message = |to, content| => stored_message(store_port(to), content)
-
 let typed_message<T>: fn(Port<T>, T) -> Message = |to, value| => {
   let stored = store_port(to)
   let selected = value_type_evidence(value, get(stored, "type"))
   Message {to: stored, semantic_type: selected, semantic_type_id: type_id(selected), content: pack(MessageContent<T> {kind: get(to, "wire"), value: value})}
 }
-
-let instantiate_delta_template<T>: fn(String, Port<T>, Map<String, nefor.mag.TypedCapture>, List<nefor.mag.Expression>, nefor.mag.DeltaTemplate) -> nefor.mag.ProgramOperation = |id, on, captures, expressions, template| => {
-  let stored = store_port(on)
-  nefor.mag.ProgramOperation {id: id, on_actor: get(stored, "actor"), on_wire: get(stored, "wire"), trigger_type: get(stored, "type"), trigger_type_id: get(stored, "type_id"), captures: captures, expressions: expressions, template: template}
-}
-
-let operation_port: fn(nefor.mag.ProgramOperation) -> StoredPort = |value| => StoredPort {actor: get(value, "on_actor"), `type`: get(value, "trigger_type"), type_id: get(value, "trigger_type_id"), wire: get(value, "on_wire")}
-
+let instantiate_delta_template<T>: fn(String, Port<T>, Map<String, nefor.mag.TypedCapture>, List<nefor.mag.Expression>, nefor.mag.DeltaTemplate) -> nefor.mag.ProgramOperation = |id, on, captures, expressions, template| => nefor.mag.ProgramOperation {id: id, on: store_port(on), captures: captures, expressions: expressions, template: template}
+let operation_port: fn(nefor.mag.ProgramOperation) -> StoredPort = |value| => get(value, "on")
 let source_factory = "nefor.factory.source"
-
 let source<T>: fn(String, T) -> Node<Unit, T> = |id, value| => {
   let `type` = type_tag<T>()
   let input = port(id, type_tag<Unit>(), "mag.Unit")
   let output = port(id, `type`, "nefor.graph.Value")
   let source_actor = closed_actor(id, source_factory, [type_evidence(`type`)], SourceParams<T> {value: value, value_type: value_type_id(value, `type`)}, store_port(input), [store_port(output)], [])
-  node(id, "source", [source_actor], ([]: List<StoredRoute>), ([]: List<Message>), input, output)
+  node(id, "source", [source_actor], [], [], input, output)
 }
-
-let output_factory = "nefor.factory.output"
-
-let output<T>: fn(String) -> Node<T, T> = |id| => {
+let pass_node<T>: fn(String, String) -> Node<T, T> = |id, role| => {
   let `type` = type_tag<T>()
-  let input = port(id, `type`, "nefor.graph.Value")
-  let result = port(id, `type`, "nefor.graph.Value")
-  let output_actor = closed_actor(id, output_factory, [type_evidence(`type`)], OutputParams {}, store_port(input), [store_port(result)], [])
-  node(id, "output", [output_actor], ([]: List<StoredRoute>), ([]: List<Message>), input, result)
+  let input = junction_port(id, `type`, "in")
+  let result = junction_port(id, `type`, "out")
+  let value = junction(id, pass_operation, [store_port(input)], [store_port(result)])
+  node_with_junctions(id, role, [], [value], [], [], input, result)
 }
-
-// An ordinary identity node is the boundary adapter used by hierarchical
-// node combinators. The runtime factory already forwards one typed value; the
-// distinct role keeps this reusable internal node out of the graph's terminal
-// output semantics.
-let identity<T>: fn(String) -> Node<T, T> = |id| => {
-  let `type` = type_tag<T>()
-  let input = port(id, `type`, "nefor.graph.Value")
-  let result = port(id, `type`, "nefor.graph.Value")
-  let identity_actor = closed_actor(id, output_factory, [type_evidence(`type`)], OutputParams {}, store_port(input), [store_port(result)], [])
-  node(id, "ordinary", [identity_actor], ([]: List<StoredRoute>), ([]: List<Message>), input, result)
-}
-
+let output<T>: fn(String) -> Node<T, T> = |id| => pass_node<T>(id, "output")
+let identity<T>: fn(String) -> Node<T, T> = |id| => pass_node<T>(id, "ordinary")
 let output_for<I, T>: fn(String, Node<I, T>) -> Node<T, T> = |id, from| => output<T>(id)
 
 let same_edge: fn(Edge, Edge) -> Bool = |left, right| => if (=)(get(get(left, "from"), "id"), get(get(right, "from"), "id")) then if (=)(get(get(left, "to"), "id"), get(get(right, "to"), "id")) then serialized_equal(get(left, "route"), get(right, "route")) else false else false
@@ -365,7 +301,7 @@ let add_edges: fn(Graph, List<Edge>) -> Graph = |value, added| => graph(concat(g
 
 let remove_edges: fn(Graph, List<Edge>) -> Graph = |value, removed| => graph(filter(((|candidate| => not(edge_in(removed, candidate))) : fn(Edge) -> Bool), get(value, "edges")))
 
-let port_address_key: fn(StoredPort) -> String = |value| => canonical(PortAddressIdentity {actor: get(value, "actor"), wire: get(value, "wire")})
+let port_address_key: fn(StoredPort) -> String = |value| => canonical(PortAddressIdentity {endpoint: get(value, "endpoint"), wire: get(value, "wire")})
 
 let full_port_key: fn(StoredPort) -> String = |value| => canonical(value)
 
@@ -394,96 +330,52 @@ let actor_occurrences_for_node: fn(NodeOccurrence) -> List<ActorOccurrence> = |o
   indexed_map(((|index, actor| => ActorOccurrence {value: actor, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, paths_for_actor(node, get(actor, "id")))}) : fn(Int, Actor) -> ActorOccurrence), get(node, "actors"))
 }
 
-let route_paths: fn(StoredNode, StoredRoute) -> List<List<String>> = |node, route| => unique_definitions(concat(paths_for_actor(node, get(get(route, "from"), "actor")), paths_for_actor(node, get(get(route, "to"), "actor"))))
-
-let route_occurrences_for_node: fn(NodeOccurrence) -> List<RouteOccurrence> = |occurrence| => {
+let junction_occurrences_for_node: fn(NodeOccurrence) -> List<JunctionOccurrence> = |occurrence| => {
   let node = get(occurrence, "value")
-  indexed_map(((|index, route| => RouteOccurrence {value: route, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, route_paths(node, route))}) : fn(Int, StoredRoute) -> RouteOccurrence), get(node, "routes"))
+  indexed_map(((|index, value| => JunctionOccurrence {value: value, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, [])}) : fn(Int, Junction) -> JunctionOccurrence), get(node, "junctions"))
 }
-
-let operation_occurrences_for_node: fn(NodeOccurrence) -> List<OperationOccurrence> = |occurrence| => {
-  let node = get(occurrence, "value")
-  indexed_map(((|index, operation| => OperationOccurrence {value: operation, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, paths_for_actor(node, get(operation, "on_actor")))}) : fn(Int, nefor.mag.ProgramOperation) -> OperationOccurrence), get(node, "operations"))
-}
-
-let logical_occurrences_for_node: fn(NodeOccurrence) -> List<LogicalNodeOccurrence> = |occurrence| => {
-  let node = get(occurrence, "value")
-  indexed_map(((|index, logical| => LogicalNodeOccurrence {value: logical, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, [get(logical, "path")])}) : fn(Int, LogicalNode) -> LogicalNodeOccurrence), get(node, "nodes"))
-}
-
+let route_paths: fn(StoredNode, StoredRoute) -> List<List<String>> = |node, route| => route_logical_paths(get(node, "nodes"), route)
+let route_occurrences_for_node: fn(NodeOccurrence) -> List<RouteOccurrence> = |occurrence| => { let node = get(occurrence, "value")
+  indexed_map(((|index, route| => RouteOccurrence {value: route, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, route_paths(node, route))}) : fn(Int, StoredRoute) -> RouteOccurrence), get(node, "routes")) }
+let operation_occurrences_for_node: fn(NodeOccurrence) -> List<OperationOccurrence> = |occurrence| => { let node = get(occurrence, "value")
+  indexed_map(((|index, operation| => OperationOccurrence {value: operation, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, endpoint_logical_paths(get(node, "nodes"), get(get(operation, "on"), "endpoint")))}) : fn(Int, nefor.mag.ProgramOperation) -> OperationOccurrence), get(node, "operations")) }
+let logical_occurrences_for_node: fn(NodeOccurrence) -> List<LogicalNodeOccurrence> = |occurrence| => { let node = get(occurrence, "value")
+  indexed_map(((|index, logical| => LogicalNodeOccurrence {value: logical, provenance: occurrence_provenance(node, get(occurrence, "occurrence"), index, [get(logical, "path")])}) : fn(Int, LogicalNode) -> LogicalNodeOccurrence), get(node, "nodes")) }
 let field_difference: fn(String, String, String) -> List<FieldDifference> = |field, first_value, conflicting_value| => if (=)(first_value, conflicting_value) then [] else [FieldDifference {field: field, first_value: first_value, conflicting_value: conflicting_value}]
-
-let operation_differences: fn(nefor.mag.ProgramOperation, nefor.mag.ProgramOperation) -> List<FieldDifference> = |first_value, conflicting_value| => concat(field_difference("on_actor", canonical(get(first_value, "on_actor")), canonical(get(conflicting_value, "on_actor"))), concat(field_difference("on_wire", canonical(get(first_value, "on_wire")), canonical(get(conflicting_value, "on_wire"))), concat(field_difference("trigger_type", canonical(get(first_value, "trigger_type")), canonical(get(conflicting_value, "trigger_type"))), concat(field_difference("trigger_type_id", canonical(get(first_value, "trigger_type_id")), canonical(get(conflicting_value, "trigger_type_id"))), concat(field_difference("captures", canonical(get(first_value, "captures")), canonical(get(conflicting_value, "captures"))), concat(field_difference("expressions", canonical(get(first_value, "expressions")), canonical(get(conflicting_value, "expressions"))), field_difference("template", canonical(get(first_value, "template")), canonical(get(conflicting_value, "template")))))))))
-
+let operation_differences: fn(nefor.mag.ProgramOperation, nefor.mag.ProgramOperation) -> List<FieldDifference> = |first_value, conflicting_value| => concat(field_difference("on", canonical(get(first_value, "on")), canonical(get(conflicting_value, "on"))), concat(field_difference("captures", canonical(get(first_value, "captures")), canonical(get(conflicting_value, "captures"))), concat(field_difference("expressions", canonical(get(first_value, "expressions")), canonical(get(conflicting_value, "expressions"))), field_difference("template", canonical(get(first_value, "template")), canonical(get(conflicting_value, "template"))))))
 let conflict_error: fn(String, String, List<FieldDifference>, String, DefinitionProvenance, String, DefinitionProvenance) -> String = |entity, identity, differences, first_definition, first_provenance, conflicting_definition, conflicting_provenance| => str("identity conflict: ", canonical(ConflictDescription {entity: entity, identity: identity, differences: differences, first_definition: first_definition, first_provenance: first_provenance, conflicting_definition: conflicting_definition, conflicting_provenance: conflicting_provenance}))
-
 let definition_field_value: fn(List<DefinitionField>, String) -> String = |fields, name| => get(first(filter(((|candidate| => (=)(get(candidate, "field"), name)) : fn(DefinitionField) -> Bool), fields)), "value")
-
 let definition_differences: fn(List<DefinitionField>, List<DefinitionField>) -> List<FieldDifference> = |first_fields, conflicting_fields| => flat_map(((|candidate| => field_difference(get(candidate, "field"), get(candidate, "value"), definition_field_value(conflicting_fields, get(candidate, "field")))) : fn(DefinitionField) -> List<FieldDifference>), first_fields)
-
 let definition_group_key: fn(DefinitionOccurrence) -> String = |value| => canonical([get(value, "kind"), get(value, "identity")])
-
-let definition_conflict_errors: fn(List<DefinitionOccurrence>) -> List<String> = |occurrences| => {
-  let by_identity = group_by(definition_group_key, occurrences)
-  unique_definitions(flat_map(((|candidate| => {
-    let bucket = __map_get_or(by_identity, definition_group_key(candidate), ([]: List<DefinitionOccurrence>))
-    let first_occurrence = first(bucket)
-    if serialized_equal(get(first_occurrence, "fields"), get(candidate, "fields")) then [] else [conflict_error(get(candidate, "kind"), get(candidate, "identity"), definition_differences(get(first_occurrence, "fields"), get(candidate, "fields")), canonical(get(first_occurrence, "fields")), get(first_occurrence, "provenance"), canonical(get(candidate, "fields")), get(candidate, "provenance"))]
-  }) : fn(DefinitionOccurrence) -> List<String>), occurrences))
-}
-
+let definition_conflict_errors: fn(List<DefinitionOccurrence>) -> List<String> = |occurrences| => { let by_identity = group_by(definition_group_key, occurrences)
+  unique_definitions(flat_map(((|candidate| => { let bucket = __map_get_or(by_identity, definition_group_key(candidate), ([]: List<DefinitionOccurrence>))
+  let first_occurrence = first(bucket)
+  if serialized_equal(get(first_occurrence, "fields"), get(candidate, "fields")) then [] else [conflict_error(get(candidate, "kind"), get(candidate, "identity"), definition_differences(get(first_occurrence, "fields"), get(candidate, "fields")), canonical(get(first_occurrence, "fields")), get(first_occurrence, "provenance"), canonical(get(candidate, "fields")), get(candidate, "provenance"))] }) : fn(DefinitionOccurrence) -> List<String>), occurrences)) }
 let definition_set_equal<T>: fn(List<T>, List<T>) -> Bool = |left, right| => (=)(canonical_definition_set(left), canonical_definition_set(right))
-
-let execution_equal: fn(ExecutionDefinition, ExecutionDefinition) -> Bool = |left, right| => if serialized_equal(left, right) then true else if not((=)(get(left, "role"), get(right, "role"))) then false else if not(serialized_equal(get(left, "input"), get(right, "input"))) then false else if not(serialized_equal(get(left, "output"), get(right, "output"))) then false else if not(definition_set_equal(get(left, "actors"), get(right, "actors"))) then false else if not(definition_set_equal(get(left, "routes"), get(right, "routes"))) then false else if not(definition_set_equal(get(left, "messages"), get(right, "messages"))) then false else definition_set_equal(get(left, "operations"), get(right, "operations"))
-
-let execution_differences: fn(ExecutionDefinition, ExecutionDefinition) -> List<FieldDifference> = |first_value, conflicting_value| => concat(field_difference("role", canonical(get(first_value, "role")), canonical(get(conflicting_value, "role"))), concat(field_difference("input", canonical(get(first_value, "input")), canonical(get(conflicting_value, "input"))), concat(field_difference("output", canonical(get(first_value, "output")), canonical(get(conflicting_value, "output"))), concat(field_difference("actors", canonical_definition_set(get(first_value, "actors")), canonical_definition_set(get(conflicting_value, "actors"))), concat(field_difference("routes", canonical_definition_set(get(first_value, "routes")), canonical_definition_set(get(conflicting_value, "routes"))), concat(field_difference("messages", canonical_definition_set(get(first_value, "messages")), canonical_definition_set(get(conflicting_value, "messages"))), field_difference("operations", canonical_definition_set(get(first_value, "operations")), canonical_definition_set(get(conflicting_value, "operations")))))))))
-
-let execution_conflict_errors: fn(List<ExecutionOccurrence>) -> List<String> = |occurrences| => {
-  let by_identity = group_by(((|candidate| => get(candidate, "identity")) : fn(ExecutionOccurrence) -> String), occurrences)
-  unique_definitions(flat_map(((|candidate| => {
-    let bucket = __map_get_or(by_identity, get(candidate, "identity"), ([]: List<ExecutionOccurrence>))
-    let first_occurrence = first(bucket)
-    if (=)(count(bucket), 1) then [] else if execution_equal(get(first_occurrence, "definition"), get(candidate, "definition")) then [] else [conflict_error("stored node", get(candidate, "identity"), execution_differences(get(first_occurrence, "definition"), get(candidate, "definition")), canonical(get(first_occurrence, "definition")), get(first_occurrence, "provenance"), canonical(get(candidate, "definition")), get(candidate, "provenance"))]
-  }) : fn(ExecutionOccurrence) -> List<String>), occurrences))
-}
-
-let operation_conflict_errors: fn(List<OperationOccurrence>) -> List<String> = |occurrences| => {
-  let by_id = group_by(((|candidate| => get(get(candidate, "value"), "id")) : fn(OperationOccurrence) -> String), occurrences)
-  flat_map(((|candidate| => {
-    let value = get(candidate, "value")
-    let first_occurrence = first(__map_get_or(by_id, get(value, "id"), ([]: List<OperationOccurrence>)))
-    if serialized_equal(get(first_occurrence, "value"), value) then [] else [conflict_error("operation", get(value, "id"), operation_differences(get(first_occurrence, "value"), value), canonical(get(first_occurrence, "value")), get(first_occurrence, "provenance"), canonical(value), get(candidate, "provenance"))]
-  }) : fn(OperationOccurrence) -> List<String>), occurrences)
-}
-
+let execution_equal: fn(ExecutionDefinition, ExecutionDefinition) -> Bool = |left, right| => if serialized_equal(left, right) then true else if not((=)(get(left, "role"), get(right, "role"))) then false else if not(serialized_equal(get(left, "input"), get(right, "input"))) then false else if not(serialized_equal(get(left, "output"), get(right, "output"))) then false else if not(definition_set_equal(get(left, "actors"), get(right, "actors"))) then false else if not(definition_set_equal(get(left, "junctions"), get(right, "junctions"))) then false else if not(definition_set_equal(get(left, "routes"), get(right, "routes"))) then false else if not(definition_set_equal(get(left, "messages"), get(right, "messages"))) then false else definition_set_equal(get(left, "operations"), get(right, "operations"))
+let execution_differences: fn(ExecutionDefinition, ExecutionDefinition) -> List<FieldDifference> = |first_value, conflicting_value| => concat(field_difference("role", canonical(get(first_value, "role")), canonical(get(conflicting_value, "role"))), concat(field_difference("input", canonical(get(first_value, "input")), canonical(get(conflicting_value, "input"))), concat(field_difference("output", canonical(get(first_value, "output")), canonical(get(conflicting_value, "output"))), concat(field_difference("actors", canonical_definition_set(get(first_value, "actors")), canonical_definition_set(get(conflicting_value, "actors"))), concat(field_difference("junctions", canonical_definition_set(get(first_value, "junctions")), canonical_definition_set(get(conflicting_value, "junctions"))), concat(field_difference("routes", canonical_definition_set(get(first_value, "routes")), canonical_definition_set(get(conflicting_value, "routes"))), concat(field_difference("messages", canonical_definition_set(get(first_value, "messages")), canonical_definition_set(get(conflicting_value, "messages"))), field_difference("operations", canonical_definition_set(get(first_value, "operations")), canonical_definition_set(get(conflicting_value, "operations"))))))))))
+let execution_conflict_errors: fn(List<ExecutionOccurrence>) -> List<String> = |occurrences| => { let by_identity = group_by(((|candidate| => get(candidate, "identity")) : fn(ExecutionOccurrence) -> String), occurrences)
+  unique_definitions(flat_map(((|candidate| => { let bucket = __map_get_or(by_identity, get(candidate, "identity"), ([]: List<ExecutionOccurrence>))
+  let first_occurrence = first(bucket)
+  if (=)(count(bucket), 1) then [] else if execution_equal(get(first_occurrence, "definition"), get(candidate, "definition")) then [] else [conflict_error("stored node", get(candidate, "identity"), execution_differences(get(first_occurrence, "definition"), get(candidate, "definition")), canonical(get(first_occurrence, "definition")), get(first_occurrence, "provenance"), canonical(get(candidate, "definition")), get(candidate, "provenance"))] }) : fn(ExecutionOccurrence) -> List<String>), occurrences)) }
+let operation_conflict_errors: fn(List<OperationOccurrence>) -> List<String> = |occurrences| => { let by_id = group_by(((|candidate| => get(get(candidate, "value"), "id")) : fn(OperationOccurrence) -> String), occurrences)
+  flat_map(((|candidate| => { let value = get(candidate, "value")
+  let first_occurrence = first(__map_get_or(by_id, get(value, "id"), ([]: List<OperationOccurrence>)))
+  if serialized_equal(get(first_occurrence, "value"), value) then [] else [conflict_error("operation", get(value, "id"), operation_differences(get(first_occurrence, "value"), value), canonical(get(first_occurrence, "value")), get(first_occurrence, "provenance"), canonical(value), get(candidate, "provenance"))] }) : fn(OperationOccurrence) -> List<String>), occurrences) }
 let standalone_operation_occurrences: fn(List<nefor.mag.ProgramOperation>) -> List<OperationOccurrence> = |operations| => indexed_map(((|index, operation| => OperationOccurrence {value: operation, provenance: DefinitionProvenance {containing_node: "<program operations>", logical_paths: [], composition_path: [], node_occurrence: 0, entity_occurrence: index}}) : fn(Int, nefor.mag.ProgramOperation) -> OperationOccurrence), operations)
-
-let merge_node_bucket: fn(List<StoredNode>) -> StoredNode = |bucket| => {
-  let first_node = first(bucket)
-  StoredNode {id: get(first_node, "id"), role: get(first_node, "role"), actors: get(first_node, "actors"), routes: get(first_node, "routes"), messages: get(first_node, "messages"), operations: get(first_node, "operations"), nodes: unique_definitions(flat_map(((|candidate| => get(candidate, "nodes")) : fn(StoredNode) -> List<LogicalNode>), bucket)), occurrences: unique_occurrences(flat_map(((|candidate| => get(candidate, "occurrences")) : fn(StoredNode) -> List<DefinitionOccurrence>), bucket)), executions: flat_map(((|candidate| => get(candidate, "executions")) : fn(StoredNode) -> List<ExecutionOccurrence>), bucket), input: get(first_node, "input"), output: get(first_node, "output")}
-}
-
-let merge_nodes: fn(List<StoredNode>) -> List<StoredNode> = |values| => {
-  let ids = ordered_strings(map(node_id, values))
+let merge_node_bucket: fn(List<StoredNode>) -> StoredNode = |bucket| => { let first_node = first(bucket)
+  StoredNode {id: get(first_node, "id"), role: get(first_node, "role"), actors: get(first_node, "actors"), junctions: get(first_node, "junctions"), routes: get(first_node, "routes"), messages: get(first_node, "messages"), operations: get(first_node, "operations"), nodes: unique_definitions(flat_map(((|candidate| => get(candidate, "nodes")) : fn(StoredNode) -> List<LogicalNode>), bucket)), occurrences: unique_occurrences(flat_map(((|candidate| => get(candidate, "occurrences")) : fn(StoredNode) -> List<DefinitionOccurrence>), bucket)), executions: flat_map(((|candidate| => get(candidate, "executions")) : fn(StoredNode) -> List<ExecutionOccurrence>), bucket), input: get(first_node, "input"), output: get(first_node, "output")} }
+let merge_nodes: fn(List<StoredNode>) -> List<StoredNode> = |values| => { let ids = ordered_strings(map(node_id, values))
   let by_id = group_by(node_id, values)
-  map(((|id| => merge_node_bucket(__map_get_or(by_id, id, ([]: List<StoredNode>)))) : fn(String) -> StoredNode), ids)
-}
-
+  map(((|id| => merge_node_bucket(__map_get_or(by_id, id, ([]: List<StoredNode>)))) : fn(String) -> StoredNode), ids) }
 let external_routes: fn(Graph) -> List<StoredRoute> = |value| => map(((|candidate| => get(candidate, "route")) : fn(Edge) -> StoredRoute), get(value, "edges"))
-
-let external_route_occurrences: fn(List<Edge>) -> List<RouteOccurrence> = |edges| => indexed_map(((|index, edge| => {
-  let from = get(edge, "from")
+let external_route_occurrences: fn(List<Edge>) -> List<RouteOccurrence> = |edges| => indexed_map(((|index, edge| => { let from = get(edge, "from")
   let to = get(edge, "to")
   let route = get(edge, "route")
-  let paths = unique_definitions(concat(paths_for_actor(from, get(get(route, "from"), "actor")), paths_for_actor(to, get(get(route, "to"), "actor"))))
-  RouteOccurrence {value: route, provenance: DefinitionProvenance {containing_node: str(get(from, "id"), str(" -> ", get(to, "id"))), logical_paths: paths, composition_path: [], node_occurrence: index, entity_occurrence: 0}}
-}) : fn(Int, Edge) -> RouteOccurrence), edges)
-
-let node_identity_conflicts<I, O>: fn(Node<I, O>) -> List<String> = |authored| => {
-  let value = normalize_node(authored)
-  concat(execution_conflict_errors(node_execution_occurrences(value)), definition_conflict_errors(get(value, "occurrences")))
-}
-
+  let paths = unique_definitions(concat(route_logical_paths(get(from, "nodes"), route), route_logical_paths(get(to, "nodes"), route)))
+  RouteOccurrence {value: route, provenance: DefinitionProvenance {containing_node: str(get(from, "id"), str(" -> ", get(to, "id"))), logical_paths: paths, composition_path: [], node_occurrence: index, entity_occurrence: 0}} }) : fn(Int, Edge) -> RouteOccurrence), edges)
+let node_identity_conflicts<I, O>: fn(Node<I, O>) -> List<String> = |authored| => { let value = normalize_node(authored)
+  concat(execution_conflict_errors(node_execution_occurrences(value)), definition_conflict_errors(get(value, "occurrences"))) }
 let graph_projection: fn(Graph) -> GraphProjection = |value| => {
   let edges = get(value, "edges")
   let edges_by_from_node = group_by(((|candidate| => node_id(get(candidate, "from"))) : fn(Edge) -> String), edges)
@@ -494,12 +386,13 @@ let graph_projection: fn(Graph) -> GraphProjection = |value| => {
   let authored_definition_occurrences = unique_occurrences(flat_map(((|candidate| => get(candidate, "occurrences")) : fn(StoredNode) -> List<DefinitionOccurrence>), all_nodes))
   let authored_execution_occurrences = flat_map(((|candidate| => get(candidate, "executions")) : fn(StoredNode) -> List<ExecutionOccurrence>), all_nodes)
   let actor_occurrences = flat_map(actor_occurrences_for_node, occurrences)
-  let internal_route_occurrences = flat_map(route_occurrences_for_node, occurrences)
-  let all_route_occurrences = concat(internal_route_occurrences, external_route_occurrences(edges))
+  let junction_occurrences = flat_map(junction_occurrences_for_node, occurrences)
+  let all_route_occurrences = concat(flat_map(route_occurrences_for_node, occurrences), external_route_occurrences(edges))
   let operation_occurrences = flat_map(operation_occurrences_for_node, occurrences)
   let logical_occurrences = flat_map(logical_occurrences_for_node, occurrences)
   let roots = filter(((|candidate| => (=)(count(__map_get_or(edges_by_to_node, node_id(candidate), ([]: List<Edge>))), 0)) : fn(StoredNode) -> Bool), nodes)
   let actors = unique_definitions(map(((|candidate| => get(candidate, "value")) : fn(ActorOccurrence) -> Actor), actor_occurrences))
+  let junctions = unique_definitions(map(((|candidate| => get(candidate, "value")) : fn(JunctionOccurrence) -> Junction), junction_occurrences))
   let routes = unique_definitions(map(((|candidate| => get(candidate, "value")) : fn(RouteOccurrence) -> StoredRoute), all_route_occurrences))
   let authored_messages = unique_definitions(flat_map(((|candidate| => get(candidate, "messages")) : fn(StoredNode) -> List<Message>), nodes))
   let messages = unique_definitions(concat(authored_messages, bootstrap_messages(map(((|candidate| => get(candidate, "input")) : fn(StoredNode) -> StoredPort), roots), routes, authored_messages)))
@@ -507,15 +400,11 @@ let graph_projection: fn(Graph) -> GraphProjection = |value| => {
   let logical_nodes = unique_definitions(map(((|candidate| => get(candidate, "value")) : fn(LogicalNodeOccurrence) -> LogicalNode), logical_occurrences))
   let external_definition_occurrences = map(((|candidate| => DefinitionOccurrence {kind: "route", identity: get(get(candidate, "value"), "id"), fields: route_definition_fields(get(candidate, "value")), provenance: get(candidate, "provenance")}) : fn(RouteOccurrence) -> DefinitionOccurrence), external_route_occurrences(edges))
   let identity_conflicts = concat(execution_conflict_errors(authored_execution_occurrences), definition_conflict_errors(concat(authored_definition_occurrences, external_definition_occurrences)))
-  GraphProjection {edges: edges, all_nodes: all_nodes, nodes: nodes, actors: actors, routes: routes, messages: messages, graph_operations: graph_operations, logical_nodes: logical_nodes, edges_by_from_node: edges_by_from_node, edges_by_to_node: edges_by_to_node, roots: roots, outputs: filter(((|candidate| => (=)(get(candidate, "role"), "output")) : fn(StoredNode) -> Bool), nodes), identity_conflicts: identity_conflicts}
+  GraphProjection {edges: edges, all_nodes: all_nodes, nodes: nodes, actors: actors, junctions: junctions, routes: routes, messages: messages, graph_operations: graph_operations, logical_nodes: logical_nodes, edges_by_from_node: edges_by_from_node, edges_by_to_node: edges_by_to_node, roots: roots, outputs: filter(((|candidate| => (=)(get(candidate, "role"), "output")) : fn(StoredNode) -> Bool), nodes), identity_conflicts: identity_conflicts}
 }
-
-let analyze_for_lowering: fn(Graph) -> LoweringAnalysis = |value| => {
-  let projection = graph_projection(value)
+let analyze_for_lowering: fn(Graph) -> LoweringAnalysis = |value| => { let projection = graph_projection(value)
   let routes = get(projection, "routes")
-  LoweringAnalysis {actors: get(projection, "actors"), routes: routes, route_input_addresses: ordered_strings(map(((|candidate| => port_address_key(get(candidate, "to"))) : fn(StoredRoute) -> String), routes)), routes_by_input: group_by(((|candidate| => port_address_key(get(candidate, "to"))) : fn(StoredRoute) -> String), sort_by(route_id, routes)), messages: get(projection, "messages"), operations: get(projection, "graph_operations"), logical_nodes: get(projection, "logical_nodes"), outputs: get(projection, "outputs")}
-}
-
+  LoweringAnalysis {actors: get(projection, "actors"), junctions: get(projection, "junctions"), routes: routes, route_input_addresses: ordered_strings(map(((|candidate| => port_address_key(get(candidate, "to"))) : fn(StoredRoute) -> String), routes)), routes_by_input: group_by(((|candidate| => port_address_key(get(candidate, "to"))) : fn(StoredRoute) -> String), sort_by(route_id, routes)), messages: get(projection, "messages"), operations: get(projection, "graph_operations"), logical_nodes: get(projection, "logical_nodes"), outputs: get(projection, "outputs")} }
 let analyze_graph: fn(Graph) -> GraphAnalysis = |value| => {
   let lowering = analyze_for_lowering(value)
   let projection = graph_projection(value)
@@ -523,18 +412,19 @@ let analyze_graph: fn(Graph) -> GraphAnalysis = |value| => {
   let all_nodes = get(projection, "all_nodes")
   let nodes = get(projection, "nodes")
   let actors = get(projection, "actors")
+  let junctions = get(projection, "junctions")
   let routes = get(projection, "routes")
   let messages = get(projection, "messages")
   let graph_operations = get(projection, "graph_operations")
   let outputs = get(projection, "outputs")
-  GraphAnalysis {edges: edges, all_nodes: all_nodes, nodes: nodes, nodes_by_id: group_by(node_id, all_nodes), actors: actors, actors_by_id: group_by(actor_id, actors), input_actors_by_address: group_by(((|candidate| => port_address_key(get(candidate, "input"))) : fn(Actor) -> String), actors), output_ports_by_address: group_by(port_address_key, flat_map(((|candidate| => get(candidate, "outputs")) : fn(Actor) -> List<StoredPort>), actors)), routes: routes, route_input_addresses: get(lowering, "route_input_addresses"), routes_by_input: get(lowering, "routes_by_input"), diagnostic_routes_by_input: group_by(((|route| => port_address_key(get(route, "to"))) : fn(StoredRoute) -> String), routes), routes_by_output: group_by(((|candidate| => port_address_key(get(candidate, "from"))) : fn(StoredRoute) -> String), routes), routes_by_source_actor: group_by(((|candidate| => get(get(candidate, "from"), "actor")) : fn(StoredRoute) -> String), routes), messages: messages, messages_by_input: group_by(((|candidate| => port_address_key(get(candidate, "to"))) : fn(Message) -> String), messages), graph_operations: graph_operations, graph_operations_by_output: group_by(((|candidate| => port_address_key(operation_port(candidate))) : fn(nefor.mag.ProgramOperation) -> String), graph_operations), edges_by_from_node: get(projection, "edges_by_from_node"), edges_by_to_node: get(projection, "edges_by_to_node"), roots: get(projection, "roots"), outputs: outputs, terminal_outputs_by_full_port: group_by(((|candidate| => full_port_key(get(candidate, "output"))) : fn(StoredNode) -> String), outputs), identity_conflicts: get(projection, "identity_conflicts")}
+  let input_ports = concat(map(((|candidate| => get(candidate, "input")) : fn(Actor) -> StoredPort), actors), flat_map(((|candidate| => get(candidate, "inputs")) : fn(Junction) -> List<StoredPort>), junctions))
+  let output_ports = concat(flat_map(((|candidate| => get(candidate, "outputs")) : fn(Actor) -> List<StoredPort>), actors), flat_map(((|candidate| => get(candidate, "outputs")) : fn(Junction) -> List<StoredPort>), junctions))
+  GraphAnalysis {edges: edges, all_nodes: all_nodes, nodes: nodes, nodes_by_id: group_by(node_id, all_nodes), actors: actors, actors_by_id: group_by(actor_id, actors), junctions: junctions, junctions_by_id: group_by(((|candidate| => get(candidate, "id")) : fn(Junction) -> String), junctions), input_ports_by_address: group_by(port_address_key, input_ports), output_ports_by_address: group_by(port_address_key, output_ports), routes: routes, route_input_addresses: get(lowering, "route_input_addresses"), routes_by_input: get(lowering, "routes_by_input"), diagnostic_routes_by_input: group_by(((|route| => port_address_key(get(route, "to"))) : fn(StoredRoute) -> String), routes), routes_by_output: group_by(((|candidate| => port_address_key(get(candidate, "from"))) : fn(StoredRoute) -> String), routes), routes_by_source_actor: group_by(((|candidate| => endpoint_id(get(get(candidate, "from"), "endpoint"))) : fn(StoredRoute) -> String), routes), messages: messages, messages_by_input: group_by(((|candidate| => port_address_key(get(candidate, "to"))) : fn(Message) -> String), messages), graph_operations: graph_operations, graph_operations_by_output: group_by(((|candidate| => port_address_key(operation_port(candidate))) : fn(nefor.mag.ProgramOperation) -> String), graph_operations), edges_by_from_node: get(projection, "edges_by_from_node"), edges_by_to_node: get(projection, "edges_by_to_node"), roots: get(projection, "roots"), outputs: outputs, terminal_outputs_by_full_port: group_by(((|candidate| => full_port_key(get(candidate, "output"))) : fn(StoredNode) -> String), outputs), identity_conflicts: get(projection, "identity_conflicts")}
 }
-
 let graph_nodes: fn(Graph) -> List<StoredNode> = |value| => get(graph_projection(value), "nodes")
-
 let graph_routes: fn(Graph) -> List<StoredRoute> = |value| => get(graph_projection(value), "routes")
-
 let graph_actors: fn(Graph) -> List<Actor> = |value| => get(graph_projection(value), "actors")
+let graph_junctions: fn(Graph) -> List<Junction> = |value| => get(graph_projection(value), "junctions")
 
 // Root activation is reserved for the exact Unit boundary. A sum or product
 // that merely contains Unit still requires an explicit incoming value.
@@ -544,7 +434,7 @@ let input_needs_bootstrap: fn(Map<String, List<StoredRoute>>, Map<String, List<M
 
 let bootstrap_message: fn(StoredPort) -> Message = |input| => {
   // Activation carries exact Unit evidence for the Unit-accepting boundary.
-  let unit_port = store_port(port(get(input, "actor"), type_tag<Unit>(), get(input, "wire")))
+  let unit_port = nefor.mag.StoredPort {endpoint: get(input, "endpoint"), `type`: type_evidence(type_tag<Unit>()), type_id: type_id(type_evidence(type_tag<Unit>())), wire: get(input, "wire")}
   stored_message(unit_port, MessageContent<Unit> {kind: get(input, "wire"), value: nil})
 }
 
@@ -626,42 +516,26 @@ let source_value_valid: fn(Actor, StoredPort) -> Bool = |value, output| => packe
 
 let one_type_argument: fn(Actor, TypeDescriptor) -> Bool = |value, expected| => serialized_equal(get(value, "type_arguments"), [expected])
 
-let concrete_source: fn(StoredNode) -> Bool = |candidate| => {
+let actor_endpoint_matches: fn(StoredPort, String) -> Bool = |value, id| => if endpoint_is_actor(get(value, "endpoint")) then (=)(endpoint_id(get(value, "endpoint")), id) else false
+let concrete_source_actor: fn(StoredNode, Actor) -> Bool = |candidate, boundary| => {
   let id = get(candidate, "id")
-  let actors = get(candidate, "actors")
   let input = get(candidate, "input")
   let output = get(candidate, "output")
-  if (=)(count(actors), 1) then (((| | => {
-    let boundary = first(actors)
-    if (=)(get(boundary, "id"), id) then if (=)(get(boundary, "factory"), source_factory) then if serialized_equal(input, StoredPort {actor: id, `type`: type_evidence(type_tag<Unit>()), type_id: type_id(type_evidence(type_tag<Unit>())), wire: "mag.Unit"}) then if (=)(get(output, "actor"), id) then if (=)(get(output, "wire"), "nefor.graph.Value") then if serialized_equal(get(boundary, "input"), input) then if one_type_argument(boundary, get(output, "type")) then if one_port(get(boundary, "outputs"), output) then if (=)(count(get(candidate, "routes")), 0) then if (=)(count(get(candidate, "messages")), 0) then if source_params_valid(get(boundary, "params")) then source_value_valid(boundary, output) else false else false else false else false else false else false else false else false else false else false else false
-  }) : fn() -> Bool))() else false
+  if (=)(get(boundary, "id"), id) then if (=)(get(boundary, "factory"), source_factory) then if actor_endpoint_matches(input, id) then if actor_endpoint_matches(output, id) then if serialized_equal(get(boundary, "input"), input) then if one_type_argument(boundary, get(output, "type")) then if one_port(get(boundary, "outputs"), output) then if (=)(count(get(candidate, "junctions")), 0) then if (=)(count(get(candidate, "routes")), 0) then if (=)(count(get(candidate, "messages")), 0) then if source_params_valid(get(boundary, "params")) then source_value_valid(boundary, output) else false else false else false else false else false else false else false else false else false else false else false
 }
-
+let concrete_source: fn(StoredNode) -> Bool = |candidate| => if (=)(count(get(candidate, "actors")), 1) then concrete_source_actor(candidate, first(get(candidate, "actors"))) else false
+let composite_source_actor: fn(StoredNode, Actor) -> Bool = |candidate, boundary| => {
+  let outputs = get(boundary, "outputs")
+  if (=)(count(outputs), 1) then if one_type_argument(boundary, get(first(outputs), "type")) then if (=)(count(get(candidate, "messages")), 0) then if source_params_valid(get(boundary, "params")) then source_value_valid(boundary, first(outputs)) else false else false else false else false
+}
 let composite_source: fn(StoredNode) -> Bool = |candidate| => {
   let input = get(candidate, "input")
   let matching = filter(((|actor| => if (=)(get(actor, "factory"), source_factory) then serialized_equal(get(actor, "input"), input) else false) : fn(Actor) -> Bool), get(candidate, "actors"))
-  if (=)(count(matching), 1) then (((| | => {
-    let boundary = first(matching)
-    let outputs = get(boundary, "outputs")
-    if (=)(count(outputs), 1) then (((| | => {
-      let source_output = first(outputs)
-      if one_type_argument(boundary, get(source_output, "type")) then if (=)(count(get(candidate, "messages")), 0) then if source_params_valid(get(boundary, "params")) then source_value_valid(boundary, source_output) else false else false else false
-    }) : fn() -> Bool))() else false
-  }) : fn() -> Bool))() else false
+  if (=)(count(matching), 1) then composite_source_actor(candidate, first(matching)) else false
 }
-
-let concrete_output: fn(StoredNode) -> Bool = |candidate| => {
-  let id = get(candidate, "id")
-  let actors = get(candidate, "actors")
-  let input = get(candidate, "input")
-  let output = get(candidate, "output")
-  if (=)(count(actors), 1) then (((| | => {
-    let boundary = first(actors)
-    if (=)(get(boundary, "id"), id) then if (=)(get(boundary, "factory"), output_factory) then if (=)(get(input, "actor"), id) then if (=)(get(output, "actor"), id) then if (=)(get(input, "wire"), "nefor.graph.Value") then if (=)(get(output, "wire"), "nefor.graph.Value") then if (=)(canonical(type_id(get(input, "type"))), canonical(type_id(get(output, "type")))) then if serialized_equal(get(boundary, "input"), input) then if one_type_argument(boundary, get(input, "type")) then if one_port(get(boundary, "outputs"), output) then if empty_packed_map(get(boundary, "params")) then if (=)(count(get(candidate, "routes")), 0) then (=)(count(get(candidate, "messages")), 0) else false else false else false else false else false else false else false else false else false else false else false else false
-  }) : fn() -> Bool))() else false
-}
-
-let boundary_valid: fn(StoredNode) -> Bool = |candidate| => if role(candidate, "source") then if concrete_source(candidate) then true else composite_source(candidate) else if role(candidate, "output") then concrete_output(candidate) else if role(candidate, "ordinary") then (=)(count(get(candidate, "messages")), 0) else false
+let pass_boundary_junction: fn(StoredNode, Junction) -> Bool = |candidate, boundary| => if (=)(get(boundary, "id"), get(candidate, "id")) then if serialized_equal(get(boundary, "operation"), pass_operation) then if one_port(get(boundary, "inputs"), get(candidate, "input")) then if one_port(get(boundary, "outputs"), get(candidate, "output")) then if (=)(count(get(candidate, "routes")), 0) then (=)(count(get(candidate, "messages")), 0) else false else false else false else false else false
+let pass_boundary: fn(StoredNode) -> Bool = |candidate| => if (=)(count(get(candidate, "actors")), 0) then if (=)(count(get(candidate, "junctions")), 1) then pass_boundary_junction(candidate, first(get(candidate, "junctions"))) else false else false
+let boundary_valid: fn(StoredNode) -> Bool = |candidate| => if role(candidate, "source") then if concrete_source(candidate) then true else composite_source(candidate) else if role(candidate, "output") then pass_boundary(candidate) else if role(candidate, "ordinary") then (=)(count(get(candidate, "messages")), 0) else false
 
 let actor_output_wires: fn(Actor) -> List<String> = |value| => map(((|output| => get(output, "wire")) : fn(StoredPort) -> String), get(value, "outputs"))
 
@@ -681,6 +555,40 @@ let actor_contract_errors: fn(Map<String, List<FactoryContract>>, Actor) -> List
 }
 
 let actor_ids_valid: fn(GraphAnalysis) -> Bool = |analysis| => (=)(count(filter(((|candidate| => not((=)(indexed_count(get(analysis, "actors_by_id"), actor_id(candidate)), 1))) : fn(Actor) -> Bool), get(analysis, "actors"))), 0)
+let junction_id: fn(Junction) -> String = |value| => get(value, "id")
+let junction_ids_valid: fn(GraphAnalysis) -> Bool = |analysis| => (=)(count(filter(((|candidate| => not((=)(indexed_count(get(analysis, "junctions_by_id"), junction_id(candidate)), 1))) : fn(Junction) -> Bool), get(analysis, "junctions"))), 0)
+let port_evidence_valid: fn(StoredPort) -> Bool = |value| => serialized_equal(get(value, "type_id"), type_id(get(value, "type")))
+let actor_port_owned: fn(String, StoredPort) -> Bool = |id, value| => if endpoint_is_actor(get(value, "endpoint")) then if (=)(endpoint_id(get(value, "endpoint")), id) then port_evidence_valid(value) else false else false
+let actor_ports_owned: fn(Actor) -> Bool = |value| => if actor_port_owned(get(value, "id"), get(value, "input")) then (=)(count(filter(((|candidate| => not(actor_port_owned(get(value, "id"), candidate))) : fn(StoredPort) -> Bool), get(value, "outputs"))), 0) else false
+let junction_port_owned: fn(String, StoredPort) -> Bool = |id, value| => if endpoint_is_actor(get(value, "endpoint")) then false else if (=)(endpoint_id(get(value, "endpoint")), id) then port_evidence_valid(value) else false
+let junction_ports_owned: fn(Junction) -> Bool = |value| => (=)(count(filter(((|candidate| => not(junction_port_owned(get(value, "id"), candidate))) : fn(StoredPort) -> Bool), concat(get(value, "inputs"), get(value, "outputs")))), 0)
+let port_descriptor_keys: fn(List<StoredPort>) -> List<String> = |ports| => map(((|port| => canonical(get(port, "type"))) : fn(StoredPort) -> String), ports)
+let branch_shape_keys: fn(List<nefor.mag.AdtBranch>) -> List<String> = |branches| => map(((|branch| => canonical([get(branch, "wire"), canonical(get(branch, "payload"))])) : fn(nefor.mag.AdtBranch) -> String), branches)
+let port_shape_keys: fn(List<StoredPort>) -> List<String> = |ports| => map(((|port| => canonical([get(port, "wire"), canonical(get(port, "type"))])) : fn(StoredPort) -> String), ports)
+let one_input_one_output: fn(List<StoredPort>, List<StoredPort>) -> Bool = |input_ports, output_ports| => if (=)(count(input_ports), 1) then (=)(count(output_ports), 1) else false
+let list_descriptor_for: fn(TypeDescriptor, TypeDescriptor) -> Bool = |candidate, item| => if (=)(type_constructor(candidate), type_constructor(type_evidence(type_tag<List<Unit>>()))) then serialized_equal(type_components(candidate), [item]) else false
+let ordered_slot_wires: fn(List<StoredPort>) -> Bool = |ports| => serialized_equal(map(((|port| => get(port, "wire")) : fn(StoredPort) -> String), ports), indexed_map(((|index, port| => str("slot:", str(index))) : fn(Int, StoredPort) -> String), ports))
+let constructor_payload_matches: fn(TypeDescriptor, String, TypeDescriptor) -> Bool = |owner, constructor, payload| => serialized_equal(adt_constructor_payload(owner, constructor), payload)
+let adt_branches_valid: fn(TypeDescriptor, List<nefor.mag.AdtBranch>) -> Bool = |owner, branches| => {
+  let constructors = map(((|branch| => get(branch, "constructor")) : fn(nefor.mag.AdtBranch) -> String), branches)
+  if (=)(count(unique_definitions(constructors)), count(constructors)) then (=)(count(filter(((|branch| => not(constructor_payload_matches(owner, get(branch, "constructor"), get(branch, "payload")))) : fn(nefor.mag.AdtBranch) -> Bool), branches)), 0) else false
+}
+let junction_operation_shape_valid: fn(Junction) -> Bool = |value| => {
+  let junction_inputs = get(value, "inputs")
+  let junction_outputs = get(value, "outputs")
+  match get(value, "operation") {
+    case Pass(unit) => if one_input_one_output(junction_inputs, junction_outputs) then serialized_equal(get(first(junction_inputs), "type"), get(first(junction_outputs), "type")) else false,
+    case Unit(unit) => if one_input_one_output(junction_inputs, junction_outputs) then serialized_equal(get(first(junction_outputs), "type"), type_evidence(type_tag<Unit>())) else false,
+    case ProductSplit(unit) => if (=)(count(junction_inputs), 1) then serialized_equal(type_components(get(first(junction_inputs), "type")), map(((|port| => get(port, "type")) : fn(StoredPort) -> TypeDescriptor), junction_outputs)) else false,
+    case ProductFirst(unit) => if one_input_one_output(junction_inputs, junction_outputs) then if not((=)(count(type_components(get(first(junction_inputs), "type"))), 0)) then serialized_equal(first(type_components(get(first(junction_inputs), "type"))), get(first(junction_outputs), "type")) else false else false,
+    case ProductJoin(unit) => if (=)(count(junction_inputs), 2) then if ordered_slot_wires(junction_inputs) then if (=)(count(junction_outputs), 1) then serialized_equal(type_components(get(first(junction_outputs), "type")), map(((|port| => get(port, "type")) : fn(StoredPort) -> TypeDescriptor), junction_inputs)) else false else false else false,
+    case Collect(unit) => if not((=)(count(junction_inputs), 0)) then if ordered_slot_wires(junction_inputs) then if (=)(count(junction_outputs), 1) then if (=)(count(unique_definitions(port_descriptor_keys(junction_inputs))), 1) then list_descriptor_for(get(first(junction_outputs), "type"), get(first(junction_inputs), "type")) else false else false else false else false,
+    case AdtPack(spec) => if one_input_one_output(junction_inputs, junction_outputs) then if not((=)(get(spec, "constructor"), "")) then if constructor_payload_matches(get(spec, "owner"), get(spec, "constructor"), get(spec, "payload")) then if serialized_equal(get(first(junction_inputs), "type"), get(spec, "payload")) then serialized_equal(get(first(junction_outputs), "type"), get(spec, "owner")) else false else false else false else false,
+    case AdtUnpack(spec) => if (=)(count(junction_inputs), 1) then if serialized_equal(get(first(junction_inputs), "type"), get(spec, "owner")) then if not((=)(count(get(spec, "branches")), 0)) then if adt_branches_valid(get(spec, "owner"), get(spec, "branches")) then serialized_equal(port_shape_keys(junction_outputs), branch_shape_keys(get(spec, "branches"))) else false else false else false else false,
+  }
+}
+let junctions_valid: fn(GraphAnalysis) -> Bool = |analysis| => (=)(count(filter(((|candidate| => if junction_ports_owned(candidate) then not(junction_operation_shape_valid(candidate)) else true) : fn(Junction) -> Bool), get(analysis, "junctions"))), 0)
+let actor_ports_valid: fn(GraphAnalysis) -> Bool = |analysis| => (=)(count(filter(((|candidate| => not(actor_ports_owned(candidate))) : fn(Actor) -> Bool), get(analysis, "actors"))), 0)
 
 let same_port_address: fn(StoredPort, StoredPort) -> Bool = |left, right| => (=)(port_address_key(left), port_address_key(right))
 
@@ -690,11 +598,11 @@ let port_is_output: fn(GraphAnalysis, StoredPort) -> Bool = |analysis, value| =>
 }
 
 let port_is_input: fn(GraphAnalysis, StoredPort) -> Bool = |analysis, value| => {
-  let candidates = __map_get_or(get(analysis, "input_actors_by_address"), port_address_key(value), ([]: List<Actor>))
-  (=)(count(filter(((|candidate| => descriptor_accepts(get(get(candidate, "input"), "type"), get(value, "type"))) : fn(Actor) -> Bool), candidates)), 1)
+  let candidates = __map_get_or(get(analysis, "input_ports_by_address"), port_address_key(value), ([]: List<StoredPort>))
+  (=)(count(filter(((|candidate| => descriptor_accepts(get(candidate, "type"), get(value, "type"))) : fn(StoredPort) -> Bool), candidates)), 1)
 }
 
-let port_address: fn(StoredPort) -> String = |value| => str(get(value, "actor"), str(".", get(value, "wire")))
+let port_address: fn(StoredPort) -> String = |value| => str(endpoint_id(get(value, "endpoint")), str(".", get(value, "wire")))
 
 let describe_route_source: fn(StoredRoute) -> String = |route| => {
   let source = get(route, "from")
@@ -708,7 +616,7 @@ let describe_route_handler: fn(StoredRoute) -> String = |route| => {
   canonical(RouteHandlerDescription {kind: "route", to: port_address(target), `type`: get(target, "type")})
 }
 
-let describe_operation_handler: fn(nefor.mag.ProgramOperation) -> String = |candidate| => canonical(OperationDescription {kind: "operation", id: get(candidate, "id"), `type`: get(candidate, "trigger_type")})
+let describe_operation_handler: fn(nefor.mag.ProgramOperation) -> String = |candidate| => canonical(OperationDescription {kind: "operation", id: get(candidate, "id"), `type`: get(operation_port(candidate), "type")})
 
 let actor_input_sources: fn(GraphAnalysis, Actor) -> List<String> = |analysis, candidate| => {
   let key = port_address_key(get(candidate, "input"))
@@ -766,7 +674,7 @@ let validate_reachable_stage: fn(Graph, GraphAnalysis, List<FactoryContract>, St
 
 let validate_output_coverage_stage: fn(Graph, GraphAnalysis, Map<String, List<nefor.mag.ProgramOperation>>, List<FactoryContract>, StoredNode) -> core.validated.Validated<String, Graph> = |value, analysis, operations_by_output, contracts, result| => {
   let bad_output_coverage = flat_map(((|candidate| => filter(((|output| => not(actor_output_coverage_valid(analysis, operations_by_output, output))) : fn(StoredPort) -> Bool), get(candidate, "outputs"))) : fn(Actor) -> List<StoredPort>), get(analysis, "actors"))
-  let errors = map(((|output| => str("output coverage failed: ", canonical(OutputCoverageDescription {actor: get(output, "actor"), output: port_address(output), output_type: get(output, "type"), available_handlers: output_handlers(analysis, operations_by_output, output), reason: "coverage is incomplete; every output alternative needs an ordinary route, operation subscription, or terminal output path"}))) : fn(StoredPort) -> String), bad_output_coverage)
+  let errors = map(((|output| => str("output coverage failed: ", canonical(OutputCoverageDescription {actor: endpoint_id(get(output, "endpoint")), output: port_address(output), output_type: get(output, "type"), available_handlers: output_handlers(analysis, operations_by_output, output), reason: "coverage is incomplete; every output alternative needs an ordinary route, operation subscription, or terminal output path"}))) : fn(StoredPort) -> String), bad_output_coverage)
   if (=)(count(bad_output_coverage), 0) then validate_reachable_stage(value, analysis, contracts, result) else core.validated.invalid(errors)
 }
 
@@ -801,7 +709,9 @@ let operation_id: fn(nefor.mag.ProgramOperation) -> String = |value| => get(valu
 
 let operation_valid: fn(GraphAnalysis, nefor.mag.ProgramOperation) -> Bool = |analysis, value| => {
   let on = operation_port(value)
-  if (=)(get(value, "id"), "") then false else if not((=)(canonical(get(value, "trigger_type_id")), canonical(get(on, "type_id")))) then false else if (=)(indexed_count(get(analysis, "output_ports_by_address"), port_address_key(on)), 0) then false else not(terminal_output(analysis, on))
+  let declared = __map_get_or(get(analysis, "output_ports_by_address"), port_address_key(on), ([]: List<StoredPort>))
+  let exact = filter(((|output| => if serialized_equal(get(output, "type_id"), get(on, "type_id")) then serialized_equal(get(output, "type"), get(on, "type")) else false) : fn(StoredPort) -> Bool), declared)
+  if (=)(get(value, "id"), "") then false else if (=)(count(exact), 0) then false else not(terminal_output(analysis, on))
 }
 
 let validate_unique_output_stage: fn(Graph, GraphAnalysis, List<nefor.mag.ProgramOperation>, List<FactoryContract>) -> core.validated.Validated<String, Graph> = |value, analysis, operations, contracts| => {
@@ -816,7 +726,7 @@ let validate_unique_output_stage: fn(Graph, GraphAnalysis, List<nefor.mag.Progra
 
 let validate_with_operations: fn(Graph, List<nefor.mag.ProgramOperation>, List<FactoryContract>) -> core.validated.Validated<String, Graph> = |value, operations, contracts| => {
   let analysis = analyze_graph(value)
-  if (=)(count(get(analysis, "edges")), 0) then core.validated.invalid(["graph needs at least one edge"]) else if not((=)(count(get(analysis, "identity_conflicts")), 0)) then core.validated.invalid(get(analysis, "identity_conflicts")) else if not(actor_ids_valid(analysis)) then core.validated.invalid(["runtime actor ids must be unique across graph nodes"]) else if not(logical_paths_valid(value)) then core.validated.invalid(["logical node paths must be non-empty and unique"]) else if not(logical_members_valid(value)) then core.validated.invalid(["every runtime actor must belong to exactly one logical node"]) else if not((=)(count(get(analysis, "outputs")), 1)) then core.validated.invalid(["graph needs exactly one concrete output node"]) else validate_unique_output_stage(value, analysis, operations, contracts)
+  if (=)(count(get(analysis, "edges")), 0) then core.validated.invalid(["graph needs at least one edge"]) else if not((=)(count(get(analysis, "identity_conflicts")), 0)) then core.validated.invalid(get(analysis, "identity_conflicts")) else if not(actor_ids_valid(analysis)) then core.validated.invalid(["runtime actor ids must be unique across graph nodes"]) else if not(junction_ids_valid(analysis)) then core.validated.invalid(["junction ids must be unique across graph nodes"]) else if not(actor_ports_valid(analysis)) then core.validated.invalid(["actor ports must use their owning actor endpoint"]) else if not(junctions_valid(analysis)) then core.validated.invalid(["junction ports and operation signatures must be valid"]) else if not(logical_paths_valid(value)) then core.validated.invalid(["logical node paths must be non-empty and unique"]) else if not(logical_members_valid(value)) then core.validated.invalid(["every runtime actor must belong to exactly one logical node"]) else if not((=)(count(get(analysis, "outputs")), 1)) then core.validated.invalid(["graph needs exactly one concrete output node"]) else validate_unique_output_stage(value, analysis, operations, contracts)
 }
 
 let validate: fn(Graph, List<FactoryContract>) -> core.validated.Validated<String, Graph> = |value, contracts| => validate_with_operations(value, ([]: List<nefor.mag.ProgramOperation>), contracts)
@@ -836,7 +746,8 @@ let descriptor_assignment_index: fn(List<StoredRoute>, List<String>, Map<String,
     core.map.insert(out, descriptor_key, group_by(assigned_route_id, zip_route_assignments(routes, positions)))
   }) : fn(Map<String, Map<String, List<AssignedRoute>>>, String) -> Map<String, Map<String, List<AssignedRoute>>>), (core.map.empty<String, _>(): Map<String, Map<String, List<AssignedRoute>>>), descriptor_keys)
 
-let assigned_input_bucket: fn(List<StoredRoute>) -> List<AssignedRoute> = |routes| => if (=)(count(routes), 0) then ([]: List<AssignedRoute>) else (((| | => {
+let assigned_route_without_product: fn(StoredRoute) -> AssignedRoute = |route| => AssignedRoute {route: route, product_position: first([-1])}
+let assigned_input_bucket: fn(List<StoredRoute>) -> List<AssignedRoute> = |routes| => if (=)(count(routes), 0) then ([]: List<AssignedRoute>) else if not(endpoint_is_actor(get(get(first(routes), "to"), "endpoint"))) then map(assigned_route_without_product, routes) else (((| | => {
   let sources = map(((|candidate| => get(get(candidate, "from"), "type")) : fn(StoredRoute) -> TypeDescriptor), routes)
   let routes_by_descriptor = group_by(route_destination_descriptor_key, routes)
   let assignments_by_descriptor = descriptor_assignment_index(routes, ordered_strings(map(route_destination_descriptor_key, routes)), routes_by_descriptor, sources)
@@ -866,79 +777,46 @@ let assigned_routes: fn(List<StoredRoute>) -> List<AssignedRoute> = |routes| => 
   assigned_routes_from_indexes(routes, route_input_addresses, routes_by_input)
 }
 
-let assigned_route_source_actor: fn(AssignedRoute) -> String = |candidate| => get(get(get(candidate, "route"), "from"), "actor")
-
-let assigned_route_source_wire: fn(AssignedRoute) -> String = |candidate| => get(get(get(candidate, "route"), "from"), "wire")
-
-let lower_destination: fn(AssignedRoute) -> LowerDestination = |assigned| => {
+let no_product_position = first([-1])
+let assigned_route_source_endpoint: fn(AssignedRoute) -> Endpoint = |candidate| => get(get(get(candidate, "route"), "from"), "endpoint")
+let assigned_route_source_actor: fn(AssignedRoute) -> String = |candidate| => endpoint_id(assigned_route_source_endpoint(candidate))
+let lower_route: fn(AssignedRoute) -> LowerRoute = |assigned| => {
   let candidate = get(assigned, "route")
-  let from = get(candidate, "from")
-  let to = get(candidate, "to")
-  LowerDestination {actor: get(to, "actor"), wire: get(to, "wire"), edge_id: get(candidate, "id"), source_type_id: get(from, "type_id"), destination_type_id: get(to, "type_id"), product_position: get(assigned, "product_position")}
+  let destination = get(candidate, "to")
+  let position = if endpoint_is_actor(get(destination, "endpoint")) then get(assigned, "product_position") else no_product_position
+  LowerRoute {id: get(candidate, "id"), from: get(candidate, "from"), to: destination, product_position: position}
 }
-
-let actor_routes: fn(List<AssignedRoute>) -> Map<String, List<LowerDestination>> = |routes| => {
-  let routes_by_wire = group_by(assigned_route_source_wire, routes)
-  fold(((|out, wire| => core.map.insert(out, wire, map(lower_destination, __map_get_or(routes_by_wire, wire, ([]: List<AssignedRoute>))))) : fn(Map<String, List<LowerDestination>>, String) -> Map<String, List<LowerDestination>>), (core.map.empty<String, _>(): Map<String, List<LowerDestination>>), ordered_strings(map(assigned_route_source_wire, routes)))
-}
-
-let lower_actor_with_routes: fn(List<AssignedRoute>, Actor) -> LowerActor = |routes, value| => LowerActor {id: get(value, "id"), factory: get(value, "factory"), type_arguments: get(value, "type_arguments"), input: get(value, "input"), outputs: get(value, "outputs"), params: get(value, "params"), routes: actor_routes(routes)}
-
-let lower_message: fn(Message) -> LowerMessage = |value| => {
-  let to = get(value, "to")
-  LowerMessage {to: get(to, "actor"), semantic_type: get(value, "semantic_type"), semantic_type_id: get(value, "semantic_type_id"), content: get(value, "content")}
-}
-
+let lower_actor: fn(Actor) -> LowerActor = |value| => LowerActor {id: get(value, "id"), factory: get(value, "factory"), type_arguments: get(value, "type_arguments"), input: get(value, "input"), outputs: get(value, "outputs"), params: get(value, "params")}
+let lower_message: fn(Message) -> LowerMessage = |value| => LowerMessage {to: get(value, "to"), semantic_type: get(value, "semantic_type"), semantic_type_id: get(value, "semantic_type_id"), content: get(value, "content")}
 let result_boundary: fn(LoweringAnalysis) -> ResultBoundary = |analysis| => ResultBoundary {from: get(first(get(analysis, "outputs")), "output")}
-
 let actor_descriptors: fn(List<Actor>) -> List<TypeDescriptor> = |actors| => flat_map(((|candidate| => concat([get(get(candidate, "input"), "type")], map(((|output| => get(output, "type")) : fn(StoredPort) -> TypeDescriptor), get(candidate, "outputs")))) : fn(Actor) -> List<TypeDescriptor>), actors)
-
+let junction_descriptors: fn(List<Junction>) -> List<TypeDescriptor> = |junctions| => flat_map(((|candidate| => map(((|port| => get(port, "type")) : fn(StoredPort) -> TypeDescriptor), concat(get(candidate, "inputs"), get(candidate, "outputs")))) : fn(Junction) -> List<TypeDescriptor>), junctions)
 let route_descriptors: fn(List<StoredRoute>) -> List<TypeDescriptor> = |routes| => flat_map(((|candidate| => [get(get(candidate, "from"), "type"), get(get(candidate, "to"), "type")]) : fn(StoredRoute) -> List<TypeDescriptor>), routes)
-
 let message_descriptors: fn(List<Message>) -> List<TypeDescriptor> = |messages| => map(((|candidate| => get(candidate, "semantic_type")) : fn(Message) -> TypeDescriptor), messages)
-
 let operation_descriptors: fn(List<nefor.mag.ProgramOperation>) -> List<TypeDescriptor> = |operations| => map(((|candidate| => get(operation_port(candidate), "type")) : fn(nefor.mag.ProgramOperation) -> TypeDescriptor), operations)
-
-let program_descriptors: fn(LoweringAnalysis, List<nefor.mag.ProgramOperation>) -> List<TypeDescriptor> = |analysis, operations| => concat(concat(concat(actor_descriptors(get(analysis, "actors")), route_descriptors(get(analysis, "routes"))), concat(message_descriptors(get(analysis, "messages")), operation_descriptors(operations))), [get(get(first(get(analysis, "outputs")), "output"), "type")])
-
-let delta_descriptors: fn(Delta) -> List<TypeDescriptor> = |value| => concat(concat(actor_descriptors(get(value, "actors")), route_descriptors(get(value, "routes"))), message_descriptors(get(value, "messages")))
-
+let program_descriptors: fn(LoweringAnalysis, List<nefor.mag.ProgramOperation>) -> List<TypeDescriptor> = |analysis, operations| => concat(actor_descriptors(get(analysis, "actors")), concat(junction_descriptors(get(analysis, "junctions")), concat(route_descriptors(get(analysis, "routes")), concat(message_descriptors(get(analysis, "messages")), concat(operation_descriptors(operations), [get(get(first(get(analysis, "outputs")), "output"), "type")])))))
+let delta_descriptors: fn(Delta) -> List<TypeDescriptor> = |value| => concat(actor_descriptors(get(value, "actors")), concat(junction_descriptors(get(value, "junctions")), concat(route_descriptors(get(value, "routes")), message_descriptors(get(value, "messages")))))
 let lower_program: fn(Graph) -> Modification = |topology| => {
   let projection = graph_projection(topology)
   let conflicts = get(projection, "identity_conflicts")
   let analysis = if (=)(count(conflicts), 0) then analyze_for_lowering(topology) else fail(conflicts)
-  let assigned = assigned_lowering_routes(analysis)
-  let assigned_by_source = group_by(assigned_route_source_actor, assigned)
   let operations = get(analysis, "operations")
-  Modification {actors: map(((|candidate| => lower_actor_with_routes(__map_get_or(assigned_by_source, actor_id(candidate), ([]: List<AssignedRoute>)), candidate)) : fn(Actor) -> LowerActor), get(analysis, "actors")), messages: map(lower_message, get(analysis, "messages")), kills: ([]: List<String>), types: descriptor_table(program_descriptors(analysis, operations)), nodes: get(analysis, "logical_nodes"), result: result_boundary(analysis)}
+  Modification {actors: map(lower_actor, get(analysis, "actors")), junctions: get(analysis, "junctions"), routes: map(lower_route, assigned_lowering_routes(analysis)), messages: map(lower_message, get(analysis, "messages")), kills: [], types: descriptor_table(program_descriptors(analysis, operations)), nodes: get(analysis, "logical_nodes"), result: result_boundary(analysis)}
 }
-
 let lower: fn(Graph) -> Modification = |value| => lower_program(value)
-
-// Deltas are operational artifacts, not graph values.
-let delta: fn(List<Actor>, List<StoredRoute>, List<Message>, List<String>) -> Delta = |actors, routes, messages, kills| => Delta {actors: actors, routes: routes, messages: messages, nodes: map(((|candidate| => logical_node([get(candidate, "id")], [get(candidate, "id")])) : fn(Actor) -> LogicalNode), actors), kills: kills}
-
-let node_delta<I, O>: fn(Node<I, O>) -> Delta = |value| => Delta {actors: get(value, "actors"), routes: get(value, "routes"), messages: get(value, "messages"), nodes: get(value, "nodes"), kills: []}
-
-let merge_delta: fn(Delta, Delta) -> Delta = |left, right| => Delta {actors: concat(get(left, "actors"), get(right, "actors")), routes: concat(get(left, "routes"), get(right, "routes")), messages: concat(get(left, "messages"), get(right, "messages")), nodes: concat(get(left, "nodes"), get(right, "nodes")), kills: concat(get(left, "kills"), get(right, "kills"))}
-
-let delta_edge<I, T, O>: fn(Delta, Node<I, T>, Node<T, O>) -> Delta = |change, from, to| => Delta {actors: get(change, "actors"), routes: concat(get(change, "routes"), [stored_route(get(from, "output"), get(to, "input"))]), messages: get(change, "messages"), nodes: get(change, "nodes"), kills: get(change, "kills")}
-
-let delta_route<A, B>: fn(Delta, Port<A>, Port<B>) -> Delta = |change, from, to| => Delta {actors: get(change, "actors"), routes: concat(get(change, "routes"), [stored_route(from, to)]), messages: get(change, "messages"), nodes: get(change, "nodes"), kills: get(change, "kills")}
-
-let delta_message<T>: fn(Delta, Port<T>, T) -> Delta = |change, to, value| => Delta {actors: get(change, "actors"), routes: get(change, "routes"), messages: concat(get(change, "messages"), [typed_message(to, value)]), nodes: get(change, "nodes"), kills: get(change, "kills")}
-
-let delta_message_front<T>: fn(Delta, Port<T>, T) -> Delta = |change, to, value| => Delta {actors: get(change, "actors"), routes: get(change, "routes"), messages: concat([typed_message(to, value)], get(change, "messages")), nodes: get(change, "nodes"), kills: get(change, "kills")}
-
+let delta_with_junctions: fn(List<Actor>, List<Junction>, List<StoredRoute>, List<Message>, List<String>) -> Delta = |actors, junctions, routes, messages, kills| => Delta {actors: actors, junctions: junctions, routes: routes, messages: messages, nodes: map(((|candidate| => logical_node([get(candidate, "id")], [get(candidate, "id")])) : fn(Actor) -> LogicalNode), actors), kills: kills}
+let delta: fn(List<Actor>, List<StoredRoute>, List<Message>, List<String>) -> Delta = |actors, routes, messages, kills| => delta_with_junctions(actors, [], routes, messages, kills)
+let node_delta<I, O>: fn(Node<I, O>) -> Delta = |value| => Delta {actors: get(value, "actors"), junctions: get(value, "junctions"), routes: get(value, "routes"), messages: get(value, "messages"), nodes: get(value, "nodes"), kills: []}
+let merge_delta: fn(Delta, Delta) -> Delta = |left, right| => Delta {actors: concat(get(left, "actors"), get(right, "actors")), junctions: concat(get(left, "junctions"), get(right, "junctions")), routes: concat(get(left, "routes"), get(right, "routes")), messages: concat(get(left, "messages"), get(right, "messages")), nodes: concat(get(left, "nodes"), get(right, "nodes")), kills: concat(get(left, "kills"), get(right, "kills"))}
+let delta_edge<I, T, O>: fn(Delta, Node<I, T>, Node<T, O>) -> Delta = |change, from, to| => Delta {actors: get(change, "actors"), junctions: get(change, "junctions"), routes: concat(get(change, "routes"), [stored_route(get(from, "output"), get(to, "input"))]), messages: get(change, "messages"), nodes: get(change, "nodes"), kills: get(change, "kills")}
+let delta_route<A, B>: fn(Delta, Port<A>, Port<B>) -> Delta = |change, from, to| => Delta {actors: get(change, "actors"), junctions: get(change, "junctions"), routes: concat(get(change, "routes"), [stored_route(from, to)]), messages: get(change, "messages"), nodes: get(change, "nodes"), kills: get(change, "kills")}
+let delta_message<T>: fn(Delta, Port<T>, T) -> Delta = |change, to, value| => Delta {actors: get(change, "actors"), junctions: get(change, "junctions"), routes: get(change, "routes"), messages: concat(get(change, "messages"), [typed_message(to, value)]), nodes: get(change, "nodes"), kills: get(change, "kills")}
+let delta_message_front<T>: fn(Delta, Port<T>, T) -> Delta = |change, to, value| => Delta {actors: get(change, "actors"), junctions: get(change, "junctions"), routes: get(change, "routes"), messages: concat([typed_message(to, value)], get(change, "messages")), nodes: get(change, "nodes"), kills: get(change, "kills")}
 let lower_delta: fn(Delta) -> LowerDelta = |value| => {
   let actors = get(value, "actors")
   let authored_messages = get(value, "messages")
-  // Deltas retain no exposed Node boundaries. Preserve their existing exact
-  // Unit actor bootstrap rule rather than activate newly eligible internals.
-  let unit_ports = filter(((|input| => (=)(canonical(type_id(get(input, "type"))), canonical(type_id(type_evidence(type_tag<Unit>()))))) : fn(StoredPort) -> Bool), map(((|candidate| => get(candidate, "input")) : fn(Actor) -> StoredPort), actors))
-  let routes = assigned_routes(get(value, "routes"))
-  let routes_by_source = group_by(assigned_route_source_actor, routes)
-  LowerDelta {actors: map(((|candidate| => lower_actor_with_routes(__map_get_or(routes_by_source, actor_id(candidate), ([]: List<AssignedRoute>)), candidate)) : fn(Actor) -> LowerActor), actors), messages: map(lower_message, concat(authored_messages, bootstrap_messages(unit_ports, get(value, "routes"), authored_messages))), kills: get(value, "kills"), types: descriptor_table(delta_descriptors(value)), nodes: get(value, "nodes")}
+  let delta_inputs = concat(map(((|candidate| => get(candidate, "input")) : fn(Actor) -> StoredPort), actors), flat_map(((|candidate| => get(candidate, "inputs")) : fn(Junction) -> List<StoredPort>), get(value, "junctions")))
+  let unit_ports = filter(((|input| => (=)(canonical(type_id(get(input, "type"))), canonical(type_id(type_evidence(type_tag<Unit>()))))) : fn(StoredPort) -> Bool), delta_inputs)
+  LowerDelta {actors: map(lower_actor, actors), junctions: get(value, "junctions"), routes: map(lower_route, assigned_routes(get(value, "routes"))), messages: map(lower_message, concat(authored_messages, bootstrap_messages(unit_ports, get(value, "routes"), authored_messages))), kills: get(value, "kills"), types: descriptor_table(delta_descriptors(value)), nodes: get(value, "nodes")}
 }
-
 let with_templateability: fn(Actor, Templateability) -> Actor = |actor, capability| => Actor {id: get(actor, "id"), factory: get(actor, "factory"), type_arguments: get(actor, "type_arguments"), params: get(actor, "params"), input: get(actor, "input"), outputs: get(actor, "outputs"), templateability: capability}

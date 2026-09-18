@@ -328,59 +328,54 @@ local function result_type()
   }
 end
 
+local function actor_endpoint(id)
+  return { constructor = "ActorEndpoint", value = { id = id } }
+end
+
+local function actor_port(id, semantic_type, type_id, wire)
+  return { endpoint = actor_endpoint(id), type = semantic_type or {},
+    type_id = type_id or "test-type", wire = wire }
+end
+
 local function lead_artifact()
   local task_type = {
-    kind = "named",
-    name = "example.LeadTurnInput",
-    arguments = json.decode("[]"),
+    kind = "named", name = "example.LeadTurnInput", arguments = json.decode("[]"),
   }
   return {
-    types = {
-      task = task_type,
-      [RESULT_TYPE_ID] = result_type(),
-      [AGENT_ERROR_TYPE_ID] = agent_error_type(),
-    },
+    types = { task = task_type, [RESULT_TYPE_ID] = result_type(),
+      [AGENT_ERROR_TYPE_ID] = agent_error_type() },
     actors = {
-      {
-        id = "lead.source", factory = "nefor.factory.source", type_arguments = { task_type },
+      { id = "lead.source", factory = "nefor.factory.source", type_arguments = { task_type },
         params = { ["$mag"] = "packed-value", value = {
           value = { prompt = "<initial task text>" },
-        } },
-        routes = { ["nefor.graph.Value"] = {
-          { actor = "lead.entry", wire = "nefor.agent.Input" },
-        } },
-      },
-      {
-        id = "lead.entry", factory = "nefor.factory.adapter", type_arguments = { task_type },
-        params = { ["$mag"] = "packed-value", value = { seed = "provider-in" } },
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } },
-      },
-      {
-        id = "lead.llm", factory = "nefor.factory.llm", type_arguments = {},
-        params = { ["$mag"] = "packed-value", value = {
-          tools = { "read_file", "mag" },
-        } },
-        routes = {
-          ["generic-tool.ToolCalls"] = { { actor = "lead.run-tool", wire = "generic-tool.ToolCalls" } },
-        },
-      },
+        } } },
+      { id = "lead.entry", factory = "nefor.factory.adapter", type_arguments = { task_type },
+        params = { ["$mag"] = "packed-value", value = { seed = "provider-in" } } },
+      { id = "lead.llm", factory = "nefor.factory.llm", type_arguments = {},
+        params = { ["$mag"] = "packed-value", value = { tools = { "read_file", "mag" } } } },
     },
-    messages = {
-      { to = "lead.source", content = {
-        ["$mag"] = "packed-value", value = { kind = "mag.Unit" },
-      } },
+    junctions = {},
+    routes = {
+      { id = "source/entry",
+        from = actor_port("lead.source", task_type, "task", "nefor.graph.Value"),
+        to = actor_port("lead.entry", task_type, "task", "nefor.agent.Input"), product_position = 0 },
+      { id = "entry/llm",
+        from = actor_port("lead.entry", {}, "provider", "generic-provider.ProviderOut"),
+        to = actor_port("lead.llm", {}, "provider", "generic-provider.ProviderOut"), product_position = 0 },
+      { id = "llm/run-tool",
+        from = actor_port("lead.llm", {}, "tool-calls", "generic-tool.ToolCalls"),
+        to = actor_port("lead.run-tool", {}, "tool-calls", "generic-tool.ToolCalls"), product_position = 0 },
     },
+    messages = { { to = actor_port("lead.source", {}, "unit", "mag.Unit"),
+      content = { ["$mag"] = "packed-value", value = { kind = "mag.Unit" } } } },
     kills = {},
-    result = { from = {
-      actor = "lead.llm",
-      type = "nefor.contracts.TextAnswer",
-      wire = "generic-provider.TextAnswer",
-    } },
+    result = { from = actor_port("lead.llm", "nefor.contracts.TextAnswer", nil,
+      "generic-provider.TextAnswer") },
   }
 end
 
 local function program_artifact()
-  return { format = "nefor.mag", version = 2, kind = "program",
+  return { format = "nefor.mag", version = 3, kind = "program",
     program = { initial = lead_artifact(), operations = {} } }
 end
 
@@ -818,7 +813,7 @@ do
     "lead execution carries the cached immutable artifact inline")
   assert_eq(exec.body.artifact.program.initial.actors[1].params.value.value.prompt,
     "<initial task text>", "execute overlays do not mutate the cached artifact")
-  assert_eq(mod.messages[1].to, "lead.source", "Unit activation targets the source actor")
+  assert_eq(mod.messages[1].to.endpoint.value.id, "lead.source", "Unit activation targets the source actor")
   assert_eq(mod.messages[1].content.value.kind, "mag.Unit",
     "the source activation remains a Unit message")
   assert_eq(task_prompt(exec.body), "hello lead",

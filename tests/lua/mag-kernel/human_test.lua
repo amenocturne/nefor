@@ -1,476 +1,191 @@
--- tests/lua/mag-kernel/human_test.lua — the human gate's reply routing,
--- end to end through the kernel (plugins/mag/docs/actor-model.md, The
--- approval boundary).
---
--- Driven from engine/tests/starter_mag_kernel_test.rs: bare Lua VM, stub
--- nefor.log, package.path at plugins/mag/lua/mag-kernel/. The harness wires
--- inventory + registry + router + observer exactly the way init.lua does,
--- INCLUDING the construction probe (set_is_constructed) that guards
--- control-plane reply injection at apply time.
---
--- Pinned here:
---   * request out — a subject firing the gate surfaces the run's
---     `mag.approval_request` control-plane event (intercepted emit, never a
---     routed/persisted node output);
---   * reply in — the control plane injects `mag.ApprovalReply` as a
---     modification message; the kernel delivers it past declared ports to the
---     constructed gate, and the gate's typed exit routes the graph onward;
---   * the full gate-template flow — produce → approve → reject → rework
---     (adapter lifts the reason) → produce re-fires → approve → approve →
---     sink completes the run;
---   * reply-before-construction REJECTS the modification (loud, at apply —
---     a reply answers an outstanding request; nothing is parked or lost);
---   * reply at a dead gate rejects after kill retracts the request;
---   * drain surfaces `mag.approval_cancel`;
---   * apply-time validation accepts the gate template's wiring against the
---     real shipped factories (llm / human / adapter / sink).
+-- Human approval remains an actor capability. ADT projection is now a
+-- structural AdtUnpack junction (covered by topology_lua.rs), so this fixture
+-- focuses on the gate's control-plane request/reply/cancel lifecycle.
 
 local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
 local observer = require("observer")
 local human = require("factories.human")
-local adapter = require("factories.adapter")
-local sink = require("factories.sink")
-local llm = require("factories.llm")
-local adt_unpack = require("factories.adt-unpack")
 
--- ------------------------------------------------------------------
--- assert helpers
--- ------------------------------------------------------------------
-
-local function assert_eq(actual, expected, msg)
+local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(string.format(
-      "assertion failed: %s\n  expected: %s\n  actual:   %s",
-      msg or "values differ", tostring(expected), tostring(actual)), 2)
+    error(string.format("assertion failed: %s\n  expected: %s\n  actual: %s",
+      message or "values differ", tostring(expected), tostring(actual)), 2)
   end
 end
 
-local function assert_true(cond, msg)
-  if not cond then error("assertion failed: " .. (msg or "(no message)"), 2) end
+local function assert_true(condition, message)
+  if not condition then error("assertion failed: " .. (message or "(no message)"), 2) end
 end
 
-local function assert_contains(haystack, needle, msg)
-  if type(haystack) ~= "string" or not haystack:find(needle, 1, true) then
-    error(string.format(
-      "assertion failed: %s\n  expected to contain: %s\n  actual: %s",
-      msg or "substring missing", tostring(needle), tostring(haystack)), 2)
+local function assert_contains(value, fragment, message)
+  if type(value) ~= "string" or not value:find(fragment, 1, true) then
+    error(string.format("assertion failed: %s\n  expected to contain: %s\n  actual: %s",
+      message or "substring missing", tostring(fragment), tostring(value)), 2)
   end
 end
 
-local function new_logger()
-  local rec = { info = {}, warn = {}, error = {} }
-  local function sink_at(bucket)
-    return function(m) bucket[#bucket + 1] = m end
-  end
-  return { info = sink_at(rec.info), warn = sink_at(rec.warn), error = sink_at(rec.error) }, rec
+local function logger()
+  local function noop() end
+  return {info=noop,warn=noop,error=noop}
 end
 
--- ------------------------------------------------------------------
--- harness — wired the way init.lua wires a run context: registry-backed
--- validation, lazy construction, deps.writer persistence, the kill hook,
--- and the construction probe for reply injection.
--- ------------------------------------------------------------------
-
--- A deterministic stand-in for the produce llm: same declared boundary
--- (ProviderInput in, TextAnswer out) but synchronous — each firing emits
--- "draft <n>" instead of a provider round-trip.
 local function producer_factory()
   return {
-    declaration = {
-      name = "producer",
-      params = {},
-      inputs = { provider_input = "generic-provider.ProviderOut" },
-      outputs = { "generic-provider.TextAnswer" },
-      semantic = {
-        input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
-        output={kind="named",name="nefor.contracts.TextAnswer",arguments={}},
-        inputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
-        outputs={{wire="generic-provider.TextAnswer",type={kind="named",name="nefor.contracts.TextAnswer",arguments={}}}},
-      },
-    },
-    construct = function(id, params, emit, deps)
-      local n = 0
-      local inst = { id = id }
-      function inst.deliver(activation)
-        n = n + 1
-        emit({ kind = "generic-provider.TextAnswer", from = id, text = "draft " .. n })
-        return { status = "ok" }
+    declaration={name="producer",params={},inputs={input="generic-provider.ProviderOut"},outputs={"generic-provider.TextAnswer"}},
+    construct=function(id, params, emit)
+      local instance={id=id}
+      function instance.deliver()
+        emit({kind="generic-provider.TextAnswer",from=id,text="draft"})
+        return {status="ok"}
       end
-      emit({ kind = "mag.ready", from = id })
-      return inst
+      emit({kind="mag.ready",from=id})
+      return instance
+    end,
+  }
+end
+
+local function collector_factory(decisions)
+  return {
+    declaration={name="collector",params={},inputs={decision="human.Decision"},outputs={}},
+    construct=function(id, params, emit)
+      local instance={id=id}
+      function instance.deliver(activation)
+        decisions[#decisions + 1] = activation.messages[1].message
+        return {status="ok"}
+      end
+      emit({kind="mag.ready",from=id})
+      return instance
     end,
   }
 end
 
 local function harness()
-  local log, rec = new_logger()
-  local events = {}
-  local bus = {}
-  local persisted = {} -- { { id = <sender>, output = <message> }, ... }
-  local reg = Registry.new()
-  for _, f in ipairs({
-    { declaration = human.declaration, construct = human.construct },
-    { declaration = adapter.declaration, construct = adapter.construct },
-    { declaration = sink.declaration, construct = sink.construct },
-    { declaration = adt_unpack.declaration, construct = adt_unpack.construct },
+  local events, persisted, decisions = {}, {}, {}
+  local registry = Registry.new()
+  for _, factory in ipairs({
+    {declaration=human.declaration,construct=human.construct},
     producer_factory(),
+    collector_factory(decisions),
   }) do
-    local _, err = reg:register(f)
+    local _, err = registry:register(factory)
     assert_true(err == nil, "factory registers: " .. tostring(err))
   end
 
-  local inv = inventory.new({ log = log, registry = reg })
+  local inv = inventory.new({log=logger(),registry=registry})
   local router = routing.new({
-    inventory = inv,
-    registry = reg,
-    log = log,
-    bus_emit = function(e) bus[#bus + 1] = e end,
-    events = function(e) events[#events + 1] = e end,
-    persist_output = function(id, output)
-      persisted[#persisted + 1] = { id = id, output = output }
-    end,
+    inventory=inv,registry=registry,log=logger(),bus_emit=function() end,
+    events=function(event) events[#events + 1] = event end,
+    persist_output=function(id, output) persisted[#persisted + 1] = {id=id,output=output} end,
   })
-  inv.set_on_kill(function(id)
-    router:dispatch_kill(id)
-    router:forget(id)
-  end)
-  inv.set_is_constructed(function(id)
-    return router:is_constructed(id)
-  end)
+  inv.set_on_kill(function(id) router:dispatch_kill(id); router:forget(id) end)
+  inv.set_is_constructed(function(id) return router:is_constructed(id) end)
   router:set_construct(function(record)
-    return reg:construct(record.factory, record.id, record.params,
-      router:emitter(record.id), { writer = function() end })
+    return registry:construct(record.factory,record.id,record.params,router:emitter(record.id),
+      {writer=function() end})
   end)
   inv.set_deliver(function(to, from, content)
     content = content or {}
-    router:deliver(to, from, content.kind, content)
+    router:deliver(to,from,content.kind,content)
   end)
-  local obs = observer.new({ inventory = inv, emit_event = function(e) events[#events + 1] = e end })
-  return {
-    inv = inv, reg = reg, router = router, obs = obs,
-    log = rec, events = events, bus = bus, persisted = persisted,
-  }
+  local obs = observer.new({inventory=inv,emit_event=function(event) events[#events + 1] = event end})
+  return {inv=inv,router=router,obs=obs,events=events,persisted=persisted,decisions=decisions}
 end
 
-local function events_of_kind(h, kind)
-  local out = {}
-  for _, e in ipairs(h.events) do
-    if e.kind == kind then out[#out + 1] = e end
-  end
-  return out
-end
-
--- The gate constellation used by the flow tests: the gate template's lowered
--- shape (produce → approve → rework → produce; approve → sink) with the
--- synchronous producer standing in for the llm.
-local function gate_actors()
-  local string = {kind="primitive",name="String"}
-  local approved = {kind="named",name="nefor.human.HumanWorkflowApproval",arguments={},body={kind="record",fields={{name="content",type=string}}}}
-  local rejected = {kind="named",name="nefor.human.HumanWorkflowRejection",arguments={},body={kind="record",fields={{name="reason",type=string}}}}
+local function actors()
+  local text_answer = {kind="named",name="nefor.contracts.TextAnswer",arguments={}}
+  local approved = {kind="named",name="nefor.human.HumanWorkflowApproval",arguments={}}
+  local rejected = {kind="named",name="nefor.human.HumanWorkflowRejection",arguments={}}
   local decision = {kind="adt",name="nefor.human.HumanWorkflowDecision",arguments={},constructors={
     {name="Approved",payload=approved},{name="Rejected",payload=rejected},
   }}
   return {
-    {
-      id = "produce", factory = "producer", type_arguments = {}, params = {},
-      evidence={version=2,identity="nefor.factory.producer",arguments={},input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},output={kind="named",name="nefor.contracts.TextAnswer",arguments={}}},
-      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={{type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"}},
-      routes = { ["generic-provider.TextAnswer"] = { { actor = "approve", wire = "generic-provider.TextAnswer" } } },
-    },
-    {
-      id = "approve", factory = "human", type_arguments = {decision}, params = { prompt = "Approve the draft?" },
-      evidence={version=2,identity="nefor.factory.human",arguments={decision},input={kind="named",name="nefor.contracts.TextAnswer",arguments={}},output=decision},
-      input={type={kind="named",name="nefor.contracts.TextAnswer",arguments={}},wire="generic-provider.TextAnswer"},outputs={{type=decision,wire="human.Decision"}},
-      routes = { ["human.Decision"] = { { actor = "decision", wire = "nefor.adt.Value" } } },
-    },
-    {
-      id = "decision", factory = "adt-unpack", type_arguments = {decision, approved, rejected},
-      params = { owner=decision, left_payload=approved, right_payload=rejected,
-        left_constructor="Approved", right_constructor="Rejected" },
-      evidence={version=2,identity="nefor.factory.adt-unpack",arguments={decision,approved,rejected},input=decision,output={kind="primitive",name="JsonValue"}},
-      input={type=decision,wire="nefor.adt.Value"},outputs={{type=approved,wire="nefor.adt.First"},{type=rejected,wire="nefor.adt.Second"}},
-      routes = { ["nefor.adt.First"] = { { actor = "out", wire = "human.Approved" } },
-        ["nefor.adt.Second"] = { { actor = "rework", wire = "nefor.agent.Input" } } },
-    },
-    {
-      id = "rework", factory = "adapter", type_arguments = {rejected},
-      params = { seed = "provider-in", schema={version=2,root={kind="named",name="nefor.human.HumanWorkflowRejection",body={kind="record",fields={{name="reason",schema={kind="string"}}}}}} },
-      evidence={version=2,identity="nefor.factory.adapter",arguments={rejected},input=rejected,output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-      input={type=rejected,wire="nefor.agent.Input"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
-      routes = { ["generic-provider.ProviderOut"] = { { actor = "produce", wire = "generic-provider.ProviderOut" } } },
-    },
-    { id = "out", factory = "sink", type_arguments = {approved},
-      params = {}, routes = {},
-      evidence={version=2,identity="nefor.factory.sink",arguments={approved},input=approved,output={kind="primitive",name="Unit"}},
-      input={type=approved,wire="human.Approved"},outputs={{type={kind="primitive",name="Unit"},wire="mag.Unit"}} },
-  }
-end
-
-local function seed_message()
-  return {
-    to = "produce",
-    content = {
-      kind = "generic-provider.ProviderOut",
-      messages = { { role = "user", content = "write the plan" } },
-    },
-  }
-end
-
-local function reply_message(to, fields)
-  local content = { kind = "mag.ApprovalReply", content = "", reason = "" }
-  for k, v in pairs(fields) do content[k] = v end
-  return { to = to, content = content }
-end
-
--- ==================================================================
--- (1) full gate flow: subject → approval request event; reject → rework →
--- produce re-fires → second request; approve → sink completes the run
--- ==================================================================
-
-do
-  local h = harness()
-  local result = h.obs:apply({ actors = gate_actors(), messages = { seed_message() } })
-  assert_eq(result.ok, true, "the gate constellation applies: " .. tostring(result.error))
-
-  -- Draft 1 reached the gate: the request surfaced as the control-plane event.
-  local requests = events_of_kind(h, "mag.approval_request")
-  assert_eq(#requests, 1, "the subject raised one approval request")
-  assert_eq(requests[1].from, "approve", "the request names the gate actor")
-  assert_eq(requests[1].correlation, "approve", "the request carries the correlation handle")
-  assert_eq(requests[1].prompt, "Approve the draft?", "the request carries the configured prompt")
-  assert_eq(requests[1].subject.text, "draft 1", "the request carries the subject")
-  assert_eq(#events_of_kind(h, "mag.run_complete"), 0, "the run waits on the human")
-
-  -- The human rejects: the control plane injects the reply as a modification
-  -- message. The gate resolves to human.Rejected → rework lifts the reason →
-  -- produce re-fires → a second request with draft 2.
-  local rejected = h.obs:apply({
-    messages = { reply_message("approve", { approved = false, reason = "tighten the wording" }) },
-  })
-  assert_eq(rejected.ok, true, "the rejecting reply applies: " .. tostring(rejected.error))
-  requests = events_of_kind(h, "mag.approval_request")
-  assert_eq(#requests, 2, "the revise loop raised a second approval request")
-  assert_eq(requests[2].subject.text, "draft 2", "the second request carries the revised draft")
-  assert_eq(#events_of_kind(h, "mag.run_complete"), 0, "still waiting on the human")
-  assert_eq(#events_of_kind(h, "mag.run_failed"), 0, "no failure escalated in the revise loop")
-
-  -- The rework adapter preserves the complete typed rejection value.
-  local lifted
-  for _, p in ipairs(h.persisted) do
-    if p.id == "rework" then lifted = p.output end
-  end
-  assert_true(lifted ~= nil, "the rework adapter emitted a routed provider turn")
-  assert_eq(lifted.messages[1].content.value.reason, "tighten the wording",
-    "the typed rejection is the next turn's content")
-
-  -- The human approves: the gate exits human.Approved into the sink.
-  local approved = h.obs:apply({
-    messages = { reply_message("approve", { approved = true, content = "ship it" }) },
-  })
-  assert_eq(approved.ok, true, "the approving reply applies: " .. tostring(approved.error))
-  local complete = events_of_kind(h, "mag.run_complete")
-  assert_eq(#complete, 1, "the approval completed the run")
-  assert_eq(complete[1].result.value.content, "ship it", "the result carries the human's content")
-
-  -- Activity honesty: strict busy/idle alternation for the gate. The reject
-  -- cascade re-fires the gate (rework → produce → draft 2) while its first
-  -- window is still open — the reply's typed exit routes BEFORE its
-  -- mag.complete ack — so the overlap extends the one open window instead of
-  -- nesting a second busy (routing.lua, mark_busy): one window, one settle.
-  local busy, idle = 0, 0
-  for _, e in ipairs(h.events) do
-    if e.kind == "mag.actor_busy" and e.id == "approve" then busy = busy + 1 end
-    if e.kind == "mag.actor_idle" and e.id == "approve" then idle = idle + 1 end
-  end
-  assert_eq(busy, 1, "the overlapping revise loop extends one busy window (no nested busy)")
-  assert_eq(idle, 1, "the window settles once, when a reply's completion resolves the gate")
-
-  -- The approval request is control-plane traffic, never a node output: the
-  -- gate's persisted outputs are exactly its typed exits.
-  for _, p in ipairs(h.persisted) do
-    if p.id == "approve" then
-      assert_true(p.output.kind == "human.Decision",
-        "the gate persists only its nominal decision, not the request; got " .. tostring(p.output.kind))
-    end
-  end
-end
-
--- ==================================================================
--- (2) reply-before-construction REJECTS the modification at apply — a reply
--- answers an outstanding request, and a request implies a constructed gate
--- ==================================================================
-
-do
-  local h = harness()
-  -- The gate registers but never fires (no seed): lazy construction leaves it
-  -- unconstructed.
-  assert_eq(h.obs:apply({ actors = gate_actors() }).ok, true, "the constellation registers")
-  assert_eq(h.router:is_constructed("approve"), false, "the gate never constructed")
-
-  local result = h.obs:apply({
-    messages = { reply_message("approve", { approved = true, content = "premature" }) },
-  })
-  assert_eq(result.ok, false, "a reply at an unconstructed gate rejects the modification")
-  assert_contains(result.error, "no outstanding approval request", "the error names the contract")
-  assert_contains(result.error, "approve", "the error names the target")
-
-  local rejected = events_of_kind(h, "mag.modification_rejected")
-  assert_eq(#rejected, 1, "the rejection surfaced as mag.modification_rejected")
-  assert_eq(h.router:is_constructed("approve"), false,
-    "the rejected reply constructed nothing (no false 'began work')")
-  assert_eq(#events_of_kind(h, "mag.run_failed"), 0, "a rejected injection never fails the run")
-end
-
--- ==================================================================
--- (3) spawn + reply in ONE modification is the same protocol error — the
--- reply structurally precedes any possible request
--- ==================================================================
-
-do
-  local h = harness()
-  local result = h.obs:apply({
-    actors = gate_actors(),
-    messages = { reply_message("approve", { approved = true }) },
-  })
-  assert_eq(result.ok, false, "a same-modification spawn+reply rejects")
-  assert_contains(result.error, "no outstanding approval request", "the error names the contract")
-  assert_eq(h.inv.state_of("approve"), "never-existed", "the rejected modification spawned nothing")
-end
-
--- ==================================================================
--- (4) a reply at a DEAD gate is rejected: kill retracted the request, so the
--- dead run can no longer consume approval
--- ==================================================================
-
-do
-  local h = harness()
-  assert_eq(h.obs:apply({ actors = gate_actors(), messages = { seed_message() } }).ok, true,
-    "the constellation applies and the gate constructs")
-  assert_eq(h.obs:apply({ kills = { "approve" } }).ok, true, "the kill applies")
-  local cancels = events_of_kind(h, "mag.approval_cancel")
-  assert_eq(#cancels, 1, "hard kill retracts the outstanding approval request")
-  assert_eq(cancels[1].correlation, "approve", "kill cancellation preserves correlation")
-
-  local result = h.obs:apply({
-    messages = { reply_message("approve", { approved = true, content = "late" }) },
-  })
-  assert_eq(result.ok, false, "late approval for a dead run is rejected")
-  assert_contains(result.error, "no outstanding approval request",
-    "late approval reports the retracted request")
-  assert_eq(#events_of_kind(h, "mag.run_failed"), 0,
-    "rejecting a late control-plane reply does not fail another run")
-
-  local fresh = harness()
-  assert_eq(fresh.obs:apply({ actors = gate_actors(), messages = { seed_message() } }).ok, true,
-    "a fresh run can open approval after the killed run")
-  assert_eq(fresh.obs:apply({
-    messages = { reply_message("approve", { approved = true, content = "fresh" }) },
-  }).ok, true, "future approval remains usable")
-  assert_eq(#events_of_kind(fresh, "mag.run_complete"), 1,
-    "future approval completes its independent run")
-end
-
--- ==================================================================
--- (5) drain retracts an outstanding request via the run_id-stamped
--- mag.approval_cancel control-plane event
--- ==================================================================
-
-do
-  local h = harness()
-  assert_eq(h.obs:apply({ actors = gate_actors(), messages = { seed_message() } }).ok, true,
-    "the constellation applies")
-  assert_eq(#events_of_kind(h, "mag.approval_request"), 1, "a request is outstanding")
-
-  assert_eq(h.router:drain("approve"), true, "the gate's drain handler ran")
-  local cancels = events_of_kind(h, "mag.approval_cancel")
-  assert_eq(#cancels, 1, "drain surfaced the cancel as a control-plane event")
-  assert_eq(cancels[1].from, "approve", "the cancel names the gate actor")
-  assert_eq(cancels[1].correlation, "approve", "the cancel carries the correlation handle")
-end
-
--- ==================================================================
--- (6) apply-time validation accepts explicit Result and decision projection
--- against the real shipped factories.
--- ==================================================================
-
-do
-  local log = new_logger()
-  local reg = Registry.new()
-  local function named(name) return { kind = "named", name = name, arguments = {} } end
-  local unit = {kind="primitive",name="Unit"}
-  local json_value = {kind="primitive",name="JsonValue"}
-  local provider_input = named("nefor.contracts.ProviderInput")
-  local task = named("test.Task")
-  local text_answer = named("nefor.contracts.TextAnswer")
-  local agent_error = named("nefor.contracts.AgentError")
-  local tool_calls = named("nefor.contracts.ToolCalls")
-  local result_type = {kind="adt",name="core.types.Result",arguments={agent_error,text_answer},constructors={
-    {name="Error",payload=agent_error},{name="Ok",payload=text_answer},
-  }}
-  local approved = named("nefor.human.HumanWorkflowApproval")
-  local rejected = named("nefor.human.HumanWorkflowRejection")
-  local decision = {kind="adt",name="nefor.human.HumanWorkflowDecision",arguments={},constructors={
-    {name="Approved",payload=approved},{name="Rejected",payload=rejected},
-  }}
-  for _, mod in ipairs({ llm, human, adapter, sink, adt_unpack }) do
-    local _, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
-    assert_true(err == nil, "shipped factory registers: " .. tostring(err))
-  end
-  local inv = inventory.new({ log = log, registry = reg })
-  local function evidence(identity, arguments, input, output)
-    return {version=2,identity=identity,arguments=arguments,input=input,output=output}
-  end
-  local result = inv.apply({ actors = {
-    { id="entry", factory="adapter", type_arguments={task},
-      params={seed="provider-in",schema={version=2,root={kind="string"}}},
-      evidence=evidence("nefor.factory.adapter",{task},task,provider_input),
-      input={type=task,wire="nefor.agent.Input"},
-      outputs={{type=provider_input,wire="generic-provider.ProviderOut"}},
-      routes={["generic-provider.ProviderOut"]={{actor="review.produce",wire="generic-provider.ProviderOut"}}} },
-    { id="review.produce", factory="llm", type_arguments={result_type},
-      params={provider="chatgpt-provider",model="opus",output_type="ok-id",
-        error_type="error-id",provider_error_type="provider-error-id"},
-      evidence=evidence("nefor.factory.llm",{result_type},provider_input,result_type),
-      input={type=provider_input,wire="generic-provider.ProviderOut"},
-      outputs={{type=tool_calls,wire="generic-tool.ToolCalls"},{type=result_type,wire="nefor.agent.Result"}},
-      routes={["nefor.agent.Result"]={{actor="review.result",wire="nefor.adt.Value"}}} },
-    { id="review.result", factory="adt-unpack",
-      type_arguments={result_type,agent_error,text_answer},
-      params={owner=result_type,left_payload=agent_error,right_payload=text_answer,
-        left_constructor="Error",right_constructor="Ok"},
-      evidence=evidence("nefor.factory.adt-unpack",{result_type,agent_error,text_answer},result_type,json_value),
-      input={type=result_type,wire="nefor.adt.Value"},
-      outputs={{type=agent_error,wire="nefor.adt.First"},{type=text_answer,wire="nefor.adt.Second"}},
-      routes={["nefor.adt.Second"]={{actor="review.approve",wire="generic-provider.TextAnswer"}}} },
-    { id="review.approve", factory="human", type_arguments={decision},
-      params={prompt="Approve this result?"},
-      evidence=evidence("nefor.factory.human",{decision},text_answer,decision),
+    {id="produce",factory="producer",type_arguments={},params={},
+      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},
+      outputs={{type=text_answer,wire="generic-provider.TextAnswer"}},
+      routes={["generic-provider.TextAnswer"]={{actor="approve",wire="generic-provider.TextAnswer"}}}},
+    {id="approve",factory="human",type_arguments={decision},params={prompt="Approve the draft?"},
       input={type=text_answer,wire="generic-provider.TextAnswer"},
       outputs={{type=decision,wire="human.Decision"}},
-      routes={["human.Decision"]={{actor="review.decision",wire="nefor.adt.Value"}}} },
-    { id="review.decision", factory="adt-unpack",
-      type_arguments={decision,approved,rejected},
-      params={owner=decision,left_payload=approved,right_payload=rejected,
-        left_constructor="Approved",right_constructor="Rejected"},
-      evidence=evidence("nefor.factory.adt-unpack",{decision,approved,rejected},decision,json_value),
-      input={type=decision,wire="nefor.adt.Value"},
-      outputs={{type=approved,wire="nefor.adt.First"},{type=rejected,wire="nefor.adt.Second"}},
-      routes={["nefor.adt.First"]={{actor="sink",wire="human.Approved"}},
-        ["nefor.adt.Second"]={{actor="review.rework",wire="nefor.agent.Input"}}} },
-    { id="review.rework", factory="adapter", type_arguments={rejected},
-      params={seed="provider-in",schema={version=2,root={kind="string"}}},
-      evidence=evidence("nefor.factory.adapter",{rejected},rejected,provider_input),
-      input={type=rejected,wire="nefor.agent.Input"},
-      outputs={{type=provider_input,wire="generic-provider.ProviderOut"}},
-      routes={["generic-provider.ProviderOut"]={{actor="review.produce",wire="generic-provider.ProviderOut"}}} },
-    { id="sink", factory="sink", type_arguments={approved}, params={}, routes={},
-      evidence=evidence("nefor.factory.sink",{approved},approved,unit),
-      input={type=approved,wire="human.Approved"},outputs={{type=unit,wire="mag.Unit"}} },
-  } })
-  assert_eq(result.ok, true,
-    "the gate template's explicit ADT wiring validates: " .. tostring(result.error))
+      routes={["human.Decision"]={{actor="collect",wire="human.Decision"}}}},
+    {id="collect",factory="collector",type_arguments={},params={},
+      input={type=decision,wire="human.Decision"},outputs={},routes={}},
+  }
+end
+
+local function seed()
+  return {to="produce",content={kind="generic-provider.ProviderOut",messages={{role="user",content="write"}}}}
+end
+
+local function reply(fields)
+  local content={kind="mag.ApprovalReply",content="",reason=""}
+  for key, value in pairs(fields) do content[key] = value end
+  return {to="approve",content=content}
+end
+
+local function of_kind(events, kind)
+  local result={}
+  for _, event in ipairs(events) do if event.kind == kind then result[#result + 1] = event end end
+  return result
+end
+
+-- Subject emission raises one request; the reply bypasses declared actor ports
+-- and the gate emits one nominal decision for structural projection downstream.
+do
+  local h = harness()
+  local applied = h.obs:apply({actors=actors(),messages={seed()}})
+  assert_true(applied.ok, "gate constellation applies: " .. tostring(applied.error))
+  local requests = of_kind(h.events, "mag.approval_request")
+  assert_eq(#requests, 1, "one request is raised")
+  assert_eq(requests[1].from, "approve", "request names gate")
+  assert_eq(requests[1].prompt, "Approve the draft?", "request carries prompt")
+  assert_eq(requests[1].subject.text, "draft", "request carries subject")
+
+  local answered = h.obs:apply({messages={reply({approved=true,content="ship it"})}})
+  assert_true(answered.ok, "approval reply applies: " .. tostring(answered.error))
+  assert_eq(#h.decisions, 1, "collector receives one decision")
+  assert_eq(h.decisions[1].value.constructor, "Approved", "decision preserves ADT constructor")
+  assert_eq(h.decisions[1].value.value.content, "ship it", "decision preserves approval content")
+  local gate_outputs=0
+  for _, record in ipairs(h.persisted) do
+    if record.id == "approve" then
+      gate_outputs = gate_outputs + 1
+      assert_eq(record.output.kind, "human.Decision", "only typed decision is persisted")
+    end
+  end
+  assert_eq(gate_outputs, 1, "control-plane request is not persisted as actor output")
+end
+
+-- A reply answers an outstanding request; before construction it rejects
+-- atomically and does not falsely begin actor work.
+do
+  local h = harness()
+  assert_true(h.obs:apply({actors=actors()}).ok, "actors register lazily")
+  assert_eq(h.router:is_constructed("approve"), false, "gate is not constructed")
+  local result = h.obs:apply({messages={reply({approved=true,content="premature"})}})
+  assert_true(not result.ok, "premature reply rejects")
+  assert_contains(result.error, "no outstanding approval request", "error names protocol")
+  assert_eq(h.router:is_constructed("approve"), false, "rejection constructs nothing")
+  assert_eq(#of_kind(h.events,"mag.modification_rejected"),1,"rejection is observed")
+end
+
+-- Killing or draining a live gate retracts its control-plane request.
+do
+  local h = harness()
+  assert_true(h.obs:apply({actors=actors(),messages={seed()}}).ok, "request opens")
+  assert_true(h.obs:apply({kills={"approve"}}).ok, "gate kill applies")
+  local cancels=of_kind(h.events,"mag.approval_cancel")
+  assert_eq(#cancels,1,"kill emits approval cancellation")
+  assert_eq(cancels[1].correlation,"approve","cancellation preserves correlation")
+  local late=h.obs:apply({messages={reply({approved=true,content="late"})}})
+  assert_true(not late.ok,"reply after cancellation rejects")
+  assert_contains(late.error,"no outstanding approval request","late reply names retracted request")
+
+  local drained=harness()
+  assert_true(drained.obs:apply({actors=actors(),messages={seed()}}).ok,"second request opens")
+  assert_true(drained.router:drain("approve"),"drain handler runs")
+  assert_eq(#of_kind(drained.events,"mag.approval_cancel"),1,"drain emits cancellation")
 end
 
 print("mag-kernel human_test: all assertions passed")

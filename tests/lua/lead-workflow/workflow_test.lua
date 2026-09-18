@@ -222,104 +222,79 @@ local function factory_contracts(factories)
   return contracts
 end
 
--- Test fixtures stay compact by describing the former sink-shaped graph,
--- then this helper expresses the same program through the current artifact
--- boundary: qualified factory identities plus a structural result selector.
+-- Test fixtures stay compact while still crossing the current artifact
+-- boundary: qualified capability factories, top-level routes, endpoint-addressed
+-- messages, and a structural result selector.
+local function actor_endpoint(id)
+  return { constructor = "ActorEndpoint", value = { id = id } }
+end
+
+local function actor_port(id, semantic_type, wire)
+  return { endpoint = actor_endpoint(id), type = semantic_type or {},
+    type_id = type(semantic_type) == "string" and semantic_type or "test-type", wire = wire }
+end
+
 local function artifact_from_modification(modification)
-  local actors, sink_ids = {}, {}
+  local actors = {}
   for _, actor in ipairs(modification.actors or {}) do
-    if actor.factory == "sink" then
-      sink_ids[actor.id] = true
-    else
-      local routes = {}
-      for wire, destinations in pairs(actor.routes or {}) do
-        local kept = {}
-        for _, destination in ipairs(destinations) do
-          local destination_id = destination.actor
-          if not sink_ids[destination_id] and destination_id ~= "sink" then
-            kept[#kept + 1] = destination
-          end
-        end
-        if #kept > 0 then routes[wire] = kept end
-      end
-      actors[#actors + 1] = {
-        id = actor.id,
-        factory = "nefor.factory." .. tostring(actor.factory),
-        type_arguments = actor.type_arguments or {},
-        params = { ["$mag"] = "packed-value", value = actor.params or {} },
-        routes = routes,
-      }
-    end
-  end
-  local result
-  for _, actor in ipairs(modification.actors or {}) do
-    if actor.factory ~= "sink" then
-      for wire, destinations in pairs(actor.routes or {}) do
-        for _, destination in ipairs(destinations) do
-          local destination_id = destination.actor
-          if destination_id == "sink" or sink_ids[destination_id] then
-            result = { from = { actor = actor.id, type = wire, wire = wire } }
-          end
-        end
-      end
-    end
+    actors[#actors + 1] = {
+      id = actor.id, factory = "nefor.factory." .. tostring(actor.factory),
+      type_arguments = actor.type_arguments or {},
+      params = { ["$mag"] = "packed-value", value = actor.params or {} },
+      input = actor_port(actor.id, {}, "input"), outputs = {},
+    }
   end
   local messages = {}
   for _, message in ipairs(modification.messages or {}) do
     messages[#messages + 1] = {
-      to = message.to,
-      semantic_type = message.semantic_type,
-      semantic_type_id = message.semantic_type_id,
+      to = actor_port(message.to, message.semantic_type,
+        type(message.content) == "table" and message.content.kind or "input"),
+      semantic_type = message.semantic_type, semantic_type_id = message.semantic_type_id,
       content = { ["$mag"] = "packed-value", value = message.content },
     }
   end
-  return {
-    types = modification.types or {},
-    actors = actors,
-    messages = messages,
-    nodes = modification.nodes or {},
-    kills = modification.kills or {},
-    result = result,
-  }
+  return { types = modification.types or {}, actors = actors,
+    junctions = modification.junctions or {}, routes = modification.routes or {},
+    messages = messages, nodes = modification.nodes or {}, kills = modification.kills or {},
+    result = modification.result }
 end
 
 local function envelope_from_modification(modification)
-  return { format = "nefor.mag", version = 2, kind = "program",
+  return { format = "nefor.mag", version = 3, kind = "program",
     program = { initial = artifact_from_modification(modification), operations = {} } }
 end
 
 local function read_only_modification()
   return {
     actors = {
-      { id = "worker.entry", factory = "adapter",
-        params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "worker.llm", wire = "generic-provider.ProviderOut" } } } },
-      { id = "worker.llm", factory = "llm",
-        params = { system = "Answer the task.", provider = "chatgpt",
-                   model = "gpt-5.6-sol", reasoning_effort = "medium",
-                   tools = { "read_file" } },
-        routes = { ["generic-provider.TextAnswer"] = { { actor = "sink", wire = "generic-provider.TextAnswer" } } } },
-      { id = "sink", factory = "sink", params = {}, routes = {} },
+      { id = "worker.entry", factory = "adapter", params = { seed = "provider-in" } },
+      { id = "worker.llm", factory = "llm", params = {
+        system = "Answer the task.", provider = "chatgpt", model = "gpt-5.6-sol",
+        reasoning_effort = "medium", tools = { "read_file" },
+      } },
     },
+    routes = { { id = "entry/llm",
+      from = actor_port("worker.entry", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
+      to = actor_port("worker.llm", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
+      product_position = 0 } },
     messages = { { to = "worker.entry", content = {
       kind = "nefor.agent.Input", value = { prompt = "<initial task text>" },
     } } },
     kills = {},
+    result = { from = actor_port("worker.llm", "generic-provider.TextAnswer", "generic-provider.TextAnswer") },
   }
 end
 
 local function writer_modification()
   return {
-    actors = {
-      { id = "build.llm", factory = "llm",
-        params = { system = "Implement feature X.", provider = "chatgpt",
-                   model = "gpt-5.6-luna", reasoning_effort = "low",
-                   tools = { "read_file", "write_file" } },
-        routes = { ["generic-provider.TextAnswer"] = { { actor = "sink", wire = "generic-provider.TextAnswer" } } } },
-      { id = "sink", factory = "sink", params = {}, routes = {} },
-    },
+    actors = { { id = "build.llm", factory = "llm", params = {
+      system = "Implement feature X.", provider = "chatgpt", model = "gpt-5.6-luna",
+      reasoning_effort = "low", tools = { "read_file", "write_file" },
+    } } },
+    routes = {},
     messages = { { to = "build.llm", content = { kind = "task", prompt = "<initial task text>" } } },
     kills = {},
+    result = { from = actor_port("build.llm", "generic-provider.TextAnswer", "generic-provider.TextAnswer") },
   }
 end
 
@@ -650,17 +625,17 @@ end
 do
   local authored = { type = "sha256:user-authored", value = { nested = true } }
   local artifact = {
-    format = "nefor.mag", version = 2, kind = "program", program = {
+    format = "nefor.mag", version = 3, kind = "program", program = {
       initial = {
         types = {},
         actors = { {
           id = "record", factory = "nefor.factory.stub", type_arguments = {},
-          params = { ["$mag"] = "packed-value", value = authored }, routes = {},
+          params = { ["$mag"] = "packed-value", value = authored },
         } },
         messages = { {
-          to = "record", content = { ["$mag"] = "packed-value", value = authored },
+          to = actor_port("record", {}, "input"), content = { ["$mag"] = "packed-value", value = authored },
         } },
-        kills = {}, nodes = {}, result = { from = { actor = "record", wire = "result" } },
+        kills = {}, nodes = {}, result = { from = actor_port("record", {}, "result") },
       },
       operations = {},
     },
@@ -686,25 +661,25 @@ do
   local initial = { types = {}, actors = {}, messages = {}, nodes = {}, kills = {}, result = {} }
   local delta = { types = {}, actors = {}, messages = {}, nodes = {}, kills = {} }
   local _, mixed_program_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 2, kind = "program",
+    format = "nefor.mag", version = 3, kind = "program",
     program = { initial = initial, operations = {} }, delta = delta,
   }
   assert_true(mixed_program_error:find("unknown field delta", 1, true) ~= nil,
     "program envelope rejects a delta sibling")
   local _, mixed_delta_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 2, kind = "delta", delta = delta,
+    format = "nefor.mag", version = 3, kind = "delta", delta = delta,
     program = { initial = initial, operations = {} },
   }
   assert_true(mixed_delta_error:find("unknown field program", 1, true) ~= nil,
     "delta envelope rejects a program sibling")
   local _, delta_operations_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 2, kind = "delta",
+    format = "nefor.mag", version = 3, kind = "delta",
     delta = { types = {}, actors = {}, messages = {}, nodes = {}, kills = {}, operations = {} },
   }
   assert_true(delta_operations_error:find("unknown field operations", 1, true) ~= nil,
     "delta payload rejects operation residue")
   local _, operation_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 2, kind = "program",
+    format = "nefor.mag", version = 3, kind = "program",
     program = { initial = initial, operations = { { extra = true } } },
   }
   assert_true(operation_error:find("unknown field extra", 1, true) ~= nil,
@@ -718,13 +693,13 @@ do
   local authored = { constructor = "Expression", value = { ["$mag"] = "packed-value", value = 42 } }
   local function artifact_for(payload)
     return {
-      format = "nefor.mag", version = 2, kind = "program", program = {
+      format = "nefor.mag", version = 3, kind = "program", program = {
         initial = { actors = {}, messages = {}, nodes = {}, kills = {}, types = {}, result = {} },
         operations = { {
-          id = "expand", on_actor = "source", on_wire = "result",
-          trigger_type = {}, trigger_type_id = "type", captures = {}, expressions = {},
-          template = { actors = {}, routes = {}, messages = { {
-            to = { actor = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
+          id = "expand", on = actor_port("source", {}, "result"),
+          captures = {}, expressions = {},
+          template = { actors = {}, messages = { {
+            to = { endpoint = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
             content = payload,
           } } },
         } },
@@ -765,8 +740,8 @@ do
     assert_true(err:find("program.operations[1].template.messages[1].content", 1, true) ~= nil,
       "template failure includes indexed occurrence context")
   end
-  local delta = { format = "nefor.mag", version = 2, kind = "delta", delta = {
-    actors = {}, messages = { { to = "worker", content = { ["$mag"] = "packed-value", value = authored } } },
+  local delta = { format = "nefor.mag", version = 3, kind = "delta", delta = {
+    actors = {}, junctions = {}, messages = { { to = actor_port("worker", {}, "input"), content = { ["$mag"] = "packed-value", value = authored } } },
     nodes = {}, kills = {}, types = {},
   } }
   local decoded = assert(workspace.decode_artifact(delta))
@@ -787,29 +762,29 @@ do
     return c.body.kind == "mag.load" and c.target == "mag"
   end)
   local artifact = {
-    format = "nefor.mag", version = 2, kind = "program", program = {
+    format = "nefor.mag", version = 3, kind = "program", program = {
       initial = {
         types = {},
         actors = { {
           id = "source", factory = "nefor.factory.stub", type_arguments = {},
-          params = { ["$mag"] = "packed-value", value = {} }, routes = {},
+          params = { ["$mag"] = "packed-value", value = {} },
         } },
         messages = {}, kills = {}, nodes = {},
-        result = { from = { actor = "source", wire = "result" } },
+        result = { from = actor_port("source", {}, "result") },
       },
       operations = { {
-        id = "expand", on_actor = "source", on_wire = "result",
-        trigger_type = {}, trigger_type_id = "type", captures = {}, expressions = {}, template = {
+        id = "expand", on = actor_port("source", {}, "result"),
+        captures = {}, expressions = {}, template = {
           actors = { {
             slot = "worker", factory = "nefor.factory.llm", type_arguments = {},
             params = { ["$mag"] = "packed-value", value = {
               system = "template authored system", tools = { "read_file" },
-            } }, routes = {},
+            } },
           } },
           messages = {
-            { to = { actor = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
+            { to = { endpoint = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
               content = { constructor = "Expression", value = "worker-input" } },
-            { to = { actor = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
+            { to = { endpoint = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
               content = { constructor = "Static", value = { ["$mag"] = "packed-value", value = {} } } },
           }, kills = {}, nodes = {},
         },
@@ -1495,19 +1470,18 @@ end
 local function lead_turn_modification()
   return {
     actors = {
-      { id = "lead.source", factory = "source",
-        params = { value = { prompt = "<initial task text>" } },
-        routes = { ["nefor.graph.Value"] = {
-          { actor = "lead.entry", wire = "nefor.agent.Input" },
-        } } },
-      { id = "lead.entry", factory = "adapter", params = { seed = "provider-in" },
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "lead.llm", wire = "generic-provider.ProviderOut" } } } },
-      { id = "lead.llm", factory = "llm", params = {},
-        routes = { ["generic-provider.TextAnswer"] = { { actor = "sink", wire = "generic-provider.TextAnswer" } } } },
-      { id = "sink", factory = "sink", params = {}, routes = {} },
+      { id = "lead.source", factory = "source", params = { value = { prompt = "<initial task text>" } } },
+      { id = "lead.entry", factory = "adapter", params = { seed = "provider-in" } },
+      { id = "lead.llm", factory = "llm", params = {} },
     },
-    messages = { { to = "lead.source", content = { kind = "mag.Unit" } } },
-    kills = {},
+    routes = {
+      { id = "source/entry", from = actor_port("lead.source", "nefor.graph.Value", "nefor.graph.Value"),
+        to = actor_port("lead.entry", "nefor.graph.Value", "nefor.agent.Input"), product_position = 0 },
+      { id = "entry/llm", from = actor_port("lead.entry", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
+        to = actor_port("lead.llm", "generic-provider.ProviderOut", "generic-provider.ProviderOut"), product_position = 0 },
+    },
+    messages = { { to = "lead.source", content = { kind = "mag.Unit" } } }, kills = {},
+    result = { from = actor_port("lead.llm", "generic-provider.TextAnswer", "generic-provider.TextAnswer") },
   }
 end
 
@@ -1777,8 +1751,7 @@ do
   _test.calls_clear()
   execute_mag("firing-sink-missing", "no-sink.mag")
   local m = read_only_modification()
-  table.remove(m.actors, 3) -- drop the sink actor
-  m.actors[2].routes = {}
+  m.result = nil
   feed_loaded(m)
   local calls = decode_calls()
   assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
@@ -1799,7 +1772,7 @@ do
   _test.calls_clear()
   execute_mag("firing-sink-orphan", "orphan-sink.mag")
   local m = read_only_modification()
-  m.actors[2].routes = {} -- nothing routes to the sink any more
+  m.result = nil -- remove the structural terminal selection
   feed_loaded(m)
   local err = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"

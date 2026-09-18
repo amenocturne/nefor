@@ -102,15 +102,23 @@ hierarchy = run_panel.nodes_declared(hierarchy, "nested", {
   { path = { "camera-stage", "retry" }, members = { "camera.retry" } },
   { path = { "result" }, members = { "workflow.result" } },
 })
-hierarchy = run_panel.actor_spawned(hierarchy, "nested", "camera.llm", "llm", {
-  routes = { answer = { { actor = "camera.retry" } } },
-}, 1)
-hierarchy = run_panel.actor_spawned(hierarchy, "nested", "camera.retry", "retry", {
-  routes = {
-    retry = { { actor = "camera.llm" } },
-    done = { { actor = "workflow.result" } },
-  },
-}, 2)
+local function actor_endpoint(id)
+  return { constructor = "ActorEndpoint", value = { id = id } }
+end
+local function junction_endpoint(id)
+  return { constructor = "JunctionEndpoint", value = { id = id } }
+end
+local function route(from_endpoint, to_endpoint)
+  return { from = { endpoint = from_endpoint }, to = { endpoint = to_endpoint } }
+end
+hierarchy.runs.nested.routes = {
+  route(actor_endpoint("camera.llm"), junction_endpoint("answer-pass")),
+  route(junction_endpoint("answer-pass"), actor_endpoint("camera.retry")),
+  route(actor_endpoint("camera.retry"), actor_endpoint("camera.llm")),
+  route(actor_endpoint("camera.retry"), actor_endpoint("workflow.result")),
+}
+hierarchy = run_panel.actor_spawned(hierarchy, "nested", "camera.llm", "llm", {}, 1)
+hierarchy = run_panel.actor_spawned(hierarchy, "nested", "camera.retry", "retry", {}, 2)
 hierarchy = run_panel.actor_spawned(hierarchy, "nested", "workflow.result", "output", {}, 3)
 local roots = run_panel.build_nodes(hierarchy.runs.nested)
 eq(#roots, 2, "run header exposes direct logical children without a wrapper node")
@@ -146,18 +154,17 @@ local function project(logical_nodes, actor_statuses, run_status)
 end
 
 local settled_children = project({
-  { path = { "parallel" }, members = { "parallel.split" } },
+  { path = { "parallel" }, members = {} },
   { path = { "parallel", "left" }, members = { "left.actor" } },
   { path = { "parallel", "right" }, members = { "right.actor" } },
 }, {
-  ["parallel.split"] = "pending",
   ["left.actor"] = "idle",
   ["right.actor"] = "done",
 })[1]
 eq(settled_children.status, "done",
-  "settled logical children complete a composite despite its pending routing actor")
+  "settled logical children complete a junction-backed composite")
 eq(#settled_children.children, 2, "composite retains its direct logical child count")
-eq(#settled_children.members, 3, "routing actors remain inspectable in flattened membership")
+eq(#settled_children.members, 2, "topology junctions do not become actor members")
 
 local recursive = project({
   { path = { "root" }, members = {} },

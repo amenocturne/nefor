@@ -134,10 +134,104 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 /// result on `nefor.agent.Result`. Both `llm`s are seeded with a
 /// `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_program() -> Value {
-    fn named(name: &str) -> Value {
-        json!({"kind":"named","name":name,"arguments":[]})
+    fn primitive(name: &str) -> Value {
+        json!({"kind":"primitive","name":name})
     }
-    fn agent(prefix: &str) -> Vec<Value> {
+    fn record(name: &str, fields: Vec<(&str, Value)>) -> Value {
+        json!({
+            "kind":"named", "name":name, "arguments":[],
+            "body":{"kind":"record","fields":fields.into_iter().map(|(name, r#type)| json!({"name":name,"type":r#type})).collect::<Vec<_>>()}
+        })
+    }
+    fn named(name: &str) -> Value {
+        match name {
+            "nefor.contracts.ProviderInput" => {
+                record(name, vec![("content", primitive("JsonValue"))])
+            }
+            "nefor.contracts.ToolCall" => record(
+                name,
+                vec![
+                    ("arguments", primitive("JsonValue")),
+                    ("name", primitive("String")),
+                ],
+            ),
+            "nefor.contracts.ToolCalls" => record(
+                name,
+                vec![(
+                    "calls",
+                    json!({"kind":"list","item":named("nefor.contracts.ToolCall")}),
+                )],
+            ),
+            "nefor.contracts.ToolHandle" => record(name, vec![("results", primitive("JsonValue"))]),
+            "nefor.contracts.TextAnswer" => {
+                json!({"kind":"named","name":name,"arguments":[],"body":primitive("String")})
+            }
+            "nefor.contracts.OptionalIdentifier" => record(
+                name,
+                vec![
+                    ("present", primitive("Bool")),
+                    ("value", primitive("String")),
+                ],
+            ),
+            "nefor.contracts.ProviderError" => record(
+                name,
+                vec![
+                    ("detail", named("nefor.contracts.OptionalIdentifier")),
+                    ("message", primitive("String")),
+                ],
+            ),
+            "nefor.contracts.OutputViolation" => record(
+                name,
+                vec![
+                    ("actual", primitive("String")),
+                    ("code", primitive("String")),
+                    ("expected", primitive("String")),
+                    ("message", primitive("String")),
+                    ("path", primitive("String")),
+                ],
+            ),
+            "nefor.contracts.OutputValidationError" => record(
+                name,
+                vec![(
+                    "violations",
+                    json!({"kind":"list","item":named("nefor.contracts.OutputViolation")}),
+                )],
+            ),
+            "nefor.contracts.AgentErrorReason" => json!({
+                "kind":"adt", "name":name, "arguments":[], "constructors":[
+                    {"name":"OutputValidationError","payload":named("nefor.contracts.OutputValidationError")},
+                    {"name":"ProviderError","payload":named("nefor.contracts.ProviderError")}
+                ]
+            }),
+            "nefor.contracts.AgentError" => record(
+                name,
+                vec![
+                    ("last_output", primitive("JsonValue")),
+                    ("reason", named("nefor.contracts.AgentErrorReason")),
+                ],
+            ),
+            other => json!({"kind":"named","name":other,"arguments":[]}),
+        }
+    }
+    fn endpoint(id: &str) -> Value {
+        json!({"constructor":"ActorEndpoint","value":{"id":id}})
+    }
+    fn type_id(semantic_type: &Value) -> String {
+        nefor_mag::json::concrete_type_from_json(semantic_type)
+            .expect("fixture semantic type")
+            .stable_id()
+            .as_str()
+            .to_owned()
+    }
+    fn port(id: &str, wire: &str, semantic_type: &Value) -> Value {
+        json!({
+            "endpoint": endpoint(id),
+            "type": semantic_type,
+            "type_id": type_id(semantic_type),
+            "wire": wire
+        })
+    }
+    fn agent(prefix: &str) -> (Vec<Value>, Vec<Value>) {
         let provider_input = named("nefor.contracts.ProviderInput");
         let tool_calls = named("nefor.contracts.ToolCalls");
         let text_answer = named("nefor.contracts.TextAnswer");
@@ -151,66 +245,90 @@ fn two_agent_program() -> Value {
             ]
         });
         let tool_handle = named("nefor.contracts.ToolHandle");
-        vec![
+        let llm = format!("{prefix}.llm");
+        let run_tool = format!("{prefix}.run-tool");
+        let tool_result = format!("{prefix}.tool-result");
+        let actors = vec![
             json!({
-                "id": format!("{prefix}.llm"),
+                "id": llm,
                 "factory": "llm",
                 "type_arguments": [result.clone()],
-                "input":{"wire":"generic-provider.ProviderOut","type":provider_input.clone()},
-                "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"nefor.agent.Result","type":result}],
+                "input": port(&llm, "generic-provider.ProviderOut", &provider_input),
+                "outputs":[port(&llm, "generic-tool.ToolCalls", &tool_calls), port(&llm, "nefor.agent.Result", &result)],
                 "params": {"$mag": "packed-value", "value": {
                     "model": "opus", "provider": PROVIDER, "system": "work",
                     "output_type": "text-answer", "error_type": "agent-error",
                     "provider_error_type": "provider-error"
-                }},
-                "routes": {
-                    "generic-tool.ToolCalls": [{
-                        "actor": format!("{prefix}.run-tool"),
-                        "wire": "generic-tool.ToolCalls"
-                    }],
-                    "nefor.agent.Result": []
-                }
+                }}
             }),
             json!({
-                "id": format!("{prefix}.run-tool"),
+                "id": run_tool,
                 "factory": "run-tool",
                 "type_arguments": [],
-                "input":{"wire":"generic-tool.ToolCalls","type":tool_calls},
-                "outputs":[{"wire":"generic-tool.ToolHandle","type":tool_handle.clone()}],
-                "params": {"$mag": "packed-value", "value": {}},
-                "routes": { "generic-tool.ToolHandle": [{
-                    "actor": format!("{prefix}.tool-result"),
-                    "wire": "generic-tool.ToolHandle"
-                }] }
+                "input": port(&run_tool, "generic-tool.ToolCalls", &tool_calls),
+                "outputs":[port(&run_tool, "generic-tool.ToolHandle", &tool_handle)],
+                "params": {"$mag": "packed-value", "value": {
+                    "model":"opus", "provider":PROVIDER, "model_profile":{"present":false,"value":""},
+                    "conversation_peer":llm, "tools":[], "tool_approval_policy":{"rules":{}}
+                }}
             }),
             json!({
-                "id": format!("{prefix}.tool-result"),
+                "id": tool_result,
                 "factory": "tool-result",
                 "type_arguments": [],
-                "input":{"wire":"generic-tool.ToolHandle","type":tool_handle},
-                "outputs":[{"wire":"generic-provider.ProviderOut","type":provider_input}],
-                "params": {"$mag": "packed-value", "value": {}},
-                "routes": { "generic-provider.ProviderOut": [{
-                    "actor": format!("{prefix}.llm"),
-                    "wire": "generic-provider.ProviderOut"
-                }] }
+                "input": port(&tool_result, "generic-tool.ToolHandle", &tool_handle),
+                "outputs":[port(&tool_result, "generic-provider.ProviderOut", &provider_input)],
+                "params": {"$mag": "packed-value", "value": {}}
             }),
-        ]
+        ];
+        let routes = vec![
+            json!({"id":format!("{prefix}.llm-to-run-tool"),"from":port(&llm,"generic-tool.ToolCalls",&tool_calls),"to":port(&run_tool,"generic-tool.ToolCalls",&tool_calls),"product_position":-1}),
+            json!({"id":format!("{prefix}.run-tool-to-tool-result"),"from":port(&run_tool,"generic-tool.ToolHandle",&tool_handle),"to":port(&tool_result,"generic-tool.ToolHandle",&tool_handle),"product_position":-1}),
+            json!({"id":format!("{prefix}.tool-result-to-llm"),"from":port(&tool_result,"generic-provider.ProviderOut",&provider_input),"to":port(&llm,"generic-provider.ProviderOut",&provider_input),"product_position":-1}),
+        ];
+        (actors, routes)
     }
 
-    let mut actors = agent("a1");
-    actors.extend(agent("a2"));
+    let (mut actors, mut routes) = agent("a1");
+    let (a2_actors, a2_routes) = agent("a2");
+    actors.extend(a2_actors);
+    routes.extend(a2_routes);
+    let provider_input = named("nefor.contracts.ProviderInput");
+    let result = json!({
+        "kind":"adt", "name":"core.types.Result", "arguments":[named("nefor.contracts.AgentError"), named("nefor.contracts.TextAnswer")],
+        "constructors":[{"name":"Error","payload":named("nefor.contracts.AgentError")},{"name":"Ok","payload":named("nefor.contracts.TextAnswer")}]
+    });
+    let mut types = Map::new();
+    for actor in &actors {
+        let ports = std::iter::once(&actor["input"]).chain(
+            actor["outputs"]
+                .as_array()
+                .expect("fixture actor outputs")
+                .iter(),
+        );
+        for port in ports {
+            types.insert(
+                port["type_id"]
+                    .as_str()
+                    .expect("fixture port type id")
+                    .to_owned(),
+                port["type"].clone(),
+            );
+        }
+    }
     json!({
         "format": "nefor.mag",
-        "version": 2,
+        "version": 3,
         "kind": "program",
         "program": {
             "initial": {
-                "types": {},
+                "types": types,
                 "actors": actors,
+                "junctions": [],
+                "routes": routes,
                 "messages": [
-                    { "to": "a1.llm", "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a1" }] } } },
-                    { "to": "a2.llm", "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a2" }] } } }
+                    { "to": port("a1.llm", "generic-provider.ProviderOut", &provider_input), "semantic_type":provider_input, "semantic_type_id":type_id(&named("nefor.contracts.ProviderInput")), "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a1" }], "semantic_value":{"content":{"messages":[{"role":"user","content":"go-a1"}]}} } } },
+                    { "to": port("a2.llm", "generic-provider.ProviderOut", &named("nefor.contracts.ProviderInput")), "semantic_type":named("nefor.contracts.ProviderInput"), "semantic_type_id":type_id(&named("nefor.contracts.ProviderInput")), "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a2" }], "semantic_value":{"content":{"messages":[{"role":"user","content":"go-a2"}]}} } } }
                 ],
                 "nodes": [
                     {"path":["a1.llm"],"members":["a1.llm"]},
@@ -221,13 +339,7 @@ fn two_agent_program() -> Value {
                     {"path":["a2.tool-result"],"members":["a2.tool-result"]}
                 ],
                 "kills": [],
-                "result": {
-                    "from": {
-                        "actor": "a1.llm",
-                        "type": "nefor.agent.Result",
-                        "wire": "nefor.agent.Result"
-                    }
-                }
+                "result": {"from": port("a1.llm", "nefor.agent.Result", &result)}
             },
             "operations": []
         }
@@ -521,11 +633,12 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                                 "artifact".into(),
                                 json!({
                                     "format": "nefor.mag",
-                                    "version": 2,
+                                    "version": 3,
                                     "kind": "delta",
                                     "delta": {
                                         "types": {},
                                         "actors": [],
+                                        "junctions": [], "routes": [],
                                         "messages": [],
                                         "kills": ["a2.llm", "a2.run-tool", "a2.tool-result"],
                                         "nodes": []
@@ -1019,12 +1132,15 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
             "run_id": "approval-run",
             "source": "chat.human_approval",
             "artifact": {
-                "format": "nefor.mag", "version": 2, "kind": "delta",
+                "format": "nefor.mag", "version": 3, "kind": "delta",
                 "delta": {
                     "types": {},
                     "actors": [],
+                    "junctions": [], "routes": [],
                     "messages": [{
-                        "to": "approval.human",
+                        "to": {"endpoint":{"constructor":"ActorEndpoint","value":{"id":"approval.human"}}, "type":reply_type.clone(), "type_id":reply_type_id.clone(), "wire":"mag.ApprovalReply"},
+                        "semantic_type": {"kind":"primitive", "name":"String"},
+                        "semantic_type_id": "String",
                         "content": {"$mag": "packed-value", "value": {
                             "kind": "mag.ApprovalReply", "approved": true,
                             "content": "untyped", "reason": ""
@@ -1040,7 +1156,7 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
     )
     .await;
     loop {
-        let outgoing = read_outgoing(&mut reader, "untyped approval rejection").await;
+        let outgoing = read_outgoing(&mut reader, "mismatched approval rejection").await;
         let Some(body) = event_body(&outgoing) else {
             continue;
         };
@@ -1055,7 +1171,7 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
             assert!(body
                 .get("error")
                 .and_then(Value::as_str)
-                .is_some_and(|error| error.contains("requires delta semantic declarations")));
+                .is_some_and(|error| error.contains("semantic")));
             break;
         }
     }
@@ -1068,12 +1184,13 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
             "run_id": "approval-run",
             "source": "chat.human_approval",
             "artifact": {
-                "format": "nefor.mag", "version": 2, "kind": "delta",
+                "format": "nefor.mag", "version": 3, "kind": "delta",
                 "delta": {
                     "types": {(reply_type_id.clone()): reply_type.clone()},
                     "actors": [],
+                    "junctions": [], "routes": [],
                     "messages": [{
-                        "to": "approval.human",
+                        "to": {"endpoint":{"constructor":"ActorEndpoint","value":{"id":"approval.human"}}, "type":reply_type.clone(), "type_id":reply_type_id.clone(), "wire":"mag.ApprovalReply"},
                         "semantic_type": reply_type.clone(),
                         "semantic_type_id": reply_type_id.clone(),
                         "content": {"$mag": "packed-value", "value": {
@@ -1111,12 +1228,13 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
     }
 
     let delta = json!({
-        "format": "nefor.mag", "version": 2, "kind": "delta",
+        "format": "nefor.mag", "version": 3, "kind": "delta",
         "delta": {
             "types": {(reply_type_id.clone()): reply_type.clone()},
             "actors": [],
+            "junctions": [], "routes": [],
             "messages": [{
-                "to": "approval.human",
+                "to": {"endpoint":{"constructor":"ActorEndpoint","value":{"id":"approval.human"}}, "type":reply_type.clone(), "type_id":reply_type_id.clone(), "wire":"mag.ApprovalReply"},
                 "semantic_type": reply_type,
                 "semantic_type_id": reply_type_id,
                 "content": {
@@ -1346,7 +1464,7 @@ async fn project_build_process_restart_hit_and_cold_load_equivalence() {
     std::fs::write(project.path().join("mag.toml"), "version = 1\n").unwrap();
     std::fs::write(
         project.path().join("main.json"),
-        r#"{"format":"nefor.mag","version":2,"kind":"delta","delta":{"types":{},"actors":[],"messages":[],"nodes":[],"kills":[]}}"#,
+        r#"{"format":"nefor.mag","version":3,"kind":"delta","delta":{"types":{},"actors":[],"junctions":[],"routes":[],"messages":[],"nodes":[],"kills":[]}}"#,
     )
     .unwrap();
     std::fs::write(

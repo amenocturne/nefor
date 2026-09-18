@@ -4640,7 +4640,11 @@ fn mag_human_approval_is_run_addressed_and_cancel_safe() {
         Some("run-live")
     );
     assert_eq!(
-        body.pointer("/artifact/delta/messages/0/to")
+        body.pointer("/artifact/version").and_then(|v| v.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        body.pointer("/artifact/delta/messages/0/to/endpoint/value/id")
             .and_then(|v| v.as_str()),
         Some("gate-b")
     );
@@ -9386,7 +9390,7 @@ fn recursive_sidebar_state_and_counts_ignore_hidden_routing_actors() {
     );
     assert!(
         !settled.contains("implement (7)"),
-        "three attached routing actors must not inflate the logical child count:\n{settled}"
+        "direct implementation actors must not inflate the logical child count:\n{settled}"
     );
     assert!(
         settled.contains("sidebar-state (1/1)"),
@@ -9738,7 +9742,7 @@ fn long_workflow_name_ellipsizes_before_protected_progress() {
             "kind": "mag.actor_spawned",
             "run_id": "layout-long",
             "id": "output",
-            "factory": "nefor.factory.output"
+            "factory": "test.output"
         }),
     );
 
@@ -9781,7 +9785,7 @@ fn settled_firing_completes_its_workflow_node_without_killing_its_actor() {
     for (id, factory) in [
         ("task", "nefor.factory.source"),
         ("investigator.llm", "nefor.factory.llm"),
-        ("result", "nefor.factory.output"),
+        ("result", "test.output"),
     ] {
         dispatch_event(
             &mut engine,

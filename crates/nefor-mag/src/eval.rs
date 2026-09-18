@@ -1297,6 +1297,31 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
             };
             Ok(Value::Str(name))
         }
+        "adt_constructor_payload" => {
+            arity(args, 2)?;
+            let Value::TypeDescriptor(ty) = raw(&args[0]) else {
+                return Err(MagError::Type(
+                    "adt_constructor_payload expects a TypeDescriptor".into(),
+                ));
+            };
+            let Value::Str(name) = raw(&args[1]) else {
+                return Err(MagError::Type(
+                    "adt_constructor_payload expects a constructor name".into(),
+                ));
+            };
+            let ConcreteType::Adt { constructors, .. } = ty else {
+                return Err(MagError::Type(
+                    "adt_constructor_payload requires an ADT owner".into(),
+                ));
+            };
+            let payload = constructors
+                .iter()
+                .find(|constructor| constructor.name == name.as_ref())
+                .ok_or_else(|| {
+                    MagError::Type(format!("constructor {name} is not a member of this ADT"))
+                })?;
+            Ok(Value::TypeDescriptor(payload.payload.clone()))
+        }
         "type_arguments" => {
             arity(args, 1)?;
             let Value::TypeDescriptor(ty) = raw(&args[0]) else {

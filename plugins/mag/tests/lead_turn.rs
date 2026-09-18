@@ -317,7 +317,7 @@ async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
         .cloned()
         .expect("mag.loaded carries the compiled artifact");
     assert_eq!(artifact.get("format"), Some(&json!("nefor.mag")));
-    assert_eq!(artifact.get("version"), Some(&json!(2)));
+    assert_eq!(artifact.get("version"), Some(&json!(3)));
     assert_eq!(artifact.get("kind"), Some(&json!("program")));
     assert!(artifact.pointer("/program/initial").is_some());
     assert!(artifact.pointer("/program/operations").is_some());
@@ -328,13 +328,13 @@ async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
 fn program_initial(artifact: &Value) -> &Value {
     artifact
         .pointer("/program/initial")
-        .expect("nefor.mag v1 program.initial")
+        .expect("nefor.mag v3 program.initial")
 }
 
 fn program_initial_mut(artifact: &mut Value) -> &mut Value {
     artifact
         .pointer_mut("/program/initial")
-        .expect("nefor.mag v1 program.initial")
+        .expect("nefor.mag v3 program.initial")
 }
 
 /// The spawner's per-turn clone: point the initial task at the user
@@ -456,12 +456,9 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
         structured.pointer("/params/value/schema/version"),
         Some(&json!(2))
     );
-    assert_eq!(
-        structured
-            .pointer("/routes/nefor.agent.Result/0")
-            .and_then(Value::as_str),
-        None,
-        "terminal validated output is not routed onward"
+    assert!(
+        structured.get("routes").is_none(),
+        "artifact-v3 actors do not own routes"
     );
 
     send_event(
@@ -514,13 +511,13 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     let first_chat = create["request_id"].as_str().unwrap().to_owned();
     assert_eq!(create.pointer_str("/output_schema/type"), Some("object"));
     assert_eq!(
-        create.pointer_str("/output_schema/properties/task/type"),
+        create.pointer_str("/output_schema/properties/value/properties/task/type"),
         Some("string")
     );
     assert_eq!(
         create
             .get("output_schema")
-            .and_then(|schema| schema.get("additionalProperties")),
+            .and_then(|schema| schema.pointer("/properties/value/additionalProperties")),
         Some(&Value::Bool(false))
     );
     send_event(
@@ -543,7 +540,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     );
     send_event(
         &mut stdin,
-        completed(MOCK, &second_chat, json!({ "text": "{\"task\":\"build\",\"description\":\"Implement it\",\"dependent_tasks\":[]}" })),
+        completed(MOCK, &second_chat, json!({ "text": "{\"value\":{\"task\":\"build\",\"description\":\"Implement it\",\"dependent_tasks\":[]}}" })),
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -618,7 +615,7 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
         completed(
             MOCK,
             &reviewer_id,
-            json!({"text": "{\"assessment\":\"continue from partial work\"}"}),
+            json!({"text": "{\"value\":{\"assessment\":\"continue from partial work\"}}"}),
         ),
     )
     .await;
@@ -637,6 +634,16 @@ async fn complete_chat<R: AsyncBufReadExt + Unpin>(
     request_id: &str,
     text: &str,
 ) {
+    let text = serde_json::from_str::<Value>(text)
+        .ok()
+        .map(|value| {
+            if value.get("value").is_some() {
+                value
+            } else {
+                json!({"value": value})
+            }
+        })
+        .map_or_else(|| text.to_owned(), |value| value.to_string());
     send_event(
         stdin,
         completed("mock-provider", request_id, json!({"text": text})),
@@ -653,7 +660,7 @@ fn dynamic_behavior_fixture() -> Value {
 
 fn assert_dynamic_program_envelope(artifact: &Value) {
     assert_eq!(artifact["format"], "nefor.mag");
-    assert_eq!(artifact["version"], 2);
+    assert_eq!(artifact["version"], 3);
     assert_eq!(artifact["kind"], "program");
     let program = artifact["program"].as_object().expect("program payload");
     let operations = program["operations"]
@@ -662,9 +669,10 @@ fn assert_dynamic_program_envelope(artifact: &Value) {
     assert_eq!(operations.len(), 1);
     let operation = &operations[0];
     assert_eq!(operation["id"], "expand.expand");
-    assert_eq!(operation["on_actor"], "expand.input");
-    assert_eq!(operation["on_wire"], "nefor.dynamic.Indexed");
-    assert!(operation["trigger_type_id"]
+    assert_eq!(operation["on"]["endpoint"]["value"]["id"], "expand.input");
+    assert_eq!(operation["on"]["endpoint"]["constructor"], "ActorEndpoint");
+    assert_eq!(operation["on"]["wire"], "nefor.dynamic.Indexed");
+    assert!(operation["on"]["type_id"]
         .as_str()
         .is_some_and(|value| value.starts_with("sha256:")));
     let expressions = operation["expressions"]
@@ -763,13 +771,22 @@ fn assert_dynamic_program_envelope(artifact: &Value) {
     );
     assert_eq!(run_tool["parameter_bindings"], json!([]));
     assert_ne!(run_tool["id"], llm["id"]);
+    let template_routes = operation["template"]["routes"]
+        .as_array()
+        .expect("template routes");
+    assert_eq!(template_routes.len(), 6);
+    assert!(template_routes.iter().all(|route| {
+        route.pointer("/from/endpoint/constructor").is_some()
+            && route.pointer("/to/endpoint/constructor").is_some()
+            && route.get("product_position").is_some()
+    }));
     let template_messages = operation["template"]["messages"]
         .as_array()
         .expect("template messages");
     assert_eq!(template_messages.len(), 1);
     let input_message = &template_messages[0];
     assert_eq!(
-        input_message.pointer("/to/actor/value/slot"),
+        input_message.pointer("/to/endpoint/value/slot"),
         Some(&json!("worker.entry"))
     );
     assert_eq!(input_message["content"]["constructor"], "Expression");
@@ -950,35 +967,15 @@ fn assert_materialized_item(events: &[Value], expected: &Value, index: usize) {
         .as_str()
         .is_some_and(|collection| !collection.is_empty()));
 
-    for route in expected["routes"].as_array().expect("fixture routes") {
-        let source = actor_for_slot(route["from"].as_str().expect("route source slot"));
-        let destination = actor_for_slot(route["to"].as_str().expect("route target slot"));
-        let from_wire = route["from_wire"].as_str().expect("route source wire");
-        let to_wire = route["to_wire"].as_str().expect("route target wire");
-        let stored = source["spec"]["routes"][from_wire]
-            .as_array()
-            .expect("source routes")
-            .iter()
-            .find(|stored| stored["actor"] == destination["id"] && stored["wire"] == to_wire)
-            .expect("materialized route");
-        assert_eq!(stored["product_position"], route["product_position"]);
-        let source_port = source["spec"]["outputs"]
-            .as_array()
-            .expect("source outputs")
-            .iter()
-            .find(|port| port["wire"] == from_wire)
-            .expect("source route port");
-        let canonical: Value = serde_json::from_str(
-            stored["edge_id"]
-                .as_str()
-                .expect("canonical edge id string"),
-        )
-        .expect("canonical edge id JSON");
-        assert_eq!(
-            canonical,
-            json!({"from": source_port, "to": destination["spec"]["input"]})
-        );
-    }
+    let actors_with_routes = spawned
+        .iter()
+        .filter(|event| event["spec"].get("routes").is_some())
+        .map(|event| json!({"id": event["id"], "routes": event["spec"]["routes"]}))
+        .collect::<Vec<_>>();
+    assert!(
+        actors_with_routes.is_empty(),
+        "artifact-v3 actors do not own routes: {actors_with_routes:?}"
+    );
 
     let entry = actor_for_slot("worker.entry");
     let message = &expected["message"];
@@ -1005,13 +1002,23 @@ fn assert_materialized_item(events: &[Value], expected: &Value, index: usize) {
         .map(|node| node["path"].clone())
         .collect::<Vec<_>>();
     assert_eq!(node_paths.len(), occurrence_ids.len());
+    let trigger_path = events
+        .iter()
+        .filter(|event| event["kind"] == "mag.nodes_declared")
+        .flat_map(|event| event["nodes"].as_array().into_iter().flatten())
+        .find(|node| {
+            node["members"]
+                .as_array()
+                .is_some_and(|members| members.contains(&json!("expand.input")))
+        })
+        .and_then(|node| node["path"].as_array())
+        .expect("traversal trigger has a declared logical owner");
     assert!(
         node_paths.iter().all(|path| {
             path.as_array().is_some_and(|segments| {
-                segments.first() == Some(&json!("workers-result"))
-                    && segments.get(1) == Some(&json!("expand"))
+                segments.starts_with(trigger_path)
                     && segments
-                        .get(2)
+                        .get(trigger_path.len())
                         .and_then(Value::as_str)
                         .is_some_and(|segment| segment.ends_with(&format!(":{index}")))
             })
@@ -1045,7 +1052,9 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         .pointer("/program/initial")
         .expect("program envelope initial");
     assert_eq!(
-        initial.pointer("/messages/0/to").and_then(Value::as_str),
+        initial
+            .pointer("/messages/0/to/endpoint/value/id")
+            .and_then(Value::as_str),
         Some("task")
     );
     assert_eq!(
@@ -1136,7 +1145,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         completed(
             "mock-provider",
             &second_id,
-            json!({"text":r#"{"task":"same","description":"done second"}"#}),
+            json!({"text":r#"{"value":{"task":"same","description":"done second"}}"#}),
         ),
     )
     .await;
@@ -1145,7 +1154,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         completed(
             "mock-provider",
             &first_id,
-            json!({"text":r#"{"task":"same","description":"done first"}"#}),
+            json!({"text":r#"{"value":{"task":"same","description":"done first"}}"#}),
         ),
     )
     .await;
@@ -1164,11 +1173,11 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         Some("object")
     );
     assert_eq!(
-        summary_create.pointer_str("/output_schema/title"),
+        summary_create.pointer_str("/output_schema/properties/value/title"),
         Some("main.Summary")
     );
     assert_eq!(
-        summary_create.pointer_str("/output_schema/properties/content/type"),
+        summary_create.pointer_str("/output_schema/properties/value/properties/content/type"),
         Some("string")
     );
     let output_schema = summary_create["output_schema"]
@@ -1208,7 +1217,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         completed(
             "mock-provider",
             &summary_id,
-            json!({"text":"{\"content\":\"done\"}"}),
+            json!({"text":"{\"value\":{\"content\":\"done\"}}"}),
         ),
     )
     .await;
@@ -1323,7 +1332,7 @@ async fn dynamic_tasks_zero_uses_empty_collection_identity_and_reaches_summarize
         completed(
             "mock-provider",
             &summary_id,
-            json!({"text":"{\"content\":\"empty\"}"}),
+            json!({"text":"{\"value\":{\"content\":\"empty\"}}"}),
         ),
     )
     .await;

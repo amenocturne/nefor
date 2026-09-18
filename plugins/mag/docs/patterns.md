@@ -8,8 +8,8 @@ the distinctions that matter.
 
 `nefor.node.sequence` accepts a compile-time `List<Node<I, O>>` and returns
 `Node<I, List<O>>`. The supplied node order defines result order even when
-actors finish out of order. A nonempty list infers its types; `sequence_empty<I, O>(id)` explicitly
-constructs the empty case and produces `[]` after its input activation.
+actors finish out of order. The list must be nonempty so its node boundary and
+result element type come from actual children; an empty list is rejected during compilation.
 
 `nefor.dynamic.DynamicList<O>` is a distinct runtime effect. It emits indexed
 occurrences plus explicit completion. Consumers retain that same nominal type;

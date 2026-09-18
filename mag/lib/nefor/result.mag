@@ -1,47 +1,36 @@
 import core.types.{}
 
 import nefor.graph.{}
-
+import nefor.mag.{}
 import nefor.node.{}
 
-// Lift an ordinary successful value into the nominal Result channel.
-let lift<I, E, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, core.types.Result<E, O>> = |id, value| => {
-  let ok = nefor.node.pack_adt<O, core.types.Result<E, O>>(str(id, ".ok"), "Ok")
-  let composed = nefor.node.compose(id, value, ok)
-  nefor.graph.node_with_occurrences_and_nodes(id, get(composed, "role"), get(composed, "actors"), get(composed, "routes"), get(composed, "messages"), get(composed, "operations"), nefor.node.compound_nodes(id, get(ok, "actors"), get(value, "nodes")), nefor.node.compound_child_occurrences(id, 0, value), nefor.node.compound_child_executions(id, 0, value), get(composed, "input"), get(composed, "output"))
-}
+let lift<I, E, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, core.types.Result<E, O>> = |id, value| => nefor.node.compose(id, value, nefor.node.pack_adt<O, core.types.Result<E, O>>(str(id, ".ok"), "Ok"))
 
-// Continue only the successful branch and preserve Error unchanged.
-let and_then<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, left, right| => {
+// Route a Result through exactly one branch, then merge already packed Result
+// values. The split, packs, and merge are topology junctions, not actors.
+let branch_result<E, A, F, B>: fn(String, nefor.graph.Node<E, core.types.Result<F, B>>, nefor.graph.Node<A, core.types.Result<F, B>>) -> nefor.graph.Node<core.types.Result<E, A>, core.types.Result<F, B>> = |id, error_path, ok_path| => {
   let split_id = str(id, ".split")
-  let split_input = nefor.graph.port(split_id, type_tag<core.types.Result<E, A>>(), "nefor.adt.Value")
-  let failed = nefor.graph.port(split_id, type_tag<E>(), "nefor.adt.First")
-  let succeeded = nefor.graph.port(split_id, type_tag<A>(), "nefor.adt.Second")
-  let split = nefor.graph.closed_actor(split_id, nefor.node.adt_unpack_factory, [type_evidence(type_tag<core.types.Result<E, A>>()), type_evidence(type_tag<E>()), type_evidence(type_tag<A>())], nefor.node.AdtUnpackParams {owner: type_evidence(type_tag<core.types.Result<E, A>>()), left_payload: type_evidence(type_tag<E>()), right_payload: type_evidence(type_tag<A>()), left_constructor: "Error", right_constructor: "Ok"}, nefor.graph.store_port(split_input), [nefor.graph.store_port(failed), nefor.graph.store_port(succeeded)], [])
-  let preserve_error = nefor.node.pack_adt<E, core.types.Result<E, B>>(str(id, ".error"), "Error")
-  let output = nefor.graph.identity<core.types.Result<E, B>>(str(id, ".output"))
-  nefor.graph.node_with_occurrences_and_nodes(id, get(left, "role"), concat(get(left, "actors"), concat([split], concat(get(right, "actors"), concat(get(preserve_error, "actors"), get(output, "actors"))))), concat(get(left, "routes"), concat(get(right, "routes"), concat(get(preserve_error, "routes"), concat(get(output, "routes"), [nefor.graph.stored_route(get(left, "output"), split_input), nefor.graph.stored_route(succeeded, get(right, "input")), nefor.graph.stored_route(failed, get(preserve_error, "input")), nefor.graph.stored_route(get(right, "output"), get(output, "input")), nefor.graph.stored_route(get(preserve_error, "output"), get(output, "input"))])))), concat(get(left, "messages"), concat(get(right, "messages"), concat(get(preserve_error, "messages"), get(output, "messages")))), concat(get(left, "operations"), concat(get(right, "operations"), concat(get(preserve_error, "operations"), get(output, "operations")))), concat(get(left, "nodes"), nefor.graph.attach_logical_members(get(right, "nodes"), concat([split_id], concat(nefor.graph.actor_ids(get(preserve_error, "actors")), nefor.graph.actor_ids(get(output, "actors")))))), concat(nefor.node.transparent_child_occurrences(id, 0, left), nefor.graph.attach_logical_occurrences(nefor.node.transparent_child_occurrences(id, 1, right), get(right, "nodes"), concat([split_id], concat(nefor.graph.actor_ids(get(preserve_error, "actors")), nefor.graph.actor_ids(get(output, "actors")))))), concat(nefor.node.transparent_child_executions(id, 0, left), nefor.node.transparent_child_executions(id, 1, right)), get(left, "input"), get(output, "output"))
+  let input = nefor.graph.junction_port(split_id, type_tag<core.types.Result<E, A>>(), "value")
+  let failed = nefor.graph.junction_port(split_id, type_tag<E>(), "Error")
+  let succeeded = nefor.graph.junction_port(split_id, type_tag<A>(), "Ok")
+  let split = nefor.graph.junction(split_id, nefor.graph.adt_unpack_operation(nefor.mag.AdtUnpackSpec {owner: type_evidence(type_tag<core.types.Result<E, A>>()), branches: [nefor.mag.AdtBranch {constructor: "Error", payload: type_evidence(type_tag<E>()), wire: "Error"}, nefor.mag.AdtBranch {constructor: "Ok", payload: type_evidence(type_tag<A>()), wire: "Ok"}]}), [nefor.graph.store_port(input)], [nefor.graph.store_port(failed), nefor.graph.store_port(succeeded)])
+  let output_node = nefor.graph.identity<core.types.Result<F, B>>(str(id, ".output"))
+  nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, "ordinary", concat(get(error_path, "actors"), get(ok_path, "actors")), concat([split], concat(get(error_path, "junctions"), concat(get(ok_path, "junctions"), get(output_node, "junctions")))), concat(get(error_path, "routes"), concat(get(ok_path, "routes"), concat(get(output_node, "routes"), [nefor.graph.stored_route(failed, get(error_path, "input")), nefor.graph.stored_route(succeeded, get(ok_path, "input")), nefor.graph.stored_route(get(error_path, "output"), get(output_node, "input")), nefor.graph.stored_route(get(ok_path, "output"), get(output_node, "input"))]))), concat(get(error_path, "messages"), get(ok_path, "messages")), concat(get(error_path, "operations"), get(ok_path, "operations")), nefor.node.compound_nodes(id, [], concat(get(error_path, "nodes"), get(ok_path, "nodes"))), concat(nefor.node.compound_child_occurrences(id, 0, error_path), nefor.node.compound_child_occurrences(id, 1, ok_path)), concat(nefor.node.compound_child_executions(id, 0, error_path), nefor.node.compound_child_executions(id, 1, ok_path)), input, get(output_node, "output"))
 }
 
-// Apply an ordinary node to Ok while preserving Error. The named form is the
-// explicit hierarchy/identity boundary; map is ordinary structural composition.
+let and_then<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, left, right| => {
+  let preserve_error = nefor.node.pack_adt<E, core.types.Result<E, B>>(str(id, ".error"), "Error")
+  let branch = branch_result<E, A, E, B>(str(id, ".branch"), preserve_error, right)
+  nefor.node.compose(id, left, branch)
+}
 let map_named<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, result_node, value_node| => and_then(id, result_node, lift<A, E, B>(str(id, ".lift"), value_node))
-
 let map<I, E, A, B>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |result_node, value_node| => map_named(nefor.node.composite_id(get(result_node, "id"), "result.map", get(value_node, "id")), result_node, value_node)
 
-// Apply an ordinary node to Error while preserving Ok.
 let map_error_named<I, E, F, A>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |id, result_node, error_node| => {
-  let split_id = str(id, ".split")
-  let split_input = nefor.graph.port(split_id, type_tag<core.types.Result<E, A>>(), "nefor.adt.Value")
-  let failed = nefor.graph.port(split_id, type_tag<E>(), "nefor.adt.First")
-  let succeeded = nefor.graph.port(split_id, type_tag<A>(), "nefor.adt.Second")
-  let split = nefor.graph.closed_actor(split_id, nefor.node.adt_unpack_factory, [type_evidence(type_tag<core.types.Result<E, A>>()), type_evidence(type_tag<E>()), type_evidence(type_tag<A>())], nefor.node.AdtUnpackParams {owner: type_evidence(type_tag<core.types.Result<E, A>>()), left_payload: type_evidence(type_tag<E>()), right_payload: type_evidence(type_tag<A>()), left_constructor: "Error", right_constructor: "Ok"}, nefor.graph.store_port(split_input), [nefor.graph.store_port(failed), nefor.graph.store_port(succeeded)], [])
-  let mapped_error = nefor.node.pack_adt<F, core.types.Result<F, A>>(str(id, ".error"), "Error")
+  let mapped_error: nefor.graph.Node<E, core.types.Result<F, A>> = nefor.node.compose(str(id, ".error"), error_node, nefor.node.pack_adt<F, core.types.Result<F, A>>(str(id, ".pack-error"), "Error"))
   let preserve_ok = nefor.node.pack_adt<A, core.types.Result<F, A>>(str(id, ".ok"), "Ok")
-  let output = nefor.graph.identity<core.types.Result<F, A>>(str(id, ".output"))
-  nefor.graph.node_with_occurrences_and_nodes(id, get(result_node, "role"), concat(get(result_node, "actors"), concat([split], concat(get(error_node, "actors"), concat(get(mapped_error, "actors"), concat(get(preserve_ok, "actors"), get(output, "actors")))))), concat(get(result_node, "routes"), concat(get(error_node, "routes"), concat(get(mapped_error, "routes"), concat(get(preserve_ok, "routes"), concat(get(output, "routes"), [nefor.graph.stored_route(get(result_node, "output"), split_input), nefor.graph.stored_route(failed, get(error_node, "input")), nefor.graph.stored_route(get(error_node, "output"), get(mapped_error, "input")), nefor.graph.stored_route(succeeded, get(preserve_ok, "input")), nefor.graph.stored_route(get(mapped_error, "output"), get(output, "input")), nefor.graph.stored_route(get(preserve_ok, "output"), get(output, "input"))]))))), concat(get(result_node, "messages"), concat(get(error_node, "messages"), concat(get(mapped_error, "messages"), concat(get(preserve_ok, "messages"), get(output, "messages"))))), concat(get(result_node, "operations"), concat(get(error_node, "operations"), concat(get(mapped_error, "operations"), concat(get(preserve_ok, "operations"), get(output, "operations"))))), concat(get(result_node, "nodes"), nefor.graph.attach_logical_members(get(error_node, "nodes"), concat([split_id], concat(nefor.graph.actor_ids(get(mapped_error, "actors")), concat(nefor.graph.actor_ids(get(preserve_ok, "actors")), nefor.graph.actor_ids(get(output, "actors"))))))), concat(nefor.node.transparent_child_occurrences(id, 0, result_node), nefor.graph.attach_logical_occurrences(nefor.node.transparent_child_occurrences(id, 1, error_node), get(error_node, "nodes"), concat([split_id], concat(nefor.graph.actor_ids(get(mapped_error, "actors")), concat(nefor.graph.actor_ids(get(preserve_ok, "actors")), nefor.graph.actor_ids(get(output, "actors"))))))), concat(nefor.node.transparent_child_executions(id, 0, result_node), nefor.node.transparent_child_executions(id, 1, error_node)), get(result_node, "input"), get(output, "output"))
+  let branch = branch_result<E, A, F, A>(str(id, ".branch"), mapped_error, preserve_ok)
+  nefor.node.compose(id, result_node, branch)
 }
-
 let map_error<I, E, F, A>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |result_node, error_node| => map_error_named(nefor.node.composite_id(get(result_node, "id"), "result.map_error", get(error_node, "id")), result_node, error_node)
-
 let `>=>`<I, E, A, B>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |left, right| => and_then(nefor.node.composite_id(get(left, "id"), ">=>", get(right, "id")), left, right)

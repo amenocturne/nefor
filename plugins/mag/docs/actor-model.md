@@ -1,14 +1,27 @@
 # Actor model
 
-## Typed dynamic fan-in
+## Structural topology is not actor lifecycle
 
-`nefor.factory.collector<T>` is the internal fixed `nefor.node.sequence`
-join. It receives the kernel-owned source actor id with each activation; payload
-fields cannot impersonate a sender. One FIFO per expected sender preserves
-overlapping activations, and each complete cohort emits one `List<T>` ordered by
-`expected_senders`. Unexpected senders and incomplete drain are terminal
-failures. The empty sequence uses a dedicated recurrent identity actor and emits
-an empty typed list after each input activation.
+Artifact v3 separates real capability actors from typed junctions. Fixed
+composition uses `Pass`, `Unit`, `ProductSplit`, `ProductFirst`, `ProductJoin`,
+`Collect`, `AdtPack`, and `AdtUnpack` junction operations, never
+factory instances. Junctions have no registry entry, logical membership,
+construction, firing/busy window, actor lifecycle event, or per-actor output
+persistence. A run owns their topology and FIFO buffers until teardown.
+
+Each join input wire owns one FIFO. A complete cohort consumes one value from
+each slot in declaration order. Equal types, one producer feeding distinct
+slots, and alternative producers for one slot remain distinct cases: sender
+identity does not determine a slot. Public fixed `sequence` requires at least
+one child. Incomplete cohorts do not fabricate completion.
+
+Top-level routes connect explicit `ActorEndpoint` or `JunctionEndpoint` ports.
+The endpoint variant is part of identity; actor and junction names may coincide.
+Actor routes retain whole-product/component positions; junction destinations use
+`-1` because their explicit slot wires own assembly. A synchronous nonrecursive
+junction queue preserves route declaration order. Actor and junction output
+observation share one terminal boundary, with no synthetic output actor;
+DynamicList items settle only after explicit completion.
 
 ## Interface
 
@@ -27,8 +40,8 @@ runtime does with the returned output (routing, operations) is described in
 ir.md.
 
 The kernel holds one actor inventory **per run**: a single map from actor id
-to instance, shared across all factories. Spawn inserts, kill deletes, routing
-consults nothing else. Runs are concurrent — each `mag.execute` gets its own
+to registered spec and lazy instance, shared across all factories. Spawn and kill
+change actor lifecycle; a separate run-owned topology indexes all routes. Runs are concurrent — each `mag.execute` gets its own
 run context (inventory, routing/firing state, correlations, modification log),
 created at run start and dropped at run end — so actor ids, routes, and sends
 resolve within one run only, and two runs of the same program coexist without
@@ -134,8 +147,8 @@ Construction is lazy: spawn registers, first firing constructs. The
 convention:
 
 1. **On spawn request the kernel registers the spec** — id, factory, params,
-   routes — in the inventory. Routes and slot buffering exist from this
-   moment: senders resolve destinations, and messages to the id are accepted
+   input/output ports — in the inventory. Top-level topology is installed
+   atomically with these specs: senders resolve destinations, and messages to the id are accepted
    whether or not an instance exists. The `mag.actor_spawned` lifecycle event
    fires here, at registration.
 2. **Messages feed the id's firing machine immediately** (ir.md, Firing). A
@@ -167,7 +180,8 @@ receives the shared bus; each consumer actor projects the facts it needs in its
 own Lua state.
 
 - `mag.actor_spawned { run_id, id, factory, spec }` owns the immutable actor
-  structure once: factory, type arguments, params, input/output endpoints, and routes.
+  structure once: factory, type arguments, params, and input/output endpoints.
+  Routes belong to the run topology, not this actor lifecycle fact.
 - `mag.nodes_declared { run_id, nodes }` precedes spawn events for the same
   validated modification and preserves authored logical node paths for
   recursive inspectors. It is presentation ownership only: actors never
@@ -425,8 +439,9 @@ actor's compiler-derived profile selector.
 `Node<I, O>`, including deterministic compositions and agents. Each authored
 actor carries an explicit templateability contract. Arbitrary low-level actors
 default to unsupported; audited constructors declare complete parameter
-relocations, with scalar `conversation_peer` and list `expected_senders`
-references relocated by identity rather than by string replacement.
+relocations, with `conversation_peer` references relocated by identity rather
+than by string replacement. Structural workers may contain zero actors; local
+junction references are typed topology fields, not actor parameter relocations.
 
 The internal template receives each occurrence's complete item through a checked
 expression-bound message on the exact worker input wire. Records, products,
@@ -438,7 +453,7 @@ contracts. Streaming workers and nested operations remain explicitly unsupported
 Template hierarchy uses an explicit trigger-path reference, resolved against the
 trigger actor's immutable logical owner. Naming or wrapping a traversal therefore
 moves its occurrence children with it without parsing or rewriting actor IDs.
-Every occurrence has fresh traversal/collection/index-qualified actor identities,
+Every occurrence has fresh traversal/collection/index-qualified actor and junction identities,
 then returns through one indexed-result actor to the ordered completion consumer.
 
 ### Structured output boundary
