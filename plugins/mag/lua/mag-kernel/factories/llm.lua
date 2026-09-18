@@ -22,7 +22,6 @@ M.declaration = {
     reasoning_effort = "string?",
     provider_options = "table?",
     provider = "string", history = "table?",
-    max_tool_call_corrections = "number?",
     output_type = "string", error_type = "string", provider_error_type = "string",
     conversation_id = "string?",
     turn_id = "string?", submission_ids = "table?", input_cause = "string?",
@@ -64,6 +63,7 @@ function M.construct(id, params, emit, deps)
   end
   return boundary.construct(id, params, emit, {
     conversation = deps.conversation,
+    diagnostic = deps.diagnostic,
     name = "llm",
     steerable = true,
     on_steered_final = function(state, result)

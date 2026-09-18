@@ -1,229 +1,250 @@
--- Focused regressions for validated-only structured-output visibility.
-local structured = require("factories.structured-output")
-
-local function assert_eq(actual, expected, msg)
-  if actual ~= expected then
-    error(string.format("assertion failed: %s\n  expected: %s\n  actual:   %s",
-      msg or "values differ", tostring(expected), tostring(actual)), 2)
-  end
-end
-
-local function assert_true(value, msg)
-  if not value then error("assertion failed: " .. (msg or "expected truthy"), 2) end
-end
-
-local function find_last(messages, kind)
-  for i = #messages, 1, -1 do if messages[i].kind == kind then return messages[i] end end
-end
-
-local function conversation_messages(facts)
-  local messages, by_id = {}, {}
-  for _, fact in ipairs(facts) do
-    if fact.kind == "message_started" then
-      local message = {
-        role = fact.role, content = "", completed = false,
-        visibility = fact.visibility or "transcript",
-      }
-      messages[#messages + 1] = message
-      by_id[fact.message_id] = message
-    elseif fact.kind == "content_chunk_appended" and fact.chunk.kind == "text" then
-      local message = by_id[fact.message_id]
-      if message then message.content = message.content .. fact.chunk.data end
-    elseif fact.kind == "message_completed" then
-      local message = by_id[fact.message_id]
-      if message then
-        message.completed = true
-        if fact.visibility ~= nil then message.visibility = fact.visibility end
-      end
-    end
-  end
-  local completed = {}
-  for _, message in ipairs(messages) do
-    if message.completed then completed[#completed + 1] = message end
-  end
-  return completed
-end
-
-local function turn()
-  return { shape = "single", messages = {{ message = { messages = {
-    { role = "user", content = "answer" },
-  } } }} }
-end
-
-local validations = {}
-nefor.typed_json = {
-  provider_schema = function(_) return { schema = { type = "object" } } end,
-  validate_provider = function(_, _)
-    local next_validation = table.remove(validations, 1)
-    assert_true(next_validation ~= nil, "test supplied a validation result")
-    return next_validation
+-- The intrinsic editor owns one draft per firing; only standalone submission
+-- accepts a validated snapshot. All rejected calls remain ordinary receipts.
+local factory = require("factories.structured-output")
+local run_tool = require("factories.run-tool")
+local files, serial, validations = {}, 0, 0
+local real_schema = nefor.typed_json and nefor.typed_json.schema
+local real_validate = nefor.typed_json and nefor.typed_json.validate
+nefor.opaque_id = function() serial = serial + 1; return tostring(serial) end
+nefor.fs = {
+  data_root = function() return "/runtime-data" end,
+  mkdir_p = function() return { ok = true } end,
+  read_file = function(path)
+    if files[path] == nil then return { ok = false, error = "not found" } end
+    return { ok = true, content = files[path] }
+  end,
+  write_file_atomic = function(path, text)
+    if text == "FAIL_IO" then return { ok = false, error = "disk unavailable" } end
+    files[path] = text; return { ok = true }
   end,
 }
-
-local function make(schema)
-  local messages, diagnostics, facts = {}, {}, {}
-  local instance, err = structured.construct("typed", {
-    provider = "provider", schema = schema, max_corrections = 1,
-    output_type = "direct-id", error_type = "error-id",
-    provider_error_type = "provider-error-id", validation_error_type = "validation-error-id",
-  }, function(message) messages[#messages + 1] = message end, {
-    conversation = {
-      id = "typed:conversation",
-      turn_id = "typed:turn",
-      emit = function(fact) facts[#facts + 1] = fact end,
-    },
-    diagnostic = function(value)
-      diagnostics[#diagnostics + 1] = value
-      return true
-    end,
-  })
-  assert_true(instance ~= nil, err)
-  return instance, messages, diagnostics, facts
+nefor.typed_json = {
+  schema = function(bound) return real_schema and real_schema(bound) or { type = "object", properties = { content = { type = "string" } } } end,
+  validate = function(schema, text)
+    validations = validations + 1
+    if real_validate then return real_validate(schema, text) end
+    local ok, value = pcall(nefor.json.decode, text)
+    if not ok then return { ok = false, error = { code = "invalid_json", message = tostring(value) } } end
+    if schema.root.kind == "list" then return { ok = true, value = value } end
+    if type(value.content) ~= "string" then return { ok = false, violations = {
+      { path = "$.content", code = "missing_field", expected = "string", actual = "missing", message = "required content" } } } end
+    return { ok = true, value = value }
+  end,
+}
+local schema = { version = 2, root = { kind = "record", fields = {
+  { name = "content", schema = { kind = "string" } },
+} } }
+local function last(out, kind)
+  for i = #out, 1, -1 do if out[i].kind == kind then return out[i] end end
 end
-
--- A rejected candidate remains in provider history for correction, but the
--- generic diagnostic fact exposes validation details only.
-do
-  validations = {
-    { ok = false, violations = {{ path = "$.content", message = "required" }} },
-    { ok = true, value = { content = "validated" } },
-  }
-  local instance, messages, diagnostics, facts = make({ root = { kind = "record" } })
-  instance.deliver(turn())
-  local first = find_last(messages, "capability.invoke")
-  local rejected = '{"raw_machine_secret":true}'
-  instance.deliver({ kind = "reply", ref = first.ref, result = { text = rejected } })
-
-  local correction = find_last(messages, "capability.invoke")
-  local history = conversation_messages(facts)
-  assert_eq(history[#history - 1].content, rejected,
-    "rejected candidate stays in canonical correction history")
-  assert_true(history[#history].content:find(
-    'The required root envelope is {"value": <corrected value>}.', 1, true) ~= nil,
-    "retry prompt preserves wrapped provider envelope guidance")
-  assert_true(history[#history].content:find(rejected, 1, true) == nil,
-    "retry prompt does not repeat the rejected candidate")
-  assert_true(correction.request.input == nil,
-    "correction invocation does not duplicate canonical history")
-
-  assert_eq(#diagnostics, 1, "rejection emits one generic diagnostic fact")
-  assert_eq(diagnostics[1].kind, "validation", "diagnostic identifies validation")
-  assert_true(diagnostics[1].output == nil,
-    "rejected raw candidate is absent from the diagnostic interface")
-
-  assert_eq(history[#history - 1].visibility, "diagnostic",
-    "the rejected candidate is model context, never an ordinary transcript message")
-  assert_eq(history[#history].visibility, "diagnostic",
-    "the correction prompt is model context, never an ordinary transcript message")
-
-  instance.deliver({ kind = "reply", ref = correction.ref,
-    result = { text = '{"value":{"content":"validated"}}' } })
-  local result = find_last(messages, "nefor.agent.Result")
-  assert_eq(result.semantic_type_id, nil, "raw factory emission has no routed identity")
-  assert_eq(result.value.constructor, "Ok", "validated result selects Ok")
-  assert_eq(result.value.value.content, "validated", "validated result remains visible")
-
-  local settled = conversation_messages(facts)
-  local visible = {}
-  for _, message in ipairs(settled) do
-    if message.visibility == "transcript" then visible[#visible + 1] = message end
-  end
-  assert_eq(#visible, 2, "one user input and one accepted answer stay in the transcript")
-  assert_eq(visible[1].role, "user", "the user's input remains the first transcript message")
-  assert_eq(visible[2].role, "assistant", "exactly one accepted answer reaches the transcript")
-  assert_eq(visible[2].content, "validated",
-    "the accepted answer carries the decoded value, not the rejected candidate")
+local function count(out, kind)
+  local n = 0; for _, v in ipairs(out) do if v.kind == kind then n = n + 1 end end; return n
 end
-
--- Streamed content of a rejected attempt is retracted rather than left behind:
--- the message the provider streamed into is closed as diagnostic.
-do
-  validations = {
-    { ok = false, violations = {{ path = "$.content", message = "required" }} },
-    { ok = true, value = { content = "second try" } },
-  }
-  local instance, messages, _, facts = make({ root = { kind = "record" } })
-  instance.deliver(turn())
-  local first = find_last(messages, "capability.invoke")
-  instance.handle_observation({ binding = "transcript",
-    value = { kind = "reasoning", text = "provisional thinking" } })
-  instance.deliver({ kind = "reply", ref = first.ref, result = { text = "not json at all" } })
-
-  local streamed
-  for _, message in ipairs(conversation_messages(facts)) do
-    if message.role == "assistant" then streamed = streamed or message end
-  end
-  assert_eq(streamed.visibility, "diagnostic",
-    "a streamed attempt narrows to diagnostic when its content fails validation")
-
-  local correction = find_last(messages, "capability.invoke")
-  instance.deliver({ kind = "reply", ref = correction.ref,
-    result = { text = '{"value":{"content":"second try"}}' } })
-  local accepted = 0
-  for _, message in ipairs(conversation_messages(facts)) do
-    if message.role == "assistant" and message.visibility == "transcript" then
-      accepted = accepted + 1
+local function make(dynamic, bound_schema, synchronous)
+  local current_schema = bound_schema or schema
+  local out, facts = {}, {}
+  local actor, err
+  actor, err = factory.construct("typed", {
+    provider = "mock", tools = {}, schema = dynamic and { version = 2,
+      root = { kind = "list", item = current_schema.root } } or current_schema,
+    output_type = "output", error_type = "error", provider_error_type = "provider-error",
+    dynamic = dynamic, dynamic_item_type = dynamic and "item" or nil,
+    dynamic_item_descriptor = dynamic and {} or nil,
+  }, function(v)
+    out[#out + 1] = v
+    if synchronous and v.kind == "generic-tool.ToolCalls" then
+      local messages = {}
+      for _, c in ipairs(v.calls) do
+        messages[#messages + 1] = {role = "tool", tool_call_id = c.id, name = c.name,
+          content = nefor.json.encode(c.runtime_result)}
+      end
+      actor.deliver({messages = {{message = {messages = messages}}}})
     end
+  end, { conversation = {
+    id = "conversation", turn_id = "turn", emit = function(v) facts[#facts + 1] = v end,
+  } })
+  assert(actor, err)
+  actor.deliver({ messages = {{ message = { messages = {{ role = "user", content = "assignment" }} } }} })
+  return actor, out, facts
+end
+local function reply(actor, out, calls, text)
+  actor.deliver({ kind = "reply", ref = last(out, "capability.invoke").ref,
+    result = { text = text, tool_calls = calls } })
+end
+local function call(name, args, id) return { id = id or name, name = name, args = args or {} } end
+local function continue(actor, calls)
+  local messages = {}
+  for _, c in ipairs(calls) do messages[#messages + 1] = {
+    role = "tool", tool_call_id = c.id, name = c.name, content = nefor.json.encode(c.runtime_result or {}) } end
+  actor.deliver({ messages = {{ message = { messages = messages } }} })
+end
+local actor, out, facts = make()
+local request = last(out, "capability.invoke").request
+assert(request.output_schema == nil and #request.tools == 2 and #request.tool_specs == 2)
+assert(request.tool_specs[1].parameters.properties.validate.default == false)
+assert(request.tool_specs[1].parameters.properties.new_string.description:find("Whole draft", 1, true))
+assert(request.tool_specs[2].description:find("sole tool call", 1, true))
+local example
+for _, f in ipairs(facts) do
+  if f.kind == "content_chunk_appended" and f.chunk.kind == "text" then
+    example = example or f.chunk.data:match('Example: write_output%((.-)%);')
   end
-  assert_eq(accepted, 1, "only the accepted attempt is an ordinary assistant message")
+end
+assert(example and nefor.json.decode(example).new_string == '{"count":1}')
+-- Malformed native arguments quarantine the entire batch before any draft edit.
+local original_request = last(out, "capability.invoke").ref
+reply(actor, out, {call("write_output", {new_string = "must not write"}), {id = "bad", name = "submit_output", arguments = "["}})
+assert(last(out, "generic-tool.ToolCalls") == nil and validations == 0)
+-- Re-delivery of that stop cannot mutate the current firing or add a reminder.
+local current_request = last(out, "capability.invoke").ref
+local request_count = count(out, "capability.invoke")
+actor.deliver({kind = "reply", ref = original_request, result = {text = "duplicate"}})
+assert(last(out, "capability.invoke").ref == current_request and count(out, "capability.invoke") == request_count)
+local before = validations
+reply(actor, out, {call("write_output", {new_string = "{"})})
+local calls = last(out, "generic-tool.ToolCalls").calls
+local receipt = calls[1].runtime_result
+local draft = receipt.draft
+assert(receipt.write == "saved" and receipt.validation.status == "not_requested" and validations == before)
+assert(files[draft] == "{" and files[calls[1].runtime_output_path] ~= nil)
+continue(actor, calls)
+reply(actor, out, {call("write_output", {new_string = "{", validate = true})})
+calls = last(out, "generic-tool.ToolCalls").calls
+assert(calls[1].runtime_result.write == "saved" and calls[1].runtime_result.validation.status == "invalid")
+assert(files[draft] == "{" and count(out, "nefor.agent.Result") == 0)
+continue(actor, calls)
+reply(actor, out, {call("write_output", {new_string = '{"content":"kept"}', validate = true})})
+calls = last(out, "generic-tool.ToolCalls").calls
+assert(calls[1].runtime_result.validation.status == "valid" and count(out, "nefor.agent.Result") == 0)
+continue(actor, calls)
+for _, args in ipairs({
+  {old_string = "missing", new_string = "replacement", validate = true},
+  {old_string = "", new_string = "replacement", validate = true},
+  {new_string = "FAIL_IO", validate = true},
+}) do
+  before = validations
+  reply(actor, out, {call("write_output", args)})
+  calls = last(out, "generic-tool.ToolCalls").calls
+  assert(calls[1].runtime_result.write == "failed" and files[draft] == '{"content":"kept"}')
+  assert(validations == before)
+  continue(actor, calls)
+end
+for _, mixed in ipairs({
+  {call("write_output", {old_string = "kept", new_string = "updated", validate = true}), call("submit_output"), call("read_file", {path = "ordinary"})},
+  {call("submit_output"), call("write_output", {old_string = "updated", new_string = "kept"})},
+}) do
+  reply(actor, out, mixed)
+  calls = last(out, "generic-tool.ToolCalls").calls
+  local rejected
+  for _, c in ipairs(calls) do if c.name == "submit_output" then rejected = c.runtime_result end end
+  assert(rejected.submission == "rejected" and rejected.validation.error.code == "standalone_submission_required")
+  assert(count(out, "nefor.agent.Result") == 0)
+  local emitted = {}
+  local executor = assert(run_tool.construct("executor", {tools = {"read_file"},
+    tool_approval_policy = {rules = {}}}, function(v) emitted[#emitted + 1] = v end))
+  executor.deliver({messages = {{message = {calls = calls}}}})
+  if #calls == 3 then
+    assert(count(emitted, "capability.invoke") == 1)
+    local invoked = last(emitted, "capability.invoke")
+    executor.deliver({kind = "reply", ref = invoked.ref, result = "normal result"})
+  else assert(count(emitted, "capability.invoke") == 0) end
+  local handle = last(emitted, "generic-tool.ToolHandle")
+  assert(handle and #handle.results == #calls)
+  continue(actor, calls)
+end
+reply(actor, out, {call("write_output", {new_string = '{"content":"aaa"}'})})
+calls = last(out, "generic-tool.ToolCalls").calls; continue(actor, calls)
+before = validations
+reply(actor, out, {call("write_output", {old_string = "aa", new_string = "b", validate = true})})
+calls = last(out, "generic-tool.ToolCalls").calls
+assert(calls[1].runtime_result.error.code == "non_unique_match" and files[draft] == '{"content":"aaa"}' and validations == before)
+continue(actor, calls)
+-- Repeated final prose produces one reminder per stop and preserves prose.
+for i = 1, 5 do reply(actor, out, nil, "investigation " .. i) end
+assert(count(out, "nefor.agent.Result") == 0)
+local reminders, investigations = 0, 0
+for _, f in ipairs(facts) do
+  if f.kind == "content_chunk_appended" then
+    local text = f.chunk.data
+    if type(text) == "string" and text:find("Your response ended", 1, true) then reminders = reminders + 1 end
+    if type(text) == "string" and text:find("investigation", 1, true) then investigations = investigations + 1 end
+  end
+end
+assert(reminders == 5 and investigations == 5)
+-- Fresh validation reads the current draft, not a cached previous valid value.
+files[draft] = "{}"
+reply(actor, out, {call("submit_output")})
+calls = last(out, "generic-tool.ToolCalls").calls
+assert(calls[1].runtime_result.submission == "rejected" and calls[1].runtime_result.validation.status == "invalid" and count(out, "nefor.agent.Result") == 0)
+continue(actor, calls)
+files[draft] = '{"content":"accepted"}'
+local requests = count(out, "capability.invoke")
+reply(actor, out, {call("submit_output")})
+assert(count(out, "capability.invoke") == requests and count(out, "nefor.agent.Result") == 1)
+assert(last(out, "nefor.agent.Result").value.value.content == "accepted")
+files[draft] = "{}"
+assert(last(out, "nefor.agent.Result").value.value.content == "accepted")
+-- A later firing has a fresh private draft.
+actor.deliver({messages = {{message = {text = "next assignment"}}}})
+reply(actor, out, {call("submit_output")})
+calls = last(out, "generic-tool.ToolCalls").calls
+assert(calls[1].runtime_result.draft ~= draft and calls[1].runtime_result.submission == "rejected" and calls[1].runtime_result.validation.status == "operational_error")
+-- Dynamic values emit only after complete collection validation.
+for _, value in ipairs({'[]', '[{"content":"first"},{"content":"second"}]'}) do
+  local dynamic, dynamic_out = make(true)
+  reply(dynamic, dynamic_out, {call("write_output", {new_string = value})})
+  local writing = last(dynamic_out, "generic-tool.ToolCalls").calls
+  continue(dynamic, writing)
+  reply(dynamic, dynamic_out, {call("submit_output")})
+  local outputs = {}; for _, v in ipairs(dynamic_out) do if v.kind == "nefor.agent.Result" then outputs[#outputs + 1] = v end end
+  local expected = value == '[]' and 0 or 2
+  assert(#outputs == expected + 1 and outputs[#outputs].dynamic.kind == "complete")
+  assert(outputs[#outputs].dynamic.count == expected)
+  if expected == 2 then assert(outputs[1].value.value.content == "first" and outputs[2].value.value.content == "second") end
 end
 
--- Exhausting the correction budget leaves no accepted answer behind: every
--- attempt is diagnostic and the failure rides the typed error result alone.
-do
-  validations = {
-    { ok = false, violations = {{ path = "$", message = "bad" }} },
-    { ok = false, violations = {{ path = "$", message = "still bad" }} },
-  }
-  local instance, messages, diagnostics, facts = make({ root = { kind = "record" } })
-  instance.deliver(turn())
-  local first = find_last(messages, "capability.invoke")
-  instance.deliver({ kind = "reply", ref = first.ref, result = { text = "garbage one" } })
-  local correction = find_last(messages, "capability.invoke")
-  instance.deliver({ kind = "reply", ref = correction.ref, result = { text = "garbage two" } })
-
-  for _, message in ipairs(conversation_messages(facts)) do
-    if message.role == "assistant" then
-      assert_eq(message.visibility, "diagnostic",
-        "no rejected attempt survives as an ordinary assistant message")
-    end
+-- Canonical products/scalars and a value-named record survive submission with
+-- no provider-only root envelope. These cases protect the runtime wire codec.
+if real_validate then
+  for _, candidate in ipairs({
+    {root = {kind = "int"}, text = "3"},
+    {root = {kind = "product", components = {{kind = "string"}, {kind = "int"}}}, text = '["task",3]'},
+    {root = {kind = "named", name = "test.Value", body = {kind = "record", fields = {{name = "value", schema = {kind = "int"}}}}}, text = '{"value":3}'},
+  }) do
+    local a, o = make(false, {version = 2, root = candidate.root})
+    reply(a, o, {call("write_output", {new_string = candidate.text, validate = true})})
+    local c = last(o, "generic-tool.ToolCalls").calls
+    assert(c[1].runtime_result.validation.status == "valid")
+    continue(a, c); reply(a, o, {call("submit_output")})
+    assert(nefor.json.encode(last(o, "nefor.agent.Result").value.value) == candidate.text)
   end
-  assert_eq(#diagnostics, 2, "each rejected attempt reports one validation diagnostic")
-  local result = find_last(messages, "nefor.agent.Result")
-  assert_eq(result.semantic_type_id, nil, "raw factory error has no routed identity")
-  assert_eq(result.value.constructor, "Error", "exhaustion settles as one error result")
-  local completions = 0
-  for _, fact in ipairs(facts) do
-    if fact.kind == "turn_completed" or fact.kind == "turn_failed" then
-      completions = completions + 1
-    end
-  end
-  assert_eq(completions, 1, "exhaustion produces exactly one terminal turn fact")
 end
 
--- Root unions retain the selected named constructor identity while applying the
--- same validated-only diagnostic rule across a correction attempt.
-do
-  validations = {
-    { ok = false, violations = {{ path = "$.value", message = "wrong branch" }} },
-    { ok = true, value = { constructor = "NamedBranch", value = { content = "union ok" } } },
-  }
-  local instance, messages, diagnostics = make({ version = 2, root = { kind = "adt", name = "test.Output", owner_id = "output-id", constructors = {
-    { name = "NamedBranch", constructor_id = "named-branch-id", schema = { kind = "record", fields = {} } },
-  } } })
-  instance.deliver(turn())
-  local first = find_last(messages, "capability.invoke")
-  instance.deliver({ kind = "reply", ref = first.ref,
-    result = { text = '{"value":{"unvalidated":"candidate"}}' } })
-  local correction = find_last(messages, "capability.invoke")
-  instance.deliver({ kind = "reply", ref = correction.ref,
-    result = { text = '{"value":{"constructor":"NamedBranch","value":{"content":"union ok"}}}' } })
+-- Drain must settle pending recoverable responses instead of waiting forever
+-- for a correction round that lifecycle policy disallows.
+for _, pending_calls in ipairs({
+  {{id = "bad", name = "write_output", arguments = "["}},
+  {call("write_output", {new_string = "{}"})},
+  {call("submit_output")},
+}) do
+  local a, o, f = make()
+  a.handle_drain()
+  reply(a, o, pending_calls)
+  assert(count(o, "mag.failed") == 1 and count(o, "capability.invoke") == 1)
+  local terminal = 0
+  for _, fact in ipairs(f) do if fact.kind == "turn_failed" then terminal = terminal + 1 end end
+  assert(terminal == 1)
+end
 
-  assert_true(diagnostics[1].output == nil,
-    "union rejection also omits candidate diagnostic data")
-  local result = find_last(messages, "nefor.agent.Result")
-  assert_eq(result.semantic_type_id, nil, "raw factory result has no routed identity")
-  assert_eq(result.value.constructor, "Ok", "validated union result selects Ok")
-  assert_eq(result.value.value.constructor, "NamedBranch", "validated payload preserves its constructor")
-  assert_eq(result.value.value.value.content, "union ok", "validated union payload remains visible")
+-- Intrinsic receipts can return synchronously through the graph. Continuation
+-- must be latched before emitting calls, so repair uses the same draft/firing.
+do
+  local a, o = make(false, nil, true)
+  reply(a, o, {call("write_output", {new_string = "{"})})
+  local original_draft = last(o, "generic-tool.ToolCalls").calls[1].runtime_result.draft
+  reply(a, o, {call("write_output", {old_string = "{", new_string = '{"content":"synchronous"}', validate = true})})
+  local result = last(o, "generic-tool.ToolCalls").calls[1].runtime_result
+  assert(result.draft == original_draft and result.write == "saved" and result.validation.status == "valid")
+  reply(a, o, {call("submit_output")})
+  assert(count(o, "capability.invoke") == 3 and last(o, "nefor.agent.Result").value.value.content == "synchronous")
 end

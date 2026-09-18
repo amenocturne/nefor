@@ -1,3 +1,5 @@
+mod structured_output_lua;
+
 pub mod bridge {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge.rs"));
 
@@ -72,6 +74,21 @@ pub mod bridge {
             assert!(!wire.contains("first"));
             assert!(!wire.contains(".chat."));
             assert!(!wire.contains("history"));
+        }
+
+        #[test]
+        fn request_local_definitions_forward_without_global_registration() {
+            let mut bridge = CapabilityBridge::new("tool-gate");
+            let specs = json!([{"name":"local_result", "owner":"runtime", "description":"scoped",
+                "parameters":{"type":"object", "required":["text"], "properties":{"text":{"type":"string"}}},
+                "execution":{"kind":"routed"}}]);
+            let mut invoke = provider_invoke("scoped", "provider-a", json!([]));
+            invoke["args"]["tool_specs"] = specs.clone();
+            let translated = bridge.translate_emit(invoke);
+            assert_eq!(translated[0]["tool_specs"], specs);
+            let ordinary =
+                bridge.translate_emit(provider_invoke("ordinary", "provider-a", json!([])));
+            assert!(ordinary[0].get("tool_specs").is_none());
         }
 
         #[test]
@@ -363,6 +380,27 @@ mod error {
 
 pub mod kernel {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernel.rs"));
+
+    #[test]
+    fn host_draft_validator_reports_locations_and_preserves_canonical_schema() {
+        let lua = Lua::new();
+        let nefor = lua.create_table().unwrap();
+        install_typed_json(&lua, &nefor).unwrap();
+        lua.globals().set("nefor", nefor).unwrap();
+        lua.load(r#"
+          local schema = {version=2,root={kind='record',fields={{name='value',schema={kind='int'}}}}}
+          local visible = nefor.typed_json.schema(schema)
+          assert(visible.properties.value.type == 'integer')
+          assert(visible.properties.value.properties == nil)
+          local syntax = nefor.typed_json.validate(schema, '{\n  "value": }')
+          assert(not syntax.ok and syntax.error.code == 'invalid_json')
+          assert(syntax.error.line == 2 and syntax.error.column > 0)
+          assert(syntax.error.excerpt:find('value', 1, true))
+          local semantic = nefor.typed_json.validate(schema, '{"value":"wrong"}')
+          assert(not semantic.ok and semantic.violations[1].path == '$.value')
+          assert(nefor.typed_json.validate(schema, '{"value":3}').ok)
+        "#).exec().unwrap();
+    }
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime.rs"));
@@ -451,36 +489,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_schema_preflight_rejects_unsupported_types_before_activation() {
-        let modification = serde_json::json!({
-            "actors": [{
-                "id": "answer",
-                "factory": "structured-output",
-                "params": {
-                    "schema": {"version": 1, "root": {"kind": "json_value"}}
-                }
-            }]
-        });
-        let error = preflight_provider_schemas(&DecodedProgram {
-            initial: modification,
+    fn output_schema_preflight_accepts_canonical_json_without_provider_lowering() {
+        let program = DecodedProgram {
+            initial: serde_json::json!({"actors": [{"id":"answer", "factory":"structured-output",
+                "params":{"schema":{"version":2,"root":{"kind":"json_value"}}}}]}),
             operations: Vec::new(),
-        })
-        .expect_err("JsonValue rejected");
-        assert!(
-            error.contains("structured-output actor \"actor:6:answer\""),
-            "{error}"
-        );
-        assert!(error.contains("no faithful"), "{error}");
+        };
+        preflight_output_schemas(&program).unwrap();
     }
 
     #[test]
-    fn provider_schema_preflight_preserves_supported_lowering() {
+    fn output_schema_preflight_preserves_supported_descriptors() {
         let modification = serde_json::json!({
             "actors": [{
                 "id": "answer",
                 "factory": "nefor.factory.structured-output",
                 "params": {
-                    "schema": {"version": 1, "root": {"kind": "record", "fields": [{
+                    "schema": {"version": 2, "root": {"kind": "record", "fields": [{
                         "name": "answer", "schema": {"kind": "int"}
                     }]}}
                 }
@@ -490,7 +515,7 @@ mod tests {
                 "params": {}
             }]
         });
-        preflight_provider_schemas(&DecodedProgram {
+        preflight_output_schemas(&DecodedProgram {
             initial: modification,
             operations: Vec::new(),
         })
@@ -907,8 +932,7 @@ mod tests {
                         "provider": "mock-provider",
                         "output_type": "output-id",
                         "error_type": "agent-error-id",
-                        "provider_error_type": "provider-id",
-                        "validation_error_type": "validation-id"
+                        "provider_error_type": "provider-id"
                     }
                 },
                 {
@@ -929,11 +953,6 @@ mod tests {
             ("typed", "output_type", serde_json::json!("forged")),
             ("typed", "error_type", serde_json::json!("forged")),
             ("typed", "provider_error_type", serde_json::json!("forged")),
-            (
-                "typed",
-                "validation_error_type",
-                serde_json::json!("forged"),
-            ),
             (
                 "typed",
                 "model_profile",
@@ -960,10 +979,6 @@ mod tests {
         assert_eq!(
             modification["actors"][0]["params"]["provider_error_type"],
             "provider-id"
-        );
-        assert_eq!(
-            modification["actors"][0]["params"]["validation_error_type"],
-            "validation-id"
         );
         assert_eq!(
             modification["actors"][0]["params"]["output_type"],

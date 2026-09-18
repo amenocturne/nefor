@@ -362,6 +362,7 @@ receive({
   provider_options = { service_tier = "fast", nested = { retained = true } },
   tools = empty_tools,
   output_schema = schema_with_empty_arrays,
+  tool_specs = { { name = "write_output", description = "private draft", parameters = schema_with_empty_arrays, execution = { kind = "routed" }, owner = "mag-runtime" } },
   system = "must not leak",
   messages = { { role = "user", content = "must not leak" } },
 })
@@ -378,9 +379,10 @@ eq(invoke.provider_options.nested.retained, true,
   "manager relay preserves opaque nested provider options")
 assert(json.is_array(invoke.tools) and #invoke.tools == 0,
   "manager relay preserves an empty tools array")
-assert(json.is_array(invoke.output_schema.required),
+assert(json.is_array(invoke.output_schema.required), "generic schema relay remains available")
+assert(json.is_array(invoke.tool_specs[1].parameters.required),
   "manager relay preserves nested empty schema arrays")
-assert(json.is_array(invoke.output_schema.properties.tags.prefixItems),
+assert(json.is_array(invoke.tool_specs[1].parameters.properties.tags.prefixItems),
   "manager relay preserves deeply nested empty schema arrays")
 eq(invoke.system, nil, "system is canonical conversation content, not invoke payload")
 eq(invoke.messages, nil, "full history never enters the manager/provider protocol")

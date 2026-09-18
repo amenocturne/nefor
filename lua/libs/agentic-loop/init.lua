@@ -61,10 +61,10 @@ local RequestLifecycle = require("libs.agentic-loop.request-lifecycle")
 
 -- The lead program's public result is deliberately fixed to
 -- Result<AgentError, TextAnswer>; exact identities keep terminal projection nominal.
-local LEAD_RESULT_TYPE_ID = "sha256:8d5a69448c44335912765e1c7536605597438d3549c5e491808a62d5ace716da"
+local LEAD_RESULT_TYPE_ID = "sha256:aa6047bf525dee9532563264d6e0d119dd2359ae92013e228bf405f434c4b8cd"
 local LEAD_RESULT_CONSTRUCTOR_IDS = {
-  Ok = "sha256:371afaaf318f87fa53982da5df1be44b2ae3a47a59c0ea0ef7408c060eecfc57",
-  Error = "sha256:18606e26610b182e4977008545da144e22a01cf4090804fd7a48352b68be85ed",
+  Ok = "sha256:e1bfb90cb2d8f7eeac511131f77680093c131eceb1eb39a50fcfb2eae73de7fd",
+  Error = "sha256:1161ef7727b26a70715789ea377f6a39efb9d897536ecc775946f64477947a5a",
 }
 
 local state = {

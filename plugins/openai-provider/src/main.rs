@@ -1061,31 +1061,62 @@ async fn dispatch_completion_request(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let direct_specs = match body.get("tool_specs") {
+        Some(value @ Value::Array(_)) => ToolCatalog::parse_tools(value),
+        None => Vec::new(),
+        Some(_) => {
+            completions.finish(&request_id, &run).await;
+            send_event(
+                out_tx,
+                completion_error_body(
+                    config,
+                    &request_id,
+                    "completion.request `tool_specs` must be an array",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let advertised = catalog.project_names(&authored_names).await;
+    let conflicts = direct_specs.iter().any(|direct| {
+        !direct.owner.is_empty()
+            && advertised
+                .iter()
+                .any(|spec| spec.name == direct.name && spec.owner != direct.owner)
+    });
+    if conflicts {
+        completions.finish(&request_id, &run).await;
+        send_event(
+            out_tx,
+            completion_error_body(
+                config,
+                &request_id,
+                "request-local tool owner conflicts with an advertised tool",
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
     let projected_specs = if authored_names.is_empty() {
         authored_tools
             .map(|tools| ToolCatalog::parse_tools(&Value::Array(tools.clone())))
             .unwrap_or_default()
     } else {
-        match body.get("tool_specs") {
-            Some(value @ Value::Array(_)) => ToolCatalog::parse_tools(value)
-                .into_iter()
-                .filter(|spec| authored_names.iter().any(|name| name == &spec.name))
-                .collect(),
-            Some(_) => {
-                completions.finish(&request_id, &run).await;
-                send_event(
-                    out_tx,
-                    completion_error_body(
-                        config,
-                        &request_id,
-                        "completion.request `tool_specs` must be an array",
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-            None => catalog.project_names(&authored_names).await,
-        }
+        authored_names
+            .iter()
+            .filter_map(|name| {
+                let known = advertised.iter().find(|spec| &spec.name == name);
+                if known.is_some_and(|spec| !spec.execution.is_routed()) {
+                    return known.cloned();
+                }
+                direct_specs
+                    .iter()
+                    .find(|spec| &spec.name == name && spec.execution.is_routed())
+                    .or(known)
+                    .cloned()
+            })
+            .collect()
     };
     let projected_names = projected_specs
         .iter()

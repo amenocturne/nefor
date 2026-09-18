@@ -6,4 +6,4 @@ import nefor.contracts.{}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
 let resolved_model_value = nefor.actors.ResolvedModel {provider: "mock-plugin", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 
-nefor.actors.agent<nefor.actors.ResolvedModel, RequestInput, MissingSemanticType>("invalid", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+nefor.actors.agent<nefor.actors.ResolvedModel, RequestInput, MissingSemanticType>("invalid", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})

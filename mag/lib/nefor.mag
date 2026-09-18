@@ -49,11 +49,9 @@ type ProviderInput = nefor.contracts.ProviderInput
 
 type TextAnswer = nefor.contracts.TextAnswer
 
-type OutputViolation = nefor.contracts.OutputViolation
 
 type ProviderError = nefor.contracts.ProviderError
 
-type OutputValidationError = nefor.contracts.OutputValidationError
 
 type AgentErrorReason = nefor.contracts.AgentErrorReason
 

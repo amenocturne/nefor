@@ -255,11 +255,11 @@ end
 -- The compiled lead-turn.mag shape the mag plugin's `mag.loaded` reply
 -- carries (source → entry adapter → lead llm → output; the spawner derives
 -- its source, entry, and llm seams from this, never hardcodes them).
-local RESULT_TYPE_ID = "sha256:8d5a69448c44335912765e1c7536605597438d3549c5e491808a62d5ace716da"
+local RESULT_TYPE_ID = "sha256:aa6047bf525dee9532563264d6e0d119dd2359ae92013e228bf405f434c4b8cd"
 local AGENT_ERROR_TYPE_ID = "sha256:2324ecf4ddda81471726a55b775bf564c1b3c814f3db279252da16843bfed431"
 local RESULT_CONSTRUCTOR_IDS = {
-  Ok = "sha256:371afaaf318f87fa53982da5df1be44b2ae3a47a59c0ea0ef7408c060eecfc57",
-  Error = "sha256:18606e26610b182e4977008545da144e22a01cf4090804fd7a48352b68be85ed",
+  Ok = "sha256:e1bfb90cb2d8f7eeac511131f77680093c131eceb1eb39a50fcfb2eae73de7fd",
+  Error = "sha256:1161ef7727b26a70715789ea377f6a39efb9d897536ecc775946f64477947a5a",
 }
 
 local function primitive(name)
@@ -268,22 +268,6 @@ end
 
 local function named(name, body)
   return { kind = "named", name = name, arguments = {}, body = body }
-end
-
-local function output_violation_type()
-  return named("nefor.contracts.OutputViolation", { kind = "record", fields = {
-    { name = "actual", type = primitive("String") },
-    { name = "code", type = primitive("String") },
-    { name = "expected", type = primitive("String") },
-    { name = "message", type = primitive("String") },
-    { name = "path", type = primitive("String") },
-  } })
-end
-
-local function output_validation_error_type()
-  return named("nefor.contracts.OutputValidationError", { kind = "record", fields = {
-    { name = "violations", type = { kind = "list", item = output_violation_type() } },
-  } })
 end
 
 local function provider_error_type()
@@ -303,7 +287,6 @@ local function agent_error_type()
   local reason = {
     kind = "adt", name = "nefor.contracts.AgentErrorReason", arguments = {},
     constructors = {
-      { name = "OutputValidationError", payload = output_validation_error_type() },
       { name = "ProviderError", payload = provider_error_type() },
     },
   }

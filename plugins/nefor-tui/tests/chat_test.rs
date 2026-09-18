@@ -12953,12 +12953,10 @@ fn independent_house_composes_public_chat_blocks_without_example_imports() {
 // Structured-output presentation
 // ============================================================
 //
-// The lead answers through a typed provider boundary. An attempt that fails
-// schema validation, and the correction prompt that answers it, are model
-// context the conversation authority marks `visibility = "diagnostic"`. The
-// surface must never render either as conversation: the user sees exactly one
-// accepted answer, in the position the turn's provider round occupied, or —
-// when the correction budget runs out — exactly one failure.
+// The conversation authority may mark runtime correction context as
+// `visibility = "diagnostic"`. The surface retracts narrowed streamed content
+// and keeps diagnostic messages out of the transcript. Terminal infrastructure
+// failures render once without promoting rejected diagnostic content.
 
 fn transcript_entry_fields(engine: &mut Engine, field: &str) -> Vec<String> {
     let state = engine.state_table().expect("state");

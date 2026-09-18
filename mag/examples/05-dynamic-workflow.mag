@@ -12,15 +12,13 @@ let planner = agents.agent<PlanningRequest, DynamicList<WorkItem>>("planner", ag
   model: agents.mock,
   system: "Return the ordered work items as JSON.",
   tools: [],
-  tool_approval_policy: named(ToolApprovalPolicy, Default, nil),
-  max_corrections: 1
+  tool_approval_policy: named(ToolApprovalPolicy, Default, nil)
 })
 let worker = agents.agent<WorkItem, WorkResult>("worker", agents.AgentConfig {
   model: agents.mock,
   system: "Consume the typed WorkItem input, complete it, and return one WorkResult.",
   tools: [],
-  tool_approval_policy: named(ToolApprovalPolicy, Default, nil),
-  max_corrections: 1
+  tool_approval_policy: named(ToolApprovalPolicy, Default, nil)
 })
 let workers = traverse("workers", worker)
 let result_context = context<Result<AgentError, WorkResult>>("result-context")
@@ -28,8 +26,7 @@ let integrator = agents.agent<ProviderInput, FinalSummary>("integrator", agents.
   model: agents.mock,
   system: "Integrate all ordered worker results into one summary.",
   tools: [],
-  tool_approval_policy: named(ToolApprovalPolicy, Default, nil),
-  max_corrections: 1
+  tool_approval_policy: named(ToolApprovalPolicy, Default, nil)
 })
 let integrate = result_context >>> integrator
 

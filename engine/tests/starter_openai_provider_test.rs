@@ -388,6 +388,7 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
             request_id = "request-1", conversation_id = "conversation-1",
             watermark = 11, model = "qwen", tools = empty_tools,
             output_schema = schema,
+            tool_specs = {{ name = "write_output", description = "private draft", parameters = schema, execution = {{ kind = "routed" }}, owner = "mag-runtime" }},
           },
         }})
 
@@ -400,8 +401,9 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
         assert(nefor.json.is_array(delivered[1].body.tools))
         assert(#delivered[1].body.tools == 0)
         assert(nefor.json.is_array(delivered[1].body.output_schema.required))
+        assert(nefor.json.is_array(delivered[1].body.tool_specs[1].parameters.required))
         assert(nefor.json.is_array(
-          delivered[1].body.output_schema.properties.tags.prefixItems))
+          delivered[1].body.tool_specs[1].parameters.properties.tags.prefixItems))
         assert(#delivered[1].body.messages == 2)
         assert(delivered[1].body.messages[1].content == "private system")
         assert(delivered[1].body.messages[2].content == "private history")

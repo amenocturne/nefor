@@ -199,24 +199,31 @@ function M.construct(id, params, emit, deps)
       -- no name/tool or args/arguments alias fallbacks.
       local call_name = call.name
       local call_args = call.args or {}
-      emit(sign({
-        kind = "capability.invoke",
-        capability = call_name,
-        provider = provider,
-        model = model,
-        -- Invocation args forwarded verbatim by routing as the tool.invoke
-        -- payload, carrying the per-node gating alongside the tool name/args.
-        request = {
-          name = call_name,
-          args = call_args,
-          allowlist = allowlist,
-          ["da-policy"] = tool_approval_policy,
-        },
-        -- Opaque correlation ref, echoed back on the reply: which batch + slot,
-        -- plus the model's call id / name for the assembled result entry.
-        ref = { batch = bid, index = i, call_id = call.id, name = call_name },
-      }))
+      if call.runtime_result ~= nil then
+        batches[bid].results[i] = { id = call.id, name = call_name, output = call.runtime_result, output_path = call.runtime_output_path }
+        batches[bid].received = batches[bid].received + 1
+      else
+        emit(sign({
+          kind = "capability.invoke",
+          capability = call_name,
+          provider = provider,
+          model = model,
+          -- Invocation args forwarded verbatim by routing as the tool.invoke
+          -- payload, carrying the per-node gating alongside the tool name/args.
+          request = {
+            name = call_name,
+            args = call_args,
+            allowlist = allowlist,
+            ["da-policy"] = tool_approval_policy,
+          },
+          -- Opaque correlation ref, echoed back on the reply: which batch + slot,
+          -- plus the model's call id / name for the assembled result entry.
+          ref = { batch = bid, index = i, call_id = call.id, name = call_name },
+        }))
+      end
     end
+    local batch = batches[bid]
+    if batch and batch.received == batch.expected then complete_batch(bid, batch) end
     return { status = "pending" }
   end
 

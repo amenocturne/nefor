@@ -100,18 +100,26 @@ projection it hands to providers, and lets a message narrow to `diagnostic`
 exactly once at its terminal fact — content that already streamed can be
 retracted, but nothing recorded as diagnostic is ever promoted back.
 
-The typed provider boundary (`structured-output`) is the current use. An
-attempt whose text fails schema validation, and the bounded correction prompt
-that answers it, are recorded diagnostic: the next round still sees them, and
-the surface never shows a rejected attempt's prose, reasoning, or streamed
-deltas as an assistant message, nor its correction as a user message. The
-surface retracts what a narrowed message already streamed, so the accepted
-answer occupies the position the turn's provider round started in, and a turn
-that exhausts its correction budget settles as one failure with no
-metadata-only answer beside it. Attempt counts and violations remain visible on
-the existing `mag.diagnostic` channel, which carries no candidate output.
+The typed provider boundary (`structured-output`) owns a private draft for each
+activation and supplies canonical MAG JSON schema plus request-local
+`write_output` and `submit_output` definitions. Editing optionally validates the
+whole saved draft; invalid edited contents remain saved. Only standalone
+submission revalidates and captures the accepted snapshot. Tool calls and
+receipts use canonical conversation facts and the ordinary graph continuation;
+accepted completion is recorded there for replay without rereading the draft.
+A final assistant response without submission remains in the conversation and
+receives one diagnostic system reminder per stop, continuing the same activation.
 
-The provider boundary treats finalized tool arguments as untrusted model output. A call is executable only when its `function.arguments` decodes to a JSON object; empty, malformed, scalar, null, and array values are quarantined. The malformed assistant call is not recorded. Instead, the canonical conversation records a bounded user correction naming the call and diagnostic, then requests another completion. This keeps every reconstructed OpenAI assistant tool call provider-valid across continuation and session replay.
+The provider boundary quarantines malformed native argument batches before any
+execution or recording of invalid assistant calls. Runtime feedback is a
+system message, never human-authored input. Model corrections have no retry
+budget; cancellation, drain and transport recovery retain their own semantics.
+
+Request-local `tool_specs` travel with catalog `tools` names through the MAG
+bridge, conversation invocation and compositor into provider requests. Native
+providers project the catalog and request definitions together. A direct
+nonempty owner conflicting with an advertised owner is a configuration error;
+no request-local tool becomes a global registration.
 
 Provider-native continuation state belongs to the assistant response that
 created it. A provider may return an opaque, provider/model-scoped artifact on

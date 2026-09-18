@@ -15,15 +15,15 @@ type WorkerResult {task: String, description: String}
 type Summary {content: String}
 
 let start = nefor.graph.source("task", RequestInput {prompt: "Plan this request"})
-let planner = agents.agent<RequestInput, nefor.dynamic.DynamicList<Task>>("planner", agents.AgentConfig {model: agents.mock, system: "Return the ordered task plan.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
-let worker = agents.agent<Task, WorkerResult>("worker", agents.AgentConfig {model: agents.mock, system: "Complete the task. Use its description field as the assignment.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+let planner = agents.agent<RequestInput, nefor.dynamic.DynamicList<Task>>("planner", agents.AgentConfig {model: agents.mock, system: "Return the ordered task plan.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
+let worker = agents.agent<Task, WorkerResult>("worker", agents.AgentConfig {model: agents.mock, system: "Complete the task. Use its description field as the assignment.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let workers = nefor.dynamic.traverse("expand", worker)
 
 // Dynamic cardinality ends at an effect-aware context node. It waits for the
 // explicit completion event and sends one ordered provider turn downstream;
 // no runtime-sized MAG List value is invented.
 let summary_context = nefor.dynamic.context<core.types.Result<nefor.contracts.AgentError, WorkerResult>>("summary-input")
-let summarizer = agents.agent<nefor.contracts.ProviderInput, Summary>("summarizer", agents.AgentConfig {model: agents.mock, system: "Summarize the ordered worker results.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+let summarizer = agents.agent<nefor.contracts.ProviderInput, Summary>("summarizer", agents.AgentConfig {model: agents.mock, system: "Summarize the ordered worker results.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let summarize = nefor.node.`>>>`(summary_context, summarizer)
 
 let planned = nefor.node.`>>>`(start, planner)

@@ -189,7 +189,7 @@ import nefor.graph.{}
 
 type WorkerRequest {prompt: String}
 let start = nefor.graph.source("worker-task", WorkerRequest {prompt: "Answer the task."})
-let worker = agents.agent<WorkerRequest, nefor.contracts.TextAnswer>("worker", agents.AgentConfig {model: agents.standard, system: "Answer the task.", tools: ["read_file"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+let worker = agents.agent<WorkerRequest, nefor.contracts.TextAnswer>("worker", agents.AgentConfig {model: agents.standard, system: "Answer the task.", tools: ["read_file"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let out = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("worker-output")
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, out)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
 ]=]
@@ -204,7 +204,7 @@ import nefor.graph.{}
 
 type WorkerRequest {prompt: String}
 let start = nefor.graph.source("build-task", WorkerRequest {prompt: "Implement feature X."})
-let build = agents.agent<WorkerRequest, nefor.contracts.TextAnswer>("build", agents.AgentConfig {model: agents.standard, system: "Implement feature X.", tools: ["read_file", "write_file"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+let build = agents.agent<WorkerRequest, nefor.contracts.TextAnswer>("build", agents.AgentConfig {model: agents.standard, system: "Implement feature X.", tools: ["read_file", "write_file"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let out = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("build-output")
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, build), nefor.graph.edge(build, out)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
 ]=]

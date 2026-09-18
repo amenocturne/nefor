@@ -2,7 +2,7 @@ type RequestInput {prompt: String}
 
 import core.types.{}
 // Shipped typed-agent example: the terminal value is either TaskDescription
-// or AgentError after the configured correction budget is exhausted.
+// or AgentError for a genuine provider failure; draft corrections stay open.
 import agents.{}
 import nefor.artifact.{}
 import nefor.contracts.{}
@@ -11,6 +11,6 @@ import nefor.graph.{}
 type TaskDescription {task: String, description: String, dependent_tasks: List<String>}
 
 let start = nefor.graph.source("typed-task-input", RequestInput {prompt: "Describe the build task"})
-let worker = agents.agent<RequestInput, TaskDescription>("typed-task", agents.AgentConfig {model: agents.mock, system: "Describe the requested task.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+let worker = agents.agent<RequestInput, TaskDescription>("typed-task", agents.AgentConfig {model: agents.mock, system: "Describe the requested task.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, TaskDescription>>("typed-task-output")
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)

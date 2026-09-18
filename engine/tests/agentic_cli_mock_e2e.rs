@@ -628,3 +628,59 @@ fn headless_starter_request_resume_tools_and_failures() {
     assert_authority_loss(&dir, &mag_death);
     println!("retained headless artifacts: {}", dir.display());
 }
+
+#[test]
+fn shipped_mock_keeps_submission_receipts_within_activation() {
+    use mlua::LuaSerdeExt;
+    let lua = mlua::Lua::new();
+    let nefor = lua.create_table().unwrap();
+    nefor.set("name", "mock-plugin").unwrap();
+    for name in ["on", "on_ready_ok"] {
+        nefor
+            .set(
+                name,
+                lua.create_function(|_, _: mlua::Variadic<mlua::Value>| Ok(()))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let json = lua.create_table().unwrap();
+    json.set(
+        "decode",
+        lua.create_function(|lua, text: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(mlua::Error::external)?;
+            lua.to_value(&value)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    json.set(
+        "encode",
+        lua.create_function(|lua, value: mlua::Value| {
+            let value: serde_json::Value = lua.from_value(value)?;
+            serde_json::to_string(&value).map_err(mlua::Error::external)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    nefor.set("json", json).unwrap();
+    lua.globals().set("nefor", nefor).unwrap();
+    let source =
+        std::fs::read_to_string(root().join("examples/nefor-agent/mock-provider/init.lua"))
+            .unwrap();
+    let select: mlua::Function = lua
+        .load(format!("{source}\nreturn typed_response"))
+        .eval()
+        .unwrap();
+    lua.globals().set("select_typed", select).unwrap();
+    lua.load(r#"
+        local instruction = {role="system",content='Expected canonical MAG JSON schema: {"type":"object","properties":{"content":{"type":"string"}}}. Write the value directly'}
+        local valid = {role="tool",name="write_output",content={write="saved",validation={status="valid"}}}
+        local invalid = {role="tool",name="write_output",content={write="saved",validation={status="invalid"}}}
+        local request = {tools={"write_output","submit_output"}}
+        assert(select_typed(request, {instruction,valid}).tool_calls[1].name == "submit_output")
+        assert(select_typed(request, {instruction,valid,invalid}).tool_calls[1].name == "write_output")
+        assert(select_typed(request, {instruction,valid,instruction}).tool_calls[1].name == "write_output")
+    "#).exec().unwrap();
+}

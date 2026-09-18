@@ -9,7 +9,6 @@ local conversation_facts = require("conversation-facts")
 local json_data = require("core.json_data")
 local M = {}
 
-local DEFAULT_TOOL_CALL_CORRECTIONS = 2
 local DIAGNOSTIC_LIMIT = 160
 
 local function bounded(value)
@@ -29,7 +28,10 @@ local function argument_diagnostic(arguments)
   if type(arguments) == "string" then
     if arguments == "" then return "function.arguments was empty" end
     local ok, decoded = pcall(nefor.json.decode, arguments)
-    if not ok then return "function.arguments was malformed JSON: " .. bounded(decoded) end
+    if not ok then
+      local diagnostic = type(nefor.json.parse) == "function" and nefor.json.parse(arguments).error or nil
+      return "function.arguments was malformed JSON: " .. bounded(decoded), nil, diagnostic
+    end
     if type(decoded) == "table" and not json_data.is_array(decoded) then return nil, decoded end
     if type(decoded) == "table" then return "arguments decoded to a JSON array" end
     if type(decoded) == "userdata" then return "arguments decoded to JSON null" end
@@ -51,12 +53,14 @@ local function inspect_tool_calls(tool_calls)
     }
     if call.args == nil then call.args = raw.arguments end
     if call.args == nil then call.args = fn.arguments end
-    local reason, decoded = argument_diagnostic(call.args)
+    local reason, decoded, diagnostic = argument_diagnostic(call.args)
     if decoded ~= nil then call.args = decoded end
     calls[index] = call
     if reason then
       invalid[#invalid + 1] = {
         id = call.id or "<missing>", name = call.name or "<missing>", reason = reason,
+        code = diagnostic and diagnostic.code or "invalid_argument_shape",
+        line = diagnostic and diagnostic.line, column = diagnostic and diagnostic.column,
       }
     end
   end
@@ -165,17 +169,9 @@ function M.construct(id, params, emit, options)
   local provider_round_completion = {}
   local facts = nil
   local firing_sequence = 0
-  local tool_call_corrections = 0
   local native_exchanges = {}
   local native_exchange_order = {}
   local native_exchange_sequence = 0
-  local max_tool_call_corrections = params.max_tool_call_corrections
-    or params.max_corrections or DEFAULT_TOOL_CALL_CORRECTIONS
-  if type(max_tool_call_corrections) ~= "number" or max_tool_call_corrections < 0
-      or max_tool_call_corrections % 1 ~= 0 then
-    return nil, string.format("%s '%s': tool-call correction limit must be a non-negative integer",
-      factory_name, tostring(id))
-  end
   local conversation_created = conversation.is_root
   local seed_recorded = false
   local submission_ids = params.submission_ids
@@ -212,7 +208,6 @@ function M.construct(id, params, emit, options)
       seed_recorded = true
     end
     facts:start_turn()
-    tool_call_corrections = 0
     streamed_message_id = nil
     streamed_text = ""
     terminal_metadata = {}
@@ -408,8 +403,6 @@ function M.construct(id, params, emit, options)
   -- the turn cannot reach a terminal fact.
   function state:is_streaming() return streamed_message_id ~= nil end
   function state:finish(message, terminal_detail)
-    self:emit(message)
-    self:emit({ kind = kinds.complete })
     turn_active = false
     awaiting_continuation = false
     facts:complete_turn(merge_terminal(terminal_detail or {
@@ -417,21 +410,23 @@ function M.construct(id, params, emit, options)
       value = message.value,
       semantic_type_id = message.semantic_type_id,
     }))
+    self:emit(message)
+    self:emit({ kind = kinds.complete })
   end
   function state:finish_many(messages, terminal_detail)
-    for _, message in ipairs(messages or {}) do self:emit(message) end
-    self:emit({ kind = kinds.complete })
     turn_active = false
     awaiting_continuation = false
     facts:complete_turn(merge_terminal(terminal_detail or {}))
+    for _, message in ipairs(messages or {}) do self:emit(message) end
+    self:emit({ kind = kinds.complete })
   end
   function state:fail(detail)
     settle_open_native(detail or "provider failed")
     interrupt_stream("provider_failed")
-    self:emit({ kind = kinds.failed, failure = kinds.Failed, value = { error = detail } })
     turn_active = false
     awaiting_continuation = false
     facts:fail_turn(merge_terminal({ error = detail }))
+    self:emit({ kind = kinds.failed, failure = kinds.Failed, value = { error = detail } })
   end
 
   local function record_input(input)
@@ -463,7 +458,7 @@ function M.construct(id, params, emit, options)
       reasoning_effort = params.reasoning_effort,
       provider_options = params.provider_options,
       output_schema = params.schema,
-      max_corrections = params.max_corrections,
+      tool_specs = params.tool_specs,
     }
   end
 
@@ -504,34 +499,32 @@ function M.construct(id, params, emit, options)
     end
   end
 
-  local function emit_tool_calls(result, calls)
+  function state:record_calls(result, calls)
     local wire_calls = {}
     for i, call in ipairs(calls) do
-      wire_calls[i] = {
-        id = call.id,
-        type = "function",
-        ["function"] = { name = call.name, arguments = encode_args(call.args) },
-      }
+      wire_calls[i] = { id = call.id, type = "function", ["function"] = {
+        name = call.name, arguments = encode_args(call.args) } }
     end
-    state:append({
-      role = "assistant",
-      content = type(result.text) == "string" and result.text or "",
-      tool_calls = wire_calls,
-    })
+    self:append({ role = "assistant", content = type(result.text) == "string" and result.text or "",
+      tool_calls = wire_calls })
+  end
+
+  local function emit_tool_calls(result, calls)
+    state:record_calls(result, calls)
     local semantic_calls = {}
     for i, call in ipairs(calls) do
       semantic_calls[i] = { name = call.name, arguments = call.args }
     end
+    awaiting_continuation = true
     state:emit({ kind = "generic-tool.ToolCalls",
       value = { calls = semantic_calls }, calls = calls })
     state:emit({ kind = kinds.complete })
-    awaiting_continuation = true
   end
 
   function instance.deliver(activation)
     activation = activation or {}
     if activation.kind == "reply" then
-      if pending == nil then return nil end
+      if pending == nil or activation.ref ~= pending.request_id then return nil end
       pending = nil
       if activation.error ~= nil then
         settle_open_native(activation.error)
@@ -563,23 +556,37 @@ function M.construct(id, params, emit, options)
           elseif type(result.text) == "string" and result.text ~= "" then
             state:append({ role = "assistant", content = result.text })
           end
-          if tool_call_corrections >= max_tool_call_corrections then
-            emit_failure("tool-call correction limit reached: " .. correction_message(invalid))
+          if draining then
+            state:fail("actor drained with malformed tool arguments; rejected batch was not executed")
             return nil
           end
-          tool_call_corrections = tool_call_corrections + 1
-          state:append({ role = "user", content = correction_message(invalid) })
+          if options.diagnostic then options.diagnostic({ kind = "malformed_tool_call", calls = invalid, executed = false }) end
+          state:append({ role = "system", content = correction_message(invalid), visibility = "diagnostic" })
           state:retry("invalid_tool_call_arguments")
           return nil
         end
-        if options.on_tool_calls then options.on_tool_calls(state, result) end
+        if options.on_tool_calls and options.on_tool_calls(state, result, calls) then return nil end
+        if draining then
+          state:record_calls(result, calls)
+          for _, call in ipairs(calls) do
+            state:append({ role = "tool", tool_call_id = call.id, name = call.name,
+              content = "[tool error] Actor drained before tool continuation; call was not executed.",
+              error = "actor_drained" })
+          end
+          state:fail("actor drained before tool continuation")
+          return nil
+        end
         emit_tool_calls(result, calls)
         return nil
       end
       if options.steerable and #steered_messages > 0 then
         if options.on_steered_final then options.on_steered_final(state, result) end
         append_steered_messages()
-        invoke_provider()
+        if draining then
+          state:fail("actor drained before steered continuation")
+        else
+          invoke_provider()
+        end
       else
         options.on_final(state, result)
       end
@@ -599,32 +606,37 @@ function M.construct(id, params, emit, options)
   end
 
   function instance.handle_kill()
+    local was_active = turn_active
     pending = nil
+    draining = true
     turn_active = false
     awaiting_continuation = false
     interrupt_stream("actor_killed")
-    if facts then facts:interrupt_turn({ reason = "actor_killed" }) end
+    if facts and was_active then facts:interrupt_turn({ reason = "actor_killed" }) end
   end
 
   function instance.handle_drain()
+    if draining then return end
+    draining = true
     if pending == nil then
-      state:emit({ kind = kinds.complete })
+      local was_active = turn_active
+      awaiting_continuation = false
       turn_active = false
       interrupt_stream("actor_drained")
-      if facts then facts:interrupt_turn({ reason = "actor_drained" }) end
-    else
-      draining = true
+      if facts and was_active then facts:interrupt_turn({ reason = "actor_drained" }) end
+      state:emit({ kind = kinds.complete })
     end
   end
 
   function instance.handle_steer(message)
-    if not options.steerable or type(message) ~= "table" then return false end
+    if draining or not options.steerable or type(message) ~= "table" then return false end
     if type(message.role) ~= "string" or message.role == "" then return false end
     steered_messages[#steered_messages + 1] = message
     return true
   end
 
   function instance.handle_observation(observation)
+    if pending == nil then return false end
     local value = observation and observation.value
     if observation.binding == "conversation" and type(value) == "table" then
       if handle_native_observation(value) then return true end

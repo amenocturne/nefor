@@ -1130,8 +1130,8 @@ let operator_bound = nefor.result.`>=>`(result_input, lifted)
 let policy = named(nefor.contracts.ToolApprovalPolicy, Rules, nefor.contracts.ToolApprovalRules {rules: core.map.insert((core.map.empty<String, String>(): Map<String, String>), "bash", "deny")})
 let no_policy = named(nefor.contracts.ToolApprovalPolicy, Default, nil)
 let resolve_model: fn(String) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
-let agent = nefor.actors.agent<String, Input, Output>("agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: policy, max_corrections: 1})
-let dynamic_agent = nefor.actors.agent<String, Input, nefor.dynamic.DynamicList<Output>>("dynamic-agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: no_policy, max_corrections: 1})
+let agent = nefor.actors.agent<String, Input, Output>("agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: policy})
+let dynamic_agent = nefor.actors.agent<String, Input, nefor.dynamic.DynamicList<Output>>("dynamic-agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: no_policy})
 let approval = nefor.human.approval_gate("approval", nefor.human.ApprovalConfig {prompt: "Approve?"})
 let retry = nefor.actors.retry_gate<Input>("retry", nefor.actors.RetryGateConfig {max_retries: 2})
 let agent_actors: List<nefor.graph.Actor> = get(agent, "actors")
@@ -1240,7 +1240,7 @@ type RecordAlias = Record
 type DynamicList<T> {value: T}
 
 let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
-let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 1}
+let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)}
 let dynamic = nefor.actors.agent<String, Unit, nefor.dynamic.DynamicList<RecordAlias>>("dynamic", resolve, config)
 let lookalike = nefor.actors.agent<String, Unit, DynamicList<Record>>("lookalike", resolve, config)
 let ordinary = nefor.actors.agent<String, Unit, Record>("ordinary", resolve, config)
@@ -1312,7 +1312,7 @@ import nefor.node.{}
 type Input {value: String}
 type Output {value: String}
 let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
-let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 1}
+let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)}
 let identity = nefor.dynamic.traverse("identity-traverse", nefor.graph.identity<Input>("identity"))
 let composition = nefor.dynamic.traverse("composition-traverse", nefor.node.compose("composition", nefor.graph.identity<Input>("composition-left"), nefor.graph.identity<Input>("composition-right")))
 let fanout = nefor.dynamic.traverse("fanout-traverse", nefor.node.fanout("fanout", nefor.graph.identity<Input>("fanout-left"), nefor.graph.identity<Input>("fanout-right")))
@@ -1489,7 +1489,7 @@ import nefor.human.{}
 import nefor.contracts.{}
 import nefor.dynamic.{}
 let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ModelProfile(nefor.actors.model_profile(model))
-let worker = nefor.actors.agent<String, String, nefor.dynamic.DynamicList<String>>("worker", resolve, nefor.actors.AgentConfig<String> {model: "test", system: "Return items", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+let worker = nefor.actors.agent<String, String, nefor.dynamic.DynamicList<String>>("worker", resolve, nefor.actors.AgentConfig<String> {model: "test", system: "Return items", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
             "dynamic producers are streaming workers",
@@ -1726,7 +1726,7 @@ import nefor
 import core.map.{}
 let resolver: fn(String) -> AuthoredModel = |model| => named(AuthoredModel, ResolvedModel, ResolvedModel {provider: "test", model: model, reasoning_effort: no_reasoning_effort})
 let policies = [named(ToolApprovalPolicy, Default, nil), named(ToolApprovalPolicy, Rules, ToolApprovalRules {rules: core.map.insert(core.map.empty<String, String>(), "cargo build", "deny")})]
-let config: fn(ToolApprovalPolicy) -> AgentConfig<String> = |policy| => AgentConfig<String> {model: "test", system: "", tools: [], tool_approval_policy: policy, max_corrections: 0}
+let config: fn(ToolApprovalPolicy) -> AgentConfig<String> = |policy| => AgentConfig<String> {model: "test", system: "", tools: [], tool_approval_policy: policy}
 let configs = map(config, policies)
 let nodes = map(((|settings| => agent<String, String, TextAnswer>("worker", resolver, settings)): fn(AgentConfig<String>) -> Node<String, core.types.Result<AgentError, TextAnswer>>), configs)
 artifact {configs: configs, actors: map(((|node| => get(node, "actors")): fn(Node<String, core.types.Result<AgentError, TextAnswer>>) -> List<nefor.graph.Actor>), nodes)}
@@ -1801,7 +1801,7 @@ fn nefor_facade_exports_exact_authoring_allowlist() {
             Some(name.to_owned())
         })
         .collect();
-    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer OutputViolation ProviderError OutputValidationError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList Indexed traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
+    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList Indexed traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
     assert_eq!(actual, expected);
     for name in [
         "Task",

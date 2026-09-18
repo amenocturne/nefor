@@ -295,7 +295,7 @@ function M.build(options)
 
   local invocation_fields = {
     "model", "tools", "reasoning_effort", "provider_options", "output_schema",
-    "max_corrections", "invocation",
+    "tool_specs", "invocation",
   }
 
   local function handle_provider_invoke(body)

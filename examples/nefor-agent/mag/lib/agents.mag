@@ -19,7 +19,7 @@ let mock = named(Model, Mock, nil)
 
 let resolve_model: fn(Model) -> nefor.actors.AuthoredModel = |model| => match model { case Standard(value) => named(nefor.actors.AuthoredModel, ResolvedModel, nefor.actors.ResolvedModel {provider: "chatgpt", model: "gpt-5.6-sol", reasoning_effort: nefor.actors.reasoning_effort("medium")}), case Mock(value) => named(nefor.actors.AuthoredModel, ResolvedModel, nefor.actors.ResolvedModel {provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}) }
 
-type AgentConfig {model: Model, system: String, tools: List<String>, tool_approval_policy: nefor.contracts.ToolApprovalPolicy, max_corrections: Int}
+type AgentConfig {model: Model, system: String, tools: List<String>, tool_approval_policy: nefor.contracts.ToolApprovalPolicy}
 
 
-let agent<I, O>: fn(String, AgentConfig) -> nefor.graph.Node<I, core.types.Result<nefor.contracts.AgentError, O>> = |id, config| => nefor.actors.agent<Model, I, O>(id, resolve_model, nefor.actors.AgentConfig<Model> {model: get(config, "model"), system: get(config, "system"), tools: get(config, "tools"), tool_approval_policy: get(config, "tool_approval_policy"), max_corrections: get(config, "max_corrections")})
+let agent<I, O>: fn(String, AgentConfig) -> nefor.graph.Node<I, core.types.Result<nefor.contracts.AgentError, O>> = |id, config| => nefor.actors.agent<Model, I, O>(id, resolve_model, nefor.actors.AgentConfig<Model> {model: get(config, "model"), system: get(config, "system"), tools: get(config, "tools"), tool_approval_policy: get(config, "tool_approval_policy")})

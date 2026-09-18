@@ -386,7 +386,7 @@ the kernel escalates the construct failure as a run failure.
 The direct `llm` factory schema is the table above: `provider`, `model`,
 `system`, `tools`, `reasoning_effort`, `provider_options`, and `history`. The MAG bridge
 forwards `model`, `tools`, `reasoning_effort`, `provider_options`, and a typed
-agent's converted `output_schema` through `conversation.provider.invoke`; the
+agent's request-local `tool_specs` through `conversation.provider.invoke`; the
 selected provider compositor reconstructs its canonical direct-completion
 request from that command and conversation-manager's owned context. `provider`
 selects the provider actor at construction. For explicitly concrete authoring, `ResolvedModel` carries the
@@ -463,33 +463,48 @@ ordered completion consumer.
 
 ### Structured output boundary
 
-Every public agent uses the `structured-output` provider boundary. Its params
-include a versioned MAG type descriptor produced by
-<code>`type_schema`(type_tag&lt;T&gt;())</code> and `max_corrections`. The bridge converts the
-descriptor to provider-neutral JSON Schema; each provider chooses its own
-realization. Every structured provider schema has one exact object envelope,
-`{"value": encoding(T)}`, including records, ADTs, collections, scalars, and
-Unit. The boundary removes exactly that outer envelope before validating and
-emitting the unchanged semantic `T`; a record whose own field is named `value`
-therefore uses `{"value":{"value":...}}`. Envelope failures are reported at
-`$`, while validation paths inside `T` are relative to the decoded inner value.
-The OpenAI-compatible provider uses `response_format`, while the ChatGPT
-provider uses the Responses API's `text.format`. MAG does not branch on that
-choice and still performs the authoritative Rust-owned validation. `TextAnswer`
-keeps its direct terminal-text factory path and does not use this contract.
+Typed agents use the `structured-output` provider boundary; nominal `TextAnswer`
+keeps direct terminal prose completion. The runtime consumes the unchanged MAG
+`type_schema` descriptor and canonical `TypeSchema.to_json_schema` and
+`validate_json` APIs. Draft JSON encodes the output type directly, without the
+provider-only root `{"value": ...}` envelope. Native final-response schema
+forcing is absent for these workers.
 
-Tool calls take the ordinary `generic-tool.ToolCalls` path and consume no
-corrections. An invalid candidate becomes a diagnostic user turn while budget
-remains. A valid candidate emits `nefor.agent.Result` with the selected output
-constructor identity. Exhaustion emits the same wire with the `AgentError`
-constructor and an `OutputValidationError`; a provider terminal failure carries
-a `ProviderError`. Both errors carry mandatory agent-owned `last_output`,
-retaining an earlier completed candidate when a later correction round fails.
+Each activation owns a private draft and intrinsic result tools even with
+`tools: []`. `write_output({new_string, old_string?, validate?})` replaces the
+whole file without `old_string`, or exactly one literal match with it.
+`validate` defaults false. true saves first and validates the whole resulting
+file. Invalid edited JSON remains saved; failed edits leave it unchanged and do
+not validate. Receipts distinguish saved/failed writes and not_requested,
+valid, invalid or operational_error validation. Structured syntax diagnostics
+include parser line/column and excerpts; schema diagnostics preserve all
+violations. Complete receipts are persisted as retrievable output artifacts.
 
-The canonical MAG constructor is `nefor.actors.agent`. It is generic over the
-configuration-owned model type and its public node boundary is
-`I -> core.types.Result<AgentError, O>`. `max_corrections = 0` means no correction,
-`1` means one correction, and so on.
+`submit_output({})` must be the sole tool call in its model response. It reads
+and validates the current file afresh, accepts the snapshot, records completion
+and emits downstream once without an extra model acknowledgment. Mixed batches
+reject each submission while other permitted calls execute normally; there is
+no ordered edit-plus-submit batch. Dynamic producers validate the complete
+collection before emitting ordered items and one complete event, including
+empty collections.
+
+Model final prose remains recorded and receives one diagnostic system reminder
+for that stop to finish the existing draft and submit. Invalid draft contents,
+malformed tool arguments and missing submission have unlimited correction
+rounds in the same activation. Cancellation and drain remain terminal lifecycle
+controls. Genuine provider failures retain `AgentError` with `ProviderError`
+and the last provider output; correction exhaustion is no longer a result.
+
+Runtime instructions and request-local definitions own this protocol, including
+parameter descriptions and an edit/validate/submit example. Distribution role
+prompts need no duplicate contract. Result tools coexist with the normal tool
+catalog; conflicting tool names fail explicitly rather than shadowing.
+
+The canonical constructor is `nefor.actors.agent`, generic over the
+configuration-owned model type with public boundary
+`I -> core.types.Result<AgentError, O>`. `AgentConfig` carries model, system,
+tools and tool approval policy, with no correction-limit fields. This contract
+change removes old APIs under the 0.7 minor-line compatibility policy.
 
 The constructor derives its runtime entry protocol from `I`. The nominal
 `ProviderInput` type denotes an already-built provider continuation; every
@@ -498,7 +513,7 @@ and lowering details and are not accepted by the MAG authoring API.
 
 The descriptor and semantic error type identities are compiler-derived
 protected params data. `mag.execute` rejects any `params_overlay` that attempts
-to replace `schema`, `provider_error_type`, or `validation_error_type`;
+to replace `schema` or `provider_error_type`;
 accepting such an overlay would let runtime data weaken or counterfeit the type
 promised by the fragment. Provider/model/history overlays remain ordinary
 runtime configuration, but a run model snapshot is authoritative over the
@@ -511,7 +526,7 @@ normalization, cancellation, draining, and error behavior. A logical turn
 starts at a non-continuation graph activation and spans any tool-result rounds
 and structured correction retries. If the same live actor receives another
 activation after a completed final output, that is a fresh logical turn:
-correction count and `last_output` reset.
+the draft identity and `last_output` reset.
 
 ### Traversal verification scope
 

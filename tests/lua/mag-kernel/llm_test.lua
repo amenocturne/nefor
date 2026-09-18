@@ -362,7 +362,7 @@ for _, case in ipairs({
   { label = "array", arguments = "[]", diagnostic = "JSON array" },
 }) do
   local instance, msgs, facts = make("invalid-" .. case.label .. ".llm", {
-    provider = "p", max_tool_call_corrections = 1,
+    provider = "p",
   })
   instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
   local first = find_last_kind(msgs, "capability.invoke")
@@ -376,7 +376,7 @@ for _, case in ipairs({
   assert_true(second ~= first, case.label .. " arguments trigger another provider completion")
   local history = conversation_messages(facts)
   local feedback = history[#history]
-  assert_eq(feedback.role, "user", "correction feedback is provider-valid user context")
+  assert_eq(feedback.role, "system", "runtime correction feedback is system context")
   assert_true(feedback.content:find("not executed", 1, true) ~= nil,
     "correction states that the call was not executed")
   assert_true(feedback.content:find(case.diagnostic, 1, true) ~= nil,
@@ -423,7 +423,7 @@ end
 
 do
   local instance, msgs = make("bounded-invalid.llm", {
-    provider = "p", max_tool_call_corrections = 1,
+    provider = "p",
   })
   instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
   local first = find_last_kind(msgs, "capability.invoke")
@@ -432,13 +432,10 @@ do
   local second = find_last_kind(msgs, "capability.invoke")
   instance.deliver({ kind = "reply", ref = second.ref,
     result = { tool_calls = { { id = "bad-2", name = "read", arguments = "[]" } } } })
-  assert_eq(count_kind(msgs, "capability.invoke"), 2,
-    "repeated malformed calls stop at the configured correction bound")
-  local failed = find_kind(msgs, "nefor.agent.Result")
-  assert_true(failed ~= nil and failed.semantic_type_id == nil and failed.value.constructor == "Error",
-    "exhausting correction feedback settles as a typed agent error")
-  assert_true(failed.value.value.reason.value.message:find("correction limit reached", 1, true) ~= nil,
-    "the typed agent error retains the correction-limit detail")
+  assert_eq(count_kind(msgs, "capability.invoke"), 3,
+    "repeated malformed calls continue without a correction bound")
+  assert_true(find_kind(msgs, "nefor.agent.Result") == nil,
+    "malformed tool calls do not settle as a terminal agent error")
 end
 
 -- ==================================================================
@@ -1412,3 +1409,37 @@ do
 end
 
 print("mag-kernel llm_test: all assertions passed")
+
+do
+  local instance, messages = make("steered-drain.llm", {provider = "p"})
+  instance.deliver(turn({text = "initial"}))
+  local request = find_last_kind(messages, "capability.invoke")
+  assert_true(instance.handle_steer({role = "user", content = "steering"}))
+  instance.handle_drain()
+  instance.deliver({kind = "reply", ref = request.ref, result = {text = "final"}})
+  assert_eq(count_kind(messages, "mag.failed"), 1, "drain settles blocked steered continuation")
+  assert_eq(count_kind(messages, "capability.invoke"), 1, "drain never invokes another provider round")
+end
+
+do
+  local instance, messages = make("tool-continuation-drain.llm", {provider = "p"})
+  instance.deliver(turn({text = "initial"}))
+  local request = find_last_kind(messages, "capability.invoke")
+  instance.deliver({kind = "reply", ref = request.ref, result = {
+    tool_calls = {{id = "ordinary", name = "read_file", args = {path = "fixture"}}}}})
+  instance.handle_drain()
+  instance.deliver(turn({messages = {{role = "tool", tool_call_id = "ordinary", name = "read_file", content = "late"}}}))
+  assert_eq(count_kind(messages, "capability.invoke"), 1, "late tool continuation cannot resurrect a drained actor")
+end
+
+do
+  local instance, messages, facts = make("idle-drain.llm", {provider = "p"})
+  instance.handle_drain()
+  instance.handle_drain()
+  assert_eq(count_kind(messages, "mag.complete"), 1, "duplicate idle drain settles once")
+  assert_true(not instance.handle_steer({role = "user", content = "late steering"}), "drained actor rejects steering")
+  assert_true(not instance.handle_observation({binding = "transcript", value = {text = "late stream"}}), "idle/drained actor ignores late observations")
+  instance.deliver(turn({text = "new activation"}))
+  assert_eq(count_kind(messages, "capability.invoke"), 0, "idle drain refuses new activation")
+  assert_eq(#facts, 0, "idle drain invents no turn or terminal fact")
+end

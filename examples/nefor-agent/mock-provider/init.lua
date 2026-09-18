@@ -70,9 +70,9 @@ let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = 
 let resolved_model_value = nefor.actors.ResolvedModel {provider: "mock-plugin", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 
 let start = nefor.graph.source("task", InvestigationInput {prompt: "<initial task text>"})
-let sx = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, OctopusSummary>("sx", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Summarise octopuses in one sentence.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
-let sy = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, OctopusSummary>, LighthouseSummary>("sy", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Summarise lighthouses in one sentence.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
-let combine = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, LighthouseSummary>, nefor.contracts.TextAnswer>("combine", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Combine the two summaries above into one paragraph.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+let sx = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, OctopusSummary>("sx", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Summarise octopuses in one sentence.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
+let sy = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, OctopusSummary>, LighthouseSummary>("sy", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Summarise lighthouses in one sentence.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
+let combine = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, LighthouseSummary>, nefor.contracts.TextAnswer>("combine", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Combine the two summaries above into one paragraph.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, sx), nefor.graph.edge(sx, sy), nefor.graph.edge(sy, combine), nefor.graph.edge(combine, result)])
 nefor.artifact.compile(topology)
@@ -792,6 +792,73 @@ nefor.on_ready_ok(function()
   nefor.emit("auth.status", { state = "connected" })
 end)
 
+-- The mock chooses deterministic data from the runtime's published schema;
+-- schema validation and activation completion remain runtime responsibilities.
+local function sample_output(schema, text)
+  if schema.const ~= nil then return schema.const end
+  if schema.oneOf then return sample_output(schema.oneOf[1], text) end
+  if schema.type == "string" then return text end
+  if schema.type == "integer" or schema.type == "number" then return 0 end
+  if schema.type == "boolean" then return false end
+  if schema.type == "array" then
+    local value = nefor.json.decode("[]")
+    for _, component in ipairs(schema.prefixItems or {}) do
+      value[#value + 1] = sample_output(component, text)
+    end
+    return value
+  end
+  if schema.type == "object" then
+    local value = {}
+    for name, property in pairs(schema.properties or {}) do value[name] = sample_output(property, text) end
+    return value
+  end
+  return nefor.json.decode("null")
+end
+
+local function typed_response(request, history)
+  local typed = false
+  for _, name in ipairs(request.tools or {}) do if name == "write_output" then typed = true end end
+  if not typed then return nil end
+  local schema, instruction_index
+  for i = #history, 1, -1 do
+    local message = history[i]
+    if message.role == "system" and type(message.content) == "string" then
+      local encoded = message.content:match("Expected canonical MAG JSON schema: (.-)%. Write the value directly")
+      if encoded then
+        schema = nefor.json.decode(encoded)
+        instruction_index = i
+        break
+      end
+    end
+  end
+  assert(schema, "typed mock request requires runtime output schema instructions")
+  for i = #history, instruction_index + 1, -1 do
+    local message = history[i]
+    if message.role == "tool" and message.name == "write_output" then
+      local ok, receipt = true, message.content
+      if type(receipt) == "string" then ok, receipt = pcall(nefor.json.decode, receipt) end
+      if ok and type(receipt) == "table" and receipt.write == "saved" and receipt.validation.status == "valid" then
+        return { text = "", finish_reason = "tool_calls", tool_calls = {
+          { id = mint_tool_id("submit_output"), name = "submit_output", arguments = {} },
+        } }
+      end
+      break
+    end
+  end
+  local authored = {}
+  for _, message in ipairs(history) do
+    if message.role ~= "tool" or (message.name ~= "write_output" and message.name ~= "submit_output") then
+      authored[#authored + 1] = message
+    end
+  end
+  local response = pick_response_for(authored)
+  if response.tool_calls or response.finish_reason == "error" then return response end
+  local contents = nefor.json.encode(sample_output(schema, response.text or "Mock typed result"))
+  return { text = "", finish_reason = "tool_calls", pre_delay_ms = response.pre_delay_ms, tool_calls = {
+    { id = mint_tool_id("write_output"), name = "write_output", arguments = {new_string = contents, validate = true} },
+  } }
+end
+
 local function complete_request(body)
   local request_id = body.request_id
   if type(request_id) ~= "string" or request_id == "" then return end
@@ -805,8 +872,10 @@ local function complete_request(body)
   for _, message in ipairs(type(messages) == "table" and messages or {}) do
     table.insert(history, {
       role         = message.role,
-      content      = flatten_content(message.content),
+      content      = (message.name == "write_output" or message.name == "submit_output")
+          and message.content or flatten_content(message.content),
       tool_call_id = message.tool_call_id,
+      name         = message.name or message.tool_name,
       tool_calls   = message.tool_calls,
     })
   end
@@ -822,7 +891,7 @@ local function complete_request(body)
   local run = { cancelled = false }
   completion_runs[request_id] = run
 
-  local resp = pick_response_for(history)
+  local resp = typed_response(request, history) or pick_response_for(history)
   -- TextAnswer is the direct-text provider path: the LLM factory assigns the
   -- semantic constructor, while providers return the ordinary response text.
   -- Tool-call and error turns use their own wire shapes.

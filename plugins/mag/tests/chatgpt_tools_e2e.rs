@@ -231,7 +231,7 @@ type InvestigationInput {prompt: String}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
 let resolved = nefor.actors.ResolvedModel {provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "read fixture"})
-let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Read fixture.txt, then answer.", tools: ["read_file", "unavailable_fixture_tool"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Read fixture.txt, then answer.", tools: ["read_file", "unavailable_fixture_tool"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let output = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [
   nefor.graph.edge(start, answer),
@@ -458,7 +458,7 @@ type InvestigationInput {prompt: String}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
 let resolved = nefor.actors.ResolvedModel {provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "research"})
-let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Research, then answer.", tools: ["web_search"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Research, then answer.", tools: ["web_search"], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let output = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [
   nefor.graph.edge(start, answer),

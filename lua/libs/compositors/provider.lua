@@ -288,7 +288,7 @@ function M.spawn_spec(name, command, opts)
       provider_options = clone_table(body.provider_options),
       tools = clone_table(body.tools),
       output_schema = clone_table(body.output_schema),
-      max_corrections = body.max_corrections,
+      tool_specs = clone_table(body.tool_specs),
       invocation = clone_table(body.invocation),
     }
     local ok, native = pcall(translator.complete, request, context)

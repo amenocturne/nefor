@@ -16,15 +16,13 @@ type ToolCalls {calls: List<ToolCall>}
 
 type ToolHandle {results: JsonValue}
 
-type OutputViolation {path: String, code: String, expected: String, actual: String, message: String}
 
 type OptionalIdentifier {present: Bool, value: String}
 
 type ProviderError {message: String, detail: OptionalIdentifier}
 
-type OutputValidationError {violations: List<OutputViolation>}
 
-type AgentErrorReason = ProviderError(ProviderError) | OutputValidationError(OutputValidationError)
+type AgentErrorReason = ProviderError(ProviderError)
 
 type AgentError {last_output: JsonValue, reason: AgentErrorReason}
 

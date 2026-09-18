@@ -641,7 +641,7 @@ async fn finish_compile(
         _ => return send_event(out_tx, error_body(in_reply_to,
             "MAG requires a nefor.mag program or delta envelope")).await,
     };
-    if let Err(error) = preflight_provider_schemas(&decoded) {
+    if let Err(error) = preflight_output_schemas(&decoded) {
         return send_event(out_tx, error_body(in_reply_to, &error)).await;
     }
     let factories = host.registry_names().unwrap_or_default();
@@ -901,7 +901,7 @@ async fn handle_execute(
             return send_event(out_tx, error_body(in_reply_to, &error)).await;
         }
     }
-    if let Err(error) = preflight_provider_schemas(&execution) {
+    if let Err(error) = preflight_output_schemas(&execution) {
         return send_event(out_tx, error_body(in_reply_to, &error)).await;
     }
     let preflight = host.preflight_program(&execution.initial, &execution.operations)?;
@@ -1071,7 +1071,7 @@ fn actor_inventory(program: &DecodedProgram) -> Vec<(String, &Value)> {
     inventory
 }
 
-fn preflight_provider_schemas(program: &DecodedProgram) -> Result<(), String> {
+fn preflight_output_schemas(program: &DecodedProgram) -> Result<(), String> {
     for (address, actor) in actor_inventory(program) {
         let Some(actor) = actor.as_object() else {
             continue;
@@ -1091,46 +1091,11 @@ fn preflight_provider_schemas(program: &DecodedProgram) -> Result<(), String> {
             .map_err(|error| {
                 format!("structured-output {address:?}: invalid MAG type schema: {error}")
             })?;
-        schema.to_provider_schema().map_err(|error| {
-            let correction = if schema_contains_named(&schema.root, "nefor.contracts.AgentError") {
-                "nefor.actors.agent adds nefor.contracts.AgentError automatically; pass only the success output type to the agent and use (core.types.Result nefor.contracts.AgentError SuccessType) only at the agent result/output boundary"
-            } else {
-                "replace the unsupported semantic field/type with a concrete strict-JSON shape before using it as structured output"
-            };
-            format!(
-                "structured-output actor {address:?}: output schema cannot be lowered for the provider: {error}; correction: {correction}"
-            )
-        })?;
+        if schema.version != nefor_mag::schema::SCHEMA_VERSION {
+            return Err(format!("structured-output {address:?}: unsupported MAG schema version {}", schema.version));
+        }
     }
     Ok(())
-}
-
-fn schema_contains_named(schema: &nefor_mag::schema::SchemaType, expected: &str) -> bool {
-    use nefor_mag::schema::SchemaType;
-    match schema {
-        SchemaType::List { item } | SchemaType::Set { item } => {
-            schema_contains_named(item, expected)
-        }
-        SchemaType::Map { key, value } => {
-            schema_contains_named(key, expected) || schema_contains_named(value, expected)
-        }
-        SchemaType::Fields { fields } => fields
-            .iter()
-            .any(|field| schema_contains_named(&field.schema, expected)),
-        SchemaType::Union { variants } => variants
-            .iter()
-            .any(|variant| schema_contains_named(&variant.schema, expected)),
-        SchemaType::Adt { constructors, .. } => constructors
-            .iter()
-            .any(|constructor| schema_contains_named(&constructor.schema, expected)),
-        SchemaType::Product { components } => components
-            .iter()
-            .any(|component| schema_contains_named(component, expected)),
-        SchemaType::Named { name, body } => {
-            name == expected || schema_contains_named(body, expected)
-        }
-        _ => false,
-    }
 }
 
 /// Merge a per-actor params overlay into a modification's actors before spawn.
@@ -1145,7 +1110,7 @@ fn apply_actor_patch(address: &str, actor: &mut Value, overlay: &Map<String, Val
     let protected_params: &[&str] = match factory {
         Some("structured-output" | "nefor.factory.structured-output") => &[
             "model_profile", "schema", "output_type", "error_type",
-            "provider_error_type", "validation_error_type",
+            "provider_error_type",
         ],
         Some("llm" | "nefor.factory.llm") => &["model_profile"],
         _ => &[],
@@ -1305,7 +1270,7 @@ async fn handle_apply(
             return send_event(out_tx, error_body(in_reply_to, &error)).await;
         }
     }
-    if let Err(error) = preflight_provider_schemas(&delta_program) {
+    if let Err(error) = preflight_output_schemas(&delta_program) {
         return send_event(out_tx, error_body(in_reply_to, &error)).await;
     }
     modification = delta_program.initial;

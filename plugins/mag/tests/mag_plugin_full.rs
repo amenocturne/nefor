@@ -324,7 +324,7 @@ type InvestigationInput {{prompt: String}}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
 let configured_model = nefor.actors.ResolvedModel {{provider: "test-provider", model: "test-model", reasoning_effort: nefor.actors.no_reasoning_effort}}
 let start = nefor.graph.source("task", InvestigationInput {{prompt: "produce values"}})
-let planner = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.dynamic.DynamicList<{input_type}>>("planner", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {{model: configured_model, system: "Return values.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0}})
+let planner = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.dynamic.DynamicList<{input_type}>>("planner", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {{model: configured_model, system: "Return values.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)}})
 let planned = nefor.node.`>>>`(start, planner)
 let traversal = nefor.dynamic.traverse("traversal", {worker})
 let lifted = nefor.result.lift<nefor.dynamic.DynamicList<{input_type}>, nefor.contracts.AgentError, nefor.dynamic.DynamicList<{output_type}>>("lifted", traversal)
@@ -386,7 +386,21 @@ nefor.artifact.compile_graph(contextual)
                 let request = tool_invoke(&emitted, "test-provider");
                 host.bus_response(
                     request["id"].as_str().unwrap(),
-                    Some(&serde_json::json!({"text": serde_json::json!({"value":provider_values}).to_string()})),
+                    Some(&serde_json::json!({"tool_calls": [{
+                        "id": "planner-draft", "name": "write_output",
+                        "args": {"new_string": provider_values.to_string(), "validate": true}
+                    }]})),
+                    None,
+                    Some("async"),
+                ).unwrap();
+                assert!(host.take_run_complete(name).unwrap().is_none());
+                let emitted = host.drain_emits().unwrap();
+                let request = tool_invoke(&emitted, "test-provider");
+                host.bus_response(
+                    request["id"].as_str().unwrap(),
+                    Some(&serde_json::json!({"tool_calls": [{
+                        "id": "planner-submit", "name": "submit_output", "args": {}
+                    }]})),
                     None,
                     Some("async"),
                 ).unwrap();
@@ -554,7 +568,7 @@ nefor.artifact.compile_graph(contextual)
     let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
     let resolved = nefor.actors.ResolvedModel {provider: "authored-provider", model: "authored-model", reasoning_effort: nefor.actors.reasoning_effort("authored-effort")}
     let start = nefor.graph.source("task", InvestigationInput {prompt: "answer"})
-    let worker = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+    let worker = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
     let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
     nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
     "#;
@@ -797,7 +811,7 @@ nefor.artifact.compile_graph(contextual)
       case Fast(value) => named(nefor.actors.AuthoredModel, ModelProfile, nefor.actors.model_profile("fast")),
     }
     let start = nefor.graph.source("task", InvestigationInput {prompt: "answer"})
-    let worker = nefor.actors.agent<Model, InvestigationInput, nefor.contracts.TextAnswer>("worker", resolve_model, nefor.actors.AgentConfig<Model> {model: fast, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
+    let worker = nefor.actors.agent<Model, InvestigationInput, nefor.contracts.TextAnswer>("worker", resolve_model, nefor.actors.AgentConfig<Model> {model: fast, system: "", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
     let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
     nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
     "#;
@@ -1886,7 +1900,7 @@ type InvestigationInput {prompt: String}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |selected| => named(nefor.actors.AuthoredModel, ResolvedModel, selected)
 let configured_model = nefor.actors.ResolvedModel {provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "test"})
-let worker = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: configured_model, system: "Answer.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+let worker = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: configured_model, system: "Answer.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>> >("result")
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
 "#,

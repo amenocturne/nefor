@@ -2286,6 +2286,27 @@ async fn handle_completion_request(
                 }
                 None => None,
             };
+            let advertised = ctx.catalog.project_names(&names).await;
+            let conflicts = direct_specs.as_ref().is_some_and(|directs| {
+                directs.iter().any(|direct| {
+                    !direct.owner.is_empty()
+                        && advertised
+                            .iter()
+                            .any(|spec| spec.name == direct.name && spec.owner != direct.owner)
+                })
+            });
+            if conflicts {
+                send_completion_event(ctx, Some(&request_id), "failed", |event| {
+                    event.insert(
+                        "error".into(),
+                        Value::String(
+                            "request-local tool owner conflicts with an advertised tool".into(),
+                        ),
+                    );
+                })
+                .await?;
+                return Ok(());
+            }
             let specs = project_direct_tool_specs(&ctx.catalog, &names, direct_specs).await;
             let projected_names = specs
                 .iter()

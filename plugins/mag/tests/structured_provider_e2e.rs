@@ -2,12 +2,12 @@
 //! and real provider dispatchers.
 //!
 //! These tests deliberately route NCP envelopes between separate plugin processes. The MAG
-//! compiler/factory owns schema projection and result decoding, while its public provider request
+//! runtime owns canonical draft validation and typed completion, while its public provider request
 //! stays thin. The harness folds MAG's canonical facts into the manager-owned read context and
 //! privately delivers the expanded native request to the provider process, standing in for the
 //! provider compositor's in-process `engine.deliver` seam. The providers still own their HTTP
 //! request controls. The local servers only inspect the resulting wire request and return a
-//! deterministic structured response.
+//! deterministic draft-edit and standalone-submission tool calls.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,13 +66,6 @@ impl AnswerCase {
         }
     }
 
-    fn provider_text(self) -> String {
-        match self {
-            Self::Text => "done".into(),
-            _ => json!({"value": self.semantic_value()}).to_string(),
-        }
-    }
-
     fn type_name(self) -> &'static str {
         match self {
             Self::Text => "nefor.contracts.TextAnswer",
@@ -80,21 +73,23 @@ impl AnswerCase {
         }
     }
 
-    fn assert_schema(self, schema: Option<&Value>) {
+    fn assert_request(self, request: &Map<String, Value>) {
+        assert!(request.get("output_schema").is_none());
+        let specs = request.get("tool_specs").and_then(Value::as_array);
         if matches!(self, Self::Text) {
-            assert!(schema.is_none(), "TextAnswer has no structured schema");
+            assert!(specs.is_none_or(Vec::is_empty));
             return;
         }
-        let schema = schema.expect("structured provider schema");
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"], json!(["value"]));
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
-        let inner = &schema["properties"]["value"];
-        match self {
-            Self::Record => assert_eq!(inner["properties"]["value"]["type"], "string"),
-            Self::Adt => assert!(inner["anyOf"].is_array()),
-            Self::Text => unreachable!(),
+        let specs = specs.expect("typed request carries intrinsic definitions");
+        for name in ["write_output", "submit_output"] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec["name"] == name)
+                .expect("intrinsic spec");
+            assert_eq!(spec["owner"], "mag-runtime");
+            assert_eq!(spec["execution"]["kind"], "routed");
+            assert_eq!(spec["parameters"]["type"], "object");
+            assert!(request["tools"].as_array().unwrap().contains(&json!(name)));
         }
     }
 }
@@ -241,7 +236,7 @@ fn assert_thin_provider_request(request: &Map<String, Value>, provider: &str) {
         request.get("provider").and_then(Value::as_str),
         Some(provider)
     );
-    for forbidden in ["messages", "system", "tool_specs", "conversation_context"] {
+    for forbidden in ["messages", "system", "conversation_context"] {
         assert!(
             request.get(forbidden).is_none(),
             "thin provider request must not carry {forbidden}: {request:?}"
@@ -278,10 +273,13 @@ fn context_messages(facts: &[Value]) -> Vec<Value> {
         text: String,
         structured: Vec<Value>,
         completed: bool,
+        tool_calls: Vec<Value>,
+        tool_call_id: Option<Value>,
     }
 
     let mut messages = Vec::<Message>::new();
     let mut message_indexes = HashMap::<String, usize>::new();
+    let mut exchange_messages = HashMap::<String, String>::new();
 
     for fact in facts {
         let Some(kind) = fact.get("kind").and_then(Value::as_str) else {
@@ -303,7 +301,21 @@ fn context_messages(facts: &[Value]) -> Vec<Value> {
                     text: String::new(),
                     structured: Vec::new(),
                     completed: false,
+                    tool_calls: Vec::new(),
+                    tool_call_id: fact.get("tool_call_id").cloned(),
                 });
+            }
+            "tool_exchange_started" => {
+                exchange_messages.insert(
+                    fact["exchange_id"].as_str().unwrap().into(),
+                    fact["message_id"].as_str().unwrap().into(),
+                );
+            }
+            "tool_call_completed" => {
+                let id = &exchange_messages[fact["exchange_id"].as_str().unwrap()];
+                let index = message_indexes[id];
+                let call = &fact["call"];
+                messages[index].tool_calls.push(json!({"id": call["tool_call_id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"].to_string()}}));
             }
             "content_chunk_appended" => {
                 let Some(index) = fact["message_id"]
@@ -355,7 +367,14 @@ fn context_messages(facts: &[Value]) -> Vec<Value> {
             } else {
                 Value::Array(message.structured)
             };
-            Some(json!({ "role": message.role, "content": content }))
+            let mut projected = json!({ "role": message.role, "content": content });
+            if !message.tool_calls.is_empty() {
+                projected["tool_calls"] = json!(message.tool_calls);
+            }
+            if let Some(id) = message.tool_call_id {
+                projected["tool_call_id"] = id;
+            }
+            Some(projected)
         })
         .collect()
 }
@@ -386,8 +405,7 @@ fn private_provider_request(
         "model",
         "reasoning_effort",
         "tools",
-        "output_schema",
-        "max_corrections",
+        "tool_specs",
         "invocation",
     ] {
         if let Some(value) = invocation.get(field) {
@@ -471,6 +489,7 @@ async fn write_sse(stream: &mut TcpStream, body: &str) {
 }
 
 async fn fake_server(kind: ProviderKind, listener: TcpListener, answer: AnswerCase) {
+    let mut round = 0;
     loop {
         let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
         let (request_line, request) = read_http_json(&mut stream).await;
@@ -493,22 +512,57 @@ async fn fake_server(kind: ProviderKind, listener: TcpListener, answer: AnswerCa
             continue;
         }
 
-        match kind {
-            ProviderKind::OpenAi => {
-                assert!(request_line.contains(" /v1/chat/completions "));
-                answer.assert_schema(request.pointer("/response_format/json_schema/schema"));
-                let event = json!({"choices": [{"delta": {"content": answer.provider_text()}}]});
-                write_sse(&mut stream, &format!("data: {event}\n\ndata: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n")).await;
-            }
-            ProviderKind::ChatGpt => {
-                assert!(request_line.contains(" /responses "));
-                assert_eq!(request["tools"], json!([]));
-                answer.assert_schema(request.pointer("/text/format/schema"));
-                let event =
-                    json!({"type": "response.output_text.delta", "delta": answer.provider_text()});
-                write_sse(&mut stream, &format!("data: {event}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\ndata: [DONE]\n\n")).await;
+        assert!(request.pointer("/response_format/json_schema").is_none());
+        assert!(request.pointer("/text/format/schema").is_none());
+        let typed = !matches!(answer, AnswerCase::Text);
+        if typed {
+            let tools = request["tools"].as_array().expect("native tools");
+            for name in ["write_output", "submit_output"] {
+                assert!(
+                    tools
+                        .iter()
+                        .any(|tool| tool["name"] == name || tool["function"]["name"] == name),
+                    "native definition missing: {request}"
+                );
             }
         }
+        let (name, args) = match round {
+            0 => ("write_output", json!({"new_string": "{", "validate": true})),
+            1 => (
+                "write_output",
+                json!({"old_string": "{", "new_string": answer.semantic_value().to_string(), "validate": true}),
+            ),
+            _ => ("submit_output", json!({})),
+        };
+        let args = args.to_string();
+        let event = match (kind, typed) {
+            (ProviderKind::OpenAi, true) => {
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": format!("call-{round}"), "type": "function", "function": {"name": name, "arguments": args}}]}}]})
+            }
+            (ProviderKind::ChatGpt, true) => {
+                json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "function_call", "id": format!("fc-{round}"), "call_id": format!("call-{round}"), "name": name, "arguments": args}})
+            }
+            (ProviderKind::OpenAi, false) => {
+                json!({"choices": [{"delta": {"content": "done"}}]})
+            }
+            (ProviderKind::ChatGpt, false) => {
+                json!({"type": "response.output_text.delta", "delta": "done"})
+            }
+        };
+        let terminal = match kind {
+            ProviderKind::OpenAi => format!("data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}\n\n", if typed { "tool_calls" } else { "stop" }),
+            ProviderKind::ChatGpt => "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n".into(),
+        };
+        write_sse(
+            &mut stream,
+            &format!("data: {event}\n\n{terminal}data: [DONE]\n\n"),
+        )
+        .await;
+        round += 1;
+        if typed && round < 3 {
+            continue;
+        }
+
         break;
     }
 }
@@ -530,7 +584,7 @@ type InvestigationInput {prompt: String}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => named(nefor.actors.AuthoredModel, ResolvedModel, model)
 let resolved = nefor.actors.ResolvedModel {provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "return done"})
-let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Return the requested structured answer.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Return the requested structured answer.", tools: [], tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let output = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [
   nefor.graph.edge(start, answer),
@@ -617,56 +671,123 @@ async fn run_case(kind: ProviderKind, answer: AnswerCase) {
     )
     .await;
 
-    let (invocation, facts) = next_provider_request_with_facts(&mut mag_out, kind.name()).await;
-    answer.assert_schema(invocation.get("output_schema"));
-    let request_id = invocation["request_id"]
-        .as_str()
-        .expect("provider request id")
-        .to_owned();
-    let private_request = private_provider_request(kind, &invocation, &facts);
-    send_event(&mut provider_in, "conversation-manager", private_request).await;
+    let mut all_facts = Vec::new();
+    for round in 0..if matches!(answer, AnswerCase::Text) {
+        1
+    } else {
+        3
+    } {
+        let (invocation, facts) = next_provider_request_with_facts(&mut mag_out, kind.name()).await;
+        answer.assert_request(&invocation);
+        if !matches!(answer, AnswerCase::Text) && round > 0 {
+            let paths: Vec<_> = std::fs::read_dir(temp.path().join("output-drafts"))
+                .expect("draft root")
+                .map(|entry| entry.unwrap().path().join("output.json"))
+                .collect();
+            assert_eq!(paths.len(), 1, "one private activation draft");
+            let saved = std::fs::read_to_string(&paths[0]).expect("saved draft");
+            assert_eq!(
+                saved,
+                if round == 1 {
+                    "{".into()
+                } else {
+                    answer.semantic_value().to_string()
+                },
+                "round {round}: {facts:?}"
+            );
+        }
 
-    let completion_kind = format!("{}.completion.event", kind.name());
-    let completed = loop {
-        let outgoing = read_outgoing(&mut provider_out, "structured provider completion").await;
-        let Body::Event(body) = outgoing.body else {
-            continue;
+        if !matches!(answer, AnswerCase::Text) && round > 0 {
+            let receipt = facts
+                .iter()
+                .filter(|fact| fact["kind"] == "tool_result_recorded")
+                .filter_map(|fact| {
+                    fact["result"]
+                        .as_str()
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                })
+                .find(|receipt| receipt["write"] == "saved")
+                .expect("saved write receipt");
+            assert_eq!(
+                receipt["validation"]["status"],
+                if round == 1 { "invalid" } else { "valid" }
+            );
+            if round == 1 {
+                let diagnostic = &receipt["validation"]["error"];
+                assert_eq!(diagnostic["code"], "invalid_json");
+                assert!(diagnostic["line"].as_u64().unwrap() > 0);
+                assert!(diagnostic["column"].as_u64().unwrap() > 0);
+                assert!(diagnostic["excerpt"].as_str().unwrap().contains('{'));
+            }
+        }
+
+        let request_id = invocation["request_id"]
+            .as_str()
+            .expect("provider request id")
+            .to_owned();
+        all_facts.extend(facts);
+        let private_request = private_provider_request(kind, &invocation, &all_facts);
+        send_event(&mut provider_in, "conversation-manager", private_request).await;
+
+        let completion_kind = format!("{}.completion.event", kind.name());
+        let completed = loop {
+            let outgoing = read_outgoing(&mut provider_out, "structured provider completion").await;
+            let Body::Event(body) = outgoing.body else {
+                continue;
+            };
+            assert_ne!(
+                body.get("kind").and_then(Value::as_str),
+                Some("completion.event"),
+                "provider process must publish its configured canonical kind"
+            );
+            if body.get("kind").and_then(Value::as_str) != Some(&completion_kind) {
+                continue;
+            }
+            assert_eq!(
+                body.get("request_id").and_then(Value::as_str),
+                Some(request_id.as_str())
+            );
+            assert_ne!(
+                body.get("event").and_then(Value::as_str),
+                Some("failed"),
+                "provider failure: {body:?}"
+            );
+            assert_ne!(
+                body.get("event").and_then(Value::as_str),
+                Some("error"),
+                "provider failure: {body:?}"
+            );
+            if body.get("event").and_then(Value::as_str) == Some("text_delta") {
+                assert_eq!(body.get("text"), Some(&json!("done")));
+                continue;
+            }
+            if body.get("event").and_then(Value::as_str) == Some("completed") {
+                break body;
+            }
+            send_event(
+                &mut mag_in,
+                "conversation-manager",
+                manager_event(kind, body),
+            )
+            .await;
         };
-        assert_ne!(
-            body.get("kind").and_then(Value::as_str),
-            Some("completion.event"),
-            "provider process must publish its configured canonical kind"
-        );
-        if body.get("kind").and_then(Value::as_str) != Some(&completion_kind) {
-            continue;
+        if matches!(answer, AnswerCase::Text) {
+            assert_eq!(
+                completed
+                    .get("result")
+                    .and_then(|result| result.get("text"))
+                    .or_else(|| completed.get("text")),
+                Some(&json!("done"))
+            );
         }
-        assert_eq!(
-            body.get("request_id").and_then(Value::as_str),
-            Some(request_id.as_str())
-        );
-        if body.get("event").and_then(Value::as_str) == Some("text_delta") {
-            assert_eq!(body.get("text"), Some(&json!(answer.provider_text())));
-            continue;
-        }
-        if body.get("event").and_then(Value::as_str) == Some("completed") {
-            break body;
-        }
-    };
-    assert_eq!(
-        completed
-            .get("result")
-            .and_then(|result| result.get("text"))
-            .or_else(|| completed.get("text")),
-        Some(&json!(answer.provider_text()))
-    );
-    assert!(completed.get("chat_id").is_none());
-    send_event(
-        &mut mag_in,
-        "conversation-manager",
-        manager_event(kind, completed),
-    )
-    .await;
-
+        assert!(completed.get("chat_id").is_none());
+        send_event(
+            &mut mag_in,
+            "conversation-manager",
+            manager_event(kind, completed),
+        )
+        .await;
+    }
     let result = next_event_of_kind(&mut mag_out, "mag.run_result").await;
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"]["value"]["constructor"], "Ok");

@@ -244,7 +244,7 @@ fn assert_thin_provider_request(request: &Map<String, Value>, provider: &str) {
         request.get("provider").and_then(Value::as_str),
         Some(provider)
     );
-    for forbidden in ["messages", "system", "tool_specs"] {
+    for forbidden in ["messages", "system"] {
         assert!(
             request.get(forbidden).is_none(),
             "thin provider request must not carry {forbidden}: {request:?}"
@@ -509,20 +509,10 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
 
     let create = next_provider_request(&mut reader, MOCK).await;
     let first_chat = create["request_id"].as_str().unwrap().to_owned();
-    assert_eq!(create.pointer_str("/output_schema/type"), Some("object"));
-    assert_eq!(
-        create.pointer_str("/output_schema/properties/value/properties/task/type"),
-        Some("string")
-    );
-    assert_eq!(
-        create
-            .get("output_schema")
-            .and_then(|schema| schema.pointer("/properties/value/additionalProperties")),
-        Some(&Value::Bool(false))
-    );
+    assert_output_tools(&create);
     send_event(
         &mut stdin,
-        completed(MOCK, &first_chat, json!({ "text": "```json\n{}\n```" })),
+        completed(MOCK, &first_chat, output_write("```json\n{}\n```", true)),
     )
     .await;
 
@@ -538,9 +528,11 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             || correction_history.contains("invalid_json"),
         "correction diagnostics are retained as canonical facts: {correction_facts:?}"
     );
-    send_event(
+    complete_chat(
+        &mut reader,
         &mut stdin,
-        completed(MOCK, &second_chat, json!({ "text": "{\"value\":{\"task\":\"build\",\"description\":\"Implement it\",\"dependent_tasks\":[]}}" })),
+        &second_chat,
+        "{\"task\":\"build\",\"description\":\"Implement it\",\"dependent_tasks\":[]}",
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -598,7 +590,7 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     let builder_id = builder_create["request_id"].as_str().unwrap().to_owned();
     send_event(
         &mut stdin,
-        completed(MOCK, &builder_id, json!({"text": "partial builder notes"})),
+        obj(json!({"kind": "conversation.provider.event", "provider": MOCK, "request_id": builder_id, "event": "error", "message": "partial builder notes"})),
     )
     .await;
 
@@ -610,13 +602,11 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
         reviewer_history.contains("partial builder notes"),
         "builder output was not recorded before the reviewer invocation"
     );
-    send_event(
+    complete_chat(
+        &mut reader,
         &mut stdin,
-        completed(
-            MOCK,
-            &reviewer_id,
-            json!({"text": "{\"value\":{\"assessment\":\"continue from partial work\"}}"}),
-        ),
+        &reviewer_id,
+        r#"{"assessment":"continue from partial work"}"#,
     )
     .await;
     let result = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -628,25 +618,99 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     shutdown(stdin, child).await;
 }
 
+fn assert_output_tools(request: &Map<String, Value>) {
+    assert!(request.get("output_schema").is_none());
+    let specs = request["tool_specs"]
+        .as_array()
+        .expect("intrinsic output definitions");
+    for name in ["write_output", "submit_output"] {
+        assert!(specs
+            .iter()
+            .any(|spec| spec["name"] == name && spec["owner"] == "mag-runtime"));
+    }
+}
+
+fn output_write(text: &str, validate: bool) -> Value {
+    json!({"tool_calls": [{"id": "draft-write", "name": "write_output", "args": {"new_string": text, "validate": validate}}]})
+}
+
 async fn complete_chat<R: AsyncBufReadExt + Unpin>(
-    _reader: &mut R,
+    reader: &mut R,
     stdin: &mut ChildStdin,
     request_id: &str,
     text: &str,
 ) {
-    let text = serde_json::from_str::<Value>(text)
-        .ok()
-        .map(|value| {
-            if value.get("value").is_some() {
-                value
-            } else {
-                json!({"value": value})
-            }
-        })
-        .map_or_else(|| text.to_owned(), |value| value.to_string());
     send_event(
         stdin,
-        completed("mock-provider", request_id, json!({"text": text})),
+        completed("mock-provider", request_id, output_write(text, true)),
+    )
+    .await;
+    let (request, facts) = next_provider_request_with_facts(reader, "mock-provider").await;
+    assert_output_tools(&request);
+    let receipt = facts
+        .iter()
+        .filter(|fact| fact["kind"] == "tool_result_recorded")
+        .filter_map(|fact| {
+            fact["result"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        })
+        .find(|receipt| receipt["operation"] == "write")
+        .expect("draft write receipt");
+    assert_eq!(receipt["write"], "saved", "{receipt}");
+    assert_eq!(
+        receipt["validation"]["status"], "valid",
+        "canonical output fixture rejected: {receipt}"
+    );
+    send_event(
+        stdin,
+        completed(
+            "mock-provider",
+            request["request_id"].as_str().unwrap(),
+            json!({"tool_calls": [{"id": "draft-submit", "name": "submit_output", "args": {}}]}),
+        ),
+    )
+    .await;
+}
+
+async fn complete_chat_recording<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+    request_id: &str,
+    text: &str,
+    trace: &mut Vec<String>,
+    events: &mut Vec<Value>,
+) {
+    send_event(
+        stdin,
+        completed("mock-provider", request_id, output_write(text, true)),
+    )
+    .await;
+    let (request, facts) =
+        next_provider_request_recording(reader, "mock-provider", trace, events).await;
+    assert_output_tools(&request);
+    let receipt = facts
+        .iter()
+        .filter(|fact| fact["kind"] == "tool_result_recorded")
+        .filter_map(|fact| {
+            fact["result"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        })
+        .find(|receipt| receipt["operation"] == "write")
+        .expect("draft write receipt");
+    assert_eq!(receipt["write"], "saved", "{receipt}");
+    assert_eq!(
+        receipt["validation"]["status"], "valid",
+        "canonical output fixture rejected: {receipt}"
+    );
+    send_event(
+        stdin,
+        completed(
+            "mock-provider",
+            request["request_id"].as_str().unwrap(),
+            json!({"tool_calls": [{"id": "draft-submit", "name": "submit_output", "args": {}}]}),
+        ),
     )
     .await;
 }
@@ -1085,8 +1149,8 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     assert_eq!(request_actor(&planner), "planner.llm");
     assert_snapshot(&planner);
     let planner_id = planner["request_id"].as_str().unwrap().to_owned();
-    complete_chat(&mut reader, &mut stdin, &planner_id,
-      r#"{"value":[{"task":"same","description":"repeated","dependent_tasks":[]},{"task":"same","description":"repeated","dependent_tasks":[] }]}"#).await;
+    complete_chat_recording(&mut reader, &mut stdin, &planner_id,
+      r#"[{"task":"same","description":"repeated","dependent_tasks":[]},{"task":"same","description":"repeated","dependent_tasks":[] }]"#, &mut lifecycle_trace, &mut observed_events).await;
 
     let (first, first_facts) = next_provider_request_recording(
         &mut reader,
@@ -1140,22 +1204,22 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         json!([1, 0]),
         fixture["scenarios"]["multiple"]["completion_order"]
     );
-    send_event(
+    complete_chat_recording(
+        &mut reader,
         &mut stdin,
-        completed(
-            "mock-provider",
-            &second_id,
-            json!({"text":r#"{"value":{"task":"same","description":"done second"}}"#}),
-        ),
+        &second_id,
+        r#"{"task":"same","description":"done second"}"#,
+        &mut lifecycle_trace,
+        &mut observed_events,
     )
     .await;
-    send_event(
+    complete_chat_recording(
+        &mut reader,
         &mut stdin,
-        completed(
-            "mock-provider",
-            &first_id,
-            json!({"text":r#"{"value":{"task":"same","description":"done first"}}"#}),
-        ),
+        &first_id,
+        r#"{"task":"same","description":"done first"}"#,
+        &mut lifecycle_trace,
+        &mut observed_events,
     )
     .await;
 
@@ -1168,23 +1232,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     .await;
     assert_eq!(request_actor(&summary_create), "summarizer.llm");
     assert_snapshot(&summary_create);
-    assert_eq!(
-        summary_create.pointer_str("/output_schema/type"),
-        Some("object")
-    );
-    assert_eq!(
-        summary_create.pointer_str("/output_schema/properties/value/title"),
-        Some("main.Summary")
-    );
-    assert_eq!(
-        summary_create.pointer_str("/output_schema/properties/value/properties/content/type"),
-        Some("string")
-    );
-    let output_schema = summary_create["output_schema"]
-        .as_object()
-        .expect("provider JSON Schema object");
-    assert!(!output_schema.contains_key("version"));
-    assert!(!output_schema.contains_key("root"));
+    assert_output_tools(&summary_create);
     let summary_id = summary_create["request_id"].as_str().unwrap().to_owned();
     let ordered = summary_facts
         .iter()
@@ -1212,13 +1260,13 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         ]),
         fixture["scenarios"]["multiple"]["summary_order"]
     );
-    send_event(
+    complete_chat_recording(
+        &mut reader,
         &mut stdin,
-        completed(
-            "mock-provider",
-            &summary_id,
-            json!({"text":"{\"value\":{\"content\":\"done\"}}"}),
-        ),
+        &summary_id,
+        r#"{"content":"done"}"#,
+        &mut lifecycle_trace,
+        &mut observed_events,
     )
     .await;
     let result = next_event_of_kind_recording(
@@ -1308,7 +1356,7 @@ async fn dynamic_tasks_zero_uses_empty_collection_identity_and_reaches_summarize
         &mut reader,
         &mut stdin,
         planner["request_id"].as_str().unwrap(),
-        r#"{"value":[]}"#,
+        r#"[]"#,
     )
     .await;
     let summary = loop {
@@ -1327,13 +1375,11 @@ async fn dynamic_tasks_zero_uses_empty_collection_identity_and_reaches_summarize
         }
     };
     let summary_id = summary["request_id"].as_str().unwrap().to_owned();
-    send_event(
+    complete_chat(
+        &mut reader,
         &mut stdin,
-        completed(
-            "mock-provider",
-            &summary_id,
-            json!({"text":"{\"value\":{\"content\":\"empty\"}}"}),
-        ),
+        &summary_id,
+        r#"{"content":"empty"}"#,
     )
     .await;
     let result = loop {
@@ -1387,7 +1433,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         &mut reader,
         &mut stdin,
         planner["request_id"].as_str().unwrap(),
-        r#"{"value":[{"task":"duplicate","description":"only","dependent_tasks":[]}]}"#,
+        r#"[{"task":"duplicate","description":"only","dependent_tasks":[]}]"#,
     )
     .await;
     let (worker, worker_facts) =
@@ -1504,13 +1550,24 @@ async fn retained_dynamic_program_survives_source_disposal_and_process_restart()
     assert_eq!(request_actor(&planner_b), "planner.llm");
     for planner in [&planner_a, &planner_b] {
         let run = planner["invocation"]["run_id"].as_str().unwrap();
-        complete_chat(
-            &mut reader,
+        send_event(
             &mut stdin,
-            planner["request_id"].as_str().expect("planner request id"),
-            &json!({"value":[{"task":run,"description":run,"dependent_tasks":[]}]}).to_string(),
+            completed(
+                "mock-provider",
+                planner["request_id"].as_str().unwrap(),
+                output_write(
+                    &json!([{"task":run,"description":run,"dependent_tasks":[]}]).to_string(),
+                    true,
+                ),
+            ),
         )
         .await;
+    }
+    let planner_submit_a = next_provider_request(&mut reader, "mock-provider").await;
+    let planner_submit_b = next_provider_request(&mut reader, "mock-provider").await;
+    for planner in [&planner_submit_a, &planner_submit_b] {
+        send_event(&mut stdin, completed("mock-provider", planner["request_id"].as_str().unwrap(),
+            json!({"tool_calls": [{"id": "submit-planner", "name": "submit_output", "args": {}}]}))).await;
     }
     let worker_a = next_provider_request(&mut reader, "mock-provider").await;
     let worker_b = next_provider_request(&mut reader, "mock-provider").await;
@@ -1521,13 +1578,24 @@ async fn retained_dynamic_program_survives_source_disposal_and_process_restart()
     for worker in [&worker_b, &worker_a] {
         assert_occurrence_actor(request_actor(worker), "worker.llm", 0);
         let run = worker["invocation"]["run_id"].as_str().unwrap();
-        complete_chat(
-            &mut reader,
+        send_event(
             &mut stdin,
-            worker["request_id"].as_str().unwrap(),
-            &json!({"task":run,"description":format!("done-{run}")}).to_string(),
+            completed(
+                "mock-provider",
+                worker["request_id"].as_str().unwrap(),
+                output_write(
+                    &json!({"task":run,"description":format!("done-{run}")}).to_string(),
+                    true,
+                ),
+            ),
         )
         .await;
+    }
+    let worker_submit_b = next_provider_request(&mut reader, "mock-provider").await;
+    let worker_submit_a = next_provider_request(&mut reader, "mock-provider").await;
+    for worker in [&worker_submit_b, &worker_submit_a] {
+        send_event(&mut stdin, completed("mock-provider", worker["request_id"].as_str().unwrap(),
+            json!({"tool_calls": [{"id": "submit-worker", "name": "submit_output", "args": {}}]}))).await;
     }
     let mut trace = Vec::new();
     let mut events = Vec::new();
@@ -1555,15 +1623,26 @@ async fn retained_dynamic_program_survives_source_disposal_and_process_restart()
         );
         summaries.push(summary);
     }
-    for summary in summaries {
+    for summary in &summaries {
         let run = summary["invocation"]["run_id"].as_str().unwrap();
-        complete_chat(
-            &mut reader,
+        send_event(
             &mut stdin,
-            summary["request_id"].as_str().unwrap(),
-            &json!({"content":format!("summary-{run}")}).to_string(),
+            completed(
+                "mock-provider",
+                summary["request_id"].as_str().unwrap(),
+                output_write(
+                    &json!({"content":format!("summary-{run}")}).to_string(),
+                    true,
+                ),
+            ),
         )
         .await;
+    }
+    let summary_submit_a = next_provider_request(&mut reader, "mock-provider").await;
+    let summary_submit_b = next_provider_request(&mut reader, "mock-provider").await;
+    for summary in [&summary_submit_a, &summary_submit_b] {
+        send_event(&mut stdin, completed("mock-provider", summary["request_id"].as_str().unwrap(),
+            json!({"tool_calls": [{"id": "submit-summary", "name": "submit_output", "args": {}}]}))).await;
     }
     let first = next_event_of_kind(&mut reader, "mag.run_result").await;
     let second = next_event_of_kind(&mut reader, "mag.run_result").await;
@@ -1603,17 +1682,41 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
         ),
     )
     .await;
-    for _ in 0..3 {
-        let request = next_provider_request(&mut reader, "mock-provider").await;
-        assert_eq!(request_actor(&request), "planner.llm");
-        complete_chat(
-            &mut reader,
-            &mut stdin,
+    let request = next_provider_request(&mut reader, "mock-provider").await;
+    assert_eq!(request_actor(&request), "planner.llm");
+    send_event(
+        &mut stdin,
+        completed(
+            "mock-provider",
             request["request_id"].as_str().unwrap(),
-            "not json",
-        )
-        .await;
+            output_write("not json", true),
+        ),
+    )
+    .await;
+    let mut trace = Vec::new();
+    let mut rejection_window = Vec::new();
+    let (request, facts) = next_provider_request_recording(
+        &mut reader,
+        "mock-provider",
+        &mut trace,
+        &mut rejection_window,
+    )
+    .await;
+    assert_eq!(
+        request_actor(&request),
+        "planner.llm",
+        "invalid output remains in the same planner"
+    );
+    assert!(facts_json(&facts).contains("not json"));
+    for event in &rejection_window {
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            assert!(
+                !id.starts_with("traverse:6:expand"),
+                "invalid output spawned dynamic actor during correction: {event:?}"
+            );
+        }
     }
+    send_event(&mut stdin, obj(json!({"kind": "conversation.provider.event", "provider": "mock-provider", "request_id": request["request_id"], "event": "error", "message": "fixture provider unavailable"}))).await;
     let result = loop {
         let event = next_event(&mut reader, "invalid terminal result").await;
         if let Some(id) = event.get("id").and_then(Value::as_str) {
@@ -1633,17 +1736,10 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
     );
     assert_typed_result(&result);
     assert_eq!(
-        result["result"]["value"]["value"]["last_output"]["text"], "not json",
-        "{result:?}"
-    );
-    assert_eq!(
         result["result"]["value"]["value"]["reason"]["constructor"],
-        "OutputValidationError"
+        "ProviderError"
     );
-    assert!(result["result"]["value"]["value"]["reason"]["value"]["violations"].is_array());
-    assert!(result["result"]["value"]["value"]["reason"]["value"]
-        .get("attempts")
-        .is_none());
+    assert!(format!("{result:?}").contains("fixture provider unavailable"));
     shutdown(stdin, child).await;
 }
 

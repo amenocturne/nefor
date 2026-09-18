@@ -12,7 +12,7 @@ type BuildReport {summary: String}
 type ReviewReport {assessment: String}
 
 let start = nefor.graph.source("recovery-input", RequestInput {prompt: "Implement the change"})
-let builder = agents.agent<RequestInput, BuildReport>("builder", agents.AgentConfig {model: agents.mock, system: "Build the requested change.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
-let reviewer = agents.agent<core.types.Result<nefor.contracts.AgentError, BuildReport>, ReviewReport>("reviewer", agents.AgentConfig {model: agents.mock, system: "Review the builder result, including retained partial output.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 0})
+let builder = agents.agent<RequestInput, BuildReport>("builder", agents.AgentConfig {model: agents.mock, system: "Build the requested change.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
+let reviewer = agents.agent<core.types.Result<nefor.contracts.AgentError, BuildReport>, ReviewReport>("reviewer", agents.AgentConfig {model: agents.mock, system: "Review the builder result, including retained partial output.", tools: ([]: List<String>), tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil)})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, ReviewReport>>("recovery-output")
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, builder), nefor.graph.edge(builder, reviewer), nefor.graph.edge(reviewer, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)

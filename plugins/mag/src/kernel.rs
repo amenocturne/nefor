@@ -745,26 +745,38 @@ fn install_typed_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
         let encoded: JsonValue = lua.from_value(schema)?;
         let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(encoded)
             .map_err(|error| mlua::Error::runtime(format!("invalid MAG type schema: {error}")))?;
-        lua.to_value(&schema.validate_json(&source))
+        let mut validation =
+            serde_json::to_value(schema.validate_json(&source)).map_err(mlua::Error::external)?;
+        if let Err(error) = serde_json::from_str::<JsonValue>(&source) {
+            let line = source
+                .lines()
+                .nth(error.line().saturating_sub(1))
+                .unwrap_or("");
+            let mut start = error.column().saturating_sub(81).min(line.len());
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            let excerpt = line[start..].chars().take(240).collect::<String>();
+            validation["error"] = serde_json::json!({
+                "kind": "invalid_json", "code": "invalid_json",
+                "message": error.to_string(), "line": error.line(), "column": error.column(),
+                "excerpt": excerpt, "excerpt_start_column": start + 1,
+            });
+        }
+        lua.to_value(&validation)
     })?;
     typed_json.set("validate", validate)?;
-    let provider_schema = lua.create_function(|lua, schema: Value| {
-        let encoded: JsonValue = lua.from_value(schema)?;
-        let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(encoded)
-            .map_err(|error| mlua::Error::runtime(format!("invalid MAG type schema: {error}")))?;
-        let provider = schema
-            .to_provider_schema()
-            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
-        lua.to_value(&provider)
-    })?;
-    typed_json.set("provider_schema", provider_schema)?;
-    let validate_provider = lua.create_function(|lua, (schema, source): (Value, String)| {
-        let encoded: JsonValue = lua.from_value(schema)?;
-        let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(encoded)
-            .map_err(|error| mlua::Error::runtime(format!("invalid MAG type schema: {error}")))?;
-        lua.to_value(&schema.validate_provider_json(&source))
-    })?;
-    typed_json.set("validate_provider", validate_provider)?;
+    typed_json.set(
+        "schema",
+        lua.create_function(|lua, schema: Value| {
+            let encoded: JsonValue = lua.from_value(schema)?;
+            let schema: nefor_mag::schema::TypeSchema =
+                serde_json::from_value(encoded).map_err(|error| {
+                    mlua::Error::runtime(format!("invalid MAG type schema: {error}"))
+                })?;
+            lua.to_value(&schema.to_json_schema())
+        })?,
+    )?;
     nefor_tbl.set("typed_json", typed_json)?;
     Ok(())
 }
@@ -787,6 +799,18 @@ fn install_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
         lua.to_value(&v)
     })?;
     json.set("decode", decode)?;
+    json.set(
+        "parse",
+        lua.create_function(|lua, source: String| {
+            match serde_json::from_str::<JsonValue>(&source) {
+                Ok(value) => lua.to_value(&serde_json::json!({"ok": true, "value": value})),
+                Err(error) => lua.to_value(&serde_json::json!({"ok": false, "error": {
+                    "code": "invalid_json", "message": error.to_string(),
+                    "line": error.line(), "column": error.column(),
+                }})),
+            }
+        })?,
+    )?;
 
     // serde_json null and arrays cross into Lua with mlua-owned identities:
     // null is a dedicated userdata sentinel and arrays carry a private
@@ -843,6 +867,19 @@ fn install_fs(
         "write_file",
         lua.create_function(|lua, (path, content): (String, String)| {
             ok_or_err(lua, std::fs::write(&path, content))
+        })?,
+    )?;
+    fs_tbl.set(
+        "write_file_atomic",
+        lua.create_function(|lua, (path, content): (String, String)| {
+            let destination = Path::new(&path);
+            let temporary = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+            let result = std::fs::write(&temporary, content)
+                .and_then(|()| std::fs::rename(&temporary, destination));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temporary);
+            }
+            ok_or_err(lua, result)
         })?,
     )?;
     fs_tbl.set(

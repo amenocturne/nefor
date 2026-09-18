@@ -79,7 +79,7 @@ impl CapabilityBridge {
             "provider_options",
             "tools",
             "output_schema",
-            "max_corrections",
+            "tool_specs",
         ] {
             if let Some(value) = args.get(key).filter(|value| !value.is_null()) {
                 request.insert(key.into(), value.clone());
