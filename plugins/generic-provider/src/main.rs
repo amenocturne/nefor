@@ -53,8 +53,33 @@
 //!   "finish_reason"?: "stop" | "tool_calls" | "length" | "content_filter",
 //!   "usage"?: {
 //!     "prompt_tokens": ...,       // aggregate operation input
+//!     "input_tokens": ...,        // normalized alias of prompt_tokens
 //!     "completion_tokens": ...,   // aggregate operation output
+//!     "output_tokens": ...,       // normalized alias of completion_tokens
+//!     "total_tokens"?: ...,
 //!     "context_input_tokens"?: ..., // final request's input/context occupancy
+//!     "cache_read_input_tokens"?: ...,
+//!     "cache_write_input_tokens"?: ...,
+//!     "cache_creation_input_tokens"?: ...,
+//!     "cache_creation"?: {
+//!       "ephemeral_5m_input_tokens"?: ...,
+//!       "ephemeral_1h_input_tokens"?: ...
+//!     },
+//!     "reasoning_tokens"?: ...,
+//!     "billing_components_complete"?: true | false,
+//!     "aggregate_totals_exact"?: true | false,
+//!     "billing_components"?: [{   // one component per provider request
+//!       "usage_available": true,
+//!       "input_tokens": ...,
+//!       "output_tokens": ...,
+//!       "cache_read_input_tokens"?: ...,
+//!       "cache_write_input_tokens"?: ...,
+//!       "reasoning_tokens"?: ...,
+//!       "input_tokens_include_cache_read"?: true | false,
+//!       "service_tier"?: "..."   // returned/effective tier for this request
+//!     }],                         // unavailable usage is {"usage_available": false}
+//!     "input_tokens_include_cache_read"?: true | false,
+//!     "provider"?: "...",
 //!     "model": "..."
 //!   }
 //! }

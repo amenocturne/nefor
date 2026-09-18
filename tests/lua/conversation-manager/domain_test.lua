@@ -213,6 +213,25 @@ do
   record(fact("retry", "serialized", "retry_started", { retry_id = "retry", message_id = "m", reason = "rate_limit" }))
   record(fact("mc", "serialized", "message_completed", {
     message_id = "m",
+    model = "gpt-5.6-sol",
+    duration_ms = 42,
+    usage = {
+      prompt_tokens = 544007, input_tokens = 544007,
+      completion_tokens = 4, output_tokens = 4, total_tokens = 544011,
+      context_input_tokens = 7,
+      cache_read_input_tokens = 0, reasoning_tokens = 2,
+      input_tokens_include_cache_read = true,
+      provider = "chatgpt", model = "gpt-5.6-sol",
+      billing_components_complete = true, aggregate_totals_exact = true,
+      billing_components = {
+        { usage_available = true, input_tokens = 271999, output_tokens = 1,
+          service_tier = "standard" },
+        { usage_available = true, input_tokens = 272001, output_tokens = 2,
+          cache_write_input_tokens = 0, service_tier = "priority" },
+        { usage_available = true, input_tokens = 7, output_tokens = 1,
+          cache_write_input_tokens = 9, service_tier = "priority" },
+      },
+    },
     provider_context = {
       provider = "chatgpt",
       format = "chatgpt.responses.output_items.v1",
@@ -226,8 +245,26 @@ do
   local encoded = nefor.json.encode(events); local decoded = nefor.json.decode(encoded)
   local replayed = manager.new(); ok(replayed:replay(decoded))
   eq(replayed:list(), live:list(), "serialized replay equals live state deeply")
-  eq(replayed:get("serialized").messages[1].provider_context.artifact.items[1].encrypted_content,
+  local replayed_message = replayed:get("serialized").messages[1]
+  eq(replayed_message.provider_context.artifact.items[1].encrypted_content,
     "sealed", "serialized replay reconstructs opaque provider context")
+  eq(replayed_message.terminal.model, "gpt-5.6-sol")
+  eq(replayed_message.terminal.duration_ms, 42)
+  eq(replayed_message.terminal.usage.cache_read_input_tokens, 0,
+    "explicit zero cache evidence survives JSONL-shaped serialization and replay")
+  eq(replayed_message.terminal.usage.reasoning_tokens, 2)
+  eq(replayed_message.terminal.usage.input_tokens_include_cache_read, true)
+  eq(replayed_message.terminal.usage.billing_components[1].service_tier, "standard")
+  eq(replayed_message.terminal.usage.billing_components[1].cache_write_input_tokens, nil,
+    "absent per-request cache writes survive replay")
+  eq(replayed_message.terminal.usage.billing_components[2].input_tokens, 272001)
+  eq(replayed_message.terminal.usage.billing_components[2].service_tier, "priority")
+  eq(replayed_message.terminal.usage.billing_components[2].cache_write_input_tokens, 0,
+    "explicit zero per-request cache writes survive replay")
+  eq(replayed_message.terminal.usage.billing_components[3].cache_write_input_tokens, 9,
+    "nonzero per-request cache writes survive replay")
+  eq(replayed_message.terminal.usage.service_tier, nil,
+    "mixed tiers do not acquire a synthetic aggregate tier")
 
   local existing = manager.new()
   local bad = domain.copy(decoded); bad[#bad].sequence = 99

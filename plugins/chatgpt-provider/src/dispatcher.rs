@@ -2394,17 +2394,21 @@ async fn handle_completion_request(
     Ok(())
 }
 
-fn completion_event_body<const N: usize>(
+fn completion_event_body<I, S>(
     args: &ServeArgs,
     request_id: &str,
     event: &str,
-    fields: [(&str, Value); N],
-) -> Map<String, Value> {
+    fields: I,
+) -> Map<String, Value>
+where
+    I: IntoIterator<Item = (S, Value)>,
+    S: Into<String>,
+{
     let mut body = Map::new();
     body.insert("request_id".into(), Value::String(request_id.to_owned()));
     body.insert("event".into(), Value::String(event.to_owned()));
     for (name, value) in fields {
-        body.insert(name.to_owned(), value);
+        body.insert(name.into(), value);
     }
     make_event(format!("{}completion.event", args.event_prefix()), body)
 }
@@ -3260,51 +3264,220 @@ impl ReasoningSummaryFormatter {
     }
 }
 
-fn parsed_token_usage(response: &Value) -> Option<(u64, u64)> {
-    let usage = response.get("usage")?;
-    Some((
-        usage.get("input_tokens")?.as_u64()?,
-        usage.get("output_tokens")?.as_u64()?,
-    ))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    service_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl ParsedTokenUsage {
+    fn billing_component(&self) -> Value {
+        let mut component = Map::from_iter([
+            ("usage_available".into(), Value::Bool(true)),
+            (
+                "input_tokens".into(),
+                Value::Number(self.input_tokens.into()),
+            ),
+            (
+                "output_tokens".into(),
+                Value::Number(self.output_tokens.into()),
+            ),
+            ("input_tokens_include_cache_read".into(), Value::Bool(true)),
+        ]);
+        if let Some(tokens) = self.cache_read_input_tokens {
+            component.insert(
+                "cache_read_input_tokens".into(),
+                Value::Number(tokens.into()),
+            );
+        }
+        if let Some(tokens) = self.cache_write_input_tokens {
+            component.insert(
+                "cache_write_input_tokens".into(),
+                Value::Number(tokens.into()),
+            );
+        }
+        if let Some(tokens) = self.reasoning_tokens {
+            component.insert("reasoning_tokens".into(), Value::Number(tokens.into()));
+        }
+        if let Some(tier) = &self.service_tier {
+            component.insert("service_tier".into(), Value::String(tier.clone()));
+        }
+        Value::Object(component)
+    }
+}
+
+fn parsed_token_usage(response: &Value) -> Option<ParsedTokenUsage> {
+    let usage = response.get("usage")?;
+    Some(ParsedTokenUsage {
+        input_tokens: usage.get("input_tokens")?.as_u64()?,
+        output_tokens: usage.get("output_tokens")?.as_u64()?,
+        cache_read_input_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64),
+        cache_write_input_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cache_write_tokens"))
+            .and_then(Value::as_u64),
+        reasoning_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
+        service_tier: response
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OperationUsage {
     input_tokens: u64,
     output_tokens: u64,
-    context_input_tokens: u64,
+    context_input_tokens: Option<u64>,
+    aggregate_totals_overflowed: bool,
+    billing_components: Vec<Option<ParsedTokenUsage>>,
+}
+
+fn sum_optional_tokens(
+    components: &[Option<ParsedTokenUsage>],
+    get: impl Fn(&ParsedTokenUsage) -> Option<u64>,
+) -> Option<u64> {
+    components.iter().try_fold(0_u64, |total, component| {
+        Some(total.saturating_add(get(component.as_ref()?)?))
+    })
 }
 
 impl OperationUsage {
-    fn record_iteration(current: Option<Self>, input_tokens: u64, output_tokens: u64) -> Self {
-        let (prior_input, prior_output) = current
-            .map(|usage| (usage.input_tokens, usage.output_tokens))
-            .unwrap_or_default();
-        Self {
-            input_tokens: prior_input.saturating_add(input_tokens),
-            output_tokens: prior_output.saturating_add(output_tokens),
-            context_input_tokens: input_tokens,
+    fn record_iteration(current: Option<Self>, iteration: Option<ParsedTokenUsage>) -> Self {
+        let Some(mut prior) = current else {
+            let (input_tokens, output_tokens, context_input_tokens) = iteration
+                .as_ref()
+                .map(|usage| {
+                    (
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        Some(usage.input_tokens),
+                    )
+                })
+                .unwrap_or((0, 0, None));
+            return Self {
+                input_tokens,
+                output_tokens,
+                context_input_tokens,
+                aggregate_totals_overflowed: false,
+                billing_components: vec![iteration],
+            };
+        };
+        if let Some(usage) = &iteration {
+            let input = prior.input_tokens.checked_add(usage.input_tokens);
+            let output = prior.output_tokens.checked_add(usage.output_tokens);
+            prior.aggregate_totals_overflowed |= input.is_none() || output.is_none();
+            prior.input_tokens = input.unwrap_or(u64::MAX);
+            prior.output_tokens = output.unwrap_or(u64::MAX);
+            prior.context_input_tokens = Some(usage.input_tokens);
+        } else {
+            prior.context_input_tokens = None;
         }
+        prior.billing_components.push(iteration);
+        prior
     }
 
-    fn totals(self) -> (u64, u64) {
-        (self.input_tokens, self.output_tokens)
+    fn complete(&self) -> bool {
+        self.billing_components.iter().all(Option::is_some)
     }
 
-    fn completion_fields(self, model: &str, duration_ms: u64) -> [(&'static str, Value); 5] {
-        [
+    fn aggregate_totals_exact(&self) -> bool {
+        self.complete()
+            && !self.aggregate_totals_overflowed
+            && self.input_tokens.checked_add(self.output_tokens).is_some()
+    }
+
+    fn totals(&self) -> Option<(u64, u64)> {
+        self.aggregate_totals_exact()
+            .then_some((self.input_tokens, self.output_tokens))
+    }
+
+    fn completion_fields(
+        &self,
+        provider: &str,
+        model: &str,
+        duration_ms: u64,
+    ) -> Vec<(&'static str, Value)> {
+        let mut fields = vec![
+            (
+                "billing_components",
+                Value::Array(
+                    self.billing_components
+                        .iter()
+                        .map(|component| {
+                            component.as_ref().map_or_else(
+                                || serde_json::json!({"usage_available": false}),
+                                |usage| usage.billing_component(),
+                            )
+                        })
+                        .collect(),
+                ),
+            ),
+            ("billing_components_complete", Value::Bool(self.complete())),
+            (
+                "aggregate_totals_exact",
+                Value::Bool(self.aggregate_totals_exact()),
+            ),
+            ("provider", Value::String(provider.to_owned())),
+            ("model", Value::String(model.to_owned())),
+            ("duration_ms", Value::Number(duration_ms.into())),
+        ];
+        if let Some(context_input_tokens) = self.context_input_tokens {
+            fields.push((
+                "context_input_tokens",
+                Value::Number(context_input_tokens.into()),
+            ));
+        }
+        if !self.aggregate_totals_exact() {
+            return fields;
+        }
+        let Some(total_tokens) = self.input_tokens.checked_add(self.output_tokens) else {
+            return fields;
+        };
+        fields.extend([
             ("prompt_tokens", Value::Number(self.input_tokens.into())),
+            ("input_tokens", Value::Number(self.input_tokens.into())),
             (
                 "completion_tokens",
                 Value::Number(self.output_tokens.into()),
             ),
+            ("output_tokens", Value::Number(self.output_tokens.into())),
+            ("total_tokens", Value::Number(total_tokens.into())),
+            ("input_tokens_include_cache_read", Value::Bool(true)),
+        ]);
+        for (name, tokens) in [
             (
-                "context_input_tokens",
-                Value::Number(self.context_input_tokens.into()),
+                "cache_read_input_tokens",
+                sum_optional_tokens(&self.billing_components, |usage| {
+                    usage.cache_read_input_tokens
+                }),
             ),
-            ("model", Value::String(model.to_owned())),
-            ("duration_ms", Value::Number(duration_ms.into())),
-        ]
+            (
+                "cache_write_input_tokens",
+                sum_optional_tokens(&self.billing_components, |usage| {
+                    usage.cache_write_input_tokens
+                }),
+            ),
+            (
+                "reasoning_tokens",
+                sum_optional_tokens(&self.billing_components, |usage| usage.reasoning_tokens),
+            ),
+        ] {
+            if let Some(tokens) = tokens {
+                fields.push((name, Value::Number(tokens.into())));
+            }
+        }
+        fields
     }
 }
 
@@ -3959,6 +4132,10 @@ fn spawn_turn(
                             match recovery_action {
                                 Auth401Action::RetryReloaded => {
                                     auth_401_recovery_stage = 1;
+                                    operation_usage = Some(OperationUsage::record_iteration(
+                                        operation_usage,
+                                        None,
+                                    ));
                                     iterations = iterations.saturating_sub(1);
                                     continue;
                                 }
@@ -3979,6 +4156,11 @@ fn spawn_turn(
                                     match ctx.auth.force_refresh_after(&failed_token).await {
                                         Ok(_) => {
                                             auth_401_recovery_stage = 2;
+                                            operation_usage =
+                                                Some(OperationUsage::record_iteration(
+                                                    operation_usage,
+                                                    None,
+                                                ));
                                             iterations = iterations.saturating_sub(1);
                                             continue;
                                         }
@@ -4025,6 +4207,8 @@ fn spawn_turn(
                             ctx.chats
                                 .mark_model_reasoning_unsupported(&snapshot.model)
                                 .await;
+                            operation_usage =
+                                Some(OperationUsage::record_iteration(operation_usage, None));
                             iterations = iterations.saturating_sub(1);
                             continue;
                         }
@@ -4077,7 +4261,7 @@ fn spawn_turn(
             let mut tool_buf = ToolCallBuffer::default();
             let mut iter_native_output = NativeOutputBuffer::default();
             let mut iter_finish_reason: Option<String> = None;
-            let mut iter_usage: Option<(u64, u64)> = None;
+            let mut iter_usage: Option<ParsedTokenUsage> = None;
             let mut iter_interrupted = false;
             let mut iter_failure: Option<StreamFailure> = None;
             let mut iter_errored: Option<String> = None;
@@ -4291,11 +4475,13 @@ fn spawn_turn(
                                 }
                                 ResponseEvent::Failed { response } => {
                                     terminal_event_seen = true;
+                                    iter_usage = parsed_token_usage(&response);
                                     iter_failure = Some(StreamFailure::semantic(&response));
                                     break;
                                 }
                                 ResponseEvent::Incomplete { response } => {
                                     terminal_event_seen = true;
+                                    iter_usage = parsed_token_usage(&response);
                                     iter_finish_reason = response
                                         .get("incomplete_details")
                                         .and_then(|d| d.get("reason"))
@@ -4391,6 +4577,10 @@ fn spawn_turn(
                 }
                 if decision.retry {
                     pre_output_stream_retries += 1;
+                    operation_usage = Some(OperationUsage::record_iteration(
+                        operation_usage,
+                        iter_usage,
+                    ));
                     iterations = iterations.saturating_sub(1);
                     if direct_request.is_none() {
                         let body = stream_retry_body(&ctx.args, &chat_id, attempt, delay, &failure);
@@ -4452,13 +4642,10 @@ fn spawn_turn(
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
-            if let Some((input_tokens, output_tokens)) = iter_usage {
-                operation_usage = Some(OperationUsage::record_iteration(
-                    operation_usage,
-                    input_tokens,
-                    output_tokens,
-                ));
-            }
+            operation_usage = Some(OperationUsage::record_iteration(
+                operation_usage,
+                iter_usage,
+            ));
 
             if let Some(err_msg) = iter_errored {
                 let _ = ctx
@@ -4589,7 +4776,7 @@ fn spawn_turn(
                     &ctx.args,
                     request_id,
                     "usage",
-                    usage.completion_fields(&active_model, elapsed_ms),
+                    usage.completion_fields(&ctx.args.provider_name, &active_model, elapsed_ms),
                 );
                 let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
@@ -4680,7 +4867,10 @@ fn spawn_turn(
             .record_turn(
                 &chat_id,
                 Some(&active_model),
-                usage_to_record(interrupted, operation_usage.map(OperationUsage::totals)),
+                usage_to_record(
+                    interrupted,
+                    operation_usage.as_ref().and_then(OperationUsage::totals),
+                ),
                 elapsed_ms,
             )
             .await;
@@ -5598,7 +5788,8 @@ mod tests {
                 .await
                 .expect("seed stats");
 
-            let measured_usage = parsed_token_usage(&response);
+            let measured_usage = parsed_token_usage(&response)
+                .map(|usage| (usage.input_tokens, usage.output_tokens));
             chats
                 .record_turn(
                     &chat_id,
@@ -5620,32 +5811,212 @@ mod tests {
         }
     }
 
-    #[test]
-    fn operation_usage_separates_aggregate_cost_from_final_request_context() {
-        let usage = OperationUsage::record_iteration(None, 80, 7);
-        let usage = OperationUsage::record_iteration(Some(usage), 105, 11);
-        let usage = OperationUsage::record_iteration(Some(usage), 105, 4);
+    fn parsed_usage(
+        input: u64,
+        output: u64,
+        cached: Option<u64>,
+        cache_write: Option<u64>,
+        reasoning: Option<u64>,
+        service_tier: Option<&str>,
+    ) -> ParsedTokenUsage {
+        ParsedTokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cached,
+            cache_write_input_tokens: cache_write,
+            reasoning_tokens: reasoning,
+            service_tier: service_tier.map(str::to_owned),
+        }
+    }
 
-        assert_eq!(usage.input_tokens, 290);
-        assert_eq!(usage.output_tokens, 22);
-        assert_eq!(usage.context_input_tokens, 105);
-        assert_eq!(usage.totals(), (290, 22));
-        let fields = usage.completion_fields("gpt-test", 42);
-        assert_eq!(fields[0].1.as_u64(), Some(290));
-        assert_eq!(fields[1].1.as_u64(), Some(22));
-        assert_eq!(fields[2].1.as_u64(), Some(105));
+    fn field<'a>(fields: &'a [(&str, Value)], name: &str) -> Option<&'a Value> {
+        fields
+            .iter()
+            .find_map(|(key, value)| (*key == name).then_some(value))
     }
 
     #[test]
-    fn parsed_token_usage_keeps_legitimate_numeric_zero_measured() {
-        let response = serde_json::json!({
-            "usage": {"input_tokens": 0, "output_tokens": 0}
-        });
-        assert_eq!(parsed_token_usage(&response), Some((0, 0)));
+    fn operation_usage_preserves_request_pricing_evidence_and_final_context() {
+        let first = parsed_usage(271_999, 7, Some(20), None, Some(2), Some("standard"));
+        let second = parsed_usage(272_001, 11, Some(30), Some(0), Some(4), Some("priority"));
+        let final_iteration = parsed_usage(105, 4, Some(0), Some(17), Some(1), Some("priority"));
+        let usage = OperationUsage::record_iteration(None, Some(first));
+        let usage = OperationUsage::record_iteration(Some(usage), Some(second));
+        let usage = OperationUsage::record_iteration(Some(usage), Some(final_iteration));
+
+        assert_eq!(usage.input_tokens, 544_105);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.context_input_tokens, Some(105));
+        assert_eq!(usage.totals(), Some((544_105, 22)));
+        let fields = usage.completion_fields("chatgpt", "gpt-test", 42);
         assert_eq!(
-            usage_to_record(true, parsed_token_usage(&response)),
+            field(&fields, "input_tokens").and_then(Value::as_u64),
+            Some(544_105)
+        );
+        assert_eq!(
+            field(&fields, "context_input_tokens").and_then(Value::as_u64),
+            Some(105)
+        );
+        assert_eq!(
+            field(&fields, "cache_read_input_tokens").and_then(Value::as_u64),
+            Some(50)
+        );
+        assert!(field(&fields, "cache_write_input_tokens").is_none());
+        assert_eq!(
+            field(&fields, "reasoning_tokens").and_then(Value::as_u64),
+            Some(7)
+        );
+        assert!(field(&fields, "service_tier").is_none());
+
+        let components = field(&fields, "billing_components")
+            .and_then(Value::as_array)
+            .expect("per-request billing evidence");
+        assert_eq!(components.len(), 3);
+        assert_eq!(components[0]["input_tokens"], 271_999);
+        assert_eq!(components[0]["service_tier"], "standard");
+        assert!(components[0].get("cache_write_input_tokens").is_none());
+        assert_eq!(components[1]["input_tokens"], 272_001);
+        assert_eq!(components[1]["service_tier"], "priority");
+        assert_eq!(components[1]["cache_write_input_tokens"], 0);
+        assert_eq!(components[2]["cache_write_input_tokens"], 17);
+    }
+
+    #[test]
+    fn unmeasured_final_request_makes_totals_and_final_context_inexact() {
+        let first = parsed_usage(271_999, 7, Some(20), None, Some(2), Some("standard"));
+        let usage = OperationUsage::record_iteration(None, Some(first));
+        let usage = OperationUsage::record_iteration(Some(usage), None);
+        let fields = usage.completion_fields("chatgpt", "gpt-test", 42);
+
+        assert_eq!(usage.totals(), None);
+        assert_eq!(
+            field(&fields, "billing_components_complete"),
+            Some(&Value::Bool(false))
+        );
+        assert!(field(&fields, "input_tokens").is_none());
+        assert!(field(&fields, "context_input_tokens").is_none());
+        let components = field(&fields, "billing_components")
+            .and_then(Value::as_array)
+            .expect("request evidence");
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0]["usage_available"], true);
+        assert_eq!(components[1]["usage_available"], false);
+    }
+
+    #[test]
+    fn unmeasured_retry_keeps_measured_final_context_separate_from_billing_totals() {
+        let usage = OperationUsage::record_iteration(None, None);
+        let final_iteration = parsed_usage(105, 4, Some(0), Some(17), Some(1), Some("priority"));
+        let usage = OperationUsage::record_iteration(Some(usage), Some(final_iteration));
+        let fields = usage.completion_fields("chatgpt", "gpt-test", 42);
+
+        assert_eq!(usage.totals(), None);
+        assert!(field(&fields, "input_tokens").is_none());
+        assert_eq!(
+            field(&fields, "context_input_tokens").and_then(Value::as_u64),
+            Some(105)
+        );
+        let components = field(&fields, "billing_components")
+            .and_then(Value::as_array)
+            .expect("request evidence");
+        assert_eq!(components[0]["usage_available"], false);
+        assert_eq!(components[1]["usage_available"], true);
+    }
+
+    #[test]
+    fn operation_usage_omits_overflowed_aggregate_totals() {
+        let first = OperationUsage::record_iteration(
+            None,
+            Some(parsed_usage(
+                u64::MAX,
+                u64::MAX,
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(u64::MAX),
+                None,
+            )),
+        );
+        let usage = OperationUsage::record_iteration(
+            Some(first),
+            Some(parsed_usage(1, 1, Some(1), Some(1), Some(1), None)),
+        );
+        let fields = usage.completion_fields("chatgpt", "gpt-test", 1);
+
+        assert_eq!(usage.totals(), None);
+        assert_eq!(
+            field(&fields, "billing_components_complete"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            field(&fields, "aggregate_totals_exact"),
+            Some(&Value::Bool(false))
+        );
+        assert!(field(&fields, "input_tokens").is_none());
+        assert!(field(&fields, "total_tokens").is_none());
+        let components = field(&fields, "billing_components")
+            .and_then(Value::as_array)
+            .expect("exact components survive aggregate overflow");
+        assert_eq!(components[0]["input_tokens"], u64::MAX);
+        assert_eq!(components[1]["input_tokens"], 1);
+    }
+
+    #[test]
+    fn parsed_token_usage_preserves_zero_details_and_effective_tier() {
+        let response = serde_json::json!({
+            "service_tier": "priority",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0}
+            }
+        });
+        let measured = parsed_token_usage(&response).expect("measured usage");
+        assert_eq!(measured.cache_read_input_tokens, Some(0));
+        assert_eq!(measured.cache_write_input_tokens, Some(0));
+        assert_eq!(measured.reasoning_tokens, Some(0));
+        assert_eq!(measured.service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            usage_to_record(true, Some((measured.input_tokens, measured.output_tokens))),
             Some((0, 0))
         );
+    }
+
+    #[test]
+    fn parsed_token_usage_preserves_nonzero_cache_write_tokens() {
+        let response = serde_json::json!({
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 3,
+                "input_tokens_details": {"cache_write_tokens": 17}
+            }
+        });
+        let measured = parsed_token_usage(&response).expect("measured usage");
+        assert_eq!(measured.cache_write_input_tokens, Some(17));
+    }
+
+    #[test]
+    fn parsed_token_usage_omits_missing_or_malformed_details() {
+        for response in [
+            serde_json::json!({"usage": {"input_tokens": 1, "output_tokens": 2}}),
+            serde_json::json!({
+                "service_tier": 7,
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "input_tokens_details": {
+                        "cached_tokens": "unknown", "cache_write_tokens": "unknown"
+                    },
+                    "output_tokens_details": []
+                }
+            }),
+        ] {
+            let usage = parsed_token_usage(&response).expect("aggregate usage remains valid");
+            assert_eq!(usage.cache_read_input_tokens, None);
+            assert_eq!(usage.cache_write_input_tokens, None);
+            assert_eq!(usage.reasoning_tokens, None);
+            assert_eq!(usage.service_tier, None);
+        }
     }
 
     #[test]

@@ -1002,11 +1002,27 @@ do
 end
 
 do
-  local instance, msgs, facts = make("observed-usage.llm", { provider = "p" })
+  local instance, msgs, facts = make("observed-usage.llm", {
+    provider = "p", provider_options = { service_tier = "fast" },
+  })
   instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   instance.handle_observation({ binding = "conversation", value = {
-    kind = "usage", prompt_tokens = 290, completion_tokens = 22,
-    context_input_tokens = 105,
+    kind = "usage", prompt_tokens = 544105, input_tokens = 544105,
+    completion_tokens = 22, output_tokens = 22, total_tokens = 544127,
+    context_input_tokens = 105, cache_read_input_tokens = 50, reasoning_tokens = 7,
+    input_tokens_include_cache_read = true, provider = "chatgpt",
+    billing_components_complete = true, aggregate_totals_exact = true,
+    billing_components = {
+      { usage_available = true, input_tokens = 271999, output_tokens = 7, cache_read_input_tokens = 20,
+        reasoning_tokens = 2, input_tokens_include_cache_read = true,
+        service_tier = "standard" },
+      { usage_available = true, input_tokens = 272001, output_tokens = 11, cache_read_input_tokens = 30,
+        cache_write_input_tokens = 0, reasoning_tokens = 4,
+        input_tokens_include_cache_read = true, service_tier = "priority" },
+      { usage_available = true, input_tokens = 105, output_tokens = 4, cache_read_input_tokens = 0,
+        cache_write_input_tokens = 17, reasoning_tokens = 1,
+        input_tokens_include_cache_read = true, service_tier = "priority" },
+    },
     model = "observed-model", duration_ms = 50,
   } })
   instance.deliver({
@@ -1015,14 +1031,52 @@ do
     result = { text = "done" },
   })
 
+  local created = facts[1]
+  assert_eq(created.provenance.provider_options.service_tier, "fast",
+    "requested service tier is retained as canonical request provenance")
+  local completed
+  for _, fact in ipairs(facts) do
+    if fact.kind == "message_completed" then completed = fact end
+  end
+  assert_eq(completed.usage.cache_read_input_tokens, 50,
+    "normalized cache evidence reaches canonical message completion")
+  assert_eq(completed.usage.reasoning_tokens, 7)
+  assert_eq(completed.usage.input_tokens_include_cache_read, true)
+  assert_eq(completed.usage.billing_components_complete, true)
+  assert_eq(#completed.usage.billing_components, 3,
+    "every provider request reaches the canonical message completion")
+  assert_eq(completed.usage.billing_components[1].input_tokens, 271999,
+    "pricing evidence retains the request below the 272k boundary")
+  assert_eq(completed.usage.billing_components[1].service_tier, "standard")
+  assert_eq(completed.usage.billing_components[1].cache_write_input_tokens, nil,
+    "an absent cache-write count remains absent")
+  assert_eq(completed.usage.billing_components[2].input_tokens, 272001,
+    "pricing evidence retains the request above the 272k boundary")
+  assert_eq(completed.usage.billing_components[2].service_tier, "priority")
+  assert_eq(completed.usage.billing_components[2].cache_write_input_tokens, 0,
+    "an explicit zero cache-write count remains present")
+  assert_eq(completed.usage.billing_components[3].cache_write_input_tokens, 17,
+    "a nonzero cache-write count remains present")
+  assert_eq(completed.usage.service_tier, nil,
+    "mixed request tiers are not flattened into false aggregate evidence")
   local terminal = facts[#facts]
   assert_eq(terminal.kind, "turn_completed", "observed usage reaches the terminal fact")
-  assert_eq(terminal.detail.usage.input_tokens, 290,
+  assert_eq(terminal.detail.usage.input_tokens, 544105,
     "aggregate provider prompt usage is preserved for operation statistics")
   assert_eq(terminal.detail.usage.output_tokens, 22,
     "aggregate provider completion usage is preserved with the input count")
   assert_eq(terminal.detail.usage.context_input_tokens, 105,
     "final-request context usage crosses the MAG provider boundary unchanged")
+  assert_eq(terminal.detail.usage.cache_read_input_tokens, 50)
+  assert_eq(terminal.detail.usage.reasoning_tokens, 7)
+  assert_eq(terminal.detail.usage.input_tokens_include_cache_read, true)
+  assert_eq(terminal.detail.usage.provider, "chatgpt")
+  assert_eq(terminal.detail.usage.billing_components[1].service_tier, "standard")
+  assert_eq(terminal.detail.usage.billing_components[2].service_tier, "priority")
+  assert_eq(terminal.detail.usage.billing_components[2].cache_write_input_tokens, 0)
+  assert_eq(terminal.detail.usage.billing_components[3].cache_write_input_tokens, 17)
+  assert_eq(terminal.detail.usage.cache_write_input_tokens, nil,
+    "an incomplete aggregate cache-write total remains absent")
   assert_eq(terminal.detail.model, "observed-model", "usage observation preserves the model")
 end
 

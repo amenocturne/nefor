@@ -141,6 +141,9 @@ function M.construct(id, params, emit, options)
   for key, value in pairs(conversation.provenance or {}) do provenance[key] = value end
   provenance.provider = provider
   provenance.model = params.model
+  if type(params.provider_options) == "table" then
+    provenance.provider_options = json_data.copy(params.provider_options)
+  end
 
   local function sign(message)
     message.from = id
