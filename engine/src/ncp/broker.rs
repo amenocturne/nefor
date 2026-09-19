@@ -870,13 +870,13 @@ impl Broker {
 
         if let Some(record) = self.conns_by_id.get_mut(&id) {
             if !record.closing && !matches!(reason, ReaderEnd::Eof) {
-                record.transport_failure = Some(match reason {
-                    ReaderEnd::IoError => "plugin stdout transport failed".to_owned(),
-                    ReaderEnd::LineTooLong => {
-                        "plugin stdout frame exceeded the line limit".to_owned()
-                    }
+                let failure = match reason {
+                    ReaderEnd::IoError => "plugin stdout transport failed",
+                    ReaderEnd::LineTooLong => "plugin stdout frame exceeded the line limit",
                     ReaderEnd::Eof => unreachable!(),
-                });
+                };
+                tracing::warn!(plugin = %record.name.as_str(), conn = %id, failure, "closing plugin transport");
+                record.transport_failure = Some(failure.to_owned());
             }
         }
 
