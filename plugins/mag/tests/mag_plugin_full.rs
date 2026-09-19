@@ -108,6 +108,38 @@ pub mod kernel {
         }
 
         #[test]
+        fn bounded_unicode_projection_crosses_the_semantic_validation_host_boundary() {
+            let host = shipped_host();
+            let valid: bool = host
+                .lua
+                .load(
+                    r#"
+                    local model_context = require("model-context")
+                    local malformed_ok, malformed_error = pcall(
+                      nefor.semantic_type.validate_value,
+                      { kind = "primitive", name = "String" },
+                      string.char(0xc3))
+                    assert(not malformed_ok)
+                    assert(tostring(malformed_error):find("invalid type: byte array", 1, true))
+
+                    local projected = model_context._utf8_head("éx", 2)
+                    assert(projected == "é")
+                    local ok, validation = pcall(
+                      nefor.semantic_type.validate_value,
+                      { kind = "primitive", name = "String" },
+                      projected)
+                    return ok and validation.ok == true
+                    "#,
+                )
+                .eval()
+                .expect("evaluate projected semantic value");
+            assert!(
+                valid,
+                "bounded Unicode must remain JSON-valid across mlua serde"
+            );
+        }
+
+        #[test]
         fn nefor_mag_in_five_minutes_satisfies_v3_runtime_contracts() {
             let host = shipped_host();
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

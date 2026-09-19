@@ -252,6 +252,21 @@ fn strict_routing_enforces_the_whole_dynamic_protocol() {
               value = 4, dynamic = { kind = "item", collection = "c", index = 0 }
             })
             assert(bad_value == nil and bad_value_error:find("malformed DynamicList item"))
+
+            nefor.semantic_type.validate_value = function()
+              _G.error("deserialize error: invalid type: byte array, expected any valid JSON value")
+            end
+            local host_failure, host_failure_error = router():factory_arrival("producer", "Out", {
+              value = "valid", dynamic = { kind = "item", collection = "c", index = 0 }
+            })
+            assert(host_failure == nil)
+            assert(host_failure_error:find("malformed DynamicList item"))
+
+            actor.outputs[1].type = item
+            local output_failure, output_failure_error = router():factory_arrival(
+              "producer", "Out", { value = "valid" })
+            assert(output_failure == nil)
+            assert(output_failure_error:find("semantic validation failed"))
             "#,
         )
         .exec()

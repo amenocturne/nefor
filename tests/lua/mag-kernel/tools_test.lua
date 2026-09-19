@@ -316,6 +316,15 @@ end
 -- ==================================================================
 
 do
+  assert_eq(model_context._utf8_head("éx", 2), "é",
+    "UTF-8 head keeps a complete two-byte codepoint at the byte limit")
+  assert_eq(model_context._utf8_head("€x", 3), "€",
+    "UTF-8 head keeps a complete three-byte codepoint at the byte limit")
+  assert_eq(model_context._utf8_head("🙂x", 4), "🙂",
+    "UTF-8 head keeps a complete four-byte codepoint at the byte limit")
+  assert_eq(model_context._utf8_head("a🙂b", 4), "a",
+    "UTF-8 head excludes a codepoint cut by the byte limit")
+
   local function project(results)
     local msgs, emit = capture()
     local inst = tool_result.construct("tr", {}, emit)

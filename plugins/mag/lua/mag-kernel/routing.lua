@@ -454,8 +454,8 @@ function M:factory_arrival(id, wire, payload)
         if item_value == nil then
           item_value = type(payload.value) == "table" and payload.value.value or payload.value
         end
-        local validation = host.validate_value(dynamic_item, item_value)
-        if not validation.ok then
+        local validation_ok, validation = pcall(host.validate_value, dynamic_item, item_value)
+        if not validation_ok or type(validation) ~= "table" or validation.ok ~= true then
           return nil, string.format(
             "actor '%s' emitted a malformed DynamicList item on '%s'",
             tostring(id), tostring(wire))
@@ -499,12 +499,17 @@ function M:factory_arrival(id, wire, payload)
         tostring(id), tostring(wire))
     end
     if dynamic_item == nil then
-      local validation = host.validate_value(actual_type, semantic_value)
-      if not validation.ok then
-        local violation = (validation.violations or {})[1]
-        local detail = violation and
-          (tostring(violation.path) .. ": " .. tostring(violation.message))
-          or ((validation.error or {}).message or "semantic value does not conform")
+      local validation_ok, validation = pcall(host.validate_value, actual_type, semantic_value)
+      if not validation_ok or type(validation) ~= "table" or validation.ok ~= true then
+        local detail
+        if validation_ok and type(validation) == "table" then
+          local violation = (validation.violations or {})[1]
+          detail = violation and
+            (tostring(violation.path) .. ": " .. tostring(violation.message))
+            or ((validation.error or {}).message or "semantic value does not conform")
+        else
+          detail = "semantic validation failed: " .. tostring(validation)
+        end
         return nil, string.format(
           "actor '%s' emitted malformed semantic value on '%s': %s",
           tostring(id), tostring(wire), tostring(detail))

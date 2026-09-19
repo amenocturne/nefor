@@ -12,19 +12,18 @@ M.TAIL_TARGET = M.ITEM_LIMIT - M.HEAD_TARGET
 
 local function utf8_head(value, limit)
   if #value <= limit then return value end
-  local finish = limit
-  while finish > 0 do
-    local byte = value:byte(finish)
-    if byte < 128 or byte >= 192 then
-      if byte >= 192 then
-        local width = byte < 224 and 2 or (byte < 240 and 3 or 4)
-        if finish + width - 1 > limit then finish = finish - 1 end
-      end
-      break
+  local start = limit
+  while start > 0 do
+    local byte = value:byte(start)
+    if byte < 128 then return value:sub(1, start) end
+    if byte >= 192 then
+      local width = byte < 224 and 2 or (byte < 240 and 3 or 4)
+      local finish = start + width - 1
+      return value:sub(1, finish <= limit and finish or start - 1)
     end
-    finish = finish - 1
+    start = start - 1
   end
-  return value:sub(1, finish)
+  return ""
 end
 
 local function utf8_tail(value, limit)
