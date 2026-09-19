@@ -116,6 +116,23 @@ mod tools {
                     .iter()
                     .any(|chunk| matches!(chunk, StreamChunk::Stderr(bytes) if bytes == b"err")));
             }
+
+            #[tokio::test]
+            async fn oversized_output_keeps_head_and_tail_within_bound() {
+                let result = run(&json!({
+                    "argv": ["/bin/sh", "-c", "printf START; head -c 3145728 /dev/zero | tr '\\0' a; printf END"],
+                    "cwd": "/",
+                    "timeout": unbounded()
+                }))
+                .await
+                .unwrap();
+                let stdout = result["stdout"].as_str().unwrap();
+                let omitted = 5 + 3_145_728 + 3 - 2 * process::RETAINED_EDGE_BYTES;
+                assert!(stdout.starts_with("STARTaaa"));
+                assert!(stdout.ends_with("aaaEND"));
+                assert!(stdout.contains(&format!("[... {omitted} bytes of output omitted ...]")));
+                assert!(stdout.len() < 2 * process::RETAINED_EDGE_BYTES + 64);
+            }
         }
     }
 

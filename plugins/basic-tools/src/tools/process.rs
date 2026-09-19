@@ -211,15 +211,15 @@ async fn read_pipe<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut retained = Vec::new();
+    let mut retained = RetainedOutput::default();
     let mut chunk = vec![0; 8192];
     loop {
         let size = reader.read(&mut chunk).await?;
         if size == 0 {
-            return Ok(retained);
+            return Ok(retained.into_bytes());
         }
         let bytes = chunk[..size].to_vec();
-        retained.extend_from_slice(&bytes);
+        retained.push(&bytes);
         if let Some(sender) = &stream {
             let event = match kind {
                 StreamKind::Stdout => StreamChunk::Stdout(bytes),
@@ -227,6 +227,51 @@ where
             };
             let _ = sender.send(event);
         }
+    }
+}
+
+/// Bytes of each stream kept from the start and from the end of the output.
+/// JSON escaping can grow a byte up to sixfold, so both streams at twice this
+/// bound must stay below the engine's 16 MiB NCP line limit.
+pub const RETAINED_EDGE_BYTES: usize = 512 * 1024;
+
+/// Head and tail of one output stream; the middle of an oversized stream is
+/// dropped so the tool result always fits in a single NCP frame.
+#[derive(Default)]
+struct RetainedOutput {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    omitted: u64,
+}
+
+impl RetainedOutput {
+    fn push(&mut self, bytes: &[u8]) {
+        let head_room = RETAINED_EDGE_BYTES.saturating_sub(self.head.len());
+        let (head, rest) = bytes.split_at(head_room.min(bytes.len()));
+        self.head.extend_from_slice(head);
+        self.tail.extend_from_slice(rest);
+        // Trim lazily so the tail is compacted once per edge-size of input.
+        if self.tail.len() > 2 * RETAINED_EDGE_BYTES {
+            let excess = self.tail.len() - RETAINED_EDGE_BYTES;
+            self.tail.drain(..excess);
+            self.omitted += excess as u64;
+        }
+    }
+
+    fn into_bytes(mut self) -> Vec<u8> {
+        if self.tail.len() > RETAINED_EDGE_BYTES {
+            let excess = self.tail.len() - RETAINED_EDGE_BYTES;
+            self.tail.drain(..excess);
+            self.omitted += excess as u64;
+        }
+        let mut bytes = self.head;
+        if self.omitted > 0 {
+            bytes.extend_from_slice(
+                format!("\n[... {} bytes of output omitted ...]\n", self.omitted).as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(&self.tail);
+        bytes
     }
 }
 
