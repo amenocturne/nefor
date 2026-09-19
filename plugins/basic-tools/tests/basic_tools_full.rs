@@ -133,6 +133,20 @@ mod tools {
                 assert!(stdout.contains(&format!("[... {omitted} bytes of output omitted ...]")));
                 assert!(stdout.len() < 2 * process::RETAINED_EDGE_BYTES + 64);
             }
+
+            #[tokio::test]
+            async fn worst_case_escaped_output_on_both_streams_fits_one_ncp_frame() {
+                // \x01 escapes to six JSON bytes (), the largest per-byte growth.
+                let result = run(&json!({
+                    "argv": ["/bin/sh", "-c", "head -c 20971520 /dev/zero | tr '\\0' '\\001' | tee /dev/stderr"],
+                    "cwd": "/",
+                    "timeout": unbounded()
+                }))
+                .await
+                .unwrap();
+                let frame = serde_json::to_string(&result).unwrap();
+                assert!(frame.len() < 16 * 1024 * 1024, "frame is {} bytes", frame.len());
+            }
         }
     }
 
