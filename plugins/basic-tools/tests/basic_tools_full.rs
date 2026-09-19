@@ -136,7 +136,7 @@ mod tools {
 
             #[tokio::test]
             async fn worst_case_escaped_output_on_both_streams_fits_one_ncp_frame() {
-                // \x01 escapes to six JSON bytes (), the largest per-byte growth.
+                // \x01 escapes to six JSON bytes (`\u0001`), the largest per-byte growth.
                 let result = run(&json!({
                     "argv": ["/bin/sh", "-c", "head -c 20971520 /dev/zero | tr '\\0' '\\001' | tee /dev/stderr"],
                     "cwd": "/",
@@ -146,6 +146,25 @@ mod tools {
                 .unwrap();
                 let frame = serde_json::to_string(&result).unwrap();
                 assert!(frame.len() < 16 * 1024 * 1024, "frame is {} bytes", frame.len());
+            }
+
+            // Emulator logcat can emit gigabytes; retention must stay flat regardless.
+            #[tokio::test]
+            #[ignore = "streams 10 GiB through a pipe"]
+            async fn ten_gib_output_fits_one_ncp_frame() {
+                let result = run(&json!({
+                    "argv": ["/bin/sh", "-c", "head -c 10737418240 /dev/zero | tr '\\0' a"],
+                    "cwd": "/",
+                    "timeout": unbounded()
+                }))
+                .await
+                .unwrap();
+                let frame = serde_json::to_string(&result).unwrap();
+                assert!(frame.len() < 16 * 1024 * 1024, "frame is {} bytes", frame.len());
+                assert!(frame.contains(&format!(
+                    "[... {} bytes of output omitted ...]",
+                    10_737_418_240_usize - 2 * process::RETAINED_EDGE_BYTES
+                )));
             }
         }
     }
