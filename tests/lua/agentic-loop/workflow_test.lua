@@ -827,7 +827,7 @@ do
   assert_eq(overlay.provider, "mock", "live provider overlays the llm actor")
   assert_eq(overlay.model, "test-model", "live model overlays the llm actor")
   assert_eq(overlay.reasoning_effort, "high", "reasoning effort overlays the llm actor")
-  assert_eq(overlay.display_text, "hello lead",
+  assert_eq(overlay.authored_prompt, "hello lead",
     "the original user text accompanies the typed task as its presentation")
   assert_eq(overlay.history, nil,
     "history is reconstructed by providers rather than persisted in execute")

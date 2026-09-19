@@ -28,7 +28,7 @@ M.declaration = {
     max_corrections = "number",
     conversation_id = "string?",
     turn_id = "string?", submission_ids = "table?", input_cause = "string?",
-    display_text = "string?",
+    authored_prompt = "string?",
     dynamic = "bool?", dynamic_item_type = "string?", dynamic_item_descriptor = "table?",
   },
   template = { relocations = {}, parameter_equals = { dynamic = false } },

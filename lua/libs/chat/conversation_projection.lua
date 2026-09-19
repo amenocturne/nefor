@@ -1,4 +1,4 @@
-local display = require("libs.conversation-manager.display")
+local authored_prompt = require("libs.conversation-manager.authored_prompt")
 
 local M = {}
 
@@ -52,6 +52,7 @@ local function record_message(state, message)
   state.messages[message.id] = {
     role = message.role,
     turn_id = message.turn_id,
+    authored_prompt = message.authored_prompt or previous.authored_prompt,
     display_text = message.display_text or previous.display_text,
     visibility = message.visibility or previous.visibility or "transcript",
     streamed = previous.streamed == true,
@@ -77,11 +78,9 @@ end
 
 local function visible_text(message)
   if type(message) ~= "table" then return "" end
+  local text = authored_prompt.display_text(message)
+  if text ~= "" then return text end
   if type(message.display_text) == "string" then return message.display_text end
-  if type(message.text) == "string" and message.text ~= "" then return message.text end
-  if type(message.structured) == "table" and #message.structured == 1 then
-    return display.structured_text(message.structured[1]) or ""
-  end
   return ""
 end
 
@@ -93,9 +92,14 @@ local function exchange_arguments(exchange)
   return arguments or {}
 end
 
-local function remember_user_prompt(state, message, text)
+local function remember_user_prompt(state, message)
   if type(message.history_id) ~= "table" or message.status ~= "completed"
       or (message.visibility or "transcript") ~= "transcript" then return end
+  local text = authored_prompt.text(message)
+  if text == nil and type(message.text) == "string" and message.text ~= "" then
+    text = message.text
+  end
+  if text == nil then return end
   state.user_prompts[#state.user_prompts + 1] = {
     history_id = message.history_id,
     text = text,
@@ -110,7 +114,7 @@ local function message_completed(state, actions, message)
     local recorded = state.messages[message.id]
     if text == "" and type(recorded) == "table"
         and type(recorded.display_text) == "string" then text = recorded.display_text end
-    remember_user_prompt(state, message, text)
+    remember_user_prompt(state, message)
     action(actions, "message", {
       role = message.role,
       text = text,
@@ -208,7 +212,7 @@ local function snapshot_actions(state, projection, actions)
       end
     elseif message.role == "user" and message.input_cause ~= "internal_async_completion" then
       local text = visible_text(message)
-      remember_user_prompt(state, message, text)
+      remember_user_prompt(state, message)
       action(actions, "message", {
         role = message.role,
         text = text,
@@ -222,11 +226,11 @@ local function snapshot_actions(state, projection, actions)
   end
   for _, turn in ipairs(projection.turns or {}) do
     if turn.status ~= "open" then
-      action(actions, "turn_" .. turn.status, {
+      action(actions, "turn_restored", {
         turn_id = turn.id,
         run_id = turn.run_id,
+        status = turn.status,
         terminal = turn.terminal,
-        answer = state.turn_text[turn.id],
       })
     end
   end
@@ -305,7 +309,9 @@ function M.reduce(previous, body)
       -- Model context only; no delta reaches the transcript.
     elseif message and message.role == "user" and type(chunk) == "table"
         and chunk.kind == "structured" and message.display_text == nil then
-      message.display_text = display.structured_text(chunk.data)
+      message.display_text = authored_prompt.display_text({
+        role = "user", authored_prompt = message.authored_prompt, structured = { chunk.data },
+      })
     elseif message and message.role == "assistant" and type(chunk) == "table"
         and type(chunk.data) == "string" and chunk.data ~= "" then
       message.streamed = true

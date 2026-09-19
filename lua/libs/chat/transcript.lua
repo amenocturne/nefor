@@ -322,4 +322,16 @@ function M.attach_latest_assistant_terminal(state, terminal)
   return state
 end
 
+function M.attach_turn_terminal(state, turn_id, terminal)
+  if type(turn_id) ~= "string" then return state end
+  for i = #state.entries, 1, -1 do
+    local entry = state.entries[i]
+    if entry.role == "assistant" and entry.turn_id == turn_id then
+      local updated = Entry.set_turn_terminal(entry, terminal)
+      return shallow_merge(state, { entries = replace_entry(state.entries, i, updated) })
+    end
+  end
+  return state
+end
+
 return M

@@ -174,7 +174,7 @@ local task_data = { value = { prompt = "session-derived prompt" },
   } } }
 actions = structured_user_actions(task_data, {
   id = "structured-user", turn_id = "structured-turn", role = "user", text = "",
-  display_text = "session-derived prompt",
+  authored_prompt = "session-derived prompt",
 })
 eq(actions[1].text, "session-derived prompt",
   "live structured records prefer their producer-owned display text")
@@ -204,9 +204,11 @@ snapshot_state, snapshot_actions = projection.reduce(snapshot_state, {
   kind = "conversation.snapshot", conversation_id = "snapshot", found = true,
   projection = {
     messages = {
-      { id = "user", turn_id = "turn-s", role = "user", text = "",
-        display_text = "session-derived prompt", structured = { task_data },
+      { id = "user", history_id = { 1 }, turn_id = "turn-s", role = "user", status = "completed", text = "",
+        authored_prompt = "session-derived prompt", structured = { task_data },
         submission_ids = { "submission-s" } },
+      { id = "generic-user", history_id = { 1, 1 }, role = "user", status = "completed",
+        text = "", structured = { { value = { prompt = "not authored" } } } },
       {
         id = "assistant-call", turn_id = "turn-s", role = "assistant", text = "",
         tool_calls = {
@@ -230,12 +232,20 @@ snapshot_state, snapshot_actions = projection.reduce(snapshot_state, {
 local tool_end_index
 local final_text_index
 local snapshot_user
+local generic_user
 for index, item in ipairs(snapshot_actions) do
-  if item.kind == "message" then snapshot_user = item end
+  if item.kind == "message" and item.message_id == "user" then snapshot_user = item end
+  if item.kind == "message" and item.message_id == "generic-user" then generic_user = item end
   if item.kind == "tool_completed" then tool_end_index = index end
   if item.kind == "text_delta" and item.text == "done" then final_text_index = index end
 end
-eq(snapshot_user.text, "session-derived prompt", "snapshot uses the same structured Task display")
+eq(snapshot_user.text, "session-derived prompt", "snapshot uses the same authored prompt projection")
+eq(snapshot_state.user_prompts[1].text, "session-derived prompt",
+  "rewind picker stores only the authored prompt text")
+eq(#snapshot_state.user_prompts, 1,
+  "generic structured records remain visible but are not reinterpreted as rewind prompts")
+eq(generic_user.text, [[{"prompt":"not authored"}]],
+  "arbitrary structured records retain generic JSON transcript display")
 eq(snapshot_user.submission_ids[1], "submission-s", "snapshot preserves submission identity")
 assert(tool_end_index ~= nil and final_text_index ~= nil and tool_end_index < final_text_index,
   "snapshot tool completion must remain before the following assistant message")

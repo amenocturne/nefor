@@ -582,7 +582,7 @@ local function submit_orchestrator_run(user_text, submission_ids, input_cause, r
     conversation_id = conversation_id,
     submission_ids = submission_ids,
     input_cause = input_cause,
-    display_text = input_cause == nil and user_text or nil,
+    authored_prompt = input_cause == nil and user_text or nil,
   }
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
     overlay_params.provider = state.config.provider

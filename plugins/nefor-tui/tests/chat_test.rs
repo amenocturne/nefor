@@ -3007,6 +3007,7 @@ fn resumed_snapshot_renders_structured_first_task_once_before_assistant() {
                 "messages": [
                     { "id": "system", "role": "system", "text": "system prompt" },
                     { "id": "user", "turn_id": "turn", "role": "user", "text": "",
+                      "authored_prompt": "resumed visible prompt",
                       "display_text": "resumed visible prompt", "structured": [{
                         "value": { "prompt": "resumed visible prompt" },
                         "mag_type": { "version": 1, "root": {
@@ -3034,6 +3035,11 @@ fn resumed_snapshot_renders_structured_first_task_once_before_assistant() {
     assert!(
         prompt < answer,
         "first user prompt must precede assistant output:\n{out}"
+    );
+    assert_eq!(
+        out.matches("▣ test").count(),
+        1,
+        "snapshot reconstruction must attach one footer to the canonical assistant:\n{out}"
     );
 }
 
@@ -4307,6 +4313,12 @@ fn idle_double_escape_opens_rewind_picker_and_space_requests_canonical_rewind() 
     assert!(rewound.contains("Rewound to before this prompt"));
     assert!(rewound.contains("second"));
     assert!(rewound.contains("line"));
+    let state = engine.state_table().expect("state");
+    assert_eq!(
+        state.get::<String>("input_value").expect("restored input"),
+        "second\nline",
+        "canonical rewind must restore the exact multiline prompt into the controlled editor"
+    );
 }
 
 #[test]

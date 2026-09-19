@@ -1,5 +1,6 @@
 local M = {}
 local json_data = require("core.json_data")
+local authored_prompt = require("libs.conversation-manager.authored_prompt")
 local history_path = require("libs.conversation-manager.history_path")
 
 -- Within this domain, the fold is the sole transcript authority: events are
@@ -124,8 +125,11 @@ handlers.message_started = function(c, event)
   event.history_id = allocated
   local parent_key = history_path.key(parent)
   c.history_child_max[parent_key] = allocated[#allocated]
-  if event.display_text ~= nil and type(event.display_text) ~= "string" then
-    return err("invalid_display_text", { message_id = event.message_id })
+  if event.authored_prompt ~= nil and type(event.authored_prompt) ~= "string" then
+    return err("invalid_authored_prompt", { message_id = event.message_id })
+  end
+  if event.authored_prompt ~= nil and event.role ~= "user" then
+    return err("invalid_authored_prompt_role", { message_id = event.message_id, role = event.role })
   end
   local message = {
     id = event.message_id, history_id = copy(allocated), role = event.role, status = "open",
@@ -133,7 +137,7 @@ handlers.message_started = function(c, event)
     turn_id = event.turn_id, tool_call_id = event.tool_call_id,
     submission_ids = copy(event.submission_ids or {}),
     input_cause = event.input_cause,
-    display_text = event.display_text,
+    authored_prompt = event.authored_prompt,
     tool_name = event.tool_name or (tool_exchange and tool_exchange.tool_name),
     chunks = {}, attempts = {}, exchange_ids = {},
   }
@@ -390,14 +394,18 @@ handlers.rewind_committed = function(c, event)
       or message.status ~= "completed" or not history_path.is_prefix(message.history_id, c.head) then
     return err("invalid_rewind_target", { target_history_id = copy(event.target_history_id) })
   end
+  local prompt = authored_prompt.text(message)
   local text = {}
-  for _, chunk in ipairs(message.chunks or {}) do
-    if chunk.kind == "text" and type(chunk.data) == "string" then text[#text + 1] = chunk.data end
+  if prompt == nil then
+    for _, chunk in ipairs(message.chunks or {}) do
+      if chunk.kind == "text" and type(chunk.data) == "string" then text[#text + 1] = chunk.data end
+    end
+    prompt = table.concat(text)
   end
   c.head = history_path.parent(message.history_id)
   c.pending_edit = {
     source_history_id = copy(message.history_id),
-    text = table.concat(text),
+    text = prompt,
   }
   return c
 end

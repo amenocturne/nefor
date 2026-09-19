@@ -90,22 +90,32 @@ end
 do
   local projection = require("libs.conversation-manager.projection")
   local store = manager.new(); create(store, "display", "lead")
+  local prompt = "resume me\nexactly"
   append(store, fact("m", "display", "message_started", {
-    message_id = "user", role = "user", display_text = "resume me",
+    message_id = "user", role = "user", authored_prompt = prompt,
   }))
   local envelope = {
     mag_type = { version = 2, root = { kind = "named", name = "main.LeadInput" } },
-    value = { prompt = "resume me" },
+    value = { prompt = prompt },
   }
   append(store, fact("chunk", "display", "content_chunk_appended", {
     message_id = "user", chunk = { kind = "structured", data = envelope },
   }))
   append(store, fact("done", "display", "message_completed", { message_id = "user" }))
 
-  local resumed = projection.conversation(store:peek("display")).messages[1]
-  eq(resumed.display_text, "resume me", "resume projection retains explicit presentation")
+  local conversation = store:peek("display")
+  local resumed = projection.conversation(conversation).messages[1]
+  eq(resumed.display_text, prompt, "resume projection retains exact authored presentation")
   eq(resumed.structured[1], envelope, "resume projection retains the typed envelope")
-  eq(resumed.content, envelope, "provider content remains the typed value")
+  eq(resumed.content, envelope, "public canonical projection retains the typed value")
+  local provider = projection.context(conversation).messages[1]
+  eq(provider.content, prompt, "provider context receives plain authored text")
+  eq(provider.structured[1], envelope, "provider projection retains canonical type evidence")
+  append(store, fact("rewind-display", "display", "rewind_committed", {
+    target_history_id = resumed.history_id, expected_head = resumed.history_id,
+  }))
+  eq(store:peek("display").pending_edit.text, prompt,
+    "rewind restores the exact multiline authored prompt")
 end
 
 -- Tool errors are the other exactly-once terminal exchange outcome.
@@ -173,7 +183,7 @@ local invalid_cases = {
   { "created twice", function(s) create(s, "c", "lead") end, fact("e", "c", "created"), "created_more_than_once" },
   { "unknown kind", function(s) create(s, "c", "lead") end, fact("e", "c", "wat"), "unknown_event_kind" },
   { "bad role", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "robot" }), "invalid_role" },
-  { "bad display text", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "user", display_text = { "not", "text" } }), "invalid_display_text" },
+  { "bad authored prompt", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "user", authored_prompt = { "not", "text" } }), "invalid_authored_prompt" },
   { "missing message", function(s) create(s, "c", "lead") end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "text", data = "x" } }), "message_not_found" },
   { "bad chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "image" } }), "invalid_content_chunk" },
   { "tool call through generic chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "tool_call", data = "{}" } }), "invalid_content_chunk" },

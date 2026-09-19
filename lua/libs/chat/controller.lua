@@ -1743,6 +1743,20 @@ local function apply_conversation_action(state, item)
       ttl_ms = 3500,
     }, state))
   end
+  if item.kind == "turn_restored" then
+    local terminal = item.terminal or {}
+    local restored = transcript.attach_turn_terminal(state, item.turn_id, terminal)
+    if item.status == "interrupted" then
+      return transcript.push_entry(
+        restored, Entry.system(display_value(terminal.reason or "interrupted")))
+    end
+    if item.status == "failed" then
+      local message = terminal.error or terminal.message or "The conversation failed."
+      return transcript.push_entry(
+        restored, Entry.error("Conversation failed", display_value(message), true))
+    end
+    return restored
+  end
   if item.kind == "turn_completed" then
     local terminal = item.terminal or {}
     local next_state = settle_terminal_provider_round(state, terminal)

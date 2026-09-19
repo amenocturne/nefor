@@ -1,5 +1,5 @@
 local domain = require("libs.conversation-manager.domain")
-local display = require("libs.conversation-manager.display")
+local authored_prompt = require("libs.conversation-manager.authored_prompt")
 local history_path = require("libs.conversation-manager.history_path")
 
 local M = {}
@@ -41,11 +41,16 @@ local function projected_message(conversation, message, include_provider_context
     end
   end
   local content = table.concat(text)
-  local display_text = message.display_text or content
-  if display_text == "" and #structured == 1 then
-    display_text = display.structured_text(structured[1]) or ""
-  end
   if content == "" and #structured == 1 then content = domain.copy(structured[1]) end
+  local presentation = {
+    role = message.role,
+    authored_prompt = message.authored_prompt,
+    text = table.concat(text),
+    structured = structured,
+  }
+  local display_text = authored_prompt.display_text(presentation)
+  local projected_content = include_provider_context
+      and authored_prompt.provider_content(presentation, content) or content
   local projected = {
     id = message.id,
     history_id = domain.copy(message.history_id),
@@ -58,9 +63,10 @@ local function projected_message(conversation, message, include_provider_context
     tool_call_id = message.tool_call_id,
     tool_name = message.tool_name,
     chunks = chunks,
-    content = content,
+    content = projected_content,
     text = table.concat(text),
     display_text = display_text,
+    authored_prompt = message.authored_prompt,
     reasoning = table.concat(reasoning),
     structured = structured,
     tool_calls = tool_calls,

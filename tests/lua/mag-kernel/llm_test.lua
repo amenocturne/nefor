@@ -95,7 +95,7 @@ local function conversation_messages(facts)
         structured = {},
         tool_call_id = fact.tool_call_id,
         name = fact.name,
-        display_text = fact.display_text,
+        authored_prompt = fact.authored_prompt,
         tool_calls = {},
         completed = false,
       }
@@ -203,7 +203,7 @@ do
     value = { prompt = "resume me" },
   }
   local instance, _, facts = make("display.llm", {
-    provider = "p", display_text = "resume me",
+    provider = "p", authored_prompt = "resume me",
   })
   instance.deliver(turn({ messages = { { role = "user", content = envelope } } }))
 
@@ -214,7 +214,7 @@ do
       chunk = fact.chunk
     end
   end
-  assert_eq(started.display_text, "resume me",
+  assert_eq(started.authored_prompt, "resume me",
     "canonical user fact carries the original human-readable prompt")
   assert_eq(chunk.data.value.prompt, "resume me",
     "canonical content keeps the typed MAG value")
