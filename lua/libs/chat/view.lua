@@ -153,6 +153,7 @@ local function render(state, statusline, slash)
     state.popup.variant == "tool_permission" or
     state.popup.variant == "model_picker" or
     state.popup.variant == "session_picker" or
+    state.popup.variant == "rewind_picker" or
     state.popup.variant == "login_picker" or
     state.popup.variant == "info" or
     state.popup.variant == "warning" or
@@ -174,6 +175,7 @@ local function render(state, statusline, slash)
   else
     input_border_style = input_focused and STYLE.input_border or STYLE.input_border_unfocused
   end
+  if state.rewind_notice ~= nil then input_border_style = STYLE.popup_user end
   -- The prompt widget owns trigger detection + popup rendering + Tab
   -- routing for both slash and @-path completion. Chat.lua declares
   -- the completion sources via slash.completions() and reads the
@@ -237,6 +239,11 @@ local function render(state, statusline, slash)
       tui.expanded { child = transcript(state, statusline) },
       queued_message(state),
       input_field,
+      state.rewind_notice and tui.text {
+        content = state.rewind_notice,
+        style = STYLE.popup_user,
+        wrap = "word",
+      } or nil,
       statusline.view(state),
       blank_row(),
       render_keepalive(state),
@@ -262,6 +269,7 @@ local function render(state, statusline, slash)
       popups.help(state),
       popups.message(state),
       popups.model_picker(state),
+      popups.rewind_picker(state),
       popups.session_picker(state),
       popups.login_picker(state),
       popups.tool_permission(state),

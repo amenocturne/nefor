@@ -1,5 +1,6 @@
 local domain = require("libs.conversation-manager.domain")
 local display = require("libs.conversation-manager.display")
+local history_path = require("libs.conversation-manager.history_path")
 
 local M = {}
 
@@ -47,6 +48,7 @@ local function projected_message(conversation, message, include_provider_context
   if content == "" and #structured == 1 then content = domain.copy(structured[1]) end
   local projected = {
     id = message.id,
+    history_id = domain.copy(message.history_id),
     turn_id = message.turn_id,
     submission_ids = domain.copy(message.submission_ids or {}),
     input_cause = message.input_cause,
@@ -70,10 +72,15 @@ local function projected_message(conversation, message, include_provider_context
   return projected
 end
 
+local function active_message(conversation, message)
+  return history_path.is_prefix(message.history_id, conversation.head)
+end
+
 local function context_messages(conversation, include_provider_context)
   local messages = {}
   for _, message in ipairs(conversation.messages) do
-    if message.status ~= "open" and message.visibility ~= "discarded" then
+    if active_message(conversation, message)
+        and message.status ~= "open" and message.visibility ~= "discarded" then
       local projected = projected_message(conversation, message, include_provider_context)
       messages[#messages + 1] = projected
     end
@@ -87,6 +94,7 @@ local function public_compaction(compaction, include_checkpoint)
     request_id = compaction.request_id,
     status = compaction.status,
     history_cutoff = compaction.history_cutoff,
+    history_id = domain.copy(compaction.history_id),
     provider = compaction.provider,
     model = compaction.model,
     provider_options = domain.copy(compaction.provider_options),
@@ -98,15 +106,29 @@ end
 
 function M.conversation(conversation)
   if not conversation then return nil end
-  local messages = {}
+  local messages, active_message_ids, active_turn_ids = {}, {}, {}
   for _, message in ipairs(conversation.messages) do
-    messages[#messages + 1] = projected_message(conversation, message)
+    if active_message(conversation, message) then
+      messages[#messages + 1] = projected_message(conversation, message)
+      active_message_ids[message.id] = true
+      if message.turn_id then active_turn_ids[message.turn_id] = true end
+    end
   end
   local exchanges = {}
-  for _, exchange in ipairs(conversation.exchanges) do exchanges[#exchanges + 1] = projected_exchange(exchange) end
+  for _, exchange in ipairs(conversation.exchanges) do
+    if active_message_ids[exchange.message_id] then
+      exchanges[#exchanges + 1] = projected_exchange(exchange)
+    end
+  end
+  local turns = {}
+  for _, turn in ipairs(conversation.turns) do
+    if active_turn_ids[turn.id] then turns[#turns + 1] = domain.copy(turn) end
+  end
   local compactions = {}
   for _, compaction in ipairs(conversation.compactions) do
-    compactions[#compactions + 1] = public_compaction(compaction, false)
+    if history_path.is_prefix(compaction.history_id, conversation.head) then
+      compactions[#compactions + 1] = public_compaction(compaction, false)
+    end
   end
   return {
     id = conversation.id,
@@ -115,8 +137,10 @@ function M.conversation(conversation)
     messages = messages,
     exchanges = exchanges,
     retries = domain.copy(conversation.retries),
-    turns = domain.copy(conversation.turns),
+    turns = turns,
     compactions = compactions,
+    pending_edit = domain.copy(conversation.pending_edit),
+    history_head = domain.copy(conversation.head),
     terminal = domain.copy(conversation.terminal),
     last_sequence = conversation.last_sequence,
     watermark = conversation.last_sequence,
@@ -129,7 +153,8 @@ function M.context(conversation)
   local selected = nil
   for index = #conversation.compactions, 1, -1 do
     local candidate = conversation.compactions[index]
-    if candidate.status == "completed" then
+    if candidate.status == "completed"
+        and history_path.is_prefix(candidate.history_id, conversation.head) then
       selected = candidate
       break
     end
@@ -193,6 +218,11 @@ function M.change(after, event)
     change.message_end = turn.message_end
     change.watermark = turn.sequence_end or event.sequence
     change.terminal = domain.copy(turn.terminal)
+  elseif kind == "rewind_committed" then
+    change.projection = M.conversation(after)
+    change.context = M.context(after)
+    change.pending_edit = domain.copy(after.pending_edit)
+    change.history_head = domain.copy(after.head)
   elseif kind:sub(1, #"context_compaction") == "context_compaction" then
     local compaction = after.compaction_by_id[event.request_id]
     change.kind = kind:gsub("_requested$", "_pending")

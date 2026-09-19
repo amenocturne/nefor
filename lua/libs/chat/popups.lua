@@ -27,8 +27,8 @@ local HELP_BODY = [[Keys:
   Enter        send message
   Shift+Enter  insert newline
   Esc          steer queued message after current LLM exchange
-  Esc Esc      stop lead; restore queued text to prompt (within 600ms)
-  Esc Esc Esc  kill every workflow, including lead (within 600ms per press)
+  Esc Esc      rewind when idle; stop lead and restore queued text when active
+  Esc Esc Esc  kill every workflow, including lead (while active)
   Ctrl+B       toggle sidebar
   Tab          focus sidebar ↔ prompt
   (sidebar)    ↑/↓ move · Space view · Enter fold · x/X terminate one/all · Esc back
@@ -214,6 +214,44 @@ local function awaiting_count(awaiting)
   local n = 0
   for _, _ in pairs(awaiting) do n = n + 1 end
   return n
+end
+
+function M.rewind_picker(state)
+  if not state.popup or state.popup.variant ~= "rewind_picker" then return nil end
+  local p = state.popup
+  local rows = p.prompts or {}
+  local picker_body = W.picker.view({
+    state = { cursor = p.cursor or math.max(1, #rows) },
+    entries = function() return rows end,
+    format_entry = function(row)
+      local text = tostring(row.text or ""):gsub("\r", " "):gsub("\n", " ")
+      if #text > 72 then text = text:sub(1, 71) .. "…" end
+      return text
+    end,
+    cursor_style = CURSOR_ROW_STYLE,
+    row_style = STYLE.status,
+    show_search = false,
+    empty_style = STYLE.status_dim,
+    empty_text = "No user prompts are available on this path.",
+    cap = 12,
+  })
+  return W.popup.view({
+    open = true,
+    border_style = STYLE.popup_user,
+    width = "75%",
+    height = "65%",
+    scroll_key = "popup_rewind_picker",
+    title = "── rewind to a prompt ──",
+    title_style = STYLE.popup_user,
+    child = tui.column { gap = 1, children = {
+      picker_body,
+      tui.text {
+        content = "↑/↓ select · Space rewind and edit · Esc cancel",
+        style = STYLE.status_dim,
+        wrap = "none",
+      },
+    }},
+  })
 end
 
 function M.session_picker(state)
@@ -662,6 +700,7 @@ function M.scroll_key(variant)
   if variant == "terminate_workflow" then return nil end
   if variant == "model_picker"    then return "popup_model_picker" end
   if variant == "session_picker"  then return "popup_session_picker" end
+  if variant == "rewind_picker"   then return "popup_rewind_picker" end
   if variant == "login_picker"    then return "popup_login_picker" end
   if variant == "node_inspector"  then return "popup_node_inspector" end
   return nil

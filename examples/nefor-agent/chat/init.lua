@@ -282,6 +282,8 @@ local function initial_state()
     escape_token     = nil,
     escape_token_seq = 0,
     escape_count     = nil,
+    pending_rewind   = nil,
+    rewind_notice    = nil,
     last_ctrl_c_ms   = nil,
     exit_token       = nil,
     exit_token_seq   = 0,

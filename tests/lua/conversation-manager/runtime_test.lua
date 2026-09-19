@@ -454,6 +454,35 @@ eq(last_body().conversation_id, "replayed")
 eq(actor._internals.active_invocations()["provider-2"], nil,
   "cancel releases correlation")
 
+-- Rewind is a correlated manager command. Only its canonical committed fact is
+-- persisted; the delta replaces active projections and stale heads reject.
+local before_rewind = actor._internals.get("replayed")
+local rewind_target = before_rewind.messages[1].history_id
+local rewind_head = before_rewind.history_head
+receive({
+  kind = "conversation.rewind.request",
+  request_id = "rewind-1",
+  conversation_id = "replayed",
+  target_history_id = rewind_target,
+  expected_head = rewind_head,
+})
+eq(last_body().kind, "conversation.rewind.committed", last_body().code or "rewind commits")
+local rewind_delta = body_at(#emitted - 1)
+eq(rewind_delta.kind, "conversation.projection.delta")
+eq(rewind_delta.change.kind, "rewind_committed")
+eq(rewind_delta.change.pending_edit.text, "question")
+eq(#rewind_delta.change.projection.messages, 0,
+  "rewound transcript is reconstructed from the canonical head")
+receive({
+  kind = "conversation.rewind.request",
+  request_id = "rewind-stale",
+  conversation_id = "replayed",
+  target_history_id = rewind_target,
+  expected_head = rewind_head,
+})
+eq(last_body().kind, "conversation.rewind.rejected")
+eq(last_body().code, "stale_rewind_target")
+
 receive({
   kind = "conversation.provider.invoke.request",
   request_id = "provider-3",

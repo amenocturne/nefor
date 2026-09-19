@@ -126,6 +126,7 @@ local function apply_recorded_to(conversations, event_index, event, stats)
     fact_fingerprint = (function()
       local fact = domain.copy(event)
       fact.sequence = nil
+      if fact.kind == "message_started" then fact.history_id = nil end
       return fingerprint(fact)
     end)(),
     event_fingerprint = fingerprint(event),

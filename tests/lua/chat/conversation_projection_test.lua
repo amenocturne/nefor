@@ -414,4 +414,77 @@ eq(replayed_reasoning, 0, "replay shows no reasoning from a retracted attempt")
 eq(#replayed_users, 1, "replay shows only the user's own input")
 eq(replayed_users[1], "question", "replay preserves the genuine user message")
 
+-- Rewind deltas rebuild the active transcript and retain the exact pending
+-- draft; the same state is reconstructed from a resumed snapshot.
+do
+  local state = projection.new()
+  state = select(1, projection.reduce(state, {
+    kind = "conversation.active.changed", conversation_id = "rewind",
+  }))
+  local rewound = {
+    messages = {
+      { id = "u1", history_id = { 1 }, role = "user", status = "completed",
+        text = "first", display_text = "first" },
+      { id = "a1", history_id = { 1, 1 }, role = "assistant", status = "completed",
+        text = "answer", display_text = "answer" },
+    },
+    exchanges = {}, turns = {}, compactions = {}, history_head = { 1, 1 },
+    pending_edit = { source_history_id = { 1, 1, 1 }, text = "second\nline" },
+  }
+  local actions
+  state, actions = projection.reduce(state, {
+    kind = "conversation.projection.delta", conversation_id = "rewind", sequence = 9,
+    change = { kind = "rewind_committed", projection = rewound,
+      pending_edit = rewound.pending_edit, history_head = rewound.history_head },
+  })
+  eq(state.pending_edit.text, "second\nline")
+  eq(#state.user_prompts, 1)
+  eq(state.user_prompts[1].text, "first")
+  eq(state.history_head[2], 1)
+  eq(actions[1].kind, "snapshot_reset")
+  eq(actions[#actions].kind, "rewind_restored")
+  eq(actions[#actions].pending_edit.text, "second\nline")
+
+  local resumed = projection.new()
+  resumed = select(1, projection.reduce(resumed, {
+    kind = "conversation.active.changed", conversation_id = "rewind",
+  }))
+  local resumed_actions
+  resumed, resumed_actions = projection.reduce(resumed, {
+    kind = "conversation.snapshot", conversation_id = "rewind", found = true,
+    projection = rewound,
+  })
+  eq(resumed.pending_edit.text, state.pending_edit.text,
+    "resume restores the pending source draft")
+  eq(resumed_actions[#resumed_actions].kind, "rewind_restored")
+
+  local cleared_actions
+  resumed, cleared_actions = projection.reduce(resumed, {
+    kind = "conversation.projection.delta", conversation_id = "rewind", sequence = 10,
+    change = { kind = "message_started", message = {
+      id = "u2-replacement", history_id = { 1, 2 }, role = "user",
+    } },
+  })
+  eq(resumed.pending_edit, nil)
+  eq(cleared_actions[1].kind, "rewind_cleared",
+    "replacement submission clears a replay-restored draft")
+
+  local interrupted = projection.new()
+  interrupted = select(1, projection.reduce(interrupted, {
+    kind = "conversation.active.changed", conversation_id = "interrupted",
+  }))
+  interrupted = select(1, projection.reduce(interrupted, {
+    kind = "conversation.snapshot", conversation_id = "interrupted", found = true,
+    projection = {
+      messages = {
+        { id = "u-open", history_id = { 1 }, role = "user", status = "interrupted",
+          visibility = "transcript", text = "partial", display_text = "partial" },
+      },
+      exchanges = {}, turns = {}, compactions = {}, history_head = { 1 },
+    },
+  }))
+  eq(#interrupted.user_prompts, 0,
+    "picker excludes user messages the manager cannot rewind")
+end
+
 print("conversation_projection_test: all assertions passed")

@@ -14,6 +14,9 @@ local function initial(active_conversation_id)
     messages = {},
     exchanges = {},
     turn_text = {},
+    user_prompts = {},
+    history_head = {},
+    pending_edit = nil,
   }
 end
 
@@ -53,6 +56,7 @@ local function record_message(state, message)
     visibility = message.visibility or previous.visibility or "transcript",
     streamed = previous.streamed == true,
   }
+  if type(message.history_id) == "table" then state.history_head = message.history_id end
 end
 
 -- Returns true when a terminal fact hides a message from the surface, retracting
@@ -89,6 +93,15 @@ local function exchange_arguments(exchange)
   return arguments or {}
 end
 
+local function remember_user_prompt(state, message, text)
+  if type(message.history_id) ~= "table" or message.status ~= "completed"
+      or (message.visibility or "transcript") ~= "transcript" then return end
+  state.user_prompts[#state.user_prompts + 1] = {
+    history_id = message.history_id,
+    text = text,
+  }
+end
+
 local function message_completed(state, actions, message)
   if settle_hidden(state, actions, message) then return end
   if type(message) ~= "table" then return end
@@ -97,6 +110,7 @@ local function message_completed(state, actions, message)
     local recorded = state.messages[message.id]
     if text == "" and type(recorded) == "table"
         and type(recorded.display_text) == "string" then text = recorded.display_text end
+    remember_user_prompt(state, message, text)
     action(actions, "message", {
       role = message.role,
       text = text,
@@ -118,6 +132,9 @@ local function snapshot_actions(state, projection, actions)
   state.messages = {}
   state.exchanges = {}
   state.turn_text = {}
+  state.user_prompts = {}
+  state.history_head = projection.history_head or {}
+  state.pending_edit = projection.pending_edit
   action(actions, "snapshot_reset", {})
 
   local exchange_by_id = {}
@@ -190,9 +207,11 @@ local function snapshot_actions(state, projection, actions)
         end
       end
     elseif message.role == "user" and message.input_cause ~= "internal_async_completion" then
+      local text = visible_text(message)
+      remember_user_prompt(state, message, text)
       action(actions, "message", {
         role = message.role,
-        text = visible_text(message),
+        text = text,
         message_id = message.id,
         turn_id = message.turn_id,
         submission_ids = message.submission_ids,
@@ -213,6 +232,9 @@ local function snapshot_actions(state, projection, actions)
   end
   for _, compaction in ipairs(projection.compactions or {}) do
     action(actions, "compaction_" .. compaction.status, { compaction = compaction })
+  end
+  if type(projection.pending_edit) == "table" then
+    action(actions, "rewind_restored", { pending_edit = projection.pending_edit })
   end
 end
 
@@ -238,7 +260,11 @@ function M.reduce(previous, body)
     messages = copy_map(previous.messages),
     exchanges = copy_map(previous.exchanges),
     turn_text = copy_map(previous.turn_text),
+    user_prompts = {},
+    history_head = previous.history_head,
+    pending_edit = previous.pending_edit,
   }
+  for index, prompt in ipairs(previous.user_prompts or {}) do state.user_prompts[index] = prompt end
   local actions = {}
 
   if body.kind == "conversation.snapshot" then
@@ -253,6 +279,10 @@ function M.reduce(previous, body)
 
   local change = body.change
   local kind = change.kind
+  if kind == "rewind_committed" and type(change.projection) == "table" then
+    snapshot_actions(state, change.projection, actions)
+    return state, actions
+  end
   if kind == "conversation_created" then
     action(actions, "conversation_created", { conversation_id = active })
   elseif kind == "turn_started" then
@@ -261,7 +291,13 @@ function M.reduce(previous, body)
       run_id = change.run_id,
     })
   elseif kind == "message_started" then
+    local clears_rewind = state.pending_edit ~= nil
+      and type(change.message) == "table" and change.message.role == "user"
     record_message(state, change.message)
+    if clears_rewind then
+      state.pending_edit = nil
+      action(actions, "rewind_cleared", {})
+    end
   elseif kind == "content_chunk_appended" then
     local message = state.messages[change.message_id]
     local chunk = change.chunk

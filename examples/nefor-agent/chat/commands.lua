@@ -39,6 +39,7 @@ return function(msg, state)
     end
   end
   if #text == 0 then return state, {} end
+  if state.pending_rewind ~= nil then return state, {} end
   -- Slash dispatch.
   local cmd, args, _has_ws = slash.parse(text)
   local extension_state, extension_effects = extensions.handle_command(

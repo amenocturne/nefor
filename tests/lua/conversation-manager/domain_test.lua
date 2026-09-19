@@ -463,4 +463,114 @@ do
   }), "invalid_provider_context")
 end
 
+-- Materialized history paths make rewind an append-only head movement. New
+-- messages allocate collision-free siblings while inactive branches remain
+-- immutable and replay reconstructs the same active head.
+do
+  local projection = require("libs.conversation-manager.projection")
+  local history_path = require("libs.conversation-manager.history_path")
+  local store = manager.new()
+  local recorded = {}
+  local function recorded_append(value)
+    local conversation, e, _, event = store:append(value); ok(conversation, e)
+    recorded[#recorded + 1] = event
+    return conversation, event
+  end
+  recorded_append(fact("branch:created", "branch", "created", { provenance = {
+    provider = "openai", model = "one", native_chat = "native:branch",
+    session = "session", parent = "parent", run = "run:branch",
+    actor = "branch", purpose = "lead",
+  } }))
+  local function message(id, role, text)
+    local conversation, event = recorded_append(fact(id .. ":start", "branch", "message_started", {
+      message_id = id, role = role,
+    }))
+    recorded_append(fact(id .. ":chunk", "branch", "content_chunk_appended", {
+      message_id = id, chunk = { kind = "text", data = text },
+    }))
+    recorded_append(fact(id .. ":done", "branch", "message_completed", { message_id = id }))
+    return event.history_id, conversation
+  end
+
+  local system_id = message("system", "system", "rules")
+  local first_id = message("m1", "user", "first")
+  message("a1", "assistant", "answer one")
+  local second_id = message("m2", "user", "second\nline")
+  message("a2", "assistant", "answer two")
+  local before_rewind = store:get("branch")
+  eq(history_path.parent(second_id), { 1, 1, 1 }, "parent drops the final component")
+  eq(history_path.prefixes(second_id), { { 1 }, { 1, 1 }, { 1, 1, 1 }, { 1, 1, 1, 1 } },
+    "prefixes represent complete ancestry")
+
+  recorded_append(fact("rewind", "branch", "rewind_committed", {
+    target_history_id = second_id,
+    expected_head = before_rewind.head,
+  }))
+  local rewound = store:get("branch")
+  eq(rewound.head, { 1, 1, 1 }, "head moves to the selected prompt parent")
+  eq(rewound.pending_edit.text, "second\nline", "exact multiline text is retained")
+  rejects(store, fact("stale", "branch", "rewind_committed", {
+    target_history_id = first_id, expected_head = before_rewind.head,
+  }), "stale_rewind_target")
+
+  local sibling_id = message("m3", "user", "replacement")
+  eq(sibling_id, { 1, 1, 1, 2 }, "new submission allocates a sibling component")
+  message("a3", "assistant", "replacement answer")
+  local public = projection.conversation(store:peek("branch"))
+  eq(#public.messages, 5, "inactive sibling messages stay out of active projection")
+  eq(public.messages[4].content, "replacement")
+  eq(public.messages[5].content, "replacement answer")
+  eq(store:get("branch").messages[4].chunks[1].data, "second\nline",
+    "inactive branch remains immutable")
+
+  local replayed = manager.new(); ok(replayed:replay(nefor.json.decode(nefor.json.encode(recorded))))
+  eq(replayed:get("branch"), store:get("branch"), "append-only replay is equivalent")
+  eq(system_id, { 1 }); eq(first_id, { 1, 1 })
+end
+
+-- Completed compactions are checkpoints on one ancestry path only. Rewinding
+-- before a checkpoint bypasses it, and a later sibling checkpoint coexists.
+do
+  local projection = require("libs.conversation-manager.projection")
+  local store = manager.new(); create(store, "compact-branch", "lead")
+  local function message(id, role, text)
+    append(store, fact(id .. ":s", "compact-branch", "message_started", {
+      message_id = id, role = role,
+    }))
+    append(store, fact(id .. ":c", "compact-branch", "content_chunk_appended", {
+      message_id = id, chunk = { kind = "text", data = text },
+    }))
+    append(store, fact(id .. ":d", "compact-branch", "message_completed", { message_id = id }))
+    return store:get("compact-branch").messages[#store:get("compact-branch").messages].history_id
+  end
+  message("system", "system", "rules")
+  local old_prompt = message("old-user", "user", "old")
+  message("old-answer", "assistant", "old answer")
+  append(store, fact("old-compact-request", "compact-branch", "context_compaction_requested", {
+    request_id = "old-compact", history_cutoff = 3, provider = "p",
+  }))
+  append(store, fact("old-compact-done", "compact-branch", "context_compaction_completed", {
+    request_id = "old-compact", checkpoint = { opaque = "old" },
+  }))
+  local old_head = store:get("compact-branch").head
+  append(store, fact("rewind-old", "compact-branch", "rewind_committed", {
+    target_history_id = old_prompt, expected_head = old_head,
+  }))
+  message("new-user", "user", "new")
+  message("new-answer", "assistant", "new answer")
+  local bypassed = projection.context(store:peek("compact-branch"))
+  eq(bypassed.compaction, nil, "branch-incompatible checkpoint is bypassed")
+  eq(#bypassed.messages, 3, "inactive sibling history never reaches provider context")
+
+  append(store, fact("new-compact-request", "compact-branch", "context_compaction_requested", {
+    request_id = "new-compact", history_cutoff = 3, provider = "p",
+  }))
+  append(store, fact("new-compact-done", "compact-branch", "context_compaction_completed", {
+    request_id = "new-compact", checkpoint = { opaque = "new" },
+  }))
+  local current = projection.context(store:peek("compact-branch"))
+  eq(current.compaction.checkpoint.opaque, "new")
+  eq(#store:get("compact-branch").compactions, 2, "branch-local checkpoints coexist")
+end
+
 print("conversation_manager_domain_test: all assertions passed")

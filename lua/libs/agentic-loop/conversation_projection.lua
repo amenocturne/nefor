@@ -34,6 +34,12 @@ function M.new()
     if change.kind == "turn_started" or change.kind == "provenance_updated" then
       for key, value in pairs(change.provenance or {}) do provenance[key] = copy(value) end
     end
+    if change.kind == "rewind_committed" and type(change.context) == "table" then
+      context = copy(change.context)
+      context.messages = context.messages or {}
+      context.tail_messages = context.tail_messages or {}
+      return true
+    end
     if change.kind == "message_completed" or change.kind == "message_interrupted" then
       for _, message in ipairs(change.context_messages or {}) do
         local item = copy(message)

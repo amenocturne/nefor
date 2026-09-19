@@ -177,6 +177,39 @@ function M.build(options)
     })
   end
 
+  local function handle_rewind_request(body)
+    if replay_active() then return end
+    if not nonempty(body.request_id) or not nonempty(body.conversation_id)
+        or type(body.target_history_id) ~= "table" or type(body.expected_head) ~= "table" then
+      send({ kind = "conversation.rewind.rejected", request_id = body.request_id,
+        conversation_id = body.conversation_id, code = "invalid_rewind_request" })
+      return
+    end
+    if body.conversation_id ~= active_conversation_id then
+      send({ kind = "conversation.rewind.rejected", request_id = body.request_id,
+        conversation_id = body.conversation_id, code = "inactive_conversation" })
+      return
+    end
+    local conversation, e, duplicate, event = store:append({
+      event_id = "rewind:" .. body.request_id,
+      conversation_id = body.conversation_id,
+      kind = "rewind_committed",
+      request_id = body.request_id,
+      target_history_id = domain.copy(body.target_history_id),
+      expected_head = domain.copy(body.expected_head),
+    })
+    if not conversation then
+      send({ kind = "conversation.rewind.rejected", request_id = body.request_id,
+        conversation_id = body.conversation_id, code = e.code,
+        context = domain.copy(e.context) })
+      return
+    end
+    publish_recorded(event, duplicate, conversation)
+    send({ kind = "conversation.rewind.committed", request_id = body.request_id,
+      conversation_id = body.conversation_id,
+      sequence = event.sequence, duplicate = duplicate })
+  end
+
   local function handle_compaction_request(body)
     if replay_active() then return end
     if not nonempty(body.request_id) or not nonempty(body.conversation_id) or not nonempty(body.provider) then
@@ -659,6 +692,7 @@ function M.build(options)
     if body.kind == "conversation.list.request" then handle_list(body); return end
     if body.kind == "conversation.context.request" then handle_context(body); return end
     if body.kind == "conversation.active.set" then handle_active_set(body); return end
+    if body.kind == "conversation.rewind.request" then handle_rewind_request(body); return end
     if body.kind == "conversation.context.compact.request" then handle_compaction_request(body); return end
     if body.kind == "conversation.context.compact.complete" then
       handle_compaction_terminal(body, "context_compaction_completed"); return

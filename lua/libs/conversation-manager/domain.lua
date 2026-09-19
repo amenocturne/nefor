@@ -1,5 +1,6 @@
 local M = {}
 local json_data = require("core.json_data")
+local history_path = require("libs.conversation-manager.history_path")
 
 -- Within this domain, the fold is the sole transcript authority: events are
 -- immutable facts, while lookup maps are derived indexes removed from the
@@ -73,7 +74,8 @@ handlers.created = function(conversation, event)
     id = event.conversation_id,
     status = "active",
     provenance = copy(event.provenance or {}),
-    messages = {}, message_by_id = {},
+    messages = {}, message_by_id = {}, history_by_key = {},
+    history_child_max = {}, head = {}, pending_edit = nil,
     exchanges = {}, exchange_by_id = {}, exchange_by_tool_call_id = {},
     retries = {}, retry_by_id = {},
     turns = {}, turn_by_id = {},
@@ -109,8 +111,21 @@ handlers.message_started = function(c, event)
   if event.visibility ~= nil and not visibilities[event.visibility] then
     return err("invalid_visibility", { message_id = event.message_id, visibility = event.visibility })
   end
+  local parent = history_path.copy(c.head)
+  local allocated, allocation_error = history_path.allocate(parent, c.history_child_max)
+  if not allocated then return err(allocation_error, { message_id = event.message_id }) end
+  if event.history_id ~= nil and not equal(event.history_id, allocated) then
+    return err("invalid_history_id", {
+      message_id = event.message_id,
+      expected = allocated,
+      actual = copy(event.history_id),
+    })
+  end
+  event.history_id = allocated
+  local parent_key = history_path.key(parent)
+  c.history_child_max[parent_key] = allocated[#allocated]
   local message = {
-    id = event.message_id, role = event.role, status = "open",
+    id = event.message_id, history_id = copy(allocated), role = event.role, status = "open",
     visibility = event.visibility or "transcript",
     turn_id = event.turn_id, tool_call_id = event.tool_call_id,
     submission_ids = copy(event.submission_ids or {}),
@@ -119,6 +134,11 @@ handlers.message_started = function(c, event)
     chunks = {}, attempts = {}, exchange_ids = {},
   }
   c.messages[#c.messages + 1] = message; c.message_by_id[message.id] = message
+  c.history_by_key[history_path.key(message.history_id)] = message
+  c.head = copy(message.history_id)
+  if message.role == "user" and message.visibility == "transcript" then
+    c.pending_edit = nil
+  end
   c.open_messages = c.open_messages + 1
   if turn then turn.open_messages = turn.open_messages + 1 end
   return c
@@ -342,6 +362,42 @@ handlers.turn_completed = finish_turn("completed")
 handlers.turn_failed = finish_turn("failed")
 handlers.turn_interrupted = finish_turn("interrupted")
 
+handlers.rewind_committed = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  local open_turns = 0
+  for _, turn in ipairs(c.turns) do
+    if turn.status == "open" then open_turns = open_turns + 1 end
+  end
+  if c.open_messages ~= 0 or c.open_exchanges ~= 0 or open_turns ~= 0 then
+    return err("rewind_while_active", {
+      open_messages = c.open_messages,
+      open_exchanges = c.open_exchanges,
+      open_turns = open_turns,
+    })
+  end
+  if not history_path.valid(event.target_history_id) then
+    return err("invalid_rewind_target", { target_history_id = copy(event.target_history_id) })
+  end
+  if not history_path.valid(event.expected_head, true) or not equal(event.expected_head, c.head) then
+    return err("stale_rewind_target", { expected_head = copy(event.expected_head), actual_head = copy(c.head) })
+  end
+  local message = c.history_by_key[history_path.key(event.target_history_id)]
+  if not message or message.role ~= "user" or message.visibility ~= "transcript"
+      or message.status ~= "completed" or not history_path.is_prefix(message.history_id, c.head) then
+    return err("invalid_rewind_target", { target_history_id = copy(event.target_history_id) })
+  end
+  local text = {}
+  for _, chunk in ipairs(message.chunks or {}) do
+    if chunk.kind == "text" and type(chunk.data) == "string" then text[#text + 1] = chunk.data end
+  end
+  c.head = history_path.parent(message.history_id)
+  c.pending_edit = {
+    source_history_id = copy(message.history_id),
+    text = table.concat(text),
+  }
+  return c
+end
+
 handlers.context_compaction_requested = function(c, event)
   local ok, e = require_live(c, event); if not ok then return nil, e end
   ok, e = require_id(event, "request_id"); if not ok then return nil, e end
@@ -356,6 +412,7 @@ handlers.context_compaction_requested = function(c, event)
     request_id = event.request_id,
     status = "pending",
     history_cutoff = event.history_cutoff,
+    history_id = copy(c.head),
     requested_sequence = event.sequence,
     provider = event.provider,
     model = event.model,
@@ -437,7 +494,8 @@ end
 function M.read_model(conversation)
   if not conversation then return nil end
   local out = copy(conversation)
-  out.message_by_id = nil; out.exchange_by_id = nil; out.exchange_by_tool_call_id = nil
+  out.message_by_id = nil; out.history_by_key = nil; out.history_child_max = nil
+  out.exchange_by_id = nil; out.exchange_by_tool_call_id = nil
   out.retry_by_id = nil; out.turn_by_id = nil; out.compaction_by_id = nil
   out.open_messages = nil; out.open_exchanges = nil
   for _, message in ipairs(out.messages) do message.exchange_ids = nil end

@@ -4148,7 +4148,7 @@ fn double_escape_stops_only_the_lead() {
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.run_started", "run_id": "mag-run-1" }),
+        json!({ "kind": "mag.run_started", "run_id": "mag-run-1", "principal": "lead" }),
     );
     dispatch_event(
         &mut engine,
@@ -4182,6 +4182,131 @@ fn double_escape_stops_only_the_lead() {
         second[0].1.get("drop_queued").and_then(|v| v.as_bool()),
         Some(true)
     );
+}
+
+#[test]
+fn idle_double_escape_opens_rewind_picker_and_space_requests_canonical_rewind() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "conversation.active.changed", "conversation_id": "conversation-1" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.snapshot",
+            "conversation_id": "conversation-1",
+            "found": true,
+            "projection": {
+                "id": "conversation-1",
+                "messages": [
+                    { "id": "u1", "history_id": [1], "role": "user", "status": "completed",
+                      "visibility": "transcript", "text": "first prompt", "display_text": "first prompt" },
+                    { "id": "a1", "history_id": [1, 1], "role": "assistant", "status": "completed",
+                      "visibility": "transcript", "text": "answer", "display_text": "answer" },
+                    { "id": "u2", "history_id": [1, 1, 1], "role": "user", "status": "completed",
+                      "visibility": "transcript", "text": "second\nline", "display_text": "second\nline" }
+                ],
+                "exchanges": [], "turns": [], "compactions": [],
+                "history_head": [1, 1, 1]
+            }
+        }),
+    );
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("escape")).expect("first esc");
+    engine.handle_key(key("escape")).expect("second esc");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "idle rewind does not interrupt"
+    );
+    let rendered = render_str(&mut engine);
+    assert!(rendered.contains("rewind to a prompt"));
+    assert!(rendered.contains("first prompt"));
+    assert!(rendered.contains("second line"));
+
+    engine.handle_key(key("escape")).expect("close picker");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "picker Esc has no side effect"
+    );
+    assert!(!render_str(&mut engine).contains("rewind to a prompt"));
+    engine.handle_key(key("escape")).expect("rearm rewind");
+    engine.handle_key(key("escape")).expect("reopen rewind");
+    let _ = engine.take_emit_queue();
+    assert!(render_str(&mut engine).contains("rewind to a prompt"));
+
+    dispatch_event(&mut engine, json!({ "kind": "key.space" }));
+    let emitted = engine.take_emit_queue();
+    let request = emitted
+        .iter()
+        .find_map(|(_, body)| {
+            (body.get("kind").and_then(|v| v.as_str()) == Some("conversation.rewind.request"))
+                .then_some(body)
+        })
+        .expect("rewind request");
+    assert_eq!(
+        request.get("conversation_id"),
+        Some(&json!("conversation-1"))
+    );
+    assert_eq!(request.get("target_history_id"), Some(&json!([1, 1, 1])));
+    assert_eq!(request.get("expected_head"), Some(&json!([1, 1, 1])));
+    assert!(render_str(&mut engine).contains("Rewinding…"));
+
+    engine
+        .handle_key(key("escape"))
+        .expect("pending rewind escape");
+    engine
+        .handle_key(key("escape"))
+        .expect("pending rewind escape again");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "pending rewind cannot issue a competing request or interrupt"
+    );
+    engine
+        .handle_key(key("x"))
+        .expect("draft while rewind pending");
+    engine
+        .handle_key(key("enter"))
+        .expect("submit while rewind pending");
+    assert!(
+        engine.take_emit_queue().iter().all(|(_, body)| body
+            .get("kind")
+            .and_then(|value| value.as_str())
+            != Some("chat.input.submit")),
+        "submission waits until the canonical rewind settles"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.projection.delta",
+            "conversation_id": "conversation-1",
+            "sequence": 9,
+            "change": {
+                "kind": "rewind_committed",
+                "projection": {
+                    "id": "conversation-1",
+                    "messages": [
+                        { "id": "u1", "history_id": [1], "role": "user", "status": "completed",
+                          "visibility": "transcript", "text": "first prompt", "display_text": "first prompt" },
+                        { "id": "a1", "history_id": [1, 1], "role": "assistant", "status": "completed",
+                          "visibility": "transcript", "text": "answer", "display_text": "answer" }
+                    ],
+                    "exchanges": [], "turns": [], "compactions": [],
+                    "history_head": [1, 1],
+                    "pending_edit": { "source_history_id": [1, 1, 1], "text": "second\nline" }
+                },
+                "pending_edit": { "source_history_id": [1, 1, 1], "text": "second\nline" },
+                "history_head": [1, 1]
+            }
+        }),
+    );
+    let rewound = render_str(&mut engine);
+    assert!(rewound.contains("Rewound to before this prompt"));
+    assert!(rewound.contains("second"));
+    assert!(rewound.contains("line"));
 }
 
 #[test]

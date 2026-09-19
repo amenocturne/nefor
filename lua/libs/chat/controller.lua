@@ -339,6 +339,8 @@ local function reset_session_state(state, patch)
     escape_token = NIL_SENTINEL,
     escape_count = NIL_SENTINEL,
     history_cursor = NIL_SENTINEL,
+    pending_rewind = NIL_SENTINEL,
+    rewind_notice = NIL_SENTINEL,
   }, patch or {}))
 end
 
@@ -582,6 +584,10 @@ local function handle_escape(_msg, state)
     end
     return shallow_merge(state, { popup = NIL_SENTINEL, toasts = {} }), {}
   end
+  -- A committed request cannot be cancelled locally. Consume Esc until the
+  -- manager settles it so another gesture cannot issue a competing rewind or
+  -- accidentally enter the lead-interrupt state machine.
+  if state.pending_rewind ~= nil then return state, {} end
   -- 1c) sidebar focused → hand focus back to the prompt. Sits before
   -- the interrupt path deliberately: Esc while navigating the sidebar
   -- is "leave the pane", never "cancel the turn".
@@ -599,8 +605,36 @@ local function handle_escape(_msg, state)
       history_cursor = NIL_SENTINEL,
     }), {}
   end
-  -- 4) The reusable control machine resolves the tokenized Esc gesture.
-  return apply_control_decisions(workflow_controls.escape(state, tui.now_ms()))
+  -- 4) Double Esc rewinds only while the lead is idle. During a lead turn the
+  -- existing control machine keeps its interrupt/terminate semantics.
+  local now_ms = tui.now_ms()
+  local second_escape = state.escape_token ~= nil and state.last_esc_ms ~= nil
+    and state.escape_count == 1
+    and now_ms - state.last_esc_ms <= workflow_controls.ESCAPE_DELAY_MS
+  local lead_active = transcript.lead_unit_open(state)
+  if not lead_active then
+    for _, run in pairs(state.runs or {}) do
+      if run.principal == "lead" and run.completed_at_ms == nil then
+        lead_active = true
+        break
+      end
+    end
+  end
+  if second_escape and not lead_active then
+    local prompts = state.conversation_projection.user_prompts or {}
+    return shallow_merge(state, {
+      popup = {
+        variant = "rewind_picker",
+        prompts = prompts,
+        cursor = math.max(1, #prompts),
+        expected_head = state.conversation_projection.history_head or {},
+      },
+      last_esc_ms = NIL_SENTINEL,
+      escape_token = NIL_SENTINEL,
+      escape_count = NIL_SENTINEL,
+    }), {}
+  end
+  return apply_control_decisions(workflow_controls.escape(state, now_ms))
 end
 
 -- ── session lifecycle ─────────────────────────────────────────────────
@@ -631,6 +665,8 @@ local function handle_session_end(msg, state)
     last_esc_ms = NIL_SENTINEL,
     escape_token = NIL_SENTINEL,
     escape_count = NIL_SENTINEL,
+    pending_rewind = NIL_SENTINEL,
+    rewind_notice = NIL_SENTINEL,
     runs = {},
     node_previews = {}, mag_arrivals = {}, capability_owners = {},
     scope_to_run = {},
@@ -822,6 +858,10 @@ local function handle_chat_submit(msg, state)
   if msg._event_source ~= "startup" then return state, {} end
   local text = msg.text or ""
   if #text == 0 then return state, {} end
+  state = shallow_merge(state, {
+    rewind_notice = NIL_SENTINEL,
+    pending_rewind = NIL_SENTINEL,
+  })
   return queued_input.observe_external_submit(state, text, msg.submission_id), {}
 end
 
@@ -1592,6 +1632,8 @@ local function apply_conversation_action(state, item)
       active_turn_entry_start = NIL_SENTINEL,
       raw_selector = raw_selector.initial(),
       raw_tool_id = NIL_SENTINEL,
+      pending_rewind = NIL_SENTINEL,
+      rewind_notice = NIL_SENTINEL,
     })
   end
   if item.kind == "active_cleared" then
@@ -1607,6 +1649,27 @@ local function apply_conversation_action(state, item)
       entries = {},
       raw_selector = raw_selector.initial(),
       raw_tool_id = NIL_SENTINEL,
+    })
+  end
+  if item.kind == "rewind_cleared" then
+    return shallow_merge(state, {
+      input_value = "",
+      rewind_notice = NIL_SENTINEL,
+      pending_rewind = NIL_SENTINEL,
+    })
+  end
+  if item.kind == "rewind_restored" then
+    local pending = item.pending_edit or {}
+    return shallow_merge(state, {
+      input_value = type(pending.text) == "string" and pending.text or "",
+      pending_rewind = NIL_SENTINEL,
+      rewind_notice = "Rewound to before this prompt — edit and send to continue",
+      pending = false,
+      in_flight = NIL_SENTINEL,
+      active_turn_id = NIL_SENTINEL,
+      active_turn_entry_start = NIL_SENTINEL,
+      queued_entry_id = NIL_SENTINEL,
+      pending_user_echo_id = NIL_SENTINEL,
     })
   end
   if item.kind == "turn_started" then
@@ -1768,6 +1831,24 @@ local function apply_conversation_action(state, item)
   return state
 end
 
+local function handle_rewind_rejected(msg, state)
+  local pending = state.pending_rewind
+  if type(pending) ~= "table" or msg.request_id ~= pending.request_id then
+    return state, {}
+  end
+  return shallow_merge(state, {
+    pending_rewind = NIL_SENTINEL,
+    rewind_notice = NIL_SENTINEL,
+    popup = {
+      variant = "warning",
+      title = "Rewind unavailable",
+      body = msg.code == "stale_rewind_target"
+          and "The conversation changed before this rewind could be applied."
+        or "The selected prompt can no longer be rewound.",
+    },
+  }), {}
+end
+
 local function handle_conversation_event(msg, state)
   if msg.session_id ~= nil and state.session_id ~= nil
       and msg.session_id ~= state.session_id then return state, {} end
@@ -1812,6 +1893,7 @@ local default_handlers = {
   ["conversation.active.changed"] = handle_conversation_event,
   ["conversation.projection.delta"] = handle_conversation_event,
   ["conversation.snapshot"]       = handle_conversation_event,
+  ["conversation.rewind.rejected"] = handle_rewind_rejected,
   ["conversation.provider.context_usage"] = handle_context_usage,
   ["conversation.usage.snapshot"] = handle_usage_values,
   ["conversation.usage.update"]   = handle_usage_values,
@@ -1901,6 +1983,41 @@ local function route_keys_and_popups(msg, state)
     if kind == "key.d" or kind == "key.D" then
       return resolve_permission(state, false)
     end
+  end
+
+  -- Rewind picker. Space is the only commit key; Esc is handled before this
+  -- router and closes the popup without changing canonical history.
+  if state.popup and state.popup.variant == "rewind_picker"
+      and kind:sub(1, 4) == "key." then
+    local p = state.popup
+    local rows = p.prompts or {}
+    if kind == "key.space" then
+      local selected = rows[p.cursor or #rows]
+      if selected == nil then return state, {} end
+      local request_id = "chat-rewind-" .. require("core.envelope").uuid_lite()
+      return shallow_merge(state, {
+        popup = NIL_SENTINEL,
+        pending_rewind = { request_id = request_id, conversation_id = state.conversation_id },
+        rewind_notice = "Rewinding…",
+      }), {
+        { kind = "send_to", target = "engine", body = {
+          kind = "conversation.rewind.request",
+          request_id = request_id,
+          conversation_id = state.conversation_id,
+          target_history_id = selected.history_id,
+          expected_head = p.expected_head or {},
+        } },
+      }
+    end
+    local result = W.picker.handle({
+      state = { cursor = p.cursor or math.max(1, #rows) },
+      entries = function() return rows end,
+      show_search = false,
+    }, msg)
+    if result ~= nil then
+      return shallow_merge(state, { popup = shallow_merge(p, result.state) }), {}
+    end
+    return state, {}
   end
 
   -- Model picker popup.
