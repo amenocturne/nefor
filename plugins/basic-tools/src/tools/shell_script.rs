@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::ToolError;
-use crate::tools::process::{self, Request, StreamChunk};
+use crate::tools::process::{self, LivePreview, Request};
 
 pub const NAME: &str = "shell.script";
 pub const DESCRIPTION: &str = "Execute a script through /bin/sh -c.";
@@ -43,7 +45,7 @@ pub async fn run(args: &Value) -> Result<Value, ToolError> {
 pub async fn run_cancellable_streaming(
     args: &Value,
     cancel: Option<oneshot::Receiver<()>>,
-    stream: Option<mpsc::UnboundedSender<StreamChunk>>,
+    preview: Option<Arc<LivePreview>>,
 ) -> Result<Value, ToolError> {
     let object = args
         .as_object()
@@ -64,7 +66,7 @@ pub async fn run_cancellable_streaming(
             stdin,
         },
         cancel,
-        stream,
+        preview,
     )
     .await
 }

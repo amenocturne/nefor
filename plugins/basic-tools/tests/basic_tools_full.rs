@@ -55,7 +55,7 @@ mod tools {
             #[tokio::test]
             async fn forwards_stdin() {
                 let result = run(&json!({
-                    "argv": ["/bin/cat"], "cwd": "/", "timeout": unbounded(), "stdin": "hello"
+                    "argv": ["cat"], "cwd": "/", "timeout": unbounded(), "stdin": "hello"
                 }))
                 .await
                 .unwrap();
@@ -102,19 +102,41 @@ mod tools {
 
             #[tokio::test]
             async fn streams_stdout_and_stderr_independently() {
-                let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+                let preview = std::sync::Arc::new(process::LivePreview::default());
                 let _ = run_cancellable_streaming(
                     &json!({ "argv": ["/bin/sh", "-c", "printf out; printf err >&2"], "cwd": "/", "timeout": unbounded() }),
                     None,
-                    Some(stream_tx),
+                    Some(preview.clone()),
                 ).await.unwrap();
-                let chunks = std::iter::from_fn(|| stream_rx.try_recv().ok()).collect::<Vec<_>>();
-                assert!(chunks
-                    .iter()
-                    .any(|chunk| matches!(chunk, StreamChunk::Stdout(bytes) if bytes == b"out")));
-                assert!(chunks
-                    .iter()
-                    .any(|chunk| matches!(chunk, StreamChunk::Stderr(bytes) if bytes == b"err")));
+                assert_eq!(
+                    preview.take(),
+                    vec![
+                        process::StreamChunk::Stdout(b"out".to_vec()),
+                        process::StreamChunk::Stderr(b"err".to_vec()),
+                    ]
+                );
+                assert!(preview.take().is_empty(), "a drain forwards each byte once");
+            }
+
+            #[tokio::test]
+            async fn undrained_preview_keeps_only_the_latest_window() {
+                let preview = std::sync::Arc::new(process::LivePreview::default());
+                let _ = run_cancellable_streaming(
+                    &json!({ "argv": ["/bin/sh", "-c", "head -c 1048576 /dev/zero | tr '\\0' a; printf END"], "cwd": "/", "timeout": unbounded() }),
+                    None,
+                    Some(preview.clone()),
+                ).await.unwrap();
+                let chunks = preview.take();
+                let [process::StreamChunk::Stdout(bytes)] = chunks.as_slice() else {
+                    panic!("expected one stdout chunk, got {chunks:?}");
+                };
+                let text = String::from_utf8(bytes.clone()).unwrap();
+                let skipped = 1_048_576 + 3 - process::PREVIEW_WINDOW_BYTES;
+                assert!(text.starts_with(&format!(
+                    "[... {skipped} bytes skipped in live output ...]\n"
+                )));
+                assert!(text.ends_with("aaaEND"));
+                assert!(text.len() < process::PREVIEW_WINDOW_BYTES + 64);
             }
 
             #[tokio::test]
@@ -145,26 +167,11 @@ mod tools {
                 .await
                 .unwrap();
                 let frame = serde_json::to_string(&result).unwrap();
-                assert!(frame.len() < 16 * 1024 * 1024, "frame is {} bytes", frame.len());
-            }
-
-            // Emulator logcat can emit gigabytes; retention must stay flat regardless.
-            #[tokio::test]
-            #[ignore = "streams 10 GiB through a pipe"]
-            async fn ten_gib_output_fits_one_ncp_frame() {
-                let result = run(&json!({
-                    "argv": ["/bin/sh", "-c", "head -c 10737418240 /dev/zero | tr '\\0' a"],
-                    "cwd": "/",
-                    "timeout": unbounded()
-                }))
-                .await
-                .unwrap();
-                let frame = serde_json::to_string(&result).unwrap();
-                assert!(frame.len() < 16 * 1024 * 1024, "frame is {} bytes", frame.len());
-                assert!(frame.contains(&format!(
-                    "[... {} bytes of output omitted ...]",
-                    10_737_418_240_usize - 2 * process::RETAINED_EDGE_BYTES
-                )));
+                assert!(
+                    frame.len() < 16 * 1024 * 1024,
+                    "frame is {} bytes",
+                    frame.len()
+                );
             }
         }
     }
@@ -283,6 +290,66 @@ mod tests {
             .is_some_and(|s| s.contains("SLOW_DONE")));
         slow_task.await.unwrap();
         fast_task.await.unwrap();
+    }
+
+    // Logcat-scale output must reach the bus as a paced preview, not one event
+    // per pipe read.
+    #[tokio::test]
+    async fn flooding_process_streams_at_the_flush_cadence() {
+        let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(8);
+        let flood = json!({
+            "kind": "basic-tools.tool.invoke",
+            "id": "flood",
+            "name": "shell.script",
+            "args": {
+                "script": "head -c 536870912 /dev/zero | tr '\\0' a | tee /dev/stderr; printf END",
+                "cwd": ".",
+                "timeout": { "present": false, "milliseconds": 0 }
+            }
+        })
+        .as_object()
+        .expect("obj")
+        .clone();
+
+        let started = std::time::Instant::now();
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let task = spawn_tool_invoke(&out_tx, &flood, &cancels);
+        let mut stream_events = 0_u128;
+        let mut last_stdout = String::new();
+        let result = loop {
+            let msg = timeout(Duration::from_secs(60), out_rx.recv())
+                .await
+                .expect("timed out waiting for tool.result")
+                .expect("event");
+            let Body::Event(body) = msg.body else {
+                continue;
+            };
+            match body.get("kind").and_then(Value::as_str) {
+                Some("tool.stream") => {
+                    stream_events += 1;
+                    if body.get("stream").and_then(Value::as_str) == Some("stdout") {
+                        last_stdout = body["text"].as_str().expect("text").to_owned();
+                    }
+                }
+                Some("tool.result") => break body,
+                _ => {}
+            }
+        };
+        let elapsed = started.elapsed().as_millis();
+        task.await.unwrap();
+
+        let ticks = elapsed / PREVIEW_FLUSH_INTERVAL.as_millis() + 2;
+        assert!(
+            stream_events <= 2 * ticks,
+            "{stream_events} stream events in {elapsed} ms exceeds two per tick"
+        );
+        assert!(
+            last_stdout.ends_with("aaaEND"),
+            "final flush carries the tail"
+        );
+        assert!(result["output"]["stdout"]
+            .as_str()
+            .is_some_and(|s| s.ends_with("aaaEND")));
     }
 
     async fn recv_result_body(rx: &mut mpsc::Receiver<PluginOutgoing>) -> Map<String, Value> {

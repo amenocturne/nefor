@@ -1,12 +1,13 @@
 // Canonical child-process execution for the structured and shell capabilities.
 
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::ToolError;
 
@@ -84,7 +85,7 @@ pub fn parse_common(
 pub async fn execute(
     request: Request,
     cancel: Option<oneshot::Receiver<()>>,
-    stream: Option<mpsc::UnboundedSender<StreamChunk>>,
+    preview: Option<Arc<LivePreview>>,
 ) -> Result<Value, ToolError> {
     let executable = request
         .argv
@@ -120,8 +121,8 @@ pub async fn execute(
         message: "spawned process did not provide its configured stderr pipe".into(),
     })?;
 
-    let stdout_task = tokio::spawn(read_pipe(stdout, stream.clone(), StreamKind::Stdout));
-    let stderr_task = tokio::spawn(read_pipe(stderr, stream, StreamKind::Stderr));
+    let stdout_task = tokio::spawn(read_pipe(stdout, preview.clone(), StreamKind::Stdout));
+    let stderr_task = tokio::spawn(read_pipe(stderr, preview, StreamKind::Stderr));
     let stdin_task = tokio::spawn(feed_stdin(stdin, request.stdin));
 
     let outcome = wait_for_outcome(&mut child, request.timeout, cancel).await;
@@ -205,7 +206,7 @@ enum StreamKind {
 
 async fn read_pipe<R>(
     mut reader: R,
-    stream: Option<mpsc::UnboundedSender<StreamChunk>>,
+    preview: Option<Arc<LivePreview>>,
     kind: StreamKind,
 ) -> Result<Vec<u8>, std::io::Error>
 where
@@ -218,16 +219,88 @@ where
         if size == 0 {
             return Ok(retained.into_bytes());
         }
-        let bytes = chunk[..size].to_vec();
-        retained.push(&bytes);
-        if let Some(sender) = &stream {
-            let event = match kind {
-                StreamKind::Stdout => StreamChunk::Stdout(bytes),
-                StreamKind::Stderr => StreamChunk::Stderr(bytes),
-            };
-            let _ = sender.send(event);
+        let bytes = &chunk[..size];
+        retained.push(bytes);
+        if let Some(preview) = &preview {
+            preview.push(kind, bytes);
         }
     }
+}
+
+/// Unforwarded live output kept per stream between preview drains; older
+/// bytes are skipped and reported by count.
+pub const PREVIEW_WINDOW_BYTES: usize = 16 * 1024;
+
+/// Live process output that a consumer drains on its own schedule. The child
+/// never waits on it, and its memory stays bounded however fast the child
+/// writes.
+#[derive(Default)]
+pub struct LivePreview {
+    stdout: Mutex<PreviewBuffer>,
+    stderr: Mutex<PreviewBuffer>,
+}
+
+impl LivePreview {
+    fn push(&self, kind: StreamKind, bytes: &[u8]) {
+        lock(self.buffer(kind)).push(bytes);
+    }
+
+    /// Output written since the previous call, at most one chunk per stream.
+    pub fn take(&self) -> Vec<StreamChunk> {
+        let stdout = lock(&self.stdout).take().map(StreamChunk::Stdout);
+        let stderr = lock(&self.stderr).take().map(StreamChunk::Stderr);
+        stdout.into_iter().chain(stderr).collect()
+    }
+
+    fn buffer(&self, kind: StreamKind) -> &Mutex<PreviewBuffer> {
+        match kind {
+            StreamKind::Stdout => &self.stdout,
+            StreamKind::Stderr => &self.stderr,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PreviewBuffer {
+    pending: Vec<u8>,
+    skipped: u64,
+}
+
+impl PreviewBuffer {
+    fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        // Trim lazily so the buffer is compacted once per window of input.
+        if self.pending.len() > 2 * PREVIEW_WINDOW_BYTES {
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.pending.len() > PREVIEW_WINDOW_BYTES {
+            let excess = self.pending.len() - PREVIEW_WINDOW_BYTES;
+            self.pending.drain(..excess);
+            self.skipped += excess as u64;
+        }
+    }
+
+    fn take(&mut self) -> Option<Vec<u8>> {
+        self.trim();
+        if self.pending.is_empty() && self.skipped == 0 {
+            return None;
+        }
+        let mut bytes = if self.skipped > 0 {
+            format!("[... {} bytes skipped in live output ...]\n", self.skipped).into_bytes()
+        } else {
+            Vec::new()
+        };
+        bytes.append(&mut self.pending);
+        self.skipped = 0;
+        Some(bytes)
+    }
+}
+
+fn lock(buffer: &Mutex<PreviewBuffer>) -> MutexGuard<'_, PreviewBuffer> {
+    buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Bytes of each stream kept from the start and from the end of the output.
