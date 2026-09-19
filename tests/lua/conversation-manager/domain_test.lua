@@ -85,6 +85,29 @@ do
   eq(value, nil); eq(e.code, "event_id_conflict")
 end
 
+-- Producer-owned presentation is durable metadata beside, not instead of,
+-- the typed canonical content used to reconstruct model context.
+do
+  local projection = require("libs.conversation-manager.projection")
+  local store = manager.new(); create(store, "display", "lead")
+  append(store, fact("m", "display", "message_started", {
+    message_id = "user", role = "user", display_text = "resume me",
+  }))
+  local envelope = {
+    mag_type = { version = 2, root = { kind = "named", name = "main.LeadInput" } },
+    value = { prompt = "resume me" },
+  }
+  append(store, fact("chunk", "display", "content_chunk_appended", {
+    message_id = "user", chunk = { kind = "structured", data = envelope },
+  }))
+  append(store, fact("done", "display", "message_completed", { message_id = "user" }))
+
+  local resumed = projection.conversation(store:peek("display")).messages[1]
+  eq(resumed.display_text, "resume me", "resume projection retains explicit presentation")
+  eq(resumed.structured[1], envelope, "resume projection retains the typed envelope")
+  eq(resumed.content, envelope, "provider content remains the typed value")
+end
+
 -- Tool errors are the other exactly-once terminal exchange outcome.
 do
   local store = manager.new(); create(store, "error-chat", "agent")
@@ -150,6 +173,7 @@ local invalid_cases = {
   { "created twice", function(s) create(s, "c", "lead") end, fact("e", "c", "created"), "created_more_than_once" },
   { "unknown kind", function(s) create(s, "c", "lead") end, fact("e", "c", "wat"), "unknown_event_kind" },
   { "bad role", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "robot" }), "invalid_role" },
+  { "bad display text", function(s) create(s, "c", "lead") end, fact("e", "c", "message_started", { message_id = "m", role = "user", display_text = { "not", "text" } }), "invalid_display_text" },
   { "missing message", function(s) create(s, "c", "lead") end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "text", data = "x" } }), "message_not_found" },
   { "bad chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "user" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "image" } }), "invalid_content_chunk" },
   { "tool call through generic chunk", function(s) create(s, "c", "lead"); append(s, fact("m", "c", "message_started", { message_id = "m", role = "assistant" })) end, fact("e", "c", "content_chunk_appended", { message_id = "m", chunk = { kind = "tool_call", data = "{}" } }), "invalid_content_chunk" },

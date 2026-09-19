@@ -124,12 +124,16 @@ handlers.message_started = function(c, event)
   event.history_id = allocated
   local parent_key = history_path.key(parent)
   c.history_child_max[parent_key] = allocated[#allocated]
+  if event.display_text ~= nil and type(event.display_text) ~= "string" then
+    return err("invalid_display_text", { message_id = event.message_id })
+  end
   local message = {
     id = event.message_id, history_id = copy(allocated), role = event.role, status = "open",
     visibility = event.visibility or "transcript",
     turn_id = event.turn_id, tool_call_id = event.tool_call_id,
     submission_ids = copy(event.submission_ids or {}),
     input_cause = event.input_cause,
+    display_text = event.display_text,
     tool_name = event.tool_name or (tool_exchange and tool_exchange.tool_name),
     chunks = {}, attempts = {}, exchange_ids = {},
   }

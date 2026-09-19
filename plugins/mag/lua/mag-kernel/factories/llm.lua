@@ -26,6 +26,7 @@ M.declaration = {
     output_type = "string", error_type = "string", provider_error_type = "string",
     conversation_id = "string?",
     turn_id = "string?", submission_ids = "table?", input_cause = "string?",
+    display_text = "string?",
   },
   template = { relocations = {} },
   inputs = { provider_input = "generic-provider.ProviderOut" },

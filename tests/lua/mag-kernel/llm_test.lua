@@ -95,6 +95,7 @@ local function conversation_messages(facts)
         structured = {},
         tool_call_id = fact.tool_call_id,
         name = fact.name,
+        display_text = fact.display_text,
         tool_calls = {},
         completed = false,
       }
@@ -192,6 +193,33 @@ do
   for _, s in ipairs(reg:declaration("llm").signals) do sigs[s] = true end
   assert_true(sigs.kill and sigs.drain and sigs.steer,
     "declares the kill, drain, and steer signals")
+end
+
+-- The first user activation keeps its typed value for model context while
+-- carrying an explicit producer-owned presentation for transcript replay.
+do
+  local envelope = {
+    mag_type = { version = 2, root = { kind = "named", name = "main.LeadInput" } },
+    value = { prompt = "resume me" },
+  }
+  local instance, _, facts = make("display.llm", {
+    provider = "p", display_text = "resume me",
+  })
+  instance.deliver(turn({ messages = { { role = "user", content = envelope } } }))
+
+  local started, chunk
+  for _, fact in ipairs(facts) do
+    if fact.kind == "message_started" and fact.role == "user" then started = fact end
+    if fact.kind == "content_chunk_appended" and fact.chunk.kind == "structured" then
+      chunk = fact.chunk
+    end
+  end
+  assert_eq(started.display_text, "resume me",
+    "canonical user fact carries the original human-readable prompt")
+  assert_eq(chunk.data.value.prompt, "resume me",
+    "canonical content keeps the typed MAG value")
+  assert_eq(chunk.data.mag_type.root.name, "main.LeadInput",
+    "canonical content keeps the typed MAG descriptor")
 end
 
 -- ==================================================================

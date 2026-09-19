@@ -52,7 +52,7 @@ local function record_message(state, message)
   state.messages[message.id] = {
     role = message.role,
     turn_id = message.turn_id,
-    display_text = previous.display_text,
+    display_text = message.display_text or previous.display_text,
     visibility = message.visibility or previous.visibility or "transcript",
     streamed = previous.streamed == true,
   }
@@ -304,7 +304,7 @@ function M.reduce(previous, body)
     if hidden(message) then
       -- Model context only; no delta reaches the transcript.
     elseif message and message.role == "user" and type(chunk) == "table"
-        and chunk.kind == "structured" then
+        and chunk.kind == "structured" and message.display_text == nil then
       message.display_text = display.structured_text(chunk.data)
     elseif message and message.role == "assistant" and type(chunk) == "table"
         and type(chunk.data) == "string" and chunk.data ~= "" then

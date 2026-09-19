@@ -41,7 +41,7 @@ local function projected_message(conversation, message, include_provider_context
     end
   end
   local content = table.concat(text)
-  local display_text = content
+  local display_text = message.display_text or content
   if display_text == "" and #structured == 1 then
     display_text = display.structured_text(structured[1]) or ""
   end

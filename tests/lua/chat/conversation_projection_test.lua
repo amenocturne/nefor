@@ -174,9 +174,10 @@ local task_data = { value = { prompt = "session-derived prompt" },
   } } }
 actions = structured_user_actions(task_data, {
   id = "structured-user", turn_id = "structured-turn", role = "user", text = "",
+  display_text = "session-derived prompt",
 })
-eq(actions[1].text, [[{"prompt":"session-derived prompt"}]],
-  "live structured records use generic value display")
+eq(actions[1].text, "session-derived prompt",
+  "live structured records prefer their producer-owned display text")
 eq(actions[1].message_id, "structured-user", "live structured display preserves message identity")
 
 actions = structured_user_actions({ value = { prompt = "not a task" },

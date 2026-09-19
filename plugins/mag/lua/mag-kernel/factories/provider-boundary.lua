@@ -182,6 +182,8 @@ function M.construct(id, params, emit, options)
   params.submission_ids = nil
   local input_cause = params.input_cause
   params.input_cause = nil
+  local display_text = params.display_text
+  params.display_text = nil
   local submission_identity_recorded = false
 
   local function start_firing()
@@ -437,6 +439,7 @@ function M.construct(id, params, emit, options)
       if not submission_identity_recorded and message.role == "user" then
         message.submission_ids = submission_ids
         message.input_cause = input_cause
+        message.display_text = display_text
         submission_identity_recorded = true
       end
       state:append(message)

@@ -211,6 +211,7 @@ function M.new(options)
       name = message.name,
       submission_ids = message.submission_ids,
       input_cause = message.input_cause,
+      display_text = message.display_text,
       visibility = visibility_of(message),
     })
     local chunk = content_chunk(message.content)
