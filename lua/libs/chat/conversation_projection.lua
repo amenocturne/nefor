@@ -96,9 +96,6 @@ local function remember_user_prompt(state, message)
   if type(message.history_id) ~= "table" or message.status ~= "completed"
       or (message.visibility or "transcript") ~= "transcript" then return end
   local text = authored_prompt.text(message)
-  if text == nil and type(message.text) == "string" and message.text ~= "" then
-    text = message.text
-  end
   if text == nil then return end
   state.user_prompts[#state.user_prompts + 1] = {
     history_id = message.history_id,

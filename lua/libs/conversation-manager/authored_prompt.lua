@@ -2,12 +2,21 @@ local display = require("libs.conversation-manager.display")
 
 local M = {}
 
--- A prompt is authored only when its producer explicitly records the text.
--- Structured values without this evidence remain ordinary structured values.
+-- This is the single interpretation boundary for human-authored prompts.
+-- Explicit presentation metadata wins over ordinary text chunks; structured
+-- values alone never become prompts merely because they contain likely fields.
 function M.text(message)
-  if type(message) ~= "table" or message.role ~= "user"
-      or type(message.authored_prompt) ~= "string" then return nil end
-  return message.authored_prompt
+  if type(message) ~= "table" or message.role ~= "user" then return nil end
+  if type(message.authored_prompt) == "string" then return message.authored_prompt end
+  if type(message.text) == "string" and message.text ~= "" then return message.text end
+  local chunks = {}
+  for _, chunk in ipairs(message.chunks or {}) do
+    if chunk.kind == "text" and type(chunk.data) == "string" then
+      chunks[#chunks + 1] = chunk.data
+    end
+  end
+  if #chunks > 0 then return table.concat(chunks) end
+  return nil
 end
 
 function M.provider_content(message, canonical_content)

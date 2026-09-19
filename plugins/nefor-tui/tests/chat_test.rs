@@ -3015,7 +3015,9 @@ fn resumed_snapshot_renders_structured_first_task_once_before_assistant() {
                         } }
                       }] },
                     { "id": "assistant", "turn_id": "turn", "role": "assistant",
-                      "text": "assistant output", "terminal": {} }
+                      "text": "assistant output", "terminal": {
+                        "duration_ms": 100, "usage": { "output_tokens": 5 }
+                      } }
                 ],
                 "exchanges": [],
                 "turns": [{ "id": "turn", "run_id": "run", "status": "completed",
@@ -3037,9 +3039,9 @@ fn resumed_snapshot_renders_structured_first_task_once_before_assistant() {
         "first user prompt must precede assistant output:\n{out}"
     );
     assert_eq!(
-        out.matches("▣ test").count(),
+        out.matches("▣ test · 100ms · 50 tok/s").count(),
         1,
-        "snapshot reconstruction must attach one footer to the canonical assistant:\n{out}"
+        "snapshot reconstruction must merge message and turn metadata into one canonical footer:\n{out}"
     );
 }
 

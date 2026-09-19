@@ -116,6 +116,21 @@ do
   }))
   eq(store:peek("display").pending_edit.text, prompt,
     "rewind restores the exact multiline authored prompt")
+
+  local generic = manager.new(); create(generic, "generic-structured", "lead")
+  append(generic, fact("generic-start", "generic-structured", "message_started", {
+    message_id = "generic-user", role = "user",
+  }))
+  append(generic, fact("generic-chunk", "generic-structured", "content_chunk_appended", {
+    message_id = "generic-user", chunk = { kind = "structured", data = { prompt = "not authored" } },
+  }))
+  local completed = append(generic, fact("generic-done", "generic-structured", "message_completed", {
+    message_id = "generic-user",
+  }))
+  rejects(generic, fact("generic-rewind", "generic-structured", "rewind_committed", {
+    target_history_id = completed.messages[1].history_id,
+    expected_head = completed.head,
+  }), "invalid_rewind_target")
 end
 
 -- Tool errors are the other exactly-once terminal exchange outcome.

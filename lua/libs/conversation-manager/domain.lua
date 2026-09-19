@@ -395,12 +395,8 @@ handlers.rewind_committed = function(c, event)
     return err("invalid_rewind_target", { target_history_id = copy(event.target_history_id) })
   end
   local prompt = authored_prompt.text(message)
-  local text = {}
   if prompt == nil then
-    for _, chunk in ipairs(message.chunks or {}) do
-      if chunk.kind == "text" and type(chunk.data) == "string" then text[#text + 1] = chunk.data end
-    end
-    prompt = table.concat(text)
+    return err("invalid_rewind_target", { target_history_id = copy(event.target_history_id) })
   end
   c.head = history_path.parent(message.history_id)
   c.pending_edit = {
