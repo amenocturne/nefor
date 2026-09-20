@@ -96,12 +96,22 @@ local overlap = { runs = {} }
 overlap = run_panel.mag_run_started(overlap, "run", "workflow", "lead", 0)
 overlap = run_panel.actor_spawned(overlap, "run", "worker.llm", "llm", 0)
 overlap = run_panel.actor_spawned(overlap, "run", "worker.run-tool", "tool", 0)
+local fallback_overlap = overlap
 overlap = run_panel.actor_busy(overlap, "run", "worker.llm", 1000)
 overlap = run_panel.actor_busy(overlap, "run", "worker.run-tool", 1200)
 overlap = run_panel.actor_idle(overlap, "run", "worker.llm", 1500)
 overlap = run_panel.actor_idle(overlap, "run", "worker.run-tool", 1700)
 group = run_panel.build_nodes(overlap.runs.run)[1]
-eq(group.active_ms, 700, "overlapping yellow members count as one logical interval")
+eq(group.active_ms, 500, "opaque actor fallback keeps its own interval")
+eq(run_panel.build_nodes(overlap.runs.run)[2].active_ms, 500, "second fallback actor keeps its own interval")
+overlap = run_panel.nodes_declared(fallback_overlap, "run", {
+  { path = { "worker" }, members = { "worker.llm", "worker.run-tool" } },
+})
+overlap = run_panel.actor_busy(overlap, "run", "worker.llm", 1000)
+overlap = run_panel.actor_busy(overlap, "run", "worker.run-tool", 1200)
+overlap = run_panel.actor_idle(overlap, "run", "worker.llm", 1500)
+overlap = run_panel.actor_idle(overlap, "run", "worker.run-tool", 1700)
+eq(run_panel.build_nodes(overlap.runs.run)[1].active_ms, 700, "declared overlapping members count as one logical interval")
 
 local hierarchy = { runs = {}, sidebar_folds = {} }
 hierarchy = run_panel.mag_run_started(hierarchy, "nested", "workflow", "lead", 0)

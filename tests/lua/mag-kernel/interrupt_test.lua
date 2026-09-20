@@ -16,6 +16,7 @@
 local inventory = require("inventory")
 local Registry  = require("registry")
 local routing   = require("routing")
+local Topology  = require("topology")
 local run_tool  = require("factories.run-tool")
 local tool_res  = require("factories.tool-result")
 
@@ -43,12 +44,12 @@ local function find_kind(msgs, kind)
   return nil
 end
 
-local function count_kind(msgs, kind)
-  local n = 0
-  for _, m in ipairs(msgs) do
-    if m.kind == kind then n = n + 1 end
-  end
-  return n
+local function endpoint(id) return {constructor="ActorEndpoint",value={id=id}} end
+local function port(id, wire, descriptor)
+  return {endpoint=endpoint(id),wire=wire,type=descriptor,type_id=nefor.semantic_type.id(descriptor)}
+end
+local function route(id, from, to)
+  return {id=id,from=from,to=to,transforms={}}
 end
 
 -- A run-scoped router with the REAL factories, wired the way init.lua wires a
@@ -87,6 +88,7 @@ local function harness()
 
   local inv = inventory.new({ log = log, registry = reg })
   local seq = 0
+  local topo
   local router = routing.new({
     inventory = inv,
     registry = reg,
@@ -94,6 +96,14 @@ local function harness()
     bus_emit = function(env) bus[#bus + 1] = env end,
     events = function(e) events[#events + 1] = e end,
     gen_id = function() seq = seq + 1; return "r1/cap-" .. seq end,
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end,
+  })
+  topo = Topology.new({
+    inventory = inv,
+    semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() return true end,
   })
   inv.set_on_kill(function(id)
     router:dispatch_kill(id)
@@ -103,21 +113,34 @@ local function harness()
     return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
   end)
 
-  -- run-tool --ToolHandle--> tool-result --ProviderInput--> capture-sink.
-  local res = inv.apply({
+  -- run-tool --ToolHandle--> tool-result --ProviderInput--> the explicit
+  -- fixture consumer. Routes are v4 top-level typed edges, not actor.routes.
+  local function named(name)
+    local arguments = nefor.json.mark_array and nefor.json.mark_array({}) or {}
+    return {kind="named",name=name,arguments=arguments}
+  end
+  local tool_calls = named("nefor.contracts.ToolCalls")
+  local tool_handle = named("nefor.contracts.ToolHandle")
+  local provider_input = named("nefor.contracts.ProviderInput")
+  local rt_in = port("rt","generic-tool.ToolCalls",tool_calls)
+  local rt_out = port("rt","generic-tool.ToolHandle",tool_handle)
+  local tr_in = port("tr","generic-tool.ToolHandle",tool_handle)
+  local tr_out = port("tr","generic-provider.ProviderOut",provider_input)
+  local cap_in = port("cap","generic-provider.ProviderOut",provider_input)
+  local modification = {
     actors = {
-      { id = "rt", factory = "run-tool", type_arguments = {}, params = {tool_approval_policy = {rules = {}}},
-        evidence={version=2,identity="nefor.factory.run-tool",arguments={},input={kind="named",name="nefor.contracts.ToolCalls",arguments={}},output={kind="named",name="nefor.contracts.ToolHandle",arguments={}}},
-        input={type={kind="named",name="nefor.contracts.ToolCalls",arguments={}},wire="generic-tool.ToolCalls"},outputs={{type={kind="named",name="nefor.contracts.ToolHandle",arguments={}},wire="generic-tool.ToolHandle"}},
-        routes = { ["generic-tool.ToolHandle"] = { { actor = "tr", wire = "generic-tool.ToolHandle" } } } },
-      { id = "tr", factory = "tool-result", type_arguments = {}, params = {},
-        evidence={version=2,identity="nefor.factory.tool-result",arguments={},input={kind="named",name="nefor.contracts.ToolHandle",arguments={}},output={kind="named",name="nefor.contracts.ProviderInput",arguments={}}},
-        input={type={kind="named",name="nefor.contracts.ToolHandle",arguments={}},wire="generic-tool.ToolHandle"},outputs={{type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"}},
-        routes = { ["generic-provider.ProviderOut"] = { { actor = "cap", wire = "generic-provider.ProviderOut" } } } },
-      { id = "cap", factory = "capture-sink", type_arguments = {}, params = {}, routes = {},
-        input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},outputs={} },
+      {id="rt",factory="run-tool",type_arguments={},params={tool_approval_policy={rules={}}},input=rt_in,outputs={rt_out}},
+      {id="tr",factory="tool-result",type_arguments={},params={},input=tr_in,outputs={tr_out}},
+      {id="cap",factory="capture-sink",type_arguments={},params={},input=cap_in,outputs={}},
     },
-  })
+    routes = {route("rt-tr",rt_out,tr_in),route("tr-cap",tr_out,cap_in)},
+    messages = {}, nodes = {}, kills = {},
+  }
+  local state, topology_error = topo:preflight(modification)
+  assert_true(state ~= nil, "typed topology preflights: " .. tostring(topology_error))
+  topo:install(modification, state)
+  local actor_modification = {actors=modification.actors,messages={},kills={}}
+  local res = inv.apply(actor_modification)
   assert_true(res.ok, "constellation applies: " .. tostring(res.error))
 
   return {

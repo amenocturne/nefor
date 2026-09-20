@@ -435,6 +435,16 @@ nefor.artifact.compile_graph(contextual)
                     serde_json::json!({"constructor":"Left","value":7}),
                 ),
                 (
+                    "operator-fanout",
+                    r#"let operation = nefor.node.`>>>`(nefor.graph.source("source", 7), nefor.node.`&&&`(nefor.graph.identity<Int>("left"), nefor.graph.identity<Int>("right")))"#,
+                    serde_json::json!([7, 7]),
+                ),
+                (
+                    "operator-empty-sequence",
+                    r#"let operation = nefor.node.sequence<Unit, Int>([])"#,
+                    serde_json::json!([]),
+                ),
+                (
                     "operator-sequence",
                     r#"let operation = nefor.node.`>>>`(nefor.graph.source("source", 7), nefor.node.sequence([nefor.graph.identity<Int>("first"), nefor.graph.identity<Int>("second")]))"#,
                     serde_json::json!([7, 7]),
@@ -447,19 +457,26 @@ nefor.artifact.compile_graph(contextual)
                 );
                 let modification = compile_mag_source(&host, name, &source);
                 assert!(modification.get("junctions").is_none(), "{name}");
+                let actor_free = name == "operator-empty-sequence";
                 assert_eq!(
                     modification["actors"].as_array().unwrap().len(),
-                    1,
+                    usize::from(!actor_free),
                     "{name}"
                 );
-                assert_eq!(modification["actors"][0]["id"], "source", "{name}");
-                assert_eq!(modification["nodes"].as_array().unwrap().len(), 1, "{name}");
                 assert_eq!(
-                    modification["nodes"][0]["path"],
-                    serde_json::json!(["source"]),
+                    modification["nodes"].as_array().unwrap().len(),
+                    usize::from(!actor_free),
                     "{name}"
                 );
-
+                if !actor_free {
+                    assert_eq!(modification["actors"][0]["id"], "source", "{name}");
+                    assert_eq!(modification["nodes"].as_array().unwrap().len(), 1, "{name}");
+                    assert_eq!(
+                        modification["nodes"][0]["path"],
+                        serde_json::json!(["source"]),
+                        "{name}"
+                    );
+                }
                 assert!(host.begin_run(name, name, None).expect("begin run").ok);
                 host.drain_emits().expect("drain begin events");
                 let started = host

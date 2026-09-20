@@ -19,6 +19,7 @@ local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
 local observer = require("observer")
+local Topology = require("topology")
 
 -- ------------------------------------------------------------------
 -- assert helpers
@@ -65,18 +66,24 @@ local function harness(factories)
     assert_true(err == nil, "factory registers: " .. tostring(err))
   end
   local cap_seq = 0
+  local topo
   local router = routing.new({
     inventory = inv,
     registry = reg,
     log = log,
     bus_emit = function(e) bus[#bus + 1] = e end,
     events = function(e) events[#events + 1] = e end,
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end,
     now_ms = function() return now.ms end,
     gen_id = function()
       cap_seq = cap_seq + 1
       return "cap-" .. tostring(cap_seq)
     end,
   })
+  topo = Topology.new({ inventory = inv, semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() end })
   inv.set_on_kill(function(id)
     router:dispatch_kill(id)
     router:forget(id)
@@ -84,13 +91,69 @@ local function harness(factories)
   router:set_construct(function(record)
     return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
   end)
-  inv.set_deliver(function(to, from, content)
-    content = content or {}
-    router:deliver(to, from, content.kind, content)
-  end)
-  local obs = observer.new({ inventory = inv, emit_event = function(e) events[#events + 1] = e end })
+  local base_observer = observer.new({ inventory = inv, emit_event = function(e) events[#events + 1] = e end })
+  local actors = {}
+  local function descriptor(wire)
+    if wire == "mag.Unit" then return { kind = "primitive", name = "Unit" } end
+    return { kind = "named", name = wire,
+      arguments = nefor.json.mark_array and nefor.json.mark_array({}) or {} }
+  end
+  local function endpoint(id) return { constructor = "ActorEndpoint", value = { id = id } } end
+  local function port(id, wire, value_type)
+    return { endpoint = endpoint(id), wire = wire, type = value_type,
+      type_id = nefor.semantic_type.id(value_type) }
+  end
+  local function actor_spec(source, extra_outputs)
+    local declaration = assert(reg:lookup(source.factory)).declaration
+    local input_wire
+    for _, value in pairs(declaration.inputs) do input_wire = value; break end
+    local actor = { id = source.id, factory = source.factory, type_arguments = {}, params = {},
+      input = port(source.id, input_wire, descriptor(input_wire)), outputs = {} }
+    local output_wires = extra_outputs or {}
+    for _, wire in ipairs(declaration.outputs or {}) do output_wires[wire] = true end
+    for wire in pairs(output_wires) do actor.outputs[#actor.outputs + 1] = port(source.id, wire, descriptor(wire)) end
+    return actor
+  end
+  local obs = {}
+  function obs:apply(mod)
+    mod = mod or {}
+    local extra_outputs = {}
+    for _, edge in ipairs(mod.routes or {}) do
+      extra_outputs[edge.from] = extra_outputs[edge.from] or {}
+      extra_outputs[edge.from][edge.wire] = true
+    end
+    local new_actors = {}
+    for _, source in ipairs(mod.actors or {}) do
+      local actor = actor_spec(source, extra_outputs[source.id])
+      actors[actor.id] = actor
+      new_actors[#new_actors + 1] = actor
+    end
+    local routes = {}
+    for _, edge in ipairs(mod.routes or {}) do
+      local actor = actors[edge.from]
+      local output
+      for _, candidate in ipairs(actor.outputs) do if candidate.wire == edge.wire then output = candidate end end
+      routes[#routes + 1] = { id = edge.id or (edge.from .. ":" .. edge.wire .. ":" .. edge.to),
+        from = output, to = actors[edge.to].input, transforms = {}, product_position = -1 }
+    end
+    local messages = {}
+    for _, message in ipairs(mod.messages or {}) do
+      local target = actors[message.to]
+      messages[#messages + 1] = { to = target.input, semantic_type = target.input.type,
+        semantic_type_id = target.input.type_id, transforms = {}, content = message.content }
+    end
+    local topology_mod = { actors = new_actors, routes = routes, messages = messages,
+      nodes = {}, kills = mod.kills or {} }
+    local state, topology_error = topo:preflight(topology_mod)
+    assert_true(state ~= nil, "topology preflight: " .. tostring(topology_error))
+    local result = base_observer:apply({ actors = new_actors, kills = mod.kills or {} })
+    if not result.ok then return result end
+    topo:install(topology_mod, state)
+    for _, message in ipairs(messages) do topo:initial(message) end
+    return result
+  end
   return {
-    inv = inv, router = router, obs = obs,
+    inv = inv, router = router, obs = obs, topo = topo,
     events = events, bus = bus,
     clock = { advance = function(ms) now.ms = now.ms + ms end },
   }
@@ -138,9 +201,10 @@ do
 
   local res = h.obs:apply({
     actors = {
-      { id = "w", factory = "worker", type_arguments = {}, params = {}, routes = { ["mag.Unit"] = { { actor = "f", wire = "mag.Unit" } } } },
-      { id = "f", factory = "follower", type_arguments = {}, params = {}, routes = {} },
+      { id = "w", factory = "worker", type_arguments = {}, params = {} },
+      { id = "f", factory = "follower", type_arguments = {}, params = {} },
     },
+    routes = { { from = "w", wire = "mag.Unit", to = "f" } },
     messages = { { to = "w", content = { kind = "seed.In" } } },
   })
   assert_true(res.ok, "apply: " .. tostring(res.error))
@@ -198,7 +262,7 @@ do
   })
 
   h.obs:apply({
-    actors = { { id = "c", factory = "caller", type_arguments = {}, params = {}, routes = {} } },
+    actors = { { id = "c", factory = "caller", type_arguments = {}, params = {} } },
     messages = { { to = "c", content = { kind = "seed.In" } } },
   })
 
@@ -234,7 +298,7 @@ do
   })
 
   h.obs:apply({
-    actors = { { id = "d", factory = "deferred", type_arguments = {}, params = {}, routes = {} } },
+    actors = { { id = "d", factory = "deferred", type_arguments = {}, params = {} } },
     messages = { { to = "d", content = { kind = "seed.In" } } },
   })
   local dk = kinds_of(events_for(h, "d"))
@@ -273,9 +337,10 @@ do
   -- Routed failure: flaky.Err reaches the catcher, and flaky still idles.
   h.obs:apply({
     actors = {
-      { id = "flaky", factory = "flaky", type_arguments = {}, params = {}, routes = { ["flaky.Err"] = { { actor = "catch", wire = "flaky.Err" } } } },
-      { id = "catch", factory = "catcher", type_arguments = {}, params = {}, routes = {} },
+      { id = "flaky", factory = "flaky", type_arguments = {}, params = {} },
+      { id = "catch", factory = "catcher", type_arguments = {}, params = {} },
     },
+    routes = { { from = "flaky", wire = "flaky.Err", to = "catch" } },
     messages = { { to = "flaky", content = { kind = "seed.In" } } },
   })
   local fk = kinds_of(events_for(h, "flaky"))
@@ -293,7 +358,7 @@ do
     },
   })
   h2.obs:apply({
-    actors = { { id = "solo", factory = "flaky", type_arguments = {}, params = {}, routes = {} } },
+    actors = { { id = "solo", factory = "flaky", type_arguments = {}, params = {} } },
     messages = { { to = "solo", content = { kind = "seed.In" } } },
   })
   local sk = kinds_of(events_for(h2, "solo"))

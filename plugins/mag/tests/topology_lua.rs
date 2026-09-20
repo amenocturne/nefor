@@ -234,3 +234,45 @@ fn delta_template_materialization_preserves_route_and_message_transforms() {
     assert_eq!(value["messages"][0]["transforms"][0]["constructor"], "Unit");
     assert!(value.get("junctions").is_none());
 }
+
+#[test]
+fn kernel_status_outputs_observe_terminal_boundaries_once() {
+    let lua = harness();
+    lua.load(r#"
+      local Topology=require("topology")
+      local Routing=require("routing")
+      for _,failure in ipairs({false, true}) do
+        local wire=failure and "test.Failure" or "mag.Unit"
+        local descriptor={kind="primitive",name=failure and "String" or "Unit"}
+        local port={endpoint={constructor="ActorEndpoint",value={id="worker"}},wire=wire,
+          type=descriptor,type_id=nefor.semantic_type.id(descriptor)}
+        local actor={id="worker",outputs={port}}
+        local inventory={get=function()return actor end,pairs=function()return pairs({worker=actor})end}
+        local settled,observed,failed=0,0,0
+        local topo=Topology.new({inventory=inventory,semantic=nefor.semantic_type,
+          dispatch=function()error("terminal-only output must not dispatch")end,
+          settle_result=function(_,output)
+            settled=settled+1
+            assert(output.value==(failure and "interrupted" or nil))
+          end})
+        local boundary={type=descriptor,type_id=port.type_id,leaves={{port=port,steps={}}},through={}}
+        local mod={actors={},routes={},messages={},result={from=boundary}}
+        local state,err=topo:preflight(mod); assert(state,err); topo:install(mod,state)
+        topo:set_result(boundary)
+        local router=Routing.new({inventory=inventory,registry={},
+          output_port=function(id,tag)return topo:output_port(id,tag)end,
+          observe_output=function(id,tag,output,arrival)
+            observed=observed+1
+            assert(output.arrival_id==arrival.arrival_id)
+            return true,topo:observe_result({constructor="ActorEndpoint",value={id=id}},tag,arrival)
+          end,
+          transform_route=function(id,tag,arrival)topo:route(id,tag,arrival)end,
+          events=function(e)if e.kind=="mag.run_failed" then failed=failed+1 end end})
+        router:apply_completion("worker",failure and {status="failed",failure=wire,value="interrupted"} or {status="ok"})
+        assert(settled==1 and observed==1 and failed==0,"status output must settle exactly once")
+        topo:set_result(nil)
+        router:apply_completion("worker",{status="failed",failure=wire,value="unhandled"})
+        assert(failed==1,"unreachable failure escalates")
+      end
+    "#).exec().unwrap();
+}

@@ -440,7 +440,7 @@ local function new_run_context(meta)
     transform_route = function(actor, wire, arrival)
       topo:route(actor, wire, arrival)
     end,
-    topology_routes = function() return topo.routes end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end,
     -- Host clock for the busy-window stamps (mag.actor_idle's busy_ms).
     -- nil-safe: routing falls back to a zero clock where the host surface
     -- lacks now_ms (the bare-VM test stub).

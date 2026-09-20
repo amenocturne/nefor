@@ -9,8 +9,7 @@
 --
 --   * Id-signed delivery. Every outbound message an instance emits carries its
 --     actor id; the kernel routes it by looking up the *sender's*
---     routes[output_type] and delivering to each destination id (lowering.md:
---     edges dissolve into per-actor routes; fanout is a multi-element array).
+--     installed top-level typed routes and anonymous transformations.
 --   * Firing by input contract. A delivered message feeds the destination's
 --     firing machine; single fires per message, union on any, product on a
 --     complete sender-bound set (per-slot FIFO). Partial product inputs buffer
@@ -62,7 +61,6 @@
 -- (init.lua passes a documented stub; tests pass a capturing sink), so these
 -- modules stay pure and unit-testable in a bare Lua VM.
 
-local shape = require("shape")
 local firing = require("firing")
 local correlation = require("correlation")
 local kinds = require("kinds")
@@ -159,7 +157,7 @@ function M.new(opts)
     persist_output = opts.persist_output or noop,
     observe_output = opts.observe_output or noop,
     transform_route = opts.transform_route,
-    topology_routes = opts.topology_routes,
+    output_port = opts.output_port,
     settle_result = opts.settle_result or function(id, result, persist_result, persisted)
       (opts.events or noop)({
         kind = EVT_RUN_COMPLETE,
@@ -194,15 +192,11 @@ function M.new(opts)
     dynamic_streams = {}, -- actor/wire -> ordered DynamicList protocol state
     published_arrivals = {}, -- arrival id -> true once its payload became a bus fact
     type_declarations = {}, -- stable id -> immutable artifact descriptor
-    result_boundary = nil, -- compiled StoredPort; structural, never a factory
     arrival_seq = 0,
   }, M)
   return self
 end
 
-function M:set_result_boundary(boundary)
-  self.result_boundary = boundary
-end
 
 function M:register_type_declarations(declarations)
   for id, descriptor in pairs(declarations or {}) do
@@ -350,26 +344,7 @@ function M:on_emit(id, message, generation)
       })
       return
     end
-    local observed = {}
-    for key, value in pairs(arrival.payload) do observed[key] = value end
-    observed.semantic_type = arrival.type
-    observed.semantic_type_id = arrival.type_id
-    observed.constructor_id = arrival.constructor_id
-    observed.arrival_id = arrival.arrival_id
-    local accepted, terminal = self.observe_output(id, kind, observed, arrival)
-    if accepted == false then return false end
-    if not terminal then
-      local persisted = self.persist_output(id, observed)
-      if type(persisted) == "table" and type(persisted.output_path) == "string" then
-        -- Persistence owns the canonical location. Carry that authority as
-        -- transport metadata to any downstream model-context projection; the
-        -- semantic value and the already-written artifact remain unchanged.
-        observed.output_path = persisted.output_path
-        arrival.payload.output_path = persisted.output_path
-      end
-    end
-    self:publish_arrival(arrival)
-    self:route_output(id, kind, observed, arrival)
+    self:route_output(id, kind, arrival.payload, arrival)
   end
 end
 
@@ -556,21 +531,15 @@ function M:on_run_complete(id, message)
   self.settle_result(id, message.result, message.persist_result, message.persisted)
 end
 
--- Route one id-signed output along the sender's routes[tag]. A tag with no
--- route entry simply goes nowhere; fanout (many dests) needs no special case.
+-- Declared and kernel-synthesized outputs share observation and topology routing.
 function M:route_output(sender_id, tag, message, source_arrival)
   local sender = self.inventory.get(sender_id)
   if not sender then return end
   local source = source_arrival
   if not source then
-    local descriptor, type_id
-    for _, route in ipairs(self.topology_routes and self.topology_routes() or {}) do
-      if route.from.endpoint.value.id == sender_id and route.from.wire == tag then
-        descriptor, type_id = route.from.type, route.from.type_id
-        break
-      end
-    end
-    if not descriptor then return end
+    local port = self.output_port and self.output_port(sender_id, tag)
+    if not port then return end
+    local descriptor, type_id = port.type, port.type_id
     source = typed_value.factory({
       arrival_id = self:next_arrival_id(),
       from = sender_id,
@@ -582,6 +551,24 @@ function M:route_output(sender_id, tag, message, source_arrival)
       product_position = -1,
       payload = message,
     })
+  end
+  local observed = {}
+  for key, value in pairs(source.payload) do observed[key] = value end
+  observed.semantic_type = source.type
+  observed.semantic_type_id = source.type_id
+  observed.constructor_id = source.constructor_id
+  observed.arrival_id = source.arrival_id
+  local accepted, terminal = self.observe_output(sender_id, tag, observed, source)
+  if accepted == false then return false end
+  if not terminal then
+    local persisted = self.persist_output(sender_id, observed)
+    if type(persisted) == "table" and type(persisted.output_path) == "string" then
+      -- Persistence owns the canonical location. Carry that authority as
+      -- transport metadata to any downstream model-context projection; the
+      -- semantic value and the already-written artifact remain unchanged.
+      observed.output_path = persisted.output_path
+      source.payload.output_path = persisted.output_path
+    end
   end
   self:publish_arrival(source)
   if self.transform_route then self.transform_route(sender_id, tag, source) end
@@ -780,10 +767,8 @@ function M:fire(dest_id, arrival, legacy_tag, legacy_message)
   })
 end
 
--- Lazily build (and cache) the per-port firing machines for an actor from its
--- factory's declared inputs. Product ports get sender-bound slots derived from
--- the current routes topology (derive_slots). Built on first use, by which
--- time upstream actors and their routes are in the inventory.
+-- Topology supplies complete typed inputs, including destination-owned product
+-- assembly. Firing owns activation, not a second set of route-derived joins.
 function M:machines_for(id, arrival)
   local existing = self.machines[id]
   if existing then
@@ -794,104 +779,17 @@ function M:machines_for(id, arrival)
   local ports = {}
   if decl and type(decl.inputs) == "table" then
     for port, in_shape in pairs(decl.inputs) do
-      local slots = nil
       local semantic = actor.input and actor.input.type_id and
         {
           input_type_id = actor.input.type_id,
           kind = actor.input.type and actor.input.type.kind == "product"
             and "product" or "single",
         } or nil
-      if semantic and actor.input.type and actor.input.type.kind == "product" then
-        slots = self:derive_slots(id, arrival)
-      elseif shape.classify(in_shape) == "product" then
-        slots = self:derive_legacy_slots(id, in_shape)
-      end
-      ports[port] = firing.build(in_shape, slots, semantic)
+      ports[port] = firing.build(in_shape, nil, semantic)
     end
   end
   self.machines[id] = ports
   return ports
-end
-
-function M:derive_legacy_slots(dest_id, product_shape)
-  local components = {}
-  for _, tag in ipairs(shape.tags(product_shape)) do components[tag] = true end
-  local edges = {}
-  for sender_id, actor in self.inventory.pairs() do
-    for _, destinations in pairs(actor.routes or {}) do
-      for _, destination in ipairs(destinations) do
-        if destination.actor == dest_id and components[destination.wire] then
-          edges[#edges + 1] = { sender = sender_id, type = destination.wire }
-        end
-      end
-    end
-  end
-  return edges
-end
-
--- Derive a product input's slots from the routes topology. Slot identity is
--- the incoming edge (sender, type), not the bare component type: scan every
--- actor's routes for entries that (a) target this actor and (b) deliver on a
--- wire that is a component of the product. Each such (sender, destination
--- wire) is one slot. Source and destination wires may differ because routing
--- performs the typed retag at the edge boundary.
--- This is what makes `(Unit + Unit)` from two upstreams unambiguous — two
--- edges, two sender-bound slots — where keying by the bare type could not tell
--- them apart (docs/ir.md, Firing). Because ids are signed and routes are
--- directional, the binding is a static fact of the topology.
-function M:derive_slots(dest_id, arrival)
-  local edges = {}
-  local whole_edges = 0
-  local destination_actor = self.inventory.get(dest_id)
-  local input_type_id = destination_actor and destination_actor.input
-    and destination_actor.input.type_id
-  if self.topology_routes then
-    for _, route in ipairs(self.topology_routes()) do
-      if route.to.endpoint.constructor == "ActorEndpoint" and route.to.endpoint.value.id == dest_id then
-        if route.product_position >= 0 then
-          edges[#edges+1] = {sender=route.from.endpoint.value.id,type=route.to.wire,
-            edge_id=route.id,product_position=route.product_position}
-        else whole_edges=whole_edges+1 end
-      end
-    end
-  else
-  for sender_id, actor in self.inventory.pairs() do
-    for _, dests in pairs(actor.routes or {}) do
-      for _, destination in ipairs(dests) do
-        if destination.actor == dest_id then
-          if type(destination.product_position) == "number" and
-              destination.product_position >= 0 then
-            edges[#edges + 1] = {
-              sender = sender_id,
-              type = destination.wire,
-              edge_id = destination.edge_id,
-              product_position = destination.product_position,
-            }
-          elseif destination.product_position == -1 and
-              destination.destination_type_id == input_type_id then
-            whole_edges = whole_edges + 1
-          end
-        end
-      end
-    end
-  end
-  end
-  -- Application validation guarantees exact product coverage before the
-  -- inventory changes. Reaching this backstop means an internal topology
-  -- invariant was broken; fail loudly rather than parking a partial product.
-  local component_count = destination_actor and destination_actor.input and
-    destination_actor.input.type and #(destination_actor.input.type.items or {}) or 0
-  -- A checked initial message is an input source too. Its whole-product
-  -- evidence can activate a newly materialized worker without a static edge.
-  local whole_arrival = typed_value.is_trusted(arrival)
-    and arrival.product_position == -1 and arrival.type_id == input_type_id
-  if (#edges == 0 and whole_edges == 0 and not whole_arrival) or
-      (#edges > 0 and #edges ~= component_count) then
-    error(string.format(
-      "actor '%s': product input derives %d component slot(s) and %d whole edge(s), but the shape has %d component(s)",
-      tostring(dest_id), #edges, whole_edges, component_count))
-  end
-  return edges
 end
 
 -- Hand one assembled activation to the instance — constructing it first when
@@ -987,8 +885,7 @@ function M:apply_completion(id, completion)
     self:route_output(id, UNIT, { kind = UNIT, from = id })
   elseif completion.status == "failed" and completion.failure then
     self:mark_idle(id)
-    local sender = self.inventory.get(id)
-    local routed = sender and (sender.routes or {})[completion.failure]
+    local routed = self.output_port and self.output_port(id, completion.failure)
     if routed then
       self:route_output(id, completion.failure, { kind = completion.failure, from = id, value = completion.value })
       return

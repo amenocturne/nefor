@@ -15,7 +15,7 @@
 -- alongside the sibling routing/registry modules.
 --
 -- Construction is NOT the fold's concern: a spawn only registers the spec
--- (id, factory, params, routes). The routing layer constructs the instance
+-- (id, factory, params, typed ports). The routing layer constructs the instance
 -- lazily, at the actor's first satisfied input contract (actor-model.md,
 -- Lifecycle). Declarative operation registration belongs to the run composition in
 -- init.lua; the fold accepts only actor/message/kill deltas.
@@ -102,27 +102,6 @@ local function validate_actor_shape(actor, idx)
   end
   if actor.params ~= nil and type(actor.params) ~= "table" then
     return string.format("actor '%s' params must be a table", actor.id)
-  end
-  if actor.routes ~= nil then
-    if type(actor.routes) ~= "table" then
-      return string.format("actor '%s' routes must be a table", actor.id)
-    end
-    for typ, dests in pairs(actor.routes) do
-      if type(typ) ~= "string" then
-        return string.format("actor '%s' route key must be a type string", actor.id)
-      end
-      if not is_array(dests) then
-        return string.format("actor '%s' route '%s' must be an array of ids", actor.id, typ)
-      end
-      for _, destination in ipairs(dests) do
-        if type(destination) ~= "table"
-            or type(destination.actor) ~= "string" or destination.actor == ""
-            or type(destination.wire) ~= "string" or destination.wire == "" then
-          return string.format(
-            "actor '%s' route '%s' needs { actor, wire } destinations", actor.id, typ)
-        end
-      end
-    end
   end
   return nil
 end
@@ -235,12 +214,6 @@ local function validate(self, mod)
     end
   end
 
-  -- routes: contract validation against the injected registry (when wired —
-  -- init.lua passes it; bare-VM fold tests run without one). Every spawned
-  -- actor's route keys must be declared outputs (or the reserved
-  -- kernel-synthesized status tags), and every destination — spawned in this
-  -- modification OR already in the inventory — must declare an input port
-  -- accepting the routed tag. A violation REJECTS the modification with the
   -- Factory specialization remains a registry contract; topology has already
   -- validated route transforms and endpoint coverage before inventory apply.
   local err = validate_actor_contracts(self, mod)
@@ -255,7 +228,7 @@ end
 -- execution — mutates the inventory. Only reached after validate passed,
 -- so shape and targets are already sound. Order: spawns, then sends, then
 -- kills, so a message addressed to an id created in the same modification
--- finds its spec (routes, input contract) already registered.
+-- finds its input contract already registered.
 -- ---------------------------------------------------------------------------
 
 -- Register a new actor record. Returns true when a fresh id was created,
@@ -280,8 +253,7 @@ local function do_spawn(self, actor)
     return false
   end
 
-  -- New id: register the spec record. `routes` are retained verbatim for the
-  -- routing layer; the record also opens a mailbox used only by the hook-less
+  -- New id: register the spec record and a mailbox used only by the hook-less
   -- bare-VM path (see do_send). The on_spawn hook surfaces the registration
   -- (the observer emits mag.actor_spawned through it) before any send in the
   -- same modification can fire the actor.
@@ -293,7 +265,6 @@ local function do_spawn(self, actor)
     input = actor.input,
     outputs = actor.outputs,
     semantic_strict = actor.semantic_strict == true,
-    routes = actor.routes or {},
     spec = spec_of(actor),
     state = ALIVE,
     mailbox = {},
@@ -339,7 +310,6 @@ local function do_kill(self, id)
   -- actor dies the same way: the spec drops, no instance ever exists.
   entry.state = DEAD
   entry.mailbox = {}
-  entry.routes = {}
   -- Notify the routing layer so it drops the instance (when one was
   -- constructed), the firing slots, and outstanding capability correlations
   -- (kill drops slots; actor-model.md).
@@ -419,8 +389,7 @@ function M.get(self, id)
 end
 
 -- Iterate every actor record: `for id, record in inv.pairs() do ... end`.
--- Read-only — the routing layer uses it to derive product slots from the
--- routes topology (which senders route which types to a given actor).
+-- Read-only; topology resolves its typed endpoints against these records.
 function M.pairs(self)
   return pairs(self.actors)
 end

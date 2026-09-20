@@ -378,6 +378,21 @@ function M:route(sender_id, wire, arrival)
   end
 end
 
+-- Installed consumers and the terminal boundary own output reachability and
+-- semantic evidence, including status outputs synthesized by the kernel.
+function M:output_port(actor_id, wire)
+  for _, route in ipairs(self.routes) do
+    if route.from.endpoint.value.id == actor_id and route.from.wire == wire then
+      return route.from
+    end
+  end
+  for _, leaf in ipairs((self.result and self.result.leaves) or {}) do
+    if leaf.port.endpoint.value.id == actor_id and leaf.port.wire == wire then
+      return leaf.port
+    end
+  end
+end
+
 function M:set_result(boundary) self.result = boundary end
 
 function M:observe_result(endpoint_value, wire, arrival)

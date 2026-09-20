@@ -16,6 +16,7 @@ local Registry = require("registry")
 local routing = require("routing")
 local firing = require("firing")
 local typed_value = require("typed-value")
+local Topology = require("topology")
 
 -- ------------------------------------------------------------------
 -- assert helpers
@@ -60,13 +61,22 @@ local function harness(factories)
     assert_true(err == nil, "factory registers: " .. tostring(err))
   end
   local seq = 0
+  local topo
   local router = routing.new({
     inventory = inv,
     registry = reg,
     log = log,
     bus_emit = function(env) bus[#bus + 1] = env end,
     events = function(e) events[#events + 1] = e end,
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end,
     gen_id = function() seq = seq + 1; return "req-" .. seq end,
+  })
+  topo = Topology.new({
+    inventory = inv,
+    semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() end,
   })
   -- Mirror init.lua: hand the dying instance its final kill message
   -- (dispatch_kill) BEFORE dropping routing state (forget) — emit-before-forget.
@@ -74,21 +84,131 @@ local function harness(factories)
     router:dispatch_kill(id)
     router:forget(id)
   end)
-  return { inv = inv, reg = reg, router = router, log = rec, bus = bus, events = events }
+  return { inv = inv, reg = reg, router = router, topo = topo,
+    log = rec, bus = bus, events = events, actors = {} }
 end
 
--- Build a test actor instance implementing the kernel<->instance contract:
--- an id-signed emitter (from the router) and a deliver(activation) whose body
--- is supplied per test. Emitting mag.ready confirms readiness.
+local function array(values)
+  return nefor.json.mark_array and nefor.json.mark_array(values) or values
+end
+
+local function descriptor(wire)
+  if wire == "mag.Unit" then return { kind = "primitive", name = "Unit" } end
+  return { kind = "named", name = wire, arguments = array({}) }
+end
+
+local function endpoint(id)
+  return { constructor = "ActorEndpoint", value = { id = id } }
+end
+
+local function port(id, wire, value_type)
+  return { endpoint = endpoint(id), wire = wire, type = value_type,
+    type_id = nefor.semantic_type.id(value_type) }
+end
+
+local function input_contract(declaration)
+  for _, value in pairs(declaration.inputs or {}) do
+    if type(value) == "string" then return value, descriptor(value) end
+    if type(value) == "table" and type(value.product) == "table" then
+      local items = {}
+      for index, wire in ipairs(value.product) do items[index] = descriptor(wire) end
+      return value.product[1], { kind = "product", items = array(items) }
+    end
+  end
+  return "mag.Unit", descriptor("mag.Unit")
+end
+
+local function install(h, actors, routes)
+  local mod = { actors = actors or {}, routes = routes or {}, messages = {}, nodes = {}, kills = {} }
+  local state, topology_error = h.topo:preflight(mod)
+  assert_true(state ~= nil, "topology preflight: " .. tostring(topology_error))
+  local res = h.inv.apply({ actors = actors or {} })
+  assert_true(res.ok, "inventory apply: " .. tostring(res.error))
+  h.topo:install(mod, state)
+  for _, actor in ipairs(actors or {}) do h.actors[actor.id] = actor end
+end
+
+local function route(actor, output, destination, wire, slot)
+  local transforms = {}
+  local product_position = -1
+  if destination.input.type.kind == "product" then
+    product_position = slot
+    transforms = { { constructor = "Assemble", value = {
+      inputs = destination.input.type.items,
+      output = destination.input.type,
+      slot = slot,
+      path = { 0 },
+      kind = "product",
+    } } }
+  end
+  return { id = actor.id .. ":" .. output.wire .. ":" .. destination.id .. ":" .. tostring(slot or -1),
+    from = output, to = destination.input, transforms = transforms,
+    product_position = product_position }
+end
+
+-- Build a test actor instance implementing the kernel<->instance contract.
+-- Actors and routes are installed through the same v4 topology preflight used
+-- by production; the inventory carries no obsolete actor.routes fallback.
 local function spawn_actor(h, id, factory, routes, deliver_fn)
-  local res = h.inv.apply({
-    actors = { { id = id, factory = factory, type_arguments = {}, params = {}, routes = routes or {} } },
-  })
-  assert_true(res.ok, "spawn " .. id .. ": " .. tostring(res.error))
+  local declaration = assert(h.reg:lookup(factory), "registered factory").declaration
+  local input_wire, input_type = input_contract(declaration)
+  local actor = { id = id, factory = factory, type_arguments = {}, params = {},
+    input = port(id, input_wire, input_type), outputs = {} }
+  local outputs = {}
+  for _, wire in ipairs(declaration.outputs or {}) do outputs[wire] = true end
+  for wire in pairs(routes or {}) do outputs[wire] = true end
+  for wire in pairs(outputs) do actor.outputs[#actor.outputs + 1] = port(id, wire, descriptor(wire)) end
+
+  local typed_routes = {}
+  for wire, destinations in pairs(routes or {}) do
+    local source
+    for _, candidate in ipairs(actor.outputs) do if candidate.wire == wire then source = candidate end end
+    for _, destination in ipairs(destinations) do
+      local target = assert(h.actors[destination.actor], "destination actor must be installed first")
+      local slot = 0
+      for _, existing in ipairs(h.topo.routes) do
+        if existing.to.endpoint.value.id == target.id then slot = slot + 1 end
+      end
+      typed_routes[#typed_routes + 1] = route(actor, source, target, destination.wire, slot)
+    end
+  end
+  install(h, { actor }, typed_routes)
+
   local inst = { id = id, emit = h.router:emitter(id), received = {} }
   inst.deliver = function(activation) return deliver_fn(inst, activation) end
   h.router:bind(id, inst)
   return inst
+end
+
+local function deliver(h, id, from, message)
+  local target = assert(h.actors[id], "typed destination exists")
+  local arrival = typed_value.initial({
+    arrival_id = h.router:next_arrival_id(),
+    from = from,
+    type_id = target.input.type_id,
+    type = target.input.type,
+    constructor_id = target.input.type_id,
+    protocol_wire = target.input.wire,
+    product_position = -1,
+    payload = message,
+  })
+  h.router:deliver(id, arrival)
+end
+
+local function deliver_component(h, id, from, slot, message)
+  local target = assert(h.actors[id], "typed product destination exists")
+  local component = target.input.type.items[slot + 1]
+  local component_id = nefor.semantic_type.id(component)
+  local arrival = typed_value.initial({
+    arrival_id = h.router:next_arrival_id(), from = from,
+    type_id = component_id, type = component, constructor_id = component_id,
+    protocol_wire = target.input.wire, product_position = slot, payload = message,
+  })
+  local assembled = h.topo:transform(Topology.address(target.input), arrival, {
+    { constructor = "Assemble", value = { inputs = target.input.type.items,
+      output = target.input.type, slot = slot, path = { 99 }, kind = "product" } },
+  })
+  if assembled then h.router:deliver(id, assembled) end
 end
 
 local function ready(h, inst)
@@ -207,7 +327,7 @@ do
   h.router:on_ready("b")
 
   -- Activate a with a graph input; a emits hop.Ping; router routes to b by id.
-  h.router:fire("a", "seed", "start.Kick", { task = "go" })
+  deliver(h, "a", "seed", { kind = "start.Kick", task = "go" })
 
   assert_eq(#got, 1, "b received exactly one routed message")
   assert_eq(got[1].from, "a", "message is signed with the sender id")
@@ -229,10 +349,12 @@ do
   local order = {}
   -- Register the spec through the fold, but bind nothing: the router's
   -- construct hook (init.lua's seam) builds the instance on demand.
-  local res = h.inv.apply({ actors = { { id = "b", factory = "sink", type_arguments = {}, params = {}, routes = {},
-    evidence={version=2,identity="nefor.factory.sink",arguments={{kind="named",name="test.Answer",arguments={}}},input={kind="named",name="test.Answer",arguments={}},output={kind="primitive",name="Unit"}},
-    input={type={kind="named",name="test.Answer",arguments={}},wire="generic-provider.TextAnswer"},outputs={{type={kind="primitive",name="Unit"},wire="mag.Unit"}} } } })
-  assert_true(res.ok, "spawn b: " .. tostring(res.error))
+  local answer = descriptor("test.Answer")
+  install(h, { { id = "b", factory = "sink", type_arguments = {}, params = {},
+    evidence = { version = 2, identity = "nefor.factory.sink", arguments = array({ answer }),
+      input = answer, output = descriptor("mag.Unit") },
+    input = port("b", "q.Item", answer),
+    outputs = { port("b", "mag.Unit", descriptor("mag.Unit")) } } }, {})
   h.router:set_construct(function(record)
     order[#order + 1] = "construct:" .. record.id
     local inst = { id = record.id, emit = h.router:emitter(record.id) }
@@ -245,11 +367,11 @@ do
   end)
 
   assert_eq(#order, 0, "registration alone constructs nothing")
-  h.router:deliver("b", "a", "q.Item", { n = 1 })
+  deliver(h, "b", "a", { kind = "q.Item", n = 1 })
   assert_eq(order[1], "construct:b", "the first delivery constructs the instance")
   assert_eq(order[2], "deliver:1", "the first activation lands right after construct")
 
-  h.router:deliver("b", "a", "q.Item", { n = 2 })
+  deliver(h, "b", "a", { kind = "q.Item", n = 2 })
   assert_eq(#order, 3, "a later delivery reuses the instance")
   assert_eq(order[3], "deliver:2", "no re-construct on the second activation")
 
@@ -279,7 +401,7 @@ do
   h.router:on_ready("b")
 
   h.inv.apply({ kills = { "b" } }) -- b dies; router:forget runs via on_kill
-  h.router:fire("a", "seed", "start.Kick", {})
+  deliver(h, "a", "seed", { kind = "start.Kick" })
 
   local dropped = false
   for _, m in ipairs(h.log.info) do
@@ -317,7 +439,7 @@ do
   w.emit({ kind = "mag.ready", from = "w" })
   h.router:on_ready("out")
 
-  h.router:fire("w", "seed", "job.Start", { x = 41 })
+  deliver(h, "w", "seed", { kind = "job.Start", x = 41 })
 
   assert_eq(#h.bus, 1, "one tool.invoke put on the bus")
   local env = h.bus[1]
@@ -365,18 +487,22 @@ do
   u2.emit({ kind = "mag.ready", from = "u2" })
 
   -- Two completions from u1 alone: per-slot FIFO — the second queues, no set.
-  h.router:deliver("j", "u1", "mag.Unit", { seq = "u1-a" })
-  h.router:deliver("j", "u1", "mag.Unit", { seq = "u1-b" })
+  deliver_component(h, "j", "u1", 0, { kind = "mag.Unit", seq = "u1-a" })
+  deliver_component(h, "j", "u1", 0, { kind = "mag.Unit", seq = "u1-b" })
   assert_eq(#fires, 0, "(Unit + Unit) does not fire from one sender twice — needs one from each")
 
   -- First completion from u2 completes one set (u1-a + u2-a).
-  h.router:deliver("j", "u2", "mag.Unit", { seq = "u2-a" })
+  deliver_component(h, "j", "u2", 1, { kind = "mag.Unit", seq = "u2-a" })
   assert_eq(#fires, 1, "one complete sender-bound set fires exactly once")
-  assert_eq(fires[1].shape, "product", "the assembled activation is a product")
-  assert_eq(#fires[1].messages, 2, "the set carries one message per slot")
+  assert_eq(fires[1].shape, "product", "the assembled activation retains the product input contract")
+  assert_eq(#fires[1].messages, 1, "topology delivers one assembled product value")
+  assert_eq(fires[1].messages[1].message.value[1], nefor.json.decode("null"),
+    "Unit occupies the first product position")
+  assert_eq(fires[1].messages[1].message.value[2], nefor.json.decode("null"),
+    "Unit occupies the second product position")
 
   -- A second u2 completes the leftover set (u1-b + u2-b).
-  h.router:deliver("j", "u2", "mag.Unit", { seq = "u2-b" })
+  deliver_component(h, "j", "u2", 1, { kind = "mag.Unit", seq = "u2-b" })
   assert_eq(#fires, 2, "the leftover u1 message assembles a second set with a new u2")
 end
 
@@ -406,7 +532,7 @@ do
   t.emit({ kind = "mag.ready", from = "t" })
   h.router:on_ready("d")
 
-  h.router:fire("t", "seed", "do.Work", {})
+  deliver(h, "t", "seed", { kind = "do.Work" })
 
   assert_eq(#dep_fired, 1, "the dependency actor fired on the upstream's completion")
   assert_eq(dep_fired[1].tag, "mag.Unit", "it received kernel-emitted mag.Unit")
@@ -432,7 +558,7 @@ do
   local other = spawn_actor(h, "other", "worker", {}, function() return nil end)
   w.emit({ kind = "mag.ready" })
   other.emit({ kind = "mag.ready" })
-  h.router:fire("w", "seed", "job.Start", {})
+  deliver(h, "w", "seed", { kind = "job.Start" })
   other.emit({ kind = "capability.invoke", capability = "unrelated", request = {}, ref = "other@r1" })
 
   assert_eq(h.router.correlation:request_id("w", "actor@r1"), "req-1",
@@ -480,7 +606,7 @@ do
     drained.count = drained.count + 1
     inst.emit({ kind = "mag.complete", from = "d" })
   end
-  h.inv.apply({ actors = { { id = "d", factory = "worker", type_arguments = {}, params = {}, routes = {} } } })
+  h.inv.apply({ actors = { { id = "d", factory = "worker", type_arguments = {}, params = {} } } })
   h.router:bind("d", inst)
   inst.emit({ kind = "mag.ready", from = "d" })
 
@@ -495,7 +621,7 @@ do
   local i2 = { id = "z", emit = h.router:emitter("z") }
   i2.deliver = function() return "ok" end
   function i2.handle_drain() flags.drained = true end
-  h.inv.apply({ actors = { { id = "z", factory = "worker", type_arguments = {}, params = {}, routes = {} } } })
+  h.inv.apply({ actors = { { id = "z", factory = "worker", type_arguments = {}, params = {} } } })
   h.router:bind("z", i2)
   i2.emit({ kind = "mag.ready", from = "z" })
   h.inv.apply({ kills = { "z" } })
@@ -519,7 +645,7 @@ do
     return { status = "failed", failure = "mag.Failed", value = { error = "provider blew up" } }
   end)
   ready(h, w)
-  h.router:deliver("w", "test", "start.Kick", { kind = "start.Kick" })
+  deliver(h, "w", "test", { kind = "start.Kick" })
 
   local run_failed
   for _, e in ipairs(h.events) do
@@ -535,7 +661,7 @@ do
     return { status = "failed", failure = "mag.Failed" }
   end)
   ready(h, w0)
-  h.router:deliver("w0", "test", "start.Kick", { kind = "start.Kick" })
+  deliver(h, "w0", "test", { kind = "start.Kick" })
   local last
   for _, e in ipairs(h.events) do
     if e.kind == "mag.run_failed" and e.from == "w0" then last = e end
@@ -554,7 +680,7 @@ do
     return { status = "failed", failure = "mag.Failed", value = { error = "handled" } }
   end)
   ready(h, w2)
-  h.router:deliver("w2", "test", "start.Kick", { kind = "start.Kick" })
+  deliver(h, "w2", "test", { kind = "start.Kick" })
   assert_eq(#caught, 1, "a routed failure delivers the failure-typed output")
   assert_eq(caught[1].message.value.error, "handled", "the routed failure carries its value")
   for _, e in ipairs(h.events) do
@@ -576,6 +702,7 @@ do
   nefor.semantic_type = {
     accepts = function() return true end,
     id = function(value) return value.name or value.kind end,
+    input_covered_by = function() return true end,
     validate_value = function(_, value)
       return type(value) == "table" and value.content ~= nil
         and { ok = true }
@@ -596,21 +723,13 @@ do
   local h = harness({ producer = producer_decl, consumer = consumer_decl })
   local received = {}
 
-  local consumer_result = h.inv.apply({ actors = { {
-    id = "provider-consumer",
-    factory = consumer_decl.name,
-    type_arguments = {},
-    params = {},
-    semantic_strict = true,
-    input = {
-      wire = "generic-provider.ProviderOut",
-      type_id = "nefor.contracts.ProviderInput",
-      type = provider_input,
-    },
+  local consumer_actor = {
+    id = "provider-consumer", factory = consumer_decl.name,
+    type_arguments = {}, params = {}, semantic_strict = true,
+    input = port("provider-consumer", "generic-provider.ProviderOut", provider_input),
     outputs = {},
-    routes = {},
-  } } })
-  assert_true(consumer_result.ok, "typed provider consumer registers")
+  }
+  install(h, { consumer_actor }, {})
   local consumer = { id = "provider-consumer", emit = h.router:emitter("provider-consumer") }
   consumer.deliver = function(activation)
     received[#received + 1] = activation.messages[1].message
@@ -619,26 +738,16 @@ do
   h.router:bind("provider-consumer", consumer)
   ready(h, consumer)
 
-  local producer_result = h.inv.apply({ actors = { {
-    id = "provider-producer",
-    factory = producer_decl.name,
-    type_arguments = {},
-    params = {},
-    semantic_strict = true,
-    input = { wire = "test.Start", type_id = "test.Start", type = provider_input },
-    outputs = { {
-      wire = "generic-provider.ProviderOut",
-      type_id = "nefor.contracts.ProviderInput",
-      type = provider_input,
-    } },
-    routes = {
-      ["generic-provider.ProviderOut"] = { {
-        actor = "provider-consumer",
-        wire = "generic-provider.ProviderOut",
-      } },
-    },
-  } } })
-  assert_true(producer_result.ok, "typed provider producer registers")
+  local producer_actor = {
+    id = "provider-producer", factory = producer_decl.name,
+    type_arguments = {}, params = {}, semantic_strict = true,
+    input = port("provider-producer", "test.Start", provider_input),
+    outputs = { port("provider-producer", "generic-provider.ProviderOut", provider_input) },
+  }
+  install(h, { producer_actor }, {
+    route(producer_actor, producer_actor.outputs[1], consumer_actor,
+      "generic-provider.ProviderOut", -1),
+  })
   local producer = { id = "provider-producer", emit = h.router:emitter("provider-producer") }
   producer.deliver = function() return "ok" end
   h.router:bind("provider-producer", producer)
@@ -694,6 +803,7 @@ do
     constructor = function(_, constructor)
       return { id = "test." .. constructor, payload = answer, payload_id = "test.Answer" }
     end,
+    input_covered_by = function() return true end,
     validate_value = function(expected, value)
       local valid = expected.name == "nefor.contracts.RetryDecision"
         and type(value) == "table" and value.value ~= nil
@@ -718,13 +828,12 @@ do
     local received = {}
     local sink_id = "sink-" .. maximum
     local gate_id = "gate-" .. maximum
-    local sink_result = h.inv.apply({ actors = { {
+    local sink_actor = {
       id = sink_id, factory = sink_decl.name, type_arguments = {}, params = {},
       semantic_strict = true,
-      input = { wire = "nefor.retry.Result", type_id = "test.Decision", type = decision },
-      outputs = {}, routes = {},
-    } } })
-    assert_true(sink_result.ok, "typed retry sink registers: " .. tostring(sink_result.error))
+      input = port(sink_id, "nefor.retry.Result", decision), outputs = {},
+    }
+    install(h, { sink_actor }, {})
     local sink = { id = sink_id, emit = h.router:emitter(sink_id) }
     sink.deliver = function(activation)
       received[#received + 1] = activation.messages[1]
@@ -733,19 +842,18 @@ do
     h.router:bind(sink_id, sink)
     ready(h, sink)
 
-    local result = h.inv.apply({ actors = { {
+    local gate_actor = {
       id = gate_id, factory = "retry-gate",
       type_arguments = { answer, decision },
       params = { max_retries = maximum }, semantic_strict = true,
       evidence = { version = 2, identity = "nefor.factory.retry-gate",
         arguments = { answer, decision }, input = answer, output = decision },
-      input = { wire = "nefor.retry.Input", type_id = "test.Answer", type = answer },
-      outputs = { { wire = "nefor.retry.Result", type_id = "test.Decision", type = decision } },
-      routes = { ["nefor.retry.Result"] = {
-        { actor = sink_id, wire = "nefor.retry.Result" },
-      } },
-    } } })
-    assert_true(result.ok, "typed retry gate registers: " .. tostring(result.error))
+      input = port(gate_id, "nefor.retry.Input", answer),
+      outputs = { port(gate_id, "nefor.retry.Result", decision) },
+    }
+    install(h, { gate_actor }, {
+      route(gate_actor, gate_actor.outputs[1], sink_actor, "nefor.retry.Result", -1),
+    })
     h.router:set_construct(function(record)
       return h.reg:construct(record.factory, record.id, record.params,
         h.router:emitter(record.id), {
@@ -760,7 +868,7 @@ do
     local payloads = {}
     for index = 1, maximum + 1 do
       payloads[index] = { maximum = maximum, index = index }
-      h.router:deliver(gate_id, "source", "nefor.retry.Input", { value = payloads[index] })
+      deliver(h, gate_id, "source", { kind = "nefor.retry.Input", value = payloads[index] })
     end
     assert_eq(#received, maximum + 1, "max " .. maximum .. " emits one decision per accepted value")
     for index = 1, maximum do
@@ -782,7 +890,7 @@ do
     assert_eq(#h.log.error, 0, "canonical decisions pass semantic-strict routing")
 
     local late = { maximum = maximum, late = true }
-    h.router:deliver(gate_id, "source", "nefor.retry.Input", { value = late })
+    deliver(h, gate_id, "source", { kind = "nefor.retry.Input", value = late })
     assert_eq(#received, maximum + 1, "a latched gate emits no decision for late input")
     assert_eq(#diagnostics, 1, "a latched gate diagnoses late input")
     assert_eq(diagnostics[1].kind, "late_input_after_exhaustion", "late diagnostic is specific")

@@ -4,6 +4,7 @@
 local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
+local Topology = require("topology")
 local observer = require("observer")
 local human = require("factories.human")
 
@@ -73,18 +74,17 @@ local function harness()
   end
 
   local inv = inventory.new({log=logger(),registry=registry})
-  local router
+  local router, topo
   router = routing.new({
     inventory=inv,registry=registry,log=logger(),bus_emit=function() end,
     events=function(event) events[#events + 1] = event end,
     persist_output=function(id, output) persisted[#persisted + 1] = {id=id,output=output} end,
-    transform_route=function(sender, wire, arrival)
-      local actor = inv.get(sender)
-      for _, destination in ipairs(actor and actor.routes and actor.routes[wire] or {}) do
-        router:deliver(destination.actor, sender, destination.wire, arrival.payload)
-      end
-    end,
+    transform_route=function(sender, wire, arrival) topo:route(sender, wire, arrival) end,
+    output_port=function(sender, wire) return topo:output_port(sender, wire) end,
   })
+  topo = Topology.new({inventory=inv,semantic=nefor.semantic_type,
+    dispatch=function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result=function() end})
   inv.set_on_kill(function(id) router:dispatch_kill(id); router:forget(id) end)
   inv.set_is_constructed(function(id) return router:is_constructed(id) end)
   router:set_construct(function(record)
@@ -96,27 +96,46 @@ local function harness()
     router:deliver(to,from,content.kind,content)
   end)
   local obs = observer.new({inventory=inv,emit_event=function(event) events[#events + 1] = event end})
-  return {inv=inv,router=router,obs=obs,events=events,persisted=persisted,decisions=decisions}
+  local topology_observer = {apply=function(_, mod)
+    if mod.actors then
+      for _, actor in ipairs(mod.actors) do
+        local function annotate(port)
+          port.endpoint={constructor="ActorEndpoint",value={id=actor.id}}
+          port.type_id=nefor.semantic_type.id(port.type)
+        end
+        annotate(actor.input)
+        for _, port in ipairs(actor.outputs) do annotate(port) end
+      end
+      local routes={
+        {id="subject",from=mod.actors[1].outputs[1],to=mod.actors[2].input,transforms={}},
+        {id="decision",from=mod.actors[2].outputs[1],to=mod.actors[3].input,transforms={}},
+      }
+      local topology_mod={actors=mod.actors,routes=routes,messages={}}
+      local state, err=topo:preflight(topology_mod)
+      if not state then return {ok=false,error=err} end
+      topo:install(topology_mod,state)
+    end
+    return obs:apply(mod)
+  end}
+  return {inv=inv,router=router,obs=topology_observer,events=events,persisted=persisted,decisions=decisions}
 end
 
 local function actors()
-  local text_answer = {kind="named",name="nefor.contracts.TextAnswer",arguments={}}
-  local approved = {kind="named",name="nefor.human.HumanWorkflowApproval",arguments={}}
-  local rejected = {kind="named",name="nefor.human.HumanWorkflowRejection",arguments={}}
-  local decision = {kind="adt",name="nefor.human.HumanWorkflowDecision",arguments={},constructors={
+  local text_answer = {kind="named",name="nefor.contracts.TextAnswer",arguments=nefor.json.mark_array({})}
+  local approved = {kind="named",name="nefor.human.HumanWorkflowApproval",arguments=nefor.json.mark_array({})}
+  local rejected = {kind="named",name="nefor.human.HumanWorkflowRejection",arguments=nefor.json.mark_array({})}
+  local decision = {kind="adt",name="nefor.human.HumanWorkflowDecision",arguments=nefor.json.mark_array({}),constructors={
     {name="Approved",payload=approved},{name="Rejected",payload=rejected},
   }}
   return {
-    {id="produce",factory="producer",type_arguments={},params={},
-      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments={}},wire="generic-provider.ProviderOut"},
-      outputs={{type=text_answer,wire="generic-provider.TextAnswer"}},
-      routes={["generic-provider.TextAnswer"]={{actor="approve",wire="generic-provider.TextAnswer"}}}},
+    {id="produce",factory="producer",type_arguments=nefor.json.mark_array({}),params={},
+      input={type={kind="named",name="nefor.contracts.ProviderInput",arguments=nefor.json.mark_array({})},wire="generic-provider.ProviderOut"},
+      outputs={{type=text_answer,wire="generic-provider.TextAnswer"}}},
     {id="approve",factory="human",type_arguments={decision},params={prompt="Approve the draft?"},
       input={type=text_answer,wire="generic-provider.TextAnswer"},
-      outputs={{type=decision,wire="human.Decision"}},
-      routes={["human.Decision"]={{actor="collect",wire="human.Decision"}}}},
-    {id="collect",factory="collector",type_arguments={},params={},
-      input={type=decision,wire="human.Decision"},outputs={},routes={}},
+      outputs={{type=decision,wire="human.Decision"}}},
+    {id="collect",factory="collector",type_arguments=nefor.json.mark_array({}),params={},
+      input={type=decision,wire="human.Decision"},outputs={}},
   }
 end
 

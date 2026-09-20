@@ -18,6 +18,7 @@ local routing = require("routing")
 local modlog = require("modlog")
 local observer = require("observer")
 local sink = require("factories.sink")
+local Topology = require("topology")
 
 -- ------------------------------------------------------------------
 -- assert helpers
@@ -60,8 +61,38 @@ local function silent_log()
   return { info = noop, warn = noop, error = noop }
 end
 
-local function actor_spec(id, factory, params, routes)
-  return { id = id, factory = factory, type_arguments = {}, params = params or {}, routes = routes or {} }
+local string_type = { kind = "primitive", name = "String" }
+local unit_type = { kind = "primitive", name = "Unit" }
+
+local function endpoint(id)
+  return { constructor = "ActorEndpoint", value = { id = id } }
+end
+
+local function port(id, wire, value_type)
+  return { endpoint = endpoint(id), wire = wire, type = value_type,
+    type_id = nefor.semantic_type.id(value_type) }
+end
+
+local function actor_spec(id, factory, params, _, input_wire, output_wire)
+  local actor = { id = id, factory = factory, type_arguments = {}, params = params or {},
+    input = port(id, input_wire or "stub.In", string_type), outputs = {} }
+  if output_wire ~= false then
+    actor.outputs[1] = port(id, output_wire or "stub.Out", string_type)
+  end
+  return actor
+end
+
+local function typed_route(id, source, destination)
+  return { id = id, from = source.outputs[1], to = destination.input,
+    transforms = {}, product_position = -1 }
+end
+
+local function install_topology(topo, actors, routes, messages)
+  local mod = { actors = actors or {}, routes = routes or {}, messages = messages or {},
+    nodes = {}, kills = {} }
+  local state, topology_error = topo:preflight(mod)
+  assert_true(state ~= nil, "topology preflight: " .. tostring(topology_error))
+  topo:install(mod, state)
 end
 
 -- ==================================================================
@@ -135,7 +166,6 @@ do
       "replayed lifecycle state matches live for " .. id)
     local live, rep = inv.get(id), replayed.get(id)
     assert_eq(rep.factory, live.factory, "replayed factory matches for " .. id)
-    assert_true(deep_equal(rep.routes, live.routes), "replayed routes match for " .. id)
     assert_true(deep_equal(rep.mailbox, live.mailbox), "replayed mailbox matches for " .. id)
   end
 end
@@ -161,23 +191,27 @@ do
     },
     construct = function(id) return { id = id } end,
   })
+  local topo
   local router = routing.new({
     inventory = inv,
     registry = reg,
     log = silent_log(),
     events = emit_event,
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end,
   })
+  topo = Topology.new({ inventory = inv, semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() end })
   inv.set_on_kill(function(id) router:forget(id) end)
   local obs = observer.new({ inventory = inv, emit_event = emit_event })
 
   -- Scripted run: start, spawn two, one becomes ready, the sink completes, kill.
   obs:run_started({ run_id = "run-1", run_name = "demo" })
-  obs:apply({
-    actors = {
-      actor_spec("A", "worker", {}, { ["stub.Out"] = { { actor = "B", wire = "stub.Out" } } }),
-      actor_spec("B", "worker", {}, {}),
-    },
-  })
+  local actor_a = actor_spec("A", "worker")
+  local actor_b = actor_spec("B", "worker", nil, nil, "stub.Out")
+  install_topology(topo, { actor_a, actor_b }, { typed_route("A-B", actor_a, actor_b) })
+  obs:apply({ actors = { actor_a, actor_b } })
 
   -- The factory confirms A ready through its id-signed emitter (as it does
   -- when lazy construction builds it at first activation).
@@ -233,6 +267,7 @@ do
     declaration = { name = "worker", params = {}, inputs = { input = "stub.In" }, outputs = { "stub.Out" } },
     construct = function(id) return { id = id } end,
   })
+  local topo
   local router = routing.new({
     inventory = inv,
     registry = reg,
@@ -241,9 +276,16 @@ do
       persisted[node_id] = nefor.json.decode(nefor.json.encode(output))
       return { output_path = "/runs/test/nodes/" .. node_id .. "/output.json" }
     end,
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end,
   })
+  topo = Topology.new({ inventory = inv, semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() end })
 
-  inv.apply({ actors = { actor_spec("W", "worker", {}, {}) } })
+  local worker = actor_spec("W", "worker")
+  install_topology(topo, { worker }, {})
+  inv.apply({ actors = { worker } })
   local emit_w = router:emitter("W")
   emit_w({ kind = "stub.Out", from = "W", payload = "the-output" })
 
@@ -294,21 +336,29 @@ do
       return i
     end,
   })
-  local router = routing.new({ inventory = inv, registry = reg, log = silent_log() })
+  local topo
+  local router = routing.new({ inventory = inv, registry = reg, log = silent_log(),
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end })
+  topo = Topology.new({ inventory = inv, semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() end })
   inv.set_on_kill(function(id) router:forget(id) end)
   router:set_construct(function(record)
     return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
-  end)
-  inv.set_deliver(function(to, from, content)
-    content = content or {}
-    router:deliver(to, from, content.kind, content)
   end)
 
   local mlog = modlog.new({}) -- in-memory only
   local obs = observer.new({ inventory = inv, emit_event = noop, modlog = mlog })
 
+  local entry_actor = actor_spec("entry", "entry", nil, nil, "seed.In", false)
+  local typed_seed = { to = entry_actor.input, transforms = {}, semantic_type = string_type,
+    semantic_type_id = nefor.semantic_type.id(string_type),
+    content = { kind = "seed.In", value = "go", semantic_value = "go", payload = "go" } }
+  install_topology(topo, { entry_actor }, {}, { typed_seed })
+  inv.set_deliver(function() topo:initial(typed_seed) end)
   local mod = {
-    actors = { actor_spec("entry", "entry", {}, {}) },
+    actors = { entry_actor },
     messages = { { to = "entry", content = { kind = "seed.In", payload = "go" } } },
   }
   local res = obs:apply(mod)
@@ -369,18 +419,28 @@ do
       return { id = id, deliver = function(_) return "ok" end }
     end,
   })
-  local router = routing.new({ inventory = inv, registry = reg, events = function(e) events[#events + 1] = e end })
+  local topo
+  local router = routing.new({ inventory = inv, registry = reg,
+    events = function(e) events[#events + 1] = e end,
+    transform_route = function(actor, wire, arrival) topo:route(actor, wire, arrival) end,
+    output_port = function(actor, wire) return topo:output_port(actor, wire) end })
+  topo = Topology.new({ inventory = inv, semantic = nefor.semantic_type,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = function() end })
   router:set_construct(function(record)
     return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
   end)
-  inv.apply({ actors = {
-    actor_spec("E", "endpoint-observed", {}, { ["stub.Out"] = {
-      { actor = "D1", wire = "stub.Out" }, { actor = "D2", wire = "stub.Out" },
-    } }),
-    actor_spec("D1", "observed-sink", {}, {}),
-    actor_spec("D2", "observed-sink", {}, {}),
-  } })
-  router:deliver("E", "source", "stub.In", { kind = "stub.In", value = "full-value" })
+  local actor_e = actor_spec("E", "endpoint-observed")
+  local actor_d1 = actor_spec("D1", "observed-sink", nil, nil, "stub.Out", false)
+  local actor_d2 = actor_spec("D2", "observed-sink", nil, nil, "stub.Out", false)
+  local actors = { actor_e, actor_d1, actor_d2 }
+  install_topology(topo, actors, {
+    typed_route("E-D1", actor_e, actor_d1), typed_route("E-D2", actor_e, actor_d2),
+  })
+  inv.apply({ actors = actors })
+  topo:initial({ to = actor_e.input, transforms = {}, semantic_type = string_type,
+    semantic_type_id = nefor.semantic_type.id(string_type),
+    content = { kind = "stub.In", value = "full-value", semantic_value = "full-value" } })
   local arrivals, firings = {}, {}
   for _, event in ipairs(events) do
     if event.kind == "mag.arrival" then arrivals[#arrivals + 1] = event end

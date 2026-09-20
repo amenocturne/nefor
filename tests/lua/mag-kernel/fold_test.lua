@@ -5,7 +5,7 @@
 -- Exercises the fold over scripted modification sequences: normal apply,
 -- duplicate spawn (identical + different spec), kill-on-dead, unknown
 -- message-target rejection, id-collision rejection, non-empty rules
--- rejection, plus lifecycle monotonicity and route retention.
+-- rejection, plus lifecycle monotonicity and actor registration.
 
 local inventory = require("inventory")
 
@@ -47,12 +47,12 @@ local function new_inv()
   return inventory.new({ log = log }), rec
 end
 
-local function actor_spec(id, factory, params, routes)
-  return { id = id, factory = factory, type_arguments = {}, params = params or {}, routes = routes or {} }
+local function actor_spec(id, factory, params)
+  return { id = id, factory = factory, type_arguments = {}, params = params or {} }
 end
 
 -- ------------------------------------------------------------------
--- normal apply — spawns register alive, routes retained, message queued
+-- normal apply — spawns register alive, message queued
 -- ------------------------------------------------------------------
 
 do
@@ -76,10 +76,7 @@ do
 
   local entry = inv.get("docs-explorer.entry")
   assert_eq(entry.factory, "adapter", "factory retained")
-  assert_eq(entry.routes["generic-provider.ProviderOut"][1].actor, "docs-explorer.llm",
-    "route destination actor retained verbatim, kernel-side")
-  assert_eq(entry.routes["generic-provider.ProviderOut"][1].wire, "generic-provider.ProviderOut",
-    "route destination wire retained verbatim, kernel-side")
+  assert_eq(entry.routes, nil, "inventory does not own topology")
   assert_eq(#entry.mailbox, 1, "message queued in the bare-VM mailbox (no deliver hook)")
   assert_eq(entry.mailbox[1].prompt, "go", "queued message content preserved")
 end
@@ -245,9 +242,8 @@ do
   assert_true(not res.ok, "actor missing factory is rejected")
   assert_contains(res.error, "factory", "error names the missing factory")
 
-  local res2 = inv.apply({ actors = { actor_spec("y", "llm", {},
-    { ["T"] = { "ok", 7 } }) } })
-  assert_true(not res2.ok, "non-string route destination is rejected")
+  local res2 = inv.apply({ actors = { actor_spec("y", "llm", "invalid") } })
+  assert_true(not res2.ok, "non-table parameters are rejected")
 end
 
 -- ==================================================================
