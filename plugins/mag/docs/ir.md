@@ -10,7 +10,7 @@ instantiation, semantic endpoints, and fixed wire tags before spawning
 anything. Dynamic routes to static actors are validated against the live
 inventory atomically with new actors.
 
-The artifact carries version-3 semantic type nodes directly: primitives,
+The artifact carries version-4 semantic type nodes directly: primitives,
 qualified nominal applications with their concrete substituted bodies, lists,
 maps, ADTs, and ordered products. A named type body may encode its owned fields
 as a `record` object, but no standalone record descriptor is valid.
@@ -40,32 +40,43 @@ Nefor's MAG library owns an explicit versioned application envelope:
 ```json
 {
   "format": "nefor.mag",
-  "version": 3,
+  "version": 4,
   "kind": "program",
   "program": {
     "initial": {
-      "actors": [{ "id": "answer", "factory": "nefor.factory.llm", "params": {} }],
-      "junctions": [{
-        "id": "result",
-        "operation": { "constructor": "Pass", "value": null },
-        "inputs": [{ "endpoint": { "constructor": "JunctionEndpoint", "value": { "id": "result" } }, "wire": "input" }],
-        "outputs": [{ "endpoint": { "constructor": "JunctionEndpoint", "value": { "id": "result" } }, "wire": "output" }]
-      }],
-      "routes": [{
-        "from": { "endpoint": { "constructor": "ActorEndpoint", "value": { "id": "answer" } }, "wire": "nefor.agent.Result" },
-        "to": { "endpoint": { "constructor": "JunctionEndpoint", "value": { "id": "result" } }, "wire": "input" },
-        "product_position": 0
-      }],
+      "actors": [
+        { "id": "answer", "factory": "nefor.factory.llm", "params": {} }
+      ],
+      "routes": [],
       "messages": [],
       "kills": [],
       "nodes": [{ "path": ["answer"], "members": ["answer"] }],
-      "result": { "from": { "endpoint": { "constructor": "JunctionEndpoint", "value": { "id": "result" } }, "wire": "output" } }
+      "result": {
+        "from": {
+          "type": {},
+          "type_id": "sha256:...",
+          "leaves": [
+            {
+              "port": {
+                "endpoint": {
+                  "constructor": "ActorEndpoint",
+                  "value": { "id": "answer" }
+                },
+                "wire": "nefor.agent.Result",
+                "type": {},
+                "type_id": "sha256:..."
+              },
+              "steps": []
+            }
+          ],
+          "through": []
+        }
+      }
     },
     "operations": []
   }
 }
 ```
-
 
 A delta uses the same format/version with `kind: "delta"` and a `delta`
 payload. It has no result boundary or operations. The core compiler remains
@@ -96,10 +107,11 @@ The registry snapshot is plain immutable data. Each entry carries `identity`,
 the parameter schema, and a `type_scheme` containing explicit variables plus
 input and output contracts. Runtime constructors never cross this boundary.
 
-`result.from` selects a typed actor or junction endpoint and wire. The kernel
-validates that the endpoint exists and declares that output. When the selected
-output is emitted, the kernel persists it through the ordinary per-node writer
-and completes the run directly; no sink or output actor is synthesized.
+`result.from` is a typed `StoredBoundary`, not an endpoint. The kernel validates
+each actor-output leaf and its ordered steps, plus each through flow. When a
+selected output is emitted, the kernel applies those steps, persists the
+observed value through the ordinary per-node writer, and completes the run
+directly; no sink or output actor is synthesized.
 
 `mag.load` resolves only against `source_dir` unless the request supplies
 `module_roots`. That optional array is passed to MAG as the complete ordered
@@ -115,9 +127,9 @@ with its content hash. No source environment, cache entry, or callable function
 handle survives compilation.
 
 Execution and apply are distinct closed boundaries. `mag.execute` accepts only
-a version-3 program envelope; `mag.apply` accepts only a version-3 delta
+a version-4 program envelope; `mag.apply` accepts only a version-4 delta
 envelope. Raw unversioned modifications and crossed envelope kinds are rejected
-before application. A program can carry only the version-3
+before application. A program can carry only the version-4
 `InstantiateDeltaTemplate` operation and its closed expression vocabulary; it
 cannot carry source, bytecode, arbitrary MAG functions, or a general runtime
 expression language.
@@ -131,9 +143,22 @@ Nefor MAG envelope.
 ```json
 {
   "actors": [{ "id": "...", "factory": "...", "params": {} }],
-  "junctions": [{ "id": "...", "operation": {}, "inputs": [], "outputs": [] }],
-  "routes": [{ "from": { "endpoint": {}, "wire": "..." }, "to": { "endpoint": {}, "wire": "..." }, "product_position": 0 }],
-  "messages": [{ "to": { "endpoint": {}, "wire": "..." }, "semantic_type": {}, "content": {} }],
+  "routes": [
+    {
+      "from": { "endpoint": {}, "wire": "..." },
+      "to": { "endpoint": {}, "wire": "..." },
+      "transforms": [{ "constructor": "Project", "value": { "index": 0 } }]
+    }
+  ],
+  "messages": [
+    {
+      "to": { "endpoint": {}, "wire": "..." },
+      "transforms": [{ "constructor": "Unit", "value": {} }],
+      "semantic_type": {},
+      "semantic_type_id": "sha256:...",
+      "content": {}
+    }
+  ],
   "kills": ["..."],
   "nodes": [
     { "path": ["stage"], "members": [] },
@@ -143,24 +168,29 @@ Nefor MAG envelope.
 ```
 
 - `actors` — capability instances to spawn: resolved factory, params, typed
-  input/output ports, and id. Actors do not own topology routes.
-- `junctions` — pure structural topology operations such as pass, product
-  split/join, collection, and ADT pack/unpack. They are not actors, factories,
-  or lifecycle nodes.
-- `routes` — kernel-owned typed wiring between nominal actor/junction endpoints.
-  Product positions are explicit and routes remain separate from actor params.
-- `messages` — typed sends to actor or junction ports.
-- `kills` — actor ids to remove. Kill removes capability actors and voids late
-  outputs; junctions are immutable topology definitions rather than killable
-  processes.
+  input/output ports, and opaque runtime id. Actors are the only runtime rows
+  and do not own topology routes.
+- `routes` — kernel-owned typed wiring between actor endpoints. Each route
+  carries an ordered `Transform` list; `Assemble` steps key destination-owned
+  FIFO cohorts by structural path and explicit slot.
+- `messages` — typed sends to actor ports with the same ordered transform
+  representation. Template messages use this shape as well.
+- `kills` — actor ids to remove; fixed transforms have no ids to kill.
 - `nodes` — presentation-only logical hierarchy. Parent paths must exist,
   complete paths are unique, and every actor in a declaring modification has
   exactly one logical owner. Dots in actor ids have no hierarchy semantics.
 
-A program's `initial` modification additionally has one typed structural
-`result` port, which may belong to an actor or junction. A delta has neither a
+A program's `initial` modification additionally has one `result` containing a
+`StoredBoundary` of actor-output leaves and through flows. A delta has neither a
 result boundary nor operations. Declarative operations are siblings of
 `initial` in the program envelope, not fields in a concrete modification.
+
+The ordered transform constructors are deliberately small: `Unit` turns any
+successful input into `Unit`; `Project` selects a product index; `Pack` and
+`Unpack` cross one nominal ADT constructor; `Assemble` contributes one explicit
+slot to a destination-owned FIFO cohort; and `EmptyList` supplies the empty
+fixed-list result. The same representation is used on actor routes, initial
+messages, template routes/messages, and result-boundary leaves/flows.
 
 Consumers reconstruct the recursive presentation tree from flat paths.
 Deterministic best-effort route order affects display only, never firing,
@@ -180,21 +210,22 @@ Graph(n+1) = apply(Graph(n), validate(modification(n)))
 
 Each capability actor is treated as a function: the kernel fires its input message,
 and the actor is a black box until it returns its output. The output follows
-top-level endpoint routes; junctions transform structural values without
-constructing capability actors. The runtime operates over nothing but
-modifications — running a workflow _is_ this fold.
+actor routes after applying their ordered transforms; fixed transforms reshape
+values without constructing capability actors. The runtime operates over
+nothing but modifications — running a workflow _is_ this fold.
 
 ## Running a program — registration, then lazy firing
 
 Program start is one fold application, no barrier. An operation materializes a
-concrete delta: it may spawn, send, kill, and route against actors or junctions already live
+concrete delta: it may spawn, send, kill, and route against actors already live
 in the run, but has no result boundary or nested operations. Applying a
 program's _initial_ modification:
 
-1. **Install** every junction and top-level route, then register every capability
-   actor — id, factory, params, and typed ports. The complete topology and actor
-   input contracts are in place before any message moves, so senders resolve
-   destinations and partial inputs buffer. `mag.actor_spawned` fires per actor.
+1. **Install** every transformed route, then register every capability actor —
+   id, factory, params, and typed ports. The complete topology and actor input
+   contracts are in place before any message moves, so senders resolve
+   destinations and partial assembly inputs buffer. `mag.actor_spawned` fires
+   per actor.
 2. **Deliver** the initial messages. Each delivery feeds the target's firing
    machine; an actor **constructs at its first satisfied input contract**
    (actor-model.md, Lifecycle) — the factory builds the instance, `mag.ready`
@@ -268,16 +299,14 @@ activation; placing the same node behind an incoming `Unit` route suppresses
 that bootstrap and makes it dependency-driven. No second pipe or sequencing
 rule is required.
 
-- **Slot identity is the incoming edge, not the type.** The kernel assembles
-  product activations with per-slot FIFO queues, where each slot is bound to
-  its sender at lowering time (messages are id-signed, routes are
-  directional, so the binding is known statically). This is what makes
-  `(Unit, Unit)` from two different upstreams — or `(Findings, Findings)`
-  from two explorers — unambiguous: two completions of the same sender fill
-  one slot twice, never two slots. One activation per complete set. The slot
-  queues are also the only buffering the lifecycle needs: they accept
-  components from the moment the spec registers, and the assembled first set
-  is what triggers lazy construction (actor-model.md, Lifecycle).
+- **Assembly identity is destination plus structural path plus slot.** An
+  `Assemble` transform creates a destination-owned cohort keyed by the concrete
+  actor destination and `Assembly.path`. The cohort owns one FIFO per explicit
+  slot; a complete activation consumes one value from each slot in slot order.
+  Thus `(Unit, Unit)` from two upstreams — or `(Findings, Findings)` from two
+  explorers — remains unambiguous, and one producer can feed distinct slots.
+  Two completions from one sender fill the same slot twice, never another slot.
+  Incomplete cohorts do not activate an actor or fabricate completion.
 - **Reserved status types are kernel-emitted.** Route keys matching the
   factory's declared output types dispatch from the returned value; reserved
   route keys `mag.Unit` (successful completion) and `mag.Failed` (generic
@@ -382,10 +411,12 @@ initial-execute rejection is itself terminal.
 
 ## Declarative operations are closed data
 
-Version 3 defines one operation: `InstantiateDeltaTemplate`. It subscribes to a
-concrete typed source output, captures immutable values, and materializes a
-structural delta template from exactly five expression forms: `Trigger`,
-`Capture`, `Field`, `IntToDecimalString`, and `ConcatStrings`.
+Version 4 defines one operation: `InstantiateDeltaTemplate`. It subscribes to a
+concrete typed source output, captures immutable values, and materializes an
+actor-only delta template from exactly five expression forms: `Trigger`,
+`Capture`, `Field`, `IntToDecimalString`, and `ConcatStrings`. Template routes
+and messages retain ordered fixed transforms; no transform is a template entity
+or reference target.
 
 Each run registers its ordered operation list before initial application. A
 matching canonical output contributes one trigger occurrence to a run-local

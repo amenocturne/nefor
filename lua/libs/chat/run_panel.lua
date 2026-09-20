@@ -181,8 +181,7 @@ end
 local function group_row_widget(group, depth, now_ms, selected)
   local style = selected and CURSOR_ROW_STYLE or NODE_STYLE[group.status] or STYLE.status_dim
   -- Composite counts describe the same authored hierarchy as their state:
-  -- direct logical children, never flattened capability actors; topology
-  -- junctions are not lifecycle rows.
+  -- direct logical children, never flattened capability actors.
   local n = #group.children > 0 and #group.children or #group.members
   local count = n > 1 and (" (" .. n .. ")") or ""
   return tui.row { gap = 0, children = {

@@ -81,18 +81,18 @@ do
     inventory={pairs=function() return pairs({}) end},
     semantic=nefor.semantic_type,
     dispatch=function() end,
-    observe=function() return true end,
+    settle_result=function() end,
   })
   local source, destination = actor("source"), actor("destination")
   local spoofed = port("source", "stub.Nope")
-  local state, err = topology:preflight({actors={source,destination},junctions={},messages={},nodes={},kills={},routes={{
-    id="bad-route",from=spoofed,to=destination.input,product_position=-1,
+  local state, err = topology:preflight({actors={source,destination},messages={},nodes={},kills={},routes={{
+    id="bad-route",from=spoofed,to=destination.input,transforms={},
   }}})
-  assert_true(state == nil and err:match("source port is not declared"),
+  assert_true(state == nil and err:match("source is not a declared actor output"),
     "topology rejects a route from an undeclared output")
 
-  state, err = topology:preflight({actors={source,destination},junctions={},messages={},nodes={},kills={},routes={{
-    id="good-route",from=source.outputs[1],to=destination.input,product_position=-1,
+  state, err = topology:preflight({actors={source,destination},messages={},nodes={},kills={},routes={{
+    id="good-route",from=source.outputs[1],to=destination.input,transforms={},
   }}})
   assert_true(state ~= nil and err == nil, "topology accepts declared compatible ports")
   assert_eq(source.outputs[1].type_id, string_id, "fixture carries semantic identity")

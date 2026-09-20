@@ -333,6 +333,9 @@ local function exact_modification(value, fields, context)
   for key in pairs(value) do
     if not fields[key] then return nil, context .. " has unknown field " .. tostring(key) end
   end
+  for key in pairs(fields) do
+    if value[key] == nil then return nil, context .. " requires " .. key end
+  end
   return copy(value)
 end
 
@@ -345,6 +348,27 @@ local function unpack(value, context)
     return nil, tostring(context) .. " must be a compiler-owned packed value"
   end
   return copy(value.value)
+end
+
+local function validate_boundary(value, context)
+  local ok, err = exact_fields(value,
+    { type = true, type_id = true, leaves = true, through = true }, context)
+  if not ok then return nil, err end
+  if type(value.type_id) ~= "string" or type(value.leaves) ~= "table"
+      or type(value.through) ~= "table" then
+    return nil, context .. " is malformed"
+  end
+  for index, leaf in ipairs(value.leaves) do
+    local leaf_ok, leaf_err = exact_fields(leaf, { port = true, steps = true },
+      context .. ".leaves[" .. index .. "]")
+    if not leaf_ok then return nil, leaf_err end
+  end
+  for index, flow in ipairs(value.through) do
+    local flow_ok, flow_err = exact_fields(flow, { steps = true },
+      context .. ".through[" .. index .. "]")
+    if not flow_ok then return nil, flow_err end
+  end
+  return true
 end
 
 local function unpack_template_payload(payload, context)
@@ -402,8 +426,8 @@ local function unpack_operations(operations)
 end
 
 function M.decode_artifact(artifact)
-  if type(artifact) ~= "table" or artifact.format ~= "nefor.mag" or artifact.version ~= 3 then
-    return nil, "artifact must be a nefor.mag version 3 envelope"
+  if type(artifact) ~= "table" or artifact.format ~= "nefor.mag" or artifact.version ~= 4 then
+    return nil, "artifact must be a nefor.mag version 4 envelope"
   end
   if artifact.kind == "program" then
     local ok, envelope_error = exact_fields(artifact,
@@ -415,10 +439,13 @@ function M.decode_artifact(artifact)
       return nil, envelope_error or "program.operations must be a list"
     end
     local initial, initial_error = exact_modification(artifact.program.initial, {
-      types = true, actors = true, junctions = true, routes = true,
+      types = true, actors = true, routes = true,
       messages = true, nodes = true, kills = true, result = true,
     }, "program.initial")
     if not initial then return nil, initial_error end
+    local boundary_ok, boundary_error = validate_boundary(initial.result and initial.result.from,
+      "program.initial.result.from")
+    if not boundary_ok then return nil, boundary_error end
     local modification, modification_error = unpack_modification(initial, "program.initial")
     if not modification then return nil, modification_error end
     local operations, operations_error = unpack_operations(artifact.program.operations)
@@ -430,7 +457,7 @@ function M.decode_artifact(artifact)
       { format = true, version = true, kind = true, delta = true }, "delta envelope")
     if not ok then return nil, envelope_error end
     local delta, delta_error = exact_modification(artifact.delta, {
-      types = true, actors = true, junctions = true, routes = true,
+      types = true, actors = true, routes = true,
       messages = true, nodes = true, kills = true,
     }, "delta")
     if not delta then return nil, delta_error end
@@ -477,10 +504,11 @@ local function template_port(port)
 end
 
 local function endpoint_ref(endpoint)
-  if type(endpoint) ~= "table" then return "<invalid-endpoint>" end
+  if type(endpoint) ~= "table" or endpoint.constructor ~= "ActorEndpoint" then
+    return "<invalid-actor-endpoint>"
+  end
   local value = type(endpoint.value) == "table" and endpoint.value or {}
-  local prefix = endpoint.constructor == "JunctionEndpoint" and "junction:" or "actor:"
-  return prefix .. tostring(value.id or "<invalid-id>")
+  return "actor:" .. tostring(value.id or "<invalid-id>")
 end
 
 local function port_ref(port)
@@ -493,37 +521,68 @@ local function append_actor(lines, prefix, actor)
     tostring(actor.id or actor.slot), tostring(actor.factory), format_params(actor.params))
 end
 
+local function format_transform(transform)
+  if type(transform) ~= "table" then return tostring(transform) end
+  local constructor = tostring(transform.constructor or "transform")
+  local value = transform.value
+  if type(value) ~= "table" then return constructor end
+  local fields = {}
+  for key, item in pairs(value) do fields[#fields + 1] = tostring(key) .. "=" .. format_value(item) end
+  table.sort(fields)
+  return constructor .. (#fields > 0 and " {" .. table.concat(fields, ", ") .. "}" or "")
+end
+
+local function append_transforms(lines, prefix, transforms)
+  if type(transforms) ~= "table" or #transforms == 0 then
+    lines[#lines + 1] = prefix .. " transforms: (identity)"
+    return
+  end
+  for index, transform in ipairs(transforms) do
+    lines[#lines + 1] = string.format("%s transform[%d]: %s", prefix, index,
+      format_transform(transform))
+  end
+end
+
+local function append_boundary(lines, boundary)
+  if type(boundary) ~= "table" then return end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Result boundary: " .. tostring(boundary.type_id or "<unknown type>")
+  lines[#lines + 1] = string.format("  leaves: %d, through: %d",
+    #(boundary.leaves or {}), #(boundary.through or {}))
+  for index, leaf in ipairs(boundary.leaves or {}) do
+    lines[#lines + 1] = string.format("  leaf[%d]: %s", index, port_ref(leaf.port))
+    append_transforms(lines, "    ", leaf.steps)
+  end
+  for index, flow in ipairs(boundary.through or {}) do
+    lines[#lines + 1] = string.format("  through[%d]:", index)
+    append_transforms(lines, "    ", flow.steps)
+  end
+end
+
 -- Format a versioned immutable program or delta envelope without mutating it.
 function M.preview(artifact, hash, factories)
   local decoded, error = M.decode_artifact(artifact)
   if not decoded then return "(invalid MAG artifact: " .. tostring(error) .. ")" end
   local modification = decoded.modification
-  local actors, junctions = modification.actors or {}, modification.junctions or {}
+  local actors = modification.actors or {}
   local routes, messages = modification.routes or {}, modification.messages or {}
   local operations = decoded.operations or {}
   local lines = {}
   lines[#lines + 1] = string.format(
-    "%s envelope: %d actors, %d junctions, %d routes, %d messages, %d operations",
+    "%s envelope: %d actors, %d routes, %d messages, %d operations",
     decoded.kind == "program" and "Program" or "Delta",
-    #actors, #junctions, #routes, #messages, #operations)
+    #actors, #routes, #messages, #operations)
   lines[#lines + 1] = "Hash: " .. tostring(hash)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Initial actors:"
   for _, actor in ipairs(actors) do append_actor(lines, "", actor) end
-  if #junctions > 0 then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "Topology junctions:"
-    for _, junction in ipairs(junctions) do
-      lines[#lines + 1] = string.format("  %s (%s)", tostring(junction.id),
-        tostring(junction.operation and junction.operation.constructor or "junction"))
-    end
-  end
   if #routes > 0 then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Routes:"
-    for _, route in ipairs(routes) do
-      lines[#lines + 1] = string.format("  %s -> %s [position %s]",
-        port_ref(route.from), port_ref(route.to), tostring(route.product_position))
+    for index, route in ipairs(routes) do
+      lines[#lines + 1] = string.format("  route[%d]: %s -> %s",
+        index, port_ref(route.from), port_ref(route.to))
+      append_transforms(lines, "    ", route.transforms)
     end
   end
 
@@ -532,34 +591,35 @@ function M.preview(artifact, hash, factories)
     lines[#lines + 1] = ""
     lines[#lines + 1] = string.format("Operation %d: %s on %s", index,
       tostring(operation.id), template_port(operation.on))
-    lines[#lines + 1] = string.format("  Template: %d actors, %d junctions, %d routes, %d messages",
-      #(template.actors or {}), #(template.junctions or {}),
-      #(template.routes or {}), #(template.messages or {}))
+    lines[#lines + 1] = string.format("  Template: %d actors, %d routes, %d messages",
+      #(template.actors or {}), #(template.routes or {}), #(template.messages or {}))
     for _, actor in ipairs(template.actors or {}) do
       append_actor(lines, "[" .. template_actor_address(operation.id, actor.slot) .. "] ", actor)
     end
-    for _, route in ipairs(template.routes or {}) do
-      lines[#lines + 1] = string.format("    route: %s -> %s [position %s]",
-        template_port(route.from), template_port(route.to), tostring(route.product_position))
+    for route_index, route in ipairs(template.routes or {}) do
+      lines[#lines + 1] = string.format("    route[%d]: %s -> %s",
+        route_index, template_port(route.from), template_port(route.to))
+      append_transforms(lines, "      ", route.transforms)
     end
-    for _, message in ipairs(template.messages or {}) do
-      lines[#lines + 1] = "    message -> " .. template_port(message.to)
+    for message_index, message in ipairs(template.messages or {}) do
+      lines[#lines + 1] = string.format("    message[%d] -> %s",
+        message_index, template_port(message.to))
+      append_transforms(lines, "      ", message.transforms)
     end
   end
 
   if #messages > 0 then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Initial messages:"
-    for _, msg in ipairs(messages) do
+    for index, msg in ipairs(messages) do
       local kind = type(msg.content) == "table" and msg.content.kind or nil
-      lines[#lines + 1] = string.format("  -> %s (%s)", port_ref(msg.to), tostring(kind or "message"))
+      lines[#lines + 1] = string.format("  message[%d] -> %s (%s)", index,
+        port_ref(msg.to), tostring(kind or "message"))
+      append_transforms(lines, "    ", msg.transforms)
     end
   end
   local result = type(modification.result) == "table" and modification.result.from or nil
-  if type(result) == "table" then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "Result: " .. port_ref(result)
-  end
+  append_boundary(lines, result)
   if type(factories) == "table" and #factories > 0 then
     local names = {}
     for _, factory in ipairs(factories) do names[#names + 1] = tostring(factory) end

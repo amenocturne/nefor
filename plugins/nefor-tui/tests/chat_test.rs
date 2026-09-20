@@ -2214,10 +2214,10 @@ fn slash_new_clears_panel_runs() {
 //
 // The kernel's `mag.*` lifecycle stream drives the sidebar run panel.
 // Kernel runs are concurrent and every event carries its run_id; the
-// surface keys panel state straight off it. The panel groups actors by
-// top-level namespace segment — an agent's whole subtree collapses to a
-// single group row. The panel is visible by default; Ctrl+B toggles it
-// off. Linger handling is pure-update plus a view-side filter, so a
+// surface keys panel state straight off it. The panel renders the
+// compiler-authored logical hierarchy; dotted actor IDs are opaque and do not
+// imply namespace grouping. The panel is visible by default; Ctrl+B toggles
+// it off. Linger handling is pure-update plus a view-side filter, so a
 // completed run drops after `LINGER_MS` of engine time.
 #[test]
 fn mag_run_lifecycle_renders_in_run_panel() {
@@ -2234,8 +2234,8 @@ fn mag_run_lifecycle_renders_in_run_panel() {
         }),
     );
     // Actor events carry their run_id — the surface keys them into that
-    // run's panel entry. Two actors in the same namespace collapse into
-    // one `explorer` group row.
+    // run's panel entry. The fixture declares both actors under one
+    // explicit `explorer` logical node.
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.actor_spawned", "run_id": "mag-demo-1", "id": "explorer.entry", "factory": "llm" }),
@@ -2243,6 +2243,13 @@ fn mag_run_lifecycle_renders_in_run_panel() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.actor_spawned", "run_id": "mag-demo-1", "id": "explorer.loop-counter", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "mag-demo-1",
+            "nodes": [{ "path": ["explorer"], "members": ["explorer.entry", "explorer.loop-counter"] }]
+        }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -2324,6 +2331,20 @@ fn workflow_sidebar_uses_compact_protected_row_grammar() {
                 "factory": "fixture" }),
         );
     }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "grammar-run",
+            "nodes": [
+                { "path": ["lead"], "members": [] },
+                { "path": ["lead", "entry"], "members": ["lead.entry"] },
+                { "path": ["lead", "llm"], "members": ["lead.llm"] },
+                { "path": ["lead", "run-tool"], "members": ["lead.run-tool"] },
+                { "path": ["lead", "tool-result"], "members": ["lead.tool-result"] },
+                { "path": ["result"], "members": ["result"] }
+            ]
+        }),
+    );
     for id in ["lead.entry", "lead.run-tool", "lead.tool-result"] {
         dispatch_event(
             &mut engine,
@@ -2395,6 +2416,13 @@ fn mag_killed_actor_renders_distinct_glyph() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.actor_killed", "run_id": "mag-kill-1", "id": "writer.draft" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "mag-kill-1",
+            "nodes": [{ "path": ["writer"], "members": ["writer.draft"] }]
+        }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -2653,6 +2681,16 @@ fn mag_failed_run_member_row_reads_failed() {
         &mut engine,
         json!({ "kind": "mag.actor_killed", "run_id": "run-fmlabel", "id": "writer.draft", "reason": "run_failed" }),
     );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "run-fmlabel",
+            "nodes": [
+                { "path": ["writer"], "members": [] },
+                { "path": ["writer", "draft"], "members": ["writer.draft"] }
+            ]
+        }),
+    );
 
     // Focus the sidebar and unfold the (default-collapsed) `writer` group so
     // its member leaf row paints its status word.
@@ -2676,9 +2714,9 @@ fn mag_failed_run_member_row_reads_failed() {
     );
 }
 
-// Grouping across multiple agents: a two-agent run (explorer.* + writer.*)
-// plus a standalone `sink` actor collapses to exactly three group rows.
-// Killing the whole writer subtree marks only the writer group ⊗; the
+// Explicit hierarchy across multiple agents: a two-agent run (explorer +
+// writer) plus an intentional `result` row produces exactly three logical
+// rows. Killing the whole writer subtree marks only the writer group ⊗; the
 // explorer group keeps running.
 #[test]
 fn mag_two_agent_run_groups_by_namespace() {
@@ -2710,10 +2748,21 @@ fn mag_two_agent_run_groups_by_namespace() {
             json!({ "kind": "mag.actor_spawned", "run_id": "mag-multi-1", "id": id, "factory": "llm" }),
         );
     }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "mag-multi-1",
+            "nodes": [
+                { "path": ["explorer"], "members": ["explorer.entry", "explorer.exhaust"] },
+                { "path": ["writer"], "members": ["writer.plan", "writer.draft"] },
+                { "path": ["result"], "members": ["sink"] }
+            ]
+        }),
+    );
     let out = render_str(&mut engine);
     assert!(
-        out.contains("explorer") && out.contains("writer") && out.contains("sink"),
-        "all three group rows should be present: {out:?}"
+        out.contains("explorer") && out.contains("writer") && out.contains("result"),
+        "all three logical rows should be present: {out:?}"
     );
     assert!(
         !out.contains("explorer.entry") && !out.contains("writer.plan"),
@@ -2722,7 +2771,7 @@ fn mag_two_agent_run_groups_by_namespace() {
     assert_eq!(
         glyphs(&out),
         3,
-        "five actors across three namespaces should render exactly 3 group rows: {out:?}"
+        "five actors across three explicit logical rows should render exactly 3 rows: {out:?}"
     );
     assert!(
         out.contains("(0/3)"),
@@ -4780,7 +4829,7 @@ fn mag_human_approval_is_run_addressed_and_cancel_safe() {
     );
     assert_eq!(
         body.pointer("/artifact/version").and_then(|v| v.as_u64()),
-        Some(3)
+        Some(4)
     );
     assert_eq!(
         body.pointer("/artifact/delta/messages/0/to/endpoint/value/id")
@@ -9292,6 +9341,16 @@ fn engine_with_scoped_worker() -> Engine {
     );
     dispatch_event(
         &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "sub-1",
+            "nodes": [
+                { "path": ["worker"], "members": [] },
+                { "path": ["worker", "llm"], "members": ["worker.llm"] }
+            ]
+        }),
+    );
+    dispatch_event(
+        &mut engine,
         json!({ "kind": "mag.actor_ready", "run_id": "sub-1", "id": "worker.llm" }),
     );
     dispatch_event(
@@ -9331,6 +9390,17 @@ fn groups_default_collapsed_and_enter_toggles_fold() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "mag.actor_spawned", "run_id": "mag-focus-1", "id": "explorer.loop-counter", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "mag-focus-1",
+            "nodes": [
+                { "path": ["explorer"], "members": [] },
+                { "path": ["explorer", "entry"], "members": ["explorer.entry"] },
+                { "path": ["explorer", "loop-counter"], "members": ["explorer.loop-counter"] }
+            ]
+        }),
     );
 
     // Unfocused sidebar: grouped + collapsed.
@@ -9763,6 +9833,17 @@ fn engine_with_cycling_group() -> Engine {
     }
     dispatch_event(
         &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "loop-1",
+            "nodes": [
+                { "path": ["lead"], "members": [] },
+                { "path": ["lead", "llm"], "members": ["lead.llm"] },
+                { "path": ["lead", "run-tool"], "members": ["lead.run-tool"] }
+            ]
+        }),
+    );
+    dispatch_event(
+        &mut engine,
         json!({ "kind": "mag.actor_ready", "run_id": "loop-1", "id": "lead.llm" }),
     );
     dispatch_event(
@@ -9798,6 +9879,19 @@ fn workflow_rows_keep_semantic_fields_contiguous_across_sidebar_widths() {
             }),
         );
     }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "layout-1",
+            "nodes": [
+                { "path": ["lead"], "members": [] },
+                { "path": ["lead", "entry"], "members": ["lead.entry"] },
+                { "path": ["lead", "worker"], "members": ["lead.worker"] },
+                { "path": ["result"], "members": ["result"] },
+                { "path": ["tâche"], "members": ["tâche.worker"] }
+            ]
+        }),
+    );
     for kind in ["mag.actor_ready", "mag.actor_busy"] {
         dispatch_event(
             &mut engine,
@@ -11366,7 +11460,7 @@ fn tui_projects_generic_diagnostics_without_factory_specific_renderer() {
     );
     let header_row = frame
         .lines()
-        .position(|line| line.contains("node · custom / node"));
+        .position(|line| line.contains("node · custom.node"));
     let body_row = frame
         .lines()
         .position(|line| line.contains("LIVE THIRD PARTY CONTENT"));
@@ -11378,7 +11472,7 @@ fn tui_projects_generic_diagnostics_without_factory_specific_renderer() {
         "inspector must keep header above its flex body and pin the footer below it:\n{frame}"
     );
     assert!(
-        frame.contains("node · custom / node") && !frame.contains("[read-only]"),
+        frame.contains("node · custom.node") && !frame.contains("[read-only]"),
         "shared shell identity missing:\n{frame}"
     );
     assert!(
@@ -12059,6 +12153,13 @@ fn agent_group_inspector_shows_its_initial_assignment() {
             "kind": "mag.actor_spawned", "run_id": "assignment-run",
             "id": "worker.llm", "factory": "llm",
             "spec": { "params": { "system": "base instructions\n\n---\n\nImplement the bounded fix." } }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.nodes_declared", "run_id": "assignment-run",
+            "nodes": [{ "path": ["worker"], "members": ["worker.entry", "worker.llm"] }]
         }),
     );
 

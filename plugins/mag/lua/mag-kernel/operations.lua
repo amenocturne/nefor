@@ -30,12 +30,10 @@ local function endpoint(ref)
   local constructor=ref.constructor
   if constructor=="LocalActorRef" then return "actor","local",ref.value.slot end
   if constructor=="ExistingActorRef" then return "actor","existing",ref.value.id end
-  if constructor=="LocalJunctionRef" then return "junction","local",ref.value.slot end
-  if constructor=="ExistingJunctionRef" then return "junction","existing",ref.value.id end
   return nil
 end
 local function endpoint_value(kind,id)
-  return {constructor=kind=="actor" and "ActorEndpoint" or "JunctionEndpoint",value={id=id}}
+  return {constructor="ActorEndpoint",value={id=id}}
 end
 local function port_value(port,ids)
   local kind,scope,name=endpoint(port.endpoint)
@@ -52,9 +50,6 @@ local function initial_outputs(initial)
   local values={}
   for _,actor in ipairs((initial and initial.actors) or {}) do
     for _,port in ipairs(actor.outputs or {}) do values[nefor.json.encode(port.endpoint).."/"..port.wire]=port end
-  end
-  for _,junction in ipairs((initial and initial.junctions) or {}) do
-    for _,port in ipairs(junction.outputs or {}) do values[nefor.json.encode(port.endpoint).."/"..port.wire]=port end
   end
   return values
 end
@@ -86,8 +81,11 @@ local function preflight(initial,operations,registry)
     if not source or source.type_id~=operation.on.type_id then return nil,label.." trigger is not an initial endpoint output" end
     ok,err=validate_typed(operation.on.type,operation.on.type_id,label..".on"); if not ok then return nil,err end
     local boundary=initial and initial.result and initial.result.from
-    if type(boundary)=="table" and boundary.wire==operation.on.wire and same_endpoint(boundary.endpoint,operation.on.endpoint) then
-      return nil,label.." may not bind the result boundary"
+    for _,leaf in ipairs(type(boundary)=="table" and (boundary.leaves or {}) or {}) do
+      local port=leaf.port
+      if port.wire==operation.on.wire and same_endpoint(port.endpoint,operation.on.endpoint) then
+        return nil,label.." may not bind the result boundary"
+      end
     end
     if type(operation.captures)~="table" or not dense(operation.expressions) or #operation.expressions==0 then
       return nil,label.." captures/expressions are malformed"
@@ -133,8 +131,8 @@ local function preflight(initial,operations,registry)
       expression_types[expression.id]=descriptor
     end
     local template=operation.template
-    ok,err=exact(template,{types=true,actors=true,junctions=true,routes=true,messages=true,nodes=true,actor_reference_relocations=true},label..".template"); if not ok then return nil,err end
-    for _,field in ipairs({"actors","junctions","routes","messages","nodes","actor_reference_relocations"}) do
+    ok,err=exact(template,{types=true,actors=true,routes=true,messages=true,nodes=true,actor_reference_relocations=true},label..".template"); if not ok then return nil,err end
+    for _,field in ipairs({"actors","routes","messages","nodes","actor_reference_relocations"}) do
       if not dense(template[field]) then return nil,label..".template."..field.." must be a dense list" end
     end
     local declarations_ok,declarations=pcall(nefor.semantic_type.validate_declarations,template.types)
@@ -170,9 +168,6 @@ local function preflight(initial,operations,registry)
         for _,path in ipairs(paths) do if overlapping(path,binding.path) then return nil,label.." parameter bindings overlap" end end
         paths[#paths+1]=binding.path
       end
-    end
-    for junction_index,junction in ipairs(template.junctions) do
-      ok,err=add_slot("junction",junction,string.format("%s.template.junctions[%d]",label,junction_index)); if not ok then return nil,err end
     end
     local relocation_seen={}
     for _,relocation in ipairs(template.actor_reference_relocations) do
@@ -221,20 +216,15 @@ local function preflight(initial,operations,registry)
       local kind,scope,name=endpoint(actor.input.endpoint); if kind~="actor" or scope~="local" or name~=actor.slot then return nil,label.." actor input ownership differs" end
       for _,output in ipairs(actor.outputs or {}) do ok,err=validate_port(output,label.." actor output"); if not ok then return nil,err end end
     end
-    for _,junction in ipairs(template.junctions) do
-      for _,input in ipairs(junction.inputs or {}) do ok,err=validate_port(input,label.." junction input"); if not ok then return nil,err end end
-      for _,output in ipairs(junction.outputs or {}) do ok,err=validate_port(output,label.." junction output"); if not ok then return nil,err end end
-    end
     for _,route in ipairs(template.routes) do
       ok,err=validate_port(route.from,label.." route source"); if not ok then return nil,err end
       ok,err=validate_port(route.to,label.." route destination"); if not ok then return nil,err end
-      local to_kind=endpoint(route.to.endpoint)
-      if to_kind=="junction" and route.product_position~=-1 then return nil,label.." route to junction requires product_position -1" end
+      if not dense(route.transforms) then return nil,label.." route transforms must be a dense list" end
     end
     for _,message in ipairs(template.messages) do
       ok,err=validate_port(message.to,label.." message target"); if not ok then return nil,err end
       ok,err=validate_typed(message.semantic_type,message.semantic_type_id,label.." message"); if not ok then return nil,err end
-      if message.semantic_type_id~=message.to.type_id then return nil,label.." message type differs from its target" end
+      if not dense(message.transforms) then return nil,label.." message transforms must be a dense list" end
       if type(message.content)~="table" then return nil,label.." malformed message content" end
       if message.content.constructor=="Expression" then
         if type_id(expression_types[message.content.value])~=message.semantic_type_id then return nil,label.." message expression type differs" end
@@ -246,7 +236,6 @@ local function preflight(initial,operations,registry)
     end
     local normalized=plain_data.copy(operation)
     local trigger_endpoint=normalized.on.endpoint
-    local trigger_kind=trigger_endpoint.constructor=="ActorEndpoint" and "actor" or "junction"
     local trigger_id=trigger_endpoint.value.id
     for _,node in ipairs(normalized.template.nodes) do
       if not dense(node.path) or #node.path==0 or not dense(node.members) then return nil,label.." malformed template logical node" end
@@ -263,7 +252,6 @@ local function preflight(initial,operations,registry)
         elseif segment.constructor~="TriggerPathSegment" or index~=1 then return nil,label.." invalid trigger path segment" end
       end
       if node.path[1] and node.path[1].constructor=="TriggerPathSegment" then
-        if trigger_kind~="actor" then return nil,label.." trigger junction has no logical actor path" end
         local owner
         for _,initial_node in ipairs((initial and initial.nodes) or {}) do
           for _,member in ipairs(initial_node.members or {}) do if member==trigger_id then if owner then return nil,label.." trigger actor has multiple logical owners" end; owner=initial_node.path end end
@@ -279,18 +267,14 @@ local function preflight(initial,operations,registry)
     -- are the only dynamic topology fields; signature and route rules are the
     -- same rules used by static apply, including actor-free workers.
     local placeholder_ids, reserved = {}, {}
-    for _,kind in ipairs({"actors","junctions"}) do
-      for _,definition in ipairs(initial[kind] or {}) do reserved[definition.id]=true end
-    end
+    for _,definition in ipairs(initial.actors or {}) do reserved[definition.id]=true end
     for key in pairs(slots) do
       local id="template:"..key
       while reserved[id] do id=id..":" end
       reserved[id]=true; placeholder_ids[key]=id
     end
-    local topology_mod={actors={},junctions={},routes={},messages={},nodes={},kills={},types=plain_data.copy(template.types)}
-    for _,kind in ipairs({"actors","junctions"}) do
-      for _,definition in ipairs(initial[kind] or {}) do topology_mod[kind][#topology_mod[kind]+1]=plain_data.copy(definition) end
-    end
+    local topology_mod={actors={},routes={},messages={},nodes={},kills={},types=plain_data.copy(template.types)}
+    for _,definition in ipairs(initial.actors or {}) do topology_mod.actors[#topology_mod.actors+1]=plain_data.copy(definition) end
     for _,route in ipairs(initial.routes or {}) do topology_mod.routes[#topology_mod.routes+1]=plain_data.copy(route) end
     local local_actors={}
     for _,actor in ipairs(template.actors) do
@@ -299,19 +283,12 @@ local function preflight(initial,operations,registry)
       for i,port in ipairs(actor.outputs or {}) do value.outputs[i]=port_value(port,placeholder_ids) end
       topology_mod.actors[#topology_mod.actors+1]=value; local_actors[#local_actors+1]=value
     end
-    for _,junction in ipairs(template.junctions) do
-      local value=plain_data.copy(junction)
-      value.id=placeholder_ids["junction:"..junction.slot]; value.inputs={}; value.outputs={}
-      for i,port in ipairs(junction.inputs or {}) do value.inputs[i]=port_value(port,placeholder_ids) end
-      for i,port in ipairs(junction.outputs or {}) do value.outputs[i]=port_value(port,placeholder_ids) end
-      topology_mod.junctions[#topology_mod.junctions+1]=value
-    end
     for i,route in ipairs(template.routes) do
       topology_mod.routes[i]={id="template-route:"..i,from=port_value(route.from,placeholder_ids),
-        to=port_value(route.to,placeholder_ids),product_position=route.product_position}
+        to=port_value(route.to,placeholder_ids),transforms=plain_data.copy(route.transforms)}
     end
     local topology=Topology.new({inventory={pairs=function() return pairs({}) end},semantic=nefor.semantic_type,
-      dispatch=function() end,observe=function() return true end})
+      dispatch=function() end,settle_result=function() return true end})
     local state,topology_error=topology:preflight(topology_mod)
     if not state then return nil,label..": "..tostring(topology_error) end
     local actor_check=registry:validate_modification({actors=local_actors})
@@ -356,7 +333,6 @@ function M.materialize(operation,trigger_value)
     ids[kind..":"..definition.slot]=id; used[kind..":"..id]=true; return true
   end
   for _,actor in ipairs(template.actors) do local ok,err=bind("actor",actor); if not ok then return nil,err end end
-  for _,junction in ipairs(template.junctions) do local ok,err=bind("junction",junction); if not ok then return nil,err end end
   local types=plain_data.copy(template.types)
   local function declare(port) types[port.type_id]=plain_data.copy(port.type) end
   local actors={}; local actor_by_slot={}
@@ -376,24 +352,17 @@ function M.materialize(operation,trigger_value)
       set_path(actor.params,relocation.path,result)
     end
   end
-  local junctions={}
-  for _,source in ipairs(template.junctions) do
-    local junction={id=ids["junction:"..source.slot],operation=plain_data.copy(source.operation),inputs={},outputs={}}
-    for index,input in ipairs(source.inputs) do junction.inputs[index]=port_value(input,ids); declare(junction.inputs[index]) end
-    for index,output in ipairs(source.outputs) do junction.outputs[index]=port_value(output,ids); declare(junction.outputs[index]) end
-    junctions[#junctions+1]=junction
-  end
   local routes={}
   for index,source in ipairs(template.routes) do
     local from,to=port_value(source.from,ids),port_value(source.to,ids); declare(from); declare(to)
-    routes[index]={id=edge_id(from,to),from=from,to=to,product_position=source.product_position}
+    routes[index]={id=edge_id(from,to),from=from,to=to,transforms=plain_data.copy(source.transforms)}
   end
   local messages={}
   for index,source in ipairs(template.messages) do
     local to=port_value(source.to,ids); declare(to)
     local value=source.content.constructor=="Static" and plain_data.copy(source.content.value)
       or {kind=to.wire,value=plain_data.copy(values[source.content.value])}
-    messages[index]={to=to,semantic_type=plain_data.copy(source.semantic_type),semantic_type_id=source.semantic_type_id,content=value}
+    messages[index]={to=to,transforms=plain_data.copy(source.transforms),semantic_type=plain_data.copy(source.semantic_type),semantic_type_id=source.semantic_type_id,content=value}
   end
   local nodes={}
   for index,source in ipairs(template.nodes) do
@@ -401,7 +370,7 @@ function M.materialize(operation,trigger_value)
     local members={}; for member,ref in ipairs(source.members) do members[member]=ids["actor:"..ref.slot] end
     nodes[index]={path=path,members=members}
   end
-  return {types=types,actors=actors,junctions=junctions,routes=routes,messages=messages,nodes=nodes,kills={}}
+  return {types=types,actors=actors,routes=routes,messages=messages,nodes=nodes,kills={}}
 end
 
 return M

@@ -1874,18 +1874,19 @@ artifact(composed)
     )
     .unwrap();
 
-    assert_eq!(
-        program["id"],
-        "nefor.node.composite:8:fallible3:>=>19:continuation-result"
-    );
+    assert_eq!(program["id"], "fallible");
     assert_eq!(program["actors"], json!([]));
-    let junctions = program["junctions"].as_array().unwrap();
-    assert!(junctions
-        .iter()
-        .any(|junction| junction["operation"]["constructor"] == "AdtUnpack"));
-    assert!(junctions
-        .iter()
-        .any(|junction| junction["operation"]["constructor"] == "AdtPack"));
+    assert!(program.get("junctions").is_none());
+    assert_eq!(
+        program["nodes"],
+        json!([{"path": ["continuation-result"], "members": []}])
+    );
+    let flows = program["output"]["boundary"]["through"].as_array().unwrap();
+    assert_eq!(flows.len(), 2);
+    for flow in flows {
+        assert_eq!(flow["steps"][0]["constructor"], "Unpack");
+        assert_eq!(flow["steps"][1]["constructor"], "Pack");
+    }
 }
 
 #[test]

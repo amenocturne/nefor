@@ -140,7 +140,7 @@ pub mod kernel {
         }
 
         #[test]
-        fn nefor_mag_in_five_minutes_satisfies_v3_runtime_contracts() {
+        fn nefor_mag_in_five_minutes_satisfies_v4_runtime_contracts() {
             let host = shipped_host();
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let repository = manifest.join("../..");
@@ -201,11 +201,16 @@ pub mod kernel {
                     "guide must not restore retired scaffolding actor {retired}"
                 );
             }
+            assert!(decoded.initial.get("junctions").is_none());
             assert!(
-                decoded.initial["junctions"]
-                    .as_array()
-                    .is_some_and(|junctions| !junctions.is_empty()),
-                "guide fixed composition lowers to junctions"
+                decoded.initial["routes"].as_array().is_some_and(|routes| {
+                    routes.iter().any(|route| {
+                        route["transforms"]
+                            .as_array()
+                            .is_some_and(|steps| !steps.is_empty())
+                    })
+                }),
+                "guide fixed composition lowers to route transformations"
             );
             assert!(
                 decoded.operations.iter().any(|operation| {
@@ -243,11 +248,11 @@ pub mod kernel {
         }
 
         #[test]
-        fn zero_actor_workers_execute_as_isolated_v3_traversal_templates() {
+        fn zero_actor_workers_execute_as_isolated_v4_traversal_templates() {
             let host = shipped_host();
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let source_dir = std::env::temp_dir().join(format!(
-                "mag-kernel-v3-traverse-workers-{}",
+                "mag-kernel-v4-traverse-workers-{}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&source_dir);
@@ -358,23 +363,17 @@ nefor.artifact.compile_graph(contextual)
                     "{name}: only the dynamic index actor remains"
                 );
                 assert_eq!(template_actors[0]["factory"], "nefor.factory.dynamic-index");
-                let junctions = operation["template"]["junctions"]
-                    .as_array()
-                    .expect("traversal template junctions");
+                assert!(operation["template"].get("junctions").is_none());
+                assert!(operation["template"]["routes"].as_array().is_some());
                 assert!(
-                    !junctions.is_empty(),
-                    "{name}: structural worker must be retained"
-                );
-                assert!(
-                    junctions.iter().all(|junction| {
-                        junction["inputs"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .chain(junction["outputs"].as_array().into_iter().flatten())
-                            .all(|port| port["endpoint"]["constructor"] == "LocalJunctionRef")
-                    }),
-                    "{name}: worker junctions must remain occurrence-local"
+                    operation["template"]["messages"]
+                        .as_array()
+                        .is_some_and(|messages| {
+                            messages
+                                .iter()
+                                .all(|message| message["transforms"].is_array())
+                        }),
+                    "{name}: occurrence messages retain anonymous transforms"
                 );
 
                 assert!(host.begin_run(name, name, None).unwrap().ok);
@@ -404,301 +403,6 @@ nefor.artifact.compile_graph(contextual)
             }
 
             std::fs::remove_dir_all(source_dir).expect("remove traversal test workspace");
-        }
-
-        #[test]
-        fn actor_free_and_actor_backed_junction_terminals_preserve_absence_values() {
-            for (run_id, source, expected, expected_actor_count) in [
-                (
-                    "actor-free-unit-terminal",
-                    r#"import nefor.artifact.{}
-import nefor.graph.{}
-nefor.artifact.compile_graph(nefor.graph.identity<Unit>("unit"))"#,
-                    JsonValue::Null,
-                    0,
-                ),
-                (
-                    "actor-backed-false-terminal",
-                    r#"import nefor.artifact.{}
-import nefor.graph.{}
-import nefor.node.{}
-let start = nefor.graph.source("start", false)
-let terminal = nefor.graph.identity<Bool>("terminal")
-nefor.artifact.compile_graph(nefor.node.compose("root", start, terminal))"#,
-                    serde_json::json!(false),
-                    1,
-                ),
-            ] {
-                let host = shipped_host();
-                let mut modification = compile_mag_source(&host, run_id, source);
-                assert_eq!(
-                    modification["actors"].as_array().map(Vec::len),
-                    Some(expected_actor_count)
-                );
-                if expected_actor_count == 0 {
-                    assert_eq!(
-                        modification["result"]["from"]["endpoint"]["constructor"],
-                        "JunctionEndpoint"
-                    );
-                } else {
-                    let actor_output = modification["actors"][0]["outputs"][0].clone();
-                    modification["result"]["from"] = actor_output;
-                    modification["junctions"] = serde_json::json!([]);
-                    modification["routes"] = serde_json::json!([]);
-                    assert_eq!(
-                        modification["result"]["from"]["endpoint"]["constructor"],
-                        "ActorEndpoint"
-                    );
-                }
-                assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
-                host.drain_emits().unwrap();
-                let started = host.start(run_id, &modification).unwrap();
-                assert!(started.ok, "{run_id}: {:?}", started.error);
-                let completion = host
-                    .take_run_complete(run_id)
-                    .unwrap()
-                    .expect("terminal completion");
-                let result = completion.result.unwrap();
-                assert_eq!(result.get("value").unwrap_or(&result), &expected);
-                let emits = host.drain_emits().unwrap();
-                let junction_ids: Vec<_> = modification["junctions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|junction| junction["id"].as_str())
-                    .collect();
-                assert!(
-                    !emits.iter().any(|event| {
-                        event
-                            .get("id")
-                            .and_then(JsonValue::as_str)
-                            .is_some_and(|id| junction_ids.contains(&id))
-                            && event
-                                .get("kind")
-                                .and_then(JsonValue::as_str)
-                                .is_some_and(|kind| {
-                                    matches!(
-                                        kind,
-                                        "mag.actor_ready"
-                                            | "mag.actor_busy"
-                                            | "mag.actor_idle"
-                                            | "mag.actor_killed"
-                                            | "mag.actor_firing"
-                                            | "mag.actor_emission"
-                                    )
-                                })
-                    }),
-                    "junctions must not fabricate actor lifecycle: {emits:#?}"
-                );
-                host.end_run(run_id, TeardownReason::RunComplete).unwrap();
-            }
-        }
-
-        #[test]
-        fn malformed_v3_topology_is_rejected_before_actor_construction() {
-            let source = r#"import nefor.artifact.{}
-import nefor.graph.{}
-let start = nefor.graph.source("start", "value")
-nefor.artifact.compile_graph(start)"#;
-            for (run_id, mutate, expected) in [
-                ("unknown-junction-endpoint", 0_u8, "unknown"),
-                ("junction-port-owner-mismatch", 1_u8, "belong"),
-                ("unknown-junction-operation", 2_u8, "operation"),
-            ] {
-                let host = shipped_host();
-                let mut modification = compile_mag_source(&host, run_id, source);
-                match mutate {
-                    0 => {
-                        modification["routes"][0]["to"]["endpoint"]["value"]["id"] =
-                            serde_json::json!("missing")
-                    }
-                    1 => {
-                        modification["junctions"][0]["inputs"][0]["endpoint"]["value"]["id"] =
-                            serde_json::json!("different")
-                    }
-                    2 => {
-                        modification["junctions"][0]["operation"] =
-                            serde_json::json!({"constructor":"RetiredFactory","value":null})
-                    }
-                    _ => unreachable!(),
-                }
-                assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
-                host.drain_emits().unwrap();
-                let outcome = host.start(run_id, &modification).unwrap();
-                assert!(
-                    !outcome.ok,
-                    "{run_id} unexpectedly accepted malformed topology"
-                );
-                assert!(
-                    outcome
-                        .error
-                        .as_deref()
-                        .is_some_and(|error| error.to_ascii_lowercase().contains(expected)),
-                    "{run_id}: {:?}",
-                    outcome.error
-                );
-                let emits = host.drain_emits().unwrap();
-                assert!(
-                    !emits
-                        .iter()
-                        .any(|event| event["kind"] == "mag.actor_spawned"),
-                    "{run_id} constructed an actor before rejecting topology: {emits:#?}"
-                );
-                host.end_run(run_id, TeardownReason::RunFailed).unwrap();
-            }
-        }
-
-        #[test]
-        fn divergent_junction_payloads_are_rejected_before_activation_without_changing_run_state() {
-            let cases = [
-                (
-                    "divergent-product",
-                    r#"import nefor.artifact.{}
-import nefor.graph.{}
-import nefor.node.{}
-let start = nefor.graph.source("start", ("left", "right"))
-let worker = nefor.node.parallel("worker", nefor.graph.identity<String>("left"), nefor.graph.identity<String>("right"))
-let result = nefor.graph.output_for("result", worker)
-nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
-                    "ProductSplit",
-                    serde_json::json!("not-a-product"),
-                    serde_json::json!(["left", "right"]),
-                ),
-                (
-                    "divergent-adt-payload",
-                    r#"import core.types.{}
-import nefor.artifact.{}
-import nefor.graph.{}
-import nefor.node.{}
-let start = nefor.graph.source("start", named(core.types.Either<String, Int>, Left, "chosen"))
-let worker = nefor.node.choose("worker", nefor.graph.identity<String>("left"), nefor.graph.identity<Int>("right"))
-let result = nefor.graph.output_for("result", worker)
-nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
-                    "AdtUnpack",
-                    serde_json::json!({"constructor":"Left","value":7}),
-                    serde_json::json!({"constructor":"Left","value":"chosen"}),
-                ),
-            ];
-
-            for (run_id, source, operation, raw_value, semantic_value) in cases {
-                let host = shipped_host();
-                let original = compile_mag_source(&host, run_id, source);
-                let mut malformed = original.clone();
-                let input = malformed["junctions"]
-                    .as_array()
-                    .and_then(|junctions| {
-                        junctions
-                            .iter()
-                            .find(|junction| junction["operation"]["constructor"] == operation)
-                    })
-                    .and_then(|junction| junction["inputs"].as_array())
-                    .and_then(|inputs| inputs.first())
-                    .cloned()
-                    .unwrap_or_else(|| panic!("{run_id} has no {operation} input"));
-                malformed["messages"]
-                    .as_array_mut()
-                    .expect("messages")
-                    .push(serde_json::json!({
-                        "to": input,
-                        "semantic_type": input["type"].clone(),
-                        "semantic_type_id": input["type_id"].clone(),
-                        "content": {
-                            "value": raw_value,
-                            "semantic_value": semantic_value,
-                        },
-                    }));
-
-                assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
-                host.drain_emits().unwrap();
-                let rejected = host.start(run_id, &malformed).unwrap();
-                assert!(!rejected.ok, "{run_id} admitted divergent representations");
-                assert!(
-                    rejected
-                        .error
-                        .as_deref()
-                        .is_some_and(|error| error.contains("malformed raw value")),
-                    "{run_id}: {:?}",
-                    rejected.error
-                );
-                let rejected_emits = host.drain_emits().unwrap();
-                assert!(
-                    !rejected_emits.iter().any(|event| matches!(
-                        event.get("kind").and_then(JsonValue::as_str),
-                        Some("mag.actor_spawned" | "mag.actor_ready" | "mag.actor_busy")
-                    )),
-                    "{run_id} activated an actor before rejection: {rejected_emits:#?}"
-                );
-                assert!(
-                    !rejected_emits
-                        .iter()
-                        .any(|event| event.get("kind")
-                            == Some(&serde_json::json!("capability.request"))),
-                    "{run_id} emitted capability work before rejection: {rejected_emits:#?}"
-                );
-
-                let accepted = host.start(run_id, &original).unwrap();
-                assert!(
-                    accepted.ok,
-                    "{run_id} retained rejected state: {:?}",
-                    accepted.error
-                );
-                assert!(host.take_run_complete(run_id).unwrap().is_some());
-                host.end_run(run_id, TeardownReason::RunComplete).unwrap();
-            }
-        }
-
-        #[test]
-        fn existing_actor_routes_install_atomically_and_rejected_delta_does_not_activate() {
-            let host = shipped_host();
-            let mut initial = compile_mag_source(
-                &host,
-                "delta-routes",
-                r#"
-import nefor.artifact.{}
-import nefor.graph.{}
-nefor.artifact.compile_graph(nefor.graph.source("start", false))
-"#,
-            );
-            let routes = initial["routes"].take();
-            let messages = initial["messages"].take();
-            initial["routes"] = serde_json::json!([]);
-            initial["messages"] = serde_json::json!([]);
-            assert!(
-                host.begin_run("delta-routes", "delta-routes", None)
-                    .unwrap()
-                    .ok
-            );
-            assert!(host.start("delta-routes", &initial).unwrap().ok);
-            assert!(host.take_run_complete("delta-routes").unwrap().is_none());
-            host.drain_emits().unwrap();
-            let delta = serde_json::json!({
-                "actors":[], "junctions":[], "nodes":[], "kills":[],
-                "types":initial["types"], "routes":routes, "messages":messages
-            });
-            let mut rejected = delta.clone();
-            rejected["routes"][0]["to"]["endpoint"]["value"]["id"] = serde_json::json!("missing");
-            let outcome = host.apply("delta-routes", &rejected).unwrap();
-            assert!(!outcome.ok);
-            assert!(host.take_run_complete("delta-routes").unwrap().is_none());
-            assert!(!host.drain_emits().unwrap().iter().any(|event| {
-                event.get("kind").and_then(JsonValue::as_str) == Some("mag.actor_ready")
-            }));
-            let outcome = host.apply("delta-routes", &delta).unwrap();
-            assert!(outcome.ok, "{:?}", outcome.error);
-            let completion = host.take_run_complete("delta-routes").unwrap().unwrap();
-            assert_eq!(completion.result.unwrap()["value"], false);
-            let mut kill = serde_json::json!({"types":{},"actors":[],"junctions":[],
-                "routes":[],"messages":[],"nodes":[],"kills":["start"]});
-            assert!(host.apply("delta-routes", &kill).unwrap().ok);
-            kill["kills"] = serde_json::json!([]);
-            let after_kill = host.apply("delta-routes", &kill).unwrap();
-            assert!(
-                after_kill.ok,
-                "dead actor routes retain known endpoints: {:?}",
-                after_kill.error
-            );
-            host.end_run("delta-routes", TeardownReason::RunComplete)
-                .unwrap();
         }
 
         #[test]

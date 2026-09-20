@@ -158,7 +158,7 @@ function M.new(opts)
     events = opts.events or noop,
     persist_output = opts.persist_output or noop,
     observe_output = opts.observe_output or noop,
-    deliver_endpoint = opts.deliver_endpoint,
+    transform_route = opts.transform_route,
     topology_routes = opts.topology_routes,
     settle_result = opts.settle_result or function(id, result, persist_result, persisted)
       (opts.events or noop)({
@@ -356,7 +356,7 @@ function M:on_emit(id, message, generation)
     observed.semantic_type_id = arrival.type_id
     observed.constructor_id = arrival.constructor_id
     observed.arrival_id = arrival.arrival_id
-    local accepted, terminal = self.observe_output(id, kind, observed)
+    local accepted, terminal = self.observe_output(id, kind, observed, arrival)
     if accepted == false then return false end
     if not terminal then
       local persisted = self.persist_output(id, observed)
@@ -560,73 +560,31 @@ end
 -- route entry simply goes nowhere; fanout (many dests) needs no special case.
 function M:route_output(sender_id, tag, message, source_arrival)
   local sender = self.inventory.get(sender_id)
-  if not sender then
-    return
-  end
-  local dests = (sender.routes or {})[tag]
-  if self.topology_routes then
-    dests = {}
-    for _, route in ipairs(self.topology_routes()) do
-      if route.from.endpoint.constructor == "ActorEndpoint" and route.from.endpoint.value.id == sender_id
-          and route.from.wire == tag then
-        dests[#dests+1] = {endpoint_kind=route.to.endpoint.constructor=="ActorEndpoint" and "actor" or "junction",
-          endpoint=route.to.endpoint,wire=route.to.wire,edge_id=route.id,
-          source_type_id=route.from.type_id,destination_type_id=route.to.type_id,
-          destination_type=route.to.type,product_position=route.product_position}
-      end
-    end
-  end
-  if not dests then
-    return
-  end
+  if not sender then return end
   local source = source_arrival
   if not source then
-    local first_destination = dests[1]
-    if not first_destination then return end
-    local source_type_id = first_destination.source_type_id or tostring(tag)
-    local source_type
-    if first_destination.source_type_id then
-      source_type = self:descriptor_for_id(sender_id, source_type_id)
-    else
-      source_type = {
-        kind = "named",
-        name = "legacy." .. tostring(tag),
-        arguments = {},
-      }
+    local descriptor, type_id
+    for _, route in ipairs(self.topology_routes and self.topology_routes() or {}) do
+      if route.from.endpoint.value.id == sender_id and route.from.wire == tag then
+        descriptor, type_id = route.from.type, route.from.type_id
+        break
+      end
     end
+    if not descriptor then return end
     source = typed_value.factory({
       arrival_id = self:next_arrival_id(),
       from = sender_id,
       edge_id = "kernel:" .. tostring(sender_id) .. ":" .. tostring(tag),
-      type_id = source_type_id,
-      type = source_type,
-      constructor_id = source_type_id,
+      type_id = type_id,
+      type = descriptor,
+      constructor_id = type_id,
       protocol_wire = tag,
       product_position = -1,
       payload = message,
     })
   end
   self:publish_arrival(source)
-  for _, destination in ipairs(dests) do
-    local destination_id = destination.endpoint and destination.endpoint.value.id or destination.actor
-    local dest = destination.endpoint_kind ~= "junction" and self.inventory.get(destination_id)
-    local input = dest and dest.input
-    local accepts = true
-    local host = nefor and nefor.semantic_type
-    if dest and dest.semantic_strict and input and type(input.type) == "table" and
-        type(host) == "table" and type(host.accepts) == "function" then
-      accepts = host.accepts(input.type, source.type)
-    end
-    if accepts then
-      local routed = typed_value.routed(source, destination, destination.destination_type or (input and input.type) or source.type)
-      if destination.endpoint_kind == "junction" and self.deliver_endpoint then
-        self.deliver_endpoint("junction", destination_id,
-          {wire=destination.wire,type=routed.declared_type,type_id=routed.declared_type_id}, routed)
-      else
-        self:deliver(destination_id, routed)
-      end
-    end
-  end
+  if self.transform_route then self.transform_route(sender_id, tag, source) end
 end
 
 function M:descriptor_for_id(actor_id, type_id)

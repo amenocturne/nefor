@@ -366,23 +366,10 @@ local function new_run_context(meta)
     return false
   end
 
-  -- Actor and junction outputs share terminal and operation observation. Only
-  -- actor routing performs per-actor persistence/lifecycle publication.
+  -- Actor outputs share terminal and operation observation before routing
+  -- performs per-actor persistence and lifecycle publication.
   local function observe_typed_output(endpoint, wire, output)
     if ctx.operation_failed or ctx.run_failed then return false end
-    local boundary = ctx.result_boundary
-    local dynamic = output.dynamic
-    local terminal = boundary and boundary.endpoint.constructor == endpoint.constructor
-      and boundary.endpoint.value.id == endpoint.value.id and boundary.wire == wire
-      and (dynamic == nil or dynamic.kind == "complete")
-    if terminal then
-      if not nefor.semantic_type.accepts(boundary.type, output.semantic_type) then
-        emit_event({kind="mag.run_failed",from=endpoint.value.id,failure="typed-result",
-          error="result semantic type is incompatible"})
-        return false
-      end
-      if not settle_result(endpoint.value.id, output) then return false end
-    end
     ctx.emission_seq = ctx.emission_seq + 1
     for _, operation in ipairs(ctx.operations) do
       local on = operation.on
@@ -396,7 +383,7 @@ local function new_run_context(meta)
         }
       end
     end
-    return true, terminal
+    return true
   end
 
   -- Injected host bus seam. Routing already mints run-scoped capability ids.
@@ -445,15 +432,13 @@ local function new_run_context(meta)
     events = emit_event,
     persist_output = persist_output,
     settle_result = settle_result,
-    deliver_endpoint = function(kind, id, port, arrival)
-      if kind == "junction" then
-        topo:enqueue(id, port, arrival)
-      else
-        router:deliver(id, arrival)
-      end
+    observe_output = function(actor, wire, output, arrival)
+      local accepted = observe_typed_output({constructor="ActorEndpoint",value={id=actor}}, wire, output)
+      if accepted == false then return false end
+      return true, topo:observe_result({constructor="ActorEndpoint",value={id=actor}}, wire, arrival)
     end,
-    observe_output = function(actor, wire, output)
-      return observe_typed_output({constructor="ActorEndpoint",value={id=actor}}, wire, output)
+    transform_route = function(actor, wire, arrival)
+      topo:route(actor, wire, arrival)
     end,
     topology_routes = function() return topo.routes end,
     -- Host clock for the busy-window stamps (mag.actor_idle's busy_ms).
@@ -469,18 +454,8 @@ local function new_run_context(meta)
   topo = Topology.new({
     inventory = inv,
     semantic = assert(nefor.semantic_type),
-    dispatch = function(kind, id, port, arrival)
-      if kind == "junction" then topo:enqueue(id, port, arrival)
-      else router:deliver(id, arrival) end
-    end,
-    observe = function(id, wire, arrival, payload)
-      local observed = plain_data.copy(payload)
-      observed.semantic_type = arrival.type
-      observed.semantic_type_id = arrival.type_id
-      observed.constructor_id = arrival.constructor_id
-      observed.arrival_id = arrival.arrival_id
-      return observe_typed_output({constructor="JunctionEndpoint",value={id=id}}, wire, observed)
-    end,
+    dispatch = function(_, id, _, arrival) router:deliver(id, arrival) end,
+    settle_result = settle_result,
   })
 
   -- Break the construction-order cycle (the hooks need the router, which needs
@@ -700,16 +675,12 @@ end
 local function preflight_topology(modification)
   local inv = inventory.new({registry=registry})
   local topo = Topology.new({inventory=inv,semantic=nefor.semantic_type,
-    dispatch=function() end,observe=function() return true end})
+    dispatch=function() end,settle_result=function() return true end})
   local state, err = topo:preflight(modification)
   if not state then return nil, err end
   local prepared = plain_data.copy(modification)
   topo:install(prepared,state)
-  prepared.junctions,prepared.routes,prepared.messages=nil,nil,{}
-  for _,message in ipairs(modification.messages or {}) do
-    local kind,id=Topology.endpoint(message.to)
-    if kind=="actor" then local lowered=plain_data.copy(message); lowered.to=id; prepared.messages[#prepared.messages+1]=lowered end
-  end
+  prepared.routes,prepared.messages=nil,{}
   local result=inv.apply(prepared)
   if not result.ok then return nil,result.error end
   return true
@@ -791,23 +762,27 @@ apply_with_logical_nodes = function(ctx, modification, opts)
     return ctx.observer:observe(
       modification or {}, ctx.observer:snapshot(modification or {}), rejected, opts)
   end
-  local prospective, topology_error = ctx.topology:preflight(modification)
+  local topology_modification = plain_data.copy(modification)
+  local approval_messages, topology_messages = {}, {}
+  for _, message in ipairs(modification.messages or {}) do
+    if type(message.content) == "table" and message.content.kind == "mag.ApprovalReply" then
+      local approval = plain_data.copy(message)
+      approval.to = message.to.endpoint.value.id
+      approval_messages[#approval_messages + 1] = approval
+    else
+      topology_messages[#topology_messages + 1] = message
+    end
+  end
+  topology_modification.messages = topology_messages
+  local prospective, topology_error = ctx.topology:preflight(topology_modification)
   if not prospective then
     local rejected = {ok=false,error=topology_error}
     return ctx.observer:observe(modification or {},ctx.observer:snapshot(modification or {}),rejected,opts)
   end
   local snapshot = ctx.topology:snapshot()
-  ctx.topology:install(modification, prospective)
+  ctx.topology:install(topology_modification, prospective)
   local actor_modification = plain_data.copy(modification)
-  actor_modification.junctions, actor_modification.routes, actor_modification.messages = nil, nil, {}
-  for _, message in ipairs(modification.messages or {}) do
-    local endpoint = message.to and message.to.endpoint
-    if endpoint and endpoint.constructor == "ActorEndpoint" then
-      local lowered = plain_data.copy(message)
-      lowered.to = endpoint.value.id
-      actor_modification.messages[#actor_modification.messages + 1] = lowered
-    end
-  end
+  actor_modification.routes, actor_modification.messages = nil, approval_messages
   local apply_opts = {}
   for key, value in pairs(opts or {}) do apply_opts[key] = value end
   apply_opts.before_execute = function()
@@ -816,18 +791,7 @@ apply_with_logical_nodes = function(ctx, modification, opts)
   end
   local result = ctx.observer:apply(actor_modification, apply_opts)
   if not result.ok then ctx.topology:restore(snapshot); return result end
-  for _, message in ipairs(modification.messages or {}) do
-    local endpoint = message.to and message.to.endpoint
-    if endpoint and endpoint.constructor == "JunctionEndpoint" then ctx.topology:initial(message) end
-  end
-  local drained = ctx.drain_topology()
-  if not drained then
-    -- Admission validated every authored junction payload before actor effects.
-    -- A later evaluation failure can only come from runtime actor output or an
-    -- internal invariant violation, so it is a run failure, not a rejected
-    -- modification whose already-visible effects could be rolled back.
-    return result
-  end
+  for _, message in ipairs(topology_messages) do ctx.topology:initial(message) end
   for _, node in ipairs(modification.nodes or {}) do
     ctx.logical_paths[logical_path_key(node.path)] = true
     for _, actor_id in ipairs(node.members or {}) do ctx.logical_actors[actor_id] = node.path end
@@ -856,14 +820,6 @@ apply_typed_delta = function(ctx, mod)
     if type(descriptor) ~= "table" or type(id) ~= "string" or mod.types[id] == nil then return false end
     local ok, actual = pcall(semantic_host.id, descriptor)
     return ok and actual == id
-  end
-  for _, junction in ipairs(mod.junctions or {}) do
-    for _, port in ipairs(junction.inputs or {}) do
-      if not declared(port.type, port.type_id) then return {ok=false,error="junction input requires delta semantic declarations"} end
-    end
-    for _, port in ipairs(junction.outputs or {}) do
-      if not declared(port.type, port.type_id) then return {ok=false,error="junction output requires delta semantic declarations"} end
-    end
   end
   for _, message in ipairs(mod.messages or {}) do
     if not declared(message.semantic_type, message.semantic_type_id)
@@ -975,40 +931,16 @@ return {
     if not checked then return { ok = false, error = operation_error } end
     ctx.operations = checked
     local boundary = mod and mod.result and mod.result.from
-    local endpoint = type(boundary) == "table" and boundary.endpoint
-    local endpoint_value = type(endpoint) == "table" and endpoint.value
-    if type(endpoint) ~= "table" or type(endpoint_value) ~= "table"
-        or (endpoint.constructor ~= "ActorEndpoint" and endpoint.constructor ~= "JunctionEndpoint")
-        or type(endpoint_value.id) ~= "string" or endpoint_value.id == ""
-        or type(boundary.wire) ~= "string" or boundary.wire == "" then
-      return { ok = false, error = "initial artifact needs endpoint-addressed result.from" }
+    if type(boundary) ~= "table" or type(boundary.type) ~= "table"
+        or type(boundary.type_id) ~= "string" or type(boundary.leaves) ~= "table"
+        or type(boundary.through) ~= "table"
+        or nefor.semantic_type.id(boundary.type) ~= boundary.type_id then
+      return { ok = false, error = "initial artifact needs a typed StoredBoundary result.from" }
     end
     local typed_artifact = type(mod.types) == "table" and next(mod.types) ~= nil
     ctx.semantic_strict = typed_artifact
-    if typed_artifact and (type(boundary.type_id) ~= "string" or type(boundary.type) ~= "table") then
-      return { ok = false, error = "typed initial artifact needs a typed result.from port" }
-    end
-    local source
-    local definitions = endpoint.constructor == "ActorEndpoint" and (mod.actors or {}) or (mod.junctions or {})
-    for _, definition in ipairs(definitions) do if definition.id == endpoint_value.id then source = definition break end end
-    if not source then
-      return {ok=false,error=string.format("result boundary source %s %q does not exist",
-        endpoint.constructor, endpoint_value.id)}
-    end
-    local declared = false
-    for _, output in ipairs(source.outputs or {}) do
-      if output.wire == boundary.wire and (not typed_artifact or output.type_id == boundary.type_id) then
-        declared = not typed_artifact or (nefor.semantic_type.id(boundary.type) == boundary.type_id
-          and nefor.semantic_type.id(output.type) == output.type_id)
-        if declared then break end
-      end
-    end
-    if not declared then
-      return {ok=false,error=string.format("result boundary %q is not a declared output of %s %q",
-        boundary.wire, endpoint.constructor, endpoint_value.id)}
-    end
     ctx.result_boundary = plain_data.copy(boundary)
-    ctx.router:set_result_boundary(boundary)
+    ctx.topology:set_result(boundary)
     if typed_artifact then ctx.router:register_type_declarations(mod.types) end
     local modification = {}
     for key, value in pairs(mod) do
@@ -1022,7 +954,10 @@ return {
       end
     end
     local outcome = apply_with_logical_nodes(ctx, modification)
-    if outcome.ok then ctx.drain_topology(); ctx.drain_operations(); ctx.drain_topology() end
+    if outcome.ok then
+      ctx.topology:bootstrap_result()
+      ctx.drain_operations()
+    end
     return outcome
   end,
 

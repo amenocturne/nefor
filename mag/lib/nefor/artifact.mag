@@ -17,18 +17,13 @@ let compile_graph_value: fn(nefor.graph.Graph) -> Artifact = |graph| => {
 let compile: fn(fn(nefor.graph.Graph) -> nefor.graph.Graph) -> Artifact = |transform| =>
   compile_graph_value(transform(nefor.graph.empty_graph))
 
-let output_id_taken<O>: fn(nefor.graph.Node<Unit, O>, String) -> Bool = |terminal, candidate| => {
-  let actor_collision = not((=)(count(filter(((|actor| => (=)(get(actor, "id"), candidate)) : fn(nefor.graph.Actor) -> Bool), get(terminal, "actors"))), 0))
-  let junction_collision = not((=)(count(filter(((|junction| => (=)(get(junction, "id"), candidate)) : fn(nefor.graph.Junction) -> Bool), get(terminal, "junctions"))), 0))
-  let path_collision = not((=)(count(filter(((|node| => nefor.graph.serialized_equal(get(node, "path"), [candidate])) : fn(nefor.graph.LogicalNode) -> Bool), get(terminal, "nodes"))), 0))
-  if actor_collision then true else if junction_collision then true else path_collision
-}
+let output_id_taken<O>: fn(nefor.graph.Node<Unit, O>, String) -> Bool = |terminal, candidate| =>
+  not((=)(count(filter(((|node| => nefor.graph.serialized_equal(get(node, "path"), [candidate])) : fn(nefor.graph.LogicalNode) -> Bool), get(terminal, "nodes"))), 0))
 
 let fresh_output_id<O>: fn(nefor.graph.Node<Unit, O>, String) -> String = |terminal, candidate| =>
   if output_id_taken(terminal, candidate) then fresh_output_id(terminal, str(candidate, "-")) else candidate
 
-// Close one root-capable terminal through the same ordinary output node, edge,
-// graph validation, and lowering values available to every MAG program.
+// Close one root-capable terminal with an actor-free result boundary.
 let compile_graph<O>: fn(nefor.graph.Node<Unit, O>) -> Artifact = |terminal| => {
   let result = nefor.graph.output_for(fresh_output_id(terminal, "result"), terminal)
   compile_graph_value(nefor.graph.graph([nefor.graph.edge(terminal, result)]))

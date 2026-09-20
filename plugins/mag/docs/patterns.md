@@ -34,6 +34,13 @@ A nominal ADT arrives as one complete owner value. `choose` explicitly unpacks a
 meanings, distinct nominal types such as `Approved` and `NeedChanges` keep that
 reason visible to validation.
 
+The fixed combinators behind these shapes are compile-time transforms —
+`Unit`, `Project`, `Pack`, `Unpack`, `Assemble`, and `EmptyList` — carried by
+boundaries, routes, and messages. They never become runtime actors. `Assemble`
+cohorts belong to the destination and structural path and use one FIFO per
+explicit slot, so equal-typed product/list positions retain their authored
+meaning.
+
 ## Ordering without data
 
 The kernel emits `mag.Unit` when an actor completes successfully. A Unit edge

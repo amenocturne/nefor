@@ -823,11 +823,12 @@ local function permission_response(popup, approved)
         run_id = popup.run_id,
         source = "chat.human_approval",
         artifact = {
-          format = "nefor.mag", version = 3, kind = "delta",
+          format = "nefor.mag", version = 4, kind = "delta",
           delta = {
             types = { [popup.reply_type_id] = popup.reply_type },
-            actors = {}, junctions = {}, routes = {},
+            actors = {}, routes = {},
             messages = { {
+              transforms = {},
               to = {
                 endpoint = { constructor = "ActorEndpoint", value = { id = popup.gate_id } },
                 type = popup.reply_type, type_id = popup.reply_type_id,

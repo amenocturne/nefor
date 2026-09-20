@@ -317,7 +317,7 @@ async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
         .cloned()
         .expect("mag.loaded carries the compiled artifact");
     assert_eq!(artifact.get("format"), Some(&json!("nefor.mag")));
-    assert_eq!(artifact.get("version"), Some(&json!(3)));
+    assert_eq!(artifact.get("version"), Some(&json!(4)));
     assert_eq!(artifact.get("kind"), Some(&json!("program")));
     assert!(artifact.pointer("/program/initial").is_some());
     assert!(artifact.pointer("/program/operations").is_some());
@@ -458,7 +458,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     );
     assert!(
         structured.get("routes").is_none(),
-        "artifact-v3 actors do not own routes"
+        "artifact-v4 actors do not own routes"
     );
 
     send_event(
@@ -660,7 +660,7 @@ fn dynamic_behavior_fixture() -> Value {
 
 fn assert_dynamic_program_envelope(artifact: &Value) {
     assert_eq!(artifact["format"], "nefor.mag");
-    assert_eq!(artifact["version"], 3);
+    assert_eq!(artifact["version"], 4);
     assert_eq!(artifact["kind"], "program");
     let program = artifact["program"].as_object().expect("program payload");
     let operations = program["operations"]
@@ -778,7 +778,7 @@ fn assert_dynamic_program_envelope(artifact: &Value) {
     assert!(template_routes.iter().all(|route| {
         route.pointer("/from/endpoint/constructor").is_some()
             && route.pointer("/to/endpoint/constructor").is_some()
-            && route.get("product_position").is_some()
+            && route.get("transforms").and_then(Value::as_array).is_some()
     }));
     let template_messages = operation["template"]["messages"]
         .as_array()

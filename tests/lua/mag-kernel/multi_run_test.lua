@@ -108,10 +108,9 @@ local function program()
         outputs={port("generic-tool.ToolCalls",tool_calls),result},
       },
     },
-    junctions = {},
     routes = {},
     messages = {
-      {to=input,semantic_type=provider_input,semantic_type_id=nefor.semantic_type.id(provider_input),content={
+      {to=input,transforms={},semantic_type=provider_input,semantic_type_id=nefor.semantic_type.id(provider_input),content={
         kind="generic-provider.ProviderOut",
         value={messages={{role="user",content="hi"}}},
         semantic_value={messages={{role="user",content="hi"}}},
@@ -120,7 +119,8 @@ local function program()
     },
     kills = {},
     nodes = { { path = { "agent" }, members = { "agent" } } },
-    result = {from=result},
+    result = {from={type=result_type,type_id=nefor.semantic_type.id(result_type),
+      leaves={{port=result,steps={}}},through={}}},
   }
 end
 

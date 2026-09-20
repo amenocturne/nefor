@@ -388,14 +388,13 @@ local function actors_have_writers(inventory)
   return false
 end
 
-local function result_actor(modification)
-  local result = type(modification.result) == "table" and modification.result.from or nil
-  local endpoint = type(result) == "table" and result.endpoint or nil
-  local value = type(endpoint) == "table" and endpoint.value or nil
-  if type(value) ~= "table" or type(value.id) ~= "string" then
+local function result_boundary(modification)
+  local boundary = type(modification.result) == "table" and modification.result.from or nil
+  if type(boundary) ~= "table" or type(boundary.leaves) ~= "table"
+      or type(boundary.through) ~= "table" or #boundary.leaves + #boundary.through == 0 then
     return nil, "artifact has no structural result boundary"
   end
-  return value.id, nil
+  return "result", nil
 end
 
 local function compose_agent_system(base, positional_overlay, session_id)
@@ -2012,7 +2011,7 @@ submit_loaded_run = function(pending, body, error_prefix)
   if actors_have_writers(inventory) and state.gate_mode == "safe" and not has_approved_plan() then
     return reject("Program contains write-capable agents. Submit a plan via write-review and get approval before executing.")
   end
-  local terminal_id, result_err = result_actor(modification)
+  local terminal_id, result_err = result_boundary(modification)
   if not terminal_id then return reject(error_prefix .. ": " .. result_err) end
   if type(resolve_model_snapshot) ~= "function" then
     return reject(error_prefix .. ": no model snapshot resolver is configured")

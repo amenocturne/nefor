@@ -235,32 +235,55 @@ local function actor_port(id, semantic_type, wire)
 end
 
 local function artifact_from_modification(modification)
+  local input_ports, output_ports = {}, {}
+  local function endpoint_id(port)
+    return port and port.endpoint and port.endpoint.value and port.endpoint.value.id
+  end
+  for _, route in ipairs(modification.routes or {}) do
+    input_ports[endpoint_id(route.to)] = route.to
+    local id = endpoint_id(route.from)
+    output_ports[id] = output_ports[id] or {}
+    output_ports[id][#output_ports[id] + 1] = route.from
+  end
+  local result_port = modification.result and modification.result.from
+  if result_port then
+    local id = endpoint_id(result_port)
+    output_ports[id] = output_ports[id] or {}
+    output_ports[id][#output_ports[id] + 1] = result_port
+  end
   local actors = {}
   for _, actor in ipairs(modification.actors or {}) do
     actors[#actors + 1] = {
       id = actor.id, factory = "nefor.factory." .. tostring(actor.factory),
       type_arguments = actor.type_arguments or {},
       params = { ["$mag"] = "packed-value", value = actor.params or {} },
-      input = actor_port(actor.id, {}, "input"), outputs = {},
+      input = input_ports[actor.id] or actor_port(actor.id, {}, "input"),
+      outputs = output_ports[actor.id] or {},
     }
   end
   local messages = {}
   for _, message in ipairs(modification.messages or {}) do
+    local to = type(message.to) == "table" and message.to or actor_port(message.to,
+      message.semantic_type, type(message.content) == "table" and message.content.kind or "input")
     messages[#messages + 1] = {
-      to = actor_port(message.to, message.semantic_type,
-        type(message.content) == "table" and message.content.kind or "input"),
-      semantic_type = message.semantic_type, semantic_type_id = message.semantic_type_id,
+      to = to, transforms = message.transforms or {},
+      semantic_type = message.semantic_type or to.type,
+      semantic_type_id = message.semantic_type_id or to.type_id,
       content = { ["$mag"] = "packed-value", value = message.content },
     }
   end
+  local result = modification.result and modification.result.from
   return { types = modification.types or {}, actors = actors,
-    junctions = modification.junctions or {}, routes = modification.routes or {},
+    routes = modification.routes or {},
     messages = messages, nodes = modification.nodes or {}, kills = modification.kills or {},
-    result = modification.result }
+    result = result and { from = {
+      type = result.type, type_id = result.type_id,
+      leaves = { { port = result, steps = {} } }, through = {},
+    } } or nil }
 end
 
 local function envelope_from_modification(modification)
-  return { format = "nefor.mag", version = 3, kind = "program",
+  return { format = "nefor.mag", version = 4, kind = "program",
     program = { initial = artifact_from_modification(modification), operations = {} } }
 end
 
@@ -276,7 +299,8 @@ local function read_only_modification()
     routes = { { id = "entry/llm",
       from = actor_port("worker.entry", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
       to = actor_port("worker.llm", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
-      product_position = 0 } },
+      transforms = {},
+    } },
     messages = { { to = "worker.entry", content = {
       kind = "nefor.agent.Input", value = { prompt = "<initial task text>" },
     } } },
@@ -618,6 +642,11 @@ do
     envelope_from_modification(modification), "sha256:test", KERNEL_FACTORIES)
   assert_true(preview:find("worker.llm (nefor.factory.structured-output)", 1, true) ~= nil,
     "preview renders the same artifact factory identity")
+  assert_true(preview:find("route[1]", 1, true) ~= nil
+      and preview:find("transforms: (identity)", 1, true) ~= nil,
+    "preview renders ordered route transforms")
+  assert_true(preview:find("Result boundary: generic-provider.TextAnswer", 1, true) ~= nil,
+    "preview renders the StoredBoundary result meaningfully")
 end
 
 -- Preview and control decoding remove exactly the explicit compiler wrapper;
@@ -625,17 +654,23 @@ end
 do
   local authored = { type = "sha256:user-authored", value = { nested = true } }
   local artifact = {
-    format = "nefor.mag", version = 3, kind = "program", program = {
+    format = "nefor.mag", version = 4, kind = "program", program = {
       initial = {
         types = {},
         actors = { {
           id = "record", factory = "nefor.factory.stub", type_arguments = {},
           params = { ["$mag"] = "packed-value", value = authored },
         } },
+        routes = {},
         messages = { {
-          to = actor_port("record", {}, "input"), content = { ["$mag"] = "packed-value", value = authored },
+          to = actor_port("record", {}, "input"), transforms = {},
+          semantic_type = {}, semantic_type_id = "test-type",
+          content = { ["$mag"] = "packed-value", value = authored },
         } },
-        kills = {}, nodes = {}, result = { from = actor_port("record", {}, "result") },
+        kills = {}, nodes = {}, result = { from = {
+          type = {}, type_id = "test-type",
+          leaves = { { port = actor_port("record", {}, "result"), steps = {} } }, through = {},
+        } },
       },
       operations = {},
     },
@@ -658,28 +693,29 @@ end
 
 do
   local workspace = require("libs.mag-workspace")
-  local initial = { types = {}, actors = {}, messages = {}, nodes = {}, kills = {}, result = {} }
-  local delta = { types = {}, actors = {}, messages = {}, nodes = {}, kills = {} }
+  local initial = { types = {}, actors = {}, routes = {}, messages = {}, nodes = {}, kills = {},
+    result = { from = { type = {}, type_id = "test-type", leaves = {}, through = {} } } }
+  local delta = { types = {}, actors = {}, routes = {}, messages = {}, nodes = {}, kills = {} }
   local _, mixed_program_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 3, kind = "program",
+    format = "nefor.mag", version = 4, kind = "program",
     program = { initial = initial, operations = {} }, delta = delta,
   }
   assert_true(mixed_program_error:find("unknown field delta", 1, true) ~= nil,
     "program envelope rejects a delta sibling")
   local _, mixed_delta_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 3, kind = "delta", delta = delta,
+    format = "nefor.mag", version = 4, kind = "delta", delta = delta,
     program = { initial = initial, operations = {} },
   }
   assert_true(mixed_delta_error:find("unknown field program", 1, true) ~= nil,
     "delta envelope rejects a program sibling")
   local _, delta_operations_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 3, kind = "delta",
-    delta = { types = {}, actors = {}, messages = {}, nodes = {}, kills = {}, operations = {} },
+    format = "nefor.mag", version = 4, kind = "delta",
+    delta = { types = {}, actors = {}, routes = {}, messages = {}, nodes = {}, kills = {}, operations = {} },
   }
   assert_true(delta_operations_error:find("unknown field operations", 1, true) ~= nil,
     "delta payload rejects operation residue")
   local _, operation_error = workspace.decode_artifact {
-    format = "nefor.mag", version = 3, kind = "program",
+    format = "nefor.mag", version = 4, kind = "program",
     program = { initial = initial, operations = { { extra = true } } },
   }
   assert_true(operation_error:find("unknown field extra", 1, true) ~= nil,
@@ -693,14 +729,15 @@ do
   local authored = { constructor = "Expression", value = { ["$mag"] = "packed-value", value = 42 } }
   local function artifact_for(payload)
     return {
-      format = "nefor.mag", version = 3, kind = "program", program = {
-        initial = { actors = {}, messages = {}, nodes = {}, kills = {}, types = {}, result = {} },
+      format = "nefor.mag", version = 4, kind = "program", program = {
+        initial = { actors = {}, routes = {}, messages = {}, nodes = {}, kills = {}, types = {},
+          result = { from = { type = {}, type_id = "test-type", leaves = {}, through = {} } } },
         operations = { {
           id = "expand", on = actor_port("source", {}, "result"),
           captures = {}, expressions = {},
           template = { actors = {}, messages = { {
             to = { endpoint = { constructor = "LocalActorRef", value = { slot = "worker" } }, wire = "input" },
-            content = payload,
+            transforms = {}, content = payload,
           } } },
         } },
       },
@@ -725,7 +762,7 @@ do
       assert_eq(content.value.value["$mag"], "packed-value", "nested user envelope remains user data")
     end
     assert_true(workspace.preview(artifact, "sha256:template", KERNEL_FACTORIES)
-      :find("message -> slot:worker/input", 1, true) ~= nil, "preview accepts both template payload variants")
+      :find("message[1] -> slot:worker/input", 1, true) ~= nil, "preview accepts both template payload variants")
     assert_eq(nefor.json.encode(artifact), before, "decode and preview preserve the immutable artifact")
   end
   for _, payload in ipairs({
@@ -740,9 +777,12 @@ do
     assert_true(err:find("program.operations[1].template.messages[1].content", 1, true) ~= nil,
       "template failure includes indexed occurrence context")
   end
-  local delta = { format = "nefor.mag", version = 3, kind = "delta", delta = {
-    actors = {}, junctions = {}, messages = { { to = actor_port("worker", {}, "input"), content = { ["$mag"] = "packed-value", value = authored } } },
-    nodes = {}, kills = {}, types = {},
+  local delta = { format = "nefor.mag", version = 4, kind = "delta", delta = {
+    actors = {}, routes = {}, messages = { {
+      to = actor_port("worker", {}, "input"), transforms = {},
+      semantic_type = {}, semantic_type_id = "test-type",
+      content = { ["$mag"] = "packed-value", value = authored },
+    } }, nodes = {}, kills = {}, types = {},
   } }
   local decoded = assert(workspace.decode_artifact(delta))
   assert_eq(decoded.modification.messages[1].content.constructor, "Expression",
@@ -762,15 +802,19 @@ do
     return c.body.kind == "mag.load" and c.target == "mag"
   end)
   local artifact = {
-    format = "nefor.mag", version = 3, kind = "program", program = {
+    format = "nefor.mag", version = 4, kind = "program", program = {
       initial = {
         types = {},
         actors = { {
           id = "source", factory = "nefor.factory.stub", type_arguments = {},
           params = { ["$mag"] = "packed-value", value = {} },
         } },
-        messages = {}, kills = {}, nodes = {},
-        result = { from = actor_port("source", {}, "result") },
+        routes = {}, messages = {}, kills = {}, nodes = {},
+        result = { from = {
+          type = {}, type_id = "test-type",
+          leaves = { { port = actor_port("source", {}, "result"), steps = {} } },
+          through = {},
+        } },
       },
       operations = { {
         id = "expand", on = actor_port("source", {}, "result"),
@@ -1061,7 +1105,7 @@ do
   -- Active run tracks the structural result actor from artifact metadata.
   local run = lw._internals.state.active_runs[reply.body.output.run_id]
   assert_true(type(run) == "table", "active_runs contains the dispatched run_id")
-  assert_eq(run.terminal, "worker.llm", "the result-producing actor is terminal")
+  assert_eq(run.terminal, "result", "the intentional result boundary is terminal")
   _test.calls_clear()
   invoke_tool("firing-mag-status-actors", "mag-status", { run_id = reply.body.output.run_id })
   local status = find_call(decode_calls(), function(c)
@@ -1476,9 +1520,11 @@ local function lead_turn_modification()
     },
     routes = {
       { id = "source/entry", from = actor_port("lead.source", "nefor.graph.Value", "nefor.graph.Value"),
-        to = actor_port("lead.entry", "nefor.graph.Value", "nefor.agent.Input"), product_position = 0 },
+        to = actor_port("lead.entry", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
+        transforms = {} },
       { id = "entry/llm", from = actor_port("lead.entry", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
-        to = actor_port("lead.llm", "generic-provider.ProviderOut", "generic-provider.ProviderOut"), product_position = 0 },
+        to = actor_port("lead.llm", "generic-provider.ProviderOut", "generic-provider.ProviderOut"),
+        transforms = {} },
     },
     messages = { { to = "lead.source", content = { kind = "mag.Unit" } } }, kills = {},
     result = { from = actor_port("lead.llm", "generic-provider.TextAnswer", "generic-provider.TextAnswer") },
@@ -1762,7 +1808,7 @@ do
        and type(c.body.error) == "string"
   end)
   assert_true(err ~= nil
-              and err.body.error:find("no structural result boundary", 1, true) ~= nil,
+              and err.body.error:find("requires result", 1, true) ~= nil,
     "missing result boundary is rejected; got " .. json.encode(_test.calls()))
 end
 
@@ -1780,7 +1826,7 @@ do
        and type(c.body.error) == "string"
   end)
   assert_true(err ~= nil
-              and err.body.error:find("no structural result boundary", 1, true) ~= nil,
+              and err.body.error:find("requires result", 1, true) ~= nil,
     "an orphaned result fixture is rejected; got " .. json.encode(_test.calls()))
 end
 

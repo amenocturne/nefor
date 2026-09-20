@@ -60,6 +60,16 @@ local group = run_panel.build_nodes(state.runs.run)[1]
 eq(group.status, "pending", "constructed actor stays pending until first activation")
 eq(group.first_start, nil, "spawn queue is not active time")
 
+local observed_only = run_panel.build_nodes({
+  nodes = {
+    ["workflow.llm"] = { status = "pending", seq = 1 },
+    ["workflow.run-tool"] = { status = "pending", seq = 2 },
+  },
+})
+eq(#observed_only, 2, "fallback projection exposes each observed actor directly")
+eq(#observed_only[1].children, 0,
+  "fallback projection does not invent composite helper rows")
+
 state = run_panel.actor_busy(state, "run", "worker.entry", 1000)
 group = run_panel.build_nodes(state.runs.run)[1]
 eq(group.status, "running", "busy actor makes its logical node active")
@@ -102,21 +112,6 @@ hierarchy = run_panel.nodes_declared(hierarchy, "nested", {
   { path = { "camera-stage", "retry" }, members = { "camera.retry" } },
   { path = { "result" }, members = { "workflow.result" } },
 })
-local function actor_endpoint(id)
-  return { constructor = "ActorEndpoint", value = { id = id } }
-end
-local function junction_endpoint(id)
-  return { constructor = "JunctionEndpoint", value = { id = id } }
-end
-local function route(from_endpoint, to_endpoint)
-  return { from = { endpoint = from_endpoint }, to = { endpoint = to_endpoint } }
-end
-hierarchy.runs.nested.routes = {
-  route(actor_endpoint("camera.llm"), junction_endpoint("answer-pass")),
-  route(junction_endpoint("answer-pass"), actor_endpoint("camera.retry")),
-  route(actor_endpoint("camera.retry"), actor_endpoint("camera.llm")),
-  route(actor_endpoint("camera.retry"), actor_endpoint("workflow.result")),
-}
 hierarchy = run_panel.actor_spawned(hierarchy, "nested", "camera.llm", "llm", {}, 1)
 hierarchy = run_panel.actor_spawned(hierarchy, "nested", "camera.retry", "retry", {}, 2)
 hierarchy = run_panel.actor_spawned(hierarchy, "nested", "workflow.result", "output", {}, 3)
@@ -162,9 +157,9 @@ local settled_children = project({
   ["right.actor"] = "done",
 })[1]
 eq(settled_children.status, "done",
-  "settled logical children complete a junction-backed composite")
+  "settled logical children complete an explicit composite")
 eq(#settled_children.children, 2, "composite retains its direct logical child count")
-eq(#settled_children.members, 2, "topology junctions do not become actor members")
+eq(#settled_children.members, 2, "composite members remain its explicit actors")
 
 local recursive = project({
   { path = { "root" }, members = {} },

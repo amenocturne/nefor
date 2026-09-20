@@ -46,12 +46,12 @@ local function topology()
     inventory={pairs=function() return pairs({}) end},
     semantic=nefor.semantic_type,
     dispatch=function() end,
-    observe=function() return true end,
+    settle_result=function() end,
   })
 end
 
 local function modification(actors, routes)
-  return {actors=actors,junctions={},routes=routes,messages={},nodes={},kills={}}
+  return {actors=actors,routes=routes,messages={},nodes={},kills={}}
 end
 
 -- A compatible route is accepted as one whole typed edge.
@@ -59,7 +59,7 @@ do
   local source = actor("source", string_type, string_type)
   local destination = actor("destination", string_type, string_type)
   local state, err = topology():preflight(modification({source,destination}, {{
-    id="source-destination",from=source.outputs[1],to=destination.input,product_position=-1,
+    id="source-destination",from=source.outputs[1],to=destination.input,transforms={},
   }}))
   assert_true(state ~= nil and err == nil, "compatible typed route passes")
 end
@@ -70,10 +70,10 @@ do
   local destination = actor("destination", string_type, string_type)
   local spoofed = port("source", "not-an-output", string_type)
   local state, err = topology():preflight(modification({source,destination}, {{
-    id="spoofed-source",from=spoofed,to=destination.input,product_position=-1,
+    id="spoofed-source",from=spoofed,to=destination.input,transforms={},
   }}))
   assert_true(state == nil, "undeclared source rejects")
-  assert_contains(err, "source port is not declared", "error names the source contract")
+  assert_contains(err, "source is not a declared actor output", "error names the source contract")
 end
 
 -- Destination acceptance is semantic rather than legacy tag/registry matching.
@@ -81,10 +81,10 @@ do
   local source = actor("source", string_type, string_type)
   local destination = actor("destination", int_type, int_type)
   local state, err = topology():preflight(modification({source,destination}, {{
-    id="incompatible",from=source.outputs[1],to=destination.input,product_position=-1,
+    id="incompatible",from=source.outputs[1],to=destination.input,transforms={},
   }}))
   assert_true(state == nil, "incompatible semantic types reject")
-  assert_contains(err, "semantic types are incompatible", "error names semantic incompatibility")
+  assert_contains(err, "transformed type is incompatible", "error names semantic incompatibility")
 end
 
 -- Routes are checked against the post-apply graph: existing live actors are
@@ -98,20 +98,20 @@ do
     end,
   }
   local graph = Topology.new({inventory=inventory,semantic=nefor.semantic_type,
-    dispatch=function() end,observe=function() return true end})
+    dispatch=function() end,settle_result=function() end})
   local source = actor("source", string_type, string_type)
   local state, err = graph:preflight(modification({source}, {{
-    id="to-live",from=source.outputs[1],to=live.input,product_position=-1,
+    id="to-live",from=source.outputs[1],to=live.input,transforms={},
   }}))
   assert_true(state ~= nil and err == nil, "route may target an existing live actor")
 
   local ghost = port("ghost", "in", string_type)
   state, err = graph:preflight(modification({source}, {{
-    id="to-ghost",from=source.outputs[1],to=ghost,product_position=-1,
+    id="to-ghost",from=source.outputs[1],to=ghost,transforms={},
   }}))
   assert_true(state == nil, "unknown endpoint rejects")
-  assert_contains(err, "references an unknown endpoint", "error names unknown endpoint")
-  assert_true(next(graph.junctions) == nil and #graph.routes == 0,
+  assert_contains(err, "references unknown actor ghost", "error names unknown endpoint")
+  assert_true(next(graph.assemblies) == nil and #graph.routes == 0,
     "failed preflight installs no partial topology")
 end
 

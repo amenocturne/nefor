@@ -98,8 +98,6 @@ let local_actor_ref: fn(String) -> nefor.mag.TemplateEndpoint = |slot| => named(
 
 let existing_actor_ref: fn(String) -> nefor.mag.TemplateEndpoint = |id| => named(nefor.mag.TemplateEndpoint, ExistingActorRef, nefor.mag.ExistingActorRef {id: id})
 
-let local_junction_ref: fn(String) -> nefor.mag.TemplateEndpoint = |slot| => named(nefor.mag.TemplateEndpoint, LocalJunctionRef, nefor.mag.LocalJunctionRef {slot: slot})
-
 let template_port<T>: fn(nefor.mag.TemplateEndpoint, TypeTag<T>, String) -> nefor.mag.TemplatePort = |endpoint, `type`, wire| => {
   let descriptor = type_evidence(`type`)
   nefor.mag.TemplatePort {endpoint: endpoint, `type`: descriptor, type_id: type_id(descriptor), wire: wire}
@@ -159,45 +157,48 @@ let worker_reachable: fn(List<String>, List<nefor.graph.StoredRoute>, Bool) -> L
   if (=)(count(next), count(visited)) then next else worker_reachable(next, routes, reverse)
 }
 
-// Validate a worker before converting it. No bootstrap is synthesized here:
-// exactly one occurrence value is the exposed input's activation.
+let boundary_leaf_endpoints: fn(List<nefor.graph.BoundaryLeaf>) -> List<String> = |leaves| => nefor.graph.ordered_strings(map(((|leaf| => canonical(get(get(leaf, "port"), "endpoint"))) : fn(nefor.graph.BoundaryLeaf) -> String), leaves))
+
+let identity_flow: fn(nefor.graph.Flow) -> Bool = |flow| => (=)(count(get(flow, "steps")), 0)
+
+// Validate a worker before converting it. Exactly one occurrence value is the
+// exposed input's activation; anonymous boundary flow is retained as metadata.
 let checked_worker<I, O>: fn(nefor.graph.Node<I, O>) -> nefor.graph.Node<I, O> = |value| => {
   let worker = nefor.graph.normalize_node(value)
   let identity_conflicts = nefor.graph.node_identity_conflicts(worker)
   let actors = get(worker, "actors")
-  let junctions = get(worker, "junctions")
   let ids = nefor.graph.actor_ids(actors)
-  let endpoint_ids = concat(map(((|id| => canonical(nefor.graph.actor_endpoint(id))) : fn(String) -> String), ids), map(((|junction| => canonical(nefor.graph.junction_endpoint(get(junction, "id")))) : fn(nefor.graph.Junction) -> String), junctions))
+  let endpoint_ids = map(((|id| => canonical(nefor.graph.actor_endpoint(id))) : fn(String) -> String), ids)
   let checked_actor_refs = map(((|actor| => checked_relocations(ids, actor)) : fn(nefor.graph.Actor) -> List<nefor.graph.Relocation>), actors)
   let terminal = nefor.graph.output<O>(worker_check_id(ids, "traverse.validation.output"))
   let topology = nefor.graph.graph([nefor.graph.edge(worker, terminal)])
   let analysis = nefor.graph.analyze_graph(topology)
-  let input = nefor.graph.store_port(get(worker, "input"))
-  let output = nefor.graph.store_port(get(worker, "output"))
+  let input = nefor.graph.store_boundary(get(worker, "input"))
+  let output = nefor.graph.store_boundary(get(worker, "output"))
+  let input_leaves = get(input, "leaves")
+  let output_leaves = get(output, "leaves")
+  let input_starts = boundary_leaf_endpoints(input_leaves)
+  let output_ends = boundary_leaf_endpoints(output_leaves)
+  let actor_free_boundary = if (=)(count(actors), 0) then if (=)(count(input_leaves), 0) then if (=)(count(output_leaves), 0) then if not((=)(count(get(input, "through")), 0)) then not((=)(count(get(output, "through")), 0)) else false else false else false else false
+  let input_transformations = filter(((|leaf| => not(descriptor_accepts(get(get(leaf, "port"), "type"), nefor.graph.transformed_type(get(input, "type"), get(leaf, "steps"))))) : fn(nefor.graph.BoundaryLeaf) -> Bool), input_leaves)
+  let output_transformations = filter(((|leaf| => not(descriptor_accepts(get(output, "type"), nefor.graph.transformed_type(get(get(leaf, "port"), "type"), get(leaf, "steps"))))) : fn(nefor.graph.BoundaryLeaf) -> Bool), output_leaves)
+  let anonymous_output_transformations = filter(((|flow| => not(descriptor_accepts(get(output, "type"), nefor.graph.transformed_type(get(input, "type"), get(flow, "steps"))))) : fn(nefor.graph.Flow) -> Bool), get(output, "through"))
   let bad_inputs = filter(((|actor| => {
     let port = get(actor, "input")
-    let incoming = map(((|route| => get(get(route, "from"), "type")) : fn(nefor.graph.StoredRoute) -> TypeDescriptor), __map_get_or(get(analysis, "routes_by_input"), nefor.graph.port_address_key(port), ([]: List<nefor.graph.StoredRoute>)))
-    let sources = if nefor.graph.same_port_address(port, input) then concat([get(input, "type")], incoming) else incoming
-    not(descriptor_input_covered_by(get(port, "type"), sources))
+    let incoming_routes = map(((|route| => nefor.graph.transformed_type(get(get(route, "from"), "type"), get(route, "transforms"))) : fn(nefor.graph.StoredRoute) -> TypeDescriptor), filter(((|route| => nefor.graph.same_port_address(get(route, "to"), port)) : fn(nefor.graph.StoredRoute) -> Bool), get(worker, "routes")))
+    let boundary_sources = map(((|leaf| => nefor.graph.transformed_type(get(input, "type"), get(leaf, "steps"))) : fn(nefor.graph.BoundaryLeaf) -> TypeDescriptor), filter(((|leaf| => nefor.graph.same_port_address(get(leaf, "port"), port)) : fn(nefor.graph.BoundaryLeaf) -> Bool), input_leaves))
+    not(descriptor_input_covered_by(get(port, "type"), concat(boundary_sources, incoming_routes)))
   }) : fn(nefor.graph.Actor) -> Bool), actors)
   let bad_outputs = filter(((|actor| => not(nefor.graph.actor_outputs_coverage_valid(analysis, get(analysis, "graph_operations_by_output"), actor))) : fn(nefor.graph.Actor) -> Bool), actors)
-  let bad_routes = filter(((|route| => {
-    let from = get(route, "from")
-    let to = get(route, "to")
-    if not(nefor.graph.contains_string(endpoint_ids, canonical(get(from, "endpoint")))) then true else if not(nefor.graph.contains_string(endpoint_ids, canonical(get(to, "endpoint")))) then true else if not(nefor.graph.serialized_equal(get(from, "type_id"), type_id(get(from, "type")))) then true else if not(nefor.graph.serialized_equal(get(to, "type_id"), type_id(get(to, "type")))) then true else not(nefor.graph.route_valid(analysis, route))
-  }) : fn(nefor.graph.StoredRoute) -> Bool), get(worker, "routes"))
   let malformed_ports = filter(((|actor| => {
     let ports = concat([get(actor, "input")], get(actor, "outputs"))
     not((=)(count(filter(((|port| => if not(nefor.graph.endpoint_is_actor(get(port, "endpoint"))) then true else if not((=)(nefor.graph.endpoint_id(get(port, "endpoint")), get(actor, "id"))) then true else not(nefor.graph.serialized_equal(get(port, "type_id"), type_id(get(port, "type"))))) : fn(nefor.graph.StoredPort) -> Bool), ports)), 0))
   }) : fn(nefor.graph.Actor) -> Bool), actors)
-  if not((=)(count(identity_conflicts), 0)) then fail(map(((|error| => str("traverse: ", error)) : fn(String) -> String), identity_conflicts)) else if not((=)(count(get(worker, "operations")), 0)) then fail(["traverse: nested worker operations are unsupported"]) else if not((=)(count(get(worker, "messages")), 0)) then fail(["traverse: authored worker messages/extra activations are unsupported"]) else if descriptor_streaming(get(input, "type")) then fail(["traverse: streaming worker input is unsupported"]) else if descriptor_streaming(get(output, "type")) then fail(["traverse: streaming worker output is unsupported"]) else if not((=)(count(checked_actor_refs), count(actors))) then fail(["traverse: actor contracts are incomplete"]) else if not(nefor.graph.actor_ids_valid(analysis)) then fail(["traverse: duplicate actor IDs"]) else if not(nefor.graph.junction_ids_valid(analysis)) then fail(["traverse: duplicate junction IDs"]) else if not(nefor.graph.junctions_valid(analysis)) then fail(["traverse: invalid junction ports or operation signatures"]) else if not(nefor.graph.contains_string(endpoint_ids, canonical(get(input, "endpoint")))) then fail(["traverse: external input boundary"]) else if not(nefor.graph.contains_string(endpoint_ids, canonical(get(output, "endpoint")))) then fail(["traverse: external output boundary"]) else if not(nefor.graph.port_is_input(analysis, input)) then fail(["traverse: ambiguous or absent input boundary"]) else if not(nefor.graph.port_is_output(analysis, output)) then fail(["traverse: ambiguous or absent output boundary"]) else if not((=)(count(malformed_ports), 0)) then fail(["traverse: malformed actor port evidence or ownership"]) else if not(nefor.graph.logical_paths_valid(topology)) then fail(["traverse: malformed logical hierarchy"]) else if not(nefor.graph.logical_members_valid(topology)) then fail(["traverse: malformed logical member references"]) else if not((=)(count(bad_inputs), 0)) then fail([str("traverse: invalid worker input coverage: ", canonical(nefor.graph.actor_ids(bad_inputs)))]) else if not((=)(count(bad_outputs), 0)) then fail(["traverse: invalid worker output coverage"]) else if not((=)(count(bad_routes), 0)) then fail(["traverse: invalid internal routes"]) else if not(nefor.graph.all_strings_in(endpoint_ids, worker_reachable([canonical(get(input, "endpoint"))], get(worker, "routes"), false))) then fail(["traverse: every endpoint must be reachable from the worker input"]) else if not(nefor.graph.all_strings_in(endpoint_ids, worker_reachable([canonical(get(output, "endpoint"))], get(worker, "routes"), true))) then fail(["traverse: every endpoint must reach the worker output"]) else worker
+  let bad_routes = filter(((|route| => if not(nefor.graph.contains_string(endpoint_ids, canonical(get(get(route, "from"), "endpoint")))) then true else if not(nefor.graph.contains_string(endpoint_ids, canonical(get(get(route, "to"), "endpoint")))) then true else not(descriptor_accepts(get(get(route, "to"), "type"), nefor.graph.transformed_type(get(get(route, "from"), "type"), get(route, "transforms")))) ) : fn(nefor.graph.StoredRoute) -> Bool), get(worker, "routes"))
+  if not((=)(count(identity_conflicts), 0)) then fail(map(((|error| => str("traverse: ", error)) : fn(String) -> String), identity_conflicts)) else if not((=)(count(get(worker, "operations")), 0)) then fail(["traverse: nested worker operations are unsupported"]) else if not((=)(count(get(worker, "messages")), 0)) then fail(["traverse: authored worker messages/extra activations are unsupported"]) else if descriptor_streaming(get(input, "type")) then fail(["traverse: streaming worker input is unsupported"]) else if descriptor_streaming(get(output, "type")) then fail(["traverse: streaming worker output is unsupported"]) else if not((=)(count(checked_actor_refs), count(actors))) then fail(["traverse: actor contracts are incomplete"]) else if not(nefor.graph.actor_ids_valid(analysis)) then fail(["traverse: duplicate actor IDs"]) else if not(nefor.graph.logical_paths_valid(topology)) then fail(["traverse: malformed logical hierarchy"]) else if not(nefor.graph.logical_members_valid(topology)) then fail(["traverse: malformed logical member references"]) else if not((=)(count(malformed_ports), 0)) then fail(["traverse: malformed actor port evidence or ownership"]) else if not((=)(count(input_transformations), 0)) then fail(["traverse: invalid worker input boundary transformation"]) else if not((=)(count(output_transformations), 0)) then fail(["traverse: invalid worker output boundary transformation"]) else if not((=)(count(anonymous_output_transformations), 0)) then fail(["traverse: invalid anonymous worker output transformation"]) else if not((=)(count(bad_inputs), 0)) then fail([str("traverse: invalid worker input coverage: ", canonical(nefor.graph.actor_ids(bad_inputs)))]) else if not((=)(count(bad_outputs), 0)) then fail(["traverse: invalid worker output coverage"]) else if not((=)(count(bad_routes), 0)) then fail(["traverse: invalid internal routes"]) else if (=)(count(actors), 0) then if actor_free_boundary then worker else fail(["traverse: actor-free workers need anonymous input and output flow"]) else if not(nefor.graph.all_strings_in(endpoint_ids, worker_reachable(input_starts, get(worker, "routes"), false))) then fail(["traverse: every actor must be reachable from the worker input"]) else if not(nefor.graph.all_strings_in(endpoint_ids, worker_reachable(output_ends, get(worker, "routes"), true))) then fail(["traverse: every actor must reach the worker output"]) else worker
 }
 
-let template_stored_port: fn(nefor.graph.StoredPort) -> nefor.mag.TemplatePort = |port| => {
-  let endpoint = get(port, "endpoint")
-  let reference = if nefor.graph.endpoint_is_actor(endpoint) then local_actor_ref(nefor.graph.endpoint_id(endpoint)) else local_junction_ref(nefor.graph.endpoint_id(endpoint))
-  nefor.mag.TemplatePort {endpoint: reference, `type`: get(port, "type"), type_id: get(port, "type_id"), wire: get(port, "wire")}
-}
+let template_stored_port: fn(nefor.graph.StoredPort) -> nefor.mag.TemplatePort = |port| => nefor.mag.TemplatePort {endpoint: local_actor_ref(nefor.graph.endpoint_id(get(port, "endpoint"))), `type`: get(port, "type"), type_id: get(port, "type_id"), wire: get(port, "wire")}
 
 // Length delimiters protect arbitrary authored ids; collection:index is an
 // injective pair because index is a nonnegative decimal integer at the end.
@@ -205,11 +206,13 @@ let occurrence_actor_id: fn(String, String, ValueRef<String>, ValueRef<String>) 
 
 let worker_template_actor: fn(nefor.graph.Actor, ValueRef<String>) -> nefor.mag.TemplateActor = |actor, id| => nefor.mag.TemplateActor {slot: get(actor, "id"), id: get(id, "id"), factory: get(actor, "factory"), type_arguments: get(actor, "type_arguments"), params: get(actor, "params"), input: template_stored_port(get(actor, "input")), outputs: map(template_stored_port, get(actor, "outputs")), parameter_bindings: []}
 
-let worker_template_junction: fn(nefor.graph.Junction, ValueRef<String>) -> nefor.mag.TemplateJunction = |junction, id| => nefor.mag.TemplateJunction {slot: get(junction, "id"), id: get(id, "id"), operation: get(junction, "operation"), inputs: map(template_stored_port, get(junction, "inputs")), outputs: map(template_stored_port, get(junction, "outputs"))}
+let worker_template_route: fn(nefor.graph.StoredRoute) -> nefor.mag.TemplateRoute = |route| => nefor.mag.TemplateRoute {from: template_stored_port(get(route, "from")), to: template_stored_port(get(route, "to")), transforms: get(route, "transforms")}
 
-let worker_template_route: fn(nefor.graph.AssignedRoute) -> nefor.mag.TemplateRoute = |assigned| => {
-  let route = get(assigned, "route")
-  nefor.mag.TemplateRoute {from: template_stored_port(get(route, "from")), to: template_stored_port(get(route, "to")), product_position: get(assigned, "product_position")}
+let output_template_route: fn(nefor.graph.BoundaryLeaf, nefor.mag.TemplatePort) -> nefor.mag.TemplateRoute = |leaf, target| => nefor.mag.TemplateRoute {from: template_stored_port(get(leaf, "port")), to: target, transforms: get(leaf, "steps")}
+
+let input_template_message<I>: fn(nefor.graph.BoundaryLeaf, ValueRef<I>) -> nefor.mag.TemplateMessage = |leaf, item| => {
+  let port = get(leaf, "port")
+  nefor.mag.TemplateMessage {to: template_stored_port(port), transforms: get(leaf, "steps"), semantic_type: type_evidence(get(item, "type")), semantic_type_id: type_id(type_evidence(get(item, "type"))), content: named(nefor.mag.TemplatePayload, Expression, get(item, "id"))}
 }
 
 let traverse<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<DynamicList<I>, DynamicList<O>> = |id, value| => {
@@ -223,34 +226,35 @@ let traverse<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<Dynam
   let output = nefor.graph.port(output_id, type_tag<DynamicList<O>>(), "nefor.dynamic.Output")
   let input_actor = nefor.graph.actor(input_id, dynamic_each_factory, [type_evidence(type_tag<I>())], DynamicParams {}, nefor.graph.store_port(input), [nefor.graph.store_port(indexed), nefor.graph.store_port(completed)])
   let output_actor = nefor.graph.actor(output_id, dynamic_output_factory, [type_evidence(type_tag<O>()), type_evidence(type_tag<DynamicEvent<O>>())], DynamicParams {}, nefor.graph.store_port(collect), [nefor.graph.store_port(output)])
-  let complete_event = nefor.node.pack_adt<DynamicCount, DynamicEvent<O>>(str(id, ".complete"), "Complete")
   let trigger = trigger_ref(type_tag<Indexed<I>>())
   let collection = field_ref(trigger, "collection", type_tag<String>())
   let index = field_ref(trigger, "index", type_tag<Int>())
   let item = field_ref(trigger, "value", type_tag<I>())
   let index_text = int_to_decimal_string_ref(index)
   let worker_actors = get(worker, "actors")
-  let worker_junctions = get(worker, "junctions")
-  let structural_ids = concat(nefor.graph.actor_ids(worker_actors), map(((|junction| => get(junction, "id")) : fn(nefor.graph.Junction) -> String), worker_junctions))
-  let result_slot = worker_check_id(structural_ids, "traverse.result")
+  let worker_input = nefor.graph.store_boundary(get(worker, "input"))
+  let worker_output = nefor.graph.store_boundary(get(worker, "output"))
+  let result_slot = worker_check_id(nefor.graph.actor_ids(worker_actors), "traverse.result")
   let result_id = occurrence_actor_id(id, result_slot, collection, index_text)
   let actor_ids = map(((|actor| => occurrence_actor_id(id, get(actor, "id"), collection, index_text)) : fn(nefor.graph.Actor) -> ValueRef<String>), worker_actors)
-  let junction_ids = map(((|junction| => occurrence_actor_id(id, get(junction, "id"), collection, index_text)) : fn(nefor.graph.Junction) -> ValueRef<String>), worker_junctions)
   let template_actors = map(((|actor| => worker_template_actor(actor, occurrence_actor_id(id, get(actor, "id"), collection, index_text))) : fn(nefor.graph.Actor) -> nefor.mag.TemplateActor), worker_actors)
-  let template_junctions = map(((|junction| => worker_template_junction(junction, occurrence_actor_id(id, get(junction, "id"), collection, index_text))) : fn(nefor.graph.Junction) -> nefor.mag.TemplateJunction), worker_junctions)
   let result_input = template_port(local_actor_ref(result_slot), type_tag<O>(), "nefor.dynamic.IndexInput")
   let result_output = template_port(local_actor_ref(result_slot), type_tag<DynamicEvent<O>>(), "nefor.dynamic.Event")
   let result_actor = nefor.mag.TemplateActor {slot: result_slot, id: get(result_id, "id"), factory: dynamic_index_factory, type_arguments: [type_evidence(type_tag<O>()), type_evidence(type_tag<DynamicEvent<O>>())], params: pack(DynamicIndexParams {collection: "", index: 0}), input: result_input, outputs: [result_output], parameter_bindings: [nefor.mag.ScalarParameterBinding {path: ["collection"], value: get(collection, "id")}, nefor.mag.ScalarParameterBinding {path: ["index"], value: get(index, "id")}]}
-  let routes = concat(map(worker_template_route, nefor.graph.assigned_routes(get(worker, "routes"))), [nefor.mag.TemplateRoute {from: template_stored_port(nefor.graph.store_port(get(worker, "output"))), to: result_input, product_position: -1}, nefor.mag.TemplateRoute {from: result_output, to: nefor.mag.TemplatePort {endpoint: existing_actor_ref(output_id), `type`: type_evidence(type_tag<DynamicEvent<O>>()), type_id: type_id(type_evidence(type_tag<DynamicEvent<O>>())), wire: "nefor.dynamic.Collect"}, product_position: -1}])
+  let worker_routes = map(worker_template_route, get(worker, "routes"))
+  let result_routes = map(((|leaf| => output_template_route(leaf, result_input)) : fn(nefor.graph.BoundaryLeaf) -> nefor.mag.TemplateRoute), get(worker_output, "leaves"))
+  let collect_route = nefor.mag.TemplateRoute {from: result_output, to: nefor.mag.TemplatePort {endpoint: existing_actor_ref(output_id), `type`: type_evidence(type_tag<DynamicEvent<O>>()), type_id: type_id(type_evidence(type_tag<DynamicEvent<O>>())), wire: "nefor.dynamic.Collect"}, transforms: []}
   let occurrence_segment = concat_strings_ref([collection, capture_ref(":"), index_text])
   let occurrence_path = [named(nefor.mag.PathSegment, TriggerPathSegment, nefor.mag.TriggerPathSegment {}), bound_segment(occurrence_segment)]
   let nodes = concat([nefor.mag.TemplateLogicalNode {path: occurrence_path, members: [nefor.mag.LocalActorRef {slot: result_slot}]}], map(((|node| => nefor.mag.TemplateLogicalNode {path: concat(occurrence_path, map(fixed_segment, get(node, "path"))), members: map(((|member| => nefor.mag.LocalActorRef {slot: member}) : fn(String) -> nefor.mag.LocalActorRef), get(node, "members"))}) : fn(nefor.graph.LogicalNode) -> nefor.mag.TemplateLogicalNode), get(worker, "nodes")))
   let relocations = flat_map(((|actor| => map(((|relocation| => nefor.mag.ActorReferenceRelocation {actor: nefor.mag.LocalActorRef {slot: get(actor, "id")}, path: get(relocation, "path"), shape: get(relocation, "shape")}) : fn(nefor.graph.Relocation) -> nefor.mag.ActorReferenceRelocation), checked_relocations(nefor.graph.actor_ids(worker_actors), actor))) : fn(nefor.graph.Actor) -> List<nefor.mag.ActorReferenceRelocation>), worker_actors)
-  let message = nefor.mag.TemplateMessage {to: template_stored_port(nefor.graph.store_port(get(worker, "input"))), semantic_type: type_evidence(type_tag<I>()), semantic_type_id: type_id(type_evidence(type_tag<I>())), content: named(nefor.mag.TemplatePayload, Expression, get(item, "id"))}
-  let template = nefor.mag.DeltaTemplate {types: descriptor_table(concat(nefor.graph.actor_descriptors(worker_actors), [type_evidence(type_tag<I>()), type_evidence(type_tag<O>()), type_evidence(type_tag<DynamicEvent<O>>())])), actors: concat(template_actors, [result_actor]), junctions: template_junctions, routes: routes, messages: [message], nodes: nodes, actor_reference_relocations: relocations}
-  let refs = concat(actor_ids, concat(junction_ids, [result_id, collection, index_text, occurrence_segment]))
+  let input_messages = map(((|leaf| => input_template_message<I>(leaf, item)) : fn(nefor.graph.BoundaryLeaf) -> nefor.mag.TemplateMessage), get(worker_input, "leaves"))
+  let anonymous_messages = map(((|flow| => nefor.mag.TemplateMessage {to: result_input, transforms: get(flow, "steps"), semantic_type: type_evidence(type_tag<I>()), semantic_type_id: type_id(type_evidence(type_tag<I>())), content: named(nefor.mag.TemplatePayload, Expression, get(item, "id"))}) : fn(nefor.graph.Flow) -> nefor.mag.TemplateMessage), get(worker_output, "through"))
+  let template = nefor.mag.DeltaTemplate {types: descriptor_table(concat(nefor.graph.actor_descriptors(worker_actors), [type_evidence(type_tag<I>()), type_evidence(type_tag<O>()), type_evidence(type_tag<DynamicEvent<O>>())])), actors: concat(template_actors, [result_actor]), routes: concat(worker_routes, concat(result_routes, [collect_route])), messages: concat(input_messages, anonymous_messages), nodes: nodes, actor_reference_relocations: relocations}
+  let refs = concat(actor_ids, [result_id, collection, index_text, occurrence_segment])
   let captures = merge_captures(concat(map(((|ref| => get(ref, "captures")) : fn(ValueRef<String>) -> Map<String, nefor.mag.TypedCapture>), refs), [get(item, "captures")]))
   let expressions = merge_expressions(concat(map(((|ref| => get(ref, "expressions")) : fn(ValueRef<String>) -> List<nefor.mag.Expression>), refs), [get(item, "expressions")]))
   let operation = nefor.graph.instantiate_delta_template(str(id, ".expand"), indexed, captures, expressions, template)
-  nefor.graph.node_with_operations_and_nodes_and_junctions(id, "ordinary", concat([input_actor, output_actor], get(complete_event, "actors")), get(complete_event, "junctions"), concat(get(complete_event, "routes"), [nefor.graph.stored_route(completed, get(complete_event, "input")), nefor.graph.stored_route(get(complete_event, "output"), collect)]), [], [operation], [nefor.graph.logical_node([id], [input_id, output_id])], input, output)
+  let completion = nefor.graph.transformed_route(nefor.graph.store_port(completed), nefor.graph.store_port(collect), [named(nefor.graph.Transform, Pack, nefor.graph.AdtTransform {owner: type_evidence(type_tag<DynamicEvent<O>>()), payload: type_evidence(type_tag<DynamicCount>()), constructor: "Complete"})])
+  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [input_actor, output_actor], [completion], [], [operation], [nefor.graph.logical_node([id], [input_id, output_id])], input, output)
 }

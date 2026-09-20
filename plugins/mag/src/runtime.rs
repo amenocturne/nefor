@@ -1785,34 +1785,17 @@ fn unpack_operations(operations: &mut [Value]) -> Result<(), String> {
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ActorEndpointValue {
-    id: ActorId,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JunctionEndpointValue {
-    id: JunctionId,
-}
+struct ActorEndpointValue { id: ActorId }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(tag = "constructor", content = "value", deny_unknown_fields)]
-enum Endpoint {
-    ActorEndpoint(ActorEndpointValue),
-    JunctionEndpoint(JunctionEndpointValue),
-}
+enum Endpoint { ActorEndpoint(ActorEndpointValue) }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(transparent)]
 struct ActorId(String);
-
-#[allow(dead_code)]
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(transparent)]
-struct JunctionId(String);
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -1828,21 +1811,32 @@ struct StoredPort {
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TopologyRoute {
-    id: String,
-    from: StoredPort,
-    to: StoredPort,
-    product_position: i64,
+struct BoundaryLeaf { port: StoredPort, steps: Vec<Value> }
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Flow { steps: Vec<Value> }
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredBoundary {
+    #[serde(rename = "type")]
+    semantic_type: Value,
+    type_id: String,
+    leaves: Vec<BoundaryLeaf>,
+    through: Vec<Flow>,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TopologyJunction {
-    id: JunctionId,
-    operation: Value,
-    inputs: Vec<StoredPort>,
-    outputs: Vec<StoredPort>,
+struct TopologyRoute {
+    id: String,
+    from: StoredPort,
+    to: StoredPort,
+    transforms: Vec<Value>,
 }
 
 #[allow(dead_code)]
@@ -1850,15 +1844,14 @@ struct TopologyJunction {
 #[serde(deny_unknown_fields)]
 struct TopologyMessage {
     to: StoredPort,
+    transforms: Vec<Value>,
     semantic_type: Value,
     semantic_type_id: String,
     content: Value,
 }
 
 fn validate_topology_shapes(modification: &Value, context: &str) -> Result<(), String> {
-    let object = modification
-        .as_object()
-        .ok_or_else(|| format!("{context} must be an object"))?;
+    let object = modification.as_object().ok_or_else(|| format!("{context} must be an object"))?;
     let actors = object.get("actors").and_then(Value::as_array)
         .ok_or_else(|| format!("{context}.actors must be an array"))?;
     for (index, actor) in actors.iter().enumerate() {
@@ -1873,23 +1866,17 @@ fn validate_topology_shapes(modification: &Value, context: &str) -> Result<(), S
     }
     if let Some(result) = object.get("result") {
         let fields = exact_object(result, &["from"], &format!("{context}.result"))?;
-        serde_json::from_value::<StoredPort>(fields["from"].clone())
+        serde_json::from_value::<StoredBoundary>(fields["from"].clone())
             .map_err(|error| format!("{context}.result.from: {error}"))?;
     }
-    for (field, target) in [
-        ("junctions", "junction definition"),
-        ("routes", "route"),
-        ("messages", "message"),
-    ] {
-        let values = object
-            .get(field)
-            .and_then(Value::as_array)
+    for (field, target) in [("routes", "route"), ("messages", "message")] {
+        let values = object.get(field).and_then(Value::as_array)
             .ok_or_else(|| format!("{context}.{field} must be an array"))?;
         for (index, value) in values.iter().enumerate() {
-            let result = match field {
-                "junctions" => serde_json::from_value::<TopologyJunction>(value.clone()).map(|_| ()),
-                "routes" => serde_json::from_value::<TopologyRoute>(value.clone()).map(|_| ()),
-                _ => serde_json::from_value::<TopologyMessage>(value.clone()).map(|_| ()),
+            let result = if field == "routes" {
+                serde_json::from_value::<TopologyRoute>(value.clone()).map(|_| ())
+            } else {
+                serde_json::from_value::<TopologyMessage>(value.clone()).map(|_| ())
             };
             result.map_err(|error| format!("{context}.{field}[{index}] has invalid {target}: {error}"))?;
         }
@@ -1911,7 +1898,7 @@ fn artifact_program(artifact: &Value) -> Result<DecodedProgram, String> {
     if object.get("format").and_then(Value::as_str) != Some("nefor.mag") {
         return Err("mag.execute artifact has an unsupported format".to_owned());
     }
-    if object.get("version").and_then(Value::as_u64) != Some(3) {
+    if object.get("version").and_then(Value::as_u64) != Some(4) {
         return Err("mag.execute artifact has an unsupported nefor.mag version".to_owned());
     }
     if object.get("kind").and_then(Value::as_str) != Some("program") {
@@ -1944,7 +1931,6 @@ fn artifact_program(artifact: &Value) -> Result<DecodedProgram, String> {
         &[
             "types",
             "actors",
-            "junctions",
             "routes",
             "messages",
             "nodes",
@@ -1972,7 +1958,7 @@ fn artifact_delta(artifact: &Value) -> Result<Value, String> {
     if object.get("format").and_then(Value::as_str) != Some("nefor.mag") {
         return Err("mag.apply artifact has an unsupported format".to_owned());
     }
-    if object.get("version").and_then(Value::as_u64) != Some(3) {
+    if object.get("version").and_then(Value::as_u64) != Some(4) {
         return Err("mag.apply artifact has an unsupported nefor.mag version".to_owned());
     }
     if object.get("kind").and_then(Value::as_str) != Some("delta") {
@@ -1985,7 +1971,6 @@ fn artifact_delta(artifact: &Value) -> Result<Value, String> {
         &[
             "types",
             "actors",
-            "junctions",
             "routes",
             "messages",
             "nodes",

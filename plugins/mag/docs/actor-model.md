@@ -1,27 +1,27 @@
 # Actor model
 
-## Structural topology is not actor lifecycle
+## Fixed transforms and actor lifecycle
 
-Artifact v3 separates real capability actors from typed junctions. Fixed
-composition uses `Pass`, `Unit`, `ProductSplit`, `ProductFirst`, `ProductJoin`,
-`Collect`, `AdtPack`, and `AdtUnpack` junction operations, never
-factory instances. Junctions have no registry entry, logical membership,
-construction, firing/busy window, actor lifecycle event, or per-actor output
-persistence. A run owns their topology and FIFO buffers until teardown.
+Artifact v4 has one runtime inventory: capability actors. Fixed composition uses
+anonymous compile-time transforms — `Unit`, `Project`, `Pack`, `Unpack`,
+`Assemble`, and `EmptyList` — carried by boundaries, routes, and messages. They
+have no runtime IDs, registry entries, logical membership, construction,
+firing, lifecycle events, or output persistence.
 
-Each join input wire owns one FIFO. A complete cohort consumes one value from
-each slot in declaration order. Equal types, one producer feeding distinct
-slots, and alternative producers for one slot remain distinct cases: sender
-identity does not determine a slot. Public fixed `sequence` requires at least
-one child. Incomplete cohorts do not fabricate completion.
+`Assemble` is destination-owned state. Its key is the concrete destination plus
+`Assembly.path`; each key owns one FIFO queue per explicit slot. A complete
+cohort consumes one value from each slot in slot order, preserving equal-typed
+branches and one producer feeding multiple slots. Incomplete cohorts do not
+fabricate completion. `Unit` is an ordered status transform, while `Project`,
+`Pack`, `Unpack`, and `EmptyList` reshape values without creating rows.
 
-Top-level routes connect explicit `ActorEndpoint` or `JunctionEndpoint` ports.
-The endpoint variant is part of identity; actor and junction names may coincide.
-Actor routes retain whole-product/component positions; junction destinations use
-`-1` because their explicit slot wires own assembly. A synchronous nonrecursive
-junction queue preserves route declaration order. Actor and junction output
-observation share one terminal boundary, with no synthetic output actor;
-DynamicList items settle only after explicit completion.
+Top-level routes connect only `ActorEndpoint` ports and carry ordered transforms.
+Initial and template messages do the same. The result boundary is a
+`StoredBoundary` of actor-output leaves and through flows, so result observation
+also applies transforms directly; no synthetic output actor exists. DynamicList
+items settle only after explicit completion. The intentional `traverse.result`
+row is a real capability actor used by dynamic traversal, not a fixed-transform
+placeholder.
 
 ## Interface
 
@@ -441,20 +441,25 @@ actor carries an explicit templateability contract. Arbitrary low-level actors
 default to unsupported; audited constructors declare complete parameter
 relocations, with `conversation_peer` references relocated by identity rather
 than by string replacement. Structural workers may contain zero actors; local
-junction references are typed topology fields, not actor parameter relocations.
+fixed-transform references remain ordered route/message data, not actor parameter
+relocations.
 
 The internal template receives each occurrence's complete item through a checked
 expression-bound message on the exact worker input wire. Records, products,
-sums, and Unit retain their semantic evidence. Compilation checks the closed
-worker boundary, routes, product assignments, hierarchy, and relocations;
-runtime preflight independently checks serialized templates against factory
-contracts. Streaming workers and nested operations remain explicitly unsupported.
+sums, and Unit retain their semantic evidence. Template endpoints and logical
+members use only local or existing actor references; fixed boundaries and
+transforms are carried inside routes/messages, never referenced as template
+entities. Compilation checks the closed worker boundary, routes, product
+assignments, hierarchy, and relocations; runtime preflight independently checks
+serialized templates against factory contracts. Streaming workers and nested
+operations remain explicitly unsupported.
 
 Template hierarchy uses an explicit trigger-path reference, resolved against the
 trigger actor's immutable logical owner. Naming or wrapping a traversal therefore
 moves its occurrence children with it without parsing or rewriting actor IDs.
-Every occurrence has fresh traversal/collection/index-qualified actor and junction identities,
-then returns through one indexed-result actor to the ordered completion consumer.
+Every occurrence has fresh traversal/collection/index-qualified capability-actor
+identities, then returns through one intentional indexed-result actor to the
+ordered completion consumer.
 
 ### Structured output boundary
 

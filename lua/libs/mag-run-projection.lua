@@ -29,39 +29,20 @@ end
 M.member_label = member_label
 
 local function fallback_descriptors(nodes)
-  local buckets, order = {}, {}
+  local entries = {}
   for actor_id, node in pairs(nodes or {}) do
-    local name = group_of(actor_id)
-    local bucket = buckets[name]
-    if not bucket then
-      bucket = { name = name, entries = {}, min_seq = math.huge }
-      buckets[name], order[#order + 1] = bucket, bucket
-    end
-    bucket.entries[#bucket.entries + 1] = { id = actor_id, node = node }
-    bucket.min_seq = math.min(bucket.min_seq, node.seq or math.huge)
+    entries[#entries + 1] = { id = actor_id, node = node }
   end
-  table.sort(order, function(left, right)
-    if left.min_seq ~= right.min_seq then return left.min_seq < right.min_seq end
-    return left.name < right.name
+  table.sort(entries, function(left, right)
+    local ls, rs = left.node.seq or math.huge, right.node.seq or math.huge
+    if ls ~= rs then return ls < rs end
+    return left.id < right.id
   end)
   local out = {}
-  for _, bucket in ipairs(order) do
-    table.sort(bucket.entries, function(left, right)
-      local ls, rs = left.node.seq or math.huge, right.node.seq or math.huge
-      if ls ~= rs then return ls < rs end
-      return left.id < right.id
-    end)
-    if #bucket.entries == 1 and bucket.entries[1].id == bucket.name then
-      out[#out + 1] = { path = { bucket.name }, members = { bucket.name } }
-    else
-      out[#out + 1] = { path = { bucket.name }, members = {} }
-      for _, entry in ipairs(bucket.entries) do
-        out[#out + 1] = {
-          path = { bucket.name, member_label(bucket.name, entry.id) },
-          members = { entry.id },
-        }
-      end
-    end
+  for _, entry in ipairs(entries) do
+    -- Runtime fallback has no compiler-authored hierarchy to invent. Each
+    -- observed capability actor is its own explicit row.
+    out[#out + 1] = { path = { entry.id }, members = { entry.id } }
   end
   return out
 end
@@ -148,64 +129,6 @@ local function composite_status(children)
   return "done"
 end
 
-local function linearize(children, run)
-  if #children < 2 then return children end
-  local owner, edges = {}, {}
-  for index, child in ipairs(children) do
-    edges[index] = {}
-    for _, member in ipairs(child.members or {}) do owner[member.id] = index end
-  end
-  local function endpoint_key(endpoint)
-    if type(endpoint) ~= "table" or type(endpoint.value) ~= "table" then return nil end
-    local kind = endpoint.constructor == "ActorEndpoint" and "actor"
-        or endpoint.constructor == "JunctionEndpoint" and "junction" or nil
-    if kind == nil or type(endpoint.value.id) ~= "string" then return nil end
-    return kind .. ":" .. endpoint.value.id
-  end
-  local outgoing = {}
-  for _, route in ipairs(run.routes or {}) do
-    local from = endpoint_key(type(route.from) == "table" and route.from.endpoint or nil)
-    local to = endpoint_key(type(route.to) == "table" and route.to.endpoint or nil)
-    if from and to then
-      outgoing[from] = outgoing[from] or {}
-      outgoing[from][#outgoing[from] + 1] = to
-    end
-  end
-  for actor_id, from in pairs(owner) do
-    local frontier, seen = { "actor:" .. actor_id }, {}
-    while #frontier > 0 do
-      local current = table.remove(frontier, 1)
-      if not seen[current] then
-        seen[current] = true
-        for _, destination in ipairs(outgoing[current] or {}) do
-          local target_actor = destination:match("^actor:(.*)$")
-          local to = target_actor and owner[target_actor] or nil
-          if to and to ~= from then edges[from][to] = true end
-          if destination:match("^junction:") then frontier[#frontier + 1] = destination end
-        end
-      end
-    end
-  end
-  local remaining, placed, ordered = {}, {}, {}
-  for index = 1, #children do remaining[index] = true end
-  while #ordered < #children do
-    local zero, reached
-    for candidate = 1, #children do if remaining[candidate] then
-      local incoming, from_placed = false, false
-      for from = 1, #children do if edges[from][candidate] then
-        if remaining[from] then incoming = true elseif placed[from] then from_placed = true end
-      end end
-      if not incoming and zero == nil then zero = candidate end
-      if from_placed and reached == nil then reached = candidate end
-    end end
-    local selected = zero or reached
-    if not selected then for index = 1, #children do if remaining[index] then selected = index; break end end end
-    remaining[selected], placed[selected] = nil, true
-    ordered[#ordered + 1] = children[selected]
-  end
-  return ordered
-end
-
 function M.build_nodes(run)
   local by_key, roots = {}, {}
   for index, descriptor in ipairs(descriptors_for(run)) do
@@ -229,7 +152,7 @@ function M.build_nodes(run)
       finish(child)
       for _, member in ipairs(child.members) do if not seen[member.id] then members[#members + 1], seen[member.id] = member, true end end
     end
-    logical.members, logical.children = members, linearize(logical.children, run)
+    logical.members, logical.children = members, logical.children
     logical.status = #logical.children == 0 and leaf_status(members, run) or composite_status(logical.children)
     local activity = (run.group_activity or {})[logical.key] or {}
     logical.active_ms, logical.active_since_ms = activity.active_ms or 0, activity.active_since_ms
@@ -242,7 +165,7 @@ function M.build_nodes(run)
   end
   table.sort(roots, order)
   for _, root in ipairs(roots) do finish(root) end
-  return linearize(roots, run)
+  return roots
 end
 
 function M.group_elapsed_ms(group, now_ms)

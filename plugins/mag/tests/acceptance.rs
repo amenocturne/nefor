@@ -231,6 +231,14 @@ fn two_agent_program() -> Value {
             "wire": wire
         })
     }
+    fn boundary(id: &str, wire: &str, semantic_type: &Value) -> Value {
+        json!({
+            "type": semantic_type,
+            "type_id": type_id(semantic_type),
+            "leaves": [{"port": port(id, wire, semantic_type), "steps": []}],
+            "through": []
+        })
+    }
     fn agent(prefix: &str) -> (Vec<Value>, Vec<Value>) {
         let provider_input = named("nefor.contracts.ProviderInput");
         let tool_calls = named("nefor.contracts.ToolCalls");
@@ -282,9 +290,9 @@ fn two_agent_program() -> Value {
             }),
         ];
         let routes = vec![
-            json!({"id":format!("{prefix}.llm-to-run-tool"),"from":port(&llm,"generic-tool.ToolCalls",&tool_calls),"to":port(&run_tool,"generic-tool.ToolCalls",&tool_calls),"product_position":-1}),
-            json!({"id":format!("{prefix}.run-tool-to-tool-result"),"from":port(&run_tool,"generic-tool.ToolHandle",&tool_handle),"to":port(&tool_result,"generic-tool.ToolHandle",&tool_handle),"product_position":-1}),
-            json!({"id":format!("{prefix}.tool-result-to-llm"),"from":port(&tool_result,"generic-provider.ProviderOut",&provider_input),"to":port(&llm,"generic-provider.ProviderOut",&provider_input),"product_position":-1}),
+            json!({"id":format!("{prefix}.llm-to-run-tool"),"from":port(&llm,"generic-tool.ToolCalls",&tool_calls),"to":port(&run_tool,"generic-tool.ToolCalls",&tool_calls),"transforms":[]}),
+            json!({"id":format!("{prefix}.run-tool-to-tool-result"),"from":port(&run_tool,"generic-tool.ToolHandle",&tool_handle),"to":port(&tool_result,"generic-tool.ToolHandle",&tool_handle),"transforms":[]}),
+            json!({"id":format!("{prefix}.tool-result-to-llm"),"from":port(&tool_result,"generic-provider.ProviderOut",&provider_input),"to":port(&llm,"generic-provider.ProviderOut",&provider_input),"transforms":[]}),
         ];
         (actors, routes)
     }
@@ -318,17 +326,16 @@ fn two_agent_program() -> Value {
     }
     json!({
         "format": "nefor.mag",
-        "version": 3,
+        "version": 4,
         "kind": "program",
         "program": {
             "initial": {
                 "types": types,
                 "actors": actors,
-                "junctions": [],
                 "routes": routes,
                 "messages": [
-                    { "to": port("a1.llm", "generic-provider.ProviderOut", &provider_input), "semantic_type":provider_input, "semantic_type_id":type_id(&named("nefor.contracts.ProviderInput")), "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a1" }], "semantic_value":{"content":{"messages":[{"role":"user","content":"go-a1"}]}} } } },
-                    { "to": port("a2.llm", "generic-provider.ProviderOut", &named("nefor.contracts.ProviderInput")), "semantic_type":named("nefor.contracts.ProviderInput"), "semantic_type_id":type_id(&named("nefor.contracts.ProviderInput")), "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a2" }], "semantic_value":{"content":{"messages":[{"role":"user","content":"go-a2"}]}} } } }
+                    { "to": port("a1.llm", "generic-provider.ProviderOut", &provider_input), "transforms": [], "semantic_type":provider_input, "semantic_type_id":type_id(&named("nefor.contracts.ProviderInput")), "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a1" }], "semantic_value":{"content":{"messages":[{"role":"user","content":"go-a1"}]}} } } },
+                    { "to": port("a2.llm", "generic-provider.ProviderOut", &named("nefor.contracts.ProviderInput")), "transforms": [], "semantic_type":named("nefor.contracts.ProviderInput"), "semantic_type_id":type_id(&named("nefor.contracts.ProviderInput")), "content": { "$mag": "packed-value", "value": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go-a2" }], "semantic_value":{"content":{"messages":[{"role":"user","content":"go-a2"}]}} } } }
                 ],
                 "nodes": [
                     {"path":["a1.llm"],"members":["a1.llm"]},
@@ -339,7 +346,7 @@ fn two_agent_program() -> Value {
                     {"path":["a2.tool-result"],"members":["a2.tool-result"]}
                 ],
                 "kills": [],
-                "result": {"from": port("a1.llm", "nefor.agent.Result", &result)}
+                "result": {"from": boundary("a1.llm", "nefor.agent.Result", &result)}
             },
             "operations": []
         }
@@ -633,12 +640,11 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                                 "artifact".into(),
                                 json!({
                                     "format": "nefor.mag",
-                                    "version": 3,
+                                    "version": 4,
                                     "kind": "delta",
                                     "delta": {
                                         "types": {},
-                                        "actors": [],
-                                        "junctions": [], "routes": [],
+                                        "actors": [], "routes": [],
                                         "messages": [],
                                         "kills": ["a2.llm", "a2.run-tool", "a2.tool-result"],
                                         "nodes": []
@@ -1132,13 +1138,13 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
             "run_id": "approval-run",
             "source": "chat.human_approval",
             "artifact": {
-                "format": "nefor.mag", "version": 3, "kind": "delta",
+                "format": "nefor.mag", "version": 4, "kind": "delta",
                 "delta": {
                     "types": {},
-                    "actors": [],
-                    "junctions": [], "routes": [],
+                    "actors": [], "routes": [],
                     "messages": [{
                         "to": {"endpoint":{"constructor":"ActorEndpoint","value":{"id":"approval.human"}}, "type":reply_type.clone(), "type_id":reply_type_id.clone(), "wire":"mag.ApprovalReply"},
+                        "transforms": [],
                         "semantic_type": {"kind":"primitive", "name":"String"},
                         "semantic_type_id": "String",
                         "content": {"$mag": "packed-value", "value": {
@@ -1184,13 +1190,13 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
             "run_id": "approval-run",
             "source": "chat.human_approval",
             "artifact": {
-                "format": "nefor.mag", "version": 3, "kind": "delta",
+                "format": "nefor.mag", "version": 4, "kind": "delta",
                 "delta": {
                     "types": {(reply_type_id.clone()): reply_type.clone()},
-                    "actors": [],
-                    "junctions": [], "routes": [],
+                    "actors": [], "routes": [],
                     "messages": [{
                         "to": {"endpoint":{"constructor":"ActorEndpoint","value":{"id":"approval.human"}}, "type":reply_type.clone(), "type_id":reply_type_id.clone(), "wire":"mag.ApprovalReply"},
+                        "transforms": [],
                         "semantic_type": reply_type.clone(),
                         "semantic_type_id": reply_type_id.clone(),
                         "content": {"$mag": "packed-value", "value": {
@@ -1228,13 +1234,13 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
     }
 
     let delta = json!({
-        "format": "nefor.mag", "version": 3, "kind": "delta",
+        "format": "nefor.mag", "version": 4, "kind": "delta",
         "delta": {
             "types": {(reply_type_id.clone()): reply_type.clone()},
-            "actors": [],
-            "junctions": [], "routes": [],
+            "actors": [], "routes": [],
             "messages": [{
                 "to": {"endpoint":{"constructor":"ActorEndpoint","value":{"id":"approval.human"}}, "type":reply_type.clone(), "type_id":reply_type_id.clone(), "wire":"mag.ApprovalReply"},
+                "transforms": [],
                 "semantic_type": reply_type,
                 "semantic_type_id": reply_type_id,
                 "content": {
@@ -1464,7 +1470,7 @@ async fn project_build_process_restart_hit_and_cold_load_equivalence() {
     std::fs::write(project.path().join("mag.toml"), "version = 1\n").unwrap();
     std::fs::write(
         project.path().join("main.json"),
-        r#"{"format":"nefor.mag","version":3,"kind":"delta","delta":{"types":{},"actors":[],"junctions":[],"routes":[],"messages":[],"nodes":[],"kills":[]}}"#,
+        r#"{"format":"nefor.mag","version":4,"kind":"delta","delta":{"types":{},"actors":[],"routes":[],"messages":[],"nodes":[],"kills":[]}}"#,
     )
     .unwrap();
     std::fs::write(

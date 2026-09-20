@@ -575,14 +575,7 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         .iter()
         .map(|node| node.get("path").cloned().expect("logical node path"))
         .collect::<Vec<_>>();
-    let sequence_root = sequence_paths
-        .iter()
-        .find(|path| path.as_array().is_some_and(|segments| segments.len() == 1))
-        .and_then(|path| path[0].as_str())
-        .expect("sequence root path");
-    assert!(sequence_paths.contains(&json!([sequence_root])));
-    assert!(sequence_paths.contains(&json!([sequence_root, "first"])));
-    assert!(sequence_paths.contains(&json!([sequence_root, "second"])));
+    assert_eq!(sequence_paths, vec![json!(["first"]), json!(["second"])]);
 
     fs::write(
         temp_root.join("node-sequence-sources.mag"),
@@ -617,20 +610,14 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         .expect("source sequence initial messages");
     assert_eq!(
         source_messages.len(),
-        1,
-        "the completed graph must bootstrap exactly one outer Unit root"
+        2,
+        "each concrete Unit-input source must receive one anonymous root activation"
     );
-    assert_eq!(
-        source_messages[0]["to"]["endpoint"]["constructor"],
-        "JunctionEndpoint"
-    );
-    assert!(source_messages[0]["to"]["endpoint"]["value"]["id"]
-        .as_str()
-        .is_some_and(|target| target.ends_with(".input")));
-    assert_eq!(
-        source_messages[0]["content"]["value"]["kind"],
-        source_messages[0]["to"]["wire"]
-    );
+    for (message, actor) in source_messages.iter().zip(["first", "second"]) {
+        assert_eq!(message["to"]["endpoint"]["constructor"], "ActorEndpoint");
+        assert_eq!(message["to"]["endpoint"]["value"]["id"], actor);
+        assert_eq!(message["content"]["value"]["kind"], message["to"]["wire"]);
+    }
 
     fs::write(
         temp_root.join("source-delta.mag"),
@@ -929,10 +916,6 @@ nefor.artifact.compile((|base| => {expression}): fn(nefor.graph.Graph) -> nefor.
             .as_array_mut()
             .expect("artifact actors")
             .sort_by_key(|actor| actor["id"].as_str().unwrap_or_default().to_owned());
-        initial["junctions"]
-            .as_array_mut()
-            .expect("artifact junctions")
-            .sort_by_key(|junction| junction["id"].as_str().unwrap_or_default().to_owned());
         initial["routes"]
             .as_array_mut()
             .expect("artifact routes")
@@ -981,7 +964,7 @@ nefor.artifact.compile((|base| => {expression}): fn(nefor.graph.Graph) -> nefor.
         .and_then(Value::as_array)
         .map(Vec::len)
         .expect("graph algebra artifact routes");
-    assert_eq!(route_count, 2, "duplicate edges must not lower twice");
+    assert_eq!(route_count, 1, "duplicate edges must not lower twice");
 
     fs::write(
         temp_root.join("worktree-create.mag"),

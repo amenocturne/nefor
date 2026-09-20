@@ -6,11 +6,13 @@ ports. Semantic MAG types remain separate from runtime wire tags: libraries
 choose the wire protocol and generic functions preserve their typed relations.
 
 MAG has no graph syntax or graph-specific lowering pass. It evaluates pure,
-typed library code. The shipped Nefor libraries represent actors, topology junctions, endpoint-addressed ports,
-routes, messages, operations, and result selection as nominal data whose semantic
-fields contain opaque compiler descriptors. Graph validation delegates
-compatibility and product coverage to the compiler rather than interpreting
-descriptor maps in MAG, then marks the lowered value as the compilation result:
+typed library code. The shipped Nefor libraries represent capability actors,
+actor-addressed ports, transformed routes and messages, operations, and result
+selection as nominal data whose semantic fields contain opaque compiler
+descriptors. Fixed combinators are anonymous `Transform` values; they are
+never runtime definitions. Graph validation delegates compatibility and product
+coverage to the compiler rather than interpreting descriptor maps in MAG, then
+marks the lowered value as the compilation result:
 
 ```mag
 artifact(modification_data)
@@ -20,10 +22,10 @@ The complete path is:
 
 ```text
 namespaced modules
-  -> ordinary typed node and topology values
+  -> ordinary typed node, boundary, and route values
   -> nefor.graph.Graph
   -> nefor.graph.validate
-  -> Nefor-owned nefor.mag v3 program or delta envelope
+  -> Nefor-owned nefor.mag v4 program or delta envelope
   -> Artifact(opaque application value)
   -> runtime binding and defensive validation
 ```
@@ -31,13 +33,14 @@ namespaced modules
 The envelope schema lives in `mag/lib/nefor/mag.mag`; core MAG remains
 schema-opaque. A program envelope contains an initial concrete modification and
 an ordered list of operations. A delta envelope contains one concrete delta.
-Version 3 defines exactly one operation, `InstantiateDeltaTemplate`, whose
+Version 4 defines exactly one operation, `InstantiateDeltaTemplate`, whose
 closed expression vocabulary is Trigger, Capture, Field, IntToDecimalString,
-and ConcatStrings. Its structural template names actor slots, local/existing
-actor and junction references, typed endpoint ports, routes and product positions, typed messages,
-logical paths, scalar parameter bindings, and explicit actor_id relocation
-metadata. It contains no executable MAG, generic AST, source, bytecode,
-condition, nested operation, or generic object-construction facility.
+and ConcatStrings. Its structural template names capability-actor slots,
+local/existing actor references, typed actor ports, routes with ordered fixed
+transforms, transformed messages, logical paths, scalar parameter bindings,
+and explicit actor_id relocation metadata. It contains no executable MAG,
+generic AST, source, bytecode, condition, nested operation, or generic
+object-construction facility.
 
 ## Authoring layer
 
@@ -48,8 +51,8 @@ there are no compiler builtins named `agent`, `bash`, `graph`, `subgraph`, or
 
 A typed port records three identities:
 
-- `endpoint`: a nominal `ActorEndpoint` or `JunctionEndpoint`, so topology
-  wiring never relies on a string that silently means either kind;
+- `endpoint`: a nominal `ActorEndpoint`; fixed transforms are not endpoints or
+  runtime identities;
 - `type`: a compiler-created `TypeTag<T>` witness, used by generic library
   composition and lowered to a complete canonical structural descriptor;
 - `wire`: the runtime tag emitted or accepted by the implementation.
@@ -58,7 +61,7 @@ This lets an agent node expose `core.types.Result<AgentError, CodeAudit>` on the
 `nefor.agent.Result` wire. The success type is declared with
 `type_tag<CodeAudit>()`; an undeclared or misspelled semantic type fails
 compilation. Compatible edges route each selected constructor directly. Closed declarative
-operations may subscribe to any typed actor or junction output port. The
+operations may subscribe to any typed actor output port. The
 compiler neither knows what an LLM is nor invents a coercion.
 
 Actor-specific constructors are ordinary typed functions. They select a
@@ -71,15 +74,17 @@ lowering.
 ## Runtime artifact
 
 `nefor.graph.lower` produces the concrete initial modification placed inside
-the program envelope: capability actors, topology junctions, top-level typed
-routes, typed initial messages, kills, and structural result metadata. Every
-port carries its nominal endpoint kind. Each explicit initial message retains
-its destination descriptor as `semantic_type` even though actor factories still
-consume `content.kind`. Lowering also gives every exposed, unfed exact-`Unit`
-node input one typed bootstrap message. Consequently any unfed
-`Node<Unit, T>` is a source boundary; the same node behind an incoming edge
-remains dependency-driven. `result.from` selects the terminal actor or junction
-port directly. Closing a graph does not synthesize an output actor or route.
+the program envelope: capability actors, top-level typed routes with ordered
+transforms, typed initial messages with ordered transforms, kills, and
+`StoredBoundary` result metadata. Every port is an actor endpoint. Each
+explicit initial message retains its destination descriptor as `semantic_type`
+even though actor factories still consume `content.kind`. Lowering also gives
+every exposed, unfed exact-`Unit` node input one typed bootstrap message.
+Consequently any unfed `Node<Unit, T>` is a source boundary; the same node
+behind an incoming edge remains dependency-driven. `result.from` is the
+terminal `StoredBoundary`: its leaves and through flows carry transforms that
+observe actor output directly. Closing a graph does not synthesize an output
+actor or route.
 
 The runtime binds each qualified factory identity to an implementation and
 revalidates its concrete input/output contract as exact semantic-type/runtime-
@@ -110,9 +115,9 @@ raced ahead of it.
 The operation is fully represented by immutable data. Compilation retains no
 environment, and execution performs no later MAG function application.
 
-A concrete delta has no result boundary or nested operations. Its routes may
-target actors or junctions already live in the run; the runtime registry validates those
-references against the combined live-plus-new inventory before applying
+A concrete delta has no result boundary or nested operations. Its transformed
+routes may target actors already live in the run; the runtime registry validates
+those references against the combined live-plus-new inventory before applying
 anything. Delta lowering applies the same bootstrap rule to newly introduced
 actors, so an unfed `Unit` input starts once whether it was introduced in the
 initial graph or by expansion.

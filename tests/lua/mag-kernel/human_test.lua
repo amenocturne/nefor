@@ -1,6 +1,5 @@
--- Human approval remains an actor capability. ADT projection is now a
--- structural AdtUnpack junction (covered by topology_lua.rs), so this fixture
--- focuses on the gate's control-plane request/reply/cancel lifecycle.
+-- Human approval remains an actor capability. This fixture focuses on the
+-- gate's control-plane request/reply/cancel lifecycle.
 
 local inventory = require("inventory")
 local Registry = require("registry")
@@ -74,10 +73,17 @@ local function harness()
   end
 
   local inv = inventory.new({log=logger(),registry=registry})
-  local router = routing.new({
+  local router
+  router = routing.new({
     inventory=inv,registry=registry,log=logger(),bus_emit=function() end,
     events=function(event) events[#events + 1] = event end,
     persist_output=function(id, output) persisted[#persisted + 1] = {id=id,output=output} end,
+    transform_route=function(sender, wire, arrival)
+      local actor = inv.get(sender)
+      for _, destination in ipairs(actor and actor.routes and actor.routes[wire] or {}) do
+        router:deliver(destination.actor, sender, destination.wire, arrival.payload)
+      end
+    end,
   })
   inv.set_on_kill(function(id) router:dispatch_kill(id); router:forget(id) end)
   inv.set_is_constructed(function(id) return router:is_constructed(id) end)

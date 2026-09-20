@@ -354,28 +354,31 @@ local function lead_artifact()
       { id = "lead.llm", factory = "nefor.factory.llm", type_arguments = {},
         params = { ["$mag"] = "packed-value", value = { tools = { "read_file", "mag" } } } },
     },
-    junctions = {},
     routes = {
       { id = "source/entry",
         from = actor_port("lead.source", task_type, "task", "nefor.graph.Value"),
-        to = actor_port("lead.entry", task_type, "task", "nefor.agent.Input"), product_position = 0 },
+        to = actor_port("lead.entry", task_type, "task", "nefor.agent.Input"), transforms = {} },
       { id = "entry/llm",
         from = actor_port("lead.entry", {}, "provider", "generic-provider.ProviderOut"),
-        to = actor_port("lead.llm", {}, "provider", "generic-provider.ProviderOut"), product_position = 0 },
+        to = actor_port("lead.llm", {}, "provider", "generic-provider.ProviderOut"), transforms = {} },
       { id = "llm/run-tool",
         from = actor_port("lead.llm", {}, "tool-calls", "generic-tool.ToolCalls"),
-        to = actor_port("lead.run-tool", {}, "tool-calls", "generic-tool.ToolCalls"), product_position = 0 },
+        to = actor_port("lead.run-tool", {}, "tool-calls", "generic-tool.ToolCalls"), transforms = {} },
     },
     messages = { { to = actor_port("lead.source", {}, "unit", "mag.Unit"),
+      transforms = {}, semantic_type = {}, semantic_type_id = "unit",
       content = { ["$mag"] = "packed-value", value = { kind = "mag.Unit" } } } },
-    kills = {},
-    result = { from = actor_port("lead.llm", "nefor.contracts.TextAnswer", nil,
-      "generic-provider.TextAnswer") },
+    nodes = {}, kills = {},
+    result = { from = {
+      type = "nefor.contracts.TextAnswer", type_id = "test-type",
+      leaves = { { port = actor_port("lead.llm", "nefor.contracts.TextAnswer", nil,
+        "generic-provider.TextAnswer"), steps = {} } }, through = {},
+    } },
   }
 end
 
 local function program_artifact()
-  return { format = "nefor.mag", version = 3, kind = "program",
+  return { format = "nefor.mag", version = 4, kind = "program",
     program = { initial = lead_artifact(), operations = {} } }
 end
 

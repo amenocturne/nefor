@@ -528,10 +528,10 @@ local function permission_response(popup, approved)
         run_id = popup.run_id,
         source = "chat.human_approval",
         artifact = {
-          format = "nefor.mag", version = 3, kind = "delta",
+          format = "nefor.mag", version = 4, kind = "delta",
           delta = {
             types = { [popup.reply_type_id] = popup.reply_type },
-            actors = {}, junctions = {}, routes = {},
+            actors = {}, routes = {},
             messages = { {
               to = {
                 endpoint = { constructor = "ActorEndpoint", value = { id = popup.gate_id } },
@@ -539,6 +539,7 @@ local function permission_response(popup, approved)
                 type_id = popup.reply_type_id,
                 wire = "mag.ApprovalReply",
               },
+              transforms = {},
               semantic_type = popup.reply_type,
               semantic_type_id = popup.reply_type_id,
               content = { ["$mag"] = "packed-value", value = reply },

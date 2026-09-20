@@ -1,36 +1,31 @@
 import core.types.{}
 
 import nefor.graph.{}
-import nefor.mag.{}
 import nefor.node.{}
 
-let lift<I, E, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, core.types.Result<E, O>> = |id, value| => nefor.node.compose(id, value, nefor.node.pack_adt<O, core.types.Result<E, O>>(str(id, ".ok"), "Ok"))
+let lift_anonymous<I, E, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, core.types.Result<E, O>> = |id, value| => nefor.node.compose(id, value, nefor.node.pack_adt<O, core.types.Result<E, O>>(id, "Ok"))
+let lift<I, E, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, core.types.Result<E, O>> = |id, value| => nefor.node.named(id, lift_anonymous<I, E, O>(id, value))
 
-// Route a Result through exactly one branch, then merge already packed Result
-// values. The split, packs, and merge are topology junctions, not actors.
-let branch_result<E, A, F, B>: fn(String, nefor.graph.Node<E, core.types.Result<F, B>>, nefor.graph.Node<A, core.types.Result<F, B>>) -> nefor.graph.Node<core.types.Result<E, A>, core.types.Result<F, B>> = |id, error_path, ok_path| => {
-  let split_id = str(id, ".split")
-  let input = nefor.graph.junction_port(split_id, type_tag<core.types.Result<E, A>>(), "value")
-  let failed = nefor.graph.junction_port(split_id, type_tag<E>(), "Error")
-  let succeeded = nefor.graph.junction_port(split_id, type_tag<A>(), "Ok")
-  let split = nefor.graph.junction(split_id, nefor.graph.adt_unpack_operation(nefor.mag.AdtUnpackSpec {owner: type_evidence(type_tag<core.types.Result<E, A>>()), branches: [nefor.mag.AdtBranch {constructor: "Error", payload: type_evidence(type_tag<E>()), wire: "Error"}, nefor.mag.AdtBranch {constructor: "Ok", payload: type_evidence(type_tag<A>()), wire: "Ok"}]}), [nefor.graph.store_port(input)], [nefor.graph.store_port(failed), nefor.graph.store_port(succeeded)])
-  let output_node = nefor.graph.identity<core.types.Result<F, B>>(str(id, ".output"))
-  nefor.graph.node_with_occurrences_and_nodes_and_junctions(id, "ordinary", concat(get(error_path, "actors"), get(ok_path, "actors")), concat([split], concat(get(error_path, "junctions"), concat(get(ok_path, "junctions"), get(output_node, "junctions")))), concat(get(error_path, "routes"), concat(get(ok_path, "routes"), concat(get(output_node, "routes"), [nefor.graph.stored_route(failed, get(error_path, "input")), nefor.graph.stored_route(succeeded, get(ok_path, "input")), nefor.graph.stored_route(get(error_path, "output"), get(output_node, "input")), nefor.graph.stored_route(get(ok_path, "output"), get(output_node, "input"))]))), concat(get(error_path, "messages"), get(ok_path, "messages")), concat(get(error_path, "operations"), get(ok_path, "operations")), nefor.node.compound_nodes(id, [], concat(get(error_path, "nodes"), get(ok_path, "nodes"))), concat(nefor.node.compound_child_occurrences(id, 0, error_path), nefor.node.compound_child_occurrences(id, 1, ok_path)), concat(nefor.node.compound_child_executions(id, 0, error_path), nefor.node.compound_child_executions(id, 1, ok_path)), input, get(output_node, "output"))
-}
+// Result routing is an anonymous ADT transformation. Only the selected branch
+// receives an activation; both already-packed outcomes share one boundary.
+let branch_result<E, A, F, B>: fn(String, nefor.graph.Node<E, core.types.Result<F, B>>, nefor.graph.Node<A, core.types.Result<F, B>>) -> nefor.graph.Node<core.types.Result<E, A>, core.types.Result<F, B>> = |id, error_path, ok_path| => nefor.node.branch_adt<core.types.Result<E, A>, core.types.Result<F, B>, E, A>(id, "Error", "Ok", error_path, ok_path)
 
-let and_then<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, left, right| => {
-  let preserve_error = nefor.node.pack_adt<E, core.types.Result<E, B>>(str(id, ".error"), "Error")
-  let branch = branch_result<E, A, E, B>(str(id, ".branch"), preserve_error, right)
+let and_then_anonymous<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, left, right| => {
+  let preserve_error = nefor.node.pack_adt<E, core.types.Result<E, B>>(id, "Error")
+  let branch = branch_result<E, A, E, B>(id, preserve_error, right)
   nefor.node.compose(id, left, branch)
 }
-let map_named<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, result_node, value_node| => and_then(id, result_node, lift<A, E, B>(str(id, ".lift"), value_node))
-let map<I, E, A, B>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |result_node, value_node| => map_named(nefor.node.composite_id(get(result_node, "id"), "result.map", get(value_node, "id")), result_node, value_node)
+let and_then<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, left, right| => nefor.node.named(id, and_then_anonymous(id, left, right))
+let map_anonymous<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, result_node, value_node| => and_then_anonymous(id, result_node, lift_anonymous<A, E, B>(id, value_node))
+let map_named<I, E, A, B>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |id, result_node, value_node| => nefor.node.named(id, map_anonymous(id, result_node, value_node))
+let map<I, E, A, B>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, B>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |result_node, value_node| => map_anonymous(get(result_node, "id"), result_node, value_node)
 
-let map_error_named<I, E, F, A>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |id, result_node, error_node| => {
-  let mapped_error: nefor.graph.Node<E, core.types.Result<F, A>> = nefor.node.compose(str(id, ".error"), error_node, nefor.node.pack_adt<F, core.types.Result<F, A>>(str(id, ".pack-error"), "Error"))
-  let preserve_ok = nefor.node.pack_adt<A, core.types.Result<F, A>>(str(id, ".ok"), "Ok")
-  let branch = branch_result<E, A, F, A>(str(id, ".branch"), mapped_error, preserve_ok)
+let map_error_anonymous<I, E, F, A>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |id, result_node, error_node| => {
+  let mapped_error = nefor.node.compose(id, error_node, nefor.node.pack_adt<F, core.types.Result<F, A>>(id, "Error"))
+  let preserve_ok = nefor.node.pack_adt<A, core.types.Result<F, A>>(id, "Ok")
+  let branch = branch_result<E, A, F, A>(id, mapped_error, preserve_ok)
   nefor.node.compose(id, result_node, branch)
 }
-let map_error<I, E, F, A>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |result_node, error_node| => map_error_named(nefor.node.composite_id(get(result_node, "id"), "result.map_error", get(error_node, "id")), result_node, error_node)
-let `>=>`<I, E, A, B>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |left, right| => and_then(nefor.node.composite_id(get(left, "id"), ">=>", get(right, "id")), left, right)
+let map_error_named<I, E, F, A>: fn(String, nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |id, result_node, error_node| => nefor.node.named(id, map_error_anonymous(id, result_node, error_node))
+let map_error<I, E, F, A>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<E, F>) -> nefor.graph.Node<I, core.types.Result<F, A>> = |result_node, error_node| => map_error_anonymous(get(result_node, "id"), result_node, error_node)
+let `>=>`<I, E, A, B>: fn(nefor.graph.Node<I, core.types.Result<E, A>>, nefor.graph.Node<A, core.types.Result<E, B>>) -> nefor.graph.Node<I, core.types.Result<E, B>> = |left, right| => and_then_anonymous(get(left, "id"), left, right)
