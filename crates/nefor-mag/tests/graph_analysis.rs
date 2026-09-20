@@ -1927,6 +1927,85 @@ artifact(composed)
 }
 
 #[test]
+fn every_fixed_operator_and_nonempty_sequence_add_no_runtime_or_logical_entity() {
+    let artifact = run(
+        "all-anonymous-fixed-combinators",
+        r#"
+import core.types.{}
+import nefor.graph.{}
+import nefor.node.{}
+
+let composed = nefor.node.`>>>`(nefor.graph.source("compose-source", 7), nefor.graph.identity<Int>("compose-right"))
+let parallel = nefor.node.`>>>`(
+  nefor.graph.source("parallel-source", (7, "x")),
+  nefor.node.`***`(nefor.graph.identity<Int>("parallel-left"), nefor.graph.identity<String>("parallel-right")),
+)
+let then = nefor.node.`*>`(nefor.graph.source("then-source", 7), nefor.graph.identity<Unit>("then-right"))
+let before = nefor.node.`<*`(nefor.graph.source("before-source", 7), nefor.graph.identity<Unit>("before-right"))
+let chosen = nefor.node.`>>>`(
+  nefor.graph.source("choice-source", named(core.types.Either<Int, String>, Left, 7)),
+  nefor.node.`+++`(nefor.graph.identity<Int>("choice-left"), nefor.graph.identity<String>("choice-right")),
+)
+let sequenced = nefor.node.`>>>`(
+  nefor.graph.source("sequence-source", 7),
+  nefor.node.sequence([nefor.graph.identity<Int>("sequence-first"), nefor.graph.identity<Int>("sequence-second")]),
+)
+artifact {compose: composed, parallel: parallel, then: then, before: before, choice: chosen, sequence: sequenced}
+"#,
+        json!({}),
+    );
+
+    for (name, source) in [
+        ("compose", "compose-source"),
+        ("parallel", "parallel-source"),
+        ("then", "then-source"),
+        ("before", "before-source"),
+        ("choice", "choice-source"),
+        ("sequence", "sequence-source"),
+    ] {
+        let node = &artifact[name];
+        assert!(node.get("junctions").is_none(), "{name}: {node:#?}");
+        assert_eq!(node["actors"].as_array().unwrap().len(), 1, "{name}");
+        assert_eq!(node["actors"][0]["id"], source, "{name}");
+        assert_eq!(node["nodes"].as_array().unwrap().len(), 1, "{name}");
+        assert_eq!(node["nodes"][0]["path"], json!([source]), "{name}");
+        assert_eq!(node["nodes"][0]["members"], json!([source]), "{name}");
+        assert!(
+            serde_json::to_string(node)
+                .unwrap()
+                .find("nefor.node.composite")
+                .is_none(),
+            "{name}"
+        );
+    }
+
+    assert_eq!(
+        artifact["compose"]["output"]["boundary"]["type"]["name"],
+        "Int"
+    );
+    assert_eq!(
+        artifact["parallel"]["output"]["boundary"]["type"]["kind"],
+        "product"
+    );
+    assert_eq!(
+        artifact["then"]["output"]["boundary"]["type"]["name"],
+        "Unit"
+    );
+    assert_eq!(
+        artifact["before"]["output"]["boundary"]["type"]["name"],
+        "Int"
+    );
+    assert_eq!(
+        artifact["choice"]["output"]["boundary"]["type"]["kind"],
+        "adt"
+    );
+    assert_eq!(
+        artifact["sequence"]["output"]["boundary"]["type"]["kind"],
+        "list"
+    );
+}
+
+#[test]
 fn compile_graph_emits_a_direct_transformed_result_without_synthetic_entities() {
     let artifact = run(
         "direct-transformed-result",

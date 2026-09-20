@@ -109,6 +109,12 @@ local function payload_values(arrival)
   return payload.value, semantic, payload
 end
 
+local function array_value(value)
+  if value ~= nil then return value end
+  -- Unit is Lua nil, but a product/list slot must remain present.
+  return nefor.json.decode("null")
+end
+
 local function preserve_transport(source, target)
   for _, field in ipairs({"messages", "calls", "dynamic", "output_path"}) do
     if source[field] ~= nil then target[field] = plain_data.copy(source[field]) end
@@ -169,7 +175,8 @@ function M:assemble(destination, spec, arrival, remaining)
   local values, semantics, entries = {}, {}, {}
   for index = 1, #cohort.inputs do
     entries[index] = table.remove(cohort.queues[index], 1)
-    values[index], semantics[index] = payload_values(entries[index].arrival)
+    local value, semantic = payload_values(entries[index].arrival)
+    values[index], semantics[index] = array_value(value), array_value(semantic)
     self:validate_value(cohort.inputs[index], semantics[index], "assembly slot " .. tostring(index - 1), entries[index].arrival)
   end
   if nefor.json and nefor.json.mark_array then

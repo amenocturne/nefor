@@ -406,6 +406,81 @@ nefor.artifact.compile_graph(contextual)
         }
 
         #[test]
+        fn fixed_operator_transformations_execute_without_synthetic_entities() {
+            let host = shipped_host();
+            let cases = [
+                (
+                    "operator-compose",
+                    r#"let operation = nefor.node.`>>>`(nefor.graph.source("source", 7), nefor.graph.identity<Int>("right"))"#,
+                    serde_json::json!(7),
+                ),
+                (
+                    "operator-parallel",
+                    r#"let operation = nefor.node.`>>>`(nefor.graph.source("source", (7, "x")), nefor.node.`***`(nefor.graph.identity<Int>("left"), nefor.graph.identity<String>("right")))"#,
+                    serde_json::json!([7, "x"]),
+                ),
+                (
+                    "operator-then",
+                    r#"let operation = nefor.node.`*>`(nefor.graph.source("source", 7), nefor.graph.identity<Unit>("right"))"#,
+                    serde_json::Value::Null,
+                ),
+                (
+                    "operator-before",
+                    r#"let operation = nefor.node.`<*`(nefor.graph.source("source", 7), nefor.graph.identity<Unit>("right"))"#,
+                    serde_json::json!(7),
+                ),
+                (
+                    "operator-choice",
+                    r#"let operation = nefor.node.`>>>`(nefor.graph.source("source", named(core.types.Either<Int, String>, Left, 7)), nefor.node.`+++`(nefor.graph.identity<Int>("left"), nefor.graph.identity<String>("right")))"#,
+                    serde_json::json!({"constructor":"Left","value":7}),
+                ),
+                (
+                    "operator-sequence",
+                    r#"let operation = nefor.node.`>>>`(nefor.graph.source("source", 7), nefor.node.sequence([nefor.graph.identity<Int>("first"), nefor.graph.identity<Int>("second")]))"#,
+                    serde_json::json!([7, 7]),
+                ),
+            ];
+
+            for (name, definition, expected) in cases {
+                let source = format!(
+                    "import core.types.{{}}\nimport nefor.artifact.{{}}\nimport nefor.graph.{{}}\nimport nefor.node.{{}}\n{definition}\nnefor.artifact.compile_graph(operation)"
+                );
+                let modification = compile_mag_source(&host, name, &source);
+                assert!(modification.get("junctions").is_none(), "{name}");
+                assert_eq!(
+                    modification["actors"].as_array().unwrap().len(),
+                    1,
+                    "{name}"
+                );
+                assert_eq!(modification["actors"][0]["id"], "source", "{name}");
+                assert_eq!(modification["nodes"].as_array().unwrap().len(), 1, "{name}");
+                assert_eq!(
+                    modification["nodes"][0]["path"],
+                    serde_json::json!(["source"]),
+                    "{name}"
+                );
+
+                assert!(host.begin_run(name, name, None).expect("begin run").ok);
+                host.drain_emits().expect("drain begin events");
+                let started = host
+                    .start_program(name, &modification, &[])
+                    .unwrap_or_else(|error| panic!("start {name}: {error:?}"));
+                assert!(started.ok, "{name} start: {:?}", started.error);
+                let failure = host.take_run_failed(name).expect("read failure");
+                let completion = host.take_run_complete(name).expect("read completion");
+                assert!(completion.is_some(), "{name} did not complete: {failure:?}");
+                assert_eq!(
+                    completion.unwrap().result.unwrap()["value"],
+                    expected,
+                    "{name}"
+                );
+                host.end_run(name, TeardownReason::RunComplete)
+                    .expect("end run");
+                host.drain_emits().expect("drain end events");
+            }
+        }
+
+        #[test]
         fn shared_source_union_executes_once_and_fans_out_to_distinct_consumers() {
             let host = shipped_host();
             let source = r#"

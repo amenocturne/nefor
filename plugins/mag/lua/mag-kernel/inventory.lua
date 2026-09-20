@@ -127,26 +127,15 @@ local function validate_actor_shape(actor, idx)
   return nil
 end
 
--- Route/port contract validation via the injected registry (nil when no
--- registry is wired — the bare-VM fold path). Destinations resolve against
--- the POST-APPLY actor set: ids spawned in this modification (the registry
--- resolves those from `mod.actors` itself) plus the live inventory (the
--- resolver below). Returns nil on success or the joined error string.
-local function validate_routes(self, mod)
+-- Capability factory specialization and endpoint validation via the injected
+-- registry (nil when no registry is wired — the bare-VM fold path). Topology
+-- owns routes, transforms, and input coverage. Returns nil on success or the
+-- joined error string.
+local function validate_actor_contracts(self, mod)
   if not self.registry then
     return nil
   end
-  local existing_specs = {}
-  for _, entry in self.pairs() do
-    if entry.state == ALIVE then existing_specs[#existing_specs + 1] = entry end
-  end
-  local result = self.registry:validate_modification(mod, function(dest_id)
-    local entry = self.actors[dest_id]
-    if not entry then
-      return nil
-    end
-    return entry.factory, entry.state, entry
-  end, existing_specs)
+  local result = self.registry:validate_modification(mod)
   if result.ok then
     return nil
   end
@@ -252,10 +241,9 @@ local function validate(self, mod)
   -- kernel-synthesized status tags), and every destination — spawned in this
   -- modification OR already in the inventory — must declare an input port
   -- accepting the routed tag. A violation REJECTS the modification with the
-  -- registry's precise wiring error, so a route no port accepts can never
-  -- reach the delivery layer's drop path (registry.lua,
-  -- validate_modification).
-  local err = validate_routes(self, mod)
+  -- Factory specialization remains a registry contract; topology has already
+  -- validated route transforms and endpoint coverage before inventory apply.
+  local err = validate_actor_contracts(self, mod)
   if err then
     return nil, err
   end
@@ -490,8 +478,8 @@ function M.new(opts)
     -- mag.actor_spawned through it at registration time.
     on_spawn = opts.on_spawn or noop,
     -- Optional factory registry (registry.lua). When present, validate checks
-    -- every modification's routes against factory-declared contracts
-    -- (validate_routes); absent (bare-VM fold tests), the check is skipped.
+    -- capability factory specialization and concrete semantic endpoints; absent
+    -- (bare-VM fold tests), the check is skipped.
     registry = opts.registry,
     -- Optional construction probe (set_is_constructed): fn(id) -> bool.
     -- Consulted by validate for `mag.ApprovalReply` injection; usually wired

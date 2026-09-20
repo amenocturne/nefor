@@ -26,7 +26,6 @@
 -- validated before applying").
 
 local shape = require("shape")
-local kinds = require("kinds")
 local type_node = require("type-node")
 local plain_data = require("plain-data")
 
@@ -49,41 +48,6 @@ end
 local function compatible_output_type(expected, actual)
   return type_node.equal(expected, actual)
 end
-
-local function accepts_semantic(target, source)
-  if type_node.equal(target, source) then return true end
-  local host = nefor and nefor.semantic_type
-  if type(host) ~= "table" or type(host.accepts) ~= "function" then
-    error("registry requires compiler semantic_type.accepts")
-  end
-  return host.accepts(target, source)
-end
-
-local function product_input_covered(target, sources)
-  if #sources == 0 then return false end
-  if #sources == 1 and type_node.equal(target, sources[1]) then return true end
-  local host = nefor and nefor.semantic_type
-  if type(host) ~= "table" or type(host.input_covered_by) ~= "function" then
-    error("registry requires compiler semantic_type.input_covered_by")
-  end
-  return host.input_covered_by(target, sources)
-end
-
--- Kernel-synthesized status types (docs/ir.md, Firing: "Reserved status types
--- are kernel-emitted"). Lowering encodes ordering/failure edges as route keys
--- carrying these tags, yet a factory never declares them as outputs — the
--- kernel emits them when applying a completion (routing.lua, apply_completion).
--- So they are implicitly-permitted route keys on any actor:
---   mag.Unit   — successful completion (a pure dependency edge, `C -> A`)
---   mag.Failed — a suffered failure the kernel synthesizes (provider error,
---                kill mid-flight, budget). A factory's OWN computed failure
---                output is a declared tag and needs no exception.
--- Both names are the canonical constants (kinds.lua), shared with routing and
--- the factories so no route key is re-spelled inline.
-local RESERVED_ROUTE_KEYS = {
-  [kinds.Unit] = true,
-  [kinds.Failed] = true,
-}
 
 -- ---- declaration validation -------------------------------------------------
 
@@ -404,34 +368,11 @@ end
 
 -- ---- modification validation ------------------------------------------------
 
--- Validate the actor specs of a graph modification against declared contracts
--- (docs/ir.md). Two checks per actor spec { id, factory, params, routes }:
---
---   1. `factory` names a registered factory        (unknown -> rejection).
---   2. every `routes` key is a declared output tag of that factory OR a
---      reserved kernel-synthesized status tag (RESERVED_ROUTE_KEYS — mag.Unit
---      dependency edges and the suffered-failure tag, which lowering emits but
---      no factory declares), and each destination actor's declared input shape
---      accepts that tag (wiring compatibility — the v1 "sniff inputs for
---      output.tool_calls" mode is gone; compatibility is a type fact over
---      declared shapes). The check stays strict for every other key.
---
--- Destination resolution: an id spawned in the same modification resolves
--- through `actors`; anything else resolves through the optional `resolve`
--- callback — `fn(id) -> factory, state` for an id the caller (the kernel
--- fold) already knows, nil for a never-existed id. With a resolver:
---
---   * a live destination's declared inputs must accept the tag (mismatch ->
---     rejection — this is the apply-time seat belt that makes the shipped
---     "warn-dropped exhaust route" bug class unrepresentable);
---   * a dead destination is skipped — routes computed while the target lived
---     are race artifacts, and the delivery layer drops those sends as logged
---     no-ops (settled race semantics, docs/ir.md);
---   * a never-existed destination rejects — mirroring message-target
---     validation ("only never-existed targets reject — that is a typo").
---
--- Without a resolver (direct registry use in tests), destinations outside the
--- modification are skipped, as before.
+-- Validate capability actor specs against their registered factory contracts.
+-- The compiler has already lowered fixed combinators into routes and ordered
+-- transforms, and topology owns validation of those runtime relationships. The
+-- registry therefore checks only factory identity, explicit specialization,
+-- and each actor's concrete semantic input/output/parameter endpoints.
 --
 -- Returns { ok = true } or { ok = false, errors = { <msg>, ... } }.
 function registry:validate_modification(modification)

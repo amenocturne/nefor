@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mlua::{Function, Lua, Value, Variadic};
+use mlua::{Function, Lua, LuaSerdeExt, Value, Variadic};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -21,12 +21,29 @@ fn repo_root() -> PathBuf {
 fn mag_kernel_process_factories() {
     let lua = Lua::new();
 
-    // Stub nefor.log (the only host surface the factory modules need).
+    // Install the host surfaces exercised by the factory contract tests.
     let nefor = lua.create_table().expect("nefor table");
     let log: Function = lua
         .create_function(|_, _: Variadic<Value>| Ok(()))
         .expect("log stub");
     nefor.set("log", log).expect("set log");
+    let json = lua.create_table().expect("json table");
+    let encode = lua
+        .create_function(|lua, value: Value| {
+            let value: serde_json::Value = lua.from_value(value)?;
+            serde_json::to_string(&value).map_err(mlua::Error::external)
+        })
+        .expect("json.encode");
+    json.set("encode", encode).expect("set json.encode");
+    let decode = lua
+        .create_function(|lua, source: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&source).map_err(mlua::Error::external)?;
+            lua.to_value(&value)
+        })
+        .expect("json.decode");
+    json.set("decode", decode).expect("set json.decode");
+    nefor.set("json", json).expect("set json");
     lua.globals().set("nefor", nefor).expect("set nefor");
 
     // Bare requires resolve resolve
