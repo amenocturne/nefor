@@ -96,6 +96,23 @@ local function validate_transforms(self, input, transforms, label)
   return current
 end
 
+local function add_input_source(sources, port, descriptor)
+  local destination = address(port)
+  sources[destination] = sources[destination] or {port=port,types={}}
+  local types = sources[destination].types
+  types[#types + 1] = descriptor
+end
+
+local function validate_input_coverage(self, sources)
+  for destination, input in pairs(sources) do
+    local ok, covered = pcall(self.semantic.input_covered_by, input.port.type, input.types)
+    if not ok or covered ~= true then
+      return nil, "incomplete actor input coverage at " .. destination
+    end
+  end
+  return true
+end
+
 local function copy_map(source)
   local result = {}
   for key, value in pairs(source) do result[key] = value end
@@ -265,6 +282,13 @@ function M:preflight(mod)
     actors[actor.id] = actor
   end
   local routes = {table.unpack(self.routes)}
+  local input_sources = {}
+  for index, route in ipairs(routes) do
+    local transformed, err = validate_transforms(self, route.from.type, route.transforms,
+      string.format("existing routes[%d]", index))
+    if not transformed then return nil, err end
+    add_input_source(input_sources, route.to, transformed)
+  end
   for index, route in ipairs(mod.routes or {}) do
     if type(route) ~= "table" or type(route.id) ~= "string" then return nil, string.format("routes[%d] is malformed", index) end
     local ok, err = validate_port(self, route.from, actors, "route source", true)
@@ -274,6 +298,7 @@ function M:preflight(mod)
     local transformed; transformed,err=validate_transforms(self,route.from.type,route.transforms,string.format("routes[%d]",index))
     if not transformed then return nil,err end
     if not self.semantic.accepts(route.to.type,transformed) then return nil,string.format("routes[%d] transformed type is incompatible",index) end
+    add_input_source(input_sources, route.to, transformed)
     routes[#routes + 1] = route
   end
   for index, message in ipairs(mod.messages or {}) do
@@ -283,7 +308,10 @@ function M:preflight(mod)
     local transformed; transformed,err=validate_transforms(self,message.semantic_type,message.transforms,string.format("messages[%d]",index))
     if not transformed then return nil,err end
     if not self.semantic.accepts(message.to.type,transformed) then return nil,string.format("messages[%d] transformed type is incompatible",index) end
+    add_input_source(input_sources, message.to, transformed)
   end
+  local covered, coverage_error = validate_input_coverage(self, input_sources)
+  if not covered then return nil, coverage_error end
   local boundary=mod.result and mod.result.from
   if boundary then
     if type(boundary.type)~="table" or descriptor_id(self.semantic,boundary.type)~=boundary.type_id

@@ -54,12 +54,36 @@ fn harness() -> Lua {
         end
         return true
       end
+      local function input_covered_by(target,sources)
+        if #sources>0 then
+          local whole=true
+          for _,source in ipairs(sources) do if type_id(target)~=type_id(source) then whole=false;break end end
+          if whole then return true end
+        end
+        if target.kind~="product" then return #sources>0 end
+        if #sources~=#target.items then return false end
+        local assigned={}
+        for _,source in ipairs(sources) do
+          local found
+          for index,item in ipairs(target.items) do
+            if not assigned[index] and type_id(item)==type_id(source) then found=index;break end
+          end
+          if not found then return false end
+          assigned[found]=true
+        end
+        return true
+      end
       nefor={json={encode=function(v)
         if type(v)~="table" then return tostring(v) end
         local parts={}; for k,x in pairs(v) do parts[#parts+1]=tostring(k)..":"..tostring(x) end
         table.sort(parts); return table.concat(parts,"|")
       end,mark_array=function(v)return v end},semantic_type={id=type_id,
-        accepts=function(a,b)return type_id(a)==type_id(b) end,
+        accepts=function(a,b)return type_id(a)==type_id(b) or
+          (a.kind=="product" and (function()
+            for _,item in ipairs(a.items) do if type_id(item)==type_id(b) then return true end end
+            return false
+          end)()) end,
+        input_covered_by=input_covered_by,
         validate_value=function(d,v)return {ok=validate(d,v)} end,
         constructor=function(owner,name)
           for _,c in ipairs(owner.constructors or {}) do if c.name==name then

@@ -16,6 +16,7 @@ end
 
 local string_type = {kind="primitive",name="String"}
 local int_type = {kind="primitive",name="Int"}
+local string_pair_type = {kind="product",items={string_type,string_type}}
 
 local function endpoint(id)
   return {constructor="ActorEndpoint",value={id=id}}
@@ -62,6 +63,37 @@ do
     id="source-destination",from=source.outputs[1],to=destination.input,transforms={},
   }}))
   assert_true(state ~= nil and err == nil, "compatible typed route passes")
+end
+
+-- Product inputs require aggregate coverage: one compatible component is not
+-- enough, while one source per ordered occurrence is complete.
+do
+  local left = actor("left", string_type, string_type)
+  local right = actor("right", string_type, string_type)
+  local destination = actor("destination", string_pair_type, string_type)
+  local first = {id="left-destination",from=left.outputs[1],to=destination.input,transforms={}}
+  local state, err = topology():preflight(modification({left,destination}, {first}))
+  assert_true(state == nil, "under-covered product input rejects")
+  assert_contains(err, "incomplete actor input coverage", "error names aggregate coverage")
+
+  local second = {id="right-destination",from=right.outputs[1],to=destination.input,transforms={}}
+  state, err = topology():preflight(modification({left,right,destination}, {first,second}))
+  assert_true(state ~= nil and err == nil, "complete equal-typed product coverage passes")
+end
+
+-- A whole-product initial message is a complete root activation.
+do
+  local destination = actor("destination", string_pair_type, string_type)
+  local mod = modification({destination}, {})
+  mod.messages = {{
+    to=destination.input,
+    semantic_type=string_pair_type,
+    semantic_type_id=nefor.semantic_type.id(string_pair_type),
+    transforms={},
+    content={value={"left","right"},semantic_value={"left","right"}},
+  }}
+  local state, err = topology():preflight(mod)
+  assert_true(state ~= nil and err == nil, "whole-product initial message passes")
 end
 
 -- A source port must be the exact port declared by its endpoint owner.

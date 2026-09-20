@@ -249,6 +249,21 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         Ok(target.accepts_edge_source(&source))
     })?;
     semantic_type.set("accepts", accepts)?;
+    let input_covered_by = lua.create_function(|lua, (target, sources): (Value, Value)| {
+        let target: serde_json::Value = lua.from_value(target)?;
+        let sources: serde_json::Value = lua.from_value(sources)?;
+        let target = nefor_mag::json::concrete_type_from_json(&target)
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        let sources = sources
+            .as_array()
+            .ok_or_else(|| mlua::Error::runtime("semantic product sources must be a list"))?
+            .iter()
+            .map(nefor_mag::json::concrete_type_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+        Ok(target.input_is_covered_by(&sources))
+    })?;
+    semantic_type.set("input_covered_by", input_covered_by)?;
     // Legacy Lua fixtures omit named-type bodies; topology only needs a positive
     // validation witness after semantic identity and edge compatibility pass.
     let validate_value = lua.create_function(|lua, _: (Value, Value)| {
