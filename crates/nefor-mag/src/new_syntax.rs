@@ -869,7 +869,7 @@ impl<'a> Parser<'a> {
                         authored::Expr::Construct {
                             owner: expected
                                 .cloned()
-                                .unwrap_or_else(|| authored::Type::Name(owner_prefix.into())),
+                                .unwrap_or(authored::Type::Name(owner_prefix)),
                             constructor: constructor.to_owned(),
                             payload: Box::new(authored::Expr::Fields(fields)),
                         }

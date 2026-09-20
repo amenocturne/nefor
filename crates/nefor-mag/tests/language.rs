@@ -574,7 +574,8 @@ artifact(count([1, 2, 3]))
         "{error}"
     );
 
-    for (name, declaration) in [("str", r#"let str: fn(Int) -> String = |value| => "custom""#)] {
+    {
+        let (name, declaration) = ("str", r#"let str: fn(Int) -> String = |value| => "custom""#);
         let source = format!("{declaration}\n(artifact {{}})");
         let error = match compile(&source, &root) {
             Err(error) => error.to_string(),

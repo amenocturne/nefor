@@ -3145,9 +3145,11 @@ fn render_call_rejections(name: &str, mut rejections: Vec<CallCandidateRejection
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let binders = (!candidate.generic_binders.is_empty())
-                    .then(|| format!("<{}>", candidate.generic_binders.join(", ")))
-                    .unwrap_or_default();
+                let binders = if candidate.generic_binders.is_empty() {
+                    String::new()
+                } else {
+                    format!("<{}>", candidate.generic_binders.join(", "))
+                };
                 format!("{name}{binders}({params}) -> {result}")
             }
             ty => format!("{name}: {ty}"),
@@ -3447,6 +3449,8 @@ struct CallArgumentFailure {
     error: String,
 }
 
+type CompiledCallArgs = (Vec<CheckedExpr>, HashMap<String, MagType>);
+
 fn compile_call_args(
     env: &Env,
     scopes: &[CheckedScope],
@@ -3455,7 +3459,7 @@ fn compile_call_args(
     parameter_names: Option<&[String]>,
     bindable: &HashSet<String>,
     holes: &[InferredTypeArgumentHole],
-) -> Result<(Vec<CheckedExpr>, HashMap<String, MagType>), CallArgumentFailure> {
+) -> Result<CompiledCallArgs, Box<CallArgumentFailure>> {
     let mut substitution = HashMap::new();
     let mut args = vec![None; params.len()];
     let mut checked_arguments = 0;
@@ -3480,7 +3484,7 @@ fn compile_call_args(
                     )
                     .map(|(hole_index, binder)| (hole_index, binder, actual.clone()))
                 });
-                CallArgumentFailure {
+                Box::new(CallArgumentFailure {
                     index,
                     name: name.clone(),
                     checked_arguments,
@@ -3488,25 +3492,27 @@ fn compile_call_args(
                     actual,
                     conflicting_hole,
                     error: error.to_string(),
-                }
+                })
             })?;
         compatible_with_bindable(env, &argument.ty, &parameter, &mut substitution, bindable)
-            .map_err(|error| CallArgumentFailure {
-                index,
-                name,
-                checked_arguments,
-                expected: parameter,
-                actual: Some(argument.ty.clone()),
-                conflicting_hole: conflicting_explicit_hole(
-                    env,
-                    &argument.ty,
-                    &params[index],
-                    &substitution,
-                    bindable,
-                    holes,
-                )
-                .map(|(hole_index, binder)| (hole_index, binder, argument.ty.clone())),
-                error,
+            .map_err(|error| {
+                Box::new(CallArgumentFailure {
+                    index,
+                    name,
+                    checked_arguments,
+                    expected: parameter,
+                    actual: Some(argument.ty.clone()),
+                    conflicting_hole: conflicting_explicit_hole(
+                        env,
+                        &argument.ty,
+                        &params[index],
+                        &substitution,
+                        bindable,
+                        holes,
+                    )
+                    .map(|(hole_index, binder)| (hole_index, binder, argument.ty.clone())),
+                    error,
+                })
             })?;
         args[index] = Some(argument);
         checked_arguments += 1;
@@ -3514,26 +3520,30 @@ fn compile_call_args(
     let args = args
         .into_iter()
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| CallArgumentFailure {
-            index: 0,
-            name: parameter_names.and_then(|names| names.first()).cloned(),
-            checked_arguments,
-            expected: params.first().cloned().unwrap_or(MagType::Unit),
-            actual: None,
-            conflicting_hole: None,
-            error: "internal error: unchecked call argument".into(),
+        .ok_or_else(|| {
+            Box::new(CallArgumentFailure {
+                index: 0,
+                name: parameter_names.and_then(|names| names.first()).cloned(),
+                checked_arguments,
+                expected: params.first().cloned().unwrap_or(MagType::Unit),
+                actual: None,
+                conflicting_hole: None,
+                error: "internal error: unchecked call argument".into(),
+            })
         })?;
     for (index, (argument, parameter)) in args.iter().zip(params).enumerate() {
         let expected = substitute(parameter, &substitution);
         check_equality_specialization(env, argument, &expected, &substitution).map_err(
-            |error| CallArgumentFailure {
-                index,
-                name: parameter_names.and_then(|names| names.get(index)).cloned(),
-                checked_arguments,
-                expected,
-                actual: Some(argument.ty.clone()),
-                conflicting_hole: None,
-                error: error.to_string(),
+            |error| {
+                Box::new(CallArgumentFailure {
+                    index,
+                    name: parameter_names.and_then(|names| names.get(index)).cloned(),
+                    checked_arguments,
+                    expected,
+                    actual: Some(argument.ty.clone()),
+                    conflicting_hole: None,
+                    error: error.to_string(),
+                })
             },
         )?;
     }
