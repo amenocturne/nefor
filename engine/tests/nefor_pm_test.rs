@@ -983,10 +983,32 @@ fn install_reproduces_existing_lock_without_moving_until_update() {
     assert_eq!(checkout_head(), pinned, "ordinary sync must not move lock");
 
     let update = format!(
-        r#"local pm = require("nefor-pm"); pm.update({{{{ name = "pinned", url = "{}", branch = "main" }}}})"#,
+        r#"
+        local pm = require("nefor-pm")
+        local real_run = nefor.process.run
+        local events = {{}}
+        nefor.process.run = function(opts)
+          if opts.cmd == "git" and opts.args[3] == "fetch" then
+            assert(events[#events] == "pinned: Fetching revision main")
+          elseif opts.cmd == "git" and opts.args[3] == "checkout" then
+            assert(events[#events] == "pinned: Checking out main")
+          end
+          return real_run(opts)
+        end
+        pm.update({{{{ name = "pinned", url = "{}", branch = "main" }}}}, {{
+          on_progress = function(name, phase)
+            events[#events + 1] = name .. ": " .. phase
+          end,
+        }})
+        return table.concat(events, "|")
+        "#,
         url
     );
-    lua.load(&update).exec().expect("explicit update");
+    let update_events: String = lua.load(&update).eval().expect("explicit update");
+    assert_eq!(
+        update_events,
+        "pinned: Fetching revision main|pinned: Checking out main|pinned: Ready"
+    );
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&checkout)
@@ -1408,6 +1430,157 @@ fn install_runs_build_callback_and_records_hash() {
 }
 
 #[test]
+fn install_reports_download_before_clone_and_never_reports_ready_after_clone_failure() {
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+
+    let (message, events): (String, String) = lua
+        .load(
+            r#"
+            local pm = require("nefor-pm")
+            local events = {}
+            nefor.process.run = function(opts)
+              if opts.cmd == "git" and opts.args[1] == "clone" then
+                assert(events[1] == "blocked: Downloading package")
+                return { code = 19, stdout = "", stderr = "fixture clone blocked" }
+              end
+              error("unexpected process: " .. tostring(opts.cmd))
+            end
+            local ok, err = pcall(function()
+              pm.install({
+                { name = "blocked", url = "https://invalid.example/plugin.git", branch = "main" },
+              }, {
+                on_progress = function(name, phase)
+                  events[#events + 1] = name .. ": " .. phase
+                end,
+              })
+            end)
+            assert(not ok)
+            return tostring(err), table.concat(events, "|")
+            "#,
+        )
+        .eval()
+        .expect("exercise failed clone");
+
+    assert!(message.contains("fixture clone blocked"), "{message}");
+    assert_eq!(events, "blocked: Downloading package");
+}
+
+#[test]
+fn install_reports_cold_phases_and_ready_only_after_lock_is_saved() {
+    let work = tempfile::tempdir().expect("workdir");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+
+    let (cold, cached): (String, String) = lua
+        .load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            local events = {{}}
+            local function build(_) end
+            local opts = {{
+              on_progress = function(name, phase)
+                if phase == "Ready" then
+                  assert(nefor.fs.exists(nefor.fs.data_root() .. "/plugins/nefor-pm.lock.json"))
+                end
+                events[#events + 1] = name .. ": " .. phase
+              end,
+            }}
+            local specs = {{
+              {{ name = "phased", url = "{}", branch = "main", build = build }},
+            }}
+            pm.install(specs, opts)
+            local cold = table.concat(events, "|")
+            events = {{}}
+            pm.install(specs, opts)
+            return cold, table.concat(events, "|")
+            "#,
+            url
+        ))
+        .eval()
+        .expect("install twice");
+
+    assert_eq!(
+        cold,
+        "phased: Downloading package|phased: Building package|phased: Ready"
+    );
+    assert_eq!(cached, "", "a fully cached install must not report work");
+}
+
+#[test]
+fn install_does_not_report_ready_when_build_fails() {
+    let work = tempfile::tempdir().expect("workdir");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+
+    let (message, events): (String, String) = lua
+        .load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            local events = {{}}
+            local ok, err = pcall(function()
+              pm.install({{
+                {{
+                  name = "broken-build",
+                  url = "{}",
+                  branch = "main",
+                  build = function() error("fixture compiler failure") end,
+                }},
+              }}, {{
+                on_progress = function(name, phase)
+                  events[#events + 1] = name .. ": " .. phase
+                end,
+              }})
+            end)
+            assert(not ok)
+            return tostring(err), table.concat(events, "|")
+            "#,
+            url
+        ))
+        .eval()
+        .expect("exercise failed build");
+
+    assert!(message.contains("fixture compiler failure"), "{message}");
+    assert_eq!(
+        events,
+        "broken-build: Downloading package|broken-build: Building package"
+    );
+}
+
+#[test]
+fn stderr_progress_writes_and_flushes_one_line_without_touching_stdout() {
+    let lua = lua_with_pm();
+    let (line, flushes, stdout_writes): (String, i64, i64) = lua
+        .load(
+            r#"
+            local pm = require("nefor-pm")
+            local stderr = { text = "", flushes = 0 }
+            function stderr:write(value) self.text = self.text .. value end
+            function stderr:flush() self.flushes = self.flushes + 1 end
+            local stdout = { writes = 0 }
+            function stdout:write(_) self.writes = self.writes + 1 end
+            io.stderr = stderr
+            io.stdout = stdout
+            pm.stderr_progress("fixture", "Compiling classifier (Cargo)")
+            return stderr.text, stderr.flushes, stdout.writes
+            "#,
+        )
+        .eval()
+        .expect("report progress");
+
+    assert_eq!(line, "[nefor-pm] fixture: Compiling classifier (Cargo)\n");
+    assert_eq!(flushes, 1);
+    assert_eq!(stdout_writes, 0);
+}
+
+#[test]
 fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
@@ -1440,8 +1613,10 @@ fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
         local da = require("libs.tool-validator.da")
         local real_run = nefor.process.run
         local lfs_calls, cargo_calls = 0, 0
+        local events = {{}}
         nefor.process.run = function(opts)
           if opts.cmd == "git" and opts.args[1] == "lfs" then
+            assert(events[#events] == "fixture-da: Downloading classifier model (Git LFS)")
             lfs_calls = lfs_calls + 1
             local f = assert(io.open(opts.cwd .. "/classifier/model.onnx", "wb"))
             f:write(string.rep("m", 1024 * 1024))
@@ -1449,6 +1624,7 @@ fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
             return {{ code = 0, stdout = "", stderr = "" }}
           end
           if opts.cmd == "cargo" then
+            assert(events[#events] == "fixture-da: Compiling classifier (Cargo)")
             cargo_calls = cargo_calls + 1
             local root
             for i, arg in ipairs(opts.args) do
@@ -1462,12 +1638,16 @@ fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
           end
           return real_run(opts)
         end
-        pm.install({{ da.package {{ name = "fixture-da", url = "{}", commit = "{}" }} }})
-        return pm.bin("fixture-da", "da"), lfs_calls, cargo_calls
+        pm.install({{ da.package {{ name = "fixture-da", url = "{}", commit = "{}" }} }}, {{
+          on_progress = function(name, phase)
+            events[#events + 1] = name .. ": " .. phase
+          end,
+        }})
+        return pm.bin("fixture-da", "da"), lfs_calls, cargo_calls, table.concat(events, "|")
         "#,
         url, commit
     );
-    let (binary, lfs_calls, cargo_calls): (String, i64, i64) =
+    let (binary, lfs_calls, cargo_calls, events): (String, i64, i64, String) =
         lua.load(script).eval().expect("install managed da fixture");
     assert_eq!(
         binary,
@@ -1477,6 +1657,21 @@ fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
     );
     assert_eq!(lfs_calls, 1, "LFS pointer must be materialized once");
     assert_eq!(cargo_calls, 1, "private package build must run once");
+    assert_eq!(
+        events,
+        concat!(
+            "fixture-da: Downloading package|",
+            "fixture-da: Fetching revision ",
+            "{}|",
+            "fixture-da: Checking out ",
+            "{}|",
+            "fixture-da: Building package|",
+            "fixture-da: Downloading classifier model (Git LFS)|",
+            "fixture-da: Compiling classifier (Cargo)|",
+            "fixture-da: Ready"
+        )
+        .replace("{}", &commit)
+    );
 }
 
 #[test]

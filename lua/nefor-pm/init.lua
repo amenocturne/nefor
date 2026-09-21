@@ -1,11 +1,13 @@
 -- nefor-pm — pure-Lua plugin manager.
 --
 -- Public API:
---   pm.install(specs)        reproduce the exact commits in the lockfile;
+--   pm.install(specs, opts)  reproduce the exact commits in the lockfile;
 --                            resolve and pin refs only when no lock exists.
---   pm.update(specs)         explicitly resolve refs again and move their pins.
+--   pm.update(specs, opts)   explicitly resolve refs again and move their pins.
 --                            Both operations are synchronous, so init.lua can
 --                            rely on plugins being present when they return.
+--                            opts.on_progress(name, message) is optional.
+--   pm.stderr_progress(name, message) flush one phase notification to stderr.
 --   pm.register(specs)       register immutable, already-materialized dirs
 --                            without writing links, locks, or checkout state.
 --   pm.load(name)            plain `require(name)`. Resolution is Lua's job —
@@ -387,7 +389,8 @@ local function is_cloned(dir)
   return fs.exists(pjoin(dir, ".git/HEAD")) or fs.exists(pjoin(dir, ".git"))
 end
 
-local function clone(label, spec, target_dir)
+local function clone(label, spec, target_dir, progress)
+  progress("Downloading package")
   local args = { "clone", "--depth", "1" }
   if spec.path then
     -- Sparse + blobless: cheaper for monorepo subtree extraction.
@@ -409,17 +412,22 @@ local function clone(label, spec, target_dir)
   if spec.ref_kind == "commit" then
     -- Commit pins: cloned default-branch shallowly; fetch+checkout the
     -- target sha. --depth=1 keeps bandwidth low.
+    progress("Fetching revision " .. spec.ref)
     git(label, { "-C", target_dir, "fetch", "--depth", "1", "origin", spec.ref })
+    progress("Checking out " .. spec.ref)
     git(label, { "-C", target_dir, "checkout", spec.ref })
   end
 end
 
-local function update_to_ref(label, spec, target_dir)
+local function update_to_ref(label, spec, target_dir, progress)
+  progress = progress or function() end
   local fetch_args = { "-C", target_dir, "fetch", "--depth", "1", "origin" }
   for _, arg in ipairs(git_fetch_ref(spec)) do
     fetch_args[#fetch_args + 1] = arg
   end
+  progress("Fetching revision " .. spec.ref)
   git(label, fetch_args)
+  progress("Checking out " .. spec.ref)
   if spec.ref_kind == "commit" then
     git(label, { "-C", target_dir, "checkout", spec.ref })
   else
@@ -602,7 +610,7 @@ local function pinned_spec(spec, entry)
   return pinned
 end
 
-local function install_spec(spec, lock, update)
+local function install_spec(spec, lock, update, progress)
   local label = spec.name
   local fs = require_fs()
 
@@ -662,10 +670,10 @@ local function install_spec(spec, lock, update)
   local head_now = is_cloned(target_dir) and current_commit(target_dir) or nil
   if head_now ~= desired.ref then
     if not is_cloned(target_dir) then
-      clone(label, desired, target_dir)
+      clone(label, desired, target_dir, progress)
       fresh_clone = true
     else
-      update_to_ref(label, desired, target_dir)
+      update_to_ref(label, desired, target_dir, progress)
     end
     if spec.path then
       flatten_subtree(label, target_dir, spec.path)
@@ -681,6 +689,7 @@ local function install_spec(spec, lock, update)
   )
 
   if need_build then
+    progress("Building package")
     -- Build is responsible for placing artefacts at target_dir/bin/<name>.
     local bin_mk = fs.mkdir_p(pjoin(target_dir, "bin"))
     if not bin_mk.ok then
@@ -693,6 +702,7 @@ local function install_spec(spec, lock, update)
       ref  = spec.ref,
       url  = spec.url,
       repo = spec.url,
+      progress = progress,
     }
     local ok, err = pcall(spec.build, plugin_record)
     if not ok then
@@ -709,7 +719,13 @@ local function install_spec(spec, lock, update)
   }
 end
 
-local function apply_specs(specs, update)
+local function apply_specs(specs, update, opts)
+  opts = opts or {}
+  if not is_table(opts) or (opts.on_progress ~= nil and not is_function(opts.on_progress)) then
+    error("nefor-pm: options.on_progress must be a function", 0)
+  end
+  local on_progress = opts.on_progress
+  local completed = {}
   if not is_table(specs) then
     error("nefor-pm: specs must be a list of tables", 0)
   end
@@ -721,21 +737,35 @@ local function apply_specs(specs, update)
 
   for i, raw in ipairs(specs) do
     local spec = parse_spec(raw, i)
-    local entry = install_spec(spec, lock, update)
+    local reported = false
+    local function progress(message)
+      if on_progress then
+        on_progress(spec.name, message)
+        reported = true
+      end
+    end
+    local entry = install_spec(spec, lock, update, progress)
+    if reported then completed[#completed + 1] = spec.name end
     if entry ~= nil then
       new_lock[spec.name] = entry
     end
   end
 
   write_lockfile(new_lock)
+  for _, name in ipairs(completed) do on_progress(name, "Ready") end
 end
 
-function M.install(specs)
-  apply_specs(specs, false)
+function M.stderr_progress(name, message)
+  io.stderr:write("[nefor-pm] " .. name .. ": " .. message .. "\n")
+  io.stderr:flush()
 end
 
-function M.update(specs)
-  apply_specs(specs, true)
+function M.install(specs, opts)
+  apply_specs(specs, false, opts)
+end
+
+function M.update(specs, opts)
+  apply_specs(specs, true, opts)
 end
 
 function M.register(specs)

@@ -31,9 +31,11 @@ local function model_state(root)
 end
 
 local function build(plugin)
+  local progress = plugin.progress or function() end
   local state, detail = model_state(plugin.dir)
   if state == nil then error("da package: " .. detail, 0) end
   if state == "pointer" then
+    progress("Downloading classifier model (Git LFS)")
     local result = nefor.process.run {
       cmd = "git",
       args = { "lfs", "pull", "--include", MODEL_PATH },
@@ -51,6 +53,7 @@ local function build(plugin)
     end
   end
 
+  progress("Compiling classifier (Cargo)")
   run_or_error("da package: cargo build", {
     cmd = "cargo",
     args = {

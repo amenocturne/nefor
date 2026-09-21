@@ -5,8 +5,9 @@
 ## API
 
 ```lua
-pm.install(specs)
-pm.update(specs)
+pm.install(specs [, opts])
+pm.update(specs [, opts])
+pm.stderr_progress(name, message)
 pm.register(specs)
 pm.root(name)
 pm.load(name)
@@ -32,7 +33,8 @@ pm.install {
     -- url = "/alternate/git/source",
     path = "plugins/my-plugin/lua/my-plugin/",
     build = function(plugin)
-      -- Build from plugin.dir and place executables in plugin.bin_dir.
+      plugin.progress("Compiling executable")
+      -- Build from plugin.dir and place executables in plugin.dir .. "/bin".
     end,
   },
 }
@@ -44,6 +46,28 @@ local executable = pm.bin("my-plugin", "my-plugin")
 `path` uses sparse checkout and flattens the selected subtree into the managed package directory. Build callbacks must populate the package's `bin` directory. They rerun when checkout/pin/spec build metadata requires it; changing only the Lua function body is not detected by the current hash, so explicitly update/rebuild after such a change.
 
 The plugin lock lives at `<data-root>/plugins/nefor-pm.lock.json`. `install` reproduces an existing exact pin and does not move it. `update` resolves again and moves the selected pins. Partial operations preserve unrelated lock entries.
+
+### Startup progress
+
+`install` and `update` accept an optional `on_progress(name, message)` callback.
+Compositions can opt into flushed stderr messages before the TUI starts:
+
+```lua
+pm.install(specs, { on_progress = pm.stderr_progress })
+```
+
+The manager reports each download, fetch, checkout, or build phase before
+starting its synchronous operation. Build callbacks receive
+`plugin.progress(message)` for more specific phases, such as downloading a
+model or invoking a compiler. `pm.stderr_progress` prefixes messages with the
+package name and flushes stderr immediately; stdout stays available for the
+frontend's output. These are phase notifications, not byte or percentage
+progress from the underlying commands.
+
+A package reports `Ready` after installation and lock persistence succeed.
+Failures still raise the normal startup error and do not report `Ready`.
+Already prepared packages emit no messages during `install`. Without an
+`on_progress` callback, both the manager and `plugin.progress` stay quiet.
 
 ### Source modes
 

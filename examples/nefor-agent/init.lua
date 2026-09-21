@@ -47,7 +47,7 @@ pm.install({
   da_package.package {
     commit = "558777ef63f4ad139de0b1be8ec667c63d697111",
   },
-})
+}, { on_progress = pm.stderr_progress })
 local SHELL_CLASSIFIER = pm.bin("da", "da")
 
 local MAG_PACKAGE_ROOT = pm.root("nefor-mag")
