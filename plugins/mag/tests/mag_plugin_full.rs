@@ -392,7 +392,8 @@ nefor.artifact.compile_graph(contextual)
                     }]})),
                     None,
                     Some("async"),
-                ).unwrap();
+                )
+                .unwrap();
                 assert!(host.take_run_complete(name).unwrap().is_none());
                 let emitted = host.drain_emits().unwrap();
                 let request = tool_invoke(&emitted, "test-provider");
@@ -403,7 +404,8 @@ nefor.artifact.compile_graph(contextual)
                     }]})),
                     None,
                     Some("async"),
-                ).unwrap();
+                )
+                .unwrap();
                 let failure = host.take_run_failed(name).unwrap();
                 let completion = host.take_run_complete(name).unwrap();
                 assert!(completion.is_some(), "{name} did not complete: {failure:?}");
@@ -1883,9 +1885,9 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
-    async fn malformed_agent_error_output_rejects_during_load_before_run_registration() {
+    async fn nested_agent_error_output_loads_with_runtime_validation() {
         let root =
-            std::env::temp_dir().join(format!("mag-malformed-agent-output-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mag-nested-agent-output-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("workspace");
         fs::write(
@@ -1916,7 +1918,7 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         )
         .expect("kernel");
         let body = serde_json::json!({
-            "id": "load-malformed",
+            "id": "load-nested-output",
             "source_dir": root,
             "module_roots": [module_root, config_module_root],
             "entry": "main.mag"
@@ -1925,28 +1927,22 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         handle_load(
             &out_tx,
             body.as_object().expect("load body"),
-            Some("load-malformed"),
+            Some("load-nested-output"),
             &host,
         )
         .await
-        .expect("load rejection is a protocol response");
+        .expect("load returns a protocol response");
 
-        let outgoing = out_rx.try_recv().expect("load rejection");
+        let outgoing = out_rx.try_recv().expect("load result");
         let Body::Event(body) = outgoing.body else {
             panic!("expected event response")
         };
-        assert_eq!(body["kind"], ERROR_KIND);
-        let message = body["message"].as_str().expect("actionable error");
-        assert!(message.contains("worker.llm"), "{message}");
-        assert!(message.contains("nefor.contracts.AgentError"), "{message}");
-        assert!(message.contains("last_output"), "{message}");
-        assert!(
-            message.contains("pass only the success output type"),
-            "{message}"
-        );
+        assert_eq!(body["kind"], LOADED_KIND, "{body:?}");
+        let program = artifact_program(&body["artifact"]).expect("loaded program");
+        preflight_output_schemas(&program).expect("runtime owns canonical output validation");
         assert!(
             host.drain_emits().expect("kernel emits").is_empty(),
-            "load rejection cannot emit mag.run_started"
+            "loading cannot emit mag.run_started"
         );
         fs::remove_dir_all(root).ok();
     }
