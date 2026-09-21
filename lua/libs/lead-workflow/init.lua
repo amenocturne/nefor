@@ -2231,6 +2231,9 @@ local function mag_write_file(firing_id, args, metadata)
   if not receipt then
     emit_tool_result_err(firing_id, "mag-write-file: " .. tostring(error))
   else
+    if receipt.operation == "overwritten" then
+      receipt.message = "Overwrote the entire file with the provided content."
+    end
     emit_tool_result_ok(firing_id, receipt)
   end
 end

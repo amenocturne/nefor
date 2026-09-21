@@ -1191,13 +1191,20 @@ do
   })
   local created = tool_result("source-create").body.output
   assert_eq(created.operation, "created", "first whole-file write creates source")
+  invoke_tool("source-overwrite", "mag-write-file", {
+    file = "nested/source.mag", new_string = "gamma beta",
+  })
+  local overwritten = tool_result("source-overwrite").body.output
+  assert_eq(overwritten.operation, "overwritten", "later whole-file write overwrites source")
+  assert_eq(overwritten.message, "Overwrote the entire file with the provided content.",
+    "whole-file overwrite receipt explains the completed action")
   invoke_tool("source-edit", "mag-write-file", {
     file = "nested/source.mag", old_string = " beta", new_string = "",
   })
   local edited = tool_result("source-edit").body.output
   assert_eq(edited.operation, "edited", "old_string selects exact replacement")
   local handle = assert(io.open(edited.source_path, "r"))
-  assert_eq(handle:read("*a"), "alpha", "empty new_string deletes the exact match")
+  assert_eq(handle:read("*a"), "gamma", "empty new_string deletes the exact match")
   handle:close()
 end
 
