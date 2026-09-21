@@ -1408,6 +1408,109 @@ fn install_runs_build_callback_and_records_hash() {
 }
 
 #[test]
+fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
+    let work = tempfile::tempdir().expect("workdir");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    std::fs::create_dir_all(origin.join("classifier")).expect("classifier dir");
+    std::fs::write(
+        origin.join("classifier/model.onnx"),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:test\nsize 1048576\n",
+    )
+    .expect("model pointer");
+    run_git(&origin, &["add", "."]);
+    run_git(&origin, &["commit", "-m", "add model pointer", "--quiet"]);
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&origin)
+        .output()
+        .expect("rev-parse fixture")
+        .stdout;
+    let commit = String::from_utf8(commit)
+        .expect("utf8 commit")
+        .trim()
+        .to_owned();
+
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+    let script = format!(
+        r#"
+        local pm = require("nefor-pm")
+        local da = require("libs.tool-validator.da")
+        local real_run = nefor.process.run
+        local lfs_calls, cargo_calls = 0, 0
+        nefor.process.run = function(opts)
+          if opts.cmd == "git" and opts.args[1] == "lfs" then
+            lfs_calls = lfs_calls + 1
+            local f = assert(io.open(opts.cwd .. "/classifier/model.onnx", "wb"))
+            f:write(string.rep("m", 1024 * 1024))
+            f:close()
+            return {{ code = 0, stdout = "", stderr = "" }}
+          end
+          if opts.cmd == "cargo" then
+            cargo_calls = cargo_calls + 1
+            local root
+            for i, arg in ipairs(opts.args) do
+              if arg == "--root" then root = opts.args[i + 1] end
+            end
+            if root == "." then root = opts.cwd end
+            local f = assert(io.open(root .. "/bin/da", "wb"))
+            f:write("fixture da")
+            f:close()
+            return {{ code = 0, stdout = "", stderr = "" }}
+          end
+          return real_run(opts)
+        end
+        pm.install({{ da.package {{ name = "fixture-da", url = "{}", commit = "{}" }} }})
+        return pm.bin("fixture-da", "da"), lfs_calls, cargo_calls
+        "#,
+        url, commit
+    );
+    let (binary, lfs_calls, cargo_calls): (String, i64, i64) =
+        lua.load(script).eval().expect("install managed da fixture");
+    assert_eq!(
+        binary,
+        data.path()
+            .join("plugins/fixture-da/bin/da")
+            .to_string_lossy()
+    );
+    assert_eq!(lfs_calls, 1, "LFS pointer must be materialized once");
+    assert_eq!(cargo_calls, 1, "private package build must run once");
+}
+
+#[test]
+fn managed_da_package_reports_missing_git_lfs_prerequisite() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    std::fs::create_dir_all(fixture.path().join("classifier")).expect("classifier dir");
+    std::fs::write(
+        fixture.path().join("classifier/model.onnx"),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:test\nsize 1048576\n",
+    )
+    .expect("model pointer");
+
+    let lua = lua_with_pm();
+    lua.globals()
+        .set("fixture_root", fixture.path().to_string_lossy().as_ref())
+        .expect("fixture root");
+    let error = lua
+        .load(
+            r#"
+            local da = require("libs.tool-validator.da")
+            nefor.process.run = function(_)
+              return { code = -1, stderr = "spawn failed: git-lfs unavailable" }
+            end
+            da._internals.build { dir = fixture_root, name = "da" }
+            "#,
+        )
+        .exec()
+        .expect_err("missing Git LFS must fail");
+    let message = error.to_string();
+    assert!(message.contains("install Git LFS"), "{message}");
+    assert!(message.contains("git-lfs unavailable"), "{message}");
+}
+
+#[test]
 fn install_skips_clone_when_lockfile_matches_head() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");

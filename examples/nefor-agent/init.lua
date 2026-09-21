@@ -40,6 +40,16 @@ pm.register({
   { name = "nefor-mag", dir = NEFOR_ROOT .. "/mag" },
 })
 
+-- External executable dependencies use nefor-pm's writable package lifecycle;
+-- the selected immutable Nefor runtime tree above remains read-only.
+local da_package = require("libs.tool-validator.da")
+pm.install({
+  da_package.package {
+    commit = "558777ef63f4ad139de0b1be8ec667c63d697111",
+  },
+})
+local SHELL_CLASSIFIER = pm.bin("da", "da")
+
 local MAG_PACKAGE_ROOT = pm.root("nefor-mag")
 local MAG_MODULE_ROOTS = {
   MAG_PACKAGE_ROOT .. "/lib",
@@ -325,7 +335,9 @@ actor.spawn(require("read-only-tools"))
 -- the first gated invocation lands. The chat surface listens to
 -- popup_request, not permission_request — without the validator
 -- running, gated invocations never reach the popup.
-actor.spawn(require("tool-validator"))
+actor.spawn(require("tool-validator").build {
+  shell_classifier = SHELL_CLASSIFIER,
+})
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.git_worktree_actor_spec())

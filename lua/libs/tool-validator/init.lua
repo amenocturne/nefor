@@ -35,7 +35,7 @@
 --
 -- ## Registration seam
 --
--- `build{ read_only_tools, auto_approve_tools, shell_fastpaths,
+-- `build{ shell_classifier, read_only_tools, auto_approve_tools, shell_fastpaths,
 -- process_fastpaths }` returns the actor spec. `read_only_tools` is the
 -- canonical inventory supplied by the composition; the remaining seams are
 -- config-owned policy:
@@ -53,9 +53,9 @@
 --
 -- ## Failure modes
 --
--- `da` is installed by the plugin manager. If it is missing or cannot be
--- probed, fail loudly: the runtime is mis-installed and shell-script classification
--- must not silently degrade.
+-- The composition supplies `shell_classifier`, normally resolved by
+-- `nefor-pm.bin`. Missing or unusable classifiers deny the affected request
+-- with an actionable reason so tool-gate never retains an unresolved prompt.
 
 local envelope     = require("core.envelope")
 local event        = require("core.event")
@@ -98,7 +98,7 @@ local function auto_denial_reason(tool)
          "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
 end
 
--- build{ read_only_tools, auto_approve_tools, shell_fastpaths, process_fastpaths } -> actor spec.
+-- build{ shell_classifier, read_only_tools, auto_approve_tools, shell_fastpaths, process_fastpaths } -> actor spec.
 -- State
 -- (da_cmd cache, gate_mode) is per-build so instances don't share.
 local function build(opts)
@@ -115,43 +115,28 @@ local function build(opts)
   local shell_fastpaths = opts.shell_fastpaths or {}
   local process_fastpaths = opts.process_fastpaths or {}
 
+  if type(opts.shell_classifier) ~= "string" or opts.shell_classifier == "" then
+    error("tool-validator: build requires a non-empty `shell_classifier` executable path", 0)
+  end
+
   local gate_mode = "safe"
-  -- Resolved on first use. Holds the resolved cmd path
-  -- (e.g. /Users/x/.local/share/nefor/bin/da) when da is reachable.
+  -- Resolved on first use. Holds the composition-provided package binary path
+  -- (e.g. /Users/x/.local/share/nefor/plugins/da/bin/da) when da is reachable.
   -- nil => not probed yet.
   local da_cmd = nil
 
-  -- Find da via two paths, in priority order:
-  --   1. <data_root>/bin/da — the private install `just install-nefor`
-  --      drops into ~/.local/share/nefor/bin/. Keeps da off the user's
-  --      PATH but reachable from the engine.
-  --   2. PATH lookup of bare `da` — fallback for users who installed it
-  --      themselves (e.g. `cargo install dabin`).
-  -- Either path is probed via `da --version`; whichever succeeds wins.
+  -- Probe the composition-resolved dependency once. Package installation and
+  -- builds happen during bootstrap, never while a permission is pending.
   local function probe_da()
     if da_cmd ~= nil then return da_cmd end
-
-    local function try(cmd)
-      local r = nefor.process.run { cmd = cmd, args = { "--version" } }
-      if type(r) == "table" and r.code == 0 then return cmd end
-      return nil
+    local r = nefor.process.run { cmd = opts.shell_classifier, args = { "--version" } }
+    if type(r) ~= "table" or r.code ~= 0 then
+      local detail = type(r) == "table" and (r.stderr or r.stdout) or nil
+      error("configured shell classifier is unusable at " .. opts.shell_classifier ..
+        (detail and detail ~= "" and ": " .. detail or ""), 0)
     end
-
-    local data_root = (nefor.fs and nefor.fs.data_root and nefor.fs.data_root()) or nil
-    local private = data_root and (data_root .. "/bin/da") or nil
-    if private and try(private) then
-      da_cmd = private
-      return da_cmd
-    end
-
-    if try("da") then
-      da_cmd = "da"
-      return da_cmd
-    end
-
-    error("tool-validator: `da` not found at " ..
-          (private or "<data_root>/bin/da") .. " or on PATH; re-run " ..
-          "`just install-nefor` to install it under the libexec dir.")
+    da_cmd = opts.shell_classifier
+    return da_cmd
   end
 
   local function emit_response(id, decision, reason, args)
@@ -184,7 +169,8 @@ local function build(opts)
   -- Config `shell_fastpaths` predicates get first refusal so a config can
   -- approve narrow, self-limited commands (e.g. read-only typed-CLI
   -- subcommands) without permitting the wider `da` surface.
-  -- `da` probe/spawn failure is a runtime install error and raises.
+  -- `da` probe/spawn failure raises to the request boundary, which converts
+  -- it into one actionable denial.
   local function classify_shell_script(command, read_only)
     if type(command) ~= "string" or #command == 0 then return "defer" end
     for _, pred in ipairs(shell_fastpaths) do
@@ -199,6 +185,10 @@ local function build(opts)
     }
     if type(r) ~= "table" then
       error("tool-validator: `da` classifier returned a non-table result")
+    end
+    if r.code ~= 0 and r.code ~= 1 and r.code ~= 2 then
+      error("tool-validator: `da` classifier failed with exit code " .. tostring(r.code) ..
+        ((r.stderr or "") ~= "" and ": " .. r.stderr or ""), 0)
     end
     if r.code == 0 then return "approve" end
     if r.code == 2 then return "deny" end
@@ -322,7 +312,12 @@ local function build(opts)
 
     if tool == "shell.script" then
       local script = (type(args) == "table" and args.script) or nil
-      local verdict = classify_shell_script(script, is_ro)
+      local classified, verdict = pcall(classify_shell_script, script, is_ro)
+      if not classified then
+        emit_response(id, "deny", "tool_classifier_unavailable[da]: " .. tostring(verdict) ..
+          ". Recovery: reinstall or repair the composition-managed `da` package, then retry.")
+        return
+      end
       if verdict == "approve" then
         emit_response(id, "approve")
         return

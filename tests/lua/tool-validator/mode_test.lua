@@ -1,4 +1,5 @@
-local tv = require("tool-validator")
+local CLASSIFIER = "/managed/plugins/da/bin/da"
+local tv = require("tool-validator").build { shell_classifier = CLASSIFIER }
 local tv_lib = require("libs.tool-validator")
 local json = nefor.json
 
@@ -119,7 +120,7 @@ end
 
 -- Read-only status is derived from the complete allowlist, not a wire flag.
 do
-  local validator = tv_lib.build { read_only_tools = { "read_file", "read_image" } }
+  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file", "read_image" } }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -138,7 +139,7 @@ end
 -- A mixed allowlist is write-capable even when the requested tool is itself
 -- read-only; it follows ordinary safe-mode policy and opens a popup.
 do
-  local validator = tv_lib.build { read_only_tools = { "read_file", "read_image" } }
+  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file", "read_image" } }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -158,6 +159,7 @@ end
 do
   local seen
   local validator = tv_lib.build {
+    shell_classifier = CLASSIFIER,
     process_fastpaths = {
       function(argv, args, read_only)
         seen = { argv = argv, args = args, read_only = read_only }
@@ -211,7 +213,7 @@ end
 -- Capability validation is fail-closed before every mode-specific policy,
 -- including yolo. Missing allowlist is the legacy unrestricted shape.
 do
-  local validator = tv_lib.build { read_only_tools = { "read_file" } }
+  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file" } }
   local cases = {
     { id = "empty", mode = "safe", allowlist = {} },
     { id = "malformed", mode = "safe", allowlist = { "read_file", 7 } },
@@ -240,7 +242,7 @@ end
 -- Legacy read_only is ignored; absence of an authoritative allowlist remains
 -- unrestricted and follows normal policy rather than becoming read-only.
 do
-  local validator = tv_lib.build { read_only_tools = { "read_file" } }
+  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file" } }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -252,6 +254,75 @@ do
   }))
   local calls = decode_calls()
   assert_eq(calls[1].kind, "chat.tool.popup_request", "missing allowlist preserves unrestricted compatibility")
+end
+
+-- A missing or unusable managed classifier settles the pending gate request
+-- with one actionable denial. It never silently approves or leaves the request
+-- waiting for a popup that cannot be produced.
+do
+  local original_run = nefor.process.run
+  nefor.process.run = function(_)
+    return { code = -1, stderr = "spawn failed: no such file" }
+  end
+  local validator = tv_lib.build { shell_classifier = "/missing/plugins/da/bin/da" }
+  validator._internals.set_mode("safe")
+  _test.calls_clear()
+  validator.receive_msg(make_entry({
+    kind = "chat.tool.permission_request",
+    id = "missing-classifier",
+    tool = "shell.script",
+    args = { script = "git status" },
+  }))
+  nefor.process.run = original_run
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "classifier failure settles exactly once")
+  assert_eq(calls[1].kind, "tool.permission_response", "classifier failure responds to gate")
+  assert_eq(calls[1].decision, "deny", "classifier failure denies")
+  assert_true(calls[1].reason:find("tool_classifier_unavailable[da]", 1, true) ~= nil,
+    "classifier failure is actionable")
+  assert_true(calls[1].reason:find("/missing/plugins/da/bin/da", 1, true) ~= nil,
+    "classifier failure identifies configured path")
+end
+
+-- A classifier can pass its cached version probe and still fail on the actual
+-- command. That later failure has the same single-settlement guarantee and
+-- uses only the injected private path.
+do
+  local original_run = nefor.process.run
+  local commands = {}
+  nefor.process.run = function(opts)
+    commands[#commands + 1] = opts.cmd
+    if type(opts.args) == "table" and opts.args[1] == "--version" then
+      return { code = 0, stdout = "da fixture" }
+    end
+    return { code = -1, stderr = "classifier process crashed" }
+  end
+  local validator = tv_lib.build { shell_classifier = CLASSIFIER }
+  validator._internals.set_mode("safe")
+  _test.calls_clear()
+  validator.receive_msg(make_entry({
+    kind = "chat.tool.permission_request",
+    id = "classifier-crash",
+    tool = "shell.script",
+    args = { script = "git status" },
+  }))
+  nefor.process.run = original_run
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "post-probe classifier failure settles exactly once")
+  assert_eq(calls[1].kind, "tool.permission_response", "post-probe failure responds to gate")
+  assert_eq(calls[1].decision, "deny", "post-probe failure denies")
+  assert_true(calls[1].reason:find("classifier process crashed", 1, true) ~= nil,
+    "post-probe failure preserves diagnostic")
+  assert_eq(#commands, 2, "probe and classification are the only processes")
+  assert_eq(commands[1], CLASSIFIER, "probe uses injected private path")
+  assert_eq(commands[2], CLASSIFIER, "classification uses injected private path")
+end
+
+do
+  local ok, err = pcall(tv_lib.build, {})
+  assert_eq(ok, false, "classifier dependency is required")
+  assert_true(tostring(err):find("shell_classifier", 1, true) ~= nil,
+    "missing dependency names the composition seam")
 end
 
 print("tool_validator_mode_test: all assertions passed")

@@ -325,10 +325,10 @@ install-nefor channel="source":
     }
 
     # $@ = the bins this install just wrote. Anything else in $LIBEXEC_BIN
-    # is from an older nefor (renamed/removed plugins); `da` is managed by
-    # install-example and kept.
+    # is from an older nefor (renamed/removed plugins). External packages such
+    # as `da` live below the package manager's plugins root.
     prune_libexec_bin() {
-      local keep=" $* da " f name
+      local keep=" $* " f name
       for f in "$LIBEXEC_BIN"/*; do
         [ -e "$f" ] || continue
         name=$(basename "$f")
@@ -424,14 +424,11 @@ install-nefor channel="source":
         ;;
     esac
 
-# Copy examples/nefor-agent/ to ~/.config/nefor and install its external dependencies (da). Refuses if the dir exists; pass `force` to wipe and re-copy.
+# Copy examples/nefor-agent/ to ~/.config/nefor. Refuses if the dir exists; pass `force` to wipe and re-copy.
 install-example mode="safe":
     #!/usr/bin/env bash
     set -eu
     DEST=~/.config/nefor
-    LIBEXEC_ROOT="$HOME/.local/share/nefor"
-    LIBEXEC_BIN="$LIBEXEC_ROOT/bin"
-
     if [ -e "$DEST" ]; then
       if [ "{{mode}}" = "force" ]; then
         rm -rf "$DEST"
@@ -445,19 +442,6 @@ install-example mode="safe":
     mkdir -p "$DEST"
     cp -R "{{justfile_directory()}}/examples/nefor-agent/." "$DEST/"
     echo "  $DEST (copied from {{justfile_directory()}}/examples/nefor-agent)"
-
-    # da — bash-command classifier used by example's tool-validator.
-    mkdir -p "$LIBEXEC_BIN"
-    if [ -x "$LIBEXEC_BIN/da" ]; then
-      echo "  da (already installed) -> $LIBEXEC_BIN/da"
-    elif command -v brew >/dev/null 2>&1; then
-      echo "Installing da via brew (amenocturne/tap)..."
-      brew install amenocturne/tap/da
-    else
-      echo "Installing da -> $LIBEXEC_BIN/da..."
-      cargo install --locked --root "$LIBEXEC_ROOT" dabin
-      echo "  $LIBEXEC_BIN/da"
-    fi
 
 # Remove the entire target/ directory. Next build is a full cold compile.
 clean:

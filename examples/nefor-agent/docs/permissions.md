@@ -48,7 +48,7 @@ read-only inventory.
 - both whole-file and exact-replacement forms of `write_file` pass only when a current approved write-review plan exists,
   except for the earlier `yolo` gate bypass;
 - write-capable `shell.script` is checked by `da` plus configured fast paths;
-- missing or unusable `da` is an installation error, not permission fallback;
+- missing or unusable `da` settles the request with an actionable denial;
 - any remaining request is interactive in `safe`, denied with recovery guidance
   in `auto`, and approved in `yolo`.
 

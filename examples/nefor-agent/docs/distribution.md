@@ -37,7 +37,7 @@ just install nightly force
 
 Channels are `source`, `latest`, and `nightly`. `latest` prefers Homebrew and otherwise downloads a stable release archive; `nightly` uses the rolling nightly release. Starter mode `safe` refuses to overwrite an existing config; `force` deletes and recopies it.
 
-Source/archive installation exposes `nefor` and `mag` on `PATH`, installs runtime plugin binaries under the Nefor data tree, prunes obsolete managed binaries, and installs `da` separately. `just install-source` is the lower-level immutable-generation primitive and verifies that the resolved checkout has the expected commit before building it.
+Source/archive installation exposes `nefor` and `mag` on `PATH`, installs runtime plugin binaries under the Nefor data tree, and prunes obsolete managed binaries. The starter composition declares its pinned `da` classifier as a `nefor-pm` package; bootstrap materializes and builds it under `<data-root>/plugins/da` without modifying the selected runtime generation. `just install-source` is the lower-level immutable-generation primitive and verifies that the resolved checkout has the expected commit before building it.
 
 ## Release bundle
 

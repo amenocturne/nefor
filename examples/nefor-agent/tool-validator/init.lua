@@ -31,6 +31,12 @@ local function string_array(field)
   return value
 end
 
-return require("libs.tool-validator").build {
-  read_only_tools = string_array("read_only"),
+return {
+  build = function(opts)
+    opts = opts or {}
+    return require("libs.tool-validator").build {
+      shell_classifier = opts.shell_classifier,
+      read_only_tools = string_array("read_only"),
+    }
+  end,
 }

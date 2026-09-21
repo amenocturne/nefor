@@ -73,7 +73,7 @@ fn starter_startup_parser_and_mode_application() {
         .find("actor.spawn(require(\"read-only-tools\"))")
         .expect("read-only tools registration");
     let tool_validator = init
-        .find("actor.spawn(require(\"tool-validator\"))")
+        .find("actor.spawn(require(\"tool-validator\").build {")
         .expect("tool validator registration");
     let gate = init
         .find(r#"actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))"#)

@@ -17,8 +17,10 @@ Building from source may work on other Rust-supported systems, but those systems
 are not exercised by the release artifact matrix. The starter and source
 installer expect a Unix-like environment and Git. Building requires the stable
 Rust toolchain and Cargo; repository recipes require `just`. The starter's
-command classifier, `da`, is installed through Homebrew when available or
-through Cargo otherwise.
+command classifier, `da`, is a pinned `nefor-pm` package under the writable
+Nefor data root. Its first bootstrap requires Cargo and, because the embedded
+model is stored with Git LFS, Git LFS when the clone has not already
+materialized that object.
 
 The repository includes a Nix flake and Home Manager module, but this route is
 **experimental**: it is not part of the release artifact matrix or the primary
