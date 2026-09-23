@@ -133,6 +133,63 @@ do
   }), "invalid_rewind_target")
 end
 
+-- Provider context needs a valid assistant message after an interruption even
+-- when only private reasoning streamed. Public projections preserve the exact
+-- text and reasoning, while text and tool-bearing interruptions pass through.
+do
+  local projection = require("libs.conversation-manager.projection")
+  local store = manager.new(); create(store, "interrupt-context", "lead")
+
+  append(store, fact("empty-start", "interrupt-context", "message_started", {
+    message_id = "empty", role = "assistant",
+  }))
+  append(store, fact("empty-reasoning", "interrupt-context", "content_chunk_appended", {
+    message_id = "empty", chunk = { kind = "reasoning", data = "private reasoning" },
+  }))
+  append(store, fact("empty-space", "interrupt-context", "content_chunk_appended", {
+    message_id = "empty", chunk = { kind = "text", data = "  \n" },
+  }))
+  append(store, fact("empty-stop", "interrupt-context", "message_interrupted", {
+    message_id = "empty",
+  }))
+
+  append(store, fact("text-start", "interrupt-context", "message_started", {
+    message_id = "text", role = "assistant",
+  }))
+  append(store, fact("text-chunk", "interrupt-context", "content_chunk_appended", {
+    message_id = "text", chunk = { kind = "text", data = "partial answer" },
+  }))
+  append(store, fact("text-stop", "interrupt-context", "message_interrupted", {
+    message_id = "text",
+  }))
+
+  append(store, fact("tool-start", "interrupt-context", "message_started", {
+    message_id = "tool", role = "assistant",
+  }))
+  append(store, fact("tool-exchange", "interrupt-context", "tool_exchange_started", {
+    exchange_id = "tool-exchange", message_id = "tool", tool_name = "read_file",
+  }))
+  append(store, fact("tool-call", "interrupt-context", "tool_call_completed", {
+    exchange_id = "tool-exchange",
+    call = { id = "call-1", name = "read_file", arguments = { path = "README.md" } },
+  }))
+  append(store, fact("tool-stop", "interrupt-context", "message_interrupted", {
+    message_id = "tool",
+  }))
+
+  local conversation = store:peek("interrupt-context")
+  local public = projection.conversation(conversation).messages
+  eq(public[1].content, "  \n", "public interruption preserves whitespace text")
+  eq(public[1].reasoning, "private reasoning", "public interruption preserves reasoning")
+  local context = projection.context(conversation).messages
+  eq(context[1].content, "[interrupted by user]",
+    "provider context replaces an empty interrupted assistant turn")
+  eq(context[1].reasoning, "private reasoning", "provider context preserves interrupted reasoning")
+  eq(context[2].content, "partial answer", "provider context preserves interrupted text")
+  eq(context[3].content, "", "provider context preserves tool-only interrupted content")
+  eq(#context[3].tool_calls, 1, "provider context preserves interrupted tool calls")
+end
+
 -- Tool errors are the other exactly-once terminal exchange outcome.
 do
   local store = manager.new(); create(store, "error-chat", "agent")

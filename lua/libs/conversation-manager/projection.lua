@@ -74,6 +74,12 @@ local function projected_message(conversation, message, include_provider_context
   }
   if include_provider_context then
     projected.provider_context = domain.copy(message.provider_context)
+    local empty_text = projected.content == nil
+      or (type(projected.content) == "string" and projected.content:match("^%s*$") ~= nil)
+    if projected.role == "assistant" and projected.status == "interrupted" and empty_text
+        and #projected.tool_calls == 0 then
+      projected.content = "[interrupted by user]"
+    end
   end
   return projected
 end
