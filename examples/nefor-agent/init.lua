@@ -44,8 +44,13 @@ pm.register({
 -- the selected immutable Nefor runtime tree above remains read-only.
 local da_package = require("libs.tool-validator.da")
 pm.install({
-  da_package.package {
-    commit = "558777ef63f4ad139de0b1be8ec667c63d697111",
+  da_package.release_package {
+    version = "0.2.1",
+    checksums = {
+      ["aarch64-apple-darwin"] = "2ab4714780f7e6509e30137b7e1434c8d534d035ddfddbc5a68278a023b281cf",
+      ["aarch64-unknown-linux-gnu"] = "14469f64a8aafbddd7f8d1c76fb85771123188657368e5f01f17031c147fa0ea",
+      ["x86_64-unknown-linux-gnu"] = "f2ab7637c0129291419683d686eeb9bd9154d7d06f5bba65abd574cf1786cfbb",
+    },
   },
 }, { on_progress = pm.stderr_progress })
 local SHELL_CLASSIFIER = pm.bin("da", "da")

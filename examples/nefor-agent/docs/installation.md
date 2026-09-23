@@ -18,14 +18,15 @@ are not exercised by the release artifact matrix. The starter and source
 installer expect a Unix-like environment and Git. Building requires the stable
 Rust toolchain and Cargo; repository recipes require `just`.
 
-Before launching the installed starter for the first time, install Git LFS as
-well as Git, Rust, and Cargo. This is a dependency of the starter distribution,
-not of the Nefor engine itself: the starter pins the `da` command classifier as
-a `nefor-pm` package, whose embedded model is stored with Git LFS. On first
-launch, the starter clones that package under the writable Nefor data root,
-materializes the LFS object, and builds a private executable with Cargo. Nefor
-prints the current preparation phase while this one-time bootstrap runs. Later
-launches reuse the prepared package unless its pinned revision changes.
+The starter pins a prebuilt `da` command classifier as a `nefor-pm` package.
+First launch downloads and verifies the platform archive, then installs it
+under `<data-root>/plugins/da`; preparation phases appear before the TUI starts.
+Later launches reuse that exact package. This needs `curl`, `tar`, and a SHA-256
+utility (`shasum` or `sha256sum`), but no Rust or Git LFS for the classifier.
+Its Linux binaries require glibc 2.39 or newer; x86-64 additionally requires an
+x86-64-v3 CPU. Intel macOS has no prebuilt classifier for the selected ONNX
+Runtime. An explicit source configuration using `da.package` still requires
+Rust, Cargo, and Git LFS.
 
 The repository includes a Nix flake and Home Manager module, but this route is
 **experimental**: it is not part of the release artifact matrix or the primary
