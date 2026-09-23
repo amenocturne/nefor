@@ -2116,3 +2116,253 @@ fn load_resolves_submodule_under_plugin_dir() {
     assert_eq!(a, "root");
     assert_eq!(b, "subm");
 }
+
+// Local release fixtures exercise the download/extract/replace boundary without a network.
+fn archive_fixture(root: &std::path::Path, name: &str) -> (String, String) {
+    let package = root.join(name);
+    std::fs::create_dir_all(package.join("bin")).expect("fixture bin");
+    std::fs::write(package.join("bin/tool"), name).expect("fixture executable");
+    let archive = root.join(format!("{name}.tar.gz"));
+    assert!(Command::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(root)
+        .arg(name)
+        .status()
+        .expect("tar")
+        .success());
+    let hash = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&archive)
+        .output()
+        .expect("shasum");
+    assert!(hash.status.success());
+    let digest = String::from_utf8(hash.stdout)
+        .expect("checksum text")
+        .split_whitespace()
+        .next()
+        .expect("digest")
+        .to_owned();
+    (format!("file://{}", archive.display()), digest)
+}
+
+fn archive_spec(url: &str, sha256: &str) -> String {
+    format!(
+        r#"{{ name = "tool", archive = {{ url = "{url}", sha256 = "{sha256}", strip_components = 1 }} }}"#
+    )
+}
+
+#[test]
+fn archives_install_cache_and_upgrade_exact_pins_without_build_tools() {
+    let work = tempfile::tempdir().expect("workdir");
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+    let (url, digest) = archive_fixture(work.path(), "first");
+    lua.load(format!(r#"
+        pm = require("nefor-pm")
+        events = {{}}
+        opts = {{ on_progress = function(_, phase) events[#events + 1] = phase end }}
+        spec = {}
+        local run = nefor.process.run
+        nefor.process.run = function(args)
+          assert(args.cmd ~= "cargo" and args.cmd ~= "git", "binary installation needs no source tools")
+          return run(args)
+        end
+        pm.install({{spec}}, opts)
+        assert(events[#events] == "Ready")
+        assert(nefor.fs.read_file(pm.bin("tool")).content == "first")
+        events = {{}}
+        nefor.process.run = function() error("cached install started a process") end
+        pm.install({{spec}}, opts)
+        assert(#events == 0)
+        nefor.process.run = run
+    "#, archive_spec(&url, &digest))).exec().expect("install and cache archive");
+    let (url, digest) = archive_fixture(work.path(), "second");
+    lua.load(format!(
+        r#"
+        pm.install({{{}}}, opts)
+        assert(nefor.fs.read_file(pm.bin("tool")).content == "first", "install reproduces the lock")
+        pm.update({{{}}}, opts)
+        assert(nefor.fs.read_file(pm.bin("tool")).content == "second")
+        assert(pm._internals.read_lockfile().tool.sha256 == "{}")
+    "#,
+        archive_spec(&url, &digest),
+        archive_spec(&url, &digest),
+        digest
+    ))
+    .exec()
+    .expect("upgrade explicit archive pin");
+}
+
+#[test]
+fn archive_failures_preserve_previous_installation_and_lock() {
+    let work = tempfile::tempdir().expect("workdir");
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+    let (url, digest) = archive_fixture(work.path(), "original");
+    lua.load(format!(
+        r#"pm = require("nefor-pm"); pm.install({{{}}})"#,
+        archive_spec(&url, &digest)
+    ))
+    .exec()
+    .expect("first install");
+    let lock_path = data.path().join("plugins/nefor-pm.lock.json");
+    let lock = std::fs::read(&lock_path).expect("original lock");
+    let missing = format!("file://{}/missing.tar.gz", work.path().display());
+    let (new_url, new_digest) = archive_fixture(work.path(), "replacement");
+    let scenarios = [
+        (archive_spec(&url, &"0".repeat(64)), "", "SHA-256 mismatch"),
+        (archive_spec(&missing, &digest), "", "curl exited"),
+        (
+            archive_spec(&new_url, &new_digest),
+            r#"
+          local real = nefor.process.run
+          nefor.process.run = function(args)
+            if args.cmd == "tar" then return { code = 2, stderr = "bad archive" } end
+            return real(args)
+          end
+        "#,
+            "tar exited",
+        ),
+        (
+            archive_spec(&new_url, &new_digest),
+            r#"
+          local real = nefor.fs.write_file
+          nefor.fs.write_file = function(path, body)
+            if path:match("nefor%-pm.lock.json.tmp$") then return { ok = false, error = "disk full" } end
+            return real(path, body)
+          end
+        "#,
+            "cannot write lockfile",
+        ),
+    ];
+    for (spec, inject, expected) in scenarios {
+        let attempt = lua_with_pm();
+        attempt
+            .load(format!(
+                r#"
+            local pm = require("nefor-pm")
+            {inject}
+            local events = {{}}
+            local ok, err = pcall(pm.update, {{{spec}}}, {{
+              on_progress = function(_, phase) events[#events + 1] = phase end,
+            }})
+            assert(not ok and tostring(err):find("{expected}", 1, true), tostring(err))
+            for _, phase in ipairs(events) do assert(phase ~= "Ready") end
+            assert(nefor.fs.read_file(pm.bin("tool")).content == "original")
+        "#
+            ))
+            .exec()
+            .expect("failure preserves prior package");
+        assert_eq!(std::fs::read(&lock_path).expect("retained lock"), lock);
+        assert_eq!(
+            std::fs::read_dir(data.path().join("plugins"))
+                .expect("plugins")
+                .count(),
+            2,
+            "failed attempts leave no staging directories"
+        );
+    }
+}
+
+#[test]
+fn archive_cleanup_failure_does_not_misreport_a_committed_install() {
+    let work = tempfile::tempdir().expect("workdir");
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let (url, digest) = archive_fixture(work.path(), "release");
+    lua_with_pm()
+        .load(format!(
+            r#"
+      local pm = require("nefor-pm")
+      local remove = nefor.fs.remove_dir_all
+      nefor.fs.remove_dir_all = function(path)
+        if path:find("/.tool.", 1, true) then return {{ ok = false, error = "cleanup fixture" }} end
+        return remove(path)
+      end
+      local ready = false
+      pm.install({{{}}}, {{ on_progress = function(_, phase) ready = phase == "Ready" end }})
+      assert(ready)
+      assert(nefor.fs.read_file(pm.bin("tool")).content == "release")
+      assert(pm._internals.read_lockfile().tool.sha256 == "{}")
+    "#,
+            archive_spec(&url, &digest),
+            digest
+        ))
+        .exec()
+        .expect("committed install succeeds despite cleanup warning");
+}
+
+#[test]
+fn archives_replace_managed_git_but_refuse_unowned_directories_and_dev_links() {
+    let work = tempfile::tempdir().expect("workdir");
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let origin = work.path().join("origin");
+    let git_url = make_origin_repo(&origin);
+    let (url, digest) = archive_fixture(work.path(), "release");
+    let lua = lua_with_pm();
+    lua.load(format!(
+        r#"
+        local pm = require("nefor-pm")
+        pm.install({{{{ name = "tool", url = "{git_url}", branch = "main" }}}})
+        pm.install({{{}}})
+        assert(nefor.fs.read_file(pm.bin("tool")).content == "release")
+        assert(not nefor.fs.exists(pm.root("tool") .. "/.git"))
+    "#,
+        archive_spec(&url, &digest)
+    ))
+    .exec()
+    .expect("Git to archive migration");
+    let target = data.path().join("plugins/tool");
+    std::fs::remove_file(data.path().join("plugins/nefor-pm.lock.json")).expect("remove ownership");
+    let attempt = format!(
+        r#"require("nefor-pm").install({{{}}})"#,
+        archive_spec(&url, &digest)
+    );
+    let err = lua_with_pm()
+        .load(&attempt)
+        .exec()
+        .expect_err("unowned directory refused");
+    assert!(err.to_string().contains("unowned directory"), "{err}");
+    std::fs::remove_dir_all(&target).expect("remove fixture package");
+    std::os::unix::fs::symlink(&origin, &target).expect("dev link");
+    let err = lua_with_pm()
+        .load(&attempt)
+        .exec()
+        .expect_err("dev symlink refused");
+    assert!(err.to_string().contains("development symlink"), "{err}");
+    assert!(origin.join(".git").is_dir());
+}
+
+#[test]
+fn archive_specs_and_da_release_platforms_are_explicit() {
+    let lua = lua_with_pm();
+    lua.load(r#"
+        local parse = require("nefor-pm")._internals.parse_spec
+        for _, key in ipairs({ "dir", "url", "branch", "tag", "commit", "path", "build" }) do
+          local spec = { name = "tool", archive = { url = "x", sha256 = string.rep("a", 64) } }
+          spec[key] = "conflict"
+          assert(not pcall(parse, spec, 1))
+        end
+        local da = require("libs.tool-validator.da")
+        local target = da._internals.release_target
+        assert(target("Darwin", "arm64") == "aarch64-apple-darwin")
+        assert(target("Linux", "aarch64") == "aarch64-unknown-linux-gnu")
+        assert(target("Linux", "x86_64") == "x86_64-unknown-linux-gnu")
+        assert(not pcall(target, "Darwin", "x86_64"))
+        nefor.process.run = function(args)
+          return { code = 0, stdout = args.args[1] == "-s" and "Darwin" or "arm64" }
+        end
+        assert(not pcall(da.release_package, { version = "0.2.1", checksums = {} }))
+        local spec = da.release_package {
+          version = "0.2.1", checksums = { ["aarch64-apple-darwin"] = string.rep("a", 64) },
+        }
+        assert(spec.build == nil and spec.commit == nil)
+        assert(spec.archive.url == "https://github.com/amenocturne/da/releases/download/v0.2.1/da-aarch64-apple-darwin.tar.gz")
+        assert(spec.archive.strip_components == 1)
+    "#).exec().expect("archive contract");
+}

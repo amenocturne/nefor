@@ -1,7 +1,7 @@
 -- nefor-pm — pure-Lua plugin manager.
 --
 -- Public API:
---   pm.install(specs, opts)  reproduce the exact commits in the lockfile;
+--   pm.install(specs, opts)  reproduce the exact source/archive pins in the lockfile;
 --                            resolve and pin refs only when no lock exists.
 --   pm.update(specs, opts)   explicitly resolve refs again and move their pins.
 --                            Both operations are synchronous, so init.lua can
@@ -21,7 +21,7 @@
 --   pm.engine_ref()          returns (ref, ref_kind) derived from nefor.version:
 --                            exact semver → ("vX.Y.Z", "tag"); otherwise ("main", "branch").
 --
--- Spec shape (see design note):
+-- Git/development spec shape (archive specs are documented in README.md):
 --   {
 --     "owner/repo",                     -- [1] shorthand → https://github.com/owner/repo
 --     name   = "string",                -- required, non-empty.
@@ -41,6 +41,7 @@
 --   }
 
 local M = {}
+local archive = require("nefor-pm.archive")
 
 -- Materialized package registry. Populated by register and install_spec;
 -- pm.root/pm.bin resolve through it while pm.load delegates to Lua.
@@ -194,6 +195,17 @@ local function parse_spec(spec, index)
       index), 0)
   end
   local label = spec.name
+  if spec.archive ~= nil then
+    for _, key in ipairs({ 1, "url", "tag", "branch", "commit", "path", "dir", "build" }) do
+      if spec[key] ~= nil then fail(label, "`archive` cannot be combined with `" .. tostring(key) .. "`") end
+    end
+    if label == "." or label == ".." or label:find("/", 1, true) then
+      fail(label, "archive package name must be a single directory name")
+    end
+    local ok, normalized = pcall(archive.normalize, spec.archive)
+    if not ok then fail(label, normalized) end
+    return { name = label, archive = normalized }
+  end
 
   local shorthand = spec[1]
   local url = spec.url
@@ -270,8 +282,13 @@ local function read_lockfile()
     error("nefor-pm: lockfile is invalid: " .. lockfile_path(), 0)
   end
   for name, entry in pairs(decoded) do
-    if type(name) ~= "string" or type(entry) ~= "table"
-        or not is_string(entry.ref) or not is_string(entry.commit) then
+    local valid = type(name) == "string" and type(entry) == "table"
+    if valid and entry.kind == "archive" then
+      valid = pcall(archive.normalize, entry)
+    else
+      valid = valid and entry.kind == nil and is_string(entry.ref) and is_string(entry.commit)
+    end
+    if not valid then
       error("nefor-pm: lockfile has an invalid entry: " .. tostring(name), 0)
     end
   end
@@ -297,9 +314,15 @@ local function write_lockfile(lock)
     out = out .. nefor.json.encode(k) .. ":" .. entry_json
   end
   out = out .. "}\n"
-  local write = fs.write_file(lockfile_path(), out)
+  local temporary = lockfile_path() .. ".tmp"
+  local write = fs.write_file(temporary, out)
   if not write.ok then
     error("nefor-pm: cannot write lockfile: " .. tostring(write.error), 0)
+  end
+  local renamed, rename_error = os.rename(temporary, lockfile_path())
+  if not renamed then
+    fs.remove(temporary)
+    error("nefor-pm: cannot replace lockfile: " .. tostring(rename_error), 0)
   end
 end
 
@@ -661,6 +684,18 @@ local function install_spec(spec, lock, update, progress)
   ensure_on_path(plugins_root())
 
   local entry = lock[spec.name]
+  if spec.archive then
+    local desired = spec
+    if not update and entry and entry.kind == "archive" then
+      desired = { name = spec.name, archive = archive.normalize(entry) }
+    end
+    local installed, transaction = archive.install(desired, plugins_root(), entry, progress, run_cmd)
+    plugins[spec.name] = { dir = target_dir, source = "data" }
+    return installed, transaction
+  end
+  if entry and entry.kind == "archive" and fs.exists(target_dir) then
+    fail(label, "remove the managed archive before switching this package back to Git source")
+  end
   local desired = update and spec or pinned_spec(spec, entry)
   local build_hash = compute_build_hash(spec)
 
@@ -735,23 +770,35 @@ local function apply_specs(specs, update, opts)
   -- partial install or update doesn't wipe sibling lock state).
   for k, v in pairs(lock) do new_lock[k] = v end
 
-  for i, raw in ipairs(specs) do
-    local spec = parse_spec(raw, i)
-    local reported = false
-    local function progress(message)
-      if on_progress then
-        on_progress(spec.name, message)
-        reported = true
+  local transactions = {}
+  local previous_plugins = {}
+  for name, entry in pairs(plugins) do previous_plugins[name] = entry end
+  local ok, err = pcall(function()
+    for i, raw in ipairs(specs) do
+      local spec = parse_spec(raw, i)
+      local reported = false
+      local function progress(message)
+        if on_progress then
+          on_progress(spec.name, message)
+          reported = true
+        end
       end
+      local entry, transaction = install_spec(spec, new_lock, update, progress)
+      if transaction then transactions[#transactions + 1] = transaction end
+      if reported then completed[#completed + 1] = spec.name end
+      if entry ~= nil then new_lock[spec.name] = entry end
     end
-    local entry = install_spec(spec, lock, update, progress)
-    if reported then completed[#completed + 1] = spec.name end
-    if entry ~= nil then
-      new_lock[spec.name] = entry
+    write_lockfile(new_lock)
+  end)
+  if not ok then
+    for i = #transactions, 1, -1 do
+      local restored, restore_error = pcall(transactions[i].rollback)
+      if not restored then err = tostring(err) .. "\nRollback failed: " .. tostring(restore_error) end
     end
+    plugins = previous_plugins
+    error(err, 0)
   end
-
-  write_lockfile(new_lock)
+  for _, transaction in ipairs(transactions) do transaction.commit() end
   for _, name in ipairs(completed) do on_progress(name, "Ready") end
 end
 

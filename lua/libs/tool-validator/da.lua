@@ -1,6 +1,6 @@
 -- da package definition for compositions that use shell-script classification.
--- The composition owns the source pin and invokes nefor-pm; this module owns
--- only da's source-specific build prerequisites and package layout.
+-- The composition owns source/release pins and invokes nefor-pm; this module
+-- describes da's supported release layout and explicit source-build option.
 
 local M = {}
 
@@ -123,7 +123,43 @@ function M.package(opts)
   }
 end
 
+local function release_target(system, machine)
+  local systems = { Darwin = "apple-darwin", Linux = "unknown-linux-gnu" }
+  local arches = { arm64 = "aarch64", aarch64 = "aarch64", x86_64 = "x86_64" }
+  local os_part, arch = systems[system], arches[machine]
+  local target = os_part and arch and (arch .. "-" .. os_part)
+  if target == "aarch64-apple-darwin" or target == "aarch64-unknown-linux-gnu"
+      or target == "x86_64-unknown-linux-gnu" then return target end
+  error("da release: no prebuilt binary for " .. tostring(system) .. "/" .. tostring(machine), 0)
+end
+
+function M.release_package(opts)
+  opts = opts or {}
+  if type(opts.version) ~= "string" or not opts.version:match("^%d+%.%d+%.%d+$") then
+    error("da release: `version` must be an exact release version", 0)
+  end
+  local function uname(flag)
+    local result = nefor.process.run { cmd = "uname", args = { flag } }
+    if result.code ~= 0 then error("da release: cannot detect platform: " .. (result.stderr or ""), 0) end
+    return (result.stdout:gsub("%s+$", ""))
+  end
+  local target = release_target(uname("-s"), uname("-m"))
+  local checksum = opts.checksums and opts.checksums[target]
+  if type(checksum) ~= "string" or #checksum ~= 64 or checksum:find("[^%x]") then
+    error("da release: a SHA-256 checksum is required for " .. target, 0)
+  end
+  return {
+    name = opts.name or "da",
+    archive = {
+      url = "https://github.com/amenocturne/da/releases/download/v" .. opts.version .. "/da-" .. target .. ".tar.gz",
+      sha256 = checksum,
+      strip_components = 1,
+    },
+  }
+end
+
 M._internals = {
+  release_target = release_target,
   build = build,
   model_state = model_state,
 }

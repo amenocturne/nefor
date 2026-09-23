@@ -47,6 +47,49 @@ local executable = pm.bin("my-plugin", "my-plugin")
 
 The plugin lock lives at `<data-root>/plugins/nefor-pm.lock.json`. `install` reproduces an existing exact pin and does not move it. `update` resolves again and moves the selected pins. Partial operations preserve unrelated lock entries.
 
+### Prebuilt archives
+
+A package can select a verified tar.gz archive instead of a Git checkout:
+
+```lua
+pm.install {
+  {
+    name = "my-tool",
+    archive = {
+      url = "https://example.org/releases/my-tool.tar.gz",
+      sha256 = "<64 hexadecimal characters>",
+      strip_components = 1,
+    },
+  },
+}
+local executable = pm.bin("my-tool", "my-tool")
+```
+
+Archive specs cannot also select Git, `dir`, `path`, or `build`. The archive
+must contain the final package layout (including `bin/` for executables).
+Installation needs `curl`, `tar`, and either `shasum` or `sha256sum`; no compiler
+or source checkout is used. The composition supplies the URL and SHA-256.
+
+`install` reproduces the recorded archive identity; `update` adopts a changed
+URL/checksum/layout. A cached package with the matching lock and installation
+marker does not download or extract again. Download, checksum, extraction, or
+lock-write failures preserve the previous package and lock. After successful
+lock persistence, a cleanup failure reports the leftover staging path without
+undoing or misreporting the installed package. These guarantees cover reported
+operation failures, not process termination or simultaneous writers.
+
+Archives can replace an existing managed Git package with a lock entry.
+Unowned directories and development symlinks are never replaced. To deliberately
+switch an archive back to a Git checkout, remove its managed package directory
+first. Packages remain under `<data-root>/plugins/<name>`.
+
+The shell classifier helper `libs.tool-validator.da.release_package` produces
+this spec from a composition-owned `version` and a `checksums` table keyed by
+release target. It supports Apple Silicon macOS and GNU Linux on x86_64/ARM64,
+and fails explicitly on unsupported platforms or missing checksums. The
+separate `da.package { commit = ... }` helper remains an explicit source-build
+choice requiring Rust and Git LFS.
+
 ### Startup progress
 
 `install` and `update` accept an optional `on_progress(name, message)` callback.
@@ -71,7 +114,8 @@ Already prepared packages emit no messages during `install`. Without an
 
 ### Source modes
 
-- **Managed:** repository/ref fields create a manager-owned checkout and lock entry.
+- **Managed Git:** repository/ref fields create a manager-owned checkout and lock entry.
+- **Managed archive:** an `archive` record selects a checksum-verified tar.gz package with an exact lock.
 - **Development override:** `dir = "/absolute/local/path"` creates a symlink to mutable source, performs no clone, and writes no lock entry. It refuses to replace a non-symlink.
 - **Immutable registration:** `pm.register { { name = "x", dir = "/absolute/materialized/x" } }` changes only the current Lua resolver. It creates no checkout, symlink, or lock and refuses to rebind a name to another directory.
 
