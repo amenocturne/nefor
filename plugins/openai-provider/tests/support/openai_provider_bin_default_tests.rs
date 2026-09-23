@@ -69,17 +69,22 @@
     }
 
     #[test]
-    fn direct_completion_model_input_requires_non_empty_user_or_tool_message() {
+    fn direct_completion_model_input_accepts_exact_empty_tool_results() {
         assert!(!completion_request_has_model_input(&[
             Message::system("instructions"),
             Message::assistant("prior answer"),
         ]));
+        assert!(!completion_request_has_model_input(&[Message::user("  ")]));
         assert!(completion_request_has_model_input(&[Message::user(
             "question"
         )]));
         assert!(completion_request_has_model_input(&[Message::Tool {
-            content: "tool result".into(),
+            content: String::new(),
             tool_call_id: "call-1".into(),
+        }]));
+        assert!(completion_request_has_model_input(&[Message::Tool {
+            content: " \n\t".into(),
+            tool_call_id: "call-2".into(),
         }]));
     }
 
@@ -1070,6 +1075,161 @@
     }
 
     #[tokio::test]
+    async fn chat_append_preserves_empty_and_whitespace_tool_results() {
+        let (auth, tx, mut rx) = auth_test_rig(None);
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+        let chat_id = ChatId::new("empty-tool-results");
+
+        chats
+            .create(chat_id.clone(), None, None, None, None, None)
+            .await
+            .expect("seed");
+        let messages = [
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-empty",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"empty.txt\"}"}
+                    },
+                    {
+                        "id": "call-whitespace",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"whitespace.txt\"}"}
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-empty",
+                "content": ""
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-whitespace",
+                "content": " \n\t"
+            }),
+        ];
+
+        for message in messages {
+            let body = make_event_body(
+                "ollama.chat.append",
+                &[
+                    ("chat_id", Value::String(chat_id.to_string())),
+                    ("message", message),
+                ],
+            );
+            dispatch_event(
+                &chats,
+                &auth,
+                &catalog,
+                &broker,
+                &config,
+                &client,
+                &tx,
+                &from_plugin("reasoner-graph"),
+                &body,
+            )
+            .await
+            .expect("append");
+        }
+
+        let emitted = drain(&mut rx).await;
+        assert_eq!(emitted.len(), 3);
+        assert!(emitted.iter().all(|body| body["kind"] == "ollama.chat.appended"));
+        let history = chats
+            .request_history_snapshot(&chat_id)
+            .await
+            .expect("request history");
+        assert_eq!(history[1].content(), Some(""));
+        assert_eq!(history[2].content(), Some(" \n\t"));
+        assert_eq!(
+            serde_json::to_value(&history[1]).expect("serialize empty result"),
+            serde_json::json!({
+                "role": "tool",
+                "content": "",
+                "tool_call_id": "call-empty"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&history[2]).expect("serialize whitespace result"),
+            serde_json::json!({
+                "role": "tool",
+                "content": " \n\t",
+                "tool_call_id": "call-whitespace"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_restore_preserves_whitespace_only_tool_result_for_requests() {
+        let (auth, tx, mut rx) = auth_test_rig(None);
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+        let chat_id = ChatId::new("restored-whitespace-tool-result");
+        let restore = make_event_body(
+            "ollama.chat.restore",
+            &[
+                ("chat_id", Value::String(chat_id.to_string())),
+                (
+                    "history",
+                    serde_json::json!([
+                        {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{\"path\":\"whitespace.txt\"}"}
+                            }]
+                        },
+                        {"role": "tool", "tool_call_id": "call-1", "content": " \n\t"}
+                    ]),
+                ),
+            ],
+        );
+
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &restore,
+        )
+        .await
+        .expect("restore");
+
+        let emitted = drain(&mut rx).await;
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["kind"], "ollama.chat.appended");
+        let history = chats
+            .request_history_snapshot(&chat_id)
+            .await
+            .expect("request history");
+        assert_eq!(history[1].content(), Some(" \n\t"));
+        assert!(request_history_has_model_input(&history));
+        assert_eq!(
+            serde_json::to_value(&history[1]).expect("serialize restored result"),
+            serde_json::json!({
+                "role": "tool",
+                "content": " \n\t",
+                "tool_call_id": "call-1"
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn chat_restore_uses_the_selected_default_for_reasoning_ownership() {
         let (auth, tx, mut rx) = auth_test_rig(None);
         let chats = fresh_chats("initial-model");
@@ -1272,7 +1432,7 @@
         assert_eq!(
             emitted[0].get("message").and_then(Value::as_str),
             Some(
-                "openai-provider: chat.complete needs at least one non-empty user or tool message"
+                "openai-provider: chat.complete needs at least one non-empty user message or tool result"
             )
         );
     }
@@ -1501,6 +1661,60 @@
             Err(err) => err,
         };
         assert_eq!(err, "user message `content` must be non-empty");
+    }
+
+    #[test]
+    fn parse_provider_message_preserves_tool_content_including_structured_json() {
+        for (content, expected) in [
+            (serde_json::json!(""), ""),
+            (serde_json::json!(" \n\t"), " \n\t"),
+            (serde_json::json!({"lines": []}), "{\"lines\":[]}"),
+        ] {
+            let value = serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": content
+            });
+            let parsed = parse_provider_message(
+                Some(&value),
+                "fixture",
+                "https://fixture.invalid",
+                Some("fixture-model"),
+            )
+            .expect("valid tool message");
+            assert_eq!(parsed.message.content(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn parse_provider_message_rejects_missing_or_null_tool_content_and_missing_id() {
+        for value in [
+            serde_json::json!({"role": "tool", "tool_call_id": "call-1"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call-1", "content": null}),
+        ] {
+            let err = match parse_provider_message(
+                Some(&value),
+                "fixture",
+                "https://fixture.invalid",
+                Some("fixture-model"),
+            ) {
+                Ok(_) => panic!("missing or null tool content should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err, "tool message missing `content`");
+        }
+
+        let missing_id = serde_json::json!({"role": "tool", "content": ""});
+        let err = match parse_provider_message(
+            Some(&missing_id),
+            "fixture",
+            "https://fixture.invalid",
+            Some("fixture-model"),
+        ) {
+            Ok(_) => panic!("missing tool id should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "tool message missing `tool_call_id`");
     }
 
     #[test]

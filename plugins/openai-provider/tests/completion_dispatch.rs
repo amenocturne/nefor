@@ -221,6 +221,76 @@ async fn direct_completion_dispatch_preserves_usage_id_and_request_additions() {
 }
 
 #[tokio::test]
+async fn direct_completion_sends_empty_and_whitespace_tool_results_exactly() {
+    for (request_id, content) in [
+        ("empty-tool-result", ""),
+        ("whitespace-tool-result", " \n\t"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let expected_content = content.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request = read_request_json(&mut stream).await;
+            assert_eq!(
+                request["messages"],
+                json!([
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{\"path\":\"empty.txt\"}"}
+                        }]
+                    },
+                    {"role": "tool", "tool_call_id": "call-1", "content": expected_content}
+                ])
+            );
+            let events = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                events.len(),
+                events
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response");
+        });
+        let (mut child, mut stdin, mut stdout) = spawn_provider(&format!("http://{addr}")).await;
+        send_completion_messages(
+            &mut stdin,
+            request_id,
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"empty.txt\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": content}
+            ]),
+        )
+        .await;
+
+        loop {
+            let event = next_completion_event(&mut stdout, request_id).await;
+            if event["event"] == "completed" {
+                assert_eq!(event["text"], "done");
+                break;
+            }
+        }
+        server.await.expect("server");
+        child.kill().await.expect("kill provider");
+    }
+}
+
+#[tokio::test]
 async fn native_reasoning_round_trips_beside_assistant_tool_calls_and_tool_results() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

@@ -44,7 +44,50 @@ mod tools {
             use std::io::Write;
             use tempfile::NamedTempFile;
 
+            #[cfg(unix)]
+            use std::ffi::CString;
+            #[cfg(unix)]
+            use std::fs::OpenOptions;
+            #[cfg(unix)]
+            use std::os::unix::ffi::OsStrExt;
+            #[cfg(unix)]
+            use std::os::unix::net::UnixListener;
+            #[cfg(unix)]
+            use std::path::Path;
+            #[cfg(unix)]
+            use std::time::Duration;
+
             const TEST_MAX_BYTES: u64 = 1024 * 1024;
+
+            #[cfg(unix)]
+            fn create_fifo(path: &Path) {
+                let path = CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+                let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+                assert_eq!(
+                    result,
+                    0,
+                    "mkfifo failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            #[cfg(unix)]
+            async fn assert_not_regular(path: &Path) {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    run(
+                        &json!({ "path": path.to_str().expect("utf8 path") }),
+                        Some(TEST_MAX_BYTES),
+                    ),
+                )
+                .await
+                .expect("read_file must reject before a special file can block")
+                .unwrap_err();
+                assert!(
+                    matches!(result, ToolError::NotRegularFile { .. }),
+                    "got {result:?}"
+                );
+            }
 
             #[tokio::test]
             async fn reads_utf8_contents() {
@@ -65,6 +108,62 @@ mod tools {
                     .await
                     .expect("ok");
                 assert_eq!(out, "");
+            }
+
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn reads_symlink_to_regular_file() {
+                let mut file = NamedTempFile::new().expect("tempfile");
+                file.write_all(b"linked text").expect("write");
+                let dir = tempfile::tempdir().expect("tempdir");
+                let link = dir.path().join("text-link");
+                std::os::unix::fs::symlink(file.path(), &link).expect("symlink");
+
+                let out = run(
+                    &json!({ "path": link.to_str().expect("utf8 path") }),
+                    Some(TEST_MAX_BYTES),
+                )
+                .await
+                .expect("symlink to regular file accepted");
+                assert_eq!(out, "linked text");
+            }
+
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn rejects_device_and_symlink_to_device() {
+                for device in ["/dev/null", "/dev/random", "/dev/urandom"] {
+                    assert_not_regular(Path::new(device)).await;
+                }
+
+                let dir = tempfile::tempdir().expect("tempdir");
+                let link = dir.path().join("device-link");
+                std::os::unix::fs::symlink("/dev/null", &link).expect("symlink");
+                assert_not_regular(&link).await;
+            }
+
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn rejects_fifo_before_opening_it() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let fifo = dir.path().join("pipe");
+                create_fifo(&fifo);
+                let _guard = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open fifo guard");
+
+                assert_not_regular(&fifo).await;
+            }
+
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn rejects_unix_socket() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let socket = dir.path().join("socket");
+                let _listener = UnixListener::bind(&socket).expect("bind unix socket");
+
+                assert_not_regular(&socket).await;
             }
 
             #[tokio::test]
@@ -313,6 +412,28 @@ mod tools {
             use std::io::Write;
             use tempfile::NamedTempFile;
 
+            #[cfg(unix)]
+            use std::os::unix::net::UnixListener;
+            #[cfg(unix)]
+            use std::path::Path;
+            #[cfg(unix)]
+            use std::time::Duration;
+
+            #[cfg(unix)]
+            async fn assert_not_regular(path: &Path) {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    run(&json!({ "path": path.to_str().expect("utf8 path") })),
+                )
+                .await
+                .expect("read_image must reject before a special file can block")
+                .unwrap_err();
+                assert!(
+                    matches!(result, ToolError::NotRegularFile { .. }),
+                    "got {result:?}"
+                );
+            }
+
             #[tokio::test]
             async fn reads_png_as_media_object() {
                 let mut f = NamedTempFile::new().expect("tempfile");
@@ -328,6 +449,39 @@ mod tools {
                     out.get("data").and_then(Value::as_str),
                     Some("iVBORw0KGgphYmM=")
                 );
+            }
+
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn reads_symlink_to_regular_image() {
+                let mut file = NamedTempFile::new().expect("tempfile");
+                file.write_all(b"\x89PNG\r\n\x1a\nabc").expect("write");
+                let dir = tempfile::tempdir().expect("tempdir");
+                let link = dir.path().join("image-link");
+                std::os::unix::fs::symlink(file.path(), &link).expect("symlink");
+
+                let out = run(&json!({ "path": link.to_str().expect("utf8 path") }))
+                    .await
+                    .expect("symlink to regular image accepted");
+                assert_eq!(
+                    out.get("media_type").and_then(Value::as_str),
+                    Some("image/png")
+                );
+            }
+
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn rejects_device_alias_and_socket() {
+                assert_not_regular(Path::new("/dev/null")).await;
+
+                let dir = tempfile::tempdir().expect("tempdir");
+                let link = dir.path().join("device-link");
+                std::os::unix::fs::symlink("/dev/null", &link).expect("symlink");
+                assert_not_regular(&link).await;
+
+                let socket = dir.path().join("socket");
+                let _listener = UnixListener::bind(&socket).expect("bind unix socket");
+                assert_not_regular(&socket).await;
             }
 
             #[tokio::test]

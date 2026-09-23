@@ -20,7 +20,7 @@ pub const NAME: &str = "read_image";
 
 /// Human-readable description shipped to the LLM via the provider.
 pub const DESCRIPTION: &str =
-    "Read an image file for visual inspection. Returns image bytes and metadata; only vision-capable models can use the result.";
+    "Read a regular image file for visual inspection. Returns image bytes and metadata; only vision-capable models can use the result.";
 
 /// Hard cap on the source image read. Larger files are probably not a
 /// pasted screenshot and should fail instead of loading into memory.
@@ -130,6 +130,9 @@ async fn read_image_file(request: ReadImageRequest) -> Result<Value, ToolError> 
 
     if meta.is_dir() {
         return Err(ToolError::IsDirectory { path });
+    }
+    if !meta.is_file() {
+        return Err(ToolError::NotRegularFile { path });
     }
 
     let size = meta.len();

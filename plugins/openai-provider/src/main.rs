@@ -1016,7 +1016,7 @@ async fn dispatch_completion_request(
             completion_error_body(
                 config,
                 &request_id,
-                "completion request needs at least one non-empty user or tool message",
+                "completion request needs at least one non-empty user message or tool result",
             ),
         )
         .await?;
@@ -1478,7 +1478,7 @@ async fn start_completion_turn(
     };
     if !request_history_has_model_input(&history) {
         let message =
-            "openai-provider: chat.complete needs at least one non-empty user or tool message";
+            "openai-provider: chat.complete needs at least one non-empty user message or tool result";
         let body = if legacy_default_chat {
             turn_error_body(config, message)
         } else {
@@ -2436,7 +2436,7 @@ fn parse_provider_message(
             })
         }
         "tool" => {
-            let text = non_empty_message_content("tool", content)?;
+            let text = required_message_content("tool", content)?;
             let tool_call_id = obj
                 .get("tool_call_id")
                 .or_else(|| obj.get("tool_name"))
@@ -2461,6 +2461,10 @@ fn non_empty_message_content(role: &str, content: Option<String>) -> Result<Stri
         .ok_or_else(|| format!("{role} message `content` must be non-empty"))
 }
 
+fn required_message_content(role: &str, content: Option<String>) -> Result<String, String> {
+    content.ok_or_else(|| format!("{role} message missing `content`"))
+}
+
 fn completion_request_messages(body: &Map<String, Value>, messages: Vec<Message>) -> Vec<Message> {
     let Some(system) = body
         .get("system")
@@ -2478,14 +2482,16 @@ fn completion_request_messages(body: &Map<String, Value>, messages: Vec<Message>
 
 fn completion_request_has_model_input(history: &[Message]) -> bool {
     history.iter().any(|message| match message {
-        Message::User { content } | Message::Tool { content, .. } => !content.trim().is_empty(),
+        Message::User { content } => !content.trim().is_empty(),
+        Message::Tool { .. } => true,
         Message::System { .. } | Message::Assistant { .. } => false,
     })
 }
 
 fn request_history_has_model_input(history: &[Message]) -> bool {
     history.iter().any(|message| match message {
-        Message::User { content } | Message::Tool { content, .. } => !content.trim().is_empty(),
+        Message::User { content } => !content.trim().is_empty(),
+        Message::Tool { .. } => true,
         Message::Assistant {
             content,
             tool_calls,

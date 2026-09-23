@@ -24,6 +24,13 @@ pub enum ToolError {
         path: String,
     },
 
+    /// The path resolved, but it isn't a regular file.
+    #[error("path is not a regular file: {path}")]
+    NotRegularFile {
+        /// Path the caller asked for.
+        path: String,
+    },
+
     /// Heuristic: the first 8 KiB of the file contains a NUL byte.
     #[error("file appears to be binary: {path}")]
     BinaryContent {

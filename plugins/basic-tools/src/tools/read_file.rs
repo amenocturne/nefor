@@ -4,6 +4,7 @@
 //
 // - Path is missing → [`ToolError::NotFound`].
 // - Path is a directory → [`ToolError::IsDirectory`].
+// - Path is not a regular file → [`ToolError::NotRegularFile`].
 // - Unsliced file larger than the configured maximum → [`ToolError::TooLarge`].
 // - First 8 KiB contains a NUL byte (binary heuristic) → [`ToolError::BinaryContent`].
 // - Contents are not valid UTF-8 → [`ToolError::NotUtf8`].
@@ -26,7 +27,7 @@ pub const NAME: &str = "read_file";
 
 /// Human-readable description shipped to the LLM via the provider.
 pub const DESCRIPTION: &str =
-    "Read the contents of a file. Returns the file's text content or an error.";
+    "Read the UTF-8 contents of a regular file. Returns the file's text content or an error.";
 
 /// The maximum is supplied by composition at process startup.
 static CONFIGURED_MAX_BYTES: OnceLock<u64> = OnceLock::new();
@@ -220,6 +221,9 @@ async fn read_text_file(request: ReadRequest, max_read_bytes: u64) -> Result<Str
 
     if meta.is_dir() {
         return Err(ToolError::IsDirectory { path });
+    }
+    if !meta.is_file() {
+        return Err(ToolError::NotRegularFile { path });
     }
 
     let size = meta.len();
