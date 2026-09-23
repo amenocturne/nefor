@@ -47,9 +47,11 @@ fn text_answer_consumes_multiline_terminal_text_without_schema_or_correction() {
       actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
         messages = {{ role = "user", content = "answer normally" }}
       }}}})
-      local request = emitted[#emitted].request
+      local invocation = emitted[#emitted]
+      local request = invocation.request
       assert(request.output_schema == nil)
-      actor.deliver({ kind = "reply", result = { text = "first line\nsecond line" } })
+      actor.deliver({ kind = "reply", ref = invocation.ref,
+        result = { text = "first line\nsecond line" } })
       local terminal = emitted[#emitted - 1]
       assert(terminal.kind == "nefor.agent.Result")
       assert(terminal.semantic_type_id == nil)
