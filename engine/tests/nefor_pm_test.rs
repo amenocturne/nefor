@@ -877,6 +877,24 @@ fn run_git(path: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn run_git_isolated(path: &std::path::Path, args: &[&str], global_config: &std::path::Path) {
+    let home = global_config.parent().expect("isolated Git home");
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .env("GIT_CONFIG_GLOBAL", global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
+        .output()
+        .expect("run isolated git");
+    assert!(
+        out.status.success(),
+        "isolated git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn install_clones_and_creates_lockfile() {
     let work = tempfile::tempdir().expect("workdir");
@@ -1618,9 +1636,20 @@ fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
           if opts.cmd == "git" and opts.args[1] == "lfs" then
             assert(events[#events] == "fixture-da: Downloading classifier model (Git LFS)")
             lfs_calls = lfs_calls + 1
-            local f = assert(io.open(opts.cwd .. "/classifier/model.onnx", "wb"))
-            f:write(string.rep("m", 1024 * 1024))
-            f:close()
+            if opts.args[2] == "install" then
+              assert(opts.args[3] == "--local")
+              assert(opts.args[4] == "--skip-repo")
+            elseif opts.args[2] == "pull" then
+              assert(opts.args[3] == "--include")
+              assert(opts.args[4] == "classifier/model.onnx")
+              assert(opts.args[5] == "--exclude")
+              assert(opts.args[6] == "")
+              local f = assert(io.open(opts.cwd .. "/classifier/model.onnx", "wb"))
+              f:write(string.rep("m", 1024 * 1024))
+              f:close()
+            else
+              error("unexpected Git LFS command")
+            end
             return {{ code = 0, stdout = "", stderr = "" }}
           end
           if opts.cmd == "cargo" then
@@ -1655,7 +1684,10 @@ fn managed_da_package_materializes_lfs_builds_and_resolves_private_binary() {
             .join("plugins/fixture-da/bin/da")
             .to_string_lossy()
     );
-    assert_eq!(lfs_calls, 1, "LFS pointer must be materialized once");
+    assert_eq!(
+        lfs_calls, 2,
+        "local LFS filters must be prepared before materialization"
+    );
     assert_eq!(cargo_calls, 1, "private package build must run once");
     assert_eq!(
         events,
@@ -1703,6 +1735,262 @@ fn managed_da_package_reports_missing_git_lfs_prerequisite() {
     let message = error.to_string();
     assert!(message.contains("install Git LFS"), "{message}");
     assert!(message.contains("git-lfs unavailable"), "{message}");
+}
+
+#[test]
+fn managed_da_package_preserves_success_output_when_pointer_remains() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    std::fs::create_dir_all(fixture.path().join("classifier")).expect("classifier dir");
+    std::fs::write(
+        fixture.path().join("classifier/model.onnx"),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:test\nsize 1048576\n",
+    )
+    .expect("model pointer");
+
+    let lua = lua_with_pm();
+    lua.globals()
+        .set("fixture_root", fixture.path().to_string_lossy().as_ref())
+        .expect("fixture root");
+    let error = lua
+        .load(
+            r#"
+            local da = require("libs.tool-validator.da")
+            nefor.process.run = function(opts)
+              if opts.args[2] == "install" then
+                return { code = 0, stdout = "install-out", stderr = "install-err" }
+              end
+              return { code = 0, stdout = "pull-out", stderr = "pull-err" }
+            end
+            da._internals.build { dir = fixture_root, name = "da" }
+            "#,
+        )
+        .exec()
+        .expect_err("unchanged pointer must fail");
+    let message = error.to_string();
+    assert!(message.contains("Git LFS did not materialize"), "{message}");
+    for expected in ["install-out", "install-err", "pull-out", "pull-err"] {
+        assert!(
+            message.contains(expected),
+            "missing {expected:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn managed_da_package_initializes_lfs_and_overrides_fetch_exclusion() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let source = fixture.path().join("source");
+    let checkout = fixture.path().join("checkout");
+    let global_config = fixture.path().join("isolated-global.gitconfig");
+    std::fs::write(&global_config, "").expect("empty global git config");
+
+    std::fs::create_dir_all(source.join("classifier")).expect("classifier dir");
+    run_git_isolated(
+        &source,
+        &["init", "--initial-branch=main", "--quiet"],
+        &global_config,
+    );
+    run_git_isolated(
+        &source,
+        &["config", "user.email", "test@example.com"],
+        &global_config,
+    );
+    run_git_isolated(&source, &["config", "user.name", "Test"], &global_config);
+    run_git_isolated(
+        &source,
+        &["lfs", "install", "--local", "--skip-repo"],
+        &global_config,
+    );
+    run_git_isolated(
+        &source,
+        &["lfs", "track", "classifier/*.onnx"],
+        &global_config,
+    );
+    let model = b"small local classifier fixture\n";
+    std::fs::write(source.join("classifier/model.onnx"), model).expect("model content");
+    run_git_isolated(
+        &source,
+        &["add", ".gitattributes", "classifier/model.onnx"],
+        &global_config,
+    );
+    run_git_isolated(
+        &source,
+        &["commit", "-m", "add LFS fixture", "--quiet"],
+        &global_config,
+    );
+
+    let clone = Command::new("git")
+        .args([
+            "clone",
+            &format!("file://{}", source.display()),
+            checkout.to_string_lossy().as_ref(),
+        ])
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("HOME", fixture.path())
+        .env("XDG_CONFIG_HOME", fixture.path().join("xdg"))
+        .output()
+        .expect("clone LFS fixture");
+    assert!(
+        clone.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    run_git_isolated(
+        &checkout,
+        &["config", "lfs.fetchexclude", "classifier/model.onnx"],
+        &global_config,
+    );
+    assert!(
+        std::fs::read_to_string(checkout.join("classifier/model.onnx"))
+            .expect("pointer before build")
+            .starts_with("version https://git-lfs.github.com/spec/v1")
+    );
+
+    let lua = lua_with_pm();
+    lua.globals()
+        .set("fixture_root", checkout.to_string_lossy().as_ref())
+        .expect("fixture root");
+    lua.globals()
+        .set(
+            "fixture_global_config",
+            global_config.to_string_lossy().as_ref(),
+        )
+        .expect("global config");
+    lua.globals()
+        .set("fixture_home", fixture.path().to_string_lossy().as_ref())
+        .expect("fixture home");
+    lua.globals()
+        .set(
+            "fixture_xdg_config_home",
+            fixture.path().join("xdg").to_string_lossy().as_ref(),
+        )
+        .expect("fixture XDG config home");
+    lua.load(
+        r#"
+        local da = require("libs.tool-validator.da")
+        local real_run = nefor.process.run
+        nefor.process.run = function(opts)
+          if opts.cmd == "git" then
+            opts.env = {
+              GIT_CONFIG_GLOBAL = fixture_global_config,
+              GIT_CONFIG_NOSYSTEM = "1",
+              HOME = fixture_home,
+              XDG_CONFIG_HOME = fixture_xdg_config_home,
+            }
+            local result = real_run(opts)
+            if opts.args[2] == "install" then
+              local hook = io.open(opts.cwd .. "/.git/hooks/pre-push", "rb")
+              assert(hook == nil, "repository-local filter setup installed a hook")
+            end
+            return result
+          elseif opts.cmd == "cargo" then
+            return { code = 0, stdout = "", stderr = "" }
+          end
+          return real_run(opts)
+        end
+        da._internals.build { dir = fixture_root, name = "da" }
+        "#,
+    )
+    .exec()
+    .expect("materialize real local LFS fixture");
+
+    assert_eq!(
+        std::fs::read(checkout.join("classifier/model.onnx")).expect("materialized model"),
+        model
+    );
+    let process_filter = Command::new("git")
+        .args(["config", "--local", "--get", "filter.lfs.process"])
+        .current_dir(&checkout)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", fixture.path())
+        .env("XDG_CONFIG_HOME", fixture.path().join("xdg"))
+        .output()
+        .expect("read local LFS filter");
+    assert!(process_filter.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&process_filter.stdout).trim(),
+        "git-lfs filter-process"
+    );
+
+    let pointer = Command::new("git")
+        .args(["show", "HEAD:classifier/model.onnx"])
+        .current_dir(&checkout)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", fixture.path())
+        .env("XDG_CONFIG_HOME", fixture.path().join("xdg"))
+        .output()
+        .expect("read committed pointer");
+    assert!(pointer.status.success());
+    let mut dirty_pointer = pointer.stdout;
+    dirty_pointer.extend_from_slice(b"# local modification\n");
+    std::fs::write(checkout.join("classifier/model.onnx"), &dirty_pointer)
+        .expect("write modified pointer");
+
+    let dirty_lua = lua_with_pm();
+    dirty_lua
+        .globals()
+        .set("fixture_root", checkout.to_string_lossy().as_ref())
+        .expect("fixture root");
+    dirty_lua
+        .globals()
+        .set(
+            "fixture_global_config",
+            global_config.to_string_lossy().as_ref(),
+        )
+        .expect("global config");
+    dirty_lua
+        .globals()
+        .set("fixture_home", fixture.path().to_string_lossy().as_ref())
+        .expect("fixture home");
+    dirty_lua
+        .globals()
+        .set(
+            "fixture_xdg_config_home",
+            fixture.path().join("xdg").to_string_lossy().as_ref(),
+        )
+        .expect("fixture XDG config home");
+    let dirty_error = dirty_lua
+        .load(
+            r#"
+            local da = require("libs.tool-validator.da")
+            local real_run = nefor.process.run
+            nefor.process.run = function(opts)
+              if opts.cmd == "git" then
+                opts.env = {
+                  GIT_CONFIG_GLOBAL = fixture_global_config,
+                  GIT_CONFIG_NOSYSTEM = "1",
+                  HOME = fixture_home,
+                  XDG_CONFIG_HOME = fixture_xdg_config_home,
+                }
+                return real_run(opts)
+              end
+              error("dirty pointer reached compiler")
+            end
+            da._internals.build { dir = fixture_root, name = "da" }
+            "#,
+        )
+        .exec()
+        .expect_err("Git LFS must not overwrite a modified pointer");
+    assert!(
+        dirty_error
+            .to_string()
+            .contains("Git LFS did not materialize"),
+        "{dirty_error}"
+    );
+    assert_eq!(
+        std::fs::read(checkout.join("classifier/model.onnx")).expect("dirty pointer remains"),
+        dirty_pointer,
+        "the helper must not force-overwrite a modified model"
+    );
+    assert_eq!(
+        std::fs::read(&global_config).expect("read isolated global config"),
+        b"",
+        "Git LFS setup must not mutate global configuration"
+    );
 }
 
 #[test]
