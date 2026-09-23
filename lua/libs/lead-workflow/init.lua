@@ -1814,7 +1814,7 @@ local function lead_workflow_tool_schemas()
         {}, "receipt", "MAG source written", {}),
       description = "Prepare or edit a session MAG source file without executing it. Use this for changes to existing source or to save source for inspection. Omit old_string to make new_string the complete contents, creating or overwriting the file. Supply old_string to replace one exact unique string. Empty new_string is valid. The file path is relative to this session's MAG workspace; absolute, non-normalized, traversal, and symlink paths are rejected.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", description = "Normalized path relative to the session MAG workspace." },
+        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
         new_string = { type = "string", description = "Complete contents or replacement text; may be empty." },
         old_string = { type = "string", description = "Optional non-empty exact text that must occur once." },
       }, required = { "file", "new_string" } },
@@ -1826,7 +1826,7 @@ local function lead_workflow_tool_schemas()
           { max_lines = 120, max_bytes = 12000 }) }, "delayed"),
       description = "Inspect the fully expanded authored node tree of an existing session MAG source file without changing the file or executing the workflow. This optional preview compiles and validates the source; mag-apply also compiles and validates on execution. Compilation errors are returned as tool errors.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", description = "Existing normalized path relative to the session MAG workspace." },
+        file = { type = "string", pattern = "\\.(mag|magl)$", description = "Existing MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
       }, required = { "file" } },
     },
     {
@@ -1840,7 +1840,7 @@ local function lead_workflow_tool_schemas()
         }, "delayed"),
       description = "Execute a new MAG operation or workflow, including a single command. To execute a new graph in one call, pass file and content together: this atomically writes a new source file, compiles and validates it, then dispatches it. Source-write, compilation, or pre-dispatch validation errors return without dispatch; created source remains available for editing. Existing files cannot be overwritten via content; edit them with mag-write-file and omit content when applying. Quick runs return the terminal result. Asynchronous acknowledgments include run_id, the complete authored node tree, and completion instructions for the calling role.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", description = "Normalized path relative to the session MAG workspace." },
+        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
         content = { type = "string", description = "Optional complete source for a new file. Existing files are never overwritten here." },
       }, required = { "file" } },
     },

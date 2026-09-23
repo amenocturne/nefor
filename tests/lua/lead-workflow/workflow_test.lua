@@ -142,6 +142,10 @@ do
   assert_true(write_schema ~= nil, "mag-write-file is advertised")
   assert_true(preview_schema ~= nil, "mag-preview is advertised")
   assert_true(apply_schema ~= nil, "mag-apply is advertised")
+  for _, schema in ipairs({ write_schema, preview_schema, apply_schema }) do
+    assert_eq(schema.parameters.properties.file.pattern, "\\.(mag|magl)$",
+      schema.name .. " advertises the compiler's supported source suffixes")
+  end
   assert_eq(write_schema.parameters.required[1], "file", "write requires file")
   assert_eq(write_schema.parameters.required[2], "new_string", "write requires new_string")
   assert_true(type(write_schema.parameters.properties.old_string) == "table", "write has optional old_string")
