@@ -291,9 +291,7 @@ inspect-sessions host="127.0.0.1" port="3939":
 test-session-inspector:
     bun test tools/session-inspector/server.test.ts
 
-# Print the workspace version — the single source of truth (Cargo.toml
-# [workspace.package]). The pre-push hook derives the release tag from this, so
-# bumping it here (and pushing) is all it takes to cut v<version>.
+# Print the workspace package version from Cargo.toml.
 version:
     @cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="nefor") | .version'
 

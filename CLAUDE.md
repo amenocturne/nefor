@@ -94,15 +94,13 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 
 ## Compatibility policy (pre-public)
 
-The only compatibility guarantee is within a single minor line: `0.y.x` stays backwards compatible with `0.y.0`. Across minor lines there are none — breaking changes ride the `0.y → 0.y+1` bump, and the flow is to mark a stable release as `0.y.0` and move on, breaking freely toward the next. In practice patch releases haven't occurred under this policy (existing `0.y.z>0` tags predate it). Prefer the clean shape over migration paths, compat shims, or old-session support: do not build fallbacks for prior wire formats, session layouts, or config shapes; delete replaced code instead of deprecating it. Old sessions failing to resume across a minor bump is acceptable. This holds until the project goes public and gains daily-driver users.
+Compatibility guarantees apply to published releases: `0.y.x` stays backwards compatible with `0.y.0`, while a new minor release may break compatibility. Prefer the clean shape over migration paths, compat shims, or old-session support: do not build fallbacks for prior wire formats, session layouts, or config shapes; delete replaced code instead of deprecating it. Old sessions failing to resume across a minor bump is acceptable. This holds until the project goes public and gains daily-driver users.
 
 ## Versioning
 
-Workspace version is `0.x.y` in `Cargo.toml`. Users pin Lua libs to the engine's version tag via `nefor-pm`; breaking the API means their install breaks on next fetch.
+Keep the workspace version in `Cargo.toml` at the last published release, currently `0.4.0`, while developing. Identify unreleased work by its Git commit; do not assign the next release version to work in progress.
 
-- **Breaking changes bump `x`** (the minor in `0.x.y`): NCP wire protocol changes, Lua binding removals/renames, pm spec shape changes, example module interface changes that external configs depend on.
-- **Non-breaking additions bump `y`**: new bindings, new pm features, new example modules, bug fixes.
-- Tag format: `v0.x.y`. The release workflow and `nefor-pm` both key on this.
+Change the version or create and publish a stable release tag only when the user explicitly requests a release. Ordinary commits and pushes do not create releases. For a requested release, select the version relative to the last published release: breaking changes require a new minor version; compatible changes use a patch version. Release tags use `v0.x.y`.
 
 ## Git
 
