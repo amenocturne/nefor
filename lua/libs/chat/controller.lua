@@ -576,6 +576,24 @@ local function handle_escape(_msg, state)
        or state.popup.variant == "error") then
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
   end
+  -- The idle rewind picker shares the second-Esc window with the global
+  -- kill rung. Only a timely third Esc reaches workflow controls; later Esc
+  -- dismisses the picker without starting another gesture.
+  if state.popup and state.popup.variant == "rewind_picker" then
+    local now_ms = tui.now_ms()
+    if state.escape_count == 2 and state.escape_token ~= nil
+        and state.last_esc_ms ~= nil
+        and now_ms - state.last_esc_ms <= workflow_controls.ESCAPE_DELAY_MS then
+      local next_state, effects = apply_control_decisions(workflow_controls.escape(state, now_ms))
+      return shallow_merge(next_state, { popup = NIL_SENTINEL }), effects
+    end
+    return shallow_merge(state, {
+      popup = NIL_SENTINEL,
+      last_esc_ms = NIL_SENTINEL,
+      escape_token = NIL_SENTINEL,
+      escape_count = NIL_SENTINEL,
+    }), {}
+  end
   -- 1b) close popup or toasts
   local has_toast = state.toasts and #state.toasts > 0
   if state.popup or has_toast then
@@ -623,17 +641,15 @@ local function handle_escape(_msg, state)
   end
   if second_escape and not lead_active then
     local prompts = state.conversation_projection.user_prompts or {}
-    return shallow_merge(state, {
+    local armed, effects = apply_control_decisions(workflow_controls.arm_rewind(state, now_ms))
+    return shallow_merge(armed, {
       popup = {
         variant = "rewind_picker",
         prompts = prompts,
         cursor = math.max(1, #prompts),
         expected_head = state.conversation_projection.history_head or {},
       },
-      last_esc_ms = NIL_SENTINEL,
-      escape_token = NIL_SENTINEL,
-      escape_count = NIL_SENTINEL,
-    }), {}
+    }), effects
   end
   return apply_control_decisions(workflow_controls.escape(state, now_ms))
 end
@@ -2012,6 +2028,9 @@ local function route_keys_and_popups(msg, state)
       local request_id = "chat-rewind-" .. require("core.envelope").uuid_lite()
       return shallow_merge(state, {
         popup = NIL_SENTINEL,
+        last_esc_ms = NIL_SENTINEL,
+        escape_token = NIL_SENTINEL,
+        escape_count = NIL_SENTINEL,
         pending_rewind = { request_id = request_id, conversation_id = state.conversation_id },
         rewind_notice = "Rewinding…",
       }), {

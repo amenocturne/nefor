@@ -4283,10 +4283,16 @@ fn idle_double_escape_opens_rewind_picker_and_space_requests_canonical_rewind() 
     assert!(rendered.contains("first prompt"));
     assert!(rendered.contains("second line"));
 
-    engine.handle_key(key("escape")).expect("close picker");
+    engine.advance_time(Duration::from_millis(601));
+    engine
+        .handle_key(key("escape"))
+        .expect("close expired picker");
+    engine
+        .drive_scheduled_dispatches()
+        .expect("drive stale picker timers");
     assert!(
         engine.take_emit_queue().is_empty(),
-        "picker Esc has no side effect"
+        "late picker Esc and stale timers have no side effect"
     );
     assert!(!render_str(&mut engine).contains("rewind to a prompt"));
     engine.handle_key(key("escape")).expect("rearm rewind");
@@ -4370,6 +4376,58 @@ fn idle_double_escape_opens_rewind_picker_and_space_requests_canonical_rewind() 
         "second\nline",
         "canonical rewind must restore the exact multiline prompt into the controlled editor"
     );
+}
+
+#[test]
+fn idle_rewind_third_escape_kills_active_worker_and_closes_picker() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "worker-run", "principal": "worker" }),
+    );
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("escape")).expect("first esc");
+    let first_token: i64 = engine
+        .state_table()
+        .expect("state")
+        .get("escape_token")
+        .expect("token");
+    engine.handle_key(key("escape")).expect("second esc");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "idle lead must not be interrupted"
+    );
+    assert!(render_str(&mut engine).contains("rewind to a prompt"));
+
+    // The first rung's old timeout cannot cancel the second rung's window.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.escape_timeout", "token": first_token }),
+    );
+    assert!(engine.take_emit_queue().is_empty());
+    engine.handle_key(key("escape")).expect("third esc");
+    let emitted = engine.take_emit_queue();
+    let kinds: Vec<_> = emitted
+        .iter()
+        .filter_map(|(_, body)| body.get("kind").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "chat.interrupt",
+            "chat.workflows.terminate_requested",
+            "mag.kill_all_runs"
+        ]
+    );
+    assert_eq!(emitted[1].1.get("scope"), Some(&json!("all")));
+    assert!(!render_str(&mut engine).contains("rewind to a prompt"));
+    engine.advance_time(Duration::from_millis(601));
+    engine
+        .drive_scheduled_dispatches()
+        .expect("drive stale second timeout");
+    assert!(engine.take_emit_queue().is_empty());
 }
 
 #[test]

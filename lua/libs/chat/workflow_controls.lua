@@ -60,6 +60,10 @@ function M.escape(state, now_ms)
   return next_state, decisions, { restored_queue = false }
 end
 
+function M.arm_rewind(state, now_ms)
+  return arm_escape(state, now_ms, 2)
+end
+
 function M.escape_timeout(state, token)
   if token ~= state.escape_token then
     return state, {}, { restored_queue = false }
