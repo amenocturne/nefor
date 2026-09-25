@@ -477,9 +477,9 @@ fn session_stats_body(args: &ServeArgs, chat_id: &ChatId, stats: &ChatStats) -> 
 /// window until either the backend or this metadata says so.
 fn known_context_window(slug: &str) -> Option<u64> {
     match slug {
-        "gpt-5.6-sol" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex"
-        | "gpt-5.2-codex" | "gpt-5.2" | "gpt-5.1-codex-max" | "gpt-5.1-codex" | "gpt-5.1"
-        | "gpt-5-codex" | "gpt-5" | "gpt-5.1-codex-mini" | "gpt-5-codex-mini"
+        "gpt-6-sol" | "gpt-6-luna" | "gpt-5.6-sol" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini"
+        | "gpt-5.3-codex" | "gpt-5.2-codex" | "gpt-5.2" | "gpt-5.1-codex-max" | "gpt-5.1-codex"
+        | "gpt-5.1" | "gpt-5-codex" | "gpt-5" | "gpt-5.1-codex-mini" | "gpt-5-codex-mini"
         | "codex-auto-review" => Some(272_000),
         "gpt-oss-120b" | "gpt-oss-20b" => Some(128_000),
         _ => None,
@@ -5534,6 +5534,34 @@ mod tests {
             context_length: None,
         };
         assert_eq!(provider_context_window(&model), Some(272_000));
+    }
+
+    #[test]
+    fn gpt6_exact_slugs_use_fallback_only_without_upstream_metadata() {
+        for slug in ["gpt-6-sol", "gpt-6-luna"] {
+            let model = ModelEntry {
+                slug: slug.into(),
+                display_name: None,
+                description: None,
+                priority: None,
+                supports_reasoning_summaries: true,
+                supports_parallel_tool_calls: true,
+                context_length: None,
+            };
+            assert_eq!(provider_context_window(&model), Some(272_000), "{slug}");
+            let upstream = ModelEntry {
+                context_length: Some(999_999),
+                ..model
+            };
+            assert_eq!(provider_context_window(&upstream), Some(999_999), "{slug}");
+        }
+    }
+
+    #[test]
+    fn other_gpt6_slugs_do_not_inherit_a_context_window() {
+        for slug in ["gpt-6", "gpt-6-sol-preview", "gpt-6-luna-preview"] {
+            assert_eq!(known_context_window(slug), None, "{slug}");
+        }
     }
 
     #[test]
