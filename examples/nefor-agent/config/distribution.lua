@@ -42,6 +42,17 @@ function M.runtime_root()
   return root
 end
 
+function M.lua_dependencies_root()
+  return nonempty(os.getenv("NEFOR_LUA_DEPENDENCIES_ROOT"))
+    or (M.runtime_root() .. "/lua-dependencies")
+end
+
+function M.load_lua_dependencies()
+  local root = M.lua_dependencies_root()
+  package.path = root .. "/share/lua/5.4/?.lua;" .. root .. "/share/lua/5.4/?/init.lua;" .. package.path
+  package.cpath = root .. "/lib/lua/5.4/?.so;" .. package.cpath
+end
+
 function M.executable_root()
   local dev = nonempty(os.getenv("NEFOR_DEV_DIR"))
   local root = nonempty(os.getenv("NEFOR_EXECUTABLE_ROOT"))

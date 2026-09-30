@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use mlua::{Lua, RegistryKey, Table};
+use mlua::{Lua, LuaOptions, RegistryKey, StdLib, Table};
 
 use crate::event_log::LogEntry;
 use crate::events::EventBus;
@@ -96,7 +96,9 @@ impl LuaHost {
         engine_ops: Arc<dyn EngineOps>,
         data_dir: crate::paths::DataDir,
     ) -> Result<Self, LuaError> {
-        let lua = Lua::new();
+        // Configs and their native Lua modules are part of the trusted host.
+        // Ordinary modules may use standard introspection as well as native C loaders.
+        let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         let subscriptions: SharedSubscriptions = Arc::new(Mutex::new(EventSubscriptions::new()));
         let stdin_pump: SharedStdinPump = Arc::new(Mutex::new(StdinPump::empty()));
         let cooperative_tasks = Arc::new(Mutex::new(VecDeque::new()));

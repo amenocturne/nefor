@@ -69,7 +69,8 @@ function M.install(spec, root, locked, progress, run)
   local ok, err = pcall(function()
     progress("Downloading archive")
     local download = staging .. "/package.tar.gz"
-    command({ "curl", "--fail", "--location", "--silent", "--show-error", "--output", download, desired.url })
+    local downloaded, download_error = pcall(require("nefor-pm.download").download, desired.url, download)
+    if not downloaded then fail(tostring(download_error)) end
     progress("Verifying archive checksum")
     local checksum = run({ "shasum", "-a", "256", download })
     if checksum.exit_code == -1 then checksum = run({ "sha256sum", download }) end

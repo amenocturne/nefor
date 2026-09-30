@@ -20,6 +20,12 @@ if [ ! -x "$target_bin/nefor" ]; then
   exit 1
 fi
 
+lua_dependencies=${NEFOR_LUA_DEPENDENCIES_ROOT:-"$target_bin/../lua-dependencies"}
+if [ ! -f "$lua_dependencies/dependencies.lock" ]; then
+  echo "missing prepared Lua dependencies: $lua_dependencies; run just prepare-distribution-lua-dependencies" >&2
+  exit 1
+fi
+
 plugin_dir="$dist_dir/share/nefor/plugins"
 manifest="$dist_dir/share/nefor/plugins.manifest"
 runtime_root="$dist_dir/share/nefor/runtime"
@@ -48,6 +54,7 @@ fi
 
 
 cp -R "$repo_root/lua/." "$runtime_root/lua/"
+cp -R "$lua_dependencies" "$runtime_root/lua-dependencies"
 cp -R "$repo_root/mag/." "$runtime_root/mag/"
 for plugin_lua in "$repo_root"/plugins/*/lua; do
   [ -d "$plugin_lua" ] || continue

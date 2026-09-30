@@ -67,8 +67,9 @@ local executable = pm.bin("my-tool", "my-tool")
 
 Archive specs cannot also select Git, `dir`, `path`, or `build`. The archive
 must contain the final package layout (including `bin/` for executables).
-Installation needs `curl`, `tar`, and either `shasum` or `sha256sum`; no compiler
-or source checkout is used. The composition supplies the URL and SHA-256.
+Installation uses the external `lua-http` library through ordinary Lua `require`,
+plus `tar` and either `shasum` or `sha256sum`; no compiler, `curl`, or source
+checkout is used during archive installation. The composition supplies the URL and SHA-256.
 
 `install` reproduces the recorded archive identity; `update` adopts a changed
 URL/checksum/layout. A cached package with the matching lock and installation
@@ -170,3 +171,24 @@ The installable agent example demonstrates a complete bootstrap in [`examples/ne
 Package refs and locks select code that runs inside the engine's Lua process and may build executables. Pin trusted sources. A build callback is arbitrary config code, not a sandbox. Network/Git/build failures are synchronous startup failures rather than silently falling back to another revision.
 
 Implementation and exhaustive edge-case tests live in [`lua/nefor-pm/init.lua`](init.lua) and `engine/tests/nefor_pm_test.rs`.
+
+## External Lua dependencies
+
+The library-owned `nefor-pm-dev-1.rockspec` declares Lua 5.4 and `http` 0.4.
+A distribution or configuration installer prepares its dependency tree before
+startup and selects its ordinary `package.path` and `package.cpath`. The engine
+neither selects nor installs these dependencies. Another manager can use the
+same standard Lua loading mechanisms without depending on nefor-pm.
+
+Archive downloads load `http.request` lazily: Git packages, immutable
+registrations, and cached archive installs do not require the HTTP library.
+Downloads use lua-http's normal TLS verification, proxy discovery, and bounded
+redirect behavior. Transfers select HTTP/1.1 and detach unfinished streams
+before closing them, avoiding the pinned library's truncated-body shutdown loop.
+A supplied Content-Length is checked before archive checksum verification.
+HTTP errors and incomplete bodies fail installation, which removes the staging directory and preserves the previous package and lock.
+
+Preparing the initial tree is an installer/build responsibility; nefor-pm does
+not attempt to download its own absent HTTP transport. Reproducible distributions
+must pin the resolved dependency closure and build it for the selected platform
+and Lua 5.4 ABI, rather than relying on future dependency resolution.

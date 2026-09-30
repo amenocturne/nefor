@@ -57,6 +57,44 @@ A plugin capability and the logic that uses it are separate concerns. Adding a n
 
 Bash-tool test: a plugin should feel like a self-contained utility you could run from a shell, then compose elsewhere. If code names neighboring plugins, rewrites their event shapes, or decides global policy, it is glue; put it in Lua.
 
+## Lua module hosting
+
+The engine permits ordinary Lua 5.4 native module loading through `require`
+and `package.loadlib`, with the ordinary Lua standard libraries available.
+Configuration and loaded native modules belong to the same trusted local system.
+The composition owns `package.path`, `package.cpath`, dependency declarations,
+and installation. The engine has no package-manager interface or knowledge of
+individual Lua libraries. Native modules must target the host's Lua ABI and
+platform; their build and distribution remain outside the engine. On the supported
+macOS and Linux targets, the executable exports its embedded Lua symbols so
+native modules resolve the host runtime rather than bringing a second Lua VM.
+Pure Lua modules need only a composition-selected `package.path`; native modules
+also need a compatible binary in `package.cpath`. The debug library is available as part of the trusted Lua runtime; external
+modules may use its introspection facilities.
+
+## Distribution Lua dependencies
+
+The starter's package manager declares its Lua dependencies in
+`lua/nefor-pm/nefor-pm-dev-1.rockspec`. Its resolved artifact closure is pinned by
+version and SHA-256 in `lua/nefor-pm/dependencies.lock`. Distribution preparation
+uses LuaRocks to build a private platform-specific tree before runtime startup;
+the engine does not execute or discover this preparation.
+
+Source installers and release bundles carry that tree as `lua-dependencies`
+under the immutable runtime root. The starter adds its ordinary Lua 5.4 search
+paths through `config.distribution`; `NEFOR_LUA_DEPENDENCIES_ROOT` explicitly
+selects another prepared tree for development or an alternate launcher. A
+separate composition may select different dependencies and a different manager.
+
+Preparation needs LuaRocks, a Lua 5.4 interpreter and headers, a C compiler,
+make, archive tools, and OpenSSL development libraries. Linux runtime modules
+require the system OpenSSL 3 libraries and CA certificates. On macOS preparation
+copies non-system dylib dependencies into the tree, rewrites their loader paths,
+and signs the modified files; release CI prepares each target separately.
+A generated native tree must not be reused across operating systems or CPU
+architectures. Preparation may use external download tools through LuaRocks;
+the installed package manager's HTTP path does not depend on those tools.
+
 ## What belongs in Lua
 
 Lua owns behavior that is composition-specific or bus-aware:

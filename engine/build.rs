@@ -11,6 +11,14 @@
 use std::process::Command;
 
 fn main() {
+    // Ordinary native Lua modules resolve their Lua ABI against the host executable.
+    // Keep this generic: compositions choose which modules to load.
+    match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux") => println!("cargo:rustc-link-arg-bin=nefor=-Wl,--export-dynamic"),
+        Ok("macos") => println!("cargo:rustc-link-arg-bin=nefor=-Wl,-export_dynamic"),
+        _ => {}
+    }
+
     // Linked worktrees split per-worktree HEAD/index state from common refs.
     // Resolve every path through Git and watch only the checked-out branch,
     // rather than every branch in every worktree.

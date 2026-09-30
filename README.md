@@ -56,6 +56,11 @@ cd nefor
 just install
 ```
 
+Source installation also prepares the starter's Lua dependencies. It requires
+LuaRocks, Lua 5.4 with development headers, a C compiler, make, archive tools,
+and OpenSSL development libraries. See [distribution Lua dependencies](docs/architecture.md#distribution-lua-dependencies)
+for platform prerequisites and the explicit private-tree override.
+
 `just install` builds the engine and plugin binaries, then copies the starter
 composition to `~/.config/nefor`. Use lower-level targets when needed:
 

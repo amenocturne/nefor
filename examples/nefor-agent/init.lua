@@ -14,6 +14,7 @@ package.path = table.concat({
 
 local distribution = require("config.distribution")
 local NEFOR_ROOT = distribution.runtime_root()
+distribution.load_lua_dependencies()
 
 local LUA_ROOT = NEFOR_ROOT .. "/lua"
 

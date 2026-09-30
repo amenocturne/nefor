@@ -8,6 +8,7 @@ run:
     export RUST_LOG=debug
     export NEFOR_DEV_DIR="{{justfile_directory()}}"
     export NEFOR_CONFIG_DIR="{{justfile_directory()}}/examples/nefor-agent"
+    export NEFOR_LUA_DEPENDENCIES_ROOT="${NEFOR_LUA_DEPENDENCIES_ROOT:-{{justfile_directory()}}/target/lua-dependencies}"
     cargo run --bin nefor
 
 # Fetch all workspace dependencies without compiling — warms the cache.
@@ -28,8 +29,12 @@ check-test-lanes:
 test-test-lanes-checker:
     tools/test-test-lanes-checker.sh
 
+# Verify distribution-owned native dependency relocation without platform tool side effects.
+test-lua-dylibs:
+    tools/test-lua-dylibs.sh
+
 # Build once and execute every default deterministic target from prepared artifacts; bare Cargo exposes the same lane.
-test-default timeout="7200": check-test-lanes test-test-lanes-checker test-docs test-session-inspector
+test-default timeout="7200": check-test-lanes test-test-lanes-checker test-lua-dylibs test-docs test-session-inspector
     @echo "=== TEST LANE: default deterministic ==="
     cargo run --quiet -p nefor-cargo-test-harness -- --lane default "{{timeout}}"
 
@@ -51,6 +56,10 @@ test-fast:
     cargo test -p nefor --test capability_tools_test
     cargo test -p tool-gate-plugin
     cargo test -p nefor-tui --test chat_smoke_test chat_lua_loads_and_renders_initial_frame -- --exact
+
+# Exercise the installed external HTTP stack inside an explicit engine and Lua tree.
+test-pm-http engine tree scratch:
+    uv run --no-project python lua/nefor-pm/tests/transport.py --engine "{{engine}}" --tree "{{tree}}" --repo "{{justfile_directory()}}" --scratch "{{scratch}}"
 
 # Nefor package-manager checkout, locking, local-source, and build behavior.
 test-pm:
@@ -180,7 +189,7 @@ test-tui-chat:
     cargo test -p nefor-tui --features full-tests --test chat_test -- --test-threads=1
 
 # Build once, execute every deterministic target from prepared artifacts, then reuse the binaries for operational checks.
-test-full timeout="7200": check-test-lanes test-test-lanes-checker
+test-full timeout="7200": check-test-lanes test-test-lanes-checker test-lua-dylibs
     #!/usr/bin/env bash
     set -euo pipefail
     repo="{{ justfile_directory() }}"
@@ -226,6 +235,10 @@ fmt: fmt-rust
 build:
     cargo build --workspace --release
 
+# Prepare the starter's declared Lua dependencies into a private platform-specific tree.
+prepare-distribution-lua-dependencies tree="target/lua-dependencies":
+    tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock "{{tree}}" "{{justfile_directory()}}"
+
 # Build this checkout and copy a channel-neutral runtime without pruning sibling distributions.
 # `expected_commit` lets an installer prove it is building the pm-resolved checkout.
 install-source expected_commit command engine_dir mag_dir plugin_root build_target="target":
@@ -244,6 +257,7 @@ install-source expected_commit command engine_dir mag_dir plugin_root build_targ
         exit 1
       fi
     fi
+    just prepare-distribution-lua-dependencies "{{build_target}}/lua-dependencies"
     cargo build --workspace --release --target-dir "{{build_target}}"
     release_dir="{{build_target}}/release"
     mkdir -p "{{engine_dir}}" "{{mag_dir}}" "{{plugin_root}}"
@@ -384,6 +398,7 @@ install-nefor channel="source":
 
     case "{{channel}}" in
       source)
+        just prepare-distribution-lua-dependencies "target/lua-dependencies"
         cargo build --workspace --release
         mkdir -p "$PREFIX/bin" "$LIBEXEC_BIN"
         cd "{{justfile_directory()}}"
@@ -397,6 +412,7 @@ install-nefor channel="source":
         rm -rf "$LIBEXEC_ROOT/runtime"
         mkdir -p "$LIBEXEC_ROOT/runtime"
         cp -R lua plugins examples "$LIBEXEC_ROOT/runtime/"
+        cp -R "target/lua-dependencies" "$LIBEXEC_ROOT/runtime/lua-dependencies"
         plugins=$(tools/plugin-binaries.sh)
         for name in $plugins; do
           install -m 0755 "target/release/$name" "$LIBEXEC_BIN/$name"

@@ -2117,6 +2117,31 @@ fn load_resolves_submodule_under_plugin_dir() {
     assert_eq!(b, "subm");
 }
 
+// Transaction tests isolate HTTP while retaining real checksum/extraction/filesystem behavior.
+fn lua_with_archive_pm() -> Lua {
+    let lua = lua_with_pm();
+    lua.load(r#"
+      package.preload["http.request"] = function()
+        return { new_from_uri = function(url)
+          return { go = function()
+            local input = io.open(assert(url:match("^file://(.*)$")), "rb")
+            local connection = { close = function() if input then input:close(); input = nil end end }
+            local headers = { get = function(_, key) if key == ":status" then return input and "200" or "404" end end }
+            return headers, { state = "closed", shutdown = connection.close, save_body_to_file = function(_, output)
+              while true do
+                local chunk = input:read(4096)
+                if not chunk then break end
+                assert(output:write(chunk))
+              end
+              return true
+            end }
+          end }
+        end }
+      end
+    "#).exec().expect("HTTP archive fixture");
+    lua
+}
+
 // Local release fixtures exercise the download/extract/replace boundary without a network.
 fn archive_fixture(root: &std::path::Path, name: &str) -> (String, String) {
     let package = root.join(name);
@@ -2158,7 +2183,7 @@ fn archives_install_cache_and_upgrade_exact_pins_without_build_tools() {
     let work = tempfile::tempdir().expect("workdir");
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
-    let lua = lua_with_pm();
+    let lua = lua_with_archive_pm();
     let (url, digest) = archive_fixture(work.path(), "first");
     lua.load(format!(r#"
         pm = require("nefor-pm")
@@ -2167,7 +2192,7 @@ fn archives_install_cache_and_upgrade_exact_pins_without_build_tools() {
         spec = {}
         local run = nefor.process.run
         nefor.process.run = function(args)
-          assert(args.cmd ~= "cargo" and args.cmd ~= "git", "binary installation needs no source tools")
+          assert(args.cmd ~= "cargo" and args.cmd ~= "git" and args.cmd ~= "curl", "binary installation needs no source tools or curl")
           return run(args)
         end
         pm.install({{spec}}, opts)
@@ -2201,7 +2226,7 @@ fn archive_failures_preserve_previous_installation_and_lock() {
     let work = tempfile::tempdir().expect("workdir");
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
-    let lua = lua_with_pm();
+    let lua = lua_with_archive_pm();
     let (url, digest) = archive_fixture(work.path(), "original");
     lua.load(format!(
         r#"pm = require("nefor-pm"); pm.install({{{}}})"#,
@@ -2215,7 +2240,32 @@ fn archive_failures_preserve_previous_installation_and_lock() {
     let (new_url, new_digest) = archive_fixture(work.path(), "replacement");
     let scenarios = [
         (archive_spec(&url, &"0".repeat(64)), "", "SHA-256 mismatch"),
-        (archive_spec(&missing, &digest), "", "curl exited"),
+        (
+            archive_spec(&missing, &digest),
+            "",
+            "HTTP request returned status 404",
+        ),
+        (
+            archive_spec(&new_url, &new_digest),
+            r#"
+          local http = require("http.request")
+          local new_request = http.new_from_uri
+          http.new_from_uri = function(url)
+            local request = new_request(url)
+            local go = request.go
+            request.go = function()
+              local headers, stream = go()
+              stream.save_body_to_file = function(_, file)
+                assert(file:write("partial archive"))
+                return nil, "truncated download"
+              end
+              return headers, stream
+            end
+            return request
+          end
+        "#,
+            "truncated download",
+        ),
         (
             archive_spec(&new_url, &new_digest),
             r#"
@@ -2240,7 +2290,7 @@ fn archive_failures_preserve_previous_installation_and_lock() {
         ),
     ];
     for (spec, inject, expected) in scenarios {
-        let attempt = lua_with_pm();
+        let attempt = lua_with_archive_pm();
         attempt
             .load(format!(
                 r#"
@@ -2274,7 +2324,7 @@ fn archive_cleanup_failure_does_not_misreport_a_committed_install() {
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
     let (url, digest) = archive_fixture(work.path(), "release");
-    lua_with_pm()
+    lua_with_archive_pm()
         .load(format!(
             r#"
       local pm = require("nefor-pm")
@@ -2304,7 +2354,7 @@ fn archives_replace_managed_git_but_refuse_unowned_directories_and_dev_links() {
     let origin = work.path().join("origin");
     let git_url = make_origin_repo(&origin);
     let (url, digest) = archive_fixture(work.path(), "release");
-    let lua = lua_with_pm();
+    let lua = lua_with_archive_pm();
     lua.load(format!(
         r#"
         local pm = require("nefor-pm")
@@ -2323,14 +2373,14 @@ fn archives_replace_managed_git_but_refuse_unowned_directories_and_dev_links() {
         r#"require("nefor-pm").install({{{}}})"#,
         archive_spec(&url, &digest)
     );
-    let err = lua_with_pm()
+    let err = lua_with_archive_pm()
         .load(&attempt)
         .exec()
         .expect_err("unowned directory refused");
     assert!(err.to_string().contains("unowned directory"), "{err}");
     std::fs::remove_dir_all(&target).expect("remove fixture package");
     std::os::unix::fs::symlink(&origin, &target).expect("dev link");
-    let err = lua_with_pm()
+    let err = lua_with_archive_pm()
         .load(&attempt)
         .exec()
         .expect_err("dev symlink refused");
@@ -2365,4 +2415,49 @@ fn archive_specs_and_da_release_platforms_are_explicit() {
         assert(spec.archive.url == "https://github.com/amenocturne/da/releases/download/v0.2.1/da-aarch64-apple-darwin.tar.gz")
         assert(spec.archive.strip_components == 1)
     "#).exec().expect("archive contract");
+}
+
+#[test]
+fn archive_http_transport_closes_resources_on_failures() {
+    let destination = tempfile::NamedTempFile::new().expect("download destination");
+    let lua = lua_with_pm();
+    lua.load(format!(r#"
+      local transport = require("nefor-pm.download")
+      assert(package.loaded["http.request"] == nil, "HTTP dependency must load lazily")
+      local scenario = "success"
+      local closes = 0
+      package.preload["http.request"] = function()
+        return {{ new_from_uri = function()
+          return {{ go = function()
+            if scenario == "connect" then return nil, "connection refused" end
+            return {{ get = function(_, key) if key == ":status" then return scenario == "status" and "503" or "200" end end }}, {{
+              state = scenario == "success" and "closed" or "open",
+              connection = {{ take_socket = function()
+                return {{ close = function() closes = closes + 1 end }}
+              end }},
+              shutdown = function() closes = closes + 1 end,
+              save_body_to_file = function(_, file)
+                assert(file:write("partial"))
+                if scenario == "partial" then return nil, "unexpected EOF" end
+                if scenario == "write" then error("disk write failed") end
+                return true
+              end,
+            }}
+          end }}
+        end }}
+      end
+      local path = {path:?}
+      transport.download("https://fixture.invalid/archive", path)
+      assert(closes == 1)
+      for _, item in ipairs({{ {{"connect", "connection refused"}}, {{"status", "status 503"}},
+                              {{"partial", "unexpected EOF"}}, {{"write", "disk write failed"}} }}) do
+        scenario = item[1]
+        local before = closes
+        local ok, err = pcall(transport.download, "https://fixture.invalid/archive", path)
+        assert(not ok and tostring(err):find(item[2], 1, true), tostring(err))
+        assert(closes == before + (scenario == "connect" and 0 or 1))
+        -- Closing the output is observable by replacing it after every failed attempt.
+        local file = assert(io.open(path, "wb")); assert(file:write("replacement")); assert(file:close())
+      end
+    "#, path = destination.path().to_string_lossy().as_ref())).exec().expect("HTTP resource cleanup");
 }
