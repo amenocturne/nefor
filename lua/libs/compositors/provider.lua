@@ -770,6 +770,31 @@ function M.spawn_spec(name, command, opts)
           if contribution_totals[rule.usage_id] ~= nil then notify_usage(rule.usage_id) end
         end
       else
+        local body = env.body
+        if type(body) == "table" and ((kind == "ncp.delivery_failed" and body.peer == name)
+            or ((kind == "engine.plugin_transport_failed" or kind == "engine.plugin_delivery_lost")
+              and body.plugin == name)) then
+          local ids, identified = {}, false
+          if kind == "ncp.delivery_failed" and body.extent == "none" then
+            for _, correlation in ipairs(body.correlations or {}) do
+              if correlation.kind == kinds.completion_request and type(correlation.request_id) == "string" then
+                identified = true
+                if pending_requests[correlation.request_id] then ids[correlation.request_id] = true end
+              end
+            end
+          end
+          local unknown = not identified
+          if unknown then for id in pairs(pending_requests) do ids[id] = true end end
+          for id in pairs(ids) do
+            local pending = pending_requests[id]
+            pending_requests[id] = nil
+            request_usage_versions[id] = nil
+            report({ request_id = id, conversation_id = pending.conversation_id, event = "error",
+              error = { code = "provider_delivery_failed", outcome = unknown and "unknown" or "rejected",
+                message = "Provider delivery failed; prior effects are unknown" } })
+          end
+          goto continue
+        end
         if provider_tools ~= nil and type(env.body) == "table"
             and env.body.kind == tool_gate .. ".hello" then
           provider_tools.advertise(tool_gate)

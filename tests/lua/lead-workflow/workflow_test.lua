@@ -3188,3 +3188,79 @@ do
   feed("mag", { kind = "mag.run_result", run_id = run_id, status = "completed" })
   assert_eq(#decode_calls(), 0, "late terminals cannot reclassify authority loss")
 end
+
+-- Invocation-boundary publication rejection cleans deferred plan ownership;
+-- no engine shutdown and a later invocation remains usable.
+do
+  fresh()
+  local encode = json.encode
+  json.encode = function(value)
+    if value.body and value.body.kind == "lead-workflow.plan.submitted" then
+      error("encoding rejected by test boundary")
+    end
+    return encode(value)
+  end
+  invoke_tool("encoding-plan", "write-review", { plan = "proposal", view = "inline" })
+  json.encode = encode
+  local result = assert(tool_result("encoding-plan"))
+  assert_true(result.body.error:find("prior effects are unknown", 1, true) ~= nil)
+  assert_true(lw._internals.state.active_plan == nil
+    or lw._internals.state.active_plan.pending_firing_id == nil)
+  _test.calls_clear()
+  feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
+  assert_eq(tool_result("encoding-plan"), nil, "late approval cannot resettle failure")
+  invoke_tool("next-status", "mag-status", {})
+  assert_true(tool_result("next-status") ~= nil, "subsequent work is admitted")
+end
+
+do
+  fresh()
+  feed("engine", { kind = "ncp.delivery_failed", peer = "basic-tools", extent = "none",
+    correlations = {{ kind = "basic-tools.tool.invoke", id = "actual-inner" }} })
+  local result = assert(tool_result("actual-inner"))
+  assert_eq(result.from, "basic-tools", "native source correlation reaches the gate")
+end
+
+-- A terminal delivery failure comes from surviving run authority, not a
+-- process-death guess. It settles waiters once and retains persisted files.
+do
+  fresh()
+  local registry = lw._internals.run_registry
+  local run_id = registry:mint_run_id()
+  lw._internals.register_active_run(run_id, {}, "terminal", "output-dispatch",
+    "output-run", sessions.current_id())
+  feed("mag", { kind = "mag.run_started", run_id = run_id })
+  invoke_tool("output-waiter", "mag-await", { run_id = run_id })
+  local terminal = { kind = "mag.run_result", run_id = run_id, status = "failed",
+    failure = "output_delivery", error = "output rejected; effects unknown",
+    persisted = true, output_path = "/retained/output.json" }
+  feed("mag", terminal)
+  assert_true(tool_result("output-waiter") ~= nil)
+  assert_eq(registry:get(run_id).canonical_body.output_path, terminal.output_path)
+  _test.calls_clear()
+  feed("mag", terminal)
+  assert_eq(tool_result("output-waiter"), nil, "duplicate terminal is inert")
+end
+
+do
+  fresh()
+  lw._internals.set_graph_status_now(function() error("trusted invariant") end)
+  local ok, err = pcall(invoke_tool, "invariant-status", "mag-status", {})
+  assert_eq(ok, false, "trusted invariant failures remain exceptional")
+  assert_true(tostring(err):find("trusted invariant", 1, true) ~= nil)
+  assert_eq(tool_result("invariant-status"), nil)
+end
+
+do
+  fresh()
+  local registry = lw._internals.run_registry
+  local run_id = registry:mint_run_id()
+  lw._internals.register_active_run(run_id, {}, "terminal", "invalid-output",
+    string.char(255), sessions.current_id())
+  invoke_tool("invalid-utf8-result", "mag-status", {run_id = run_id})
+  local result = assert(tool_result("invalid-utf8-result"))
+  assert_eq(result.body.error_code, "output_rejected", "encoding fallback retains real invocation id")
+  _test.calls_clear()
+  invoke_tool("usable-status", "mag-status", {run_id = "unknown"})
+  assert_true(tool_result("usable-status") ~= nil)
+end

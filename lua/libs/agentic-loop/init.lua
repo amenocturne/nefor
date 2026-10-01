@@ -1935,6 +1935,13 @@ fail_open_requests = function(err)
   end
 end
 
+-- Capability loss is not an effects-free invocation rejection. Whole requests
+-- fail unknown first; cancellation then asks the surviving MAG authority to stop.
+function M.capability_lost(peer, message)
+  fail_open_requests({ code = "capability_lost", authority = peer, outcome = "unknown",
+    message = message or "Capability lost; accepted effects are unknown" })
+end
+
 -- Whether a gate correlation id belongs to the lead's ACTIVE turn (ids are
 -- `<scope>/cap-N`; the lead's own tool firings carry its turn scope, a
 -- dispatched sub-run's carry that run's scope). Public for consumers that

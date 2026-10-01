@@ -109,8 +109,20 @@ local function display_contract(label, primary, fields, result_kind, result_text
   }
 end
 
-local emit_as = envelope.emit_as
-local emit    = envelope.emit
+local current_invocation
+local publication_failure = {}
+local function emit_as(from, target, body)
+  if not current_invocation then return envelope.emit_as(from, target, body) end
+  local ok, err, phase = envelope.checked_emit_as(from, target, body)
+  if not ok then
+    if phase ~= "encoding" and not (nefor.engine.error_kind and nefor.engine.error_kind(err)) then
+      error(err, 0)
+    end
+    error({ tag = publication_failure, cause = err }, 0)
+  end
+  return true
+end
+local function emit(target, body) return emit_as("engine", target, body) end
 
 local monotonic_now_ms = function()
   if type(nefor.now_ms) == "function" then return nefor.now_ms() end
@@ -280,10 +292,19 @@ local expire_termination_waiter
 local tool_source
 
 local function emit_tool_result(body)
+  if current_invocation and current_invocation.id == body.id then
+    if current_invocation.settled then return end
+    current_invocation.settled = true
+  end
   local admitted = envelope.checked_emit_as(SOURCE_NAME, nil, body)
   if admitted then return end
-  emit_as(SOURCE_NAME, nil, { kind = "tool.result", id = body.id,
-    error = "lead-workflow: response could not be published", error_code = "output_rejected" })
+  local fallback = envelope.checked_emit_as(SOURCE_NAME, nil, { kind = "tool.result", id = body.id,
+    error = "lead-workflow: response could not be published; prior effects are unknown",
+    error_code = "output_rejected" })
+  if not fallback then
+    require("libs.agentic-loop").capability_lost(SOURCE_NAME,
+      "Lead-workflow response authority unavailable; accepted effects are unknown")
+  end
 end
 
 local function emit_tool_result_ok(firing_id, output, completion_delivery)
@@ -2132,6 +2153,54 @@ local TOOL_HANDLERS = {
   ["mag-apply"]      = mag_apply,
 }
 
+local function invoke_owned_handler(handler, firing_id, args, body)
+  local previous_invocation = current_invocation
+  local invocation = { id = firing_id }
+  current_invocation = invocation
+  local ok, err = pcall(handler, firing_id, args, {
+    caller_id = body.caller_id,
+    from = body.from,
+    invocation = body.invocation,
+  })
+  current_invocation = previous_invocation
+  if ok then return end
+  -- Only the local encoding boundary and typed engine admission errors are
+  -- expected here. Trusted invariant failures still escape to the actor boundary.
+  local error_kind
+  if type(err) == "table" and err.tag == publication_failure then
+    error_kind = "publication_failed"
+  else
+    error_kind = nefor.engine.error_kind and nefor.engine.error_kind(err)
+  end
+  if error_kind == nil then error(err, 0) end
+  invalidate_pending_mag_loads(firing_id)
+  local apply_settled = false
+  for request_id, pending in pairs(state.pending_mag_apply) do
+    if pending.firing_id == firing_id then
+      apply_settled = fail_pending_apply({ in_reply_to = request_id,
+        message = "Invocation publication failed; prior effects are unknown" }) or apply_settled
+    end
+  end
+  run_registry:detach_waiter(firing_id)
+  cancel_completion_grace_by_firing(firing_id)
+  for run_id, waiters in pairs(state.termination_waiters) do
+    for index = #waiters, 1, -1 do
+      local waiter = waiters[index]
+      if waiter.firing_id == firing_id then
+        if type(waiter.cancel_timer) == "function" then waiter.cancel_timer() end
+        table.remove(waiters, index)
+      end
+    end
+    if #waiters == 0 then state.termination_waiters[run_id] = nil end
+  end
+  local plan = state.active_plan
+  if plan and plan.pending_firing_id == firing_id then clear_pending_plan(plan) end
+  if not apply_settled and not invocation.settled then
+    emit_tool_result_err(firing_id,
+      "lead-workflow: invocation publication failed; prior effects are unknown (" .. error_kind .. ")")
+  end
+end
+
 -- Handlers keep firing-id addressing so deferred settlement (plan verdicts,
 -- run completion, termination confirmation) can resolve later by id.
 local function tool_definitions()
@@ -2139,7 +2208,7 @@ local function tool_definitions()
   for _, spec in ipairs(lead_workflow_tool_specs()) do
     local handler = assert(TOOL_HANDLERS[spec.name], spec.name)
     spec.handler = function(args, call)
-      handler(call.id, args, {
+      invoke_owned_handler(handler, call.id, args, {
         caller_id = call.request.caller_id,
         from = call.request.from,
         invocation = call.request.invocation,
@@ -2150,7 +2219,7 @@ local function tool_definitions()
   return definitions
 end
 
-tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions(), emit = emit_tool_result }
+tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions(), emit = emit_tool_result, propagate_handler_errors = true }
 
 local function handle_tool_invoke(body)
   tool_source.invoke(body)
@@ -2304,11 +2373,42 @@ local function receive_msg(entry)
     resolve_pending_apply(body)
     return
   end
+  if (kind == "ncp.delivery_failed" and body.peer ~= "mag")
+      or ((kind == "engine.plugin_transport_failed" or kind == "engine.plugin_delivery_lost")
+        and body.plugin ~= "mag") then
+    local peer = body.peer or body.plugin
+    if type(peer) ~= "string" then return end
+    if peer ~= "tool-gate" and peer ~= "basic-tools" and peer ~= "git-worktree"
+        and peer ~= SOURCE_NAME then return end
+    local identified = false
+    if kind == "ncp.delivery_failed" and body.extent == "none" then
+      for _, correlation in ipairs(body.correlations or {}) do
+        -- Source and id are supplied by the failed egress, never parsed from
+        -- opaque actor identities. The gate owns inner-to-outer rewriting.
+        if correlation.kind == peer .. ".tool.invoke" and type(correlation.id) == "string" then
+          identified = true
+          emit_as(peer, nil, { kind = "tool.result", id = correlation.id,
+            error = "Invocation was not delivered; earlier effects are unknown" })
+        end
+      end
+    end
+    if not identified then
+      require("libs.agentic-loop").capability_lost(peer,
+        "Capability delivery failed; accepted outcomes are unknown")
+      -- Do not invent run terminals while the MAG authority survives.
+      interrupt_active_runs()
+    end
+    return
+  end
   if kind == "ncp.delivery_failed" and body.peer == "mag" then
     if replay_window.active() then return end
     if body.extent == "none" then
+      local identified = false
       for _, correlation in ipairs(body.correlations or {}) do
         local rejection = { in_reply_to = correlation.id, message = body.message }
+        if type(correlation.id) == "string" and (correlation.kind == "mag.apply"
+            or correlation.kind == "mag.execute" or correlation.kind == "mag.load"
+            or correlation.kind == "mag.build") then identified = true end
         if correlation.kind == "mag.apply" then
           fail_pending_apply(rejection)
         elseif correlation.kind == "mag.execute" then
@@ -2316,6 +2416,9 @@ local function receive_msg(entry)
         elseif correlation.kind == "mag.load" or correlation.kind == "mag.build" then
           fail_pending_load(rejection)
         end
+      end
+      if not identified then
+        reconcile_mag_authority_loss("MAG delivery outcome cannot be correlated; accepted effects are unknown")
       end
     else
       reconcile_mag_authority_loss("MAG delivery failed; accepted effects are unknown")

@@ -113,7 +113,11 @@ fn run_inner(
         .env("NEFOR_STARTUP_TIMEOUT_MS", "10000")
         .env("OPENAI_PROVIDER_API_KEY", "offline-sentinel")
         .arg("--config")
-        .arg(root().join("examples/nefor-agent"))
+        .arg(if dir.join("fixture-config").is_dir() {
+            dir.join("fixture-config")
+        } else {
+            root().join("examples/nefor-agent")
+        })
         .arg("run")
         .args(args)
         .current_dir(dir)
@@ -630,4 +634,189 @@ fn headless_starter_request_resume_tools_and_failures() {
     assert_eq!(mag_death.status.code(), Some(1));
     assert_authority_loss(&dir, &mag_death);
     println!("retained headless artifacts: {}", dir.display());
+}
+
+#[test]
+fn shipped_mock_keeps_submission_receipts_within_activation() {
+    use mlua::LuaSerdeExt;
+    let lua = mlua::Lua::new();
+    let nefor = lua.create_table().unwrap();
+    nefor.set("name", "mock-plugin").unwrap();
+    for name in ["on", "on_ready_ok"] {
+        nefor
+            .set(
+                name,
+                lua.create_function(|_, _: mlua::Variadic<mlua::Value>| Ok(()))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let json = lua.create_table().unwrap();
+    json.set(
+        "decode",
+        lua.create_function(|lua, text: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(mlua::Error::external)?;
+            lua.to_value(&value)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    json.set(
+        "encode",
+        lua.create_function(|lua, value: mlua::Value| {
+            let value: serde_json::Value = lua.from_value(value)?;
+            serde_json::to_string(&value).map_err(mlua::Error::external)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    nefor.set("json", json).unwrap();
+    lua.globals().set("nefor", nefor).unwrap();
+    let source =
+        std::fs::read_to_string(root().join("examples/nefor-agent/mock-provider/init.lua"))
+            .unwrap();
+    let select: mlua::Function = lua
+        .load(format!("{source}\nreturn typed_response"))
+        .eval()
+        .unwrap();
+    lua.globals().set("select_typed", select).unwrap();
+    lua.load(r#"
+        local instruction = {role="system",content='Expected canonical MAG JSON schema: {"type":"object","properties":{"content":{"type":"string"}}}. Write the value directly'}
+        local valid = {role="tool",name="write_output",content={write="saved",validation={status="valid"}}}
+        local invalid = {role="tool",name="write_output",content={write="saved",validation={status="invalid"}}}
+        local request = {tools={"write_output","submit_output"}}
+        assert(select_typed(request, {instruction,valid}).tool_calls[1].name == "submit_output")
+        assert(select_typed(request, {instruction,valid,invalid}).tool_calls[1].name == "write_output")
+        assert(select_typed(request, {instruction,valid,instruction}).tool_calls[1].name == "write_output")
+    "#).exec().unwrap();
+}
+
+#[test]
+fn rejected_provider_frame_closes_whole_request_and_resume_remains_usable() {
+    let dir = tempfile::Builder::new()
+        .prefix("owner-admission-")
+        .tempdir_in(root().join("tmp"))
+        .unwrap()
+        .keep();
+    for name in [
+        "home",
+        "config",
+        "data",
+        "cache",
+        "bin",
+        "fixture-config/mock-provider",
+    ] {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+    }
+    for name in [
+        "mag-plugin",
+        "mock-plugin",
+        "tool-gate",
+        "basic-tools",
+        "git-worktree",
+    ] {
+        std::os::unix::fs::symlink(binaries().join(name), dir.join("bin").join(name)).unwrap();
+    }
+    for entry in std::fs::read_dir(root().join("examples/nefor-agent")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "mock-provider" {
+            assert!(Command::new("/bin/cp")
+                .arg("-R")
+                .arg(entry.path())
+                .arg(dir.join("fixture-config").join(entry.file_name()))
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+    let script =
+        std::fs::read_to_string(root().join("examples/nefor-agent/mock-provider/init.lua"))
+            .unwrap();
+    let injected = script.replace(
+        "local function complete_request(body)",
+        r#"
+local function complete_request(body)
+  if os.getenv("OWNER_REJECT_FRAME") == "1" then
+    local ok = pcall(nefor.emit, "completion.event", {
+      request_id = body.request_id, event = "text_delta", text = string.rep("x", 17 * 1024 * 1024),
+    })
+    assert(not ok, "fixture must exercise actual output admission")
+    nefor.emit("completion.event", {request_id = body.request_id, event = "error",
+      message = "output admission rejected; prior effects unknown", effects = "unknown"})
+    return
+  end
+"#,
+    );
+    std::fs::write(dir.join("fixture-config/mock-provider/init.lua"), injected).unwrap();
+    let rejected = run_with_env(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--format",
+            "json",
+            "--prompt",
+            "Owner frame rejection",
+        ],
+        &[("OWNER_REJECT_FRAME", "1")],
+    );
+    assert_eq!(
+        rejected.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(result["status"], "error");
+    assert_canonical_settlement(&dir, &rejected, 1);
+    let session = result["session_id"].as_str().unwrap();
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap();
+    let bodies = persisted
+        .lines()
+        .filter_map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).ok()?;
+            let envelope: serde_json::Value =
+                serde_json::from_str(row["payload"].as_str()?).ok()?;
+            Some(envelope["body"].clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| body["kind"] == "agentic_loop.request_completed"
+                && body["request_id"] == result["request_id"])
+            .count(),
+        1
+    );
+    assert!(bodies
+        .iter()
+        .any(|body| body["kind"] == "conversation.fact.recorded"
+            && body["event"]["kind"] == "turn_failed"
+            && body["event"]["detail"]["effects"] == "unknown"));
+    assert!(
+        !persisted.contains(&"x".repeat(1024)),
+        "rejected progress never entered the bus"
+    );
+    let resumed = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--format",
+            "json",
+            "--resume",
+            session,
+            "--prompt",
+            "Summarise octopuses in one sentence.",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&success(&resumed)).unwrap()["status"],
+        "success"
+    );
 }

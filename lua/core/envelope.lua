@@ -84,6 +84,8 @@ local function emit_as(from, target, body, checked)
     body = body,
   })
   if not ok then
+    -- Checked callers own invocation cleanup and a small semantic fallback.
+    if checked then return nil, payload, "encoding" end
     local kind = (type(body) == "table" and tostring(body.kind)) or "(unknown)"
     nefor.log.error("agentic_workflow: json.encode failed — payload not emitted", {
       kind  = kind,
@@ -128,9 +130,9 @@ function M.emit_as(from, target, body)
   return emit_as(from, target, body, false)
 end
 
--- Admission is checked before publication by the engine. Encoding still uses
--- the explicitly selected fail-fast policy above; this is not exception
--- containment around arbitrary application code.
+-- Admission is checked before publication by the engine. Checked callers own
+-- encoding rejection as well: nil, error, "encoding" distinguishes it from a
+-- typed engine admission error. Unchecked emission retains fail-fast encoding.
 function M.checked_emit_as(from, target, body)
   return emit_as(from, target, body, true)
 end

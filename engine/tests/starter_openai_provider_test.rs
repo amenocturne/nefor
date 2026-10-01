@@ -906,3 +906,56 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     );
     lua.load(&script).exec()
 }
+
+#[test]
+fn provider_output_errors_and_capability_loss_release_exact_requests_once() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(r#"
+      local spec = require("libs.compositors.provider").spawn_spec("owner", {"/bin/true"}, {
+        agentic_loop = {}, conversations = {
+          context = function() return {messages = {}, watermark = 1} end,
+          watermark = function() return 1 end,
+        },
+      })
+      local function invoke(id)
+        spec.to_plugin({{type="event", from="conversation-manager", body={
+          kind="conversation.provider.invoke", provider="owner", request_id=id,
+          conversation_id="conversation", watermark=1,
+        }}})
+      end
+      invoke("rejected-output")
+      spec.from_plugin({{type="event", from="owner", body={
+        kind="owner.completion.event", request_id="rejected-output", event="error",
+        message="output admission failed", error_category="output_admission_failed", effects="unknown",
+      }}})
+      local sent = _test.sent()
+      assert(#sent == 1 and sent[1].body.request_id == "rejected-output")
+      assert(sent[1].body.event == "error" and sent[1].body.effects == "unknown")
+      assert(next(spec._internals.pending_requests()) == nil)
+      spec.from_plugin({{type="event", from="owner", body={
+        kind="owner.completion.event", request_id="rejected-output", event="completed",
+      }}})
+      assert(#_test.sent() == 0, "stale success is inert")
+      invoke("none")
+      spec.to_plugin({{type="event", from="engine", body={kind="ncp.delivery_failed",
+        peer="owner", extent="none", correlations={{kind="owner.completion.request", request_id="none"}},
+      }}})
+      sent = _test.sent()
+      assert(#sent == 1 and sent[1].body.error.outcome == "rejected")
+      invoke("unknown")
+      spec.to_plugin({{type="event", from="engine", body={kind="ncp.delivery_failed",
+        peer="owner", extent="none", correlations={{kind="owner.completion.request", request_id="none"}},
+      }}})
+      assert(#_test.sent() == 0 and spec._internals.pending_requests().unknown ~= nil,
+        "stale rejection must not fail an unrelated request")
+      spec.to_plugin({{type="event", from="engine", body={kind="engine.plugin_transport_failed", plugin="owner"}}})
+      sent = _test.sent()
+      assert(#sent == 1 and sent[1].body.request_id == "unknown")
+      assert(sent[1].body.error.outcome == "unknown")
+      assert(next(spec._internals.pending_requests()) == nil)
+      invoke("later")
+      assert(spec._internals.pending_requests().later ~= nil)
+    "#).exec().expect("provider owner settlement");
+}
