@@ -33,3 +33,18 @@ Each run preserves its immutable manifest, Cargo JSON, phase logs, signing list,
 and watchdog output beneath `tmp/prepared-tests/`. These artifacts are the
 evidence boundary for inventory, phase timing, process kind, failures, and
 timeouts.
+
+## Explicit local-package process fixtures
+
+The CLI mock process tests copy the starter configuration into retained project
+`tmp/` directories and replace only the external classifier package with a local
+test fixture. Providers, gate, tools, MAG, sessions and CLI still use their real
+routed owners. Fixture observation does not perform settlement.
+
+The TUI scenario recipe accepts the optional `NEFOR_TEST_DA_BINARY` environment
+variable for offline execution with an existing real classifier executable.
+`tools/stage-tui-local-package.ts` stages an isolated config/package and adjusts
+only copied scenario launch arguments. The executable is not a classifier stub;
+permission-policy scenarios continue exercising its actual behavior. Without
+this explicit test-only option, normal package resolution is unchanged. Neither
+fixture edits the production starter or its archive pin.

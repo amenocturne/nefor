@@ -97,6 +97,49 @@ fn run_inner(
     intervention: Intervention<'_>,
     extra_env: &[(&str, &str)],
 ) -> Output {
+    // Test-only local classifier package keeps every process witness offline.
+    // The distribution and its production archive pin remain unchanged.
+    if !dir.join("fixture-config").exists() {
+        assert!(Command::new("/bin/cp")
+            .arg("-R")
+            .arg(root().join("examples/nefor-agent"))
+            .arg(dir.join("fixture-config"))
+            .status()
+            .unwrap()
+            .success());
+    }
+    let da = dir.join("da-fixture/bin");
+    std::fs::create_dir_all(&da).unwrap();
+    let classifier = da.join("da");
+    std::fs::write(&classifier, "#!/bin/sh\nprintf 'allow\\n'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(classifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let init = dir.join("fixture-config/init.lua");
+    let source = std::fs::read_to_string(&init).unwrap();
+    let marker = "local da_package = require(\"libs.tool-validator.da\")";
+    if !source.contains("-- local acceptance classifier") {
+        assert_eq!(source.matches(marker).count(), 1);
+        std::fs::write(
+            init,
+            source.replace(
+                marker,
+                &format!(
+                    r#"{marker}
+-- local acceptance classifier
+local release_package = da_package.release_package
+da_package.release_package = function(opts)
+  local package = release_package(opts)
+  package.archive = nil
+  package.dir = {}
+  return package
+end
+"#,
+                    serde_json::to_string(&dir.join("da-fixture").display().to_string()).unwrap()
+                ),
+            ),
+        )
+        .unwrap();
+    }
     let mut cmd = Command::new(binaries().join("nefor"));
     cmd.env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -819,4 +862,417 @@ local function complete_request(body)
         serde_json::from_str::<serde_json::Value>(&success(&resumed)).unwrap()["status"],
         "success"
     );
+}
+
+// Only fixture configuration is altered. Routing, providers, tool-gate, MAG,
+// conversation authority, sessions and CLI are the shipped processes/owners.
+fn isolated_starter(prefix: &str) -> PathBuf {
+    std::fs::create_dir_all(root().join("tmp")).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(root().join("tmp"))
+        .unwrap()
+        .keep();
+    for name in ["home", "config", "data", "cache", "bin"] {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+    }
+    for name in [
+        "mag-plugin",
+        "mock-plugin",
+        "tool-gate",
+        "basic-tools",
+        "git-worktree",
+    ] {
+        std::os::unix::fs::symlink(binaries().join(name), dir.join("bin").join(name)).unwrap();
+    }
+    assert!(Command::new("/bin/cp")
+        .arg("-R")
+        .arg(root().join("examples/nefor-agent"))
+        .arg(dir.join("fixture-config"))
+        .status()
+        .unwrap()
+        .success());
+    let init = dir.join("fixture-config/init.lua");
+    let original = std::fs::read_to_string(&init).unwrap();
+    std::fs::write(
+        init,
+        format!(
+            "{original}\n{}",
+            r#"
+nefor.bus.on_event("*", function(entry)
+  local ok, env = pcall(nefor.json.decode, entry.payload or "")
+  local body = ok and type(env) == "table" and env.body
+  if type(body) ~= "table" then return end
+  if body.kind == "sessions.transition_failed" or body.kind == "sessions.resume_done"
+      or body.kind == "sessions.flush_request" or body.kind == "sessions.flush_done"
+      or body.kind == "tool.result" or body.kind == "basic-tools.tool.invoke"
+      or body.kind == "tool-gate.tool.invoke" then
+    local f = assert(io.open("boundary-trace.jsonl", "a"))
+    f:write(nefor.json.encode({from=env.from,body=body}), "\n"); f:close()
+  end
+end)
+"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn oversized_real_tool_result_routes_small_failure_and_later_work() {
+    let dir = isolated_starter("tool-output-admission-");
+    let turn = dir.join("fixture-config/agentic-loop/lead-turn.mag");
+    let turn_source = std::fs::read_to_string(&turn).unwrap();
+    std::fs::write(
+        turn,
+        turn_source.replace("tools: [", "tools: [\"shell.script\", "),
+    )
+    .unwrap();
+    let script = dir.join("fixture-config/mock-provider/init.lua");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let marker = "  -- 5a. read readme -> read_file tool call";
+    assert_eq!(source.matches(marker).count(), 1);
+    std::fs::write(dir.join("README.md"), "later operation").unwrap();
+    let source = source.replace(
+        "  -- Tool-result relay for the new interactive triggers.",
+        r#"  if last_tool ~= nil and tostring(last_tool):find("frame_too_large", 1, true)
+      and string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
+    return {text="", finish_reason="tool_calls", tool_calls={{
+      id=mint_tool_id("later"), name="read_file", arguments={path="README.md"}}}}
+  end
+  -- Tool-result relay for the new interactive triggers."#,
+    );
+    std::fs::write(
+        script,
+        source.replace(
+            marker,
+            r#"
+  if string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
+    return {text="", finish_reason="tool_calls", tool_calls={{
+      id=mint_tool_id("giant"), name="shell.script",
+      arguments={script="head -c 17825792 /dev/zero | tr '\\000' x", cwd=".",
+        timeout={present=true,milliseconds=10000}}}}}
+  end
+"#,
+        ),
+    )
+    .unwrap();
+    let output = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--mode",
+            "yolo",
+            "--format",
+            "json",
+            "--prompt",
+            "GIANT_TOOL_OUTPUT",
+        ],
+    );
+    let result: serde_json::Value = serde_json::from_str(&success(&output)).unwrap();
+    let session = result["session_id"].as_str().unwrap();
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap();
+    assert!(
+        persisted.contains("frame_too_large"),
+        "native small admission failure must reach canonical tool result"
+    );
+    assert!(persisted.contains("effects may have occurred"));
+    let trace = std::fs::read_to_string(dir.join("boundary-trace.jsonl")).unwrap();
+    let trace = trace
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let invoke = trace
+        .iter()
+        .find(|row| row["body"]["kind"] == "basic-tools.tool.invoke")
+        .unwrap();
+    let inner = &invoke["body"]["id"];
+    let native = trace
+        .iter()
+        .filter(|row| {
+            row["from"] == "basic-tools"
+                && row["body"]["kind"] == "tool.result"
+                && row["body"]["id"] == *inner
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(native.len(), 1);
+    assert!(
+        native[0]["body"]["output"].is_null(),
+        "no giant native terminal was admitted"
+    );
+    assert!(trace.iter().any(|row| row["from"] == "tool-gate"
+        && row["body"]["kind"] == "tool.result"
+        && row["body"]["error"] == native[0]["body"]["error"]));
+    assert!(trace
+        .iter()
+        .any(|row| row["body"]["kind"] == "sessions.flush_done"
+            && row["body"]["request_id"] == result["request_id"]));
+    assert_eq!(
+        persisted.matches("agentic_loop.request_completed").count(),
+        1
+    );
+    // A subsequent real basic-tools operation, not only another provider turn.
+    std::fs::write(dir.join("README.md"), "later operation").unwrap();
+    let resumed = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--format",
+            "json",
+            "--resume",
+            session,
+            "--prompt",
+            "read readme",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&success(&resumed)).unwrap()["status"],
+        "success"
+    );
+    println!("retained oversized tool artifacts: {}", dir.display());
+}
+
+#[test]
+fn routed_replay_reader_fault_closes_cli_and_reader_without_submission() {
+    let dir = isolated_starter("routed-replay-fault-");
+    let first = run(
+        &dir,
+        &["--frontend", "cli", "--format", "json", "--prompt", "hello"],
+    );
+    let first: serde_json::Value = serde_json::from_str(&success(&first)).unwrap();
+    let session = first["session_id"].as_str().unwrap();
+    let init = dir.join("fixture-config/init.lua");
+    let original = std::fs::read_to_string(&init).unwrap();
+    // Fail the physical file-reader boundary deterministically after size sampling.
+    // The real sessions handler and NCP/CLI routing remain untouched.
+    let shim = r#"
+if os.getenv("REPLAY_READER_FAULT") == "1" then
+  local open = io.open
+  io.open = function(path, mode)
+    local fh, err = open(path, mode)
+    if not fh or mode ~= "r" or not tostring(path):match("%.jsonl$") then return fh,err end
+    local sampled = false
+    return {
+      seek = function(_, whence, offset)
+        if whence == "end" then sampled = true end
+        return fh:seek(whence, offset)
+      end,
+      read = function(_, ...)
+        if sampled then return nil, "deterministic replay EIO" end
+        return fh:read(...)
+      end,
+      close = function(_)
+        if sampled then
+          local proof = assert(open("reader-closed", "a")); proof:write("closed\n"); proof:close()
+        end
+        return fh:close()
+      end,
+    }
+  end
+end
+"#;
+    std::fs::write(init, format!("{shim}\n{original}")).unwrap();
+    std::fs::write(dir.join("boundary-trace.jsonl"), "").unwrap();
+    let fault = run_with_env(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--format",
+            "json",
+            "--resume",
+            session,
+            "--prompt",
+            "MUST_NOT_SUBMIT_AFTER_REPLAY_FAULT",
+        ],
+        &[("REPLAY_READER_FAULT", "1")],
+    );
+    assert_eq!(fault.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&fault.stdout).unwrap();
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["error"]["code"], "session_failure");
+    assert!(result["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("deterministic replay EIO"));
+    assert!(result["request_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("request-"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("reader-closed")).unwrap(),
+        "closed\n"
+    );
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap();
+    assert!(!persisted.contains("MUST_NOT_SUBMIT_AFTER_REPLAY_FAULT"));
+    let trace = std::fs::read_to_string(dir.join("boundary-trace.jsonl")).unwrap();
+    let rows = trace
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failures = rows
+        .iter()
+        .filter(|row| row["body"]["kind"] == "sessions.transition_failed")
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["body"]["session_id"], session);
+    assert!(!rows
+        .iter()
+        .any(|row| row["body"]["kind"] == "sessions.resume_done"));
+    // Record missing acceptance rather than encoding the bug as a desired law.
+    let evidence = serde_json::json!({
+        "cli_request_id": result["request_id"], "cli_status": result["status"],
+        "transition_request_id": failures[0]["body"]["request_id"],
+        "correlated_flush_done": rows.iter().any(|row| row["body"]["kind"] == "sessions.flush_done" && row["body"]["request_id"] == result["request_id"]),
+    });
+    std::fs::write(
+        dir.join("replay-loss-evidence.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    let recovered = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--format",
+            "json",
+            "--resume",
+            session,
+            "--prompt",
+            "hello",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&success(&recovered)).unwrap()["status"],
+        "success"
+    );
+    println!("retained routed replay fault artifacts: {}", dir.display());
+}
+
+#[test]
+fn accepted_real_mag_giant_join_has_small_authoritative_terminal() {
+    let dir = isolated_starter("mag-output-admission-");
+    let script = dir.join("fixture-config/mock-provider/init.lua");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let start = source.find("local CANNED_MAG_PROGRAM = [=[").unwrap();
+    let end = start + source[start..].find("]=]").unwrap() + 3;
+    let program = r#"local CANNED_MAG_PROGRAM = [=[
+import nefor.{compile_graph, script, ShellScriptParams, Timeout, &&&}
+let left = script("left", ShellScriptParams {script: "head -c 9437184 /dev/zero | tr '\\000' x", cwd: ".", timeout: named(Timeout, Seconds, 10)})
+let right = script("right", ShellScriptParams {script: "head -c 9437184 /dev/zero | tr '\\000' y", cwd: ".", timeout: named(Timeout, Seconds, 10)})
+compile_graph(left &&& right)
+]=]"#;
+    std::fs::write(
+        script,
+        format!("{}{}{}", &source[..start], program, &source[end..]),
+    )
+    .unwrap();
+    let output = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--mode",
+            "yolo",
+            "--format",
+            "json",
+            "--prompt",
+            "summarise octopuses and lighthouses in parallel and combine into one paragraph",
+        ],
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = result["session_id"].as_str().unwrap();
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap();
+    let bodies = persisted
+        .lines()
+        .filter_map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).ok()?;
+            let env: serde_json::Value = serde_json::from_str(row["payload"].as_str()?).ok()?;
+            Some(env["body"].clone())
+        })
+        .collect::<Vec<_>>();
+    let terminals = bodies
+        .iter()
+        .filter(|body| body["kind"] == "mag.run_result" && body["failure"] == "output_delivery")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "accepted giant MAG output must yield one small authoritative terminal; artifacts {}",
+        dir.display()
+    );
+    let run_id = &terminals[0]["run_id"];
+    assert!(bodies
+        .iter()
+        .any(|body| body["kind"] == "mag.run_started" && body["run_id"] == *run_id));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["error"]["run_id"], *run_id);
+    assert_eq!(result["error"]["code"], "mag_run_failed");
+    assert_eq!(terminals[0]["status"], "failed");
+    assert!(terminals[0]["result"].is_null());
+    assert_eq!(terminals[0]["persisted"], true);
+    let output_path = terminals[0]["output_path"].as_str().unwrap();
+    assert!(std::fs::metadata(output_path).unwrap().len() >= 9 * 1024 * 1024);
+    let failed_index = bodies
+        .iter()
+        .position(|body| body["kind"] == "mag.run_result" && body["run_id"] == *run_id)
+        .unwrap();
+    assert!(
+        bodies[failed_index + 1..]
+            .iter()
+            .any(|body| body["kind"] == "mag.run_started"),
+        "same MAG process accepts the subsequent deferred lead turn"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body["kind"] == "mag.actor_killed" && body["run_id"] == *run_id),
+        "failed run reclaims its actors"
+    );
+    assert!(terminals[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("effects may have occurred"));
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| body["kind"] == "agentic_loop.request_completed"
+                && body["request_id"] == result["request_id"])
+            .count(),
+        1
+    );
+    let resumed = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--format",
+            "json",
+            "--resume",
+            session,
+            "--prompt",
+            "Summarise octopuses in one sentence.",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&success(&resumed)).unwrap()["status"],
+        "success"
+    );
+    println!("retained accepted MAG output artifacts: {}", dir.display());
 }

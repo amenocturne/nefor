@@ -1432,7 +1432,7 @@ mod tests {
                 r#"
                 function dispatch(c) end
                 function invoke_from_plugin(source, payload)
-                    nefor.engine.send(payload)
+                    nefor.engine.send(source .. ":" .. payload)
                 end
             "#,
             );
@@ -1454,8 +1454,17 @@ mod tests {
             };
             let transport = crate::ncp::runner::spawn_plugin(&spec).unwrap();
             broker.attach_transport(transport, pn(mode));
-            let (mut healthy, ht) = make_transport();
-            broker.attach_transport(ht, pn("healthy"));
+            let healthy_spec = PluginSpec {
+                name: pn("healthy"),
+                terminal: TerminalMode::Detached,
+                kind: PluginKind::Command(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".into(),
+                ]),
+            };
+            let healthy_transport = crate::ncp::runner::spawn_plugin(&healthy_spec).unwrap();
+            broker.attach_transport(healthy_transport, pn("healthy"));
             let ops = BrokerOps::new(Arc::clone(&shared));
             let shutdown = broker.shutdown_handle();
             let run = tokio::spawn(broker.run());
@@ -1503,13 +1512,13 @@ mod tests {
                 ops.deliver(pn(mode), "later".into()),
                 Err(AdmissionError::Unavailable(_))
             ));
-            send_line(&mut healthy, "Ж heartbeat").await;
+            ops.deliver(pn("healthy"), "Ж heartbeat".into()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
                     if lock_shared(&shared)
                         .event_log
                         .iter()
-                        .any(|entry| entry.payload == "Ж heartbeat")
+                        .any(|entry| entry.payload == "healthy:Ж heartbeat")
                     {
                         break;
                     }

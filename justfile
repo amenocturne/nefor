@@ -157,8 +157,14 @@ test-tui-scenarios prepared="false":
       tests/tui/starter-sidebar-overflow.json
       tests/tui/starter-interrupt-recovery.json
     )
+    config_dir="$repo/examples/nefor-agent"
+    if [ -n "${NEFOR_TEST_DA_BINARY:-}" ]; then
+      bun tools/stage-tui-local-package.ts "$repo" "$suite_dir" "$NEFOR_TEST_DA_BINARY"
+      config_dir="$suite_dir/config"
+    fi
     for scenario in "${scenarios[@]}"; do
       scenario_name="$(basename "$scenario" .json)"
+      if [ -n "${NEFOR_TEST_DA_BINARY:-}" ]; then scenario="$suite_dir/$scenario_name.json"; fi
       data_dir="$suite_dir/$scenario_name"
       mkdir -p "$data_dir"
       fast_mock=1
@@ -167,7 +173,7 @@ test-tui-scenarios prepared="false":
         --repo-root "{{ justfile_directory() }}" \
         --artifacts-dir "{{ justfile_directory() }}/tmp/tui-driver-artifacts" \
         --env "NEFOR_DEV_DIR={{ justfile_directory() }}" \
-        --env "NEFOR_CONFIG_DIR={{ justfile_directory() }}/examples/nefor-agent" \
+        --env "NEFOR_CONFIG_DIR=$config_dir" \
         --env "NEFOR_DATA_DIR=$data_dir" \
         --env "CARGO_TARGET_DIR=$target" \
         --env "NEFOR_PREPARED_TESTS={{prepared}}" \
