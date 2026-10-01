@@ -54,6 +54,35 @@ All handlers are optional — a script with no handlers loads fine and does noth
 | `nefor.emit(sub_kind, body?)`      | Emit an event with `kind = "<nefor.name>.<sub_kind>"`. `body` is an optional table; if omitted, an empty body is used. **Error** if `body.kind` is already set (scripts must not bypass the host's prefix; use `emit_raw` if you really mean to). **Error** if emitted before `ready_ok` arrives. |
 | `nefor.emit_raw(full_kind, body?)` | Emit with `body.kind = full_kind` verbatim — no prefixing. Useful for impersonating other plugins' event shapes in tests. Caveat: nothing stops you from sending malformed or namespace-colliding kinds; that's on you.                                                                           |
 
+Both emission functions use checked wire admission (16 MiB including the final
+LF). They raise in the calling coroutine before enqueue on rejection, so `pcall`
+can observe the failure before the script continues. Success means enqueue
+admission only, not writing, receipt, or request acceptance. `emit_raw` bypasses
+only kind prefixing, **not** framing validation; deliberately malformed/oversized
+peer output belongs in test-only raw stdout fixtures, not this API.
+
+`nefor.emission_error_kind(error)` classifies an emission error returned by
+`pcall` as `"frame_too_large"`, `"invalid_framing"`, or `"writer_closed"`; it
+returns nil for other errors (including Lua-to-JSON encoding errors). Diagnostics
+are constant and do not include the rejected body. Scripts that actually own an
+invocation correlation may catch admission/encoding rejection, stop its output,
+send one small existing correlated terminal error, release script-owned pending
+state, and handle later requests. Earlier effects may already have occurred.
+The host never derives invocation identity from arbitrary `id` or `kind` fields,
+never fabricates a `tool.result`, and never retries rejected work. A failed
+fallback must escape; writer closure cannot deliver a fallback.
+
+Unhandled hook/handler errors, including detached completion handler failures,
+fail the plugin locally with nonzero exit. Writer closure is observed even when
+stdin is idle. Terminal stdin framing/UTF-8/I/O faults also end the plugin;
+bounded malformed JSON remains parse noise. The supervisor aborts and joins all
+owned completion handlers before returning, and reaps completed task handles
+continuously. This capability-loss policy leaves already accepted effects
+unknown for the engine/application owner to reconcile; it is not pre-start
+request rejection. Ordinary handlers remain ordered, while completion handlers
+can yield concurrently for cancellation. Arbitrary non-yielding Lua can still
+block its VM; this is not a script sandbox or preemptive execution limit.
+
 ### Utilities
 
 | Entry             | Description                                                                                                                                                                                                                      |
@@ -86,6 +115,8 @@ Live under `scenarios/`:
 ## Quality
 
 - `cargo build -p mock-plugin` clean.
-- `cargo test -p mock-plugin` green (18 unit tests, 3 integration tests spawning the binary).
+- Focused unit and process integration tests cover checked admission, script-owned
+  correlated fallback, subsequent requests, and supervisor teardown. Integration
+  tests are in the registered `full-tests` target.
 - `cargo clippy -p mock-plugin -- -D warnings` clean.
 - No `unwrap()` / `expect()` outside tests.

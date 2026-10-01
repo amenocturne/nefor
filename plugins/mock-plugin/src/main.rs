@@ -10,10 +10,11 @@ mod lua_host;
 mod state;
 
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use clap::Parser;
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{
+    await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
+};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use tokio::sync::mpsc;
 
@@ -43,7 +44,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -52,14 +53,17 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+    let code = match run().await {
+        Ok(()) => 0,
         Err(e) => {
             tracing::error!(error = %e, "mock-plugin exited with error");
             eprintln!("mock-plugin: {e}");
-            ExitCode::from(1)
+            1
         }
-    }
+    };
+    // Tokio stdin uses a non-cancellable blocking read. Tasks have been
+    // reclaimed by run; do not let that read defer process-loss observation.
+    std::process::exit(code);
 }
 
 async fn run() -> Result<(), MockError> {
@@ -77,9 +81,9 @@ async fn run() -> Result<(), MockError> {
         .to_string();
 
     // Transport tasks.
-    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (out_tx, writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
-    let _reader_handle = spawn_stdin_reader(in_tx);
+    let mut reader_handle = spawn_stdin_reader(in_tx);
 
     // Lua host. Load the script before the handshake so we surface
     // syntax errors immediately and never talk to the engine with a
@@ -88,28 +92,61 @@ async fn run() -> Result<(), MockError> {
     if let Some(lua_root) = &args.lua_root {
         host.prepend_package_path(lua_root)?;
     }
-    host.exec_script(&script_name, &script_src).await?;
+    tokio::select! {
+        result = host.exec_script(&script_name, &script_src) => result?,
+        _ = &mut reader_handle => return Err(MockError::InputEnded),
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    }
 
     // Handshake.
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    };
     tracing::info!(engine_version = %engine_version, "ready");
-    host.on_ready_ok().await?;
+    tokio::select! {
+        result = host.on_ready_ok() => result?,
+        _ = &mut reader_handle => return Err(MockError::InputEnded),
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    }
 
     // Main dispatch loop.
-    run_dispatch_loop(&host, &mut in_rx).await?;
+    run_dispatch_loop(&host, &mut in_rx, &out_tx, &mut reader_handle).await?;
 
     // Shutdown path: fire the Lua handler, then let tasks drop.
-    host.on_shutdown().await?;
+    tokio::select! {
+        result = host.on_shutdown() => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    }
+    host.release_script()?;
+    drop(host);
+    drop(out_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(2), writer_handle)
+        .await
+        .map_err(|_| MockError::WriterDrain)?
+        .map_err(MockError::Task)?;
     Ok(())
 }
 
 async fn run_dispatch_loop(
     host: &LuaHost,
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    reader_handle: &mut tokio::task::JoinHandle<()>,
 ) -> Result<(), MockError> {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut outcome = async {
     loop {
         tokio::select! {
+            _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                match completed {
+                    Some(Ok(result)) => result?,
+                    Some(Err(error)) => return Err(MockError::Task(error)),
+                    None => {}
+                }
+            }
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(Ok(env)) => {
@@ -160,20 +197,34 @@ async fn run_dispatch_loop(
                                     .is_some_and(|k| k.ends_with(".completion.request"));
                                 if kind_is_complete {
                                     let host_clone = host.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = host_clone.dispatch_event(&env).await {
-                                            tracing::error!(error = %e, "dispatch task failed");
-                                        }
+                                    tasks.spawn(async move {
+                                        host_clone.dispatch_event(&env).await
                                     });
-                                } else if let Err(e) = host.dispatch_event(&env).await {
-                                    tracing::error!(error = %e, "dispatch task failed");
+                                } else {
+                                    let dispatch = host.dispatch_event(&env);
+                                    tokio::pin!(dispatch);
+                                    loop {
+                                        tokio::select! {
+                                            result = &mut dispatch => { result?; break; }
+                                            _ = &mut *reader_handle => return Err(MockError::InputEnded),
+                                            _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+                                            completed = tasks.join_next(), if !tasks.is_empty() => {
+                                                match completed {
+                                                    Some(Ok(result)) => result?,
+                                                    Some(Err(error)) => return Err(MockError::Task(error)),
+                                                    None => {}
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    Some(Err(e)) => {
+                    Some(Err(TransportError::Parse(e))) => {
                         tracing::error!(error = %e, "stdin parse error; dropping line");
                     }
+                    Some(Err(e)) => return Err(e.into()),
                     None => {
                         tracing::info!("stdin closed; exiting");
                         return Ok(());
@@ -186,13 +237,84 @@ async fn run_dispatch_loop(
             }
         }
     }
+    }.await;
+    tasks.abort_all();
+    while let Some(completed) = tasks.join_next().await {
+        match completed {
+            Ok(Err(error)) if outcome.is_ok() => outcome = Err(error),
+            Err(error) if error.is_panic() => return Err(MockError::Task(error)),
+            _ => {}
+        }
+    }
+    outcome
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), MockError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
+        }),
+    )
+    .await
+    .map_err(MockError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nefor_protocol::{PluginName, Timestamp};
+
+    #[tokio::test]
+    async fn writer_closure_reclaims_script_task_without_inbound_traffic() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let host = LuaHost::new(PLUGIN_NAME, out_tx.clone()).unwrap();
+        host.exec_script(
+            "closed",
+            r#"
+            nefor.on("peer.completion.request", function()
+                nefor.emit("accepted")
+                nefor.sleep(60000)
+                nefor.emit("false-success")
+            end)
+        "#,
+        )
         .await
-        .map_err(|_| MockError::Transport(TransportError::WriterClosed))
+        .unwrap();
+        host.on_ready_ok().await.unwrap();
+        let (in_tx, mut in_rx) = mpsc::channel(4);
+        let body = serde_json::json!({"kind":"peer.completion.request"})
+            .as_object()
+            .unwrap()
+            .clone();
+        in_tx
+            .send(Ok(Envelope::event(
+                PluginName::new("peer").unwrap(),
+                Timestamp::now(),
+                body,
+            )))
+            .await
+            .unwrap();
+        let mut reader = tokio::spawn(std::future::pending::<()>());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                run_dispatch_loop(&host, &mut in_rx, &out_tx, &mut reader),
+                async {
+                    out_rx.recv().await.unwrap();
+                    drop(out_rx);
+                }
+            )
+            .0
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(MockError::Transport(TransportError::WriterClosed))
+        ));
+        // The loop returns only after aborting and joining its owned scripts.
+        reader.abort();
+        let _ = reader.await;
+        drop(in_tx);
+    }
 }

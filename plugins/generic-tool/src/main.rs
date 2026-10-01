@@ -46,7 +46,9 @@
 //! }
 //! ```
 
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{
+    await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
+};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -91,22 +93,26 @@ async fn run() -> Result<(), TransportError> {
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed),
+    };
     tracing::info!(engine_version = %engine_version, "ready");
 
     send_event(&out_tx, hello_body()).await?;
     send_event(&out_tx, register_body()).await?;
     send_event(&out_tx, ready_body()).await?;
 
-    idle_until_shutdown(&mut in_rx).await?;
+    idle_until_shutdown(&mut in_rx, &out_tx).await?;
 
-    let _ = out_tx.send(PluginOutgoing::event(goodbye_body())).await;
+    let _ = checked_send(&out_tx, PluginOutgoing::event(goodbye_body())).await;
     Ok(())
 }
 
 /// The plugin has no incoming work — it only registers types and waits.
 async fn idle_until_shutdown(
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
 ) -> Result<(), TransportError> {
     loop {
         tokio::select! {
@@ -124,15 +130,17 @@ async fn idle_until_shutdown(
                             // Not for us. Passive type registry.
                         }
                     },
-                    Some(Err(e)) => {
+                    Some(Err(TransportError::Parse(e))) => {
                         tracing::error!(error = %e, "stdin parse error; dropping line");
                     }
+                    Some(Err(e)) => return Err(e),
                     None => {
                         tracing::info!("stdin closed; exiting");
                         return Ok(());
                     }
                 }
             }
+            _ = out_tx.closed() => return Err(TransportError::WriterClosed),
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("ctrl-c; exiting");
                 return Ok(());
@@ -182,23 +190,47 @@ async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+    checked_send(out_tx, PluginOutgoing::event(body)).await
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+        }),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    // Passive metadata has no invocation correlation: rejection exits the owner.
+    #[tokio::test]
+    async fn metadata_rejection_and_closed_writer_are_local_failures() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut metadata = super::register_body();
+        metadata.insert(
+            "dynamic".into(),
+            serde_json::Value::String("x".repeat(16 * 1024 * 1024)),
+        );
+        assert!(matches!(
+            super::send_event(&tx, metadata).await,
+            Err(nefor_plugin_sdk::TransportError::FrameTooLarge { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(matches!(
+            super::send_ready(&tx).await,
+            Err(nefor_plugin_sdk::TransportError::WriterClosed)
+        ));
+        let (_in_tx, mut in_rx) = tokio::sync::mpsc::channel(1);
+        assert!(matches!(
+            super::idle_until_shutdown(&mut in_rx, &tx).await,
+            Err(nefor_plugin_sdk::TransportError::WriterClosed)
+        ));
+    }
+
     use super::*;
 
     #[test]

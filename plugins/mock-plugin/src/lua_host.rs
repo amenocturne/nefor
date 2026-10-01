@@ -31,6 +31,7 @@
 use std::sync::{Arc, Mutex};
 
 use mlua::{AnyUserData, Function, Lua, RegistryKey, Table, Value};
+use nefor_plugin_sdk::{checked_send, TransportError};
 use nefor_protocol::{Envelope, PluginOutgoing};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::mpsc;
@@ -121,9 +122,7 @@ impl LuaHost {
         };
         if let Some(key) = key {
             let f: Function = self.inner.lua.registry_value(&key)?;
-            if let Err(e) = f.call_async::<()>(()).await {
-                tracing::error!(error = %e, "on_ready_ok handler raised");
-            }
+            f.call_async::<()>(()).await?;
         }
         Ok(())
     }
@@ -137,9 +136,7 @@ impl LuaHost {
         };
         if let Some(key) = key {
             let f: Function = self.inner.lua.registry_value(&key)?;
-            if let Err(e) = f.call_async::<()>(()).await {
-                tracing::error!(error = %e, "on_shutdown handler raised");
-            }
+            f.call_async::<()>(()).await?;
         }
         Ok(())
     }
@@ -168,19 +165,23 @@ impl LuaHost {
 
         if let Some(key) = specific {
             let f: Function = self.inner.lua.registry_value(&key)?;
-            if let Err(e) = f
-                .call_async::<()>((body_map.clone(), envelope_table.clone()))
-                .await
-            {
-                tracing::error!(error = %e, kind = ?kind_opt, "on handler raised");
-            }
+            f.call_async::<()>((body_map.clone(), envelope_table.clone()))
+                .await?;
         }
         if let Some(key) = any {
             let f: Function = self.inner.lua.registry_value(&key)?;
-            if let Err(e) = f.call_async::<()>((body_map, envelope_table)).await {
-                tracing::error!(error = %e, kind = ?kind_opt, "on_any handler raised");
-            }
+            f.call_async::<()>((body_map, envelope_table)).await?;
         }
+        Ok(())
+    }
+
+    /// Reclaim Lua-held publisher clones before draining the stdout writer.
+    /// Task ownership must already have been joined by the caller.
+    pub fn release_script(&self) -> Result<(), MockError> {
+        *lock(&self.inner.handlers) = Handlers::default();
+        self.inner.lua.globals().clear()?;
+        self.inner.lua.expire_registry_values();
+        self.inner.lua.gc_collect()?;
         Ok(())
     }
 
@@ -197,6 +198,15 @@ impl LuaHost {
         self.install_on_shutdown(&nefor)?;
         self.install_emit(&nefor)?;
         self.install_emit_raw(&nefor)?;
+        nefor.set(
+            "emission_error_kind",
+            lua.create_function(|_, error: Value| {
+                Ok(match error {
+                    Value::Error(error) => admission_category(&error),
+                    _ => None,
+                })
+            })?,
+        )?;
         self.install_sleep(&nefor)?;
         self.install_json(&nefor)?;
 
@@ -366,10 +376,9 @@ impl LuaHost {
                         "kind".into(),
                         JsonValue::String(format!("{name}.{sub_kind}")),
                     );
-                    out_tx
-                        .send(PluginOutgoing::event(map))
+                    checked_send(&out_tx, PluginOutgoing::event(map))
                         .await
-                        .map_err(|_| mlua::Error::runtime("nefor.emit: stdout writer closed"))
+                        .map_err(emission_error)
                 }
             })?;
         nefor.set("emit", f)?;
@@ -402,10 +411,9 @@ impl LuaHost {
                         None => JsonMap::new(),
                     };
                     map.insert("kind".into(), JsonValue::String(full_kind));
-                    out_tx
-                        .send(PluginOutgoing::event(map))
+                    checked_send(&out_tx, PluginOutgoing::event(map))
                         .await
-                        .map_err(|_| mlua::Error::runtime("nefor.emit_raw: stdout writer closed"))
+                        .map_err(emission_error)
                 }
             })?;
         nefor.set("emit_raw", f)?;
@@ -428,6 +436,31 @@ impl LuaHost {
     fn set_state_for_test(&self, s: PluginState) {
         set_state(&self.inner.state, s);
     }
+}
+
+// Stable admission categories, not payload-dependent diagnostics. Scripts own
+// their correlation and any fallback terminal; the host cannot infer either.
+fn admission_category(error: &mlua::Error) -> Option<&'static str> {
+    match error {
+        mlua::Error::CallbackError { cause, .. } => admission_category(cause),
+        mlua::Error::RuntimeError(message) => match message.as_str() {
+            "nefor.emit admission: frame_too_large" => Some("frame_too_large"),
+            "nefor.emit admission: invalid_framing" => Some("invalid_framing"),
+            "nefor.emit admission: writer_closed" => Some("writer_closed"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn emission_error(error: TransportError) -> mlua::Error {
+    let category = match error {
+        TransportError::FrameTooLarge { .. } => "frame_too_large",
+        TransportError::InvalidFraming => "invalid_framing",
+        TransportError::WriterClosed => "writer_closed",
+        other => return mlua::Error::external(other),
+    };
+    mlua::Error::runtime(format!("nefor.emit admission: {category}"))
 }
 
 // ---- state helpers --------------------------------------------------------
@@ -614,6 +647,33 @@ mod tests {
             Timestamp::parse("2026-04-21T00:00:00.000Z").expect("valid"),
             map,
         )
+    }
+
+    #[tokio::test]
+    async fn closed_writer_is_classified_and_encoding_failure_is_not_admitted() {
+        let (host, mut rx) = host_ready().await;
+        host.exec_script(
+            "encoding",
+            r#"
+            local ok, err = pcall(nefor.emit, "bad", {value=function() end})
+            assert(not ok and nefor.emission_error_kind(err) == nil)
+        "#,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        host.exec_script(
+            "closed",
+            r#"
+            for _, publish in ipairs({nefor.emit, nefor.emit_raw}) do
+                local ok, err = pcall(publish, "result", {id="owned"})
+                assert(not ok and nefor.emission_error_kind(err) == "writer_closed")
+            end
+        "#,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

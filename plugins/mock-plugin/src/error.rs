@@ -8,6 +8,15 @@ use std::path::PathBuf;
 /// All failure modes inside mock-plugin.
 #[derive(Debug, thiserror::Error)]
 pub enum MockError {
+    #[error("stdin ended during script execution; accepted effects may have occurred")]
+    InputEnded,
+
+    #[error("stdout writer did not drain during teardown")]
+    WriterDrain,
+
+    #[error("script task failed: {0}")]
+    Task(#[source] tokio::task::JoinError),
+
     /// User passed `--script <path>` but the file doesn't exist.
     #[error("script file not found: {0}")]
     ScriptNotFound(PathBuf),

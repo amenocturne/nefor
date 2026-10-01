@@ -607,3 +607,154 @@ async fn mock_provider_completes_tool_calls_and_reports_behavior_faults() {
 
     finish(child, stdin, script).await;
 }
+
+async fn send_request(stdin: &mut tokio::process::ChildStdin, kind: &str, id: &str) {
+    let body = serde_json::json!({"kind": kind, "id": id})
+        .as_object()
+        .unwrap()
+        .clone();
+    let env = Envelope::event(PluginName::new("peer").unwrap(), Timestamp::now(), body);
+    stdin
+        .write_all(format!("{}\n", env.to_line()).as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_emits_are_script_owned_errors_and_later_request_works() {
+    let script = temp_script(
+        "admission",
+        r#"
+        nefor.on("peer.request", function(body)
+            if body.id ~= "later" then
+                local publish = body.id == "raw" and nefor.emit_raw or nefor.emit
+                local ok, err = pcall(publish, "result", {id=body.id, text=string.rep("x", 16*1024*1024)})
+                assert(not ok and nefor.emission_error_kind(err) == "frame_too_large")
+                -- This script owns the actual id and existing terminal shape.
+                nefor.emit_raw("peer.error", {id=body.id, error="output admission failed; earlier effects may have occurred"})
+            else
+                nefor.emit_raw("peer.result", {id=body.id, text="ok"})
+            end
+        end)
+    "#,
+    );
+    let mut child = spawn_mock(&script).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    assert!(read_line(&mut reader).await.unwrap().contains("ready"));
+    send_ready_ok(&mut stdin).await;
+    for id in ["prefixed", "raw", "later"] {
+        send_request(&mut stdin, "peer.request", id).await;
+        let line = read_line(&mut reader).await.unwrap();
+        let out = PluginOutgoing::parse_line(&line).unwrap();
+        let nefor_protocol::Body::Event(body) = out.body else {
+            panic!("event")
+        };
+        assert_eq!(body["id"], id);
+        assert_eq!(
+            body["kind"],
+            if id == "later" {
+                "peer.result"
+            } else {
+                "peer.error"
+            }
+        );
+        assert!(line.len() < 256);
+    }
+    send_shutdown(&mut stdin).await;
+    assert!(timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    cleanup(&script);
+}
+
+#[tokio::test]
+async fn escaped_detached_error_exits_without_fabricating_a_terminal() {
+    let script = temp_script(
+        "escaped",
+        r#"
+        nefor.on("peer.completion.request", function()
+            nefor.emit("accepted")
+            nefor.sleep(10)
+            error("handler lost authority")
+        end)
+    "#,
+    );
+    let mut child = spawn_mock(&script).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    read_line(&mut reader).await.unwrap();
+    send_ready_ok(&mut stdin).await;
+    send_request(&mut stdin, "peer.completion.request", "actual-id").await;
+    assert!(read_line(&mut reader).await.unwrap().contains("accepted"));
+    // Keep stdin open: loss must be observed without another inbound message.
+    assert!(!timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(read_line(&mut reader).await.is_none());
+    cleanup(&script);
+}
+
+#[tokio::test]
+async fn terminal_stdin_fault_reclaims_a_sleeping_script() {
+    let script = temp_script(
+        "stdin-fault",
+        r#"
+        nefor.on("peer.completion.request", function()
+            nefor.emit("accepted")
+            nefor.sleep(60000)
+            nefor.emit("false-success")
+        end)
+    "#,
+    );
+    let mut child = spawn_mock(&script).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    read_line(&mut reader).await.unwrap();
+    send_ready_ok(&mut stdin).await;
+    send_request(&mut stdin, "peer.completion.request", "actual-id").await;
+    read_line(&mut reader).await.unwrap();
+    stdin.write_all(&[0xff, b'\n']).await.unwrap();
+    stdin.flush().await.unwrap();
+    assert!(!timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(read_line(&mut reader).await.is_none());
+    cleanup(&script);
+}
+
+#[tokio::test]
+async fn startup_rejection_does_not_wait_for_ready_ok() {
+    let script = temp_script("reject-ready", "");
+    let mut child = spawn_mock(&script).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    read_line(&mut reader).await.unwrap();
+    let env = Envelope::system(
+        PluginName::engine(),
+        Timestamp::now(),
+        SystemBody::Error {
+            code: nefor_protocol::ErrorCode::InvalidReady,
+            message: "rejected".into(),
+            offending: None,
+        },
+    );
+    stdin
+        .write_all(format!("{}\n", env.to_line()).as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    assert!(!timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    cleanup(&script);
+}
