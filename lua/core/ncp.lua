@@ -285,7 +285,8 @@ local function delivery_failed(target, phase, extent, err, envs)
     local item = {}
     for _, key in ipairs({ "kind", "id", "in_reply_to", "run_id", "chat_id" }) do
       local value = env.body and env.body[key]
-      if type(value) == "string" then item[key] = bounded_diagnostic(value) end
+      -- Correlation identity must never be shortened into another identity.
+      if type(value) == "string" and #value <= 512 then item[key] = value end
     end
     correlations[#correlations + 1] = item
   end

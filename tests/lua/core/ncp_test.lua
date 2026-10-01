@@ -1139,7 +1139,7 @@ local function test_delivery_failures_are_bounded_local_and_not_replayed()
       error(string.rep("diagnostic", 1000))
     end })
     for i = 1, 2 do
-      ncp.invoke_from_plugin("src", make_event({ kind = "tool.invoke", id = "firing-" .. i }))
+      ncp.invoke_from_plugin("src", make_event({ kind = "tool.invoke", id = "firing-" .. i, chat_id = string.rep("x", 513) }))
     end
     _test.calls_clear()
     ncp.dispatch(_test.bus_log())
@@ -1152,6 +1152,7 @@ local function test_delivery_failures_are_bounded_local_and_not_replayed()
         assert_eq(env.body.phase, "egress")
         assert_eq(env.body.extent, "unknown")
         assert_eq(env.body.correlations[1].id, "firing-1")
+        assert_eq(env.body.correlations[1].chat_id, nil, "oversized identities are omitted, never truncated")
         assert_true(#env.body.message <= 512)
       end
     end
