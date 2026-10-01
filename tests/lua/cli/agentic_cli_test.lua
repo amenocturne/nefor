@@ -148,6 +148,34 @@ do
   assert(exits[1].code == 1)
 end
 reset()
+do
+  local id = start("json")
+  emit { kind = "sessions.flush_done", request_id = id }
+  assert(#out == 0 and #exits == 0, "unsolicited flush completion cannot finish(nil)")
+  activate()
+  emit { kind = "agentic_loop.request_completed", request_id = id, status = "success", answer = "not persisted" }
+  emit { kind = "sessions.persistence_failed", message = "flush owner failed" }
+  local result = nefor.json.decode(table.concat(out))
+  assert(result.status == "error" and result.error.code == "session_failure")
+  assert(#exits == 1 and exits[1].code == 1)
+  emit { kind = "sessions.flush_done", request_id = id }
+  assert(#exits == 1, "late flush acknowledgment is inert")
+end
+reset()
+do
+  local id = start("json")
+  activate()
+  local send = nefor.engine.send
+  nefor.engine.send = function(payload)
+    if nefor.json.decode(payload).body.kind == "sessions.flush_request" then error("writer unavailable") end
+    return send(payload)
+  end
+  emit { kind = "agentic_loop.request_completed", request_id = id, status = "error", error = { message = "rejected" } }
+  nefor.engine.send = send
+  assert(#exits == 1 and exits[1].code == 1)
+  assert(nefor.json.decode(table.concat(out)).error.code == "session_failure")
+end
+reset()
 start("json")
 timers[1].on_exit()
 assert(exits[1].code == 1 and nefor.json.decode(table.concat(out)).error.code == "startup_failure")

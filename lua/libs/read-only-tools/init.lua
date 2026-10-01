@@ -11,6 +11,7 @@
 -- advertisement and dispatch on every live gate hello.
 
 local tool = require("libs.tool")
+local envelope = require("core.envelope")
 local instruction_files = require("libs.instruction-files")
 local tool_display = require("libs.chat.tool_display")
 
@@ -31,6 +32,14 @@ end
 
 local SOURCE_NAME = "read-only-tools"
 local GATE = "tool-gate"
+
+local function emit_result(body)
+  local admitted = envelope.checked_emit_as(SOURCE_NAME, nil, body)
+  if admitted then return end
+  local fallback, err = envelope.checked_emit_as(SOURCE_NAME, nil, { kind = "tool.result", id = body.id,
+    error = "read-only-tools: response could not be published", error_code = "output_rejected" })
+  if not fallback then error({ kind = "tool_output_unavailable", error = err }, 0) end
+end
 
 local function discover_instruction_files(args, call)
   local result = instruction_files.discover(args.path or ".", {
@@ -171,7 +180,7 @@ local function build(opts)
   end
 
   return tool.actor {
-    source = tool.source { name = SOURCE_NAME, tools = tools },
+    source = tool.source { name = SOURCE_NAME, tools = tools, emit = emit_result },
     gate = GATE,
   }
 end

@@ -117,6 +117,49 @@ assert_true(not pcall(rot.build, {
   } },
 }), "extra tool cannot collide with an included base name")
 
+-- A checked output rejection is settled by the invocation owner using a small
+-- correlated error. A failing extra must not send a second result after success.
+do
+  local send = nefor.engine.send
+  local rejected, terminals = 0, 0
+  nefor.engine.send = function(payload)
+    local body = nefor.json.decode(payload).body
+    if body.kind == "tool.result" and type(body.output) == "string" and #body.output > 1024 then
+      rejected = rejected + 1
+      error("frame_too_large")
+    end
+    if body.kind == "tool.result" then terminals = terminals + 1 end
+    return send(payload)
+  end
+  local result = invoke(extras, "custom", { value = string.rep("Ж", 2048) })
+  assert_true(result.output == nil and result.error_code == "output_rejected",
+    "rejected response becomes one correlated terminal")
+  assert_true(rejected == 1 and terminals == 1, "no recursive fallback")
+  local later = invoke(extras, "custom", { value = "later response" })
+  assert_true(later.output == "later response", "producer remains usable after rejection")
+  nefor.engine.send = send
+end
+for _, already_settled in ipairs({ false, true }) do
+  local terminals = 0
+  local send = nefor.engine.send
+  nefor.engine.send = function(payload)
+    if nefor.json.decode(payload).body.kind == "tool.result" then terminals = terminals + 1 end
+    return send(payload)
+  end
+  local throwing = rot.build { extra_tools = { tool.define {
+    name = "custom", description = "Throwing custom tool",
+    parameters = { type = "object" }, display = custom_display("custom"),
+    handler = function(_, emit)
+      if already_settled then emit.ok("completed") end
+      error("expected external invocation failure")
+    end,
+  } } }
+  local result = invoke(throwing, "custom", {})
+  assert_true(terminals == 1, "throwing invocation settles exactly once")
+  assert_true(already_settled and result.output == "completed" or not already_settled and result.error ~= nil)
+  nefor.engine.send = send
+end
+
 local display = require("libs.chat.tool_display")
 local contract = {
   compact = { label = "Read file", primary = { label = "path", select = { source = "args", path = "path" }, kind = "path" } },

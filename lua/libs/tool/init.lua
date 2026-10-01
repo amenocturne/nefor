@@ -250,6 +250,7 @@ function M.source(opts)
     pending[id] = call
     local ok, raised = pcall(definition.handler, args, call)
     if not ok then
+      if type(raised) == "table" and raised.kind == "tool_output_unavailable" then error(raised, 0) end
       if pending[id] == call then
         call.err(definition.name .. ": handler raised: " .. tostring(raised))
       else

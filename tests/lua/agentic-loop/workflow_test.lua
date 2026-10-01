@@ -622,6 +622,81 @@ local function begin_turn(text, submission_id)
   return exec
 end
 
+-- Execute rejection is not a terminal result from a run which never began.
+do
+  fresh_loop()
+  local first = begin_turn("rejected", "reject-request")
+  _test.calls_clear()
+  raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = "stale", message = "stale" })
+  assert_eq(agentic_loop._internals.state.current_run_id, first.body.id)
+  raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = first.body.id, message = "preflight rejected" })
+  local completed = assert(find_kind(decode_calls(), "agentic_loop.request_completed"))
+  assert_eq(completed.body.request_id, "reject-request")
+  assert_eq(completed.body.status, "error")
+  assert_eq(completed.body.error.code, "execute_rejected")
+  assert_eq(agentic_loop._internals.state.current_run_id, nil)
+  assert(find_kind(decode_calls(), "agentic_loop.idle"))
+  assert_eq(find_kind(decode_calls(), "mag.run_result"), nil)
+  _test.calls_clear()
+  raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = first.body.id, message = "duplicate" })
+  assert_eq(#decode_calls(), 0)
+  local second = begin_turn("later", "later-request")
+  assert(second.body.id ~= first.body.id)
+  _test.calls_clear()
+  raw_send_to_loop("mag", { kind = "mag.run_started", run_id = second.body.id })
+  raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = second.body.id, message = "accepted error is not rejection" })
+  assert_eq(agentic_loop._internals.state.current_run_id, second.body.id)
+  assert_eq(find_kind(decode_calls(), "agentic_loop.request_completed"), nil)
+end
+
+do
+  fresh_loop()
+  local first = begin_turn("first", "queue-first")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued", submission_id = "queue-next" })
+  _test.calls_clear()
+  raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = first.body.id, message = "rejected" })
+  local next_execute = assert(find_kind(decode_calls(), "mag.execute"))
+  assert_eq(task_prompt(next_execute.body), "queued", "existing queue promotion survives rejection")
+  assert_eq(find_kind(decode_calls(), "agentic_loop.request_completed").body.request_id, "queue-first")
+end
+
+do
+  fresh_loop()
+  local first = begin_turn("delivery rejected", "delivery-rejected-request")
+  _test.calls_clear()
+  raw_send_to_loop("engine", { kind = "ncp.delivery_failed", peer = "mag", extent = "none",
+    message = "writer disconnected", correlations = { { kind = "mag.execute", id = first.body.id } } })
+  local completed = assert(find_kind(decode_calls(), "agentic_loop.request_completed"))
+  assert_eq(completed.body.error.code, "execute_rejected")
+  assert_eq(completed.body.request_id, "delivery-rejected-request")
+  assert_eq(agentic_loop._internals.state.current_run_id, nil)
+end
+
+-- Checked publication failures reach the turn owner, not actor exception logs.
+do
+  fresh_loop()
+  local first = begin_turn("seed", "seed-request")
+  raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = first.body.id, message = "rejected" })
+  local send = nefor.engine.send
+  local rejected = 0
+  nefor.engine.send = function(payload, target)
+    if nefor.json.decode(payload).body.kind == "mag.execute" then
+      rejected = rejected + 1
+      error("frame_too_large")
+    end
+    return send(payload, target)
+  end
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "oversized", submission_id = "oversized-request" })
+  nefor.engine.send = send
+  assert_eq(rejected, 1)
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "rejected publication is absent")
+  local completed = assert(find_kind(decode_calls(), "agentic_loop.request_completed"))
+  assert_eq(completed.body.request_id, "oversized-request")
+  assert_eq(completed.body.error.code, "execute_rejected")
+  assert_eq(agentic_loop._internals.state.current_run_id, nil)
+end
+
 -- Convenience: start a turn and bind its run (mag.run_started).
 local function begin_bound_turn(text, scope)
   local exec = begin_turn(text)

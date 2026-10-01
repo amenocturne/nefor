@@ -259,6 +259,7 @@ local SOURCE_NAME = "lead-workflow"
 
 local register_active_run
 local submit_loaded_run
+local fail_pending_apply
 local invalidate_pending_mag_loads
 local invalidate_pending_mag_applies
 local graph_status
@@ -277,6 +278,13 @@ local expire_termination_waiter
 -- The tool source is built once the handlers below exist; every result,
 -- immediate or deferred, settles through it by invocation id.
 local tool_source
+
+local function emit_tool_result(body)
+  local admitted = envelope.checked_emit_as(SOURCE_NAME, nil, body)
+  if admitted then return end
+  emit_as(SOURCE_NAME, nil, { kind = "tool.result", id = body.id,
+    error = "lead-workflow: response could not be published", error_code = "output_rejected" })
+end
 
 local function emit_tool_result_ok(firing_id, output, completion_delivery)
   tool_source.result(firing_id, { output = output, completion_delivery = completion_delivery })
@@ -1135,13 +1143,25 @@ local function handle_mag_pre_start_error(body)
   local run_id = body.in_reply_to
   local run = type(run_id) == "string" and state.active_runs[run_id] or nil
   if not run or run.phase ~= "queued" or run.dispatch_firing_id == nil then return false end
-  handle_mag_run_result({
-    kind = "mag.run_result",
-    in_reply_to = run_id,
-    run_id = run_id,
-    status = "failed",
-    error = tostring(body.message or "MAG rejected the run before it started"),
+  local message = tostring(body.message or "MAG rejected the run before it started")
+  local rejected, transitioned = run_registry:reject(run_id, message)
+  if not transitioned then return false end
+  refresh_active_run_id()
+  local al = require("libs.agentic-loop")
+  al.record_request_outcome(run.request_ids, "error", {
+    code = "execute_rejected", message = message, run_id = run_id,
   })
+  for _, firing_id in ipairs(rejected.waiters) do emit_await_outcome(firing_id, rejected.outcome) end
+  local grace = cancel_completion_grace(run_id)
+  if grace then emit_await_outcome(grace.firing_id, rejected.outcome, "sync") end
+  for _, waiter in ipairs(take_termination_waiters(run_id) or {}) do
+    emit_tool_result_err(waiter.firing_id, message)
+  end
+  if not grace and #rejected.waiters == 0 then
+    emit_mag_result_block(run, "failed", nil, message)
+    relay_kernel_completion(run, false, nil, "Execute rejected before starting: " .. message)
+  end
+  settle_request_run(run)
   return true
 end
 
@@ -1736,8 +1756,12 @@ local function begin_mag_load(firing_id, action, args, ws, provenance)
     request_ids = provenance.request_ids,
   }
 
-  emit_as(SOURCE_NAME, "mag", mag.compile_request(load_id, ws, args.file,
+  local admitted = envelope.checked_emit_as(SOURCE_NAME, "mag", mag.compile_request(load_id, ws, args.file,
     module_roots_for(ws), project_build))
+  if not admitted then
+    state.pending_mag_load[load_id] = nil
+    emit_tool_result_err(firing_id, "MAG compile request could not be published")
+  end
 end
 
 
@@ -1878,7 +1902,11 @@ submit_loaded_run = function(pending, body, error_prefix)
   run.invocation_label = pending.invocation_label or pending.run_name
   run.invocation_kind = pending.invocation_kind
   begin_completion_grace(run, async_run_ack(pending, body))
-  emit_as(SOURCE_NAME, "mag", exec)
+  local admitted, err = envelope.checked_emit_as(SOURCE_NAME, "mag", exec)
+  if not admitted then
+    handle_mag_pre_start_error({ in_reply_to = exec.id, message = "Execute not published: " .. tostring(err) })
+    return false
+  end
   return true
 end
 
@@ -1923,7 +1951,11 @@ local function submit_loaded_apply(pending, body)
   local apply = { kind = "mag.apply", id = request_id, run_id = pending.run_id,
     source = "lead-workflow.mag.apply", artifact = body.artifact }
   if next(overlay) ~= nil then apply.params_overlay = overlay end
-  emit_as(SOURCE_NAME, "mag", apply)
+  local admitted, err = envelope.checked_emit_as(SOURCE_NAME, "mag", apply)
+  if not admitted then
+    fail_pending_apply({ in_reply_to = request_id, message = "Apply not published: " .. tostring(err) })
+    return false
+  end
   return true
 end
 
@@ -1965,7 +1997,7 @@ local function resolve_pending_apply(body)
   return true
 end
 
-local function fail_pending_apply(body)
+fail_pending_apply = function(body)
   local request_id = body.in_reply_to
   local pending = type(request_id) == "string"
     and state.pending_mag_apply[request_id] or nil
@@ -2118,7 +2150,7 @@ local function tool_definitions()
   return definitions
 end
 
-tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions() }
+tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions(), emit = emit_tool_result }
 
 local function handle_tool_invoke(body)
   tool_source.invoke(body)
@@ -2272,10 +2304,36 @@ local function receive_msg(entry)
     resolve_pending_apply(body)
     return
   end
+  if kind == "ncp.delivery_failed" and body.peer == "mag" then
+    if replay_window.active() then return end
+    if body.extent == "none" then
+      for _, correlation in ipairs(body.correlations or {}) do
+        local rejection = { in_reply_to = correlation.id, message = body.message }
+        if correlation.kind == "mag.apply" then
+          fail_pending_apply(rejection)
+        elseif correlation.kind == "mag.execute" then
+          handle_mag_pre_start_error(rejection)
+        elseif correlation.kind == "mag.load" or correlation.kind == "mag.build" then
+          fail_pending_load(rejection)
+        end
+      end
+    else
+      reconcile_mag_authority_loss("MAG delivery failed; accepted effects are unknown")
+    end
+    return
+  end
+  if (kind == "engine.plugin_transport_failed" or kind == "engine.plugin_delivery_lost")
+      and body.plugin == "mag" then
+    if not replay_window.active() then
+      reconcile_mag_authority_loss("MAG transport capability was lost; accepted outcomes are unknown")
+    end
+    return
+  end
+
   -- mag.error may reject either an in-flight load or a submitted execute
   -- before begin_run. The load owners consume their correlations first; a
-  -- queued registry entry is settled canonically as a failed run so its grace
-  -- timer cannot emit a false executing acknowledgment.
+  -- queued registry entry retains an admission rejection, not an invented
+  -- executor result; its grace timer cannot emit a false executing acknowledgment.
   if kind == "mag.error" then
     if fail_pending_apply(body) then return end
     if handle_mag_pre_start_error(body) then return end

@@ -1490,7 +1490,7 @@ do
   assert_eq(lw._internals.state.active_runs[run_id], nil,
     "pre-start failure leaves no queued active registry entry")
   assert_eq(lw._internals.run_registry:get(run_id).phase, "terminal",
-    "pre-start failure is retained only as a canonical failed terminal outcome")
+    "pre-start failure is retained as a registry admission outcome")
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "mag.run_started" and c.body.run_id == run_id
   end), nil, "lead-workflow does not fabricate mag.run_started for a rejected run")
@@ -1500,8 +1500,11 @@ do
     "a stale grace callback cannot emit status=executing after failure")
   invoke_tool("status-after-pre-start-failure", "mag-status", { run_id = run_id })
   local status = tool_result("status-after-pre-start-failure")
-  assert_eq(status.body.output.run.status, "failed",
-    "mag-status reports the canonical failure, never a queued ghost")
+  assert_eq(status.body.output.run.status, "rejected",
+    "mag-status reports admission rejection, never a queued ghost")
+  local rejected = lw._internals.run_registry:get(run_id)
+  assert_eq(rejected.canonical_body, nil, "no fabricated executor terminal")
+  assert_eq(rejected.canonical.terminal, nil, "await does not invent a never-started run result")
 end
 
 -- ------------------------------------------------------------------
@@ -3109,6 +3112,39 @@ do
   assert_true(completed ~= nil, "owner terminal releases the final obligation")
   assert_eq(completed.body.status, "error")
   assert_eq(completed.body.error.code, "completion_undeliverable")
+end
+
+-- The live capability observation, not process exit timing, reconciles unknown
+-- delivery extent. Known-none delivery errors reject only their correlation.
+for _, kind in ipairs({ "ncp.delivery_failed", "engine.plugin_transport_failed", "engine.plugin_delivery_lost" }) do
+  fresh()
+  local registry = lw._internals.run_registry
+  local run_id = registry:mint_run_id()
+  lw._internals.register_active_run(run_id, {}, "terminal", "delivery-dispatch",
+    "delivery-run", sessions.current_id(), nil, nil, { "delivery-request" })
+  feed("mag", { kind = "mag.run_started", run_id = run_id })
+  invoke_tool("delivery-waiter", "mag-await", { run_id = run_id })
+  _test.calls_clear()
+  feed("engine", { kind = kind, peer = "mag", plugin = "mag", extent = "unknown" })
+  local waiter = assert(tool_result("delivery-waiter"))
+  assert_eq(waiter.body.error_code, "await_run_authority_lost")
+  assert_eq(registry:get(run_id).status, "unknown")
+  assert_eq(registry:get(run_id).canonical_body, nil)
+  _test.calls_clear()
+  feed("engine", { kind = kind, peer = "mag", plugin = "mag", extent = "unknown" })
+  assert_eq(#decode_calls(), 0, "duplicate uncertainty is inert")
+end
+
+do
+  fresh()
+  controlled_grace()
+  local run_id = start_file_run("delivery-none", "delivery-none.mag")
+  _test.calls_clear()
+  feed("engine", { kind = "ncp.delivery_failed", peer = "mag", extent = "none",
+    message = "disconnected", correlations = { { kind = "mag.execute", id = run_id } } })
+  local result = assert(tool_result("delivery-none"))
+  assert_eq(result.body.error_code, "await_run_rejected")
+  assert_eq(lw._internals.run_registry:get(run_id).canonical_body, nil)
 end
 
 -- MAG authority loss finalizes registry handles and whole requests without

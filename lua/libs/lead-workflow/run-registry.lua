@@ -264,6 +264,31 @@ function M:detach_waiter(firing_id)
   return true
 end
 
+-- A queued execute rejection is a registry-owned admission outcome, not an
+-- executor terminal. Retain it for await/status without fabricating a result.
+function M:reject(run_id, message)
+  local run = self.active_runs[run_id]
+  if not run or run.phase ~= "queued" then return nil, false end
+  run.phase = "terminal"
+  run.status = "rejected"
+  run.terminal_status = "rejected"
+  run.updated_at = self.now()
+  run.canonical = typed_error("await_run_rejected", message, run_id, "rejected")
+  run.canonical.run_name = run.run_name
+  run.canonical.invocation_label = run.invocation_label
+  run.error = message
+  local waiters = {}
+  for firing_id in pairs(run.waiters) do waiters[#waiters + 1] = firing_id end
+  table.sort(waiters)
+  for _, firing_id in ipairs(waiters) do self.waiter_runs[firing_id] = nil end
+  run.waiters = {}
+  self.active_runs[run_id] = nil
+  self.completed_runs[#self.completed_runs + 1] = run
+  self.terminal_order[#self.terminal_order + 1] = run_id
+  self:enforce_terminal_limit(run.session_id)
+  return { run = run, waiters = waiters, outcome = run.canonical }, true
+end
+
 function M:settle(run_id, body)
   local run = self.active_runs[run_id]
   if not run then return nil, false end

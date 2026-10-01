@@ -55,7 +55,12 @@ function M.start(opts)
 
   local function fail(code, message)
     local err = { code = code, message = tostring(message) }
-    if phase == "submitted" then
+    if phase == "flushing" then
+      if code ~= "session_failure" then return end
+      result.status = "error"
+      result.error = err
+      finish(result)
+    elseif phase == "submitted" then
       if settlement_requested then return end
       settlement_requested = true
       loop.fail_request(request_id, err)
@@ -113,8 +118,12 @@ function M.start(opts)
       phase = "flushing"
       -- A bus barrier makes the sessions actor consume every prior canonical
       -- fact before acknowledging the final flush; callback order is irrelevant.
-      envelope.emit_as("cli", nil, { kind = "sessions.flush_request", request_id = request_id })
-    elseif kind == "sessions.flush_done" and body.request_id == request_id then
+      local admitted, err = envelope.checked_emit_as("cli", nil,
+        { kind = "sessions.flush_request", request_id = request_id })
+      if not admitted then
+        fail("session_failure", "Session flush request was not published: " .. tostring(err))
+      end
+    elseif phase == "flushing" and kind == "sessions.flush_done" and body.request_id == request_id then
       if body.error then result.status = "error"; result.error = body.error end
       finish(result)
     elseif kind == "chat.error.append" and phase == "starting" then

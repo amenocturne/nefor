@@ -76,7 +76,7 @@ end
 -- `generic-tool`) — combinators reads `envelope.from` to namespace
 -- declared types, so Lua-resident type registrations have to set the
 -- field to the canonical-plugin name, not the engine.
-function M.emit_as(from, target, body)
+local function emit_as(from, target, body, checked)
   local ok, payload = pcall(json.encode, {
     type = "event",
     from = from,
@@ -102,7 +102,7 @@ function M.emit_as(from, target, body)
     })
     if popup_ok and nefor.engine and nefor.engine.send then
       for _, peer in ipairs(nefor.engine.plugins()) do
-        nefor.engine.send(popup_payload, peer)
+        pcall(nefor.engine.send, popup_payload, peer)
       end
     end
     if nefor.engine and type(nefor.engine.shutdown) == "function" then
@@ -115,7 +115,28 @@ function M.emit_as(from, target, body)
   -- entry, with target=None on the broker side). Ship one entry; the
   -- broker's targeted/broadcast distinction handles peer fan-out without
   -- the actor.lua bus subscriber dispatching the same envelope N times.
-  nefor.engine.send(payload, target)
+  if checked then
+    local sent, err = pcall(nefor.engine.send, payload, target)
+    if not sent then return nil, err end
+  else
+    nefor.engine.send(payload, target)
+  end
+  return true
+end
+
+function M.emit_as(from, target, body)
+  return emit_as(from, target, body, false)
+end
+
+-- Admission is checked before publication by the engine. Encoding still uses
+-- the explicitly selected fail-fast policy above; this is not exception
+-- containment around arbitrary application code.
+function M.checked_emit_as(from, target, body)
+  return emit_as(from, target, body, true)
+end
+
+function M.checked_emit(target, body)
+  return M.checked_emit_as("engine", target, body)
 end
 
 -- Test-only: reset module-level counters.

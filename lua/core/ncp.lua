@@ -268,6 +268,40 @@ end
 -- per-envelope inner step of the framework default (when a wrapper has
 -- no `to_plugin` override) and by no-override peers iterating their own
 -- batches via the framework default.
+-- Diagnostics are bus-local and bounded: never send them through the egress
+-- path which failed, or replay a callback whose partial effects are unknown.
+local function bounded_diagnostic(value)
+  local text = tostring(value)
+  local stop = math.min(#text, 512)
+  while stop > 0 and stop < #text and text:byte(stop + 1) >= 128
+      and text:byte(stop + 1) < 192 do stop = stop - 1 end
+  return text:sub(1, stop)
+end
+
+local function delivery_failed(target, phase, extent, err, envs)
+  local correlations = {}
+  for i, env in ipairs(envs) do
+    if i > 16 then break end
+    local item = {}
+    for _, key in ipairs({ "kind", "id", "in_reply_to", "run_id", "chat_id" }) do
+      local value = env.body and env.body[key]
+      if type(value) == "string" then item[key] = bounded_diagnostic(value) end
+    end
+    correlations[#correlations + 1] = item
+  end
+  local ok, failure = pcall(function()
+    nefor.engine.send(encode({ type = "event", from = "engine", ts = nefor.engine.now(),
+      body = { kind = "ncp.delivery_failed", peer = target, phase = phase,
+        extent = extent, message = bounded_diagnostic(err), correlations = correlations,
+        count = #envs } }))
+  end)
+  if not ok then
+    nefor.log.error("ncp: delivery failure observation could not be published", {
+      peer = target, error = bounded_diagnostic(failure),
+    })
+  end
+end
+
 local function default_deliver_for(target, env, entry_target, encoded_cache)
   -- Default to_plugin: deliver the envelope verbatim to `target`,
   -- subject to:
@@ -299,15 +333,21 @@ local function default_deliver_for(target, env, entry_target, encoded_cache)
   if payload then
     work_stats.encode_cache_hits = work_stats.encode_cache_hits + 1
   else
-    payload = encode({
+    local ok, result = pcall(encode, {
       type = env.type,
       from = env.from,
       ts   = env.ts,
       body = env.body,
     })
+    if not ok then
+      delivery_failed(target, "admission", "none", result, { env })
+      return
+    end
+    payload = result
     if encoded_cache then encoded_cache[env] = payload end
   end
-  pcall(nefor.engine.deliver, target, payload)
+  local ok, err = pcall(nefor.engine.deliver, target, payload)
+  if not ok then delivery_failed(target, "enqueue", "none", err, { env }) end
 end
 
 -- Fan a per-peer batch of envelopes (already deep-copied for this
@@ -320,17 +360,21 @@ end
 -- Wrapper overrides don't see entry_target directly; if a wrapper needs
 -- targeting, it inspects env.body.kind / env.from and delivers itself.
 local function call_to_plugin_for_batch(target, envs, entry_targets, encoded_cache)
+  local routed, targets = {}, {}
+  for i, env in ipairs(envs) do
+    if not (env.body and env.body.kind == "ncp.delivery_failed") then
+      routed[#routed + 1] = env
+      targets[#routed] = entry_targets[i]
+    end
+  end
+  envs, entry_targets = routed, targets
   if #envs == 0 then return end
   local t = plugin_transforms[target]
   local cb = t and t.to_plugin
   if cb then
     local ok, err = pcall(cb, envs)
     if not ok then
-      nefor.log.warn("ncp: to_plugin raised; dropping batch for peer", {
-        peer  = target,
-        count = #envs,
-        error = tostring(err),
-      })
+      delivery_failed(target, "egress", "unknown", err, envs)
     end
     return
   end

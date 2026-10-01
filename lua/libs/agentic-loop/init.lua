@@ -473,6 +473,8 @@ local function derive_program_seams(modification)
   return { source_actor = source_actor, entry_actor = entry_actor, llm_actor = llm_actor }, nil
 end
 
+local handle_lead_program_error
+
 -- Kick the turn-program load handshake (idempotent while in flight). The
 -- mag.loaded reply returns the exact immutable program artifact and flushes queued submits.
 local function ensure_lead_program_loaded()
@@ -481,14 +483,19 @@ local function ensure_lead_program_loaded()
   p.load_id = "lead-turn-load-" .. envelope.uuid_lite()
   local source_dir = lead_program_source_dir()
   local module_roots = lead_program_module_roots(source_dir)
-  emit("mag", mag_workspace.compile_request(p.load_id, source_dir, p.entry,
+  local admitted, err = envelope.checked_emit("mag", mag_workspace.compile_request(p.load_id, source_dir, p.entry,
     module_roots, p.project_build))
+  if not admitted then
+    handle_lead_program_error({ in_reply_to = p.load_id, message = "Lead program load was not published: " .. tostring(err) })
+    return
+  end
   nefor.log.info("agentic-loop: loading lead turn-program", {
     source_dir = source_dir, entry = p.entry,
   })
 end
 
 local flush_pending_user_inputs
+local handle_execute_rejection
 
 local function release_lead_program()
   local p = state.lead_program
@@ -542,9 +549,9 @@ local function handle_lead_program_loaded(body)
   flush_pending_user_inputs()
 end
 
-local function handle_lead_program_error(body)
+handle_lead_program_error = function(body)
   local p = state.lead_program
-  if body.in_reply_to ~= p.load_id then return end
+  if p.load_id == nil or body.in_reply_to ~= p.load_id then return end
   p.load_id = nil
   emit("nefor-tui", {
     kind = "chat.error.append",
@@ -650,7 +657,12 @@ local function submit_orchestrator_run(user_text, submission_ids, input_cause, r
     end
   end
   if run_model_snapshot ~= nil then execute.model_snapshot = run_model_snapshot end
-  envelope.emit_as("agentic-loop", "mag", execute)
+  local admitted, admission_error = envelope.checked_emit_as("agentic-loop", "mag", execute)
+  if not admitted then
+    handle_execute_rejection({ in_reply_to = run_id,
+      message = "Lead execute was not published: " .. tostring(admission_error) })
+    return nil
+  end
   nefor.log.info("agentic-loop: lead turn submitted to mag kernel", {
     run_id = run_id,
     text_preview = string.sub(user_text or "", 1, 80),
@@ -1099,6 +1111,7 @@ end
 local function handle_mag_run_started(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
+  turn.started = true
   if type(body.scope) ~= "string" or #body.scope == 0 then
     nefor.log.warn("agentic-loop: mag.run_started carried no scope; transcript binding skipped", {
       run_id = body.run_id,
@@ -1391,6 +1404,29 @@ local function finish_mag_run_result(body)
   flush_deferred()
   flush_pending_user_inputs()
   emit_idle_if_idle(run_id)
+end
+
+-- A rejected execute has no kernel run or manager projection to wait for.
+-- Keep it separate from accepted-run results and ignore stale/duplicate errors.
+handle_execute_rejection = function(body)
+  local turn = state.current_turn
+  if turn == nil or turn.started or turn.result_body ~= nil or body.in_reply_to ~= turn.run_id then return false end
+  local run_id, request_ids = turn.run_id, turn.request_ids or {}
+  state.current_run_id = nil
+  state.current_turn = nil
+  state.pending_steer = nil
+  local message = tostring(body.message or "Lead execution was rejected before starting")
+  emit("nefor-tui", { kind = "chat.error.append", title = "Lead execution rejected",
+    message = message, retryable = true })
+  fire_observers(state.complete_observers, run_id, "error")
+  request_lifecycle:set_terminal(request_ids, "error", "", {
+    code = "execute_rejected", message = message,
+  })
+  request_lifecycle:release_all(request_ids, "turn:" .. run_id)
+  flush_deferred()
+  flush_pending_user_inputs()
+  emit_idle_if_idle(run_id)
+  return true
 end
 
 local function handle_mag_run_result(body)
@@ -1979,9 +2015,24 @@ local function receive_msg(entry)
   if kind == "chat.reasoning.set" then handle_chat_reasoning_set(body); return end
   if kind == "chat.compaction.request" then handle_chat_compaction_request(body); return end
 
+  if kind == "ncp.delivery_failed" and body.peer == "mag" and body.extent == "none" then
+    for _, correlation in ipairs(body.correlations or {}) do
+      local rejection = { in_reply_to = correlation.id, message = body.message }
+      if correlation.kind == "mag.execute" then
+        handle_execute_rejection(rejection)
+      elseif correlation.kind == "mag.load" or correlation.kind == "mag.build" then
+        handle_lead_program_error(rejection)
+      end
+    end
+    return
+  end
+
   -- Turn-program load handshake.
   if kind == "mag.loaded" then handle_lead_program_loaded(body); return end
-  if kind == "mag.error"  then handle_lead_program_error(body); return end
+  if kind == "mag.error" then
+    if not handle_execute_rejection(body) then handle_lead_program_error(body) end
+    return
+  end
 
   -- Turn lifecycle.
   if kind == "mag.run_started" then handle_mag_run_started(body); return end

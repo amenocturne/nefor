@@ -328,3 +328,38 @@ status. Neither cancellation nor session end evicts inert cache records.
 change preview, run ownership, or execute/apply behavior. Source readiness does
 not activate an installed generation: adoption requires a separately authorized
 compatible runtime/config installation and a new process.
+
+## Owner-local delivery failure settlement
+
+`core.envelope.checked_emit` and `checked_emit_as` return engine admission
+rejections before publication to the emitting owner. JSON encoding retains the
+composition's explicit fail-fast policy; checked emission does not contain
+arbitrary application exceptions. Enqueue is not proof of peer consumption.
+
+NCP publishes bus-local `ncp.delivery_failed` observations with `peer`, `phase`
+(`admission`, `enqueue`, or `egress`), `extent` (`none` or `unknown`), a bounded
+diagnostic, and a bounded list of correlation fields from envelopes it actually
+possesses. These observations are never sent to process peers, preventing
+recursive failure diagnostics. Default delivery rejection means no enqueue for
+that item. An egress callback exception can follow partial effects; NCP never
+replays that batch or claims it was atomic.
+
+The lead loop distinguishes current execute rejection from load failure and
+accepted-run terminals. It releases the never-started turn's obligation, emits
+one correlated request error, clears transient busy state, and follows the
+existing queue policy without waiting for a manager terminal. Started, stale,
+and duplicate correlations cannot be reclassified as pre-start rejection. The
+detached-run registry retains `rejected` admission outcomes separately from
+executor terminals, with no fabricated `mag.run_result` or canonical body.
+Known MAG delivery rejection settles only the matching invocation. Unknown
+egress extent, MAG transport loss, and unattributable MAG queue loss use the
+existing authority-loss reconciliation seam: accepted effects remain unknown.
+
+Lua read-only tools and lead-workflow translate rejected output into one small
+correlated tool error. Config-provided read-only handlers settle at most once,
+even if they raise after returning a result. CLI completes only after its
+whole-request terminal and session flush barrier. An unsolicited flush reply is
+inert; a persistence fault during flushing or rejection of the flush request
+produces one explicit persistence error and nonzero shutdown instead of waiting
+for an acknowledgment that cannot arrive. Ordinary unrelated process exits
+during flushing do not bypass that barrier.

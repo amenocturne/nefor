@@ -1127,7 +1127,62 @@ local function test_sizeable_broadcast_batch_work_counters()
     "two recipients reuse each of 200 serialized outbound envelopes")
 end
 
+local function test_delivery_failures_are_bounded_local_and_not_replayed()
+  for _, delivered in ipairs({ 0, 1 }) do
+    reset()
+    _test.set_plugins({ "src", "peer" })
+    ready_each({ "src", "peer" })
+    local effects, attempts = 0, 0
+    ncp._test_set_transforms("peer", { to_plugin = function(envs)
+      attempts = attempts + 1
+      for i = 1, delivered do effects = effects + 1 end
+      error(string.rep("diagnostic", 1000))
+    end })
+    for i = 1, 2 do
+      ncp.invoke_from_plugin("src", make_event({ kind = "tool.invoke", id = "firing-" .. i }))
+    end
+    _test.calls_clear()
+    ncp.dispatch(_test.bus_log())
+    local failures = 0
+    for _, call in ipairs(_test.calls()) do
+      local env = json.decode(call.payload)
+      if env.body.kind == "ncp.delivery_failed" then
+        failures = failures + 1
+        assert_eq(env.body.peer, "peer")
+        assert_eq(env.body.phase, "egress")
+        assert_eq(env.body.extent, "unknown")
+        assert_eq(env.body.correlations[1].id, "firing-1")
+        assert_true(#env.body.message <= 512)
+      end
+    end
+    assert_eq(failures, 1)
+    ncp.dispatch(_test.bus_log())
+    ncp.dispatch(_test.bus_log())
+    assert_eq(attempts, 1, "failure observation never re-enters broken egress")
+    assert_eq(effects, delivered, "partial effect is never replayed")
+  end
+  reset()
+  _test.set_plugins({ "src", "peer" })
+  ready_each({ "src", "peer" })
+  local deliver = nefor.engine.deliver
+  nefor.engine.deliver = function() error("writer disconnected") end
+  _test.calls_clear()
+  drive_inbound("src", make_event({ kind = "tool.invoke", id = "not-enqueued" }))
+  nefor.engine.deliver = deliver
+  local found = false
+  for _, call in ipairs(_test.calls()) do
+    local body = json.decode(call.payload).body
+    if body.kind == "ncp.delivery_failed" then
+      found = true
+      assert_eq(body.extent, "none")
+      assert_eq(body.correlations[1].id, "not-enqueued")
+    end
+  end
+  assert_true(found, "ordinary enqueue rejection is observed")
+end
+
 local tests = {
+  { name = "delivery_failures_are_bounded_local_and_not_replayed", fn = test_delivery_failures_are_bounded_local_and_not_replayed },
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
   { name = "ready_with_wrong_version_triggers_error", fn = test_ready_with_wrong_version_triggers_error },
   { name = "malformed_ready_body_triggers_error", fn = test_malformed_ready_body_triggers_error },
