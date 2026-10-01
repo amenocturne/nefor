@@ -331,8 +331,8 @@ mod tests {
             .and_then(|output| output.get("stdout"))
             .and_then(Value::as_str)
             .is_some_and(|s| s.contains("SLOW_DONE")));
-        slow_task.await.unwrap();
-        fast_task.await.unwrap();
+        slow_task.await.unwrap().unwrap();
+        fast_task.await.unwrap().unwrap();
     }
 
     // Logcat-scale output must reach the bus as a paced preview, not one event
@@ -411,5 +411,197 @@ mod tests {
                 Body::System(other) => panic!("expected event body, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod producer_failure_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::time::{timeout, Duration};
+
+    fn request(id: &str, script: &str) -> Map<String, Value> {
+        json!({"kind": "basic-tools.tool.invoke", "id": id, "name": "shell.script",
+            "args": {"script": script, "cwd": "/", "timeout": {"present": false, "milliseconds": 0}}})
+            .as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn actual_giant_process_result_errors_once_clears_registry_and_accepts_later_work() {
+        let (out, mut incoming) = mpsc::channel(32);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let body = request("giant", "head -c 17825792 /dev/zero | tr '\\000' x");
+        let task = spawn_tool_invoke(&out, &body, &cancels);
+        let mut streamed = 0;
+        let terminal = timeout(Duration::from_secs(20), async {
+            loop {
+                let message = incoming.recv().await.unwrap();
+                if let Body::Event(body) = message.body {
+                    if body["kind"] == "tool.result" {
+                        break body;
+                    }
+                    streamed += body["text"].as_str().unwrap().len();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(streamed, 17825792);
+        assert_eq!(terminal["id"], "giant");
+        assert!(terminal.get("output").is_none());
+        assert!(terminal["error"]
+            .as_str()
+            .unwrap()
+            .contains("frame_too_large"));
+        assert!(terminal["error"]
+            .as_str()
+            .unwrap()
+            .contains("effects may have occurred"));
+        assert!(cancels.lock().unwrap().is_empty());
+        let later = spawn_tool_invoke(&out, &request("later", "printf ok"), &cancels);
+        let terminal = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Body::Event(body) = incoming.recv().await.unwrap().body {
+                    if body["kind"] == "tool.result" {
+                        break body;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        later.await.unwrap().unwrap();
+        assert_eq!(terminal["id"], "later");
+        assert_eq!(terminal["output"]["stdout"], "ok");
+        assert!(incoming.try_recv().is_err());
+        assert!(cancels.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_stream_promptly_kills_and_reaps_active_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let id = "x".repeat(16 * 1024 * 1024 - 1000);
+        let body = request(
+            &id,
+            &format!(
+                "echo $$ > {}; head -c 8192 /dev/zero; sleep 30",
+                pid_path.display()
+            ),
+        );
+        // The invocation itself fits; the required stream frame does not.
+        let (admission, mut admitted) = mpsc::channel(1);
+        checked_send(&admission, PluginOutgoing::event(body.clone()))
+            .await
+            .unwrap();
+        assert!(admitted.recv().await.is_some());
+        let (out, mut incoming) = mpsc::channel(4);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let task = spawn_tool_invoke(&out, &body, &cancels);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let terminal = incoming.recv().await.unwrap();
+        let Body::Event(terminal) = terminal.body else {
+            panic!("event")
+        };
+        assert_eq!(terminal["id"], id);
+        assert!(terminal["error"]
+            .as_str()
+            .unwrap()
+            .contains("frame_too_large"));
+        assert!(incoming.try_recv().is_err());
+        assert!(cancels.lock().unwrap().is_empty());
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "leader must be reaped before terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_transport_error_supervises_and_reaps_active_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let active = request(
+            "sibling",
+            &format!("echo $$ > {}; sleep 30", pid_path.display()),
+        );
+        let (out, _incoming) = mpsc::channel(4);
+        let (input, mut envelopes) = mpsc::channel(4);
+        let supervisor = tokio::spawn(async move { run_dispatch_loop(&out, &mut envelopes).await });
+        let envelope =
+            |body: Map<String, Value>| {
+                Envelope::parse_line(&serde_json::json!({
+            "type": "event", "from": "engine", "ts": "2026-01-01T00:00:00Z", "body": body
+        }).to_string()).unwrap()
+            };
+        input.send(Ok(envelope(active))).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !pid_path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let failed = serde_json::json!({"kind": "basic-tools.tool.invoke", "id": "x".repeat(16 * 1024 * 1024),
+            "name": "process.exec", "args": {"argv": []}}).as_object().unwrap().clone();
+        input.send(Ok(envelope(failed))).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), supervisor)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(TransportError::FrameTooLarge { .. })
+        ));
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[tokio::test]
+    async fn closed_writer_while_process_active_cancels_reaps_and_clears_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let body = request(
+            "active",
+            &format!("echo $$ > {}; sleep 30", pid_path.display()),
+        );
+        let (out, incoming) = mpsc::channel(4);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let task = spawn_tool_invoke(&out, &body, &cancels);
+        timeout(Duration::from_secs(2), async {
+            while !pid_path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(incoming);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(TransportError::WriterClosed)
+        ));
+        assert!(cancels.lock().unwrap().is_empty());
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     }
 }

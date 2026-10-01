@@ -926,3 +926,55 @@ mod tests {
         assert!(rx.recv().await.is_none());
     }
 }
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn minimal_fallback_failure_reaches_supervisor_and_releases_registration() {
+        let (out, mut incoming) = mpsc::channel(4);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let body = json!({"kind": "basic-tools.tool.invoke", "id": "x".repeat(16 * 1024 * 1024),
+            "name": "process.exec", "args": {"argv": []}})
+        .as_object()
+        .unwrap()
+        .clone();
+        let task = spawn_tool_invoke(&out, &body, &cancels);
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(TransportError::FrameTooLarge { .. })
+        ));
+        assert!(cancels.lock().unwrap().is_empty());
+        assert!(incoming.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_writer_closure_and_terminal_stdin_are_not_parse_noise() {
+        for fault in [
+            None,
+            Some(TransportError::InvalidUtf8),
+            Some(TransportError::FrameTooLarge {
+                bytes: 99,
+                limit_bytes: 1,
+            }),
+        ] {
+            let (out, incoming) = mpsc::channel(4);
+            let (input, mut envelopes) = mpsc::channel(4);
+            if let Some(error) = fault {
+                input.send(Err(error)).await.unwrap();
+            } else {
+                drop(incoming);
+            }
+            assert!(timeout(
+                Duration::from_secs(2),
+                run_dispatch_loop(&out, &mut envelopes)
+            )
+            .await
+            .unwrap()
+            .is_err());
+        }
+    }
+}

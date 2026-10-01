@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -93,14 +93,19 @@ async fn run() -> Result<(), TransportError> {
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed),
+    };
     tracing::info!(engine_version = %engine_version, capabilities = CAPABILITIES.len(), "ready");
 
     send_event(&out_tx, hello_body()).await?;
 
     run_dispatch_loop(&out_tx, &mut in_rx).await?;
 
-    let _ = out_tx.send(PluginOutgoing::event(goodbye_body())).await;
+    if let Err(error) = send_event(&out_tx, goodbye_body()).await {
+        tracing::warn!(%error, "goodbye unavailable during teardown");
+    }
     Ok(())
 }
 
@@ -109,51 +114,60 @@ async fn run_dispatch_loop(
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), TransportError> {
     let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
-    let mut tasks = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     let termination = termination_signal();
     tokio::pin!(termination);
-    loop {
+    let outcome = loop {
         tokio::select! {
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(Ok(env)) => match &env.body {
                         Body::System(SystemBody::Shutdown { .. }) => {
                             tracing::info!("shutdown received");
-                            break;
+                            break Ok(());
                         }
                         Body::System(_) => {
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
                             if is_kind(map, INVOKE_SUFFIX) {
-                                tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
-                                tasks.push(spawn_invoke(out_tx, map, &cancels));
+                                tasks.spawn(tool_invocation(out_tx, map, &cancels));
                             } else if is_kind(map, CANCEL_SUFFIX) {
                                 handle_cancel(&cancels, map);
                             }
                         }
                     },
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "stdin parse error; dropping line");
+                    Some(Err(TransportError::Parse(e))) => {
+                        tracing::warn!(error = %e, "stdin parse error; dropping line");
                     }
+                    Some(Err(error)) => break Err(error),
                     None => {
                         tracing::info!("stdin closed; exiting");
-                        break;
+                        break Ok(());
                     }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("ctrl-c; exiting");
-                break;
+                break Ok(());
             }
             _ = &mut termination => {
                 tracing::info!("termination signal; cancelling active tools");
-                break;
+                break Ok(());
+            }
+            _ = out_tx.closed() => break Err(TransportError::WriterClosed),
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => break Err(error),
+                    Some(Err(error)) => break Err(TransportError::Io(std::io::Error::other(error))),
+                    None => {}
+                }
             }
         }
-    }
-    cancel_and_wait(&cancels, tasks).await;
-    Ok(())
+    };
+    let cleanup = cancel_and_wait(&cancels, tasks).await;
+    outcome.and(cleanup)
 }
 
 async fn termination_signal() {
@@ -172,18 +186,25 @@ async fn termination_signal() {
     std::future::pending::<()>().await;
 }
 
-async fn cancel_and_wait(cancels: &Cancels, tasks: Vec<tokio::task::JoinHandle<()>>) {
+async fn cancel_and_wait(cancels: &Cancels, mut tasks: tokio::task::JoinSet<Result<(), TransportError>>) -> Result<(), TransportError> {
     let pending = match cancels.lock() {
         Ok(mut registrations) => registrations.drain().map(|(_, tx)| tx).collect::<Vec<_>>(),
         Err(error) => {
-            tracing::error!(%error, "process cancellation registry poisoned during shutdown");
-            return;
+            panic!("process cancellation registry poisoned during shutdown: {error}");
         }
     };
     for cancel in pending { let _ = cancel.send(()); }
     // Cancellation drives each process group through kill + reap. Joining the
     // invocation owners keeps plugin exit from racing that accounting.
-    for task in tasks { let _ = task.await; }
+    let mut failure = None;
+    while let Some(result) = tasks.join_next().await {
+        let result = result.unwrap_or_else(|error| Err(TransportError::Io(std::io::Error::other(error))));
+        if let Err(error) = result {
+            tracing::error!(%error, "tool task failed during teardown");
+            if failure.is_none() { failure = Some(error); }
+        }
+    }
+    match failure { Some(error) => Err(error), None => Ok(()) }
 }
 
 const INVOKE_SUFFIX: &str = "capability.invoke";
@@ -210,8 +231,7 @@ fn handle_cancel(cancels: &Cancels, body: &Map<String, Value>) {
     let taken = match cancels.lock() {
         Ok(mut registrations) => registrations.remove(id),
         Err(error) => {
-            tracing::error!(%error, "process cancellation registry poisoned");
-            return;
+            panic!("process cancellation registry poisoned: {error}");
         }
     };
     match taken {
@@ -227,11 +247,11 @@ fn handle_cancel(cancels: &Cancels, body: &Map<String, Value>) {
     }
 }
 
-fn spawn_invoke(
+fn tool_invocation(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
     cancels: &Cancels,
-) -> tokio::task::JoinHandle<()> {
+) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + 'static {
     let out_tx = out_tx.clone();
     let body = body.clone();
     let cancels = Arc::clone(cancels);
@@ -250,17 +270,14 @@ fn spawn_invoke(
                     Some(rx)
                 }
                 Err(error) => {
-                    tracing::error!(%error, "process cancellation registry poisoned");
-                    None
+                    panic!("process cancellation registry poisoned: {error}");
                 }
             }
         }
         _ => None,
     };
-    tokio::spawn(async move {
-        if let Err(e) = handle_invoke(&out_tx, &body, cancel_rx).await {
-            tracing::error!(error = %e, "capability.invoke task failed");
-        }
+    async move {
+        let result = handle_invoke(&out_tx, &body, cancel_rx).await;
         // Clear the registration on completion so a late cancel is a no-op and
         // the map doesn't leak finished invocations.
         if let Some(id) = id {
@@ -268,10 +285,20 @@ fn spawn_invoke(
                 Ok(mut registrations) => {
                     registrations.remove(&id);
                 }
-                Err(error) => tracing::error!(%error, "process cancellation registry poisoned"),
+                Err(error) => panic!("process cancellation registry poisoned: {error}"),
             }
         }
-    })
+        result
+    }
+}
+
+#[cfg(test)]
+fn spawn_tool_invoke(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    cancels: &Cancels,
+) -> tokio::task::JoinHandle<Result<(), TransportError>> {
+    tokio::spawn(tool_invocation(out_tx, body, cancels))
 }
 
 async fn handle_invoke(
@@ -317,41 +344,87 @@ async fn handle_invoke(
     let outcome = if name == process_exec::NAME || name == shell_script::NAME {
         let preview = Arc::new(process::LivePreview::default());
         let (finished_tx, finished_rx) = oneshot::channel();
-        let forward = tokio::spawn(forward_preview(
-            Arc::clone(&preview),
-            out_tx.clone(),
-            id.clone(),
-            finished_rx,
+        let mut forward = tokio::spawn(forward_preview(
+            Arc::clone(&preview), out_tx.clone(), id.clone(), finished_rx,
         ));
-        let result = if name == process_exec::NAME {
-            process_exec::run_cancellable_streaming(&args, cancel, Some(preview)).await
-        } else {
-            shell_script::run_cancellable_streaming(&args, cancel, Some(preview)).await
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let execution = async {
+            let result = if name == process_exec::NAME {
+                process_exec::run_cancellable_streaming(&args, Some(stop_rx), Some(preview)).await
+            } else {
+                shell_script::run_cancellable_streaming(&args, Some(stop_rx), Some(preview)).await
+            };
+            let _ = finished_tx.send(());
+            result
         };
-        let _ = finished_tx.send(());
-        match forward.await {
-            Ok(Ok(())) => result,
-            Ok(Err(error)) => Err(ToolError::ProcessIo {
-                operation: "publishing process stream (process effects may have occurred)".into(),
-                message: error.to_string(),
-            }),
-            Err(error) => Err(ToolError::ProcessIo {
-                operation: "joining process stream publisher".into(),
-                message: error.to_string(),
-            }),
+        tokio::pin!(execution);
+        let cancelled = async {
+            match cancel {
+                Some(receiver) => { let _ = receiver.await; }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        tokio::select! {
+            result = &mut execution => {
+                if let Err(error) = publisher_result(forward.await) {
+                    return delivery_failure(out_tx, &id, error).await;
+                }
+                result
+            }
+            published = &mut forward => {
+                match publisher_result(published) {
+                    Ok(()) => execution.await,
+                    Err(error) => {
+                        let _ = stop_tx.send(());
+                        let _ = execution.await;
+                        return delivery_failure(out_tx, &id, error).await;
+                    }
+                }
+            }
+            _ = &mut cancelled => {
+                let _ = stop_tx.send(());
+                let result = execution.await;
+                if let Err(error) = publisher_result(forward.await) {
+                    return delivery_failure(out_tx, &id, error).await;
+                }
+                result
+            }
+            _ = out_tx.closed() => {
+                let _ = stop_tx.send(());
+                let _ = execution.await;
+                let _ = forward.await;
+                return Err(TransportError::WriterClosed);
+            }
         }
     } else {
         run_capability(&name, &args).await
     };
-    match outcome {
-        Ok(output) => {
-            send_event(out_tx, result_ok_body(&id, output)).await?;
-        }
-        Err(e) => {
-            send_event(out_tx, result_error_body(&id, &e.to_string())).await?;
-        }
+    let terminal = match outcome {
+        Ok(output) => result_ok_body(&id, output),
+        Err(error) => result_error_body(&id, &error.to_string()),
+    };
+    match send_event(out_tx, terminal).await {
+        Ok(()) => Ok(()),
+        Err(error) => delivery_failure(out_tx, &id, error).await,
     }
-    Ok(())
+}
+
+fn publisher_result(
+    result: Result<Result<(), TransportError>, tokio::task::JoinError>,
+) -> Result<(), TransportError> {
+    result.map_err(|error| TransportError::Io(std::io::Error::other(error)))?
+}
+
+async fn delivery_failure(
+    out_tx: &mpsc::Sender<PluginOutgoing>, id: &str, error: TransportError,
+) -> Result<(), TransportError> {
+    let message = match error {
+        TransportError::FrameTooLarge { .. } => "Output admission failed: frame_too_large; earlier/external effects may have occurred.",
+        TransportError::InvalidFraming => "Output admission failed: invalid_framing; earlier/external effects may have occurred.",
+        other => return Err(other),
+    };
+    send_event(out_tx, result_error_body(id, message)).await
 }
 
 /// Live output is a lossy preview; the authoritative output is the
@@ -434,17 +507,11 @@ async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+    checked_send(out_tx, PluginOutgoing::event(body)).await
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
-            protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+    checked_send(out_tx, PluginOutgoing::system(SystemBody::Ready {
+        protocol_version: PROTOCOL_VERSION.into(),
+    })).await
 }

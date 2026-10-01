@@ -169,22 +169,53 @@ pub async fn execute(
     let stderr_task = tokio::spawn(read_pipe(stderr, preview, StreamKind::Stderr));
     let stdin_task = tokio::spawn(feed_stdin(stdin, request.stdin));
 
-    let outcome = wait_for_outcome(&mut child, request.timeout, cancel).await;
-    if matches!(
-        outcome,
-        WaitOutcome::WaitFailed(_) | WaitOutcome::TimedOut(_) | WaitOutcome::Cancelled
-    ) {
+    let cancelled = async move {
+        match cancel {
+            Some(receiver) => {
+                let _ = receiver.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(cancelled);
+    let mut outcome = wait_for_outcome(&mut child, request.timeout, &mut cancelled).await;
+    let reap = if !matches!(outcome, WaitOutcome::Exited(_)) {
         kill_process_group(process_group);
-        child.wait().await.map_err(|source| ToolError::ProcessIo {
-            operation: "reaping process after termination".into(),
-            message: source.to_string(),
-        })?;
-    }
+        child
+            .wait()
+            .await
+            .map(|_| ())
+            .map_err(|source| ToolError::ProcessIo {
+                operation: "reaping process after termination".into(),
+                message: source.to_string(),
+            })
+    } else {
+        Ok(())
+    };
 
-    let stdout = join_reader(stdout_task, "reading stdout").await?;
-    let stderr = join_reader(stderr_task, "reading stderr").await?;
-    join_writer(stdin_task).await?;
+    // A leader may exit while descendants still hold the pipes. Cancellation
+    // must retain process-group authority until all pipe tasks are joined.
+    let readers = async {
+        let stdout = join_reader(stdout_task, "reading stdout").await;
+        let stderr = join_reader(stderr_task, "reading stderr").await;
+        let stdin = join_writer(stdin_task).await;
+        Ok::<_, ToolError>((stdout?, stderr?, stdin?))
+    };
+    tokio::pin!(readers);
+    let (stdout, stderr, ()) = if matches!(outcome, WaitOutcome::Exited(_)) {
+        tokio::select! {
+            result = &mut readers => result?,
+            _ = &mut cancelled => {
+                kill_process_group(process_group);
+                outcome = WaitOutcome::Cancelled;
+                readers.await?
+            }
+        }
+    } else {
+        readers.await?
+    };
 
+    reap?;
     match outcome {
         WaitOutcome::Exited(status) => Ok(result_value(stdout, stderr, termination(&status))),
         WaitOutcome::WaitFailed(source) => Err(ToolError::ProcessIo {
@@ -213,7 +244,7 @@ enum WaitOutcome {
 async fn wait_for_outcome(
     child: &mut Child,
     timeout: Timeout,
-    cancel: Option<oneshot::Receiver<()>>,
+    cancelled: &mut (impl std::future::Future<Output = ()> + Unpin),
 ) -> WaitOutcome {
     let deadline = async move {
         match timeout {
@@ -222,14 +253,6 @@ async fn wait_for_outcome(
                 tokio::time::sleep(duration).await;
                 duration
             }
-        }
-    };
-    let cancelled = async move {
-        match cancel {
-            Some(receiver) => {
-                let _ = receiver.await;
-            }
-            None => std::future::pending::<()>().await,
         }
     };
     tokio::select! {

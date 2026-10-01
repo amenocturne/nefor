@@ -17,16 +17,18 @@ use crossterm::event::{Event, EventStream};
 use crossterm::terminal::size as term_size;
 use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
-use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{
+    await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
+};
 use nefor_tui::clipboard_image::{is_clipboard_image_paste_key, save_system_clipboard_image};
 use nefor_tui::engine::Engine;
 use nefor_tui::error::TuiError;
 use nefor_tui::input::from_key_event;
 use nefor_tui::mouse::from_crossterm as from_mouse_event;
+use nefor_tui::transport::drain_emits_to_writer;
 
 const CHANNEL_CAP: usize = 128;
 use nefor_tui::tty::{open_tty, RawModeGuard};
@@ -258,14 +260,18 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader_handle = spawn_stdin_reader(in_tx);
 
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        &out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| TuiError::Transport(TransportError::WriterClosed))?;
+        }),
+    )
+    .await?;
 
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    };
     tracing::info!(engine_version = %engine_version, "ready");
 
     // Bring up the terminal *after* the handshake so an early reject
@@ -307,6 +313,7 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     let mut wallclock_tick = interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
             maybe_env = in_rx.recv() => match maybe_env {
                 Some(Ok(env)) => {
                     let mut shutdown = false;
@@ -354,16 +361,18 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                                 if shutdown { break; }
                                 drained += 1;
                             }
-                            Ok(Err(e)) => {
+                            Ok(Err(TransportError::Parse(e))) => {
                                 tracing::warn!(error = %e, "stdin parse error");
                                 drained += 1;
                             }
+                            Ok(Err(error)) => return Err(error.into()),
                             Err(_) => break, // channel empty for this tick
                         }
                     }
                     if shutdown { break; }
                 }
-                Some(Err(e)) => tracing::warn!(error = %e, "stdin parse error"),
+                Some(Err(TransportError::Parse(e))) => tracing::warn!(error = %e, "stdin parse error"),
+                Some(Err(error)) => return Err(error.into()),
                 None => break,
             },
             maybe_evt = term_events.next() => {
@@ -516,36 +525,6 @@ fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) -> 
             matches!(kind, "sessions.replay.progress" | "sessions.resume_done")
         }
     }
-}
-
-/// Drain accumulated Lua egress and forward each entry as a
-/// `PluginOutgoing::event(body)` line. `target_hint` is logged but not
-/// used for routing — the engine broadcasts; per-peer delivery happens
-/// via the bus (prefix-targeting in `examples/nefor-agent/ncp.lua`).
-async fn drain_emits_to_writer(
-    engine: &mut Engine,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
-) -> Result<(), TuiError> {
-    let pending = engine.take_emit_queue();
-    for (target_hint, body) in pending {
-        if let Some(t) = &target_hint {
-            tracing::trace!(target = %t, kind = ?body.get("kind"), "emit (hint)");
-        }
-        let outgoing = PluginOutgoing::event(canonical_body(body));
-        out_tx
-            .send(outgoing)
-            .await
-            .map_err(|_| TuiError::Transport(TransportError::WriterClosed))?;
-    }
-    Ok(())
-}
-
-/// `serde_json::Map` already has insertion-order semantics with the
-/// `preserve_order` feature on, so this is identity. Wrapped as a
-/// helper anyway so a future canonicalization pass (e.g. moving `kind`
-/// to the front) has one place to live.
-fn canonical_body(map: JsonMap<String, JsonValue>) -> JsonMap<String, JsonValue> {
-    map
 }
 
 #[cfg(test)]

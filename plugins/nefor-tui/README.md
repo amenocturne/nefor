@@ -244,3 +244,34 @@ active, extension events, link activation and popup rendering are suppressed:
 permission request correlation and approve/deny handling remain authoritative.
 The extension popup is retained behind it and resumes after it closes. There
 is no default extension popup or link menu.
+
+## Queued output admission
+
+Lua emission is queued; enqueue admission does not promise delivery. A rejected
+queued item is not interpreted as a tool invocation merely because it has an
+`id`. The bridge notifies the local Lua reducer and publishes the same bounded
+observation:
+
+```lua
+{ kind = "tui.delivery_failed", phase = "admission", extent = "none",
+  message = "Output admission failed: frame_too_large; ...",
+  correlations = { { kind = "chat.input.submit", id = "actual-id" } },
+  target_hint = "peer" }
+```
+
+`extent=none` means this item was not published, not that earlier effects are
+absent or the target lost authority. Correlations project only string `kind`,
+`id`, `in_reply_to`, `run_id`, and `chat_id`, each at most 512 UTF-8 bytes; overlong
+identities are omitted, never truncated. There is one entry for the rejected
+item (possibly empty). Kind alone is not an invocation correlation. The diagnostic
+is constant and below 512 bytes; a string target hint is included only when it
+fits the same bound. Origin on the wire is stamped by the engine, not inferred
+from the item. The reducer owns semantic rollback/reconciliation and must not
+re-emit the failure through the rejected path. Local notification does not itself
+prove the wire observation was delivered.
+
+After successful observer admission, later independent items in the taken queue
+are preserved. Observer admission failure cannot recursively produce another
+observer. Writer closure or terminal stdin faults exit through terminal guard
+cleanup; bounded JSON parse errors remain noise. The bridge does not retry lost
+requests, invent tool results, or decide application continuation policy.

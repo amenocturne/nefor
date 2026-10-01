@@ -25,4 +25,5 @@ pub mod reconciler;
 pub mod render;
 pub mod scrollable;
 pub mod text_input;
+pub mod transport;
 pub mod tty;

@@ -140,3 +140,22 @@ Process stream decoding retains incomplete UTF-8 suffixes independently for
 stdout and stderr. Complete invalid sequences and incomplete EOF suffixes use
 the same lossy replacement policy as the captured terminal process result;
 concatenated stream text therefore does not depend on pipe-read partitioning.
+
+## Output admission and transport loss
+
+Every outgoing frame is checked before enqueue (16 MiB including LF). Admission
+is not proof of write, receipt, or execution. A rejected result or stream stops
+that invocation's output and produces one checked `tool.result {id, error}` with
+the actual invocation ID, `frame_too_large` or `invalid_framing`, and an explicit
+warning that earlier/external effects may have occurred. No operation is retried.
+Stream publication failure cancels, kills, and reaps its owned process group
+before the terminal error; the cancellation registration is released, and later
+independent invocations remain usable.
+
+If the constant diagnostic plus unmodified ID also cannot fit, or the writer is
+closed, the error reaches the task supervisor. It cancels and joins owned work
+before exiting. Terminal stdin framing, UTF-8, and I/O faults take the same
+cleanup path; malformed bounded JSON remains parse noise. Accepted effects are
+unknown after transport loss. Required startup/advertisement failures are fatal;
+goodbye is checked but best effort during selected teardown. Frame admission does
+not bound captured process output or the upstream stream channel's memory.
