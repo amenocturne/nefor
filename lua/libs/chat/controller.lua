@@ -727,6 +727,12 @@ local function handle_session_start(msg, state)
   end
   return shallow_merge(state, {
     session_id = msg.session_id,
+    -- Cold-start resumes also need a correlated failure surface, even when
+    -- the requester did not ask sessions to emit progress/loading updates.
+    resume_loading = msg.from_resume and {
+      session_id = msg.session_id, request_id = msg.request_id, replayed = 0,
+    } or NIL_SENTINEL,
+    replay_mode = msg.from_resume and true or NIL_SENTINEL,
     gate_mode = "safe",
     runs = runs,
     node_previews = {}, mag_arrivals = {}, capability_owners = {}, scope_to_run = {},
@@ -739,10 +745,14 @@ end
 
 local function handle_transition_failed(msg, state)
   local pending = state.pending_session_transition
-  if type(pending) ~= "table" or msg.request_id ~= pending.request_id then
-    return state, {}
-  end
+  local loading = state.resume_loading
+  local pending_matches = type(pending) == "table" and msg.request_id == pending.request_id
+  local loading_matches = type(loading) == "table"
+    and msg.session_id == loading.session_id and msg.request_id == loading.request_id
+  if not pending_matches and not loading_matches then return state, {} end
   local next_state = shallow_merge(state, {
+    resume_loading = NIL_SENTINEL,
+    replay_mode = NIL_SENTINEL,
     pending_session_transition = NIL_SENTINEL,
     pending = false,
     turn_started_at = NIL_SENTINEL,

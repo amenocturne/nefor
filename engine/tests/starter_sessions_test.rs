@@ -1665,3 +1665,29 @@ fn headless_persistence_filters_display_and_reports_flush_failure() {
       assert(sent[#sent].error.code == "persistence_failed")
     "#).exec().unwrap();
 }
+
+#[test]
+fn replay_reader_faults_settle_and_release_continuations() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _data_dir = ScopedEnvVar::set(&ENV_LOCK, "NEFOR_DATA_DIR", tempdir.path());
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("stub");
+    set_package_path(&lua).expect("paths");
+    lua.load(include_str!(
+        "../../tests/lua/sessions/replay_fault_test.lua"
+    ))
+    .exec()
+    .expect("reader fault contract");
+}
+
+#[test]
+fn chat_replay_failure_clears_loading_with_correlated_diagnostic() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("stub");
+    set_package_path(&lua).expect("paths");
+    lua.load(include_str!(
+        "../../tests/lua/chat/session_replay_failure_test.lua"
+    ))
+    .exec()
+    .expect("frontend failure contract");
+}

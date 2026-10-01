@@ -71,10 +71,13 @@ local state = {
   replay_generation = 0,
   ---@type string|nil
   replay_session_id = nil,
+  ---@type file*|nil
+  replay_file = nil,
 }
 
 local sessions_dir = nil
 local persistence_failed
+local transition_failed
 local persistence_error = nil
 
 local function configure(options)
@@ -304,43 +307,44 @@ local REPLAY_CHUNK_ENTRIES = 64
 local MAX_PROGRESS_UPDATES = 100
 
 local function file_size(fh)
-  local start = fh:seek()
-  local total = fh:seek("end")
-  if start == nil or total == nil or fh:seek("set", start) == nil then return nil end
+  local start, err = fh:seek()
+  if start == nil then return nil, err end
+  local total
+  total, err = fh:seek("end")
+  if total == nil then return nil, err end
+  local reset
+  reset, err = fh:seek("set", start)
+  if reset == nil then return nil, err end
   return total
 end
 
 local function cancel_replay()
+  if state.replay_file then
+    state.replay_file:close()
+    state.replay_file = nil
+  end
+  state.in_replay_window = false
   state.replay_session_id = nil
   state.replay_generation = state.replay_generation + 1
   replay_window.set(false)
 end
 
----@param path string|nil
----@param session_id string
----@param request_id string|nil
----@param report_progress boolean
----@param generation integer
----@param finish fun(replayed: integer)
-local function begin_replay(path, session_id, request_id, report_progress, generation, finish)
-  local fh = path and io.open(path, "r") or nil
-  local total = fh and file_size(fh) or 0
-  if total == nil then
-    if fh then fh:close() end
-    fh = nil
-    total = 0
+-- The reader and sampled size are acquired before activation. Once activated,
+-- a fault leaves the selected session in place, with reconstruction incomplete.
+local function begin_replay(fh, total, session_id, request_id, report_progress, generation, finish)
+  state.replay_session_id = session_id
+  state.replay_file = fh
+
+  local function fail(message)
+    cancel_replay()
+    transition_failed("resume", request_id, session_id,
+      "Session reconstruction is incomplete: " .. tostring(message))
   end
 
-  state.replay_session_id = session_id
-
-  if not fh then
-    send_msg({ kind = "control", event = "sessions.replay.start",
-               extra = { session_id = session_id, request_id = request_id,
-                         count = total } })
-    send_msg({ kind = "control", event = "sessions.replay.end",
-               extra = { session_id = session_id, request_id = request_id } })
-    finish(0)
-    return
+  local function cursor()
+    local offset, err = fh:seek()
+    if offset == nil then fail("reader seek failed: " .. tostring(err)) end
+    return offset
   end
 
   local progress_step = math.max(1, math.ceil(total / MAX_PROGRESS_UPDATES))
@@ -349,29 +353,31 @@ local function begin_replay(path, session_id, request_id, report_progress, gener
 
   local function step()
     if generation ~= state.replay_generation then
-      fh:close()
       return
     end
 
-    local chunk_start = fh:seek() or 0
+    local chunk_start = cursor()
+    if chunk_start == nil then return end
     local replayed_entries = 0
     local replay_entries = {}
     while replayed_entries < REPLAY_CHUNK_ENTRIES do
-      local cursor = fh:seek() or chunk_start
-      if cursor >= total then break end
+      local offset = cursor()
+      if offset == nil then return end
+      if offset >= total then break end
 
       local line, read_error = fh:read("*l")
       if line == nil then
-        if read_error and nefor.log then
-          nefor.log.error("sessions.resume: failed while reading session file", {
-            path = path, error = tostring(read_error),
-          })
-        end
-        break
+        fail(read_error and ("reader failed: " .. tostring(read_error))
+          or "unexpected EOF before sampled session size")
+        return
       end
 
-      local after = fh:seek() or cursor
-      if after > total then break end
+      local after = cursor()
+      if after == nil then return end
+      if after <= offset or after > total then
+        fail("session file changed or reader made no progress")
+        return
+      end
 
       if line:sub(1, 12) ~= [[{"_session":]] then
         local ok, decoded = pcall(json.decode, line)
@@ -385,7 +391,8 @@ local function begin_replay(path, session_id, request_id, report_progress, gener
       if after - chunk_start >= REPLAY_CHUNK_BYTES then break end
     end
 
-    local replayed = fh:seek() or chunk_start
+    local replayed = cursor()
+    if replayed == nil then return end
     local complete = replayed >= total
     local progress_due = report_progress and replayed >= next_progress and replayed < total
 
@@ -416,6 +423,7 @@ local function begin_replay(path, session_id, request_id, report_progress, gener
 
     if complete then
       fh:close()
+      state.replay_file = nil
       finish(delivered)
       return
     end
@@ -451,7 +459,7 @@ local function acquire_session(action, session_id)
   return { ok = true, path = path }
 end
 
-local function transition_failed(operation, request_id, session_id, message)
+transition_failed = function(operation, request_id, session_id, message)
   send_msg({ kind = "control", event = "sessions.transition_failed", extra = {
     operation = operation,
     request_id = request_id,
@@ -478,18 +486,19 @@ local function do_resume(target_session_id, show_loading, request_id)
     end
   end
 
-  -- Opening is part of activation. Do it before touching the current session
-  -- or emitting its lifecycle events.
-  if not session_file_exists(acquired.path) then
-    local message = "session file disappeared before activation"
-    if nefor.log then nefor.log.error("sessions.resume: " .. message, {
-      path = acquired.path,
-    }) end
-    transition_failed("resume", request_id, target_session_id, message)
+  -- Hold the actual reader (not just an existence probe) before activation.
+  local reader, read_error = io.open(acquired.path, "r")
+  local total
+  if reader then total, read_error = file_size(reader) end
+  if not reader or total == nil then
+    if reader then reader:close() end
+    transition_failed("resume", request_id, target_session_id,
+      "Failed to acquire session reader: " .. tostring(read_error))
     return nil
   end
   local fh, err, had_content = open_session_file(acquired.path, target_session_id)
   if not fh then
+    reader:close()
     if nefor.log then nefor.log.error("sessions.resume: failed to open session file", {
       path = acquired.path, error = err,
     }) end
@@ -515,7 +524,7 @@ local function do_resume(target_session_id, show_loading, request_id)
                extra = { session_id = target_session_id, request_id = request_id } })
   end
   local generation = state.replay_generation
-  begin_replay(acquired.path, target_session_id, request_id, show_loading, generation, function(replayed)
+  begin_replay(reader, total, target_session_id, request_id, show_loading, generation, function(replayed)
     if generation ~= state.replay_generation then return end
     state.replay_session_id = nil
     send_msg({ kind = "control", event = "sessions.resume_done",
@@ -691,8 +700,7 @@ return {
       state.should_prune_session  = true
       state.initialised           = false
       state.in_replay_window      = false
-      state.replay_generation     = state.replay_generation + 1
-      state.replay_session_id     = nil
+      cancel_replay()
     end,
   },
 }
