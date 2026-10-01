@@ -24,3 +24,24 @@ argument validation, and tool-gate advertisement — are Lua definitions in
 [`lua/libs/git-worktree`](../../lua/libs/git-worktree/init.lua), built with
 [`libs.tool`](../../lua/libs/tool/init.lua) and wrapped around this process by
 `libs.compositors.tools.git_worktree_actor_spec`.
+
+## Output and teardown failures
+
+Wire output is checked before enqueue; enqueue success is not proof of delivery.
+If a result exceeds the transport frame limit, the plugin substitutes one bounded
+`capability.result` with the actual invocation `id` and an `error` explaining output
+admission failure. Git effects may already exist: this is not a rejected request
+or a rollback, and created worktrees/branches are not removed. A later independent
+invocation can proceed when the writer remains available.
+
+Ready, hello and goodbye are required uncorrelated output. Their
+admission failure, a closed writer, terminal stdin framing/I/O failure or an
+undeliverable fallback ends the plugin with a transport error. Bounded malformed
+JSON remains parse noise. Detached invocation errors reach the plugin supervisor;
+trusted task panics are not converted to successful tool outcomes.
+
+Shutdown and transport teardown retain outstanding Git task ownership until each
+blocking operation finishes. Dropping an async waiter cannot cancel a running
+Git operation. There is no retry or deletion during teardown; downstream consumers
+must treat accepted effects as unknown if transport disappears before a result.
+The engine's process termination policy may still interrupt this local drain.

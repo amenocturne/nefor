@@ -1,10 +1,10 @@
 #![deny(unsafe_code)]
 
 use clap::Parser;
-use git_worktree_plugin::{
-    CreateSpec, OpenSpec, WorktreeError, CREATE_CAPABILITY, OPEN_CAPABILITY,
+use git_worktree_plugin::{CreateSpec, OpenSpec, WorktreeError, CREATE_CAPABILITY, OPEN_CAPABILITY};
+use nefor_plugin_sdk::{
+    await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
 };
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -39,29 +39,71 @@ async fn main() {
 }
 
 async fn run(_args: Args) -> Result<(), TransportError> {
-    let (out_tx, _writer) = spawn_stdout_writer(CHANNEL_CAP);
+    let (out_tx, writer) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed),
+    };
     tracing::info!(%engine_version, "ready");
     send_event(&out_tx, hello_body()).await?;
 
-    loop {
-        match in_rx.recv().await {
-            Some(Ok(env)) => match env.body {
-                Body::System(SystemBody::Shutdown { .. }) => return Ok(()),
-                Body::System(other) => tracing::warn!(?other, "unexpected system envelope"),
-                Body::Event(body) => {
-                    if is_invoke(&body) {
-                        spawn_invoke(out_tx.clone(), body);
-                    }
+    let mut tasks = tokio::task::JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            _ = out_tx.closed() => break Err(TransportError::WriterClosed),
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = task_result(match completed { Some(result) => result, None => unreachable!("nonempty task set") }) {
+                    break Err(error);
                 }
-            },
-            Some(Err(error)) => tracing::warn!(%error, "dropping malformed envelope"),
-            None => return Ok(()),
+            }
+            message = in_rx.recv() => match message {
+                Some(Ok(env)) => match env.body {
+                    Body::System(SystemBody::Shutdown { .. }) => break Ok(()),
+                    Body::System(other) => tracing::warn!(?other, "unexpected system envelope"),
+                    Body::Event(body) if is_invoke(&body) => {
+                        tasks.spawn(invoke_task(out_tx.clone(), body));
+                    }
+                    Body::Event(_) => (),
+                },
+                Some(Err(TransportError::Parse(error))) => tracing::warn!(%error, "dropping malformed envelope"),
+                Some(Err(error)) => break Err(error),
+                None => break Ok(()),
+            }
         }
+    };
+    // spawn_blocking Git operations cannot be canceled by dropping their waiter.
+    // Retain ownership until they finish; never delete effects during teardown.
+    let mut result = result;
+    while let Some(completed) = tasks.join_next().await {
+        if let Err(error) = task_result(completed) {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
+    }
+    result?;
+    send_event(
+        &out_tx,
+        object(json!({"kind": "git-worktree.goodbye", "reason": "stream closed"})),
+    )
+    .await?;
+    drop(out_tx);
+    if let Err(error) = writer.await {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    Ok(())
+}
+
+fn task_result(
+    result: Result<Result<(), TransportError>, tokio::task::JoinError>,
+) -> Result<(), TransportError> {
+    match result {
+        Ok(result) => result,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
     }
 }
 
@@ -69,29 +111,42 @@ fn is_invoke(body: &Map<String, Value>) -> bool {
     body.get("kind").and_then(Value::as_str) == Some(&format!("{PLUGIN_NAME}.capability.invoke"))
 }
 
-fn spawn_invoke(out_tx: mpsc::Sender<PluginOutgoing>, body: Map<String, Value>) {
-    tokio::spawn(async move {
-        let id = match body.get("id").and_then(Value::as_str) {
-            Some(id) => id.to_owned(),
-            None => return,
-        };
-        let name = body
-            .get("capability")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let args = body.get("args").cloned().unwrap_or_else(|| json!({}));
-        let result = tokio::task::spawn_blocking(move || invoke(&name, args)).await;
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => failure(WorktreeError {
-                operation: "invoke",
-                kind: "git-failed",
-                message: format!("worktree task failed: {error}"),
-            }),
-        };
-        let _ = send_event(&out_tx, result_body(&id, output)).await;
-    });
+async fn invoke_task(
+    out_tx: mpsc::Sender<PluginOutgoing>,
+    body: Map<String, Value>,
+) -> Result<(), TransportError> {
+    let id = match body.get("id").and_then(Value::as_str) {
+        Some(id) => id.to_owned(),
+        None => return Ok(()),
+    };
+    let name = body
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let args = body.get("args").cloned().unwrap_or_else(|| json!({}));
+    let result = tokio::task::spawn_blocking(move || invoke(&name, args)).await;
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    };
+    send_result(&out_tx, &id, output).await
+}
+
+async fn send_result(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    id: &str,
+    output: Value,
+) -> Result<(), TransportError> {
+    match send_event(out_tx, result_body(id, output)).await {
+        Err(TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming) => {
+            send_event(out_tx, object(json!({
+                "kind": "capability.result", "id": id,
+                "error": "output admission failed; Git effects may already exist and were not rolled back"
+            }))).await
+        }
+        result => result,
+    }
 }
 
 fn invoke(name: &str, args: Value) -> Value {
@@ -146,27 +201,140 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+        }),
+    )
+    .await
 }
 
 async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+    checked_send(out_tx, PluginOutgoing::event(body)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejected_result_preserves_created_git_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        let path = temp.path().join("worktree");
+        std::fs::create_dir(&repository).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&repository)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        let output = invoke(
+            CREATE_CAPABILITY,
+            json!({"repository": repository, "path": path, "branch": "feature/retained", "base": "HEAD"}),
+        );
+        assert_eq!(output["ok"], true, "{output}");
+        let (tx, mut rx) = mpsc::channel(8);
+        send_result(
+            &tx,
+            "created",
+            json!({"receipt": output, "stderr": "x".repeat(16 * 1024 * 1024)}),
+        )
+        .await
+        .unwrap();
+        let failure: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(failure["body"]["id"], "created");
+        assert!(failure["body"].get("error").is_some());
+        assert!(path.join(".git").exists());
+        assert_eq!(
+            invoke(
+                OPEN_CAPABILITY,
+                json!({"repository": repository, "path": path, "branch": "feature/retained"})
+            )["ok"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_awaits_running_blocking_operation_instead_of_aborting_waiter() {
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+            Ok(())
+        });
+        started_rx.await.unwrap();
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        task_result(tasks.join_next().await.unwrap()).unwrap();
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_output_uses_actual_id_and_subsequent_request_works() {
+        let (tx, mut rx) = mpsc::channel(8);
+        send_result(
+            &tx,
+            "actual-id",
+            json!({"stderr": "x".repeat(16 * 1024 * 1024)}),
+        )
+        .await
+        .unwrap();
+        let rejected: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(rejected["body"]["id"], "actual-id");
+        assert!(rejected["body"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not rolled back"));
+        assert!(rejected["body"].get("output").is_none());
+        invoke_task(tx, object(json!({"kind": "git-worktree.capability.invoke", "id": "later", "capability": CREATE_CAPABILITY, "args": {}}))).await.unwrap();
+        let later: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(later["body"]["id"], "later");
+        assert_eq!(later["body"]["output"]["error"]["kind"], "invalid-args");
+    }
+
+    #[tokio::test]
+    async fn closed_writer_errors_reach_invocation_supervisor() {
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx);
+        let task = tokio::spawn(invoke_task(
+            tx,
+            object(json!({"id": "owned", "capability": CREATE_CAPABILITY, "args": {}})),
+        ));
+        assert!(matches!(
+            task_result(task.await),
+            Err(TransportError::WriterClosed)
+        ));
+    }
 
     #[test]
     fn malformed_create_returns_structured_failure() {

@@ -41,11 +41,23 @@
 //! the underlying plugin's broadcast `tool.result` doesn't collide with
 //! the gate's eventual outbound `tool.result` to the provider.
 
+//! Output failure contract: wire admission uses SDK `checked_send`, not delivery
+//! acknowledgement. A rejected forward releases its inner correlation and emits
+//! one small outer `tool.result.error`. Rejected source progress cancels the
+//! actual inner invocation and settles the outer once; late results are inert.
+//! Final-output rejection substitutes the same terminal error, never success.
+//! Earlier/external effects remain unknown. Permission/catalog/control output
+//! is required uncorrelated protocol: rejection or a closed writer ends the
+//! plugin rather than inventing tool correlation. An undeliverable fallback also
+//! ends transport. Malformed bounded JSON is noise; framing/I/O faults are not.
+
 mod policy;
 
 use std::collections::HashMap;
 
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{
+    await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
+};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -152,12 +164,15 @@ fn parse_args() -> Policy {
 }
 
 async fn run(policy: Policy) -> Result<(), TransportError> {
-    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (out_tx, writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed),
+    };
     tracing::info!(engine_version = %engine_version, "ready");
 
     send_event(&out_tx, hello_body()).await?;
@@ -165,9 +180,25 @@ async fn run(policy: Policy) -> Result<(), TransportError> {
     let mut state = GateState::new(policy);
     // Announce the initial mode so any UI that comes up after us still sees it.
     send_event(&out_tx, mode_changed_body(state.mode)).await?;
-    run_dispatch_loop(&out_tx, &mut in_rx, &mut state).await?;
-
-    let _ = out_tx.send(PluginOutgoing::event(goodbye_body())).await;
+    let mut result = run_dispatch_loop(&out_tx, &mut in_rx, &mut state).await;
+    for (inner_id, pending) in &state.pending {
+        if let Err(error) =
+            send_event(&out_tx, forward_cancel_body(&pending.source, inner_id)).await
+        {
+            if result.is_ok() {
+                result = Err(error);
+            }
+            break;
+        }
+    }
+    state.pending.clear();
+    state.awaiting_approval.clear();
+    result?;
+    send_event(&out_tx, goodbye_body()).await?;
+    drop(out_tx);
+    if let Err(error) = writer_handle.await {
+        std::panic::resume_unwind(error.into_panic());
+    }
     Ok(())
 }
 
@@ -332,6 +363,7 @@ async fn run_dispatch_loop(
 ) -> Result<(), TransportError> {
     loop {
         tokio::select! {
+            _ = out_tx.closed() => return Err(TransportError::WriterClosed),
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(Ok(env)) => match &env.body {
@@ -346,9 +378,10 @@ async fn run_dispatch_loop(
                             dispatch_event(out_tx, map, state).await?;
                         }
                     },
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "stdin parse error; dropping line");
+                    Some(Err(TransportError::Parse(e))) => {
+                        tracing::warn!(error = %e, "stdin parse error; dropping line");
                     }
+                    Some(Err(e)) => return Err(e),
                     None => {
                         tracing::info!("stdin closed; exiting");
                         return Ok(());
@@ -925,7 +958,7 @@ async fn forward_to_source(
             name: name.to_owned(),
         },
     );
-    send_event(
+    let result = send_event(
         out_tx,
         forward_invoke_body(
             &source,
@@ -940,7 +973,11 @@ async fn forward_to_source(
             },
         ),
     )
-    .await?;
+    .await;
+    if let Err(error) = result {
+        state.pending.remove(&inner_id);
+        return admission_failure(out_tx, &outer_id, error).await;
+    }
     Ok(())
 }
 
@@ -989,7 +1026,7 @@ async fn handle_tool_cancel(
 async fn handle_tool_stream(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
-    state: &GateState,
+    state: &mut GateState,
 ) -> Result<(), TransportError> {
     let inner_id = match body.get("id").and_then(Value::as_str) {
         Some(id) => id,
@@ -1000,7 +1037,19 @@ async fn handle_tool_stream(
     };
     let mut out = body.clone();
     out.insert("id".into(), Value::String(pending.outer_id.clone()));
-    send_event(out_tx, out).await
+    let outer_id = pending.outer_id.clone();
+    let source = pending.source.clone();
+    if let Err(error) = send_event(out_tx, out).await {
+        state.pending.remove(inner_id);
+        if matches!(
+            error,
+            TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming
+        ) {
+            send_event(out_tx, forward_cancel_body(&source, inner_id)).await?;
+        }
+        return admission_failure(out_tx, &outer_id, error).await;
+    }
+    Ok(())
 }
 
 async fn handle_tool_result(
@@ -1020,10 +1069,9 @@ async fn handle_tool_result(
     };
     let mut out = body.clone();
     out.insert("kind".into(), Value::String("tool.result".into()));
-    out.insert("id".into(), Value::String(pending.outer_id));
+    out.insert("id".into(), Value::String(pending.outer_id.clone()));
     out.insert("name".into(), Value::String(pending.name));
-    send_event(out_tx, out).await?;
-    Ok(())
+    send_event(out_tx, out).await
 }
 
 async fn handle_permission_response(
@@ -1214,19 +1262,57 @@ async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+    let terminal_id = if body.get("kind").and_then(Value::as_str) == Some("tool.result") {
+        body.get("id").and_then(Value::as_str).map(str::to_owned)
+    } else {
+        None
+    };
+    match checked_send(out_tx, PluginOutgoing::event(body)).await {
+        Err(TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming)
+            if terminal_id.is_some() =>
+        {
+            checked_send(
+                out_tx,
+                PluginOutgoing::event(tool_result_error_body(
+                    terminal_id.as_deref().unwrap_or_default(),
+                    "output admission failed; earlier or external effects may have occurred",
+                )),
+            )
+            .await
+        }
+        result => result,
+    }
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), TransportError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| TransportError::WriterClosed)
+        }),
+    )
+    .await
+}
+
+/// Admission is not delivery. Never replay the source operation after a rejected output.
+async fn admission_failure(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    outer_id: &str,
+    error: TransportError,
+) -> Result<(), TransportError> {
+    match error {
+        TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming => {
+            checked_send(
+                out_tx,
+                PluginOutgoing::event(tool_result_error_body(
+                    outer_id,
+                    "output admission failed; earlier or external effects may have occurred",
+                )),
+            )
+            .await
+        }
+        error => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1236,6 +1322,138 @@ mod tests {
     use super::*;
     use mlua::{Function, Lua, Table, Value as LuaValue};
     use serde_json::json;
+
+    fn huge() -> Value {
+        Value::String("x".repeat(16 * 1024 * 1024))
+    }
+
+    fn pending_invocation(args: Value) -> PendingApproval {
+        PendingApproval {
+            outer_id: "outer".into(),
+            source: "source".into(),
+            name: "test".into(),
+            args,
+            invoking_from: None,
+            invocation: None,
+            allowlist: None,
+        }
+    }
+
+    fn wire_body(message: PluginOutgoing) -> Value {
+        serde_json::from_str::<Value>(&message.to_line()).unwrap()["body"].clone()
+    }
+
+    #[tokio::test]
+    async fn oversized_forward_rolls_back_then_later_invocation_works() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = make_state();
+        forward_to_source(&tx, &mut state, pending_invocation(huge()))
+            .await
+            .unwrap();
+        assert!(state.pending.is_empty());
+        let error = wire_body(rx.recv().await.unwrap());
+        assert_eq!(error["id"], "outer");
+        assert!(error["error"].as_str().unwrap().contains("admission"));
+        assert!(rx.try_recv().is_err());
+        forward_to_source(&tx, &mut state, pending_invocation(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(
+            wire_body(rx.recv().await.unwrap())["kind"],
+            "source.tool.invoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_stream_cancels_source_and_makes_late_result_inert() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = make_state();
+        forward_to_source(&tx, &mut state, pending_invocation(json!({})))
+            .await
+            .unwrap();
+        let inner = wire_body(rx.recv().await.unwrap())["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let body = json!({"kind": "tool.stream", "id": inner, "text": huge()})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_stream(&tx, &body, &mut state).await.unwrap();
+        assert!(state.pending.is_empty());
+        let cancel = wire_body(rx.recv().await.unwrap());
+        assert_eq!(cancel["kind"], "source.tool.cancel");
+        assert_eq!(cancel["id"], inner);
+        let error = wire_body(rx.recv().await.unwrap());
+        assert_eq!(error["kind"], "tool.result");
+        assert_eq!(error["id"], "outer");
+        handle_tool_result(&tx, &body, &mut state).await.unwrap();
+        handle_permission_response(
+            &tx,
+            &json!({"id": "outer", "decision": "approve"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_final_result_settles_once_without_success() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = make_state();
+        forward_to_source(&tx, &mut state, pending_invocation(json!({})))
+            .await
+            .unwrap();
+        let inner = wire_body(rx.recv().await.unwrap())["id"].clone();
+        let result = json!({"kind": "tool.result", "id": inner, "output": huge()})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_result(&tx, &result, &mut state).await.unwrap();
+        let error = wire_body(rx.recv().await.unwrap());
+        assert_eq!(error["id"], "outer");
+        assert!(error.get("output").is_none());
+        assert!(error["error"].as_str().unwrap().contains("effects"));
+        handle_tool_result(&tx, &result, &mut state).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(state.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_writer_ends_idle_dispatch_and_failed_forward_releases_pending() {
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx);
+        let mut state = make_state();
+        assert!(matches!(
+            forward_to_source(&tx, &mut state, pending_invocation(json!({}))).await,
+            Err(TransportError::WriterClosed)
+        ));
+        assert!(state.pending.is_empty());
+        let (_input, mut input) = mpsc::channel(8);
+        assert!(matches!(
+            run_dispatch_loop(&tx, &mut input, &mut state).await,
+            Err(TransportError::WriterClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn required_uncorrelated_output_is_not_disguised_as_tool_result() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let output = json!({"kind": "tool.register", "tools": huge()})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            send_event(&tx, output).await,
+            Err(TransportError::FrameTooLarge { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 
     fn make_state() -> GateState {
         let mut policy = Policy::new(Decision::Prompt);
