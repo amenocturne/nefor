@@ -84,14 +84,58 @@ pub enum ConnectionInbound {
 pub enum ReaderEnd {
     /// Clean EOF.
     Eof,
-    /// Transport-level IO error (including invalid UTF-8 on the wire).
+    /// Transport-level read IO error.
     IoError,
+    /// A complete frame contains invalid UTF-8.
+    InvalidUtf8,
     /// Line exceeded the 16 MiB bound (§2). Treated as a framing error.
     LineTooLong,
 }
 
 /// Maximum line length in bytes (§2: 16 MiB default).
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Admission is checked before publication or channel enqueue.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AdmissionError {
+    #[error("frame_too_large: {bytes} wire bytes exceeds {limit_bytes}")]
+    FrameTooLarge { bytes: usize, limit_bytes: usize },
+    #[error("invalid_framing: embedded LF")]
+    InvalidFraming,
+    #[error("unavailable: target plugin '{0}' is not connected")]
+    Unavailable(String),
+    #[error("writer_closed: target plugin '{0}' disconnected during delivery")]
+    WriterClosed(String),
+}
+
+impl AdmissionError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::FrameTooLarge { .. } => "frame_too_large",
+            Self::InvalidFraming => "invalid_framing",
+            Self::Unavailable(_) => "unavailable",
+            Self::WriterClosed(_) => "writer_closed",
+        }
+    }
+}
+
+/// Normalize one optional final LF and validate the LF-inclusive wire size.
+pub fn admit_frame(mut payload: String) -> Result<String, AdmissionError> {
+    if payload.ends_with('\n') {
+        payload.pop();
+    }
+    if payload.contains('\n') {
+        return Err(AdmissionError::InvalidFraming);
+    }
+    let bytes = payload.len().saturating_add(1);
+    if bytes > MAX_LINE_BYTES {
+        return Err(AdmissionError::FrameTooLarge {
+            bytes,
+            limit_bytes: MAX_LINE_BYTES,
+        });
+    }
+    Ok(payload)
+}
 
 /// Default per-connection receive queue capacity (§6).
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -134,6 +178,7 @@ pub async fn run_reader(
                 }
             }
             Ok(ReadLine::TooLong) => ReaderEnd::LineTooLong,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => ReaderEnd::InvalidUtf8,
             Err(_) => ReaderEnd::IoError,
         };
         let _ = tx
@@ -143,6 +188,7 @@ pub async fn run_reader(
     }
 }
 
+#[derive(Debug)]
 enum ReadLine {
     Ok(usize),
     TooLong,
@@ -195,11 +241,49 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum WriterEnd {
+    WriteIo,
+    FlushIo,
+}
+
+impl WriterEnd {
+    pub fn phase(self) -> &'static str {
+        match self {
+            Self::WriteIo => "write",
+            Self::FlushIo => "flush",
+        }
+    }
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::WriteIo => "write_io",
+            Self::FlushIo => "flush_io",
+        }
+    }
+}
+
+#[cfg(test)]
+pub async fn run_writer(
+    id: ConnectionId,
+    writer: Pin<Box<dyn AsyncWrite + Send + Unpin>>,
+    rx: mpsc::UnboundedReceiver<ConnectionOutbound>,
+    cap: usize,
+) {
+    run_writer_observed(
+        id,
+        writer,
+        rx,
+        cap,
+        None,
+        std::sync::Arc::new(AtomicU64::new(0)),
+    )
+    .await;
+}
+
 /// Spawn the writer task. Implements the bounded receive queue from §6 for
 /// ordinary [`ConnectionOutbound::Send`] traffic. When that live queue is
-/// full, the oldest lossy line is dropped and a warning is logged — the
-/// broker no longer emits a protocol-level `QueueOverflow` system message
-/// (that was a examples/nefor-agent/init.lua concern in the new model).
+/// full, the oldest lossy line is dropped and counted for the broker
+/// to report a coalesced, attributed delivery-loss observation.
 ///
 /// Finite [`ConnectionOutbound::SendLosslessBatch`] chunks are protected
 /// from that policy and retain their position relative to preceding sends,
@@ -210,11 +294,13 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
 /// `rx` itself is unbounded so the broker is never blocked; backpressure
 /// is enforced inside this task. Exits on [`ConnectionOutbound::Close`] or
 /// when `rx` closes.
-pub async fn run_writer(
+pub async fn run_writer_observed(
     id: ConnectionId,
     mut writer: Pin<Box<dyn AsyncWrite + Send + Unpin>>,
     rx: mpsc::UnboundedReceiver<ConnectionOutbound>,
     cap: usize,
+    notices: Option<mpsc::Sender<(ConnectionId, WriterEnd)>>,
+    lost: std::sync::Arc<AtomicU64>,
 ) {
     let mut rx = rx;
     let mut q: VecDeque<QueuedOutbound> = VecDeque::with_capacity(cap.min(1024));
@@ -224,10 +310,11 @@ pub async fn run_writer(
     loop {
         // Drain anything we can read without blocking, applying overflow
         // policy per §6.
-        loop {
+        for _ in 0..4096 {
             match rx.try_recv() {
                 Ok(ConnectionOutbound::Send(payload)) => {
                     if queued_lossy >= cap {
+                        lost.fetch_add(1, Ordering::Relaxed);
                         let oldest_lossy = q
                             .iter()
                             .position(|item| matches!(item, QueuedOutbound::Lossy(_)));
@@ -266,16 +353,29 @@ pub async fn run_writer(
         // Try to write the head of the queue.
         if let Some(line) = pop_next_line(&mut q, &mut queued_lossy) {
             if writer.write_all(line.as_bytes()).await.is_err() {
+                rx.close();
+                if let Some(tx) = &notices {
+                    let _ = tx.send((id, WriterEnd::WriteIo)).await;
+                }
                 return;
             }
             if writer.flush().await.is_err() {
+                rx.close();
+                if let Some(tx) = &notices {
+                    let _ = tx.send((id, WriterEnd::FlushIo)).await;
+                }
                 return;
             }
             continue;
         }
 
         if close_after_drain {
-            let _ = writer.flush().await;
+            if writer.flush().await.is_err() {
+                rx.close();
+                if let Some(tx) = &notices {
+                    let _ = tx.send((id, WriterEnd::FlushIo)).await;
+                }
+            }
             let _ = writer.shutdown().await;
             return;
         }
@@ -283,6 +383,9 @@ pub async fn run_writer(
         // Nothing to do — wait for at least one new message.
         match rx.recv().await {
             Some(ConnectionOutbound::Send(payload)) => {
+                if cap == 0 {
+                    lost.fetch_add(1, Ordering::Relaxed);
+                }
                 if cap > 0 {
                     q.push_back(QueuedOutbound::Lossy(payload));
                     queued_lossy += 1;
@@ -362,6 +465,71 @@ pub async fn run_exit_watcher(
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn capped_reader_decodes_split_cyrillic_and_distinguishes_invalid_bytes() {
+        let mut reader = BufReader::with_capacity(1, "Ж Cyrillic\n".as_bytes());
+        let mut line = String::new();
+        assert!(matches!(
+            read_line_capped(&mut reader, &mut line, 32).await.unwrap(),
+            ReadLine::Ok(_)
+        ));
+        assert_eq!(line, "Ж Cyrillic\n");
+        let mut reader = BufReader::with_capacity(1, &b"\xff\n"[..]);
+        let error = read_line_capped(&mut reader, &mut String::new(), 32)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn writer_reports_write_and_flush_failures_once() {
+        struct FaultWriter(bool);
+        impl AsyncWrite for FaultWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(if self.0 {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::other("write failed"))
+                })
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("flush failed")))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        for flush in [false, true] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (notices, mut got) = mpsc::channel(4);
+            tx.send(ConnectionOutbound::Send("message\n".into()))
+                .unwrap();
+            run_writer_observed(
+                ConnectionId::next(),
+                Box::pin(FaultWriter(flush)),
+                rx,
+                4,
+                Some(notices),
+                std::sync::Arc::new(AtomicU64::new(0)),
+            )
+            .await;
+            let (_, fault) = got.recv().await.unwrap();
+            assert_eq!(fault.phase(), if flush { "flush" } else { "write" });
+            assert!(got.recv().await.is_none());
+            assert!(tx.send(ConnectionOutbound::Send("late\n".into())).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn capped_reader_rejects_oversized_unterminated_input_at_the_boundary() {
@@ -476,7 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_overflow_drops_oldest_silently() {
+    async fn writer_overflow_retains_the_declared_suffix() {
         // Tiny duplex: writer stalls after 1-2 lines. Tiny cap: queue
         // saturates after a couple of pushes. The new string-level writer
         // drops oldest on overflow and logs a warning — no protocol-level

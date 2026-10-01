@@ -60,9 +60,6 @@ pub enum ExitOutcome {
     Crash,
     /// The process could not be spawned.
     SpawnFailure { reason: String },
-    /// The process transport failed before a more specific process outcome was available.
-    #[allow(dead_code)]
-    TransportFailure { reason: String },
     /// The engine could not observe the process outcome.
     Unknown { reason: String },
 }

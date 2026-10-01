@@ -615,7 +615,13 @@ mod tests {
 
     struct NullOps;
     impl EngineOps for NullOps {
-        fn send(&self, _target: SendTarget, _payload: String) {}
+        fn send(
+            &self,
+            _target: SendTarget,
+            _payload: String,
+        ) -> Result<(), crate::ncp::connection::AdmissionError> {
+            Ok(())
+        }
         fn plugins(&self) -> Vec<PluginName> {
             Vec::new()
         }
@@ -635,8 +641,13 @@ mod tests {
         }
     }
     impl EngineOps for RecordOps {
-        fn send(&self, target: SendTarget, payload: String) {
+        fn send(
+            &self,
+            target: SendTarget,
+            payload: String,
+        ) -> Result<(), crate::ncp::connection::AdmissionError> {
             self.calls.lock().unwrap().push((target, payload));
+            Ok(())
         }
         fn plugins(&self) -> Vec<PluginName> {
             Vec::new()

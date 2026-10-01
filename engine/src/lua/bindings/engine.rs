@@ -34,6 +34,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::ncp::connection::{admit_frame, AdmissionError};
 use mlua::{Lua, RegistryKey, Table, Value};
 
 pub type CooperativeTasks = Arc<Mutex<VecDeque<RegistryKey>>>;
@@ -65,12 +66,8 @@ pub trait EngineOps: Send + Sync {
     /// emission is part of the canonical log, then writes the line to
     /// every (broadcast) or one (targeted) connected plugin's stdin.
     ///
-    /// Infallible from the binding's perspective — the engine is responsible
-    /// for surfacing any delivery failure asynchronously (e.g., through the
-    /// event log). Making `send` fallible here would force the dispatch
-    /// function to reason about transport-level errors, which is not its
-    /// job.
-    fn send(&self, target: SendTarget, payload: String);
+    /// Returns a typed admission failure before publication; routing happens later.
+    fn send(&self, target: SendTarget, payload: String) -> Result<(), AdmissionError>;
 
     /// Forward `payload` to one peer's stdin **without** appending a log
     /// entry.
@@ -83,13 +80,8 @@ pub trait EngineOps: Send + Sync {
     /// well would muddy the log — replaying step-origin entries to late
     /// attachers would double-deliver every event.
     ///
-    /// Returns `Err` if `target` is not currently connected. Unlike
-    /// `send`'s infallible signature, the caller of `deliver` is the
-    /// in-VM Lua code that just enumerated `nefor.engine.plugins()` —
-    /// it has full agency to decide what to do on a TOCTOU disconnect
-    /// (typically: log + drop). Default impl returns `Ok(())` so test
-    /// recorders that don't care about transport semantics stay terse.
-    fn deliver(&self, _target: PluginName, _payload: String) -> Result<(), String> {
+    /// Returns a typed admission/enqueue error. Success is not peer consumption.
+    fn deliver(&self, _target: PluginName, _payload: String) -> Result<(), AdmissionError> {
         Ok(())
     }
 
@@ -99,7 +91,15 @@ pub trait EngineOps: Send + Sync {
     /// The default preserves compatibility for recording implementations;
     /// production overrides this to enqueue the batch atomically so later
     /// sends and connection close cannot overtake it.
-    fn deliver_batch(&self, target: PluginName, payloads: Vec<String>) -> Result<(), String> {
+    fn deliver_batch(
+        &self,
+        target: PluginName,
+        payloads: Vec<String>,
+    ) -> Result<(), AdmissionError> {
+        let payloads = payloads
+            .into_iter()
+            .map(admit_frame)
+            .collect::<Result<Vec<_>, _>>()?;
         for payload in payloads {
             self.deliver(target.clone(), payload)?;
         }
@@ -128,6 +128,24 @@ pub fn install_engine(
     cooperative_tasks: CooperativeTasks,
 ) -> mlua::Result<()> {
     let engine = lua.create_table()?;
+    engine.set(
+        "error_kind",
+        lua.create_function(|_, value: Value| {
+            fn classify(error: &mlua::Error) -> Option<&'static str> {
+                match error {
+                    mlua::Error::ExternalError(error) => error
+                        .downcast_ref::<AdmissionError>()
+                        .map(AdmissionError::kind),
+                    mlua::Error::CallbackError { cause, .. } => classify(cause),
+                    _ => None,
+                }
+            }
+            Ok(match value {
+                Value::Error(error) => classify(&error),
+                _ => None,
+            })
+        })?,
+    )?;
 
     let task_lua = lua.clone();
     let defer_fn = lua.create_function(move |_, callback: Value| {
@@ -175,7 +193,9 @@ pub fn install_engine(
                 )));
             }
         };
-        ops_for_send.send(target, payload);
+        ops_for_send
+            .send(target, payload)
+            .map_err(mlua::Error::external)?;
         Ok(())
     })?;
     engine.set("send", send_fn)?;
@@ -222,7 +242,7 @@ pub fn install_engine(
             }
         };
         if let Err(e) = ops_for_deliver.deliver(peer, payload) {
-            return Err(mlua::Error::runtime(format!("nefor.engine.deliver: {e}")));
+            return Err(mlua::Error::external(e));
         }
         Ok(())
     })?;
@@ -279,9 +299,7 @@ pub fn install_engine(
             }
         }
         if let Err(e) = ops_for_deliver_batch.deliver_batch(peer, payloads) {
-            return Err(mlua::Error::runtime(format!(
-                "nefor.engine.deliver_batch: {e}"
-            )));
+            return Err(mlua::Error::external(e));
         }
         Ok(())
     })?;
@@ -392,12 +410,13 @@ mod tests {
     }
 
     impl EngineOps for RecordOps {
-        fn send(&self, target: SendTarget, payload: String) {
+        fn send(&self, target: SendTarget, payload: String) -> Result<(), AdmissionError> {
             self.calls.lock().unwrap().push((target, payload));
+            Ok(())
         }
-        fn deliver(&self, target: PluginName, payload: String) -> Result<(), String> {
+        fn deliver(&self, target: PluginName, payload: String) -> Result<(), AdmissionError> {
             if let Some(e) = self.deliver_err.lock().unwrap().clone() {
-                return Err(e);
+                return Err(AdmissionError::Unavailable(e));
             }
             self.deliveries.lock().unwrap().push((target, payload));
             Ok(())

@@ -37,8 +37,9 @@ use crate::events::{EventBus, EventName, EventPayload, SHUTDOWN};
 use crate::lua::bindings::{EngineOps, SendTarget};
 use crate::lua::LuaHost;
 use crate::ncp::connection::{
-    run_exit_watcher, run_reader, run_stderr_pump, run_writer, ConnectionId, ConnectionInbound,
-    ConnectionOutbound, ReaderEnd, DEFAULT_QUEUE_CAPACITY,
+    admit_frame, run_exit_watcher, run_reader, run_stderr_pump, run_writer_observed,
+    AdmissionError, ConnectionId, ConnectionInbound, ConnectionOutbound, ReaderEnd, WriterEnd,
+    DEFAULT_QUEUE_CAPACITY,
 };
 use crate::ncp::transport::{ExitOutcome, Transport};
 
@@ -177,7 +178,8 @@ impl EngineOps for BrokerOps {
         guard.conns.keys().cloned().collect()
     }
 
-    fn send(&self, target: SendTarget, payload: String) {
+    fn send(&self, target: SendTarget, payload: String) -> Result<(), AdmissionError> {
+        let payload = admit_frame(payload)?;
         // Post-callback-refactor: `send` is pure emission. It appends a
         // canonical Step entry to the bus log; routing is owned entirely by
         // Lua wrappers (their `to_plugin` callbacks call
@@ -205,9 +207,11 @@ impl EngineOps for BrokerOps {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.event_log.push(entry);
+        Ok(())
     }
 
-    fn deliver(&self, target: PluginName, payload: String) -> Result<(), String> {
+    fn deliver(&self, target: PluginName, payload: String) -> Result<(), AdmissionError> {
+        let payload = admit_frame(payload)?;
         // Per-peer delivery — write the line to one peer's stdin without
         // appending a LogEntry. The original emission already produced its
         // canonical Plugin/Step entry at ingress; delivery is a routing
@@ -227,15 +231,23 @@ impl EngineOps for BrokerOps {
                 // `nefor.engine.plugins()` to pick this peer — so the
                 // explicit error gives them the chance to react to a
                 // TOCTOU disconnect.
-                return Err(format!("target plugin '{target}' is not connected"));
+                return Err(AdmissionError::Unavailable(target.to_string()));
             }
         };
         let line = with_trailing_newline(payload);
-        let _ = conn.send(ConnectionOutbound::Send(line));
-        Ok(())
+        conn.send(ConnectionOutbound::Send(line))
+            .map_err(|_| AdmissionError::WriterClosed(target.to_string()))
     }
 
-    fn deliver_batch(&self, target: PluginName, payloads: Vec<String>) -> Result<(), String> {
+    fn deliver_batch(
+        &self,
+        target: PluginName,
+        payloads: Vec<String>,
+    ) -> Result<(), AdmissionError> {
+        let payloads = payloads
+            .into_iter()
+            .map(admit_frame)
+            .collect::<Result<Vec<_>, _>>()?;
         let guard = match self.shared.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -243,10 +255,10 @@ impl EngineOps for BrokerOps {
         let conn = guard
             .conns
             .get(&target)
-            .ok_or_else(|| format!("target plugin '{target}' is not connected"))?;
+            .ok_or_else(|| AdmissionError::Unavailable(target.to_string()))?;
         let lines = payloads.into_iter().map(with_trailing_newline).collect();
         conn.send(ConnectionOutbound::SendLosslessBatch(lines))
-            .map_err(|_| format!("target plugin '{target}' disconnected during delivery"))
+            .map_err(|_| AdmissionError::WriterClosed(target.to_string()))
     }
 }
 
@@ -262,7 +274,14 @@ fn with_trailing_newline(mut s: String) -> String {
 struct ConnectionRecord {
     name: PluginName,
     closing: bool,
-    transport_failure: Option<String>,
+    transport_failure: Option<Instant>,
+    close_deadline: Option<Instant>,
+    has_watcher: bool,
+    pending_exit: Option<ExitOutcome>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+    lost: Arc<std::sync::atomic::AtomicU64>,
     terminate: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -284,6 +303,8 @@ pub struct Broker {
     /// Shared channel all per-connection exit watchers drop outcomes onto.
     exit_tx: mpsc::Sender<(ConnectionId, ExitOutcome)>,
     exit_rx: mpsc::Receiver<(ConnectionId, ExitOutcome)>,
+    writer_tx: mpsc::Sender<(ConnectionId, WriterEnd)>,
+    writer_rx: mpsc::Receiver<(ConnectionId, WriterEnd)>,
     /// Triggered only after Lua composition has completed its shutdown policy.
     shutdown_rx: mpsc::Receiver<ShutdownRequest>,
     shutdown_tx: mpsc::Sender<ShutdownRequest>,
@@ -334,6 +355,7 @@ impl Broker {
         // many plugins. 1024 each matches §6's per-connection default.
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
         let (exit_tx, exit_rx) = mpsc::channel(64);
+        let (writer_tx, writer_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<ShutdownRequest>(4);
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(4);
 
@@ -364,6 +386,8 @@ impl Broker {
             inbound_rx,
             exit_tx,
             exit_rx,
+            writer_tx,
+            writer_rx,
             shutdown_rx,
             shutdown_tx,
             interrupt_rx,
@@ -491,16 +515,20 @@ impl Broker {
         let id = ConnectionId::next();
         let log_label = name.as_str().to_owned();
         let (send_tx, send_rx) = mpsc::unbounded_channel::<ConnectionOutbound>();
-        tokio::spawn(run_writer(
+        let lost = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = tokio::spawn(run_writer_observed(
             id,
             transport.writer,
             send_rx,
             DEFAULT_QUEUE_CAPACITY,
+            Some(self.writer_tx.clone()),
+            Arc::clone(&lost),
         ));
-        tokio::spawn(run_reader(id, transport.reader, self.inbound_tx.clone()));
-        if let Some(stderr) = transport.stderr {
-            tokio::spawn(run_stderr_pump(log_label, stderr));
-        }
+        let reader = tokio::spawn(run_reader(id, transport.reader, self.inbound_tx.clone()));
+        let stderr = transport
+            .stderr
+            .map(|stderr| tokio::spawn(run_stderr_pump(log_label, stderr)));
+        let has_watcher = transport.exit.is_some();
         tokio::spawn(run_exit_watcher(id, transport.exit, self.exit_tx.clone()));
 
         {
@@ -513,6 +541,13 @@ impl Broker {
                 name,
                 closing: false,
                 transport_failure: None,
+                close_deadline: None,
+                has_watcher,
+                pending_exit: None,
+                reader,
+                writer,
+                stderr,
+                lost,
                 terminate: transport.terminate,
             },
         );
@@ -597,6 +632,25 @@ impl Broker {
             // real inbound lines. Doing this before the `tokio::select!`
             // guarantees they reach dispatch before any pending shutdown
             // arm fires this iteration.
+            // Drain bounded, already-pending notices before accounting any OS outcome.
+            if self
+                .conns_by_id
+                .values()
+                .any(|record| record.pending_exit.is_some())
+            {
+                let pending = self.inbound_rx.len();
+                for _ in 0..pending {
+                    let Ok((id, msg)) = self.inbound_rx.try_recv() else {
+                        break;
+                    };
+                    self.handle_inbound_tick(id, msg).await;
+                }
+                while let Ok((id, reason)) = self.writer_rx.try_recv() {
+                    self.transport_failed(id, reason.phase(), reason.kind());
+                }
+            }
+            self.observe_losses_and_local_deadlines();
+            self.account_finished_exits();
             self.drain_engine_envelopes();
 
             // Cooperative close gets one grace window. After it expires,
@@ -639,7 +693,7 @@ impl Broker {
                 return BrokerStopReason::AllPluginsGone;
             }
 
-            let sleep_dur = if shutdown_grace.is_none() && self.host.has_cooperative_tasks() {
+            let mut sleep_dur = if shutdown_grace.is_none() && self.host.has_cooperative_tasks() {
                 Duration::ZERO
             } else if forced_exit_deadline.is_some() {
                 Duration::from_millis(10)
@@ -649,12 +703,24 @@ impl Broker {
                 Duration::from_millis(500)
             };
 
+            for record in self.conns_by_id.values() {
+                if let Some(deadline) = record.close_deadline {
+                    sleep_dur = sleep_dur.min(deadline.saturating_duration_since(Instant::now()));
+                }
+                if record.pending_exit.is_some() {
+                    sleep_dur = sleep_dur.min(Duration::from_millis(10));
+                }
+            }
+
             tokio::select! {
                 Some(callback) = self.runtime_callbacks.recv(), if shutdown_grace.is_none() => {
                     self.handle_runtime_callbacks(callback);
                 }
                 Some((conn_id, msg)) = self.inbound_rx.recv() => {
                     self.handle_inbound_tick(conn_id, msg).await;
+                }
+                Some((conn_id, reason)) = self.writer_rx.recv() => {
+                    self.transport_failed(conn_id, reason.phase(), reason.kind());
                 }
                 Some((conn_id, outcome)) = self.exit_rx.recv() => {
                     self.handle_exit(conn_id, outcome).await;
@@ -673,7 +739,7 @@ impl Broker {
                     shutdown_deadline = Some(Instant::now() + Duration::from_millis(request.grace_ms));
                     self.begin_shutdown();
                 }
-                _ = tokio::time::sleep(sleep_dur), if shutdown_grace.is_some() || self.host.has_cooperative_tasks() => {
+                _ = tokio::time::sleep(sleep_dur) => {
                     // Loop iteration to re-check shutdown or advance a deferred task.
                 }
             }
@@ -739,11 +805,11 @@ impl Broker {
             let Some(record) = conns.get(&id) else {
                 return;
             };
-            if record.closing {
-                return;
-            }
             match msg {
                 ConnectionInbound::Line(line) => {
+                    if record.closing {
+                        return;
+                    }
                     let name = record.name.clone();
                     if let Some((_, lines)) = batched.iter_mut().find(|(n, _)| n == &name) {
                         lines.push(line);
@@ -862,55 +928,140 @@ impl Broker {
     }
 
     fn handle_reader_closed(&mut self, id: ConnectionId, reason: ReaderEnd) {
-        // Reader EOF / IO error — the plugin's outbound stream is done.
-        // Don't immediately remove the connection from state; wait for the
-        // exit watcher to fire. In-memory test transports without an exit
-        // watcher fall through to the inbound-drained path below.
-        tracing::debug!(conn = %id, ?reason, "reader loop ended");
+        let kind = match reason {
+            ReaderEnd::Eof => {
+                self.force_close(id);
+                if self
+                    .conns_by_id
+                    .get(&id)
+                    .is_some_and(|record| !record.has_watcher)
+                {
+                    if let Some(record) = self.conns_by_id.remove(&id) {
+                        record.reader.abort();
+                        record.writer.abort();
+                        if let Some(stderr) = record.stderr {
+                            stderr.abort();
+                        }
+                    }
+                }
+                return;
+            }
+            ReaderEnd::IoError => "read_io",
+            ReaderEnd::InvalidUtf8 => "invalid_utf8",
+            ReaderEnd::LineTooLong => "frame_too_large",
+        };
+        self.transport_failed(id, "read", kind);
+    }
 
-        if let Some(record) = self.conns_by_id.get_mut(&id) {
-            if !record.closing && !matches!(reason, ReaderEnd::Eof) {
-                let failure = match reason {
-                    ReaderEnd::IoError => "plugin stdout transport failed",
-                    ReaderEnd::LineTooLong => "plugin stdout frame exceeded the line limit",
-                    ReaderEnd::Eof => unreachable!(),
-                };
-                tracing::warn!(plugin = %record.name.as_str(), conn = %id, failure, "closing plugin transport");
-                record.transport_failure = Some(failure.to_owned());
+    fn transport_failed(&mut self, id: ConnectionId, phase: &str, kind: &str) {
+        let Some(record) = self.conns_by_id.get_mut(&id) else {
+            return;
+        };
+        if record.transport_failure.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        record.transport_failure = Some(now);
+        record.closing = true;
+        record.close_deadline = Some(now + Duration::from_millis(2000));
+        record.reader.abort();
+        record.writer.abort();
+        if let Some(stderr) = &record.stderr {
+            stderr.abort();
+        }
+        let name = record.name.clone();
+        let has_watcher = record.has_watcher;
+        lock_shared(&self.shared).conns.remove(&name);
+        let mut reason = serde_json::json!({ "kind": kind });
+        if kind == "frame_too_large" {
+            reason["limit_bytes"] = crate::ncp::connection::MAX_LINE_BYTES.into();
+        }
+        self.queue_engine_envelope(serde_json::json!({
+            "kind": "engine.plugin_transport_failed", "plugin": name.as_str(),
+            "phase": phase, "reason": reason,
+        }));
+        // Observation reaches composition before requesting process termination.
+        self.drain_engine_envelopes();
+        if !has_watcher {
+            self.conns_by_id.remove(&id);
+        }
+    }
+
+    fn observe_losses_and_local_deadlines(&mut self) {
+        let mut losses = Vec::new();
+        let mut transport_only = Vec::new();
+        for (id, record) in &mut self.conns_by_id {
+            let count = record.lost.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if count > 0 {
+                losses.push((record.name.clone(), count));
+            }
+            if record
+                .close_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                record.close_deadline = None;
+                record.reader.abort();
+                record.writer.abort();
+                if let Some(stderr) = &record.stderr {
+                    stderr.abort();
+                }
+                if let Some(terminate) = record.terminate.take() {
+                    let _ = terminate.send(());
+                }
+                if !record.has_watcher {
+                    transport_only.push(*id);
+                }
             }
         }
-
-        // If the connection has no exit watcher (in-memory tests), the
-        // reader-closed signal is the only teardown notification we'll get.
-        // Drop it now.
-        let has_watcher = self.conns_by_id.contains_key(&id);
-        if has_watcher {
-            // If this connection has no exit watcher attached (we can't tell
-            // from here — so be conservative), schedule a best-effort close.
-            // The real exit watcher path takes priority and is idempotent.
-            self.force_close(id);
+        for id in transport_only {
+            self.conns_by_id.remove(&id);
+        }
+        for (name, count) in losses {
+            self.queue_engine_envelope(serde_json::json!({
+                "kind": "engine.plugin_delivery_lost", "plugin": name.as_str(),
+                "count": count, "reason": "queue_overflow",
+            }));
         }
     }
 
     async fn handle_exit(&mut self, id: ConnectionId, outcome: ExitOutcome) {
-        let name = self
+        let Some(record) = self.conns_by_id.get_mut(&id) else {
+            return;
+        };
+        record.pending_exit = Some(outcome);
+        self.force_close(id);
+    }
+
+    fn account_finished_exits(&mut self) {
+        let ids: Vec<_> = self
             .conns_by_id
-            .get(&id)
-            .map(|r| r.name.as_str().to_owned())
-            .unwrap_or_default();
-        tracing::info!(plugin = %name, ?outcome, "plugin exited");
-
-        // Drop the connection state. The writer task will exit when its
-        // channel closes.
-        let mut reported_outcome = outcome;
-        if let Some(record) = self.conns_by_id.remove(&id) {
-            if let Some(reason) = record.transport_failure {
-                reported_outcome = ExitOutcome::TransportFailure { reason };
-            }
-            let mut guard = lock_shared(&self.shared);
-            guard.conns.remove(&record.name);
+            .iter()
+            .filter_map(|(id, record)| {
+                (record.pending_exit.is_some()
+                    && record.reader.is_finished()
+                    && record.writer.is_finished())
+                .then_some(*id)
+            })
+            .collect();
+        for id in ids {
+            self.account_exit(id);
         }
+    }
 
+    fn account_exit(&mut self, id: ConnectionId) {
+        let Some(record) = self.conns_by_id.remove(&id) else {
+            return;
+        };
+        let name = record.name.as_str().to_owned();
+        record.reader.abort();
+        record.writer.abort();
+        if let Some(stderr) = record.stderr {
+            stderr.abort();
+        }
+        lock_shared(&self.shared).conns.remove(&record.name);
+        let Some(reported_outcome) = record.pending_exit else {
+            return;
+        };
         if let Some(code) = abnormal_exit_code(&reported_outcome) {
             match self.abnormal_exits.lock() {
                 Ok(mut exits) => exits.push((name.clone(), code)),
@@ -955,7 +1106,13 @@ impl Broker {
         for (id, record) in &mut self.conns_by_id {
             if let Some(terminate) = record.terminate.take() {
                 let _ = terminate.send(());
-            } else {
+            }
+            record.reader.abort();
+            record.writer.abort();
+            if let Some(stderr) = &record.stderr {
+                stderr.abort();
+            }
+            if !record.has_watcher {
                 transport_only.push((*id, record.name.clone()));
             }
         }
@@ -996,9 +1153,10 @@ impl Broker {
             return;
         }
         record.closing = true;
+        record.close_deadline = Some(Instant::now() + Duration::from_millis(2000));
         let name = record.name.clone();
-        let guard = lock_shared(&self.shared);
-        if let Some(sender) = guard.conns.get(&name) {
+        let mut guard = lock_shared(&self.shared);
+        if let Some(sender) = guard.conns.remove(&name) {
             let _ = sender.send(ConnectionOutbound::Close);
         }
     }
@@ -1011,7 +1169,6 @@ fn abnormal_exit_code(outcome: &ExitOutcome) -> Option<&'static str> {
         ExitOutcome::Signal(_) => Some("signal"),
         ExitOutcome::Crash => Some("crash"),
         ExitOutcome::SpawnFailure { .. } => Some("spawn_failure"),
-        ExitOutcome::TransportFailure { .. } => Some("transport_failure"),
         ExitOutcome::Unknown { .. } => Some("unknown"),
     }
 }
@@ -1024,9 +1181,6 @@ fn process_fact_body(plugin: String, outcome: ExitOutcome) -> serde_json::Value 
         ExitOutcome::Crash => serde_json::json!({ "kind": "crash" }),
         ExitOutcome::SpawnFailure { reason } => {
             serde_json::json!({ "kind": "spawn_failure", "reason": reason })
-        }
-        ExitOutcome::TransportFailure { reason } => {
-            serde_json::json!({ "kind": "transport_failure", "reason": reason })
         }
         ExitOutcome::Unknown { reason } => {
             serde_json::json!({ "kind": "unknown", "reason": reason })
@@ -1153,6 +1307,236 @@ mod tests {
     }
 
     // --- tests ---------------------------------------------------------
+
+    #[test]
+    fn admission_precedes_publication_and_batch_enqueue() {
+        use crate::ncp::connection::MAX_LINE_BYTES;
+        let shared = shared_state();
+        let ops = BrokerOps::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        lock_shared(&shared).conns.insert(pn("peer"), tx);
+        assert!(ops
+            .send(SendTarget::Broadcast, "first\nsecond".into())
+            .is_err());
+        assert!(ops
+            .send(SendTarget::Broadcast, "x".repeat(MAX_LINE_BYTES))
+            .is_err());
+        assert!(lock_shared(&shared).event_log.is_empty());
+        ops.send(SendTarget::Broadcast, "Ж\\n\n".into()).unwrap();
+        assert_eq!(lock_shared(&shared).event_log[0].payload, "Ж\\n");
+        for bad in ["bad\nmember".into(), "x".repeat(MAX_LINE_BYTES)] {
+            assert!(ops
+                .deliver_batch(pn("peer"), vec!["good".into(), bad])
+                .is_err());
+            assert!(
+                rx.try_recv().is_err(),
+                "no member of a rejected batch may enqueue"
+            );
+        }
+        let exact = "x".repeat(MAX_LINE_BYTES - 1);
+        ops.deliver(pn("peer"), exact).unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), ConnectionOutbound::Send(line) if line.len() == MAX_LINE_BYTES)
+        );
+        drop(rx);
+        assert!(matches!(
+            ops.deliver(pn("peer"), "x".into()),
+            Err(AdmissionError::WriterClosed(_))
+        ));
+        assert!(matches!(
+            ops.deliver(pn("missing"), "x".into()),
+            Err(AdmissionError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn lua_admission_errors_have_a_stable_classifier() {
+        let shared = shared_state();
+        let host = build_host(&shared, "function dispatch(c) end");
+        host.exec_str(
+            "test",
+            r#"
+            local ok, err = pcall(nefor.engine.send, "a\nb")
+            assert(not ok)
+            assert(nefor.engine.error_kind(err) == "invalid_framing")
+            local ok2, err2 = pcall(nefor.engine.deliver, "absent", "valid")
+            assert(not ok2)
+            assert(nefor.engine.error_kind(err2) == "unavailable")
+        "#,
+        )
+        .unwrap();
+        assert!(lock_shared(&shared).event_log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overflow_is_attributed_and_coalesced() {
+        let shared = shared_state();
+        let host = build_host(&shared, "function dispatch(c) end");
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (_peer, transport) = make_transport_buf(1);
+        broker.attach_transport(transport, pn("slow"));
+        let ops = BrokerOps::new(Arc::clone(&shared));
+        for _ in 0..1100 {
+            ops.deliver(pn("slow"), "payload".into()).unwrap();
+        }
+        let shutdown = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let facts = engine_facts(&shared);
+        let losses: Vec<_> = facts
+            .iter()
+            .filter(|f| f["kind"] == "engine.plugin_delivery_lost")
+            .collect();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0]["plugin"], "slow");
+        assert_eq!(losses[0]["count"], 1100 - DEFAULT_QUEUE_CAPACITY);
+        shutdown.shutdown(0).await;
+        run.await.unwrap();
+    }
+
+    fn engine_facts(shared: &Arc<StdMutex<BrokerShared>>) -> Vec<serde_json::Value> {
+        lock_shared(shared)
+            .event_log
+            .iter()
+            .filter_map(|entry| {
+                if entry.origin != Origin::Plugin(PluginName::engine()) {
+                    return None;
+                }
+                Some(
+                    serde_json::from_str::<serde_json::Value>(&entry.payload).unwrap()["body"]
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stubborn_process_transport_failure_is_local_and_reaped_with_actual_os_fact() {
+        use crate::ncp::spawn::{PluginKind, PluginSpec, TerminalMode};
+        for (mode, script, phase, kind) in [
+            (
+                "giant",
+                "head -c 16777217 /dev/zero; wait",
+                "read",
+                "frame_too_large",
+            ),
+            ("invalid", "printf '\\377\\n'; wait", "read", "invalid_utf8"),
+            ("closed-stdin", "exec 0<&-; wait", "write", "write_io"),
+            ("exit-invalid", "printf '\\377\\n'", "read", "invalid_utf8"),
+        ] {
+            let shared = shared_state();
+            // Explicit test continuation: no process-fact shutdown hook.
+            let host = build_host(
+                &shared,
+                r#"
+                function dispatch(c) end
+                function invoke_from_plugin(source, payload)
+                    nefor.engine.send(payload)
+                end
+            "#,
+            );
+            let mut broker = Broker::new(Arc::clone(&shared), host);
+            std::fs::create_dir_all("tmp").unwrap();
+            let dir = tempfile::tempdir_in("tmp").unwrap();
+            let pid_file = dir.path().join("pids");
+            let script = format!("sleep 30 & echo $$ $! > \"$1\"; {script}");
+            let spec = PluginSpec {
+                name: pn(mode),
+                terminal: TerminalMode::Detached,
+                kind: PluginKind::Command(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    script,
+                    "fixture".into(),
+                    pid_file.to_string_lossy().into_owned(),
+                ]),
+            };
+            let transport = crate::ncp::runner::spawn_plugin(&spec).unwrap();
+            broker.attach_transport(transport, pn(mode));
+            let (mut healthy, ht) = make_transport();
+            broker.attach_transport(ht, pn("healthy"));
+            let ops = BrokerOps::new(Arc::clone(&shared));
+            let shutdown = broker.shutdown_handle();
+            let run = tokio::spawn(broker.run());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !pid_file.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if mode == "closed-stdin" {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                ops.deliver(pn(mode), "probe".into()).unwrap();
+            } else if mode == "giant" {
+                // Stall stdin writer while stdout independently crosses the cap.
+                let _ = ops.deliver(pn(mode), "x".repeat(8 * 1024 * 1024));
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if engine_facts(&shared)
+                        .iter()
+                        .any(|fact| fact["kind"] == "engine.plugin_process_terminated")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let facts = engine_facts(&shared);
+            assert_eq!(facts.len(), 2, "{mode}: {facts:?}");
+            assert_eq!(facts[0]["kind"], "engine.plugin_transport_failed");
+            assert_eq!(facts[0]["plugin"], mode);
+            assert_eq!(facts[0]["phase"], phase);
+            assert_eq!(facts[0]["reason"]["kind"], kind);
+            assert_eq!(facts[1]["kind"], "engine.plugin_process_terminated");
+            if mode == "exit-invalid" {
+                assert_eq!(facts[1]["outcome"]["kind"], "clean_exit");
+            } else {
+                assert_eq!(facts[1]["outcome"]["kind"], "signal");
+                assert_eq!(facts[1]["outcome"]["signal"], libc::SIGKILL);
+            }
+            assert!(matches!(
+                ops.deliver(pn(mode), "later".into()),
+                Err(AdmissionError::Unavailable(_))
+            ));
+            send_line(&mut healthy, "Ж heartbeat").await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if lock_shared(&shared)
+                        .event_log
+                        .iter()
+                        .any(|entry| entry.payload == "Ж heartbeat")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !run.is_finished(),
+                "sibling remains live under test continuation"
+            );
+            let pids = std::fs::read_to_string(&pid_file).unwrap();
+            for pid in pids.split_whitespace() {
+                let pid: i32 = pid.parse().unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while unsafe { libc::kill(pid, 0) } == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("owned child must not survive teardown");
+            }
+            shutdown.shutdown(0).await;
+            run.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn broker_exits_when_no_plugins_configured() {
@@ -1811,6 +2195,7 @@ mod tests {
         broker.attach_transport(tb, pn("b"));
         let shutdown = broker.shutdown_handle();
         let run = tokio::spawn(broker.run());
+        drop(_a);
         exit_a.send(ExitOutcome::ExitCode(9)).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
@@ -1851,6 +2236,7 @@ mod tests {
         broker.attach_transport(tb, pn("b"));
         let shutdown = broker.shutdown_handle();
         let run = tokio::spawn(broker.run());
+        drop(_a);
         exit_a.send(ExitOutcome::CleanExit).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let facts: mlua::Table = lua.globals().get("facts").unwrap();
