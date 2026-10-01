@@ -2122,3 +2122,94 @@
             "no-op cancels must not touch the live chat",
         );
     }
+
+    #[tokio::test]
+    async fn publisher_overflow_drops_work_instead_of_reporting_success() {
+        let (wire, mut output) = mpsc::channel(16);
+        let (publisher, input) = Publisher::new(1);
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = completed.clone();
+        let result = publisher.run(&wire, input, &CancellationToken::new(), async {
+            publisher.try_send(PluginOutgoing::event(turn_error_body(&cfg("fixture"), "first"))).expect("first handoff");
+            assert!(publisher.try_send(PluginOutgoing::event(turn_error_body(&cfg("fixture"), "second"))).is_err());
+            std::future::pending::<()>().await;
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }).await;
+        assert!(matches!(result, Err(publisher::OutputFailure::Full)));
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(output.try_recv().is_err(), "no queued progress after failure");
+    }
+
+    #[tokio::test]
+    async fn publisher_rejects_giant_progress_without_later_success() {
+        let (wire, mut output) = mpsc::channel(16);
+        let (publisher, input) = Publisher::new(8);
+        let result = publisher.run(&wire, input, &CancellationToken::new(), async {
+            let _ = publisher.send(PluginOutgoing::event(completion_event_body("fixture.", "req", "reasoning_end", [("text", Value::String("x".repeat(16 * 1024 * 1024)))]))).await;
+            let _ = publisher.send(PluginOutgoing::event(completion_event_body("fixture.", "req", "completed", []))).await;
+        }).await;
+        assert!(matches!(result, Err(publisher::OutputFailure::Transport(TransportError::FrameTooLarge { .. }))));
+        assert!(output.try_recv().is_err());
+        publisher::terminal(&wire, &CancellationToken::new(), &CancellationToken::new(), PluginOutgoing::event(completion_error_body(&cfg("fixture"), "req", ADMISSION_FAILURE)), "output_admission").await.expect("small fallback");
+        let event: Value = serde_json::from_str(&output.recv().await.expect("fallback").to_line()).expect("json");
+        assert_eq!(event["body"]["request_id"], "req");
+        assert_eq!(event["body"]["event"], "error");
+        assert_eq!(event["body"]["error_category"], "output_admission");
+    }
+
+    #[tokio::test]
+    async fn fallback_unavailable_is_not_recursively_replaced_or_identity_truncated() {
+        let config = cfg("fixture");
+        let (wire, mut output) = mpsc::channel(1);
+        let id = "i".repeat(16 * 1024 * 1024);
+        let result = publisher::terminal(&wire, &CancellationToken::new(), &CancellationToken::new(), PluginOutgoing::event(completion_error_body(&config, &id, ADMISSION_FAILURE)), "output_admission").await;
+        assert!(matches!(result, Err(TransportError::FrameTooLarge { .. })));
+        assert!(output.try_recv().is_err());
+        drop(output);
+        assert!(matches!(publisher::terminal(&wire, &CancellationToken::new(), &CancellationToken::new(), PluginOutgoing::event(completion_error_body(&config, "req", ADMISSION_FAILURE)), "output_admission").await, Err(TransportError::WriterClosed)));
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_invoke_releases_broker_before_waiting_for_impossible_reply() {
+        let catalog = Arc::new(ToolCatalog::new());
+        catalog.register_from("tool-owner", ToolCatalog::parse_tools(&serde_json::json!([{"name":"large", "parameters":{"type":"object"}}]))).await;
+        let broker = Arc::new(ToolBroker::new());
+        let (wire, mut output) = mpsc::channel(16);
+        let (publisher, input) = Publisher::new(16);
+        let call = ToolCall { id: "call-large".into(), kind: "function".into(), function: ToolCallFunction { name: "large".into(), arguments: serde_json::json!({"value": "x".repeat(16 * 1024 * 1024)}).to_string() } };
+        // chat.tool.start includes a 200-byte input preview; the invoke owns
+        // the full arguments and must fail before the broker await.
+        let result = publisher.run(&wire, input, &CancellationToken::new(), async {
+            run_one_tool_call_published(&catalog, &broker, &publisher, &CancellationToken::new(), call).await;
+        }).await;
+        assert!(matches!(result, Err(publisher::OutputFailure::Transport(TransportError::FrameTooLarge { .. }))));
+        broker.reap_abandoned().await;
+        assert!(!broker.deliver(ToolResult { id: "call-large".into(), output: Some("late".into()), error: None }).await);
+        let events = drain(&mut output).await;
+        assert!(!events.iter().any(|body| body.get("kind").and_then(Value::as_str) == Some("tool-owner.tool.invoke")));
+    }
+
+    #[tokio::test]
+    async fn uncorrelated_control_admission_failure_is_explicit() {
+        let (wire, mut output) = mpsc::channel(1);
+        let mut config = cfg("fixture");
+        config.base_url = "x".repeat(16 * 1024 * 1024);
+        assert!(matches!(send_event(&wire, hello_body(&config)).await, Err(LlmError::Transport(TransportError::FrameTooLarge { .. }))));
+        assert!(output.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn hard_cancel_suppresses_a_fallback_waiting_for_writer_capacity() {
+        let (wire, mut output) = mpsc::channel(1);
+        checked_send(&wire, PluginOutgoing::event(turn_error_body(&cfg("fixture"), "earlier"))).await.expect("fill wire queue");
+        let abandoned = CancellationToken::new();
+        let cancel = abandoned.clone();
+        let task = tokio::spawn(async move {
+            publisher::terminal(&wire, &CancellationToken::new(), &abandoned, PluginOutgoing::event(completion_error_body(&cfg("fixture"), "req", ADMISSION_FAILURE)), "output_admission").await
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        task.await.expect("join").expect("suppressed fallback");
+        assert!(output.recv().await.is_some());
+        assert!(output.try_recv().is_err(), "hard-cancelled request receives no later error");
+    }

@@ -230,3 +230,44 @@ Each pair maps `<prefix>.stream.delta` -> `chat.stream.delta`, `<prefix>.stream.
 ## Multi-instance pattern
 
 Wire one provider into the chat surface at a time. Spawning two providers (e.g. `ollama` and `groq`) means **both** would translate their `<prefix>.stream.*` events to `chat.stream.*`, so the chat surface would render interleaved deltas from both. A future router plugin could fan `chat.input.submit` out to a chosen provider based on a model-selector UI; until that exists, pick one.
+
+## Output admission and invocation lifetime
+
+All NCP output uses SDK checked admission (16 MiB wire bytes including LF).
+Admission succeeds before enqueue; it does not guarantee stdout write, peer
+receipt, or request acceptance. Output construction and upstream response
+accumulation are not bounded by this wire limit.
+
+Completion and chat turns own bounded progress publishers. Synchronous stream
+callbacks hand off to a 256-item invocation-local queue; queue-full is a terminal
+invocation failure, not a silent dropped delta. The publisher preserves order
+and stops the invocation on rejected progress, tool calls, or completed output.
+It drops the active HTTP stream, removes abandoned tool-result waiters, and
+releases only that request/turn's registry generation. Earlier bus output,
+provider requests, and external tool effects are not rolled back or replayed.
+
+With a live writer, a rejected invocation emits at most one small existing error:
+
+- Direct completion: `<prefix>.completion.event`, `event="error"`, with the
+  caller's exact `request_id`. There is no separate `completion.error` event or
+  replacement `id` correlation.
+- Chat completion: `<prefix>.chat.error` with the exact `chat_id`.
+- Legacy prompt: the existing `<prefix>.turn.error` shape, not a fabricated
+  completion request identity.
+
+These fallback events add `error_category="output_admission"` for frame rejection
+or `"output_backpressure"` for callback queue-full, and a constant diagnostic:
+`provider output admission failed; earlier or external effects may have occurred`.
+They never include the rejected payload or truncate correlation identities.
+Hard-cancelled turns/requests retain no-terminal suppression. After successful
+fallback admission and local cleanup, the same chat/request identity may be used
+again. A late old task cannot clear a newer chat turn's busy slot.
+
+If the fallback cannot be admitted (including an overlong identity), or the
+writer is closed, the plugin stops instead of recursively falling back. Required
+uncorrelated/control output rejection also stops the plugin rather than inventing
+a completion. Terminal stdin framing/UTF-8/I/O faults and writer closure supervise,
+cancel, and join outstanding invocation work before local exit; bounded malformed
+JSON remains parse noise. Capability loss leaves accepted effects unknown to the
+application owner. Trusted task panics remain local process failures, not successful
+completions. No restart or continuation policy is introduced.

@@ -175,6 +175,7 @@ pub struct ChatRestore {
 #[derive(Debug, Clone)]
 pub struct TurnToken {
     cancel: CancellationToken,
+    abandoned: CancellationToken,
     suppress: Arc<AtomicBool>,
 }
 
@@ -182,6 +183,7 @@ impl TurnToken {
     fn new() -> Self {
         Self {
             cancel: CancellationToken::new(),
+            abandoned: CancellationToken::new(),
             suppress: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -202,6 +204,10 @@ impl TurnToken {
     /// True when this turn was hard-cancelled: the turn task must
     /// suppress every terminal emission (no `chat.complete.result`, no
     /// `stream.end`, no `session.stats`, no `turn.error`).
+    pub fn suppression_token(&self) -> CancellationToken {
+        self.abandoned.clone()
+    }
+
     pub fn is_suppressed(&self) -> bool {
         self.suppress.load(Ordering::SeqCst)
     }
@@ -715,6 +721,17 @@ impl Chats {
         }
     }
 
+    /// Release only the slot owned by this task, including after delete/recreate.
+    pub async fn finish_turn(&self, id: &ChatId, token: &TurnToken) {
+        let mut chats = self.inner.lock().await;
+        if let Some(chat) = chats.get_mut(id) {
+            if matches!(&chat.turn, TurnState::InFlight(live) if Arc::ptr_eq(&live.suppress, &token.suppress))
+            {
+                chat.turn = TurnState::Idle;
+            }
+        }
+    }
+
     /// Gracefully interrupt the in-flight turn for `id` if one is
     /// running: stop the work but let the turn task deliver its
     /// interrupted result. Returns `true` if a turn was running,
@@ -765,6 +782,7 @@ impl Chats {
                 // cancelling so the turn task reliably observes it when
                 // the select's `cancelled()` branch wakes.
                 token.suppress.store(true, Ordering::SeqCst);
+                token.abandoned.cancel();
                 token.cancel.cancel();
                 true
             }
@@ -1656,5 +1674,35 @@ mod tests {
             .await
             .expect_err("ghost");
         assert!(matches!(err, ChatsError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn stale_turn_finish_cannot_release_recreated_chat() {
+        let chats = Chats::with_default_model(Some("test-model".into()));
+        let id = ChatId::new("same-chat");
+        chats.ensure(id.clone()).await.expect("create");
+        let old = chats.begin_turn(&id).await.expect("old turn");
+        chats.delete(&id).await.expect("delete");
+        chats.ensure(id.clone()).await.expect("recreate");
+        let current = chats.begin_turn(&id).await.expect("current turn");
+        chats.finish_turn(&id, &old).await;
+        assert!(matches!(
+            chats.begin_turn(&id).await,
+            Err(ChatsError::Busy(_))
+        ));
+        chats.finish_turn(&id, &current).await;
+        assert!(chats.begin_turn(&id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_completion_finish_preserves_current_generation() {
+        let runs = CompletionRuns::new();
+        let old = runs.begin("same-request".into()).await.expect("old");
+        assert!(runs.finish("same-request", &old).await);
+        let current = runs.begin("same-request".into()).await.expect("current");
+        assert!(!runs.finish("same-request", &old).await);
+        assert!(runs.begin("same-request".into()).await.is_err());
+        assert!(runs.finish("same-request", &current).await);
+        assert!(runs.begin("same-request".into()).await.is_ok());
     }
 }

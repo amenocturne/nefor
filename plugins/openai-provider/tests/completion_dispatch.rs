@@ -707,3 +707,102 @@ async fn invalid_or_colliding_request_additions_fail_without_reaching_upstream()
     );
     child.kill().await.expect("kill provider");
 }
+
+#[tokio::test]
+async fn terminal_stdin_fault_cancels_accepted_http_work_and_exits() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (mut child, mut stdin, mut stdout) = spawn_provider(&format!("http://{addr}")).await;
+    send_completion_messages(
+        &mut stdin,
+        "accepted-before-fault",
+        json!([{"role":"user","content":"answer"}]),
+    )
+    .await;
+    let (mut connection, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("accepted HTTP")
+        .expect("accept");
+    read_request_json(&mut connection).await;
+    stdin.write_all(&[0xff, b'\n']).await.expect("fault");
+    stdin.flush().await.expect("flush");
+    let status = timeout(WAIT, child.wait())
+        .await
+        .expect("provider teardown")
+        .expect("wait");
+    assert!(
+        !status.success(),
+        "terminal stdin fault is local failure, not success"
+    );
+    let mut byte = [0; 1];
+    assert_eq!(
+        timeout(WAIT, connection.read(&mut byte))
+            .await
+            .expect("network cancelled")
+            .expect("read"),
+        0
+    );
+    let mut remainder = String::new();
+    stdout
+        .read_to_string(&mut remainder)
+        .await
+        .expect("output EOF");
+    assert!(!remainder.contains("\"event\":\"completed\""));
+    assert!(
+        !remainder.contains("\"event\":\"error\""),
+        "lost transport does not invent terminal"
+    );
+}
+
+#[tokio::test]
+async fn stdout_loss_without_new_bus_traffic_cancels_sibling_http_work() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (mut child, mut stdin, stdout) = spawn_provider(&format!("http://{addr}")).await;
+    send_completion_messages(
+        &mut stdin,
+        "writer-trigger",
+        json!([{"role":"user","content":"answer"}]),
+    )
+    .await;
+    let (mut trigger, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("accept trigger")
+        .expect("accept");
+    read_request_json(&mut trigger).await;
+    send_completion_messages(
+        &mut stdin,
+        "pending-sibling",
+        json!([{"role":"user","content":"answer"}]),
+    )
+    .await;
+    let (mut pending, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("accept sibling")
+        .expect("accept");
+    read_request_json(&mut pending).await;
+    drop(stdout);
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"trigger writer\"}}]}\n\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    trigger
+        .write_all(response.as_bytes())
+        .await
+        .expect("response");
+    let status = timeout(WAIT, child.wait())
+        .await
+        .expect("idle writer supervision")
+        .expect("wait");
+    assert!(!status.success());
+    let mut byte = [0; 1];
+    assert_eq!(
+        timeout(WAIT, pending.read(&mut byte))
+            .await
+            .expect("pending network cancelled")
+            .expect("read"),
+        0
+    );
+}

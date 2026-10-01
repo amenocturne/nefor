@@ -1496,3 +1496,204 @@
             .unwrap_or_default();
         assert_eq!(text, "hello", "second completion streamed its output");
     }
+
+    #[tokio::test]
+    async fn oversized_completed_response_errors_once_and_same_request_is_reusable() {
+        let (base_url, server) = large_response_server().await;
+        let mut config = cfg("fixture");
+        config.base_url = base_url;
+        let client = reqwest::Client::new();
+        let completions = Arc::new(CompletionRuns::new());
+        let auth = Arc::new(AuthStore::from_env_key(None));
+        let catalog = Arc::new(ToolCatalog::new());
+        let (wire, mut output) = mpsc::channel(32);
+        let tasks = Arc::new(publisher::Tasks::default());
+        publisher::TASKS.scope(tasks.clone(), async {
+            for expected in ["error", "completed"] {
+                let body = make_event_body("fixture.completion.request", &[
+                    ("request_id", Value::String("reused-request".into())),
+                    ("messages", serde_json::json!([{"role":"user","content":"answer"}])),
+                    ("output_schema", serde_json::json!({"type":"string"})),
+                ]);
+                dispatch_completion_request(&completions, &auth, &catalog, &config, &client, &wire, &body).await.expect("dispatch");
+                let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        let msg = output.recv().await.expect("output");
+                        let body = match msg.body { Body::Event(body) => body, _ => panic!("event") };
+                        assert_eq!(body["request_id"], "reused-request");
+                        if matches!(body.get("event").and_then(Value::as_str), Some("error" | "completed")) { break body; }
+                    }
+                }).await.expect("terminal");
+                assert_eq!(terminal["event"], expected);
+                if expected == "error" { assert_eq!(terminal["error_category"], "output_admission"); assert_eq!(terminal["message"], ADMISSION_FAILURE); }
+                let probe = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop { if let Ok(run) = completions.begin("reused-request".into()).await { break run; } tokio::task::yield_now().await; }
+                }).await.expect("registry cleanup");
+                completions.finish("reused-request", &probe).await;
+                assert!(output.try_recv().is_err(), "one terminal, no later success");
+            }
+        }).await;
+        tasks.shutdown().await.expect("shutdown");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn oversized_chat_result_errors_once_and_same_chat_is_reusable() {
+        let (base_url, server) = large_response_server().await;
+        let mut config = cfg("fixture"); config.base_url = base_url;
+        let chats = fresh_chats("test-model");
+        let chat_id = ChatId::new("same-chat");
+        chats.ensure(chat_id.clone()).await.expect("create");
+        chats.push_user(&chat_id, "answer".into()).await.expect("input");
+        let auth = Arc::new(AuthStore::from_env_key(None));
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let client = reqwest::Client::new();
+        let (wire, mut output) = mpsc::channel(32);
+        let tasks = Arc::new(publisher::Tasks::default());
+        publisher::TASKS.scope(tasks.clone(), async {
+            for expected in ["fixture.chat.error", "fixture.chat.complete.result"] {
+                start_completion_turn(&chats, &auth, &catalog, &broker, &config, &client, &wire, chat_id.clone(), false, Vec::new(), Some(serde_json::json!({"type":"json_object"}))).await.expect("start");
+                let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        let body = match output.recv().await.expect("output").body { Body::Event(body) => body, _ => panic!("event") };
+                        if matches!(body.get("kind").and_then(Value::as_str), Some("fixture.chat.error" | "fixture.chat.complete.result")) { break body; }
+                    }
+                }).await.expect("terminal");
+                assert_eq!(terminal["kind"], expected);
+                assert_eq!(terminal["chat_id"], "same-chat");
+                if expected.ends_with("error") { assert_eq!(terminal["error_category"], "output_admission"); assert_eq!(terminal["message"], ADMISSION_FAILURE); }
+                let probe = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop { if let Ok(token) = chats.begin_turn(&chat_id).await { break token; } tokio::task::yield_now().await; }
+                }).await.expect("busy slot cleanup");
+                chats.finish_turn(&chat_id, &probe).await;
+                assert!(output.try_recv().is_err(), "no later terminal after rejected result");
+            }
+        }).await;
+        tasks.shutdown().await.expect("shutdown");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_drops_network_and_releases_completion_and_chat_slots() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut config = cfg("fixture"); config.base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let chats = fresh_chats("test-model");
+        let chat_id = ChatId::new("shutdown-chat");
+        chats.ensure(chat_id.clone()).await.expect("create");
+        chats.push_user(&chat_id, "answer".into()).await.expect("input");
+        let completions = Arc::new(CompletionRuns::new());
+        let auth = Arc::new(AuthStore::from_env_key(None));
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let client = reqwest::Client::new();
+        let (wire, mut output) = mpsc::channel(32);
+        let tasks = Arc::new(publisher::Tasks::default());
+        publisher::TASKS.scope(tasks.clone(), async {
+            start_completion_turn(&chats, &auth, &catalog, &broker, &config, &client, &wire, chat_id.clone(), false, Vec::new(), None).await.expect("start");
+            dispatch_completion_request(&completions, &auth, &catalog, &config, &client, &wire, &make_event_body("fixture.completion.request", &[("request_id", Value::String("shutdown-request".into())), ("messages", serde_json::json!([{"role":"user", "content":"answer"}]))])).await.expect("completion");
+        }).await;
+        let (mut first, _) = listener.accept().await.expect("first HTTP request");
+        let (mut second, _) = listener.accept().await.expect("second HTTP request");
+        read_local_request(&mut first).await; read_local_request(&mut second).await;
+        tokio::time::timeout(Duration::from_secs(2), tasks.shutdown()).await.expect("bounded shutdown").expect("joined");
+        assert!(chats.begin_turn(&chat_id).await.is_ok());
+        assert!(completions.begin("shutdown-request".into()).await.is_ok());
+        assert!(output.try_recv().is_err(), "teardown must not invent terminal");
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0;1];
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), first.read(&mut byte)).await.expect("network closed").expect("read"), 0);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), second.read(&mut byte)).await.expect("network closed").expect("read"), 0);
+    }
+
+    #[tokio::test]
+    async fn giant_stream_reasoning_and_tool_call_reject_the_invocation_without_success() {
+        for mode in ["reasoning", "tool"] {
+            let (base_url, server) = large_response_server_for(mode).await;
+            let mut config = cfg("fixture"); config.base_url = base_url;
+            let completions = Arc::new(CompletionRuns::new());
+            let auth = Arc::new(AuthStore::from_env_key(None));
+            let catalog = Arc::new(ToolCatalog::new());
+            let (wire, mut output) = mpsc::channel(64);
+            let client = reqwest::Client::new();
+            let tasks = Arc::new(publisher::Tasks::default());
+            publisher::TASKS.scope(tasks.clone(), async {
+                for expected in ["error", "completed"] {
+                    let body = make_event_body("fixture.completion.request", &[("request_id", Value::String(mode.into())), ("messages", serde_json::json!([{"role":"user","content":"answer"}]))]);
+                    dispatch_completion_request(&completions, &auth, &catalog, &config, &client, &wire, &body).await.expect("dispatch");
+                    let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+                        loop {
+                            let body = match output.recv().await.expect("output").body { Body::Event(body) => body, _ => panic!("event") };
+                            if matches!(body.get("event").and_then(Value::as_str), Some("completed" | "error")) { break body; }
+                        }
+                    }).await.expect("terminal");
+                    assert_eq!(terminal["event"], expected);
+                    if expected == "error" { assert_eq!(terminal["error_category"], "output_admission"); }
+                    let probe = tokio::time::timeout(Duration::from_secs(2), async {
+                        loop { if let Ok(run) = completions.begin(mode.into()).await { break run; } tokio::task::yield_now().await; }
+                    }).await.expect("released");
+                    completions.finish(mode, &probe).await;
+                    assert!(output.try_recv().is_err());
+                }
+            }).await;
+            tasks.shutdown().await.expect("joined");
+            server.await.expect("server");
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_stream_callback_full_cancels_network_without_cancelling_request_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut config = cfg("fixture"); config.base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_local_request(&mut stream).await;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"three\"}}]}\n\n";
+            // Leave the response unfinished so cancellation must close the socket.
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 999999\r\n\r\n{body}").as_bytes()).await.expect("stream");
+            let mut byte = [0;1];
+            assert_eq!(tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await.expect("cancelled socket").expect("read"), 0);
+        });
+        let parent = CancellationToken::new();
+        let (publisher, input) = Publisher::for_invocation(1, &parent, &parent);
+        let (wire, mut output) = mpsc::channel(8);
+        let client = reqwest::Client::new();
+        let result = tokio::time::timeout(Duration::from_secs(2), publisher.run(&wire, input, &CancellationToken::new(), async {
+            let _ = run_completion_attempt(&client, &config, None, "test-model", &[Message::user("answer")], None, None, None, None, publisher.cancellation_token(), &publisher, "req").await;
+            let _ = publisher.send(PluginOutgoing::event(completion_event_body("fixture.", "req", "completed", []))).await;
+        })).await.expect("publisher termination");
+        assert!(matches!(result, Err(publisher::OutputFailure::Full)));
+        assert!(publisher.cancellation_token().is_cancelled());
+        assert!(!parent.is_cancelled(), "backpressure is not caller hard-cancel");
+        assert!(output.try_recv().is_err(), "no progress or success after queue rejection");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn unavailable_correlated_fallback_reaches_supervisor_after_registry_cleanup() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut config = cfg("fixture"); config.base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_local_request(&mut stream).await;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"small answer\"}}]}\n\ndata: [DONE]\n\n";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.expect("response");
+        });
+        let id = "i".repeat(16 * 1024 * 1024);
+        let runs = Arc::new(CompletionRuns::new());
+        let auth = Arc::new(AuthStore::from_env_key(None));
+        let catalog = Arc::new(ToolCatalog::new());
+        let client = reqwest::Client::new();
+        let (wire, mut output) = mpsc::channel(8);
+        let tasks = Arc::new(publisher::Tasks::default());
+        publisher::TASKS.scope(tasks.clone(), async {
+            dispatch_completion_request(&runs, &auth, &catalog, &config, &client, &wire, &make_event_body("fixture.completion.request", &[("request_id", Value::String(id.clone())), ("messages", serde_json::json!([{"role":"user","content":"answer"}]))])).await.expect("dispatch");
+        }).await;
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(10), tasks.monitor()).await.expect("supervisor fault"), Err(LlmError::Transport(TransportError::FrameTooLarge { .. }))));
+        tasks.shutdown().await.expect("remaining work joined");
+        assert!(runs.begin(id).await.is_ok(), "failed fallback still releases request generation");
+        assert!(output.try_recv().is_err(), "no truncated identity or recursive terminal");
+        server.await.expect("server");
+    }

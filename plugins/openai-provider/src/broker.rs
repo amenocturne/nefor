@@ -59,6 +59,14 @@ impl ToolBroker {
         }
     }
 
+    /// Invocation futures dropped by their publisher no longer own waiters.
+    pub async fn reap_abandoned(&self) {
+        self.pending
+            .lock()
+            .await
+            .retain(|_, sender| !sender.is_closed());
+    }
+
     /// Drop a pending registration without delivering. Used when a turn
     /// is interrupted before the tool replies.
     pub async fn cancel(&self, id: &str) {

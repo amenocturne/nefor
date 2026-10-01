@@ -5,6 +5,8 @@ use openai_provider::state::ChatsError;
 /// All failure modes inside openai-provider.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
+    #[error("provider task failed: {0}")]
+    Task(String),
     #[error(transparent)]
     ProviderHttp(#[from] nefor_provider_http::ProviderHttpError),
 

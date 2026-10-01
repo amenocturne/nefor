@@ -44,11 +44,15 @@
 // intentionally exercises (`Into.in` cross-namespace).
 
 mod error;
+mod publisher;
+use publisher::{Publisher, ADMISSION_FAILURE};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{
+    await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
+};
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 
 const CHANNEL_CAP: usize = 256;
@@ -129,12 +133,15 @@ async fn run() -> Result<(), LlmError> {
         .connect_timeout(Duration::from_secs(10))
         .build()?;
 
-    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (out_tx, mut writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
-    let _reader_handle = spawn_stdin_reader(in_tx);
+    let reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    };
     tracing::info!(
         engine_version = %engine_version,
         provider = %config.provider_name,
@@ -159,22 +166,57 @@ async fn run() -> Result<(), LlmError> {
     let catalog = Arc::new(ToolCatalog::new());
     let broker = Arc::new(ToolBroker::new());
 
-    run_dispatch_loop(
-        &chats,
-        &completions,
-        &auth,
-        &catalog,
-        &broker,
-        &config,
-        &client,
-        &out_tx,
-        &mut in_rx,
-    )
-    .await?;
-
-    let _ = out_tx
-        .send(PluginOutgoing::event(goodbye_body(&config)))
+    let tasks = Arc::new(publisher::Tasks::default());
+    let result = publisher::TASKS
+        .scope(tasks.clone(), async {
+            tokio::select! {
+                    result = tasks.monitor() => result,
+                    _ = out_tx.closed() => Err(TransportError::WriterClosed.into()),
+                    result = run_dispatch_loop(
+                &chats,
+                &completions,
+                &auth,
+                &catalog,
+                &broker,
+                &config,
+                &client,
+                &out_tx,
+                &mut in_rx,
+            ) => result,
+                }
+        })
         .await;
+    let cleanup = tasks.shutdown().await;
+    reader_handle.abort();
+    let _ = reader_handle.await;
+    drop(in_rx);
+    if result.is_ok() && cleanup.is_ok() {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            checked_send(&out_tx, PluginOutgoing::event(goodbye_body(&config))),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            outcome => tracing::warn!(?outcome, "goodbye unavailable during teardown"),
+        }
+    }
+    drop(out_tx);
+    let drained = match tokio::time::timeout(Duration::from_secs(2), &mut writer_handle).await {
+        Ok(result) => result.map_err(|error| LlmError::Task(error.to_string())),
+        Err(_) => {
+            writer_handle.abort();
+            let _ = writer_handle.await;
+            Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "stdout teardown timed out",
+            ))
+            .into())
+        }
+    };
+    result?;
+    cleanup?;
+    drained?;
     Ok(())
 }
 
@@ -192,6 +234,7 @@ async fn run_dispatch_loop(
 ) -> Result<(), LlmError> {
     loop {
         tokio::select! {
+            _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(Ok(env)) => match &env.body {
@@ -219,9 +262,10 @@ async fn run_dispatch_loop(
                             .await?;
                         }
                     },
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "stdin parse error; dropping line");
+                    Some(Err(TransportError::Parse(e))) => {
+                        tracing::warn!(error = %e, "stdin parse error; dropping line");
                     }
+                    Some(Err(e)) => return Err(e.into()),
                     None => {
                         tracing::info!("stdin closed; exiting");
                         return Ok(());
@@ -1161,146 +1205,186 @@ async fn dispatch_completion_request(
     let config = config.clone();
     let client = client.clone();
     let out_tx = out_tx.clone();
-    tokio::spawn(async move {
-        let started = Instant::now();
-        let event_prefix = config.event_prefix();
-        let token = auth.token().await;
-        let tools_supported = completions.model_supports_tools(&model).await;
-        let attempted_tools = tools_supported && tools.is_some();
-        let mut result = run_completion_attempt(
-            &client,
-            &config,
-            token.as_deref(),
-            &model,
-            &messages,
-            if tools_supported {
-                tools.as_deref()
-            } else {
-                None
-            },
-            reasoning_effort.as_deref(),
-            response_format.as_ref(),
-            request_additions.as_ref(),
-            cancel.clone(),
-            &out_tx,
-            &request_id,
-        )
-        .await;
-
-        if attempted_tools
-            && matches!(result, Err(StreamError::ToolsUnsupported { .. }))
-            && !cancel.is_cancelled()
-        {
-            completions.mark_model_tools_unsupported(&model).await;
-            result = run_completion_attempt(
+    let stop = publisher::shutdown_token();
+    publisher::spawn(async move {
+        let wire = out_tx;
+        let (out_tx, rx) = Publisher::for_invocation(CHANNEL_CAP, &cancel, &cancel);
+        let work = async {
+            let started = Instant::now();
+            let event_prefix = config.event_prefix();
+            let token = auth.token().await;
+            let tools_supported = completions.model_supports_tools(&model).await;
+            let attempted_tools = tools_supported && tools.is_some();
+            let mut result = run_completion_attempt(
                 &client,
                 &config,
                 token.as_deref(),
                 &model,
                 &messages,
-                None,
+                if tools_supported {
+                    tools.as_deref()
+                } else {
+                    None
+                },
                 reasoning_effort.as_deref(),
                 response_format.as_ref(),
                 request_additions.as_ref(),
-                cancel.clone(),
+                out_tx.cancellation_token(),
                 &out_tx,
                 &request_id,
             )
             .await;
-        }
 
-        completions.finish(&request_id, &run).await;
-        let cancelled = cancel.is_cancelled();
-        if cancelled && !matches!(&result, Ok(outcome) if outcome.usage.is_some()) {
-            return;
-        }
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        match result {
-            Ok(outcome) => {
-                if let Some(usage) = outcome.usage.clone() {
+            if attempted_tools
+                && matches!(result, Err(StreamError::ToolsUnsupported { .. }))
+                && !cancel.is_cancelled()
+            {
+                completions.mark_model_tools_unsupported(&model).await;
+                result = run_completion_attempt(
+                    &client,
+                    &config,
+                    token.as_deref(),
+                    &model,
+                    &messages,
+                    None,
+                    reasoning_effort.as_deref(),
+                    response_format.as_ref(),
+                    request_additions.as_ref(),
+                    out_tx.cancellation_token(),
+                    &out_tx,
+                    &request_id,
+                )
+                .await;
+            }
+
+            let cancelled = cancel.is_cancelled();
+            if cancelled && !matches!(&result, Ok(outcome) if outcome.usage.is_some()) {
+                return;
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match result {
+                Ok(outcome) => {
+                    if let Some(usage) = outcome.usage.clone() {
+                        let mut fields = vec![
+                            ("usage", usage.into_ncp_value()),
+                            ("model", Value::String(model.clone())),
+                            ("duration_ms", Value::Number(elapsed_ms.into())),
+                        ];
+                        if let Some(completion_id) = &outcome.completion_id {
+                            fields.push(("completion_id", Value::String(completion_id.clone())));
+                        }
+                        let _ = out_tx
+                            .send(PluginOutgoing::event(completion_event_body_from_iter(
+                                &event_prefix,
+                                &request_id,
+                                "usage",
+                                fields,
+                            )))
+                            .await;
+                    }
+                    if cancelled {
+                        return;
+                    }
+                    for call in &outcome.tool_calls {
+                        let arguments = serde_json::from_str(&call.function.arguments)
+                            .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+                        let _ = out_tx
+                            .send(PluginOutgoing::event(completion_event_body(
+                                &event_prefix,
+                                &request_id,
+                                "tool_call",
+                                [
+                                    ("id", Value::String(call.id.clone())),
+                                    ("name", Value::String(call.function.name.clone())),
+                                    ("arguments", arguments),
+                                ],
+                            )))
+                            .await;
+                    }
+                    let provider_context = reasoning_provider_context(
+                        &config,
+                        &model,
+                        outcome.reasoning_continuation.as_ref(),
+                    );
                     let mut fields = vec![
-                        ("usage", usage.into_ncp_value()),
+                        ("text", Value::String(outcome.full_text)),
+                        ("reasoning", Value::String(outcome.reasoning_text)),
+                        (
+                            "finish_reason",
+                            outcome
+                                .finish_reason
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        ),
                         ("model", Value::String(model.clone())),
                         ("duration_ms", Value::Number(elapsed_ms.into())),
                     ];
-                    if let Some(completion_id) = &outcome.completion_id {
-                        fields.push(("completion_id", Value::String(completion_id.clone())));
+                    if let Some(provider_context) = provider_context {
+                        fields.push(("provider_context", provider_context));
+                    }
+                    if let Some(completion_id) = outcome.completion_id {
+                        fields.push(("completion_id", Value::String(completion_id)));
                     }
                     let _ = out_tx
                         .send(PluginOutgoing::event(completion_event_body_from_iter(
                             &event_prefix,
                             &request_id,
-                            "usage",
+                            "completed",
                             fields,
                         )))
                         .await;
                 }
-                if cancelled {
-                    return;
-                }
-                for call in &outcome.tool_calls {
-                    let arguments = serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+                Err(error) => {
                     let _ = out_tx
                         .send(PluginOutgoing::event(completion_event_body(
                             &event_prefix,
                             &request_id,
-                            "tool_call",
+                            "error",
                             [
-                                ("id", Value::String(call.id.clone())),
-                                ("name", Value::String(call.function.name.clone())),
-                                ("arguments", arguments),
+                                ("message", Value::String(error.to_string())),
+                                ("model", Value::String(model)),
+                                ("duration_ms", Value::Number(elapsed_ms.into())),
                             ],
                         )))
                         .await;
                 }
-                let provider_context = reasoning_provider_context(
+            }
+        };
+        let result = out_tx.run(&wire, rx, &stop, work).await;
+        let suppressed = cancel.is_cancelled();
+        let terminal = if result.is_err()
+            && !suppressed
+            && !stop.is_cancelled()
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.recoverable())
+        {
+            publisher::terminal(
+                &wire,
+                &stop,
+                &out_tx.abandonment_token(),
+                PluginOutgoing::event(completion_error_body(
                     &config,
-                    &model,
-                    outcome.reasoning_continuation.as_ref(),
-                );
-                let mut fields = vec![
-                    ("text", Value::String(outcome.full_text)),
-                    ("reasoning", Value::String(outcome.reasoning_text)),
-                    (
-                        "finish_reason",
-                        outcome
-                            .finish_reason
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    ),
-                    ("model", Value::String(model.clone())),
-                    ("duration_ms", Value::Number(elapsed_ms.into())),
-                ];
-                if let Some(provider_context) = provider_context {
-                    fields.push(("provider_context", provider_context));
-                }
-                if let Some(completion_id) = outcome.completion_id {
-                    fields.push(("completion_id", Value::String(completion_id)));
-                }
-                let _ = out_tx
-                    .send(PluginOutgoing::event(completion_event_body_from_iter(
-                        &event_prefix,
-                        &request_id,
-                        "completed",
-                        fields,
-                    )))
-                    .await;
-            }
-            Err(error) => {
-                let _ = out_tx
-                    .send(PluginOutgoing::event(completion_event_body(
-                        &event_prefix,
-                        &request_id,
-                        "error",
-                        [
-                            ("message", Value::String(error.to_string())),
-                            ("model", Value::String(model)),
-                            ("duration_ms", Value::Number(elapsed_ms.into())),
-                        ],
-                    )))
-                    .await;
-            }
+                    &request_id,
+                    ADMISSION_FAILURE,
+                )),
+                result
+                    .as_ref()
+                    .err()
+                    .map(|error| error.category())
+                    .unwrap_or("output_admission"),
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        cancel.cancel();
+        completions.finish(&request_id, &run).await;
+        terminal?;
+        match result {
+            Err(error) if !error.recoverable() => Err(error.into_transport()),
+            _ => Ok(()),
         }
     });
     Ok(())
@@ -1318,7 +1402,7 @@ async fn run_completion_attempt(
     response_format: Option<&Value>,
     request_additions: Option<&Map<String, Value>>,
     cancel: CancellationToken,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
+    out_tx: &Publisher,
     request_id: &str,
 ) -> Result<StreamOutcome, StreamError> {
     let event_prefix = config.event_prefix();
@@ -1531,321 +1615,335 @@ fn spawn_turn(
     extra_tools: Vec<Value>,
     response_format: Option<Value>,
 ) {
-    tokio::spawn(async move {
-        // The streaming/tool helpers only need the abort signal; the
-        // suppress flag stays with `cancel` for this task's own
-        // terminal-emission decisions.
-        let cancel_token = cancel.cancellation_token();
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let active_model = match chats.model(&chat_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished before turn started");
-                let _ = out_tx
-                    .send(PluginOutgoing::event(chat_error_body(
-                        &config, &chat_id, &e,
-                    )))
-                    .await;
-                return;
-            }
-        };
-        let started = std::time::Instant::now();
-        let mut total_prompt_tokens: u64 = 0;
-        let mut total_completion_tokens: u64 = 0;
-        let mut observed_usage = false;
-        let mut iterations: u32 = 0;
-
-        // Final outcome of the *last* HTTP call — what we emit
-        // `chat.stream.end` from. Filled by the loop below.
-        let mut final_text = String::new();
-        #[allow(unused_assignments)]
-        let mut final_finish_reason: Option<String> = None;
-        let mut final_tool_calls: Vec<ToolCall> = Vec::new();
-        // Reasoning trace from the last firing only — reasoning is
-        // per-message, not accumulated across tool-loop iterations
-        // (each firing produces its own thinking trace; we surface the
-        // most recent one on `chat.complete.result`).
-        let mut final_reasoning = String::new();
-        let mut final_reasoning_continuation: Option<ReasoningContinuation> = None;
-        let mut final_error: Option<String> = None;
-        let mut interrupted = false;
-        let mut errored = false;
-
-        loop {
-            iterations += 1;
-            let history = match chats
-                .request_history_snapshot_for_model(&chat_id, &active_model)
-                .await
-            {
-                Ok(h) => h,
+    let stop = publisher::shutdown_token();
+    publisher::spawn(async move {
+        let wire = out_tx;
+        let (out_tx, rx) = Publisher::for_invocation(
+            CHANNEL_CAP,
+            &cancel.cancellation_token(),
+            &cancel.suppression_token(),
+        );
+        let work = async {
+            // The streaming/tool helpers only need the abort signal; the
+            // suppress flag stays with `cancel` for this task's own
+            // terminal-emission decisions.
+            let cancel_token = out_tx.cancellation_token();
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let active_model = match chats.model(&chat_id).await {
+                Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished mid-turn");
-                    errored = true;
-                    final_finish_reason = Some("error".to_string());
+                    tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished before turn started");
                     let _ = out_tx
                         .send(PluginOutgoing::event(chat_error_body(
                             &config, &chat_id, &e,
                         )))
                         .await;
-                    break;
+                    return;
                 }
             };
-            if tracing::enabled!(tracing::Level::INFO) {
-                tracing::info!(
-                    target: "openai_provider::turn",
-                    chat_id = %chat_id,
-                    iteration = iterations,
-                    history_len = history.len(),
-                    roles = ?history.iter().map(|m| m.role()).collect::<Vec<_>>(),
-                    "history snapshot for turn iteration",
-                );
-            }
-            // Per-model cache: a model the upstream previously rejected
-            // with the "does not support tools" signature stays disabled
-            // for the rest of this process — even on a fresh chat.
-            let model_tools_supported = chats.model_supports_tools(&active_model).await;
-            // Per-chat tool allowlist (sole mechanism for tool control):
-            //   None          → all tools (no filter)
-            //   Some(vec![])  → no tools (disabled)
-            //   Some(names)   → filtered to those tool names
-            let chat_tool_allowlist = chats.tool_allowlist(&chat_id).await.unwrap_or(None);
-            let tools_disabled = !model_tools_supported
-                || matches!(&chat_tool_allowlist, Some(names) if names.is_empty());
-            let mut tools_array = if tools_disabled {
-                Vec::new()
-            } else {
-                catalog.to_openai_tools().await
-            };
-            // Per-firing extra_tools (e.g. agent reasoner's `finalize`
-            // synthetic terminator). Appended AFTER the catalog so a
-            // catalog entry of the same name still wins on iteration.
-            // Skipped when tools are disabled entirely.
-            if !tools_disabled && !extra_tools.is_empty() {
-                tools_array.extend(extra_tools.iter().cloned());
-            }
-            // Apply the per-chat name filter. Entries not in the list
-            // are dropped; the caller that wanted `finalize` injected
-            // per firing must also include `finalize` in the chat's
-            // allowlist.
-            if let Some(names) = &chat_tool_allowlist {
-                tools_array.retain(|t| {
-                    let name = t
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str);
-                    matches!(name, Some(n) if names.iter().any(|allowed| allowed == n))
-                });
-            }
-            let tools_slice: Option<&[serde_json::Value]> = if tools_array.is_empty() {
-                None
-            } else {
-                Some(tools_array.as_slice())
-            };
-            let reasoning_effort = chats.reasoning_effort(&chat_id).await.unwrap_or(None);
+            let started = std::time::Instant::now();
+            let mut total_prompt_tokens: u64 = 0;
+            let mut total_completion_tokens: u64 = 0;
+            let mut observed_usage = false;
+            let mut iterations: u32 = 0;
 
-            let endpoint = config.chat_endpoint();
-            let id_for_delta = turn_id.clone();
-            let chat_id_for_delta = chat_id.clone();
-            let out_tx_for_delta = out_tx.clone();
-            let prefix_for_delta = config.event_prefix();
-            let id_for_reason = turn_id.clone();
-            let chat_id_for_reason = chat_id.clone();
-            let out_tx_for_reason = out_tx.clone();
-            let prefix_for_reason = config.event_prefix();
-            let id_for_retry = turn_id.clone();
-            let chat_id_for_retry = chat_id.clone();
-            let out_tx_for_retry = out_tx.clone();
-            let prefix_for_retry = config.event_prefix();
-            let token = auth.token().await;
-            // Stamp the reasoning duration from first reasoning chunk
-            // → ReasoningEvent::End. Captured in the closure so each
-            // firing in a tool loop gets its own timer (per-firing
-            // reasoning, never accumulated across firings).
-            let mut reasoning_started_at: Option<std::time::Instant> = None;
-            let result = run_chat_stream_with_retry_progress_and_format(
-                &client,
-                &endpoint,
-                token.as_deref(),
-                &config.auth_header,
-                &active_model,
-                &history,
-                tools_slice,
-                reasoning_effort.as_deref(),
-                response_format.as_ref(),
-                cancel_token.clone(),
-                |delta| {
-                    if response_format.is_some() {
-                        return;
-                    }
-                    let body = stream_delta_body(
-                        &prefix_for_delta,
-                        &id_for_delta,
-                        &chat_id_for_delta,
-                        delta,
-                    );
-                    let _ = out_tx_for_delta.try_send(PluginOutgoing::event(body));
-                },
-                |ev| match ev {
-                    ReasoningEvent::Delta(text) => {
-                        if reasoning_started_at.is_none() {
-                            reasoning_started_at = Some(std::time::Instant::now());
-                        }
-                        let body = stream_reasoning_delta_body(
-                            &prefix_for_reason,
-                            &id_for_reason,
-                            &chat_id_for_reason,
-                            text,
-                        );
-                        let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
-                    }
-                    ReasoningEvent::End { text } => {
-                        let duration_ms = reasoning_started_at
-                            .map(|s| s.elapsed().as_millis() as u64)
-                            .unwrap_or(0);
-                        let body = stream_reasoning_end_body(
-                            &prefix_for_reason,
-                            &id_for_reason,
-                            &chat_id_for_reason,
-                            text,
-                            duration_ms,
-                        );
-                        let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
-                    }
-                },
-                |progress| {
-                    let body = retry_progress_body(
-                        &prefix_for_retry,
-                        &id_for_retry,
-                        &chat_id_for_retry,
-                        progress,
-                    );
-                    let _ = out_tx_for_retry.try_send(PluginOutgoing::event(body));
-                },
-            )
-            .await;
-            drop(history);
+            // Final outcome of the *last* HTTP call — what we emit
+            // `chat.stream.end` from. Filled by the loop below.
+            let mut final_text = String::new();
+            #[allow(unused_assignments)]
+            let mut final_finish_reason: Option<String> = None;
+            let mut final_tool_calls: Vec<ToolCall> = Vec::new();
+            // Reasoning trace from the last firing only — reasoning is
+            // per-message, not accumulated across tool-loop iterations
+            // (each firing produces its own thinking trace; we surface the
+            // most recent one on `chat.complete.result`).
+            let mut final_reasoning = String::new();
+            let mut final_reasoning_continuation: Option<ReasoningContinuation> = None;
+            let mut final_error: Option<String> = None;
+            let mut interrupted = false;
+            let mut errored = false;
 
-            // Hard cancel arrived mid-stream: drop this turn entirely.
-            // The HTTP stream was already aborted when
-            // `run_chat_stream`'s select took the `cancelled()` branch;
-            // suppress every terminal emission by breaking out before
-            // any result is built or partial text is persisted. A
-            // graceful `interrupt` is NOT suppressed and falls through
-            // to the interrupted-result path below.
-            if cancel.is_suppressed() {
-                break;
-            }
-
-            match result {
-                Ok(outcome) => {
-                    if let Some(u) = outcome.usage {
-                        observed_usage = true;
-                        total_prompt_tokens =
-                            total_prompt_tokens.saturating_add(u.prompt_tokens.unwrap_or_default());
-                        total_completion_tokens = total_completion_tokens
-                            .saturating_add(u.completion_tokens.unwrap_or_default());
-                    }
-
-                    if outcome.interrupted {
-                        // A provider-native reasoning artifact is valid only for a
-                        // completed assistant response. Do not retain a partial
-                        // assistant without the continuation its provider requires.
-                        if !outcome.full_text.is_empty() && outcome.reasoning_continuation.is_none()
-                        {
-                            let _ = chats
-                                .push_assistant(&chat_id, outcome.full_text.clone())
-                                .await;
-                        }
-                        final_text = outcome.full_text;
-                        final_reasoning = outcome.reasoning_text;
-                        final_finish_reason = Some("interrupted".to_string());
-                        interrupted = true;
+            loop {
+                iterations += 1;
+                let history = match chats
+                    .request_history_snapshot_for_model(&chat_id, &active_model)
+                    .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished mid-turn");
+                        errored = true;
+                        final_finish_reason = Some("error".to_string());
+                        let _ = out_tx
+                            .send(PluginOutgoing::event(chat_error_body(
+                                &config, &chat_id, &e,
+                            )))
+                            .await;
                         break;
                     }
+                };
+                if tracing::enabled!(tracing::Level::INFO) {
+                    tracing::info!(
+                        target: "openai_provider::turn",
+                        chat_id = %chat_id,
+                        iteration = iterations,
+                        history_len = history.len(),
+                        roles = ?history.iter().map(|m| m.role()).collect::<Vec<_>>(),
+                        "history snapshot for turn iteration",
+                    );
+                }
+                // Per-model cache: a model the upstream previously rejected
+                // with the "does not support tools" signature stays disabled
+                // for the rest of this process — even on a fresh chat.
+                let model_tools_supported = chats.model_supports_tools(&active_model).await;
+                // Per-chat tool allowlist (sole mechanism for tool control):
+                //   None          → all tools (no filter)
+                //   Some(vec![])  → no tools (disabled)
+                //   Some(names)   → filtered to those tool names
+                let chat_tool_allowlist = chats.tool_allowlist(&chat_id).await.unwrap_or(None);
+                let tools_disabled = !model_tools_supported
+                    || matches!(&chat_tool_allowlist, Some(names) if names.is_empty());
+                let mut tools_array = if tools_disabled {
+                    Vec::new()
+                } else {
+                    catalog.to_openai_tools().await
+                };
+                // Per-firing extra_tools (e.g. agent reasoner's `finalize`
+                // synthetic terminator). Appended AFTER the catalog so a
+                // catalog entry of the same name still wins on iteration.
+                // Skipped when tools are disabled entirely.
+                if !tools_disabled && !extra_tools.is_empty() {
+                    tools_array.extend(extra_tools.iter().cloned());
+                }
+                // Apply the per-chat name filter. Entries not in the list
+                // are dropped; the caller that wanted `finalize` injected
+                // per firing must also include `finalize` in the chat's
+                // allowlist.
+                if let Some(names) = &chat_tool_allowlist {
+                    tools_array.retain(|t| {
+                        let name = t
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str);
+                        matches!(name, Some(n) if names.iter().any(|allowed| allowed == n))
+                    });
+                }
+                let tools_slice: Option<&[serde_json::Value]> = if tools_array.is_empty() {
+                    None
+                } else {
+                    Some(tools_array.as_slice())
+                };
+                let reasoning_effort = chats.reasoning_effort(&chat_id).await.unwrap_or(None);
 
-                    if !outcome.tool_calls.is_empty() {
-                        // Persist the raw assistant turn. Provider-bound serialization
-                        // normalizes malformed arguments without changing what tool
-                        // execution receives below.
-                        let assistant = if outcome.full_text.is_empty() {
-                            Message::assistant_tool_calls(outcome.tool_calls.clone())
-                        } else {
-                            Message::assistant_with_tool_calls(
-                                outcome.full_text.clone(),
-                                outcome.tool_calls.clone(),
-                            )
+                let endpoint = config.chat_endpoint();
+                let id_for_delta = turn_id.clone();
+                let chat_id_for_delta = chat_id.clone();
+                let out_tx_for_delta = out_tx.clone();
+                let prefix_for_delta = config.event_prefix();
+                let id_for_reason = turn_id.clone();
+                let chat_id_for_reason = chat_id.clone();
+                let out_tx_for_reason = out_tx.clone();
+                let prefix_for_reason = config.event_prefix();
+                let id_for_retry = turn_id.clone();
+                let chat_id_for_retry = chat_id.clone();
+                let out_tx_for_retry = out_tx.clone();
+                let prefix_for_retry = config.event_prefix();
+                let token = auth.token().await;
+                // Stamp the reasoning duration from first reasoning chunk
+                // → ReasoningEvent::End. Captured in the closure so each
+                // firing in a tool loop gets its own timer (per-firing
+                // reasoning, never accumulated across firings).
+                let mut reasoning_started_at: Option<std::time::Instant> = None;
+                let result = run_chat_stream_with_retry_progress_and_format(
+                    &client,
+                    &endpoint,
+                    token.as_deref(),
+                    &config.auth_header,
+                    &active_model,
+                    &history,
+                    tools_slice,
+                    reasoning_effort.as_deref(),
+                    response_format.as_ref(),
+                    cancel_token.clone(),
+                    |delta| {
+                        if response_format.is_some() {
+                            return;
                         }
-                        .with_reasoning(outcome.reasoning_continuation.clone());
-                        let _ = chats
-                            .append_for_model(&chat_id, &active_model, assistant)
-                            .await;
+                        let body = stream_delta_body(
+                            &prefix_for_delta,
+                            &id_for_delta,
+                            &chat_id_for_delta,
+                            delta,
+                        );
+                        let _ = out_tx_for_delta.try_send(PluginOutgoing::event(body));
+                    },
+                    |ev| match ev {
+                        ReasoningEvent::Delta(text) => {
+                            if reasoning_started_at.is_none() {
+                                reasoning_started_at = Some(std::time::Instant::now());
+                            }
+                            let body = stream_reasoning_delta_body(
+                                &prefix_for_reason,
+                                &id_for_reason,
+                                &chat_id_for_reason,
+                                text,
+                            );
+                            let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
+                        }
+                        ReasoningEvent::End { text } => {
+                            let duration_ms = reasoning_started_at
+                                .map(|s| s.elapsed().as_millis() as u64)
+                                .unwrap_or(0);
+                            let body = stream_reasoning_end_body(
+                                &prefix_for_reason,
+                                &id_for_reason,
+                                &chat_id_for_reason,
+                                text,
+                                duration_ms,
+                            );
+                            let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
+                        }
+                    },
+                    |progress| {
+                        let body = retry_progress_body(
+                            &prefix_for_retry,
+                            &id_for_retry,
+                            &chat_id_for_retry,
+                            progress,
+                        );
+                        let _ = out_tx_for_retry.try_send(PluginOutgoing::event(body));
+                    },
+                )
+                .await;
+                drop(history);
 
-                        // Stage 1+ (chat.complete API): defer the tool
-                        // loop to the caller. reasoner-graph dispatches
-                        // tools via tool-executor + tool-gate; the
-                        // adapter reasoner translates ToolResults back
-                        // into chat.append messages on the next firing.
-                        // Running our own tool loop here would race
-                        // those external dispatches and our internal
-                        // tool-id broker would wait
-                        // TOOL_RESULT_TIMEOUT (120s) for a tool.result
-                        // that never matches because the gate-side ids
-                        // are minted independently. Yield by returning
-                        // the tool_calls in chat.complete.result.
-                        if !legacy_default_chat {
+                // Hard cancel arrived mid-stream: drop this turn entirely.
+                // The HTTP stream was already aborted when
+                // `run_chat_stream`'s select took the `cancelled()` branch;
+                // suppress every terminal emission by breaking out before
+                // any result is built or partial text is persisted. A
+                // graceful `interrupt` is NOT suppressed and falls through
+                // to the interrupted-result path below.
+                if cancel.is_suppressed() {
+                    break;
+                }
+
+                match result {
+                    Ok(outcome) => {
+                        if let Some(u) = outcome.usage {
+                            observed_usage = true;
+                            total_prompt_tokens = total_prompt_tokens
+                                .saturating_add(u.prompt_tokens.unwrap_or_default());
+                            total_completion_tokens = total_completion_tokens
+                                .saturating_add(u.completion_tokens.unwrap_or_default());
+                        }
+
+                        if outcome.interrupted {
+                            // A provider-native reasoning artifact is valid only for a
+                            // completed assistant response. Do not retain a partial
+                            // assistant without the continuation its provider requires.
+                            if !outcome.full_text.is_empty()
+                                && outcome.reasoning_continuation.is_none()
+                            {
+                                let _ = chats
+                                    .push_assistant(&chat_id, outcome.full_text.clone())
+                                    .await;
+                            }
                             final_text = outcome.full_text;
                             final_reasoning = outcome.reasoning_text;
-                            final_reasoning_continuation = outcome.reasoning_continuation;
-                            final_finish_reason = outcome.finish_reason;
-                            final_tool_calls = outcome.tool_calls;
+                            final_finish_reason = Some("interrupted".to_string());
+                            interrupted = true;
                             break;
                         }
 
-                        // Legacy `<prefix>.prompt` API: run each tool
-                        // call (sequentially — the API requires every
-                        // call's tool message to be present before the
-                        // next chat-completions request, so there's no
-                        // win in parallelism for a single round trip).
-                        //
-                        // Capture the call ids upfront so an interrupt
-                        // partway through can synthesise tool_result
-                        // messages for the cancelled tool AND any
-                        // unstarted ones — the assistant turn pushed
-                        // earlier carried every tool_call, and the
-                        // OpenAI history shape requires a matching
-                        // tool message per call. Without this, the
-                        // next user submit would fail validation with
-                        // "tool_call has no tool message".
-                        let tool_call_ids: Vec<String> =
-                            outcome.tool_calls.iter().map(|tc| tc.id.clone()).collect();
-                        let mut tool_loop_failed = false;
-                        let mut cancelled_idx: Option<usize> = None;
-                        for (idx, tc) in outcome.tool_calls.into_iter().enumerate() {
-                            let tool_step =
-                                run_one_tool_call(&catalog, &broker, &out_tx, &cancel_token, tc)
-                                    .await;
-                            match tool_step {
-                                ToolStepOutcome::Result { id, content } => {
-                                    let _ = chats.push_tool_result(&chat_id, id, content).await;
-                                }
-                                ToolStepOutcome::Cancelled { id } => {
-                                    let _ = chats
-                                        .push_tool_result(
-                                            &chat_id,
-                                            id,
-                                            "(tool was interrupted by the user)".to_owned(),
-                                        )
-                                        .await;
-                                    interrupted = true;
-                                    tool_loop_failed = true;
-                                    cancelled_idx = Some(idx);
-                                    break;
+                        if !outcome.tool_calls.is_empty() {
+                            // Persist the raw assistant turn. Provider-bound serialization
+                            // normalizes malformed arguments without changing what tool
+                            // execution receives below.
+                            let assistant = if outcome.full_text.is_empty() {
+                                Message::assistant_tool_calls(outcome.tool_calls.clone())
+                            } else {
+                                Message::assistant_with_tool_calls(
+                                    outcome.full_text.clone(),
+                                    outcome.tool_calls.clone(),
+                                )
+                            }
+                            .with_reasoning(outcome.reasoning_continuation.clone());
+                            let _ = chats
+                                .append_for_model(&chat_id, &active_model, assistant)
+                                .await;
+
+                            // Stage 1+ (chat.complete API): defer the tool
+                            // loop to the caller. reasoner-graph dispatches
+                            // tools via tool-executor + tool-gate; the
+                            // adapter reasoner translates ToolResults back
+                            // into chat.append messages on the next firing.
+                            // Running our own tool loop here would race
+                            // those external dispatches and our internal
+                            // tool-id broker would wait
+                            // TOOL_RESULT_TIMEOUT (120s) for a tool.result
+                            // that never matches because the gate-side ids
+                            // are minted independently. Yield by returning
+                            // the tool_calls in chat.complete.result.
+                            if !legacy_default_chat {
+                                final_text = outcome.full_text;
+                                final_reasoning = outcome.reasoning_text;
+                                final_reasoning_continuation = outcome.reasoning_continuation;
+                                final_finish_reason = outcome.finish_reason;
+                                final_tool_calls = outcome.tool_calls;
+                                break;
+                            }
+
+                            // Legacy `<prefix>.prompt` API: run each tool
+                            // call (sequentially — the API requires every
+                            // call's tool message to be present before the
+                            // next chat-completions request, so there's no
+                            // win in parallelism for a single round trip).
+                            //
+                            // Capture the call ids upfront so an interrupt
+                            // partway through can synthesise tool_result
+                            // messages for the cancelled tool AND any
+                            // unstarted ones — the assistant turn pushed
+                            // earlier carried every tool_call, and the
+                            // OpenAI history shape requires a matching
+                            // tool message per call. Without this, the
+                            // next user submit would fail validation with
+                            // "tool_call has no tool message".
+                            let tool_call_ids: Vec<String> =
+                                outcome.tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                            let mut tool_loop_failed = false;
+                            let mut cancelled_idx: Option<usize> = None;
+                            for (idx, tc) in outcome.tool_calls.into_iter().enumerate() {
+                                let tool_step = run_one_tool_call_published(
+                                    &catalog,
+                                    &broker,
+                                    &out_tx,
+                                    &cancel_token,
+                                    tc,
+                                )
+                                .await;
+                                match tool_step {
+                                    ToolStepOutcome::Result { id, content } => {
+                                        let _ = chats.push_tool_result(&chat_id, id, content).await;
+                                    }
+                                    ToolStepOutcome::Cancelled { id } => {
+                                        let _ = chats
+                                            .push_tool_result(
+                                                &chat_id,
+                                                id,
+                                                "(tool was interrupted by the user)".to_owned(),
+                                            )
+                                            .await;
+                                        interrupted = true;
+                                        tool_loop_failed = true;
+                                        cancelled_idx = Some(idx);
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        if let Some(c_idx) = cancelled_idx {
-                            for unstarted_id in tool_call_ids.iter().skip(c_idx + 1) {
-                                let _ = chats
+                            if let Some(c_idx) = cancelled_idx {
+                                for unstarted_id in tool_call_ids.iter().skip(c_idx + 1) {
+                                    let _ = chats
                                     .push_tool_result(
                                         &chat_id,
                                         unstarted_id.clone(),
@@ -1853,218 +1951,253 @@ fn spawn_turn(
                                             .to_owned(),
                                     )
                                     .await;
+                                }
                             }
+
+                            if tool_loop_failed {
+                                final_finish_reason = Some("interrupted".to_string());
+                                break;
+                            }
+
+                            if iterations >= TOOL_LOOP_MAX_ITERATIONS {
+                                tracing::warn!(
+                                    cap = TOOL_LOOP_MAX_ITERATIONS,
+                                    "tool-loop iteration cap hit; aborting turn"
+                                );
+                                errored = true;
+                                final_finish_reason = Some("error".to_string());
+                                // Emit the cap diagnostic via turn.error
+                                // *after* the stream.end — same pattern as
+                                // existing failure paths.
+                                let _ = out_tx
+                                    .send(PluginOutgoing::event(turn_error_body(
+                                        &config,
+                                        &format!(
+                                            "tool-loop iteration cap hit ({} iterations); aborting",
+                                            TOOL_LOOP_MAX_ITERATIONS
+                                        ),
+                                    )))
+                                    .await;
+                                break;
+                            }
+                            // Loop back: another chat-completions call with the
+                            // tool result(s) appended to history.
+                            continue;
                         }
 
-                        if tool_loop_failed {
-                            final_finish_reason = Some("interrupted".to_string());
-                            break;
-                        }
-
-                        if iterations >= TOOL_LOOP_MAX_ITERATIONS {
-                            tracing::warn!(
-                                cap = TOOL_LOOP_MAX_ITERATIONS,
-                                "tool-loop iteration cap hit; aborting turn"
-                            );
-                            errored = true;
-                            final_finish_reason = Some("error".to_string());
-                            // Emit the cap diagnostic via turn.error
-                            // *after* the stream.end — same pattern as
-                            // existing failure paths.
-                            let _ = out_tx
-                                .send(PluginOutgoing::event(turn_error_body(
-                                    &config,
-                                    &format!(
-                                        "tool-loop iteration cap hit ({} iterations); aborting",
-                                        TOOL_LOOP_MAX_ITERATIONS
-                                    ),
-                                )))
+                        // No tool calls — the turn is done.
+                        if !outcome.full_text.is_empty() {
+                            let assistant = Message::assistant(outcome.full_text.clone())
+                                .with_reasoning(outcome.reasoning_continuation.clone());
+                            let _ = chats
+                                .append_for_model(&chat_id, &active_model, assistant)
                                 .await;
-                            break;
                         }
-                        // Loop back: another chat-completions call with the
-                        // tool result(s) appended to history.
+                        final_text = outcome.full_text;
+                        final_reasoning = outcome.reasoning_text;
+                        final_reasoning_continuation = outcome.reasoning_continuation;
+                        final_finish_reason = outcome.finish_reason;
+                        final_tool_calls = outcome.tool_calls;
+                        break;
+                    }
+                    Err(StreamError::ToolsUnsupported { body }) => {
+                        // Reactive fallback: the upstream rejected the request
+                        // because the active model lacks the `tools` capability
+                        // (e.g. ollama against `translategemma`). User's mental
+                        // model is "I sent a message, the model should reply" —
+                        // surfacing the raw 400 fails that. Mark the model as
+                        // tools-incapable for the rest of this process and the
+                        // chat as tools-off so subsequent iterations + future
+                        // turns skip the round-trip, then `continue` to retry
+                        // *this* iteration with no tools array. The retry can't
+                        // re-enter this arm because the next iteration's
+                        // `tools_array` is empty (chat flag flipped + model-
+                        // cache populated).
+                        tracing::info!(
+                            target: "openai_provider::tools",
+                            chat_id = %chat_id,
+                            model = %active_model,
+                            body = %body,
+                            "model rejected tools — falling back to chat-only mode for this model",
+                        );
+                        chats.mark_model_tools_unsupported(&active_model).await;
+                        let _ = chats.set_tool_allowlist(&chat_id, Some(vec![])).await;
+                        iterations = iterations.saturating_sub(1);
                         continue;
                     }
-
-                    // No tool calls — the turn is done.
-                    if !outcome.full_text.is_empty() {
-                        let assistant = Message::assistant(outcome.full_text.clone())
-                            .with_reasoning(outcome.reasoning_continuation.clone());
-                        let _ = chats
-                            .append_for_model(&chat_id, &active_model, assistant)
-                            .await;
-                    }
-                    final_text = outcome.full_text;
-                    final_reasoning = outcome.reasoning_text;
-                    final_reasoning_continuation = outcome.reasoning_continuation;
-                    final_finish_reason = outcome.finish_reason;
-                    final_tool_calls = outcome.tool_calls;
-                    break;
-                }
-                Err(StreamError::ToolsUnsupported { body }) => {
-                    // Reactive fallback: the upstream rejected the request
-                    // because the active model lacks the `tools` capability
-                    // (e.g. ollama against `translategemma`). User's mental
-                    // model is "I sent a message, the model should reply" —
-                    // surfacing the raw 400 fails that. Mark the model as
-                    // tools-incapable for the rest of this process and the
-                    // chat as tools-off so subsequent iterations + future
-                    // turns skip the round-trip, then `continue` to retry
-                    // *this* iteration with no tools array. The retry can't
-                    // re-enter this arm because the next iteration's
-                    // `tools_array` is empty (chat flag flipped + model-
-                    // cache populated).
-                    tracing::info!(
-                        target: "openai_provider::tools",
-                        chat_id = %chat_id,
-                        model = %active_model,
-                        body = %body,
-                        "model rejected tools — falling back to chat-only mode for this model",
-                    );
-                    chats.mark_model_tools_unsupported(&active_model).await;
-                    let _ = chats.set_tool_allowlist(&chat_id, Some(vec![])).await;
-                    iterations = iterations.saturating_sub(1);
-                    continue;
-                }
-                Err(e) => {
-                    let msg = match &e {
-                        StreamError::Unauthorized { body } => {
-                            format!("HTTP 401: {}", extract_error_message(body))
-                        }
-                        StreamError::Http { status, body } => {
-                            format!("HTTP {status}: {}", extract_error_message(body))
-                        }
-                        StreamError::Request(s) => format!("request failed: {s}"),
-                        StreamError::Body(s) => format!("stream read error: {s}"),
-                        // Handled above in its own arm — unreachable here,
-                        // listed for exhaustiveness.
-                        StreamError::ToolsUnsupported { body } => {
-                            format!("HTTP 400: {}", extract_error_message(body))
-                        }
-                        StreamError::Malformed(message) => {
-                            format!("malformed streamed response: {message}")
-                        }
-                        StreamError::Provider { message, .. } => {
-                            format!("provider stream error: {message}")
-                        }
-                        StreamError::Refusal(message) => {
-                            format!("provider refused the request: {message}")
-                        }
-                        StreamError::IncompleteToolCall { index, missing } => {
-                            format!(
+                    Err(e) => {
+                        let msg = match &e {
+                            StreamError::Unauthorized { body } => {
+                                format!("HTTP 401: {}", extract_error_message(body))
+                            }
+                            StreamError::Http { status, body } => {
+                                format!("HTTP {status}: {}", extract_error_message(body))
+                            }
+                            StreamError::Request(s) => format!("request failed: {s}"),
+                            StreamError::Body(s) => format!("stream read error: {s}"),
+                            // Handled above in its own arm — unreachable here,
+                            // listed for exhaustiveness.
+                            StreamError::ToolsUnsupported { body } => {
+                                format!("HTTP 400: {}", extract_error_message(body))
+                            }
+                            StreamError::Malformed(message) => {
+                                format!("malformed streamed response: {message}")
+                            }
+                            StreamError::Provider { message, .. } => {
+                                format!("provider stream error: {message}")
+                            }
+                            StreamError::Refusal(message) => {
+                                format!("provider refused the request: {message}")
+                            }
+                            StreamError::IncompleteToolCall { index, missing } => {
+                                format!(
                                 "incomplete streamed tool call at index {index}: missing {missing}"
                             )
+                            }
+                        };
+                        tracing::warn!(error = %e, "turn failed");
+                        if matches!(e, StreamError::Unauthorized { .. }) {
+                            let snap = auth.mark_auth_error(HTTP_401_MESSAGE.to_owned()).await;
+                            let _ = out_tx
+                                .send(PluginOutgoing::event(auth_status_body(&config, &snap)))
+                                .await;
                         }
-                    };
-                    tracing::warn!(error = %e, "turn failed");
-                    if matches!(e, StreamError::Unauthorized { .. }) {
-                        let snap = auth.mark_auth_error(HTTP_401_MESSAGE.to_owned()).await;
+                        errored = true;
+                        final_finish_reason = Some("error".to_string());
+                        final_error = Some(msg.clone());
                         let _ = out_tx
-                            .send(PluginOutgoing::event(auth_status_body(&config, &snap)))
+                            .send(PluginOutgoing::event(turn_error_body(&config, &msg)))
                             .await;
+                        break;
                     }
-                    errored = true;
-                    final_finish_reason = Some("error".to_string());
-                    final_error = Some(msg.clone());
-                    let _ = out_tx
-                        .send(PluginOutgoing::event(turn_error_body(&config, &msg)))
-                        .await;
-                    break;
                 }
             }
-        }
 
-        // Suppressed hard-cancel: release the slot and return without
-        // emitting stream.end / session.stats / turn.error /
-        // chat.complete.result. No result is delivered for a cancelled
-        // request — that is the honor side of the kernel's kill flush.
-        // Any partial stream.delta already put on the bus before the
-        // abort is unavoidable (it was emitted live), but no terminal
-        // completion lands.
-        if cancel.is_suppressed() {
-            chats.end_turn(&chat_id).await;
-            return;
-        }
+            // Suppressed hard-cancel: release the slot and return without
+            // emitting stream.end / session.stats / turn.error /
+            // chat.complete.result. No result is delivered for a cancelled
+            // request — that is the honor side of the kernel's kill flush.
+            // Any partial stream.delta already put on the bus before the
+            // abort is unavoidable (it was emitted live), but no terminal
+            // completion lands.
+            if cancel.is_suppressed() {
+                return;
+            }
 
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        // Record the *aggregate* tokens for the turn. last_turn_*
-        // captures the union of every chat-completions call (initial
-        // + N follow-ups after tool calls); cumulative accumulates the
-        // same aggregate.
-        let _ = chats
-            .record_turn(
-                &chat_id,
-                Some(&active_model),
-                if observed_usage {
-                    Some((total_prompt_tokens, total_completion_tokens))
-                } else {
-                    None
-                },
-                elapsed_ms,
-            )
-            .await;
-
-        let visible_final_text = if response_format.is_some() {
-            ""
-        } else {
-            &final_text
-        };
-        let stream_end = stream_end_body(
-            &config,
-            &turn_id,
-            &chat_id,
-            visible_final_text,
-            &active_model,
-            elapsed_ms,
-            final_finish_reason.as_deref(),
-        );
-        let _ = out_tx.send(PluginOutgoing::event(stream_end)).await;
-        if let Ok(stats) = chats.stats_snapshot(&chat_id).await {
-            let _ = out_tx
-                .send(PluginOutgoing::event(session_stats_body(
-                    &config, &chat_id, &stats,
-                )))
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            // Record the *aggregate* tokens for the turn. last_turn_*
+            // captures the union of every chat-completions call (initial
+            // + N follow-ups after tool calls); cumulative accumulates the
+            // same aggregate.
+            let _ = chats
+                .record_turn(
+                    &chat_id,
+                    Some(&active_model),
+                    if observed_usage {
+                        Some((total_prompt_tokens, total_completion_tokens))
+                    } else {
+                        None
+                    },
+                    elapsed_ms,
+                )
                 .await;
-        }
-        if interrupted && !errored {
-            let _ = out_tx
-                .send(PluginOutgoing::event(turn_error_body(
-                    &config,
-                    "interrupted",
-                )))
-                .await;
-        }
 
-        // Explicit `chat.complete` path: emit a closing
-        // `<prefix>.chat.complete.result` carrying the
-        // generic-provider.ProviderOut-shaped output. Legacy
-        // `<prefix>.prompt` path skips it — the chat plugin reads
-        // stream.end directly and doesn't speak the chat.* protocol
-        // yet.
-        if !legacy_default_chat && errored {
-            let message = final_error
-                .as_deref()
-                .unwrap_or("provider turn failed")
-                .to_owned();
-            let body = chat_error_body_msg(&config, &chat_id, message);
-            let _ = out_tx.send(PluginOutgoing::event(body)).await;
-        } else if !legacy_default_chat {
-            let body = chat_complete_result_body(
+            let visible_final_text = if response_format.is_some() {
+                ""
+            } else {
+                &final_text
+            };
+            let stream_end = stream_end_body(
                 &config,
+                &turn_id,
                 &chat_id,
-                &final_text,
-                &final_tool_calls,
-                final_finish_reason.as_deref(),
-                observed_usage.then_some((total_prompt_tokens, total_completion_tokens)),
+                visible_final_text,
                 &active_model,
-                &final_reasoning,
-                final_reasoning_continuation.as_ref(),
+                elapsed_ms,
+                final_finish_reason.as_deref(),
             );
-            let _ = out_tx.send(PluginOutgoing::event(body)).await;
-        }
+            let _ = out_tx.send(PluginOutgoing::event(stream_end)).await;
+            if let Ok(stats) = chats.stats_snapshot(&chat_id).await {
+                let _ = out_tx
+                    .send(PluginOutgoing::event(session_stats_body(
+                        &config, &chat_id, &stats,
+                    )))
+                    .await;
+            }
+            if interrupted && !errored {
+                let _ = out_tx
+                    .send(PluginOutgoing::event(turn_error_body(
+                        &config,
+                        "interrupted",
+                    )))
+                    .await;
+            }
 
-        chats.end_turn(&chat_id).await;
+            // Explicit `chat.complete` path: emit a closing
+            // `<prefix>.chat.complete.result` carrying the
+            // generic-provider.ProviderOut-shaped output. Legacy
+            // `<prefix>.prompt` path skips it — the chat plugin reads
+            // stream.end directly and doesn't speak the chat.* protocol
+            // yet.
+            if !legacy_default_chat && errored {
+                let message = final_error
+                    .as_deref()
+                    .unwrap_or("provider turn failed")
+                    .to_owned();
+                let body = chat_error_body_msg(&config, &chat_id, message);
+                let _ = out_tx.send(PluginOutgoing::event(body)).await;
+            } else if !legacy_default_chat {
+                let body = chat_complete_result_body(
+                    &config,
+                    &chat_id,
+                    &final_text,
+                    &final_tool_calls,
+                    final_finish_reason.as_deref(),
+                    observed_usage.then_some((total_prompt_tokens, total_completion_tokens)),
+                    &active_model,
+                    &final_reasoning,
+                    final_reasoning_continuation.as_ref(),
+                );
+                let _ = out_tx.send(PluginOutgoing::event(body)).await;
+            }
+        };
+        let result = out_tx.run(&wire, rx, &stop, work).await;
+        cancel.cancellation_token().cancel();
+        broker.reap_abandoned().await;
+        let terminal = if result.is_err()
+            && !cancel.is_suppressed()
+            && !stop.is_cancelled()
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.recoverable())
+        {
+            let body = if legacy_default_chat {
+                turn_error_body(&config, ADMISSION_FAILURE)
+            } else {
+                chat_error_body_msg(&config, &chat_id, ADMISSION_FAILURE.to_owned())
+            };
+            publisher::terminal(
+                &wire,
+                &stop,
+                &out_tx.abandonment_token(),
+                PluginOutgoing::event(body),
+                result
+                    .as_ref()
+                    .err()
+                    .map(|error| error.category())
+                    .unwrap_or("output_admission"),
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        chats.finish_turn(&chat_id, &cancel).await;
+        terminal?;
+        match result {
+            Err(error) if !error.recoverable() => Err(error.into_transport()),
+            _ => Ok(()),
+        }
     });
 }
 
@@ -2082,10 +2215,10 @@ enum ToolStepOutcome {
 /// `<plugin>.tool.invoke`, await the matching `tool.result`, emit
 /// `chat.tool.end`. Returns the content the model should see in the
 /// follow-up request.
-async fn run_one_tool_call(
+async fn run_one_tool_call_published(
     catalog: &Arc<ToolCatalog>,
     broker: &Arc<ToolBroker>,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
+    out_tx: &Publisher,
     cancel: &tokio_util::sync::CancellationToken,
     tc: ToolCall,
 ) -> ToolStepOutcome {
@@ -3058,17 +3191,18 @@ async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), LlmError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
+    checked_send(out_tx, PluginOutgoing::event(body))
         .await
-        .map_err(|_| LlmError::Transport(TransportError::WriterClosed))
+        .map_err(Into::into)
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), LlmError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| LlmError::Transport(TransportError::WriterClosed))
+        }),
+    )
+    .await
+    .map_err(Into::into)
 }

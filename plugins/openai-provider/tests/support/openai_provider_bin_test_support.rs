@@ -56,3 +56,14 @@
     fn fresh_chats(default_model: &str) -> Arc<Chats> {
         Arc::new(Chats::with_default_model(Some(default_model.to_owned())))
     }
+
+    async fn run_one_tool_call(
+        catalog: &Arc<ToolCatalog>, broker: &Arc<ToolBroker>, wire: &mpsc::Sender<PluginOutgoing>, cancel: &CancellationToken, call: ToolCall,
+    ) -> ToolStepOutcome {
+        let (publisher, rx) = Publisher::new(256);
+        let mut outcome = None;
+        publisher.run(wire, rx, &CancellationToken::new(), async {
+            outcome = Some(run_one_tool_call_published(catalog, broker, &publisher, cancel, call).await);
+        }).await.expect("tool publication");
+        outcome.expect("tool outcome")
+    }
