@@ -167,6 +167,7 @@ local function render(state, statusline, slash)
   -- so the Rust router bubbles every key to the reducer's sidebar
   -- navigation instead of swallowing it into the text field.
   local input_focused = not popup_owns_keys
+    and state.extension_popup == nil
     and state.focus ~= "sidebar"
     and state.resume_loading == nil
   local input_border_style
@@ -275,6 +276,7 @@ local function render(state, statusline, slash)
       popups.tool_permission(state),
       popups.terminate_workflow(state),
       popups.node_inspector(state),
+      require("libs.chat.extensions").popup_view(state),
       -- Toast renders last so it sits above input, statusline, and
       -- every popup — non-blocking notifications must never be
       -- occluded by chrome below them.

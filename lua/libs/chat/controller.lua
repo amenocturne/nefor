@@ -23,6 +23,7 @@ local workflow_controls = require("libs.chat.workflow_controls")
 local exit_controls = require("libs.chat.exit_controls")
 local queued_input = require("libs.chat.queued_input")
 local model_selection = require("libs.chat.model_selection")
+local extensions = require("libs.chat.extensions")
 local dispatch      = require("libs.chat.dispatch")
 local mag_run_bindings = require("libs.mag-run-bindings")
 local raw_selector = require("libs.chat.raw_selector")
@@ -2323,6 +2324,14 @@ local function reduce(msg, state, handlers)
     state = exit_controls.reset(state)
   end
   log.log("update", "dispatch kind=%s", kind)
+  -- Only extension-owned overlays may claim keys ahead of canonical handlers.
+  -- A correlated canonical popup suppresses the extension entirely.
+  local extension_input = state.extension_popup ~= nil
+    and (kind:match("^key%.") or kind:match("^mouse%."))
+  if state.popup == nil and (extension_input or handlers[kind] == nil) then
+    local extended, effects = extensions.handle_event(msg, state)
+    if extended ~= nil then return extended, effects end
+  end
   local handler = handlers[kind]
   local next_state, effects
   if handler then

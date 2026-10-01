@@ -23,6 +23,46 @@ scroll_position` + NCP egress via the `send_to` side-effect and
 - Raw key bubbling to Lua as `{ kind = "key.<name>", mods = {...} }`;
   mouse wheel auto-scrolls the scrollable under the cursor.
 
+## OS operations from Lua
+
+These generic effects do not interpret rendered links or select UI policy. Lua
+composition decides when to call them and how to display failures.
+
+```lua
+local ok, err = tui.open_external { uri = "mailto:person@example.org" }
+local ok, err = tui.open_external { path = "notes/design.md", base = "/absolute/project" }
+local ok, err = tui.open_external { path = "/absolute/project/image.png" }
+local ok, err = tui.copy_to_clipboard("text to copy")
+```
+
+- `tui.open_external(spec)` accepts exactly one target field: `uri` or `path`.
+  Targets must be non-empty UTF-8 strings without NUL bytes. `uri` is passed
+  unchanged to the platform opener: there is no URL normalization, scheme
+  allowlist, browser restriction, or application selection. `base` applies only
+  to `path`; relative paths require an explicit absolute `base`. Paths are
+  joined to that base without filesystem canonicalization, existence checks,
+  tilde expansion, or dependence on the plugin's working directory. Absolute
+  paths do not require a base; any supplied base must still be absolute.
+- The opener uses the platform's default handling for URIs and files (`open`
+  on macOS, `explorer.exe` on Windows, `xdg-open` on other Unix platforms).
+  Arguments are passed directly to a structured process command, never a shell.
+  The call waits for the opener's exit status, not for the launched application
+  to finish. Success means that the opener exited successfully, not that the
+  destination was loaded or viewed. Unsupported platforms, launch failures,
+  and non-success exit statuses are reported as failures.
+- `tui.copy_to_clipboard(text)` accepts a UTF-8 string (including an empty
+  string) and writes it through the system clipboard backend. Success means
+  that the backend accepted the write; subsequent clipboard ownership and
+  persistence follow that backend's platform behavior.
+- Both calls return `true` on success, or `nil, error_string` for invalid
+  arguments and expected OS/backend failures, rather than raising a Lua
+  exception. Existing clipboard callers may continue ignoring the returns.
+  Error strings are diagnostic text, not stable machine-readable categories.
+
+The Rust OS-effects boundary is substituted with a fake in unit tests, so API
+validation, target preservation, command construction, and failure reporting
+are tested without launching applications or accessing the real clipboard.
+
 ## CLI flags
 
 ```
@@ -140,7 +180,7 @@ Type `@path` anywhere in a message to include a text file. Completion is cwd-rel
 
 Paste an image from the system clipboard with `Ctrl+V` or `Super+V`. The TUI saves it as a PNG and inserts its absolute path into the prompt. This gives the agent a path it can inspect with `read_image`; it does not itself attach image bytes to the user message. Text paste continues through the normal prompt path. Image interpretation still depends on a vision-capable provider/model.
 
-Rendered Markdown links with absolute `http`, `https`, or `mailto` targets open through the system handler when the same linked text receives an unmodified left-button press and release. Dragging still selects text. Relative links, fragments, `file:` links, and effectful schemes render without activation. This is an engine behavior, not an example-composition command.
+Rendered Markdown destinations are preserved exactly as provided by the parser and delivered to optional user-owned Lua activation. The starter has no built-in open action: without a configured handler, clicking shows a visible no-action diagnostic. See the callback and extension contracts below.
 
 ## Sessions and context
 
@@ -158,3 +198,49 @@ The starter begins in `safe` unless this invocation explicitly selects another s
 - [Sessions and context](../../examples/nefor-agent/docs/sessions.md) — persistence, replay, resume, and compaction
 - [Workflows and tools](../../examples/nefor-agent/docs/workflows.md) — sidebar, termination, paths, images, receipts, and links
 - [Permissions](../../examples/nefor-agent/docs/permissions.md) — safe/auto/yolo and all approval paths
+
+## User-owned link activation
+
+`tui.start` optionally accepts `on_link(destination, state)`. The destination
+is the Markdown parser's verbatim `dest_url`, not a normalized URL: relative
+paths, fragments, arbitrary app schemes, `file:` destinations, and empty
+strings are metadata too. Wrapping, layout and hit testing retain it. An
+unmodified left-button down/up on the same target invokes the callback;
+drags, wheel events, intervening keys, changed modifiers/buttons, or release
+outside that target cancel activation. Ordinary down-click dispatch and text
+selection remain available.
+
+The callback returns `next_state_table, effects`, using the same effect forms
+as `update`; `nil` declines. It is optional at startup. Missing, declined,
+invalid-return, or errored callbacks display `Link: no action` over the current
+view, with diagnostic detail. The overlay clears on the next key or mouse
+press. No OS action is implicit. This boundary catches callback errors, not
+transactions: imperative effects already performed by a callback cannot be
+rolled back, and callbacks should return replacement state rather than mutate
+the supplied table before a possible error.
+
+## Canonical chat extension events and popups
+
+The canonical entry loads `config.active.chat_extension` (a table or module
+name) through `libs.chat.extensions`. In addition to existing command and
+status hooks, it supports:
+
+- `on_event(msg, readonly_state, api) -> next_state, effects` (or `nil` to
+  decline). Unclaimed events reach this hook through `libs.chat.controller`.
+  The entry's `on_link` callback translates activation to
+  `{kind = "link.activate", destination = verbatim_destination}` and calls
+  the same hook. This is an event adapter, not a link action.
+- `api.finish(patch)` constructs replacement state; `api.clear` clears a
+  patched field. Store custom popup data in `extension_popup`, not `popup`.
+  The latter is reserved for correlated canonical popups and cannot be patched
+  by this helper.
+- `popup_view(readonly_popup, readonly_state) -> widget_or_nil` renders that
+  slot through `libs.chat.view`; use the generic `nefor-tui` popup widget or
+  any other widget composition. While the slot exists, prompt input loses
+  focus and key/mouse messages reach `on_event` before ordinary key handlers.
+
+Canonical handlers for bus events still run first. When a canonical popup is
+active, extension events, link activation and popup rendering are suppressed:
+permission request correlation and approve/deny handling remain authoritative.
+The extension popup is retained behind it and resumes after it closes. There
+is no default extension popup or link menu.

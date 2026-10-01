@@ -61,6 +61,7 @@ struct StartedState {
     state_key: Option<RegistryKey>,
     view_key: Option<RegistryKey>,
     update_key: Option<RegistryKey>,
+    on_link_key: Option<RegistryKey>,
 }
 
 /// Side-effect record returned from `update` (or queued via the
@@ -247,6 +248,46 @@ impl LuaHost {
                 other.type_name()
             ))),
         }
+    }
+
+    /// Optional user-owned activation. Nil declines; a table accepts and replaces
+    /// state exactly like update. Callback failures are returned as diagnostics.
+    pub fn activate_link(&self, destination: &str) -> Result<Vec<SideEffect>, String> {
+        let call = || -> mlua::Result<Vec<SideEffect>> {
+            let (callback, state) = {
+                let started = lock(&self.started);
+                let key = started
+                    .on_link_key
+                    .as_ref()
+                    .ok_or_else(|| mlua::Error::runtime("no on_link callback configured"))?;
+                let state_key = started
+                    .state_key
+                    .as_ref()
+                    .ok_or_else(|| mlua::Error::runtime("TUI not started"))?;
+                (
+                    self.lua.registry_value::<mlua::Function>(key)?,
+                    self.lua.registry_value::<Value>(state_key)?,
+                )
+            };
+            let (next, effects): (Value, Value) = callback.call((destination, state))?;
+            match next {
+                Value::Nil => return Err(mlua::Error::runtime("on_link declined activation")),
+                Value::Table(_) => {}
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "on_link must return a state table or nil",
+                    ))
+                }
+            }
+            let effects = parse_side_effects(&self.lua, effects);
+            let next_key = self.lua.create_registry_value(next)?;
+            let mut started = lock(&self.started);
+            if let Some(old) = started.state_key.replace(next_key) {
+                self.lua.remove_registry_value(old)?;
+            }
+            Ok(effects)
+        };
+        call().map_err(|error| error.to_string())
     }
 
     /// Whether `tui.start` has been called.
@@ -865,30 +906,7 @@ fn install_tui(
     })?;
     tui.set("emit", emit_fn)?;
 
-    // ── Clipboard ────────────────────────────────────────────────────
-    //
-    // `tui.copy_to_clipboard(text)` writes `text` to the system
-    // clipboard via `arboard`. The engine ships the mechanism (the cell
-    // → text extraction + the binding); the policy of *whether* to copy
-    // a given selection lives in user-space Lua. Errors are swallowed
-    // and logged because clipboard backends are best-effort at the OS
-    // level (Wayland surfaces, headless CI, focus-stealing rules) and
-    // we don't want a failed copy to propagate as a Lua exception that
-    // crashes the dispatch.
-    let copy_fn = lua.create_function(|_, text: String| -> mlua::Result<()> {
-        match arboard::Clipboard::new() {
-            Ok(mut cb) => {
-                if let Err(e) = cb.set_text(text) {
-                    tracing::warn!(error = %e, "tui.copy_to_clipboard: set_text failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "tui.copy_to_clipboard: clipboard init failed");
-            }
-        }
-        Ok(())
-    })?;
-    tui.set("copy_to_clipboard", copy_fn)?;
+    crate::os_operations::install_os_operations(lua, &tui)?;
 
     let queue_for_send_to = Arc::clone(&emit_queue);
     let send_to_fn = lua.create_function(
@@ -979,6 +997,10 @@ fn install_tui(
             mlua::Error::runtime("tui.start: `update` is required and must be a function")
         })?;
 
+        let on_link: Option<mlua::Function> = args.get("on_link")?;
+        let on_link_key = on_link
+            .map(|callback| lua.create_registry_value(callback))
+            .transpose()?;
         let state_key = lua.create_registry_value(initial_state)?;
         let view_key = lua.create_registry_value(view)?;
         let update_key = lua.create_registry_value(update)?;
@@ -987,6 +1009,7 @@ fn install_tui(
         s.state_key = Some(state_key);
         s.view_key = Some(view_key);
         s.update_key = Some(update_key);
+        s.on_link_key = on_link_key;
         Ok(())
     })?;
     tui.set("start", start_fn)?;

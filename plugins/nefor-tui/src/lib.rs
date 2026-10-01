@@ -20,6 +20,7 @@ pub mod link;
 pub mod lua_host;
 pub mod markdown;
 pub mod mouse;
+mod os_operations;
 pub mod reconciler;
 pub mod render;
 pub mod scrollable;

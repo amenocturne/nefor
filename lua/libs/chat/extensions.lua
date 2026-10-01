@@ -139,4 +139,27 @@ function M.input_border_style(state, focused, canonical)
   return active.input_border_style(readonly(state), focused, canonical) or canonical
 end
 
+-- Generic local events and a separately owned popup slot. Canonical popups
+-- always win: extensions cannot intercept their keys or replace correlation.
+function M.handle_event(msg, state)
+  if state.popup ~= nil or active == nil or type(active.on_event) ~= "function" then return nil end
+  local common = require("libs.chat.common")
+  local api = {
+    finish = function(patch)
+      assert(patch == nil or patch.popup == nil, "extension events use extension_popup, not canonical popup")
+      return common.shallow_merge(state, patch or {})
+    end,
+    clear = common.NIL_SENTINEL,
+  }
+  local next_state, effects = active.on_event(msg, readonly(state), api)
+  if next_state == nil then return nil end
+  return next_state, effects or {}
+end
+
+function M.popup_view(state)
+  if state.popup ~= nil or state.extension_popup == nil or active == nil
+      or type(active.popup_view) ~= "function" then return nil end
+  return active.popup_view(readonly(state.extension_popup), readonly(state))
+end
+
 return M

@@ -13596,3 +13596,91 @@ fn model_picker_marks_the_active_pair_and_the_pending_one() {
         "nothing stays pending once the selection is adopted: {adopted:?}"
     );
 }
+
+#[test]
+fn canonical_extension_events_links_and_popup_hooks_preserve_permission_precedence() {
+    let mut engine = Engine::new(100, 30).unwrap();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/nefor-agent");
+    engine
+        .load_scenario(&canonical_chat_lua_source_for_config(&root))
+        .unwrap();
+    engine.lua().load(r#"
+      require("libs.chat.extensions").configure {
+        on_event = function(msg, state, api)
+          if msg.kind == "link.activate" or msg.kind == "test.extension.open" then
+            assert(state.popup == nil)
+            return api.finish { extension_popup = { destination = msg.destination or "fixture" } }, {}
+          end
+          if state.extension_popup and msg.kind == "key.escape" then
+            return api.finish { extension_popup = api.clear }, {}
+          end
+          if state.extension_popup and msg.kind == "key.a" then
+            return api.finish { extension_key_seen = true }, {}
+          end
+        end,
+        popup_view = function(popup, _state)
+          return tui.text { content = "EXTENSION POPUP " .. popup.destination }
+        end,
+      }
+    "#).exec().unwrap();
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "test.extension.open", "destination": "custom:Exact" }),
+    );
+    assert!(render_str(&mut engine).contains("EXTENSION POPUP custom:Exact"));
+    engine.handle_key(key("escape")).unwrap();
+    assert!(!render_str(&mut engine).contains("EXTENSION POPUP"));
+    // Reach the callback installed by the canonical entry via actual rendered cells.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "conversation.active.changed", "conversation_id": "links" }),
+    );
+    append_canonical_assistant_turn(
+        &mut engine,
+        "links",
+        "link-turn",
+        "[LINKLABEL](APP:Verbatim)",
+        json!({}),
+    );
+    render_str(&mut engine);
+    let snapshot = engine.snapshot();
+    let (y, line) = snapshot
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("LINKLABEL"))
+        .unwrap();
+    let x = line.chars().position(|ch| ch == 'L').unwrap();
+    for kind in [MouseKind::Click, MouseKind::Up] {
+        engine
+            .handle_mouse(MouseMessage {
+                kind,
+                x: x as u16,
+                y: y as u16,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .unwrap();
+    }
+    assert!(render_str(&mut engine).contains("EXTENSION POPUP APP:Verbatim"));
+    engine.handle_key(key("escape")).unwrap();
+    dispatch_event(&mut engine, json!({ "kind": "test.extension.open" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.popup_request", "id": "correlated-permission", "tool": "Bash", "args": {} }),
+    );
+    let snapshot = render_str(&mut engine);
+    assert!(snapshot.contains("permission requested"), "{snapshot}");
+    assert!(!snapshot.contains("EXTENSION POPUP"), "{snapshot}");
+    engine.handle_key(key("a")).unwrap();
+    let emits = engine.take_emit_queue();
+    assert!(emits.iter().any(|(_, body)| body.get("kind")
+        == Some(&json!("tool.permission_response"))
+        && body.get("id") == Some(&json!("correlated-permission"))));
+    assert!(engine
+        .state_table()
+        .unwrap()
+        .get::<Option<bool>>("extension_key_seen")
+        .unwrap()
+        .is_none());
+    assert!(render_str(&mut engine).contains("EXTENSION POPUP"));
+}

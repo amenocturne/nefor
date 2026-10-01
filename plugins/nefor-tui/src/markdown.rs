@@ -276,7 +276,7 @@ impl<'a> Walker<'a> {
             Tag::Link { dest_url, .. } => self
                 .inline
                 .links
-                .push(crate::link::LinkTarget::parse(&dest_url)),
+                .push(Some(crate::link::LinkTarget::new(&dest_url))),
             Tag::Image { .. } => { /* skip image alt; inline-text events still fire */ }
             // GFM tables: accumulate cell content into a per-table grid,
             // then render the whole table at TagEnd::Table with padded
@@ -1199,10 +1199,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_link_targets_render_without_activation() {
+    fn relative_link_targets_preserve_metadata() {
         let chars = render_to_styled_chars("[local](docs/readme.md)", None);
         assert_eq!(chars.iter().map(|c| c.ch).collect::<String>(), "local\n");
-        assert!(chars.iter().all(|c| c.link.is_none()));
+        assert!(chars
+            .iter()
+            .filter(|c| c.ch != '\n')
+            .all(|c| c.link.as_ref().map(|t| t.as_str()) == Some("docs/readme.md")));
     }
 
     #[test]

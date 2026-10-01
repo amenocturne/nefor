@@ -224,11 +224,25 @@ impl Renderer {
         root: &mut WidgetInstance,
         highlight: Option<SelectionHighlight>,
     ) -> Vec<u8> {
+        self.render_with_overlay(root, highlight, None)
+    }
+
+    /// Transient diagnostics are painted independently so they cannot remount
+    /// the composition or discard editor/scroll state.
+    pub(crate) fn render_with_overlay(
+        &mut self,
+        root: &mut WidgetInstance,
+        highlight: Option<SelectionHighlight>,
+        overlay: Option<&mut WidgetInstance>,
+    ) -> Vec<u8> {
         self.next.reset(self.width, self.height);
         reset_layout_state(root);
         layout::layout_and_paint(root, self.width, self.height, &mut self.next);
         if let Some(h) = highlight {
             apply_selection_highlight_in_content_coords(&mut self.next, h);
+        }
+        if let Some(overlay) = overlay {
+            layout::layout_and_paint(overlay, self.width, self.height, &mut self.next);
         }
         let bytes = if self.needs_full {
             self.emit_full()

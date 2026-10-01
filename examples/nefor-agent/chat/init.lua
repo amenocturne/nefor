@@ -306,6 +306,9 @@ tui.start {
   initial_state = initial_state(),
   view          = view,
   update        = update,
+  on_link       = function(destination, state)
+    return extensions.handle_event({ kind = "link.activate", destination = destination }, state)
+  end,
 }
 
 -- Startup prompts must wait until this process has loaded the composition;

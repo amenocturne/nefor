@@ -50,15 +50,9 @@ fn install_render_time_ms(now_ms: u64) {
     RENDER_TIME_MS.with(|c| c.set(now_ms));
 }
 
-type LinkOpener = fn(&str) -> Result<(), String>;
-
-fn open_system_link(target: &str) -> Result<(), String> {
-    webbrowser::open(target).map_err(|error| error.to_string())
-}
-
 pub struct Engine {
     lua: LuaHost,
-    link_opener: LinkOpener,
+    link_diagnostic: Option<String>,
     pending_link: Option<crate::link::LinkTarget>,
     reconciler: Reconciler,
     renderer: Renderer,
@@ -167,7 +161,7 @@ impl Engine {
         lua.set_dimensions(width, height);
         Ok(Engine {
             lua,
-            link_opener: open_system_link,
+            link_diagnostic: None,
             pending_link: None,
             reconciler: Reconciler::new(),
             renderer: Renderer::new(width, height),
@@ -253,6 +247,8 @@ impl Engine {
         // Ensure we have a current reconciled tree so the router can
         // inspect the latest description. The first key event would
         // otherwise see an empty reconciler.
+        self.link_diagnostic = None;
+        self.pending_link = None;
         self.ensure_reconciled()?;
 
         if let Some(root) = self.reconciler.root.as_mut() {
@@ -389,6 +385,10 @@ impl Engine {
         // would surface as flicker or off-by-one prune timing.
         self.lua.set_now_ms(self.now_ms());
         let effects = self.lua.dispatch(msg)?;
+        self.apply_effects(effects)
+    }
+
+    fn apply_effects(&mut self, effects: Vec<SideEffect>) -> Result<(), TuiError> {
         for e in effects {
             match e {
                 SideEffect::Exit => self.exit_requested = true,
@@ -618,26 +618,32 @@ impl Engine {
     ///   plain-text from the framebuffer, dispatch `mouse.selection` to
     ///   Lua, clear the range. Does not bubble as a separate click.
     pub fn handle_mouse(&mut self, evt: MouseMessage) -> Result<(), TuiError> {
-        // A link is activated on release at the same target, not on
-        // button-down. This leaves drag-to-select intact when a selection
-        // starts over linked text and mirrors ordinary desktop link UX.
-        if matches!(evt.kind, MouseKind::Click) && evt.button == Some("left") && evt.mods.is_empty()
-        {
-            self.pending_link = self.renderer.link_at(evt.x, evt.y);
-        }
-        if matches!(evt.kind, MouseKind::Drag) {
-            self.pending_link = None;
-        }
+        // Capture only unmodified primary presses; every other mouse gesture
+        // invalidates the candidate, including a changed release modifier.
         if matches!(evt.kind, MouseKind::Up) {
             if let Some(target) = self.pending_link.take() {
-                let activate = self.renderer.link_at(evt.x, evt.y).as_ref() == Some(&target);
+                let activate = evt.button == Some("left")
+                    && evt.mods.is_empty()
+                    && self.renderer.link_at(evt.x, evt.y).as_ref() == Some(&target);
                 self.finalise_selection(evt.x, evt.y)?;
                 if activate {
-                    if let Err(error) = (self.link_opener)(target.as_str()) {
-                        tracing::warn!(target = target.as_str(), error = %error, "failed to open markdown link");
+                    match self.lua.activate_link(target.as_str()) {
+                        Ok(effects) => self.apply_effects(effects)?,
+                        Err(error) => {
+                            self.link_diagnostic = Some(format!("Link: no action — {error}"));
+                            self.needs_render = true;
+                        }
                     }
                 }
                 return Ok(());
+            }
+        } else {
+            self.pending_link = None;
+            if matches!(evt.kind, MouseKind::Click) {
+                self.link_diagnostic = None;
+                if evt.button == Some("left") && evt.mods.is_empty() {
+                    self.pending_link = self.renderer.link_at(evt.x, evt.y);
+                }
             }
         }
 
@@ -1369,6 +1375,7 @@ impl Engine {
         // animation primitive computes on the same frame.
         self.lua.set_now_ms(now);
         let selection = self.current_selection();
+        let diagnostic = self.link_diagnostic.clone();
         let result = {
             let lua = &self.lua;
             let reconciler = &mut self.reconciler;
@@ -1376,10 +1383,19 @@ impl Engine {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 || -> Result<Vec<u8>, TuiError> {
                     let desc = lua.render_view()?;
+                    let mut overlay = Reconciler::new();
+                    if let Some(content) = diagnostic {
+                        overlay.reconcile(WidgetDescription::Text {
+                            content,
+                            style: None,
+                            wrap: crate::desc::WrapMode::Word,
+                            key: None,
+                        });
+                    }
                     reconciler.reconcile(desc);
                     let root = reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
                     sync_text_inputs(root);
-                    Ok(renderer.render_with_selection(root, selection))
+                    Ok(renderer.render_with_overlay(root, selection, overlay.root.as_mut()))
                 },
             ))
         };
@@ -1908,16 +1924,16 @@ mod tests {
         assert!(r.is_some(), "advance_time should mark dirty");
     }
 
-    fn record_link_open(target: &str) -> Result<(), String> {
-        assert_eq!(target, "https://example.com/docs");
-        Ok(())
-    }
-
     #[test]
-    fn markdown_link_click_uses_opener_and_preserves_click_dispatch() {
+    fn markdown_link_click_uses_callback_and_preserves_click_dispatch() {
         const LINK_SCENARIO: &str = r#"
             tui.start {
               initial_state = { clicks = 0 },
+              on_link = function(destination, s)
+                assert(destination == "https://example.com/docs")
+                s.destination = destination
+                return s, {}
+              end,
               view = function(s)
                 return tui.markdown {
                   key = "message",
@@ -1931,7 +1947,7 @@ mod tests {
             }
         "#;
         let mut engine = Engine::new(30, 3).expect("engine");
-        engine.link_opener = record_link_open;
+
         engine.load_scenario(LINK_SCENARIO).expect("load");
         let _ = engine.render_if_dirty().expect("render");
 
@@ -1980,6 +1996,128 @@ mod tests {
                 .expect("clicks"),
             2
         );
+    }
+
+    #[test]
+    fn link_activation_reports_missing_declined_and_errored_callbacks_visibly() {
+        for callback in [
+            "",
+            "on_link = function() return nil end,",
+            "on_link = function() error('boom') end,",
+            "on_link = function() return false end,",
+        ] {
+            let mut engine = Engine::new(90, 5).unwrap();
+            engine
+                .load_scenario(&format!(
+                    r#"
+            tui.start {{ initial_state = {{}}, {callback}
+              view = function() return tui.markdown {{ source = "[custom](app:Exact)" }} end,
+              update = function(_, s) return s, {{}} end }}
+        "#
+                ))
+                .unwrap();
+            engine.render_if_dirty().unwrap();
+            for kind in [MouseKind::Click, MouseKind::Up] {
+                engine
+                    .handle_mouse(MouseMessage {
+                        kind,
+                        x: 1,
+                        y: 0,
+                        button: Some("left"),
+                        mods: vec![],
+                    })
+                    .unwrap();
+            }
+            engine.render_if_dirty().unwrap();
+            assert!(
+                engine.snapshot().contains("Link: no action"),
+                "{}",
+                engine.snapshot()
+            );
+            assert!(!engine.exit_requested());
+        }
+    }
+
+    #[test]
+    fn link_activation_cancels_changed_gestures_and_dispatches_verbatim() {
+        for cancel in [
+            "none",
+            "drag",
+            "wheel",
+            "modified_down",
+            "modified_up",
+            "right_up",
+            "different_target",
+        ] {
+            let mut engine = Engine::new(90, 5).unwrap();
+            engine
+                .load_scenario(
+                    r#"
+            tui.start { initial_state = { activations = 0 },
+              on_link = function(destination, s)
+                return { activations = s.activations + 1, destination = destination }, {}
+              end,
+              view = function() return tui.markdown { source = "[custom](APP:Exact) plain" } end,
+              update = function(_, s) return s, {} end }
+        "#,
+                )
+                .unwrap();
+            engine.render_if_dirty().unwrap();
+            engine
+                .handle_mouse(MouseMessage {
+                    kind: MouseKind::Click,
+                    x: 1,
+                    y: 0,
+                    button: Some("left"),
+                    mods: if cancel == "modified_down" {
+                        vec!["ctrl".into()]
+                    } else {
+                        vec![]
+                    },
+                })
+                .unwrap();
+            if cancel == "drag" || cancel == "wheel" {
+                engine
+                    .handle_mouse(MouseMessage {
+                        kind: if cancel == "drag" {
+                            MouseKind::Drag
+                        } else {
+                            MouseKind::Wheel
+                        },
+                        x: 1,
+                        y: 0,
+                        button: Some("left"),
+                        mods: vec![],
+                    })
+                    .unwrap();
+            }
+            engine
+                .handle_mouse(MouseMessage {
+                    kind: MouseKind::Up,
+                    x: if cancel == "different_target" { 10 } else { 1 },
+                    y: 0,
+                    button: Some(if cancel == "right_up" {
+                        "right"
+                    } else {
+                        "left"
+                    }),
+                    mods: if cancel == "modified_up" {
+                        vec!["ctrl".into()]
+                    } else {
+                        vec![]
+                    },
+                })
+                .unwrap();
+            let state = engine.state_table().unwrap();
+            assert_eq!(
+                state.get::<u64>("activations").unwrap(),
+                u64::from(cancel == "none"),
+                "{cancel}"
+            );
+            if cancel == "none" {
+                assert_eq!(state.get::<String>("destination").unwrap(), "APP:Exact");
+            }
+        }
     }
 
     #[test]

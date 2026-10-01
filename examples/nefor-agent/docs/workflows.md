@@ -69,6 +69,15 @@ A receipt is an observability view, not proof that every external side effect co
 
 ## Markdown links
 
-Text rendered by the engine's Markdown widget carries safe link targets through wrapping and layout. An unmodified left-button press and release on the same linked text opens absolute `http`, `https`, or `mailto` URLs with the system handler. A drag cancels activation so selection remains usable. Opener failure is logged rather than turned into a chat popup.
+Markdown link cells retain the parser-provided destination through wrapping and
+layout. An unmodified left-button press and release on the same target calls
+optional user-owned activation; dragging, intervening gestures or keys cancel
+it. There is no built-in open action or scheme allowlist.
 
-Relative links, `#fragments`, `file:` URLs, and schemes such as `javascript:` are deliberately non-activating. The engine guarantee is limited to recognized Markdown link cells and the allowed schemes; the starter does not add a URL command, browsing sandbox, confirmation screen, or link-history export.
+The canonical chat entry forwards activation as `link.activate` to the selected
+`config.active.chat_extension.on_event` hook. The extension may choose an action
+or populate its own `extension_popup` through the generic popup/view seam.
+Without a handler, or when it declines or errors, the TUI displays a visible
+no-action diagnostic. Canonical permission popups retain priority and correlation.
+See [TUI APIs](../../../plugins/nefor-tui/README.md#user-owned-link-activation)
+for the callback, extension, OS-open and clipboard contracts.
