@@ -101,6 +101,10 @@ fmt-rust:
 test-engine target *args:
     cargo test -p nefor --features full-tests --test {{target}} {{args}}
 
+# Real gate/worktree admission checks require current runtime helpers.
+test-producer-admission: build-headless
+    just test-engine producer_admission_process_test
+
 # Provider/API translation tests; may need local socket binding permissions.
 test-provider:
     cargo test -p openai-provider --lib

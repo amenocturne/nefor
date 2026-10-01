@@ -54,6 +54,11 @@ name = "starter_sessions_test"
 path = "tests/starter_sessions_test.rs"
 required-features = ["full-tests"]
 
+[[test]]
+name = "producer_admission_process_test"
+path = "tests/producer_admission_process_test.rs"
+required-features = ["full-tests"]
+
 [dev-dependencies]
 nefor-mag = { path = "../crates/nefor-mag" }
 nefor-tui = { path = "../plugins/nefor-tui" }
