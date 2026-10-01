@@ -346,7 +346,7 @@ async fn flush_emits(
             }
             for envelope in bridge.translate_emit(body) {
                 if let Err(error) = send_event(out_tx, envelope).await {
-                    if !admission_rejection(&error) { return Err(error); }
+                    if !admission_rejection(&error) || kind == "tool.cancel" { return Err(error); }
                     if kind == "tool.invoke" {
                         if let Some(id) = &id {
                             bridge.forget(id);
