@@ -388,7 +388,10 @@ local function new_run_context(meta)
 
   -- Injected host bus seam. Routing already mints run-scoped capability ids.
   local function bus_emit(envelope)
-    if type(envelope) == "table" then nefor.emit(envelope) end
+    if type(envelope) == "table" then
+      envelope.run_id = ctx.run_id
+      nefor.emit(envelope)
+    end
   end
 
   -- The registry is injected so the fold validates every modification's
@@ -1040,6 +1043,23 @@ return {
   -- the same call. `reason` stamps the teardown's `mag.actor_killed` events
   -- ("run_complete" / "run_failed" / "killed"); absent, the teardown is an
   -- outright kill. Returns true when a context existed.
+  fail_output = function(run_id)
+    local ctx = runs[run_id]
+    if not ctx then return false end
+    ctx.output_failed = true
+    return true
+  end,
+
+  output_evidence = function(run_id)
+    local ctx = runs[run_id]
+    return ctx and ctx.last_output_path or nil
+  end,
+
+  output_failed = function(run_id)
+    local ctx = runs[run_id]
+    return ctx ~= nil and ctx.output_failed == true
+  end,
+
   end_run = function(run_id, reason)
     return reap_run(run_id, reason or "killed")
   end,

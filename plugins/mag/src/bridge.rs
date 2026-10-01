@@ -45,6 +45,14 @@ impl CapabilityBridge {
         }
     }
 
+    pub fn forget(&mut self, request_id: &str) {
+        self.pending_providers.remove(request_id);
+    }
+
+    pub fn clear(&mut self) {
+        self.pending_providers.clear();
+    }
+
     pub fn translate_emit(&mut self, body: Map<String, Value>) -> Vec<Map<String, Value>> {
         match body.get("kind").and_then(Value::as_str) {
             Some(TOOL_CANCEL) => self.translate_cancel(&body),

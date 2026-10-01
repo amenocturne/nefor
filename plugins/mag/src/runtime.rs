@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_plugin_sdk::{await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -30,9 +30,8 @@ use crate::kernel::{ExecutionModelSnapshot, LuaHost, RunCompletion, TeardownReas
 /// until that run signals `mag.run_complete` or `mag.run_failed` (via inbound
 /// capability responses that unblock deferred activations). Runs are
 /// concurrent — each `mag.execute` gets its own run-scoped kernel context and
-/// its own entry here, keyed by run_id, settling independently. Synchronous
-/// programs (the shipped factories) finish inside the `mag.execute` call and
-/// never register one.
+/// its own entry here, keyed by run_id, settling independently. Registration
+/// precedes the first flush, including synchronously completed programs.
 struct ActiveExecute {
     /// The `mag.execute` request id to correlate the terminal reply to.
     in_reply_to: Option<String>,
@@ -166,7 +165,10 @@ async fn run() -> Result<(), MagError> {
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = await_ready_ok(&mut in_rx).await?;
+    let engine_version = tokio::select! {
+        result = await_ready_ok(&mut in_rx) => result?,
+        _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
+    };
     tracing::info!(engine_version = %engine_version, "ready");
 
     // Host the Lua VM and load the kernel before advertising liveness, so
@@ -194,7 +196,9 @@ async fn run() -> Result<(), MagError> {
 
     run_dispatch_loop(&out_tx, &mut in_rx, &host).await?;
 
-    let _ = out_tx.send(PluginOutgoing::event(goodbye_body())).await;
+    if let Err(error) = checked_send(&out_tx, PluginOutgoing::event(goodbye_body())).await {
+        tracing::warn!(%error, "goodbye admission failed during teardown");
+    }
     Ok(())
 }
 
@@ -264,8 +268,9 @@ async fn run_dispatch_loop(
     // provider completions and rewrites tool-class invocations onto the
     // composition-named gate's `<gate>.tool.invoke` contract (bridge.rs).
     let mut bridge = CapabilityBridge::new(resolve_gate_target());
-    loop {
+    let result = async { loop {
         tokio::select! {
+            _ = out_tx.closed() => return Err(TransportError::WriterClosed.into()),
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(Ok(env)) => match &env.body {
@@ -288,9 +293,10 @@ async fn run_dispatch_loop(
                             .await?;
                         }
                     },
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "stdin parse error; dropping line");
+                    Some(Err(TransportError::Parse(e))) => {
+                        tracing::warn!(error = %e, "stdin parse error; dropping line");
                     }
+                    Some(Err(e)) => return Err(e.into()),
                     None => {
                         tracing::info!("stdin closed; exiting");
                         return Ok(());
@@ -303,6 +309,16 @@ async fn run_dispatch_loop(
             }
         }
     }
+    }.await;
+    for run_id in host.run_ids()? {
+        host.end_run(&run_id, TeardownReason::Killed)?;
+    }
+    active.clear();
+    if !out_tx.is_closed() {
+        flush_emits(out_tx, host, &mut bridge).await?;
+    }
+    bridge.clear();
+    result
 }
 
 /// Forward everything the kernel emitted since the last drain (capability
@@ -316,9 +332,36 @@ async fn flush_emits(
     host: &LuaHost,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
-    for body in host.drain_emits()? {
-        for envelope in bridge.translate_emit(body) {
-            send_event(out_tx, envelope).await?;
+    loop {
+        let emits = host.drain_emits()?;
+        if emits.is_empty() { break; }
+        for body in emits {
+            let kind = body.get("kind").and_then(Value::as_str).unwrap_or("").to_owned();
+            let id = body.get("id").and_then(Value::as_str).map(str::to_owned);
+            let run_id = body.get("run_id").and_then(Value::as_str).map(str::to_owned);
+            if let Some(run_id) = &run_id {
+                if host.output_failed(run_id)? && kind != "tool.cancel" && kind != "mag.actor_killed" {
+                    continue;
+                }
+            }
+            for envelope in bridge.translate_emit(body) {
+                if let Err(error) = send_event(out_tx, envelope).await {
+                    if !admission_rejection(&error) { return Err(error); }
+                    if kind == "tool.invoke" {
+                        if let Some(id) = &id {
+                            bridge.forget(id);
+                            if host.bus_response(id, None, Some(OUTPUT_FAILURE), None)?.is_some() {
+                                continue;
+                            }
+                        }
+                    } else if let Some(run_id) = &run_id {
+                        // Cancellation and teardown observers cannot be recovered by
+                        // failing an already-ended context: authority loss is unknown.
+                        if host.fail_output(run_id)? { continue; }
+                    }
+                    return Err(error);
+                }
+            }
         }
     }
     Ok(())
@@ -350,11 +393,14 @@ async fn settle_run(
         return Ok(());
     };
     let duration_ms = elapsed_ms(active_run.started_at);
+    let output_failed = host.output_failed(run_id)?;
     let (mut reply, reason) = if let Some(rc) = host.take_run_complete(run_id)? {
         (
-            run_result_ok(None, run_id, &rc, duration_ms),
+            if output_failed { delivery_failure_reply(None, run_id, Some(&rc), duration_ms) } else { run_result_ok(None, run_id, &rc, duration_ms) },
             TeardownReason::RunComplete,
         )
+    } else if output_failed {
+        (delivery_failure_reply(None, run_id, Some(&host.output_evidence(run_id)?), duration_ms), TeardownReason::RunFailed)
     } else if let Some(error) = host.take_run_failed(run_id)? {
         (
             run_result_failed(None, run_id, &error, duration_ms),
@@ -369,8 +415,9 @@ async fn settle_run(
     if let Some(id) = active_run.in_reply_to {
         reply.insert("in_reply_to".into(), Value::String(id));
     }
-    send_event(out_tx, reply).await?;
+    let sent = send_terminal(out_tx, reply).await;
     host.end_run(run_id, reason)?;
+    sent?;
     flush_emits(out_tx, host, bridge).await
 }
 
@@ -964,65 +1011,30 @@ async fn handle_execute(
         Some(&conversation_id),
         model_snapshot.as_ref(),
     )?;
-    // The kernel reaps stale contexts from a previous session at the boundary
-    // (begin_run); fail their pending replies before driving the new run.
+    if begun.ok {
+        active.insert(run_id.clone(), ActiveExecute {
+            in_reply_to: in_reply_to.map(str::to_owned), started_at,
+        });
+    }
+    // The kernel reaps stale contexts from a previous session at the boundary.
     settle_reaped(out_tx, host, active, bridge, &begun.reaped).await?;
     if !begun.ok {
         let msg = begun.error.unwrap_or_else(|| "begin_run failed".into());
-        return send_event(
-            out_tx,
-            run_result_failed(in_reply_to, &run_id, &msg, elapsed_ms(started_at)),
-        )
-        .await;
+        return send_terminal(out_tx, run_result_failed(in_reply_to, &run_id, &msg, elapsed_ms(started_at))).await;
+    }
+    if host.output_failed(&run_id)? {
+        return settle_run(out_tx, host, active, bridge, &run_id).await;
     }
     let outcome = host.start_program(&run_id, &execution.initial, &execution.operations)?;
-    flush_emits(out_tx, host, bridge).await?;
-
-    // A failed apply / rejected initial modification: nothing useful spawned;
-    // drop the context.
     if !outcome.ok {
         let msg = outcome.error.unwrap_or_else(|| "start failed".into());
-        send_event(
-            out_tx,
-            run_result_failed(in_reply_to, &run_id, &msg, elapsed_ms(started_at)),
-        )
-        .await?;
+        let sent = send_terminal(out_tx, run_result_failed(in_reply_to, &run_id, &msg, elapsed_ms(started_at))).await;
         host.end_run(&run_id, TeardownReason::RunFailed)?;
+        active.remove(&run_id);
+        sent?;
         return flush_emits(out_tx, host, bridge).await;
     }
-
-    // Synchronous terminal state inside `start`: reply now and tear the run's
-    // context down (reaping any still-live actors — e.g. a parallel branch —
-    // through the fold).
-    let terminal = if let Some(rc) = host.take_run_complete(&run_id)? {
-        Some((
-            run_result_ok(in_reply_to, &run_id, &rc, elapsed_ms(started_at)),
-            TeardownReason::RunComplete,
-        ))
-    } else {
-        host.take_run_failed(&run_id)?.map(|error| {
-            (
-                run_result_failed(in_reply_to, &run_id, &error, elapsed_ms(started_at)),
-                TeardownReason::RunFailed,
-            )
-        })
-    };
-    if let Some((reply, reason)) = terminal {
-        send_event(out_tx, reply).await?;
-        host.end_run(&run_id, reason)?;
-        return flush_emits(out_tx, host, bridge).await;
-    }
-
-    // Async program: defer the terminal reply until `mag.run_complete` (or
-    // `mag.run_failed`) arrives via capability responses.
-    active.insert(
-        run_id,
-        ActiveExecute {
-            in_reply_to: in_reply_to.map(str::to_owned),
-            started_at,
-        },
-    );
-    Ok(())
+    settle_run(out_tx, host, active, bridge, &run_id).await
 }
 
 fn initial_actor_address(id: &str) -> String {
@@ -2081,20 +2093,50 @@ async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), MagError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
-        .await
-        .map_err(|_| TransportError::WriterClosed)?;
-    Ok(())
+    let fallback_id = body.get("in_reply_to").and_then(Value::as_str).map(str::to_owned);
+    let pre_start_reply = matches!(body.get("kind").and_then(Value::as_str), Some(LOADED_KIND | ERROR_KIND));
+    match checked_send(out_tx, PluginOutgoing::event(body)).await {
+        Err(error @ (TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming)) if pre_start_reply => {
+            if let Some(id) = fallback_id {
+                checked_send(out_tx, PluginOutgoing::event(error_body(Some(&id), "output admission failed before execution"))).await?;
+                Ok(())
+            } else { Err(error.into()) }
+        }
+        result => result.map_err(MagError::from),
+    }
 }
 
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), MagError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(out_tx, PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| TransportError::WriterClosed)?;
+        })).await?;
     Ok(())
+}
+
+const OUTPUT_FAILURE: &str = "output admission failed; earlier or external effects may have occurred";
+
+fn admission_rejection(error: &MagError) -> bool {
+    matches!(error, MagError::Transport(TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming))
+}
+
+fn delivery_failure_reply(id: Option<&str>, run_id: &str, completion: Option<&RunCompletion>, duration: u64) -> Map<String, Value> {
+    let mut reply = run_result_failed(id, run_id, OUTPUT_FAILURE, duration);
+    reply.insert("failure".into(), Value::String("output_delivery".into()));
+    if let Some(completion) = completion {
+        reply.insert("persisted".into(), Value::Bool(completion.persisted));
+        if let Some(path) = &completion.output_path { reply.insert("output_path".into(), Value::String(path.clone())); }
+    }
+    reply
+}
+
+async fn send_terminal(out_tx: &mpsc::Sender<PluginOutgoing>, reply: Map<String, Value>) -> Result<(), MagError> {
+    match send_event(out_tx, reply.clone()).await {
+        Err(error) if admission_rejection(&error) => {
+            let mut fallback = delivery_failure_reply(reply.get("in_reply_to").and_then(Value::as_str), reply.get("run_id").and_then(Value::as_str).unwrap_or(""), None, reply.get("duration_ms").and_then(Value::as_u64).unwrap_or(0));
+            for key in ["persisted", "output_path"] { if let Some(value) = reply.get(key) { fallback.insert(key.into(), value.clone()); } }
+            send_event(out_tx, fallback).await
+        }
+        result => result,
+    }
 }

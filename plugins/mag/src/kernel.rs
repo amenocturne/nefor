@@ -365,6 +365,31 @@ impl LuaHost {
         Ok(f.call::<bool>((run_id, reason.as_str()))?)
     }
 
+    pub fn run_ids(&self) -> Result<Vec<String>, MagError> {
+        let f: Function = self.kernel.get("run_ids")?;
+        Ok(f.call(())?)
+    }
+
+    pub fn fail_output(&self, run_id: &str) -> Result<bool, MagError> {
+        let f: Function = self.kernel.get("fail_output")?;
+        Ok(f.call(run_id)?)
+    }
+
+    pub fn output_evidence(&self, run_id: &str) -> Result<RunCompletion, MagError> {
+        let f: Function = self.kernel.get("output_evidence")?;
+        let path: Option<String> = f.call(run_id)?;
+        Ok(RunCompletion {
+            persisted: path.is_some(),
+            output_path: path,
+            result: None,
+        })
+    }
+
+    pub fn output_failed(&self, run_id: &str) -> Result<bool, MagError> {
+        let f: Function = self.kernel.get("output_failed")?;
+        Ok(f.call(run_id)?)
+    }
+
     /// Interrupt a live run's in-flight work. Two shapes selected by
     /// `terminate`:
     /// Gracefully settle every in-flight capability correlation as an
@@ -473,8 +498,8 @@ impl LuaHost {
     pub fn drain_emits(&self) -> Result<Vec<Map<String, JsonValue>>, MagError> {
         let queue: Table = self.lua.globals().get(EMIT_QUEUE)?;
         let mut out = Vec::new();
-        for pair in queue.clone().pairs::<i64, Value>() {
-            let (_, v) = pair?;
+        for item in queue.clone().sequence_values::<Value>() {
+            let v = item?;
             let json: JsonValue = self.lua.from_value(v)?;
             if let JsonValue::Object(map) = json {
                 out.push(map);

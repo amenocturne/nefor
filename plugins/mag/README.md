@@ -108,3 +108,37 @@ its envelope. A hit is never proof of current kernel acceptance. Corrupt records
 fall back to compilation. No execution state, model snapshot, source environment,
 or failure is retained in this cache. Execute/apply and retained artifact lifetime
 remain unchanged; deleting cache/source after loading does not dispose an artifact.
+
+## Output admission and run settlement
+
+Every outgoing envelope uses SDK checked admission (16 MiB including LF).
+Admission success is enqueue only, not stdout delivery or peer acceptance.
+Before execution begins, a rejected correlated compilation/error reply becomes
+one bounded `mag.error {in_reply_to, message}`. Required uncorrelated startup or
+control output rejection exits rather than advertising a usable authority.
+
+An accepted run is never turned into a pre-start `mag.error`. A rejected
+capability request is delivered to its exact kernel correlation as a failure;
+normal graph failure routing determines whether that firing's failure is handled.
+The bridge forgets a rejected provider correlation before that delivery. Kernel
+bus emissions carry explicit run identity, not identity parsed from actor names.
+
+Rejected run lifecycle/output observations mark the owning kernel context for
+output failure. Its remaining output progression stops, and settlement reaps its
+actors (including parallel capability cancellation) and drops the run context.
+Exactly one execute-correlated `mag.run_result` has `status = "failed"`,
+`failure = "output_delivery"`, and a bounded error explaining that earlier or
+external effects may have occurred. A rejected oversized terminal result uses
+that same small terminal instead of publishing success. Persisted output files
+are not removed; `persisted` and `output_path` evidence are retained when available.
+This is failure to deliver output, not proof that completed execution effects
+failed or never happened. No execution is retried.
+
+If identity cannot be resolved to a surviving owner, cancellation/teardown
+observation admission fails, the small fallback cannot fit, or the writer closes,
+the plugin tears down local kernel authority and exits. Downstream owners must
+reconcile accepted work as unknown; they must not invent effects-free rejection.
+Writer closure and terminal stdin faults wake the idle loop. Bounded malformed
+JSON remains parse noise. Goodbye is checked best effort only during already
+selected teardown. These policies do not promise atomic OS delivery or bound
+value-construction/serialization memory.

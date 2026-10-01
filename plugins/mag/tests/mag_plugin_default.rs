@@ -1309,3 +1309,299 @@ let n0 = 0
     assert_eq!(reply["kind"], "mag.error");
     assert_eq!(reply["message"], "current kernel rejection");
 }
+
+#[cfg(test)]
+mod output_admission_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn host() -> LuaHost {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        LuaHost::load_kernel(
+            &root.join("lua/mag-kernel/init.lua"),
+            Some(&root.join("../../lua")),
+        )
+        .unwrap()
+    }
+
+    fn compile(host: &LuaHost, source: &str) -> Value {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        nefor_mag::compile_with_inputs_and_module_roots_and_options_and_syntax(
+            source,
+            &root,
+            json!({"factory_contracts": host.registry_contracts().unwrap()}),
+            &[
+                root.join("../../mag/lib"),
+                root.join("../../examples/nefor-agent/mag/lib"),
+            ],
+            nefor_mag::CompilerOptions::default(),
+            nefor_mag::SyntaxMode::New,
+        )
+        .unwrap()
+    }
+
+    fn program(host: &LuaHost) -> Value {
+        compile(
+            host,
+            r#"import nefor.{compile_graph, source, identity, >>>}
+compile_graph(source("input", "MARKER") >>> identity<String>("answer"))"#,
+        )
+    }
+
+    fn replace_marker(value: &mut Value, text: &str) {
+        match value {
+            Value::String(s) if s == "MARKER" => *s = text.to_owned(),
+            Value::Array(items) => items.iter_mut().for_each(|item| replace_marker(item, text)),
+            Value::Object(fields) => fields
+                .values_mut()
+                .for_each(|item| replace_marker(item, text)),
+            _ => (),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_giant_terminal_releases_kernel_and_allows_later_run() {
+        let host = host();
+        let mut artifact = program(&host);
+        replace_marker(&mut artifact, &"x".repeat(16 * 1024 * 1024));
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut active = ActiveExecutes::new();
+        let mut bridge = CapabilityBridge::new("gate");
+        let request = json!({"artifact":artifact,"run_id":"giant","session_id":"admission-test"});
+        handle_execute(
+            &tx,
+            "test",
+            request.as_object().unwrap(),
+            Some("execute-giant"),
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .unwrap();
+        assert!(active.is_empty());
+        assert!(host.run_ids().unwrap().is_empty());
+        let mut terminal = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let Body::Event(body) = message.body {
+                assert_ne!(body["kind"], "mag.error");
+                if body["kind"] == RUN_RESULT_KIND {
+                    terminal.push(body);
+                }
+            }
+        }
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["status"], "failed");
+        assert_eq!(terminal[0]["failure"], "output_delivery");
+        assert_eq!(terminal[0]["in_reply_to"], "execute-giant");
+        assert!(terminal[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("effects may have occurred"));
+        let request =
+            json!({"artifact":program(&host),"run_id":"later","session_id":"admission-test"});
+        handle_execute(
+            &tx,
+            "test",
+            request.as_object().unwrap(),
+            Some("execute-later"),
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .unwrap();
+        let mut completed = false;
+        while let Ok(message) = rx.try_recv() {
+            if let Body::Event(body) = message.body {
+                if body["kind"] == RUN_RESULT_KIND {
+                    assert_eq!(body["status"], "completed");
+                    completed = true;
+                }
+            }
+        }
+        assert!(completed);
+    }
+
+    #[tokio::test]
+    async fn giant_capability_request_fails_its_firing_without_wire_publication() {
+        let host = host();
+        let mut artifact = compile(
+            &host,
+            r#"import nefor.{compile_graph, script, ShellScriptParams, Timeout}
+compile_graph(script("shell", ShellScriptParams {script: "MARKER", cwd: ".", timeout: named(Timeout, Seconds, 30)}))"#,
+        );
+        replace_marker(&mut artifact, &"x".repeat(16 * 1024 * 1024));
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut active = ActiveExecutes::new();
+        let mut bridge = CapabilityBridge::new("gate");
+        let request =
+            json!({"artifact":artifact,"run_id":"capability","session_id":"admission-test"});
+        handle_execute(
+            &tx,
+            "test",
+            request.as_object().unwrap(),
+            Some("execute-capability"),
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .unwrap();
+        assert!(host.run_ids().unwrap().is_empty());
+        assert!(active.is_empty());
+        let mut terminal = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let Body::Event(body) = message.body {
+                assert_ne!(body["kind"], "gate.tool.invoke");
+                assert_ne!(body["kind"], "mag.error");
+                if body["kind"] == RUN_RESULT_KIND {
+                    terminal.push(body);
+                }
+            }
+        }
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["in_reply_to"], "execute-capability");
+        assert!(serde_json::to_string(&terminal[0])
+            .unwrap()
+            .contains("output admission failed"));
+    }
+
+    #[tokio::test]
+    async fn deferred_giant_output_cancels_parallel_branch_and_late_reply_is_inert() {
+        let host = host();
+        let artifact = compile(
+            &host,
+            r#"import nefor.{compile_graph, script, ShellScriptParams, Timeout, &&&}
+let left = script("left", ShellScriptParams {script: "left", cwd: ".", timeout: named(Timeout, Seconds, 30)})
+let right = script("right", ShellScriptParams {script: "right", cwd: ".", timeout: named(Timeout, Seconds, 30)})
+compile_graph(left &&& right)"#,
+        );
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut active = ActiveExecutes::new();
+        let mut bridge = CapabilityBridge::new("gate");
+        let request =
+            json!({"artifact":artifact,"run_id":"parallel","session_id":"admission-test"});
+        handle_execute(
+            &tx,
+            "test",
+            request.as_object().unwrap(),
+            Some("execute-parallel"),
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .unwrap();
+        let mut calls = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let Body::Event(body) = message.body {
+                if body["kind"] == "gate.tool.invoke" {
+                    calls.push(body["id"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        assert_eq!(calls.len(), 2);
+        let reply = json!({"id": calls[0], "output": {"stdout": "x".repeat(16 * 1024 * 1024), "stderr": "", "termination": {"kind":"code","code":0}}});
+        handle_tool_result(
+            &tx,
+            reply.as_object().unwrap(),
+            &host,
+            &mut active,
+            &mut bridge,
+        )
+        .await
+        .unwrap();
+        assert!(active.is_empty());
+        assert!(host.run_ids().unwrap().is_empty());
+        let mut cancelled = false;
+        let mut terminals = 0;
+        while let Ok(message) = rx.try_recv() {
+            if let Body::Event(body) = message.body {
+                if body["kind"] == "gate.tool.cancel" && body["id"] == calls[1] {
+                    cancelled = true;
+                }
+                if body["kind"] == RUN_RESULT_KIND {
+                    assert_eq!(body["status"], "failed");
+                    assert_eq!(body["failure"], "output_delivery");
+                    terminals += 1;
+                }
+            }
+        }
+        assert!(cancelled);
+        assert_eq!(terminals, 1);
+        assert!(host
+            .bus_response(&calls[1], None, Some("late"), None)
+            .unwrap()
+            .is_none());
+        assert!(host.drain_emits().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_start_rejection_is_not_an_accepted_run_terminal() {
+        let host = host();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut active = ActiveExecutes::new();
+        let mut bridge = CapabilityBridge::new("gate");
+        handle_execute(
+            &tx,
+            "test",
+            json!({"artifact":{}}).as_object().unwrap(),
+            Some("rejected"),
+            (&host, &mut active, &mut bridge),
+        )
+        .await
+        .unwrap();
+        let Body::Event(body) = rx.recv().await.unwrap().body else {
+            panic!("event")
+        };
+        assert_eq!(body["kind"], "mag.error");
+        assert_eq!(body["in_reply_to"], "rejected");
+        assert!(host.run_ids().unwrap().is_empty());
+        assert!(active.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_terminal_fallback_is_once_only_and_preserves_path_evidence() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let rc = RunCompletion {
+            output_path: Some("retained.output".into()),
+            persisted: true,
+            result: Some(json!("x".repeat(16 * 1024 * 1024))),
+        };
+        send_terminal(&tx, run_result_ok(Some("execute"), "run", &rc, 1))
+            .await
+            .unwrap();
+        let Body::Event(body) = rx.recv().await.unwrap().body else {
+            panic!("event")
+        };
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["persisted"], true);
+        assert_eq!(body["output_path"], "retained.output");
+        assert!(rx.try_recv().is_err());
+        let long_id = "x".repeat(16 * 1024 * 1024);
+        assert!(
+            send_terminal(&tx, run_result_ok(Some(&long_id), "run", &rc, 1))
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_writer_and_terminal_stdin_faults_wake_and_teardown() {
+        for writer_closed in [false, true] {
+            let host = host();
+            host.begin_run("idle", "idle", Some("admission-test"))
+                .unwrap();
+            let (tx, rx) = mpsc::channel(128);
+            let (input, mut incoming) = mpsc::channel(4);
+            if writer_closed {
+                drop(rx);
+            } else {
+                input.send(Err(TransportError::InvalidUtf8)).await.unwrap();
+            }
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                run_dispatch_loop(&tx, &mut incoming, &host),
+            )
+            .await
+            .unwrap();
+            assert!(outcome.is_err());
+            assert!(host.run_ids().unwrap().is_empty());
+        }
+    }
+}
