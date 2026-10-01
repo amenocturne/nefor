@@ -225,7 +225,7 @@ function M.rewind_picker(state)
     entries = function() return rows end,
     format_entry = function(row)
       local text = tostring(row.text or ""):gsub("\r", " "):gsub("\n", " ")
-      if #text > 72 then text = text:sub(1, 71) .. "…" end
+      text = sessions.clip_preview(text, 72)
       return text
     end,
     cursor_style = CURSOR_ROW_STYLE,

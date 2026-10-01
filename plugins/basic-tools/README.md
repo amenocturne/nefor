@@ -32,6 +32,11 @@ supplies the read_file cap; the composition passes the same value to the Lua
 
 ### `read_file`
 
+UTF-8 slices preserve the explicit byte cap. An artificial cap cut floors to
+its complete scalar prefix; if no scalar fits, the tool returns a bounded-read
+argument error rather than a nonprogressing continuation. Incomplete UTF-8 at
+actual EOF is an error, not a successful truncated read.
+
 Reads the contents of a regular UTF-8 text file. Symlinks to regular files are
 accepted. Arguments: `path` (required), optional
 `cwd`, optional `offset`, and optional `max_bytes`. The composition supplies
@@ -130,3 +135,8 @@ active policy/mode.
 
 basic-tools is composed into the default starter. To run it ad-hoc against a
 fake engine, see [`tools/fake-engine`](../../tools/fake-engine).
+
+Process stream decoding retains incomplete UTF-8 suffixes independently for
+stdout and stderr. Complete invalid sequences and incomplete EOF suffixes use
+the same lossy replacement policy as the captured terminal process result;
+concatenated stream text therefore does not depend on pipe-read partitioning.

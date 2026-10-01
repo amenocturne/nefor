@@ -17,6 +17,50 @@ pub enum StreamChunk {
     Stderr(Vec<u8>),
 }
 
+/// Pipe read boundaries are unrelated to UTF-8 boundaries. Only incomplete
+/// suffixes are deferred; invalid complete sequences retain the terminal
+/// result's whole-buffer lossy replacement policy.
+#[derive(Default)]
+pub struct StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut output = String::new();
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(text) => {
+                    output.push_str(text);
+                    consumed = self.pending.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    output.push_str(&String::from_utf8_lossy(&self.pending[consumed..valid_end]));
+                    consumed = valid_end;
+                    match error.error_len() {
+                        Some(length) => {
+                            output.push('�');
+                            consumed += length;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+        output
+    }
+
+    pub fn finish(&mut self) -> String {
+        let output = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        output
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Timeout {
     Unbounded,
@@ -425,5 +469,54 @@ pub fn bad_args(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError::BadArgs {
         tool: tool.into(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::StreamDecoder;
+
+    #[test]
+    fn every_partition_matches_whole_buffer_lossy() {
+        for bytes in [
+            "Ж€😀".as_bytes(),
+            b"a\xf0\x9f\xff\xd0",
+            b"\xe2\x82x\xff\xc0\xaf",
+        ] {
+            for mask in 0..(1usize << (bytes.len() - 1)) {
+                let mut decoder = StreamDecoder::default();
+                let mut actual = String::new();
+                let mut start = 0;
+                for end in 1..=bytes.len() {
+                    if end == bytes.len() || mask & (1 << (end - 1)) != 0 {
+                        actual.push_str(&decoder.push(&bytes[start..end]));
+                        start = end;
+                    }
+                }
+                actual.push_str(&decoder.finish());
+                assert_eq!(actual, String::from_utf8_lossy(bytes), "mask={mask}");
+                assert_eq!(decoder.finish(), "");
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_streams_keep_independent_suffixes() {
+        let stdout = "Привет😀".as_bytes();
+        let stderr = b"\xe2\x82\xac\xd0";
+        for a in 0..=stdout.len() {
+            for b in 0..=stderr.len() {
+                let mut out = StreamDecoder::default();
+                let mut err = StreamDecoder::default();
+                let mut out_text = out.push(&stdout[..a]);
+                let mut err_text = err.push(&stderr[..b]);
+                out_text.push_str(&out.push(&stdout[a..]));
+                err_text.push_str(&err.push(&stderr[b..]));
+                out_text.push_str(&out.finish());
+                err_text.push_str(&err.finish());
+                assert_eq!(out_text, String::from_utf8_lossy(stdout));
+                assert_eq!(err_text, String::from_utf8_lossy(stderr));
+            }
+        }
     }
 }

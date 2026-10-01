@@ -329,8 +329,17 @@ async fn handle_invoke(
             shell_script::run_cancellable_streaming(&args, cancel, Some(preview)).await
         };
         let _ = finished_tx.send(());
-        let _ = forward.await;
-        result
+        match forward.await {
+            Ok(Ok(())) => result,
+            Ok(Err(error)) => Err(ToolError::ProcessIo {
+                operation: "publishing process stream (process effects may have occurred)".into(),
+                message: error.to_string(),
+            }),
+            Err(error) => Err(ToolError::ProcessIo {
+                operation: "joining process stream publisher".into(),
+                message: error.to_string(),
+            }),
+        }
     } else {
         run_capability(&name, &args).await
     };
@@ -355,7 +364,7 @@ async fn forward_preview(
     out_tx: mpsc::Sender<PluginOutgoing>,
     id: String,
     mut finished: oneshot::Receiver<()>,
-) {
+) -> Result<(), TransportError> {
     let mut ticks = tokio::time::interval(PREVIEW_FLUSH_INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -369,12 +378,10 @@ async fn forward_preview(
                 process::StreamChunk::Stderr(bytes) => ("stderr", bytes),
             };
             let text = String::from_utf8_lossy(&bytes);
-            if send_event(&out_tx, stream_body(&id, stream, &text)).await.is_err() {
-                return;
-            }
+            send_event(&out_tx, stream_body(&id, stream, &text)).await?;
         }
         if done {
-            return;
+            return Ok(());
         }
     }
 }

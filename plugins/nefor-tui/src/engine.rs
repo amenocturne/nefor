@@ -1768,6 +1768,71 @@ mod tests {
     "#;
 
     #[test]
+    fn session_and_rewind_preview_trees_preserve_utf8_and_durable_text() {
+        let lua = mlua::Lua::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        lua.globals().set("repo", root.to_str().unwrap()).unwrap();
+        lua.load(
+            r#"
+            package.path = repo .. "/lua/?.lua;" .. repo .. "/lua/?/init.lua;" .. package.path
+            table.insert(package.searchers, 1, function(name)
+              if name == "nefor-tui" or name:sub(1, 10) == "nefor-tui." then
+                local suffix = name == "nefor-tui" and "init" or name:sub(11):gsub("%.", "/")
+                return assert(loadfile(repo .. "/plugins/nefor-tui/lua/" .. suffix .. ".lua"))
+              end
+            end)
+            -- Capture real widget description trees, with constructors only
+            -- stubbed (no lossy Rust conversion can hide a bad Lua prefix).
+            tui = setmetatable({}, {__index=function(_, kind)
+              return function(desc) desc.type=kind; return desc end
+            end})
+            dofile(repo .. "/tests/lua/chat/preview_text_test.lua")
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn prepaint_mixed_line_keys_reach_safe_hard_newline_navigation() {
+        for (value, movement, expected) in [
+            ("a\nЖ", &["home", "left", "down"][..], "a\nxЖ"),
+            ("Ж\na", &["end", "up"][..], "xЖ\na"),
+        ] {
+            let mut engine = Engine::new(20, 8).unwrap();
+            let source = format!(
+                r#"
+                tui.start {{
+                  initial_state = {{value = {value:?}}},
+                  view = function(s) return tui.text_input {{ key="input", value=s.value,
+                    focused=true, max_lines=6, on_change="changed" }} end,
+                  update = function(msg, s)
+                    if msg.kind == "changed" then
+                      tui.emit {{kind="witness", value=msg.value}}
+                      return {{value=msg.value}}, {{}}
+                    end
+                    return s, {{}}
+                  end,
+                }}
+            "#
+            );
+            engine.load_scenario(&source).unwrap();
+            // Deliberately no render/layout: ensure_reconciled routes keys
+            // with viewport_width=0 before the first paint.
+            for name in movement.iter().copied().chain(["x"]) {
+                engine
+                    .handle_key(crate::input::KeyMessage {
+                        name: name.into(),
+                        mods: vec![],
+                    })
+                    .unwrap();
+            }
+            let emits = engine.take_emit_queue();
+            assert_eq!(emits.last().unwrap().1["value"], expected);
+        }
+    }
+
+    #[test]
     fn scenario_load_preserves_imperative_emits() {
         let mut engine = Engine::new(40, 5).expect("engine");
         engine

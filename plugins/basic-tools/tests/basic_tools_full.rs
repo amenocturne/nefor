@@ -237,6 +237,47 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
     #[tokio::test]
+    async fn forwarding_flushes_invalid_suffixes_independently_before_terminal_result() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let body = json!({"id":"suffix", "name":"shell.script", "args":{
+            "script": "printf '\\320\\226\\342\\202'; printf '\\360\\237\\230\\200\\320' >&2",
+            "cwd":".", "timeout":{"present":false,"milliseconds":0}
+        }})
+        .as_object()
+        .unwrap()
+        .clone();
+        let task = tokio::spawn(async move { handle_tool_invoke(&tx, &body, None).await });
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let result = loop {
+            let message = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Body::Event(body) = message.body {
+                match body["kind"].as_str().unwrap() {
+                    "tool.stream" => {
+                        let text = body["text"].as_str().unwrap();
+                        match body["stream"].as_str().unwrap() {
+                            "stdout" => stdout.push_str(text),
+                            "stderr" => stderr.push_str(text),
+                            other => panic!("unexpected stream {other}"),
+                        }
+                    }
+                    "tool.result" => break body,
+                    other => panic!("unexpected message {other}"),
+                }
+            }
+        };
+        task.await.unwrap().unwrap();
+        assert_eq!(stdout, "Ж�");
+        assert_eq!(stderr, "😀�");
+        assert_eq!(result["output"]["stdout"], stdout);
+        assert_eq!(result["output"]["stderr"], stderr);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn spawned_invocations_run_concurrently() {
         let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(8);
 

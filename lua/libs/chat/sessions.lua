@@ -155,16 +155,8 @@ function M.list_recent(limit)
   return enriched
 end
 
--- Truncate `text` to `n` columns (byte-count proxy; non-ASCII
--- previews may render slightly off but the picker is dev-tooling).
--- Newlines collapse to spaces so multi-line prompts render as a
--- single row.
-function M.clip_preview(text, n)
-  if text == nil then return "" end
-  text = tostring(text):gsub("\n", " "):gsub("\r", " ")
-  if #text <= n then return text end
-  return text:sub(1, math.max(0, n - 1)) .. "…"
-end
+-- Shared preview-only clipping leaves durable prompts unchanged.
+M.clip_preview = require("libs.chat.preview_text").clip
 
 -- Format the started_at timestamp for picker rows. ISO 8601 →
 -- "MM-DD HH:MM". Falls back to the raw string on parse failure.

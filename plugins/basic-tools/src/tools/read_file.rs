@@ -200,7 +200,14 @@ async fn read_text_file(request: ReadRequest, max_read_bytes: u64) -> Result<Str
         ));
     }
 
-    let start = seek_to_next_utf8_boundary(&mut file, request.offset, size, &path).await?;
+    let start = if request.offset == 0 {
+        0
+    } else {
+        seek_to_next_utf8_boundary(&mut file, request.offset, size, &path).await?
+    };
+    if start == size {
+        return Err(ToolError::NotUtf8 { path });
+    }
     let read_limit = request.max_bytes.min(size.saturating_sub(start));
 
     // Probe the first BINARY_PROBE_BYTES for NUL bytes. If we find one,
@@ -234,7 +241,8 @@ async fn read_text_file(request: ReadRequest, max_read_bytes: u64) -> Result<Str
     // `probe_read` bytes; keep the same handle and continue from there.
     let remaining_cap = (read_limit as usize).saturating_sub(probe_read);
     let mut rest = Vec::with_capacity(remaining_cap);
-    file.take(remaining_cap as u64)
+    (&mut file)
+        .take(remaining_cap as u64)
         .read_to_end(&mut rest)
         .await
         .map_err(|e| ToolError::Io {
@@ -244,7 +252,34 @@ async fn read_text_file(request: ReadRequest, max_read_bytes: u64) -> Result<Str
 
     let mut all = probe;
     all.extend_from_slice(&rest);
-    let valid_len = valid_utf8_prefix_len(&all, &path)?;
+    if all.is_empty() {
+        return Err(ToolError::Io {
+            path,
+            message: "file reached EOF before the sampled size; no read progress".into(),
+        });
+    }
+    // A cap cut may defer a scalar; an actual EOF must never hide malformed
+    // trailing bytes. Probe only when decoding found an incomplete suffix.
+    let at_eof = match std::str::from_utf8(&all) {
+        Err(error) if error.error_len().is_none() => {
+            let mut next = [0u8; 1];
+            file.read(&mut next).await.map_err(|e| ToolError::Io {
+                path: path.clone(),
+                message: e.to_string(),
+            })? == 0
+        }
+        _ => false,
+    };
+    let valid_len = valid_utf8_prefix_len(&all, &path, at_eof)?;
+    if valid_len == 0 && !all.is_empty() {
+        return Err(ToolError::BadArgs {
+            tool: NAME.into(),
+            message: format!(
+                "no complete UTF-8 character fits max_bytes={} at offset {start}",
+                request.max_bytes
+            ),
+        });
+    }
     all.truncate(valid_len);
 
     let text = String::from_utf8(all).map_err(|_| ToolError::NotUtf8 { path: path.clone() })?;
@@ -306,10 +341,10 @@ fn is_utf8_continuation(b: u8) -> bool {
     (0x80..=0xBF).contains(&b)
 }
 
-fn valid_utf8_prefix_len(bytes: &[u8], path: &str) -> Result<usize, ToolError> {
+fn valid_utf8_prefix_len(bytes: &[u8], path: &str, at_eof: bool) -> Result<usize, ToolError> {
     match std::str::from_utf8(bytes) {
         Ok(_) => Ok(bytes.len()),
-        Err(e) if e.error_len().is_none() => Ok(e.valid_up_to()),
+        Err(e) if e.error_len().is_none() && !at_eof => Ok(e.valid_up_to()),
         Err(_) => Err(ToolError::NotUtf8 { path: path.into() }),
     }
 }

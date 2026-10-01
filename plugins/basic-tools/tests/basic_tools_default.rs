@@ -59,6 +59,54 @@ mod tools {
             #[cfg(unix)]
             use std::time::Duration;
 
+            #[tokio::test]
+            async fn eof_rejects_incomplete_utf8_and_tiny_cap_never_stalls() {
+                let mut malformed = NamedTempFile::new().unwrap();
+                malformed.write_all(b"a\xd0").unwrap();
+                for args in [
+                    json!({"path": malformed.path()}),
+                    json!({"path": malformed.path(), "max_bytes": 2}),
+                ] {
+                    assert!(matches!(
+                        run(&args, Some(TEST_MAX_BYTES)).await,
+                        Err(ToolError::NotUtf8 { .. })
+                    ));
+                }
+                let mut invalid_start = NamedTempFile::new().unwrap();
+                invalid_start.write_all(b"\x80a").unwrap();
+                assert!(matches!(
+                    run(&json!({"path": invalid_start.path()}), Some(TEST_MAX_BYTES)).await,
+                    Err(ToolError::NotUtf8 { .. })
+                ));
+                let mut valid = NamedTempFile::new().unwrap();
+                valid.write_all("Ж😀Ж".as_bytes()).unwrap();
+                assert!(matches!(
+                    run(
+                        &json!({"path": valid.path(), "max_bytes": 1}),
+                        Some(TEST_MAX_BYTES)
+                    )
+                    .await,
+                    Err(ToolError::BadArgs { .. })
+                ));
+                for (offset, end, text) in [(0, 2, "Ж"), (2, 6, "😀"), (6, 8, "Ж")] {
+                    let result = run(
+                        &json!({"path": valid.path(), "offset": offset, "max_bytes": 4}),
+                        Some(TEST_MAX_BYTES),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        result.starts_with(&format!(
+                            "[read_file slice: bytes {offset}..{end} of 8]\n{text}"
+                        )),
+                        "{result}"
+                    );
+                    if end < 8 {
+                        assert!(result.contains(&format!("next offset: {end}")));
+                    }
+                }
+            }
+
             const TEST_MAX_BYTES: u64 = 1024 * 1024;
 
             #[cfg(unix)]

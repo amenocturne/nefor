@@ -790,7 +790,8 @@ impl TextInputState {
             let prev_line_end = cur_line_start - 1;
             let prev_line_start = line_start(&self.last_value, prev_line_end);
             let prev_line_len = prev_line_end - prev_line_start;
-            self.cursor = prev_line_start + col.min(prev_line_len);
+            self.cursor =
+                floor_char_boundary(&self.last_value, prev_line_start + col.min(prev_line_len));
         }
         if !extend_selection {
             self.selection_anchor = None;
@@ -818,7 +819,8 @@ impl TextInputState {
             let next_line_start = cur_line_end + 1;
             let next_line_end = line_end(&self.last_value, next_line_start);
             let next_line_len = next_line_end - next_line_start;
-            self.cursor = next_line_start + col.min(next_line_len);
+            self.cursor =
+                floor_char_boundary(&self.last_value, next_line_start + col.min(next_line_len));
         }
         if !extend_selection {
             self.selection_anchor = None;
@@ -1012,6 +1014,51 @@ impl TextInputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_line_navigation_selection_and_next_edits_keep_boundaries() {
+        for width in [0, 20] {
+            for (value, cursor, down) in [("a\nЖ😀", 1, true), ("Ж😀\na", "Ж😀\na".len(), false)]
+            {
+                for extend in [false, true] {
+                    let mut state = TextInputState::default();
+                    state.sync_with_desc(value, true);
+                    state.cursor = cursor;
+                    state.viewport_width = width;
+                    if down {
+                        state.move_down(extend);
+                    } else {
+                        state.move_up(extend);
+                    }
+                    assert!(state.last_value.is_char_boundary(state.cursor));
+                    if let Some(anchor) = state.selection_anchor {
+                        assert!(state.last_value.is_char_boundary(anchor));
+                    }
+                    for edit in 0..4 {
+                        let mut next = state.clone();
+                        match edit {
+                            0 => {
+                                next.insert_char('x');
+                            }
+                            1 => {
+                                next.delete_forward();
+                            }
+                            2 => {
+                                next.delete_word_backward();
+                            }
+                            _ => {
+                                next.delete_word_forward();
+                            }
+                        }
+                        assert!(next.last_value.is_char_boundary(next.cursor));
+                        if let Some(anchor) = next.selection_anchor {
+                            assert!(next.last_value.is_char_boundary(anchor));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn sync_seeds_baseline_and_lands_cursor_at_end() {
@@ -1534,4 +1581,13 @@ mod tests {
             assert_eq!(back, cursor, "round-trip failed @ cursor={cursor}");
         }
     }
+}
+
+// Hard-newline navigation retains its byte-column policy, but a shorter or
+// differently encoded line may put that column inside a scalar.
+fn floor_char_boundary(value: &str, mut offset: usize) -> usize {
+    while !value.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
