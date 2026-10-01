@@ -1129,7 +1129,14 @@ end
     assert!(!rows
         .iter()
         .any(|row| row["body"]["kind"] == "sessions.resume_done"));
-    // Record missing acceptance rather than encoding the bug as a desired law.
+    assert_eq!(failures[0]["body"]["request_id"], result["request_id"]);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["body"]["kind"] == "sessions.flush_done"
+                && row["body"]["request_id"] == result["request_id"])
+            .count(),
+        1
+    );
     let evidence = serde_json::json!({
         "cli_request_id": result["request_id"], "cli_status": result["status"],
         "transition_request_id": failures[0]["body"]["request_id"],

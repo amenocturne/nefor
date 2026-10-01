@@ -61,7 +61,7 @@ fn starter_startup_parser_and_mode_application() {
         .find("actor.spawn(require(\"libs.conversation-manager.runtime\").build({")
         .expect("conversation manager actor registration");
     let session_init = init
-        .find("sessions.init(startup.session_id)")
+        .find("sessions.init(startup.session_id, startup_request_id)")
         .expect("session initialization");
     let agentic_loop = init
         .find("actor.spawn(agentic_loop)")

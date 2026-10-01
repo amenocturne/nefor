@@ -363,3 +363,20 @@ inert; a persistence fault during flushing or rejection of the flush request
 produces one explicit persistence error and nonzero shutdown instead of waiting
 for an acknowledgment that cannot arrive. Ordinary unrelated process exits
 during flushing do not bypass that barrier.
+
+### Local delivery observations and startup replay closure
+
+NCP failure diagnostics never re-enter physical egress. Provider compositors
+observe `ncp.delivery_failed` through their actor `receive_msg` subscription;
+transport and queue-loss observations still reach the wrapper. The provider
+settles its pending completion, compaction and model-selection obligations before
+publishing the existing correlated failures. Unidentified loss is unknown, not
+an effects-free rejection; compaction may have delivered earlier control items.
+Late completion, model and compaction acknowledgments do not restore settled work.
+
+CLI startup returns its operation ID to composition. Composition passes that ID
+into `sessions.init(resume_id, request_id)` so replay failures are correlated even
+before prompt submission. Startup errors use the same session-flush barrier as
+whole-request terminals. A matching flush acknowledgement (including its explicit
+persistence error), or an explicitly correlated persistence failure, closes the
+frontend; an unrelated persistence observation cannot bypass an active barrier.

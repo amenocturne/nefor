@@ -651,6 +651,10 @@ function M.spawn_spec(name, command, opts)
 
       if type(env.body) == "table" then
         local body = env.body
+        if body.kind == kinds.chat_compaction_commit then
+          finish_compaction(body)
+          goto continue
+        end
         if pending_compactions[body.chat_id]
             and (body.kind == kinds.chat_compaction_commit
               or body.kind == kinds.chat_error
@@ -671,6 +675,9 @@ function M.spawn_spec(name, command, opts)
           goto continue
         end
       end
+
+      if type(env.body) == "table" and env.body.kind == kinds.model_set_ack
+          and (pending_model_set == nil or env.body.model ~= pending_model_set.model) then goto continue end
 
       if type(env.body) == "table"
           and env.body.kind == kinds.model_set_ack
@@ -774,20 +781,50 @@ function M.spawn_spec(name, command, opts)
         if type(body) == "table" and ((kind == "ncp.delivery_failed" and body.peer == name)
             or ((kind == "engine.plugin_transport_failed" or kind == "engine.plugin_delivery_lost")
               and body.plugin == name)) then
-          local ids, identified = {}, false
+          local ids, compactions, model, identified, incomplete = {}, {}, false, false, false
           if kind == "ncp.delivery_failed" and body.extent == "none" then
             for _, correlation in ipairs(body.correlations or {}) do
+              if correlation.chat_id then
+                identified = true
+                if pending_compactions[correlation.chat_id] then compactions[correlation.chat_id] = true end
+              end
+              if correlation.kind == kinds.model_set then
+                identified = true
+                incomplete = incomplete or type(correlation.model) ~= "string"
+                model = pending_model_set ~= nil and correlation.model == pending_model_set.model
+              end
               if correlation.kind == kinds.completion_request and type(correlation.request_id) == "string" then
                 identified = true
                 if pending_requests[correlation.request_id] then ids[correlation.request_id] = true end
               end
             end
           end
-          local unknown = not identified
-          if unknown then for id in pairs(pending_requests) do ids[id] = true end end
+          local unknown = not identified or incomplete
+            or (type(body.count) == "number" and body.count > #(body.correlations or {}))
+          if unknown then
+            for id in pairs(pending_requests) do ids[id] = true end
+            for id in pairs(pending_compactions) do compactions[id] = true end
+            model = true
+          end
+          for id in pairs(compactions) do
+            local pending = pending_compactions[id]
+            pending_compactions[id] = nil
+            emit_synthetic(name, { kind = "conversation.context.compact.failed",
+              request_id = pending.request_id, conversation_id = pending.conversation_id,
+              error = { code = "provider_delivery_failed", outcome = "unknown",
+                message = "Provider compaction delivery failed; prior effects are unknown" } })
+          end
+          if model and pending_model_set then
+            local pending = pending_model_set
+            pending_model_set = nil
+            emit_synthetic(name, { kind = "chat.model.set_failed", provider = name,
+              model = pending.model, outcome = unknown and "unknown" or "rejected",
+              error = "Provider model selection delivery failed" })
+          end
           for id in pairs(ids) do
             local pending = pending_requests[id]
             pending_requests[id] = nil
+            cancelled_requests[id] = nil
             request_usage_versions[id] = nil
             report({ request_id = id, conversation_id = pending.conversation_id, event = "error",
               error = { code = "provider_delivery_failed", outcome = unknown and "unknown" or "rejected",
@@ -952,7 +989,16 @@ function M.spawn_spec(name, command, opts)
     from_plugin = from_plugin,
     to_plugin   = to_plugin,
     to_plugin_readonly = true,
-    receive_msg = function(_) end,
+    -- NCP diagnostics are deliberately barred from physical egress. Observe
+    -- them locally through the actor bus instead of the suppressed wrapper.
+    receive_msg = function(entry)
+      local ok, env = pcall(nefor.json.decode, entry.payload or "")
+      if ok and type(env) == "table" and type(env.body) == "table"
+          and env.body.kind == "ncp.delivery_failed" and env.body.peer == name and not env.replay
+          and not require("core.replay_window").active() then
+        to_plugin({ env })
+      end
+    end,
     _internals = {
       pending_requests = function() return pending_requests end,
       usage_value = function(usage_id) return copy_usage(usage_values[usage_id]) end,

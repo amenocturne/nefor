@@ -959,3 +959,96 @@ fn provider_output_errors_and_capability_loss_release_exact_requests_once() {
       assert(spec._internals.pending_requests().later ~= nil)
     "#).exec().expect("provider owner settlement");
 }
+
+#[test]
+fn routed_provider_egress_failure_settles_completion_compaction_and_model_locally() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(r#"
+      local log, observers, cursor = {}, {}, 0
+      nefor.bus.on_event = function(_, cb) observers[#observers + 1] = cb end
+      nefor.engine.plugins = function() return {"owner"} end
+      local send = nefor.engine.send
+      nefor.engine.send = function(payload)
+        send(payload)
+        log[#log + 1] = {origin="step", payload=payload}
+      end
+      local actor, ncp = require("core.actor"), require("core.ncp")
+      actor.install()
+      local spec = require("libs.compositors.provider").spawn_spec("owner", {"/bin/true"}, {
+        translator_lib="chatgpt-provider", tool_gate="tool-gate", agentic_loop={}, conversations={
+          context=function() return {messages={{role="user", content="context"}}, watermark=1} end,
+          watermark=function() return 1 end,
+        },
+      })
+      actor.spawn(spec)
+      ncp._test_set_ready("owner", true)
+      local function drain()
+        while cursor < #log do
+          ncp.dispatch(log)
+          local stop = #log
+          for i=cursor+1,stop do for _,cb in ipairs(observers) do cb(log[i]) end end
+          cursor = stop
+        end
+      end
+      local function publish(body)
+        nefor.engine.send(nefor.json.encode({type="event", from="consumer", body=body}))
+        drain()
+      end
+      publish {kind="conversation.provider.invoke", provider="owner", request_id="completion",
+        conversation_id="lead", watermark=1}
+      publish {kind="conversation.projection.delta", conversation_id="lead", change={
+        kind="context_compaction_pending", provider="owner", model="model", compaction={request_id="compact"}}}
+      local deliver = nefor.engine.deliver
+      nefor.engine.deliver = function(peer,payload)
+        if nefor.json.decode(payload).body.kind == "owner.model.set" then error("egress failed after possible effects") end
+        return deliver(peer,payload)
+      end
+      publish {kind="chat.model.set", provider="owner", model="model"}
+      nefor.engine.deliver = deliver
+      local counts = {}
+      for _,entry in ipairs(log) do
+        local body=nefor.json.decode(entry.payload).body
+        counts[body.kind]=(counts[body.kind] or 0)+1
+        if body.kind=="conversation.provider.event.reported" then
+          assert(body.request_id=="completion" and body.event=="error" and body.error.outcome=="unknown")
+        elseif body.kind=="conversation.context.compact.failed" then
+          assert(body.request_id=="compact" and body.error.outcome=="unknown")
+        elseif body.kind=="chat.model.set_failed" then
+          assert(body.model=="model" and body.outcome=="unknown")
+        end
+      end
+      assert(counts["ncp.delivery_failed"]==1)
+      assert(counts["conversation.provider.event.reported"]==1)
+      assert(counts["conversation.context.compact.failed"]==1)
+      assert(counts["chat.model.set_failed"]==1)
+      assert(next(spec._internals.pending_requests())==nil)
+      for _,row in ipairs(_test.delivered()) do assert(row.kind~="ncp.delivery_failed") end
+      local before=#log
+      spec.from_plugin({{type="event",from="owner",body={kind="owner.model.set_ack",model="model"}}})
+      spec.from_plugin({{type="event",from="owner",body={kind="owner.completion.event",request_id="completion",event="completed"}}})
+      spec.from_plugin({{type="event",from="owner",body={kind="owner.chat.compaction.commit",
+        chat_id="conversation-compact:compact",model="model",model_context_artifact={}}}})
+      assert(#log==before,"late acknowledgments are inert")
+      publish {kind="engine.plugin_delivery_lost",plugin="owner"}
+      local function count(kind)
+        local n=0
+        for _,entry in ipairs(log) do if nefor.json.decode(entry.payload).body.kind==kind then n=n+1 end end
+        return n
+      end
+      assert(count("chat.model.set_failed")==1 and count("conversation.context.compact.failed")==1,
+        "duplicate scoped loss is inert")
+      publish {kind="chat.model.set",provider="owner",model="next"}
+      publish {kind="ncp.delivery_failed",peer="owner",extent="none",correlations={{kind="owner.model.set",model="old"}}}
+      assert(count("chat.model.set_failed")==1,"stale rejection cannot settle newer model")
+      publish {kind="ncp.delivery_failed",peer="owner",extent="none",correlations={{kind="owner.model.set",model="next"}}}
+      assert(count("chat.model.set_failed")==2)
+      publish {kind="conversation.projection.delta",conversation_id="lead",change={
+        kind="context_compaction_pending",provider="owner",model="model",compaction={request_id="scoped"}}}
+      publish {kind="engine.plugin_delivery_lost",plugin="owner"}
+      assert(count("conversation.context.compact.failed")==2,"surviving queue loss settles compaction")
+      publish {kind="conversation.provider.invoke",provider="owner",request_id="later",conversation_id="lead",watermark=1}
+      assert(spec._internals.pending_requests().later~=nil,"surviving provider accepts later work")
+    "#).exec().expect("routed provider local failure observation");
+}

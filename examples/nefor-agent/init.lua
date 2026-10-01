@@ -383,8 +383,9 @@ local composition_readiness = {
     },
     timeout_ms = tonumber(os.getenv("NEFOR_STARTUP_TIMEOUT_MS")) or 10000,
 }
+local startup_request_id
 if startup.frontend == "cli" then
-  require("libs.cli").start {
+  startup_request_id = require("libs.cli").start {
     prompt = startup.prompt, format = startup.format, readiness = composition_readiness,
   }
 elseif startup.prompt ~= nil then
@@ -406,5 +407,5 @@ end
 
 -- Register all replay consumers and frontend observers before session activation:
 -- resume may synchronously emit its first chunk during init.
-sessions.init(startup.session_id)
+sessions.init(startup.session_id, startup_request_id)
 startup_args.apply_mode(startup, agentic_loop)

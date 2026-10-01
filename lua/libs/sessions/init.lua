@@ -562,7 +562,7 @@ local function do_shutdown()
 end
 
 ---@param resume_id string|nil
-local function do_init(resume_id)
+local function do_init(resume_id, request_id)
   if state.initialised then
     if nefor.log then
       nefor.log.warn("sessions.init: already initialised; ignoring", {
@@ -575,7 +575,7 @@ local function do_init(resume_id)
   state.initialised = true
 
   if resume_id and resume_id ~= "" then
-    local resumed = do_resume(resume_id, false)
+    local resumed = do_resume(resume_id, false, request_id)
     if not resumed then state.initialised = false end
     return resumed
   end

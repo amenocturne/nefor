@@ -154,7 +154,9 @@ do
   assert(#out == 0 and #exits == 0, "unsolicited flush completion cannot finish(nil)")
   activate()
   emit { kind = "agentic_loop.request_completed", request_id = id, status = "success", answer = "not persisted" }
-  emit { kind = "sessions.persistence_failed", message = "flush owner failed" }
+  emit { kind = "sessions.persistence_failed", message = "uncorrelated fault" }
+  assert(#exits == 0, "uncorrelated persistence failure cannot bypass flush")
+  emit { kind = "sessions.persistence_failed", request_id = id, message = "flush owner failed" }
   local result = nefor.json.decode(table.concat(out))
   assert(result.status == "error" and result.error.code == "session_failure")
   assert(#exits == 1 and exits[1].code == 1)
@@ -178,6 +180,8 @@ end
 reset()
 start("json")
 timers[1].on_exit()
+assert(#exits == 0 and sent[1].body.kind == "sessions.flush_request")
+emit { kind = "sessions.flush_done", request_id = sent[1].body.request_id }
 assert(exits[1].code == 1 and nefor.json.decode(table.concat(out)).error.code == "startup_failure")
 reset()
 cli.start { prompt = " ", readiness = {} }

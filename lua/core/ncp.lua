@@ -283,7 +283,7 @@ local function delivery_failed(target, phase, extent, err, envs)
   for i, env in ipairs(envs) do
     if i > 16 then break end
     local item = {}
-    for _, key in ipairs({ "kind", "id", "in_reply_to", "run_id", "chat_id", "request_id" }) do
+    for _, key in ipairs({ "kind", "id", "in_reply_to", "run_id", "chat_id", "request_id", "model" }) do
       local value = env.body and env.body[key]
       -- Correlation identity must never be shortened into another identity.
       if type(value) == "string" and #value <= 512 then item[key] = value end

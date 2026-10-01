@@ -53,6 +53,19 @@ function M.start(opts)
     nefor.engine.shutdown { code = code, reason = "CLI request " .. outcome.status, grace_ms = 2000 }
   end
 
+  local function flush(outcome)
+    result = outcome
+    phase = "flushing"
+    local admitted, err = envelope.checked_emit_as("cli", nil,
+      { kind = "sessions.flush_request", request_id = request_id })
+    if not admitted then
+      result.status = "error"
+      result.error = { code = "session_failure",
+        message = "Session flush request was not published: " .. tostring(err) }
+      finish(result)
+    end
+  end
+
   local function fail(code, message)
     local err = { code = code, message = tostring(message) }
     if phase == "flushing" then
@@ -65,7 +78,7 @@ function M.start(opts)
       settlement_requested = true
       loop.fail_request(request_id, err)
     elseif phase ~= "flushing" then
-      finish { status = "error", error = err }
+      flush { status = "error", error = err }
     end
   end
 
@@ -97,7 +110,9 @@ function M.start(opts)
       interrupt()
     elseif kind == "engine.plugin_process_terminated" and required_plugin(body.plugin) then
       fail("plugin_terminated", "Required runtime process terminated: " .. tostring(body.plugin))
-    elseif kind == "sessions.transition_failed" or kind == "sessions.persistence_failed" then
+    elseif (kind == "sessions.transition_failed" and body.request_id == request_id)
+        or (kind == "sessions.persistence_failed"
+          and (phase ~= "flushing" or body.request_id == request_id)) then
       fail("session_failure", body.message)
     elseif kind == "tool-gate.mode_changed" then
       gate_mode = body.mode
@@ -113,16 +128,8 @@ function M.start(opts)
       })
       fail("approval_required", "Review requires interactive approval; no approval was granted")
     elseif phase == "submitted" and kind == "agentic_loop.request_completed" and body.request_id == request_id then
-      result = { session_id = body.session_id, request_id = request_id,
+      flush { session_id = body.session_id, request_id = request_id,
         status = body.status, answer = body.answer or "", error = body.error }
-      phase = "flushing"
-      -- A bus barrier makes the sessions actor consume every prior canonical
-      -- fact before acknowledging the final flush; callback order is irrelevant.
-      local admitted, err = envelope.checked_emit_as("cli", nil,
-        { kind = "sessions.flush_request", request_id = request_id })
-      if not admitted then
-        fail("session_failure", "Session flush request was not published: " .. tostring(err))
-      end
     elseif phase == "flushing" and kind == "sessions.flush_done" and body.request_id == request_id then
       if body.error then result.status = "error"; result.error = body.error end
       finish(result)
@@ -174,8 +181,8 @@ function M.run(argv)
     return 2
   end
   opts.readiness = assert(configured and configured.readiness, "CLI readiness not configured")
-  M.start(opts)
-  assert(configured.initialize_session, "virtual CLI session initialization not configured")(opts.session_id)
+  local request_id = M.start(opts)
+  assert(configured.initialize_session, "virtual CLI session initialization not configured")(opts.session_id, request_id)
   require("libs.startup").apply_mode(opts, require("libs.agentic-loop"))
   return 0
 end
