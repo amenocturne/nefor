@@ -935,7 +935,7 @@ async fn serve_scripted_sse(
 ) {
     for reply in replies {
         let (mut stream, _) = listener.accept().await.expect("accept");
-        let _ = read_request(&mut stream).await;
+        let _ = read_request_json(&mut stream).await;
         hits.fetch_add(1, Ordering::SeqCst);
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1566,4 +1566,302 @@ async fn direct_completion_replays_encrypted_reasoning_before_tool_output() {
     drop(in_tx);
     server.await.expect("server");
     let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+}
+
+#[tokio::test]
+async fn giant_live_delta_rejects_once_cancels_reader_and_reuses_request_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("first request");
+        read_request_json(&mut stream).await;
+        let delta = serde_json::json!({"type":"response.output_text.delta", "delta":"x".repeat(16 * 1024 * 1024)});
+        let body = format!("data: {delta}\n\n");
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + 1024);
+        stream.write_all(header.as_bytes()).await.expect("headers");
+        stream.write_all(body.as_bytes()).await.expect("delta");
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(90), stream.read(&mut byte))
+                .await
+                .expect("reader cancelled")
+                .expect("read"),
+            0
+        );
+        closed_tx.send(()).expect("reader observation");
+        serve_scripted_sse(
+            listener,
+            vec![ScriptedSseReply::complete(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"later\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"second\"}}\n\n"
+            ))],
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+    });
+    let (in_tx, mut out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    submit_direct_completion(&in_tx, "reuse").await;
+    let error = wait_for_completion_event(&mut out_rx, "reuse", "error", Duration::from_secs(90))
+        .await
+        .expect("small terminal");
+    assert_eq!(error["error_category"], "output_admission_failed");
+    assert_eq!(error["effects"], "unknown");
+    assert!(serde_json::to_vec(&error).expect("encode").len() < 1024);
+    closed_rx.await.expect("stream was dropped before terminal");
+    assert!(drain_for(&mut out_rx, Duration::from_millis(30))
+        .await
+        .iter()
+        .all(|b| b.get("event") != Some(&Value::String("completed".into()))));
+    submit_direct_completion(&in_tx, "reuse").await;
+    let result =
+        wait_for_completion_event(&mut out_rx, "reuse", "completed", Duration::from_secs(5))
+            .await
+            .expect("released request id");
+    assert_eq!(result["text"], "later");
+    finish_harness(in_tx, handle).await;
+    server.await.expect("mock server");
+}
+
+#[tokio::test]
+async fn giant_final_tool_call_is_not_published_as_success() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let item = serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":{
+        "type":"function_call", "id":"item-1", "call_id":"call-1", "name":"read_file", "arguments":"x".repeat(16 * 1024 * 1024)
+    }});
+    let body = format!("data: {item}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r\"}}}}\n\n");
+    let server = tokio::spawn(serve_scripted_sse(
+        listener,
+        vec![ScriptedSseReply::complete(body)],
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let (in_tx, mut out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    in_tx.send(Ok(event_env("tool.register", &[("tools", serde_json::json!([{"name":"read_file", "description":"read", "input_schema":{"type":"object"}}]))]))).await.expect("advertise");
+    in_tx
+        .send(Ok(event_env(
+            &kind("completion.request"),
+            &[
+                ("request_id", Value::String("giant-call".into())),
+                ("model", Value::String("test-model".into())),
+                ("tools", serde_json::json!(["read_file"])),
+                (
+                    "messages",
+                    serde_json::json!([{"role":"user","content":"read"}]),
+                ),
+            ],
+        )))
+        .await
+        .expect("request");
+    let error =
+        wait_for_completion_event(&mut out_rx, "giant-call", "error", Duration::from_secs(90))
+            .await
+            .expect("terminal admission error");
+    assert_eq!(error["error_category"], "output_admission_failed");
+    assert!(drain_for(&mut out_rx, Duration::from_millis(30))
+        .await
+        .iter()
+        .all(|b| b.get("event") != Some(&Value::String("completed".into()))));
+    finish_harness(in_tx, handle).await;
+    server.await.expect("mock server");
+}
+
+#[tokio::test]
+async fn writer_loss_joins_active_http_task_without_input_traffic() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("request");
+        read_request_json(&mut stream).await;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\n\r\n").await.expect("headers");
+        started_tx.send(()).expect("started");
+        let mut byte = [0];
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte))
+            .await
+            .expect("cancelled read");
+        assert!(matches!(closed, Ok(0)) || closed.is_err());
+    });
+    let (in_tx, out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    submit_direct_completion(&in_tx, "writer-loss").await;
+    started_rx.await.expect("active HTTP");
+    drop(out_rx);
+    let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("supervisor exits")
+        .expect("joins");
+    assert!(matches!(
+        result,
+        Err(chatgpt_provider::error::ChatgptError::Transport(
+            TransportError::WriterClosed
+        ))
+    ));
+    drop(in_tx);
+    server.await.expect("reader cancelled and joined");
+}
+
+#[tokio::test]
+async fn giant_accumulated_chat_result_releases_same_chat_slot() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let delta =
+        serde_json::json!({"type":"response.output_text.delta", "delta":"x".repeat(1024 * 1024)});
+    let mut body = format!("data: {delta}\n\n").repeat(17);
+    body.push_str("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"first\"}}\n\n");
+    let server = tokio::spawn(serve_scripted_sse(listener, vec![
+        ScriptedSseReply::complete(body),
+        ScriptedSseReply::complete("data: {\"type\":\"response.output_text.delta\",\"delta\":\"healthy\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"second\"}}\n\n")
+    ], Arc::new(AtomicUsize::new(0))));
+    let (in_tx, mut out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    in_tx
+        .send(Ok(event_env(
+            &kind("chat.create"),
+            &[
+                ("chat_id", Value::String("same-chat".into())),
+                ("model", Value::String("test-model".into())),
+            ],
+        )))
+        .await
+        .expect("create");
+    wait_for_kind(&mut out_rx, &kind("chat.created"), Duration::from_secs(5))
+        .await
+        .expect("created");
+    in_tx
+        .send(Ok(event_env(
+            &kind("chat.append"),
+            &[
+                ("chat_id", Value::String("same-chat".into())),
+                (
+                    "message",
+                    serde_json::json!({"role":"user", "content":"hi"}),
+                ),
+            ],
+        )))
+        .await
+        .expect("append");
+    let complete = event_env(
+        &kind("chat.complete"),
+        &[("chat_id", Value::String("same-chat".into()))],
+    );
+    in_tx.send(Ok(complete.clone())).await.expect("first turn");
+    let error = wait_for_kind(&mut out_rx, &kind("chat.error"), Duration::from_secs(90))
+        .await
+        .expect("rejected aggregate terminal");
+    assert_eq!(error["chat_id"], "same-chat");
+    assert_eq!(error["effects"], "unknown");
+    assert_eq!(error["error_category"], "output_admission_failed");
+    in_tx.send(Ok(complete)).await.expect("subsequent turn");
+    let result = wait_for_kind(
+        &mut out_rx,
+        &kind("chat.complete.result"),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("slot released");
+    assert_eq!(result["output"]["text"], "healthy");
+    finish_harness(in_tx, handle).await;
+    server.await.expect("mock server");
+}
+
+#[tokio::test]
+async fn oversized_identity_does_not_recursively_fallback_or_stay_alive() {
+    let base = "http://127.0.0.1:1".to_owned();
+    let (in_tx, _out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    submit_direct_completion(&in_tx, &"i".repeat(16 * 1024 * 1024)).await;
+    let result = tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("fallback rejection exits")
+        .expect("joined");
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn terminal_stdin_fault_joins_active_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("request");
+        read_request_json(&mut stream).await;
+        started_tx.send(()).expect("started");
+        let mut byte = [0];
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte))
+            .await
+            .expect("cancelled read");
+        assert!(matches!(closed, Ok(0)) || closed.is_err());
+    });
+    let (in_tx, _out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    submit_direct_completion(&in_tx, "stdin-fault").await;
+    started_rx.await.expect("active request");
+    in_tx
+        .send(Err(TransportError::InvalidUtf8))
+        .await
+        .expect("stdin fault");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("teardown")
+            .expect("join"),
+        Err(chatgpt_provider::error::ChatgptError::Transport(
+            TransportError::InvalidUtf8
+        ))
+    ));
+    server.await.expect("HTTP dropped");
+}
+
+#[tokio::test]
+async fn full_publisher_queue_backpressures_without_losing_required_deltas() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let mut body =
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n".repeat(400);
+    body.push_str(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"backpressure\"}}\n\n",
+    );
+    let server = tokio::spawn(serve_scripted_sse(
+        listener,
+        vec![ScriptedSseReply::complete(body)],
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let (in_tx, mut out_rx, handle) =
+        start_direct_harness(base.clone(), test_responses_client(base)).await;
+    submit_direct_completion(&in_tx, "backpressure").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while out_rx.len() < 256 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("wire queue saturated");
+    let mut deltas = 0;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("output")
+            .expect("writer");
+        let Some(body) = event_body(&message) else {
+            continue;
+        };
+        match body.get("event").and_then(Value::as_str) {
+            Some("text_delta") => deltas += 1,
+            Some("completed") => {
+                assert_eq!(body["text"], "x".repeat(400));
+                break;
+            }
+            Some("error" | "failed") => panic!("unexpected terminal failure: {body:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        deltas, 400,
+        "required deltas are not silently dropped by try_send"
+    );
+    finish_harness(in_tx, handle).await;
+    server.await.expect("mock server");
 }

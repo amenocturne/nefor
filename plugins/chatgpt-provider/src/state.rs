@@ -239,6 +239,7 @@ pub struct ChatStats {
 pub struct TurnToken {
     cancel: CancellationToken,
     suppress: Arc<AtomicBool>,
+    hard_cancel: CancellationToken,
 }
 
 impl TurnToken {
@@ -246,6 +247,7 @@ impl TurnToken {
         Self {
             cancel: CancellationToken::new(),
             suppress: Arc::new(AtomicBool::new(false)),
+            hard_cancel: CancellationToken::new(),
         }
     }
 
@@ -263,6 +265,10 @@ impl TurnToken {
     /// True when this turn was hard-cancelled: the streaming task must
     /// suppress every terminal emission (no `chat.complete.result`, no
     /// `stream.end`, no `turn.error`).
+    pub fn hard_cancelled(&self) -> tokio_util::sync::WaitForCancellationFuture<'_> {
+        self.hard_cancel.cancelled()
+    }
+
     pub fn is_suppressed(&self) -> bool {
         self.suppress.load(Ordering::SeqCst)
     }
@@ -845,6 +851,26 @@ impl Chats {
         Ok(token)
     }
 
+    pub async fn release_all_turns(&self) {
+        let mut g = self.inner.lock().await;
+        for chat in g.values_mut() {
+            if let TurnState::InFlight(token) = &chat.turn {
+                token.cancel.cancel();
+            }
+            chat.turn = TurnState::Idle;
+        }
+    }
+
+    pub async fn end_turn_if_current(&self, id: &ChatId, owner: &TurnToken) {
+        let mut g = self.inner.lock().await;
+        if let Some(chat) = g.get_mut(id) {
+            if matches!(&chat.turn, TurnState::InFlight(token) if Arc::ptr_eq(&token.suppress, &owner.suppress))
+            {
+                chat.turn = TurnState::Idle;
+            }
+        }
+    }
+
     pub async fn end_turn(&self, id: &ChatId) {
         let mut g = self.inner.lock().await;
         if let Some(chat) = g.get_mut(id) {
@@ -897,6 +923,7 @@ impl Chats {
                 // cancelling so the streaming task reliably observes it
                 // when the select's `cancelled()` branch wakes.
                 token.suppress.store(true, Ordering::SeqCst);
+                token.hard_cancel.cancel();
                 token.cancel.cancel();
                 true
             }

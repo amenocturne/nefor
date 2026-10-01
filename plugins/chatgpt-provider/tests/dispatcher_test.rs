@@ -298,3 +298,27 @@ fn message_round_trips_through_json_appended_shape() {
         _ => panic!("expected Tool variant"),
     }
 }
+
+#[tokio::test]
+async fn stale_turn_cleanup_cannot_release_recreated_chat_generation() {
+    let chats = Chats::with_default_model(Some("test-model".into()));
+    let id = ChatId::new("recreated");
+    chats
+        .create(id.clone(), None, None, None, None, None)
+        .await
+        .expect("create");
+    let old = chats.begin_turn(&id).await.expect("old turn");
+    chats.delete(&id).await.expect("delete");
+    chats
+        .create(id.clone(), None, None, None, None, None)
+        .await
+        .expect("recreate");
+    let current = chats.begin_turn(&id).await.expect("current turn");
+    chats.end_turn_if_current(&id, &old).await;
+    assert!(
+        chats.begin_turn(&id).await.is_err(),
+        "old task must not release new owner"
+    );
+    chats.end_turn_if_current(&id, &current).await;
+    assert!(chats.begin_turn(&id).await.is_ok());
+}

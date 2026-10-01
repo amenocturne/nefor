@@ -70,9 +70,9 @@ async fn main() -> anyhow::Result<()> {
 async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
     let args = Arc::new(args);
 
-    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (out_tx, writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
-    let _reader_handle = spawn_stdin_reader(in_tx);
+    let reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
     let engine_version = await_ready_ok(&mut in_rx).await?;
@@ -104,8 +104,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
         DEFAULT_ORIGINATOR.to_string(),
     )?);
 
-    emit_startup_events(&args, &auth, &chats, &responses_client, &out_tx).await?;
-
     let ctx = DispatcherContext::new(
         args.clone(),
         chats,
@@ -115,8 +113,16 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
         responses_client,
         out_tx.clone(),
     );
-    run_dispatch_loop(ctx, in_rx).await?;
-
-    emit_goodbye(&args, &out_tx, "stream closed").await;
-    Ok(())
+    emit_startup_events(&ctx).await?;
+    let result = run_dispatch_loop(ctx, in_rx).await;
+    if result.is_ok() {
+        emit_goodbye(&args, &out_tx, "stream closed").await;
+    }
+    reader_handle.abort();
+    let _ = reader_handle.await;
+    drop(out_tx);
+    if let Err(error) = writer_handle.await {
+        panic!("stdout writer failed: {error}");
+    }
+    result
 }

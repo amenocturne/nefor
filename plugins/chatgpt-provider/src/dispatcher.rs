@@ -48,7 +48,7 @@ use crate::state::{
 };
 use crate::translator;
 use crate::web::{SearchRequest, WebClient, WebCommand};
-use nefor_plugin_sdk::TransportError;
+use nefor_plugin_sdk::{checked_send, TransportError};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -68,6 +68,9 @@ const LOGOUT_REFUSED_ENV_MESSAGE: &str =
     "no login to revoke — credentials come from the environment; restart the plugin without it";
 
 const HTTP_401_MESSAGE: &str = "auth failed (HTTP 401) — re-login via chatgpt-provider login";
+
+const DELIVERY_FAILURE: &str =
+    "provider output admission failed; earlier or external effects may have occurred";
 
 const USAGE_POLL_INTERVAL_SECS: u64 = 5 * 60;
 
@@ -735,51 +738,34 @@ pub async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
 ) -> Result<(), ChatgptError> {
-    out_tx
-        .send(PluginOutgoing::event(body))
+    checked_send(out_tx, PluginOutgoing::event(body))
         .await
-        .map_err(|_| ChatgptError::Transport(TransportError::WriterClosed))
+        .map_err(ChatgptError::Transport)
 }
 
 pub async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), ChatgptError> {
-    out_tx
-        .send(PluginOutgoing::system(SystemBody::Ready {
+    checked_send(
+        out_tx,
+        PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
-        }))
-        .await
-        .map_err(|_| ChatgptError::Transport(TransportError::WriterClosed))
+        }),
+    )
+    .await
+    .map_err(ChatgptError::Transport)
 }
 
 /// Convenience used at startup to emit hello/ready/auth.status in order.
 /// If auth is already Connected (tokens on disk), also kicks off a
 /// background fetch of `/models` so the chat surface's `/model` picker
 /// has entries the first time the user opens it.
-pub async fn emit_startup_events(
-    args: &Arc<ServeArgs>,
-    auth: &Arc<AuthStore>,
-    chats: &Arc<Chats>,
-    responses_client: &Arc<ResponsesClient>,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
-) -> Result<(), ChatgptError> {
-    send_event(out_tx, hello_body(args)).await?;
-    send_event(out_tx, ready_body(args)).await?;
-    let snap = auth.snapshot().await;
-    send_event(out_tx, auth_status_body(args, &snap)).await?;
+pub async fn emit_startup_events(ctx: &DispatcherContext) -> Result<(), ChatgptError> {
+    send_event(&ctx.out_tx, hello_body(&ctx.args)).await?;
+    send_event(&ctx.out_tx, ready_body(&ctx.args)).await?;
+    let snap = ctx.auth.snapshot().await;
+    send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
     if matches!(snap.state, AuthState::Connected) {
-        spawn_models_fetch(
-            args.clone(),
-            auth.clone(),
-            chats.clone(),
-            responses_client.clone(),
-            out_tx.clone(),
-        );
-        spawn_usage_fetch(
-            args.clone(),
-            auth.clone(),
-            responses_client.clone(),
-            out_tx.clone(),
-            false,
-        );
+        spawn_models_fetch(ctx.clone());
+        spawn_usage_fetch(ctx.clone(), false);
     }
     Ok(())
 }
@@ -789,71 +775,54 @@ pub async fn emit_startup_events(
 /// (on success) kicks off a `/models` fetch. Used by both
 /// `<prefix>.login_requested` and `<prefix>.model.set` (when not yet
 /// Connected — picking a model auto-logs in).
-fn spawn_login_flow(
-    args: Arc<ServeArgs>,
-    auth: Arc<AuthStore>,
-    chats: Arc<Chats>,
-    responses_client: Arc<ResponsesClient>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
-    lease: LoginLease,
-) {
-    tokio::spawn(async move {
+fn spawn_login_flow(ctx: DispatcherContext, lease: LoginLease) {
+    let args = ctx.args.clone();
+    let auth = ctx.auth.clone();
+    let out_tx = ctx.out_tx.clone();
+    let owner = ctx.clone();
+    owner.spawn_background(async move {
         let result = crate::auth::oauth::run_login_without_persisting(true).await;
         match result {
             Ok(td) => {
                 match auth.apply_login_result(lease, td).await {
                     Ok(true) => {}
-                    Ok(false) => return,
+                    Ok(false) => return Ok(()),
                     Err(e) => {
                         if let Some(snap) = auth
                             .apply_login_error(lease, format!("apply login: {e}"))
                             .await
                         {
-                            let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
+                            send_event(&out_tx, auth_status_body(&args, &snap)).await?;
                         }
-                        return;
+                        return Ok(());
                     }
                 }
                 let snap = auth.snapshot().await;
-                let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
+                send_event(&out_tx, auth_status_body(&args, &snap)).await?;
                 if matches!(snap.state, AuthState::Connected) {
-                    spawn_models_fetch(
-                        args.clone(),
-                        auth.clone(),
-                        chats.clone(),
-                        responses_client.clone(),
-                        out_tx.clone(),
-                    );
-                    spawn_usage_fetch(
-                        args.clone(),
-                        auth.clone(),
-                        responses_client.clone(),
-                        out_tx.clone(),
-                        false,
-                    );
+                    spawn_models_fetch(ctx.clone());
+                    spawn_usage_fetch(ctx.clone(), false);
                 }
             }
             Err(e) => {
                 if let Some(snap) = auth.apply_login_error(lease, format!("login: {e}")).await {
-                    let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
+                    send_event(&out_tx, auth_status_body(&args, &snap)).await?;
                 }
             }
         }
+        Ok(())
     });
 }
 
-async fn start_login_flow(
-    args: Arc<ServeArgs>,
-    auth: Arc<AuthStore>,
-    chats: Arc<Chats>,
-    responses_client: Arc<ResponsesClient>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
-) -> Result<(), ChatgptError> {
+async fn start_login_flow(ctx: DispatcherContext) -> Result<(), ChatgptError> {
+    let args = ctx.args.clone();
+    let auth = ctx.auth.clone();
+    let out_tx = ctx.out_tx.clone();
     let outcome = auth.begin_login().await;
     let snap = auth.snapshot().await;
     send_event(&out_tx, auth_status_body(&args, &snap)).await?;
     if let LoginStartOutcome::Started(lease) = outcome {
-        spawn_login_flow(args, auth, chats, responses_client, out_tx, lease);
+        spawn_login_flow(ctx.clone(), lease);
     }
     Ok(())
 }
@@ -863,18 +832,18 @@ async fn start_login_flow(
 /// `chat.models.listed`); on error logs and drops. Called whenever
 /// auth transitions to Connected — at startup if tokens are on disk,
 /// or after `auth.set`/`login_requested` completes.
-fn spawn_models_fetch(
-    args: Arc<ServeArgs>,
-    auth: Arc<AuthStore>,
-    chats: Arc<Chats>,
-    responses_client: Arc<ResponsesClient>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
-) {
-    tokio::spawn(async move {
+fn spawn_models_fetch(ctx: DispatcherContext) {
+    let args = ctx.args.clone();
+    let auth = ctx.auth.clone();
+    let chats = ctx.chats.clone();
+    let responses_client = ctx.responses_client.clone();
+    let out_tx = ctx.out_tx.clone();
+    let owner = ctx.clone();
+    owner.spawn_background(async move {
         let snap = auth.snapshot().await;
         if !matches!(snap.state, AuthState::Connected) {
             tracing::debug!("spawn_models_fetch: not connected, skipping");
-            return;
+            return Ok(());
         }
         match responses_client.list_models(&snap).await {
             Ok(models) => {
@@ -905,54 +874,52 @@ fn spawn_models_fetch(
                     }))
                     .await;
                 let body = models_listed_body(&args, &models);
-                if let Err(e) = send_event(&out_tx, body).await {
-                    tracing::warn!(error = %e, "spawn_models_fetch: send_event failed");
-                }
+                send_event(&out_tx, body).await?;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "spawn_models_fetch: list_models failed");
             }
         }
+        Ok(())
     });
 }
 
-fn spawn_usage_fetch(
-    args: Arc<ServeArgs>,
-    auth: Arc<AuthStore>,
-    responses_client: Arc<ResponsesClient>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
-    report_errors: bool,
-) {
-    tokio::spawn(async move {
+fn spawn_usage_fetch(ctx: DispatcherContext, report_errors: bool) {
+    let args = ctx.args.clone();
+    let auth = ctx.auth.clone();
+    let responses_client = ctx.responses_client.clone();
+    let out_tx = ctx.out_tx.clone();
+    let owner = ctx.clone();
+    owner.spawn_background(async move {
         let snap = auth.snapshot().await;
         if !matches!(snap.state, AuthState::Connected) {
             if report_errors {
-                let _ =
-                    send_event(&out_tx, usage_error_body(&args, "ChatGPT login required")).await;
+                send_event(&out_tx, usage_error_body(&args, "ChatGPT login required")).await?;
             }
-            return;
+            return Ok(());
         }
         if let Err(error) = auth.current_access_token().await {
             if report_errors {
-                let _ = send_event(&out_tx, usage_error_body(&args, &error.to_string())).await;
+                send_event(&out_tx, usage_error_body(&args, &error.to_string())).await?;
             }
-            return;
+            return Ok(());
         }
         let snap = auth.snapshot().await;
         match responses_client.usage(&snap).await {
             Ok(usage) => match usage_updated_body(&args, &usage) {
                 Ok(body) => {
-                    let _ = send_event(&out_tx, body).await;
+                    send_event(&out_tx, body).await?;
                 }
                 Err(error) => tracing::warn!(%error, "could not encode usage snapshot"),
             },
             Err(error) => {
                 tracing::warn!(%error, "usage fetch failed");
                 if report_errors {
-                    let _ = send_event(&out_tx, usage_error_body(&args, &error.to_string())).await;
+                    send_event(&out_tx, usage_error_body(&args, &error.to_string())).await?;
                 }
             }
         }
+        Ok(())
     });
 }
 
@@ -970,6 +937,13 @@ struct DirectCompletions {
 }
 
 impl DirectCompletions {
+    async fn is_current(&self, id: &str, owner: u64) -> bool {
+        self.runs
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|run| run.owner == owner)
+    }
     async fn begin(
         &self,
         request_id: String,
@@ -1034,6 +1008,13 @@ struct WebExecutions {
 }
 
 impl WebExecutions {
+    async fn is_current(&self, id: &str, owner: u64) -> bool {
+        self.runs
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|run| run.owner == owner)
+    }
     async fn begin(
         &self,
         id: String,
@@ -1088,6 +1069,13 @@ impl WebExecutions {
     }
 }
 
+struct TaskDone(Arc<Notify>);
+impl Drop for TaskDone {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 /// Shared state threaded through every dispatch handler. Bundles the
 /// shared dependencies that every event path needs so function signatures
 /// stay short.
@@ -1105,9 +1093,50 @@ pub struct DispatcherContext {
     recovery_gate: Arc<ProviderRecoveryGate>,
     direct_completions: Arc<DirectCompletions>,
     web_executions: Arc<WebExecutions>,
+    shutdown: CancellationToken,
+    tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    task_done: Arc<Notify>,
 }
 
 impl DispatcherContext {
+    fn spawn_background(
+        &self,
+        operation: impl std::future::Future<Output = Result<(), ChatgptError>> + Send + 'static,
+    ) {
+        let ctx = self.clone();
+        self.spawn_owned(async move {
+            tokio::select! {
+                biased;
+                _ = ctx.shutdown.cancelled() => {},
+                _ = ctx.out_tx.closed() => { ctx.shutdown.cancel(); },
+                result = operation => if let Err(error) = result {
+                    tracing::error!(%error, "required background output failed");
+                    ctx.shutdown.cancel();
+                },
+            }
+        });
+    }
+
+    fn spawn_owned(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| panic!("task registry poisoned: {e}"));
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result {
+                panic!("provider task failed: {error}");
+            }
+        }
+        let done = self.task_done.clone();
+        tasks.spawn(async move {
+            let _done = TaskDone(done);
+            task.await;
+        });
+    }
+
     pub fn new(
         args: Arc<ServeArgs>,
         chats: Arc<Chats>,
@@ -1140,6 +1169,9 @@ impl DispatcherContext {
             recovery_gate: Arc::new(ProviderRecoveryGate::default()),
             direct_completions: Arc::new(DirectCompletions::default()),
             web_executions: Arc::new(WebExecutions::default()),
+            shutdown: CancellationToken::new(),
+            tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            task_done: Arc::new(Notify::new()),
         }
     }
 
@@ -1169,8 +1201,17 @@ pub async fn run_dispatch_loop(
         std::time::Duration::from_secs(USAGE_POLL_INTERVAL_SECS),
     );
     usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = async {
     loop {
         tokio::select! {
+            _ = ctx.out_tx.closed() => return Err(ChatgptError::Transport(TransportError::WriterClosed)),
+            _ = ctx.shutdown.cancelled() => return Err(ChatgptError::Transport(TransportError::WriterClosed)),
+            _ = ctx.task_done.notified() => {
+                let mut tasks = ctx.tasks.lock().unwrap_or_else(|e| panic!("task registry poisoned: {e}"));
+                while let Some(result) = tasks.try_join_next() {
+                    if let Err(error) = result { panic!("provider task failed: {error}"); }
+                }
+            }
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(Ok(env)) => match &env.body {
@@ -1184,12 +1225,23 @@ pub async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            if let Err(e) = dispatch_event(&ctx, &env.from, map).await {
+                            let result = tokio::select! {
+                                biased;
+                                _ = ctx.out_tx.closed() => Err(ChatgptError::Transport(TransportError::WriterClosed)),
+                                _ = ctx.shutdown.cancelled() => Err(ChatgptError::Transport(TransportError::WriterClosed)),
+                                result = dispatch_event(&ctx, &env.from, map) => result,
+                            };
+                            if let Err(e) = result {
+                                if matches!(e, ChatgptError::Transport(TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming)) {
+                                    if publish_dispatch_failure(&ctx, map).await? { continue; }
+                                }
+                                if matches!(e, ChatgptError::Transport(_)) { return Err(e); }
                                 tracing::error!(error = %e, "dispatch_event errored; continuing");
                             }
                         }
                     },
                     Some(Err(e)) => {
+                        if !matches!(e, TransportError::Parse(_)) { return Err(ChatgptError::Transport(e)); }
                         tracing::error!(error = %e, "stdin parse error; dropping line");
                     }
                     None => {
@@ -1206,23 +1258,84 @@ pub async fn run_dispatch_loop(
                 return Ok(());
             }
             _ = usage_interval.tick() => {
-                spawn_usage_fetch(
-                    ctx.args.clone(),
-                    ctx.auth.clone(),
-                    ctx.responses_client.clone(),
-                    ctx.out_tx.clone(),
-                    false,
-                );
+                spawn_usage_fetch(ctx.clone(), false);
             }
         }
     }
+    }.await;
+    ctx.shutdown.cancel();
+    ctx.chats.release_all_turns().await;
+    ctx.direct_completions.runs.lock().await.clear();
+    ctx.web_executions.cancel_all().await;
+    let mut tasks = {
+        let mut guard = ctx
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| panic!("task registry poisoned: {e}"));
+        std::mem::replace(&mut *guard, tokio::task::JoinSet::new())
+    };
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            panic!("provider task failed: {error}");
+        }
+    }
+    result
 }
 
 /// Emit goodbye after the loop returns.
 pub async fn emit_goodbye(args: &ServeArgs, out_tx: &mpsc::Sender<PluginOutgoing>, reason: &str) {
-    let _ = out_tx
-        .send(PluginOutgoing::event(goodbye_body(args, reason)))
-        .await;
+    if let Err(error) =
+        checked_send(out_tx, PluginOutgoing::event(goodbye_body(args, reason))).await
+    {
+        tracing::warn!(%error, "goodbye delivery failed");
+    }
+}
+
+async fn publish_dispatch_failure(
+    ctx: &DispatcherContext,
+    request: &Map<String, Value>,
+) -> Result<bool, ChatgptError> {
+    let prefix = ctx.args.event_prefix();
+    let suffix = request
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(|kind| kind.strip_prefix(&prefix));
+    let body = match suffix {
+        Some("completion.request") => read_request_id(request).map(|id| {
+            completion_event_body(
+                &ctx.args,
+                &id,
+                "error",
+                [("message", Value::String(DELIVERY_FAILURE.into()))],
+            )
+        }),
+        Some("web.request") => request
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| web_result_body(&ctx.args, id.trim(), Err(DELIVERY_FAILURE.into()))),
+        Some(
+            "chat.create"
+            | "chat.restore"
+            | "chat.append"
+            | "chat.complete"
+            | "chat.compact"
+            | "chat.compaction.restore"
+            | "chat.delete",
+        ) => {
+            read_chat_id(request).map(|id| chat_error_body(&ctx.args, &id, DELIVERY_FAILURE.into()))
+        }
+        _ => None,
+    };
+    let Some(mut body) = body else {
+        return Ok(false);
+    };
+    body.insert(
+        "error_category".into(),
+        Value::String("output_admission_failed".into()),
+    );
+    body.insert("effects".into(), Value::String("unknown".into()));
+    send_event(&ctx.out_tx, body).await?;
+    Ok(true)
 }
 
 async fn dispatch_event(
@@ -1352,33 +1465,12 @@ async fn dispatch_event(
             let snap = ctx.auth.apply_auth_set(token).await;
             send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
             if matches!(snap.state, AuthState::Connected) {
-                spawn_models_fetch(
-                    ctx.args.clone(),
-                    ctx.auth.clone(),
-                    ctx.chats.clone(),
-                    ctx.responses_client.clone(),
-                    ctx.out_tx.clone(),
-                );
-                spawn_usage_fetch(
-                    ctx.args.clone(),
-                    ctx.auth.clone(),
-                    ctx.responses_client.clone(),
-                    ctx.out_tx.clone(),
-                    false,
-                );
+                spawn_models_fetch(ctx.clone());
+                spawn_usage_fetch(ctx.clone(), false);
             }
             Ok(())
         }
-        "login_requested" => {
-            start_login_flow(
-                ctx.args.clone(),
-                ctx.auth.clone(),
-                ctx.chats.clone(),
-                ctx.responses_client.clone(),
-                ctx.out_tx.clone(),
-            )
-            .await
-        }
+        "login_requested" => start_login_flow(ctx.clone()).await,
         "logout_requested" => {
             // Cancel any in-flight turns before tearing down auth — a
             // turn mid-stream would otherwise emit a confusing 401 turn
@@ -1393,12 +1485,13 @@ async fn dispatch_event(
             match ctx.auth.apply_logout().await {
                 LogoutOutcome::Cleared => {
                     if let Some(rt) = refresh_token {
-                        tokio::spawn(async move {
+                        ctx.spawn_background(async move {
                             if let Err(e) = crate::auth::refresh::revoke_tokens(&rt).await {
                                 tracing::warn!(error = %e, "logout: revoke call failed");
                             } else {
                                 tracing::info!("logout: refresh token revoked server-side");
                             }
+                            Ok(())
                         });
                     }
                     let snap = ctx.auth.snapshot().await;
@@ -1431,13 +1524,7 @@ async fn dispatch_event(
             }
         }
         "usage.requested" => {
-            spawn_usage_fetch(
-                ctx.args.clone(),
-                ctx.auth.clone(),
-                ctx.responses_client.clone(),
-                ctx.out_tx.clone(),
-                true,
-            );
+            spawn_usage_fetch(ctx.clone(), true);
             Ok(())
         }
         "model.set" => {
@@ -1485,14 +1572,7 @@ async fn dispatch_event(
             // surface in sync as the flow progresses.
             let snap = ctx.auth.snapshot().await;
             if matches!(snap.state, AuthState::LoginRequired | AuthState::Error(_)) {
-                start_login_flow(
-                    ctx.args.clone(),
-                    ctx.auth.clone(),
-                    ctx.chats.clone(),
-                    ctx.responses_client.clone(),
-                    ctx.out_tx.clone(),
-                )
-                .await?;
+                start_login_flow(ctx.clone()).await?;
             }
             Ok(())
         }
@@ -2077,8 +2157,8 @@ async fn handle_web_request(
     };
     let request = SearchRequest::new(session_id, model, command);
     let owned = ctx.clone();
-    tokio::spawn(async move {
-        let result = async {
+    ctx.spawn_owned(async move {
+        let operation = async {
             let auth = owned.auth.snapshot().await;
             if !matches!(auth.state, AuthState::Connected) {
                 return Err("auth not connected; cannot execute web request".to_owned());
@@ -2102,10 +2182,35 @@ async fn handle_web_request(
                 semantic_error,
             })
         }
-        .await;
-        if owned.web_executions.finish(&id, execution.owner).await {
-            let _ = send_event(&owned.out_tx, web_result_body(&owned.args, &id, result)).await;
+        ;
+        let result = tokio::select! {
+            biased;
+            _ = owned.shutdown.cancelled() => { execution.cancellation.cancel(); None },
+            _ = owned.out_tx.closed() => { execution.cancellation.cancel(); owned.shutdown.cancel(); None },
+            result = operation => Some(result),
+        };
+        if let Some(result) = result {
+            let publication = async {
+                if owned.web_executions.is_current(&id, execution.owner).await {
+                    if let Err(error) = send_event(&owned.out_tx, web_result_body(&owned.args, &id, result)).await {
+                        let mut fallback = web_result_body(&owned.args, &id, Err(DELIVERY_FAILURE.into()));
+                        fallback.insert("error_category".into(), Value::String("output_admission_failed".into()));
+                        fallback.insert("effects".into(), Value::String("unknown".into()));
+                        if matches!(error, ChatgptError::Transport(TransportError::WriterClosed)) || send_event(&owned.out_tx, fallback).await.is_err() {
+                            owned.shutdown.cancel();
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = owned.shutdown.cancelled() => {},
+                _ = execution.cancellation.cancelled() => {},
+                _ = owned.out_tx.closed() => { owned.shutdown.cancel(); },
+                _ = publication => {},
+            }
         }
+        owned.web_executions.finish(&id, execution.owner).await;
     });
     Ok(())
 }
@@ -2825,7 +2930,7 @@ async fn handle_chat_compact(
     };
 
     let result = compact_chat(ctx, &chat_id, &trigger, &cancel).await;
-    ctx.chats.end_turn(&chat_id).await;
+    ctx.chats.end_turn_if_current(&chat_id, &cancel).await;
     result
 }
 
@@ -3834,7 +3939,67 @@ fn spawn_turn(
     output_schema: Option<Value>,
     direct_request: Option<(String, DirectCompletion)>,
 ) {
-    tokio::spawn(async move {
+    let supervisor = ctx.clone();
+    let task_ctx = ctx.clone();
+    ctx.spawn_owned(async move {
+        let operation = run_turn(&task_ctx, &chat_id, &cancel, output_schema, &direct_request);
+        let result = tokio::select! {
+            biased;
+            _ = supervisor.shutdown.cancelled() => Err(TransportError::WriterClosed),
+            _ = supervisor.out_tx.closed() => Err(TransportError::WriterClosed),
+            _ = cancel.hard_cancelled() => Ok(()),
+            result = operation => result,
+        };
+        supervisor
+            .chats
+            .end_turn_if_current(&chat_id, &cancel)
+            .await;
+        if let Some((id, owner)) = &direct_request {
+            supervisor.direct_completions.finish(id, owner.owner).await;
+        }
+        if let Err(error) = result {
+            if !cancel.is_suppressed() && !matches!(error, TransportError::WriterClosed) {
+                let mut body = if let Some((id, _)) = &direct_request {
+                    completion_event_body(
+                        &supervisor.args,
+                        id,
+                        "error",
+                        [("message", Value::String(DELIVERY_FAILURE.into()))],
+                    )
+                } else {
+                    chat_error_body(&supervisor.args, &chat_id, DELIVERY_FAILURE.into())
+                };
+                body.insert(
+                    "error_category".into(),
+                    Value::String("output_admission_failed".into()),
+                );
+                body.insert("effects".into(), Value::String("unknown".into()));
+                tokio::select! {
+                    biased;
+                    _ = supervisor.shutdown.cancelled() => {},
+                    _ = cancel.hard_cancelled() => {},
+                    result = checked_send(&supervisor.out_tx, PluginOutgoing::event(body)) => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "turn delivery fallback failed");
+                            supervisor.shutdown.cancel();
+                        }
+                    },
+                }
+            } else if matches!(error, TransportError::WriterClosed) {
+                supervisor.shutdown.cancel();
+            }
+        }
+    });
+}
+
+async fn run_turn(
+    ctx: &DispatcherContext,
+    chat_id: &ChatId,
+    cancel: &TurnToken,
+    output_schema: Option<Value>,
+    direct_request: &Option<(String, DirectCompletion)>,
+) -> Result<(), TransportError> {
+    async {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let started = Instant::now();
         let mut iterations: u32 = 0;
@@ -3885,14 +4050,11 @@ fn spawn_turn(
                     TOOL_LOOP_MAX_ITERATIONS
                 );
                 final_error = Some(msg.clone());
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(turn_error_body(
-                        &ctx.args,
-                        Some(&chat_id),
-                        &msg,
-                    )))
-                    .await;
+                checked_send(
+                    &ctx.out_tx,
+                    PluginOutgoing::event(turn_error_body(&ctx.args, Some(chat_id), &msg)),
+                )
+                .await?;
                 break;
             }
 
@@ -3903,14 +4065,11 @@ fn spawn_turn(
                     errored = true;
                     final_finish_reason = Some("error".into());
                     final_error = Some(e.to_string());
-                    let _ = ctx
-                        .out_tx
-                        .send(PluginOutgoing::event(chat_error_body(
-                            &ctx.args,
-                            &chat_id,
-                            e.to_string(),
-                        )))
-                        .await;
+                    checked_send(
+                        &ctx.out_tx,
+                        PluginOutgoing::event(chat_error_body(&ctx.args, &chat_id, e.to_string())),
+                    )
+                    .await?;
                     break;
                 }
             };
@@ -3929,26 +4088,25 @@ fn spawn_turn(
                     .collect(),
                 None => tools_specs,
             };
-            let (provider_tool_names, tools_json) = match translator::tools_to_responses_format(
-                &filtered_specs,
-                &ctx.args.provider_name,
-            ) {
-                Ok(mapped) => mapped,
-                Err(error) => {
-                    errored = true;
-                    final_finish_reason = Some("error".into());
-                    final_error = Some(error.to_string());
-                    let _ = ctx
-                        .out_tx
-                        .send(PluginOutgoing::event(turn_error_body(
-                            &ctx.args,
-                            Some(&chat_id),
-                            &error.to_string(),
-                        )))
-                        .await;
-                    break;
-                }
-            };
+            let (provider_tool_names, tools_json) =
+                match translator::tools_to_responses_format(&filtered_specs, &ctx.args.provider_name) {
+                    Ok(mapped) => mapped,
+                    Err(error) => {
+                        errored = true;
+                        final_finish_reason = Some("error".into());
+                        final_error = Some(error.to_string());
+                        checked_send(
+                            &ctx.out_tx,
+                            PluginOutgoing::event(turn_error_body(
+                                &ctx.args,
+                                Some(chat_id),
+                                &error.to_string(),
+                            )),
+                        )
+                        .await?;
+                        break;
+                    }
+                };
             tracing::info!(
                 count = filtered_specs.len(),
                 names = ?filtered_specs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
@@ -3962,14 +4120,15 @@ fn spawn_turn(
                 errored = true;
                 final_finish_reason = Some("error".into());
                 final_error = Some(error.to_string());
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(turn_error_body(
+                checked_send(
+                    &ctx.out_tx,
+                    PluginOutgoing::event(turn_error_body(
                         &ctx.args,
-                        Some(&chat_id),
+                        Some(chat_id),
                         &error.to_string(),
-                    )))
-                    .await;
+                    )),
+                )
+                .await?;
                 break;
             }
             tracing::info!(
@@ -3988,8 +4147,7 @@ fn spawn_turn(
             //    only used when /models hasn't been fetched yet for
             //    this model. The /models fetch fires on startup +
             //    auth.set, so this fallback is rare in practice.
-            let supports_reasoning = if ctx.chats.model_reasoning_unsupported(&snapshot.model).await
-            {
+            let supports_reasoning = if ctx.chats.model_reasoning_unsupported(&snapshot.model).await {
                 false
             } else if let Some(api) = ctx.chats.model_capability_reasoning(&snapshot.model).await {
                 api
@@ -4045,27 +4203,27 @@ fn spawn_turn(
                         ("context_input_accuracy", Value::String("estimated".into())),
                     ],
                 );
-                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
             }
 
             // Snapshot auth before sending so we can fail fast on
             // LoginRequired/Error without burning an HTTP round trip.
             let auth_snap = ctx.auth.snapshot().await;
             if !matches!(auth_snap.state, AuthState::Connected) {
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(auth_status_body(
-                        &ctx.args, &auth_snap,
-                    )))
-                    .await;
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(turn_error_body(
+                checked_send(
+                    &ctx.out_tx,
+                    PluginOutgoing::event(auth_status_body(&ctx.args, &auth_snap)),
+                )
+                .await?;
+                checked_send(
+                    &ctx.out_tx,
+                    PluginOutgoing::event(turn_error_body(
                         &ctx.args,
-                        Some(&chat_id),
+                        Some(chat_id),
                         "auth not connected; cannot complete turn",
-                    )))
-                    .await;
+                    )),
+                )
+                .await?;
                 errored = true;
                 final_finish_reason = Some("error".into());
                 final_error = Some("auth not connected; cannot complete turn".into());
@@ -4078,7 +4236,11 @@ fn spawn_turn(
             // tokens may have rotated.
             if let Err(e) = ctx.auth.current_access_token().await {
                 final_error = Some(format!("token refresh failed: {e}"));
-                let _ = handle_refresh_error(&ctx, Some(&chat_id), e).await;
+                if let Err(ChatgptError::Transport(error)) =
+                    handle_refresh_error(ctx, Some(chat_id), e).await
+                {
+                    return Err(error);
+                }
                 errored = true;
                 final_finish_reason = Some("error".into());
                 break;
@@ -4150,23 +4312,19 @@ fn spawn_turn(
                             match recovery_action {
                                 Auth401Action::RetryReloaded => {
                                     auth_401_recovery_stage = 1;
-                                    operation_usage = Some(OperationUsage::record_iteration(
-                                        operation_usage,
-                                        None,
-                                    ));
+                                    operation_usage =
+                                        Some(OperationUsage::record_iteration(operation_usage, None));
                                     iterations = iterations.saturating_sub(1);
                                     continue;
                                 }
                                 Auth401Action::ForceRefresh => {}
                                 Auth401Action::Fail => {
-                                    let snap =
-                                        ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
-                                    let _ = ctx
-                                        .out_tx
-                                        .send(PluginOutgoing::event(auth_status_body(
-                                            &ctx.args, &snap,
-                                        )))
-                                        .await;
+                                    let snap = ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
+                                    checked_send(
+                                        &ctx.out_tx,
+                                        PluginOutgoing::event(auth_status_body(&ctx.args, &snap)),
+                                    )
+                                    .await?;
                                 }
                             }
                             if recovery_action == Auth401Action::ForceRefresh {
@@ -4174,34 +4332,33 @@ fn spawn_turn(
                                     match ctx.auth.force_refresh_after(&failed_token).await {
                                         Ok(_) => {
                                             auth_401_recovery_stage = 2;
-                                            operation_usage =
-                                                Some(OperationUsage::record_iteration(
-                                                    operation_usage,
-                                                    None,
-                                                ));
+                                            operation_usage = Some(OperationUsage::record_iteration(
+                                                operation_usage,
+                                                None,
+                                            ));
                                             iterations = iterations.saturating_sub(1);
                                             continue;
                                         }
                                         Err(error) => {
                                             final_error =
                                                 Some(format!("token refresh failed: {error}"));
-                                            let _ =
-                                                handle_refresh_error(&ctx, Some(&chat_id), error)
-                                                    .await;
+                                            if let Err(ChatgptError::Transport(error)) =
+                                                handle_refresh_error(ctx, Some(chat_id), error).await
+                                            {
+                                                return Err(error);
+                                            }
                                             errored = true;
                                             final_finish_reason = Some("error".into());
                                             break;
                                         }
                                     }
                                 } else {
-                                    let snap =
-                                        ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
-                                    let _ = ctx
-                                        .out_tx
-                                        .send(PluginOutgoing::event(auth_status_body(
-                                            &ctx.args, &snap,
-                                        )))
-                                        .await;
+                                    let snap = ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
+                                    checked_send(
+                                        &ctx.out_tx,
+                                        PluginOutgoing::event(auth_status_body(&ctx.args, &snap)),
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -4232,14 +4389,11 @@ fn spawn_turn(
                         }
                         let msg = format!("HTTP {status}: {}", snippet(&body));
                         final_error = Some(msg.clone());
-                        let _ = ctx
-                            .out_tx
-                            .send(PluginOutgoing::event(turn_error_body(
-                                &ctx.args,
-                                Some(&chat_id),
-                                &msg,
-                            )))
-                            .await;
+                        checked_send(
+                            &ctx.out_tx,
+                            PluginOutgoing::event(turn_error_body(&ctx.args, Some(chat_id), &msg)),
+                        )
+                        .await?;
                         errored = true;
                         final_finish_reason = Some("error".into());
                         break;
@@ -4252,14 +4406,11 @@ fn spawn_turn(
                 Err(e) => {
                     let msg = format!("request failed: {e}");
                     final_error = Some(msg.clone());
-                    let _ = ctx
-                        .out_tx
-                        .send(PluginOutgoing::event(turn_error_body(
-                            &ctx.args,
-                            Some(&chat_id),
-                            &msg,
-                        )))
-                        .await;
+                    checked_send(
+                        &ctx.out_tx,
+                        PluginOutgoing::event(turn_error_body(&ctx.args, Some(chat_id), &msg)),
+                    )
+                    .await?;
                     errored = true;
                     final_finish_reason = Some("error".into());
                     break;
@@ -4268,7 +4419,7 @@ fn spawn_turn(
 
             if let Some(usage) = stream.usage() {
                 if let Ok(body) = usage_updated_body(&ctx.args, usage) {
-                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                    checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                 }
             }
 
@@ -4321,7 +4472,7 @@ fn spawn_turn(
                                                 &delta,
                                             )
                                         };
-                                        let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                     }
                                 }
                                 ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
@@ -4349,7 +4500,7 @@ fn spawn_turn(
                                                 &formatted,
                                             )
                                         };
-                                        let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                     }
                                 }
                                 ResponseEvent::ReasoningSummaryPartAdded { .. } => {
@@ -4383,7 +4534,7 @@ fn spawn_turn(
                                                 &formatted,
                                             )
                                         };
-                                        let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                     }
                                     reasoning_text.push_str(&delta);
                                     let body = if let Some((request_id, _)) = &direct_request {
@@ -4401,7 +4552,7 @@ fn spawn_turn(
                                             &delta,
                                         )
                                     };
-                                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                    checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                 }
                                 ResponseEvent::FunctionCallArgumentsDelta { delta, item_id } => {
                                     tool_state_observed = true;
@@ -4412,7 +4563,7 @@ fn spawn_turn(
                                         item_id.as_deref(),
                                         &delta,
                                     );
-                                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                    checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                 }
                                 ResponseEvent::FunctionCallArgumentsDone {
                                     arguments,
@@ -4586,12 +4737,12 @@ fn spawn_turn(
                     if decision.retry && state.has_provisional_state() {
                         let body =
                             attempt_discarded_body(&ctx.args, request_id, attempt, &failure, state);
-                        let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                     }
                     let body = retry_decision_body(
                         &ctx.args, request_id, attempt, delay, &failure, decision, state,
                     );
-                    let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                    checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                 }
                 if decision.retry {
                     pre_output_stream_retries += 1;
@@ -4602,7 +4753,7 @@ fn spawn_turn(
                     iterations = iterations.saturating_sub(1);
                     if direct_request.is_none() {
                         let body = stream_retry_body(&ctx.args, &chat_id, attempt, delay, &failure);
-                        let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                     }
                     continue;
                 }
@@ -4629,7 +4780,7 @@ fn spawn_turn(
                         &formatted,
                     )
                 };
-                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
             }
 
             // Emit per-turn reasoning_end if we accumulated any.
@@ -4657,7 +4808,7 @@ fn spawn_turn(
                         duration_ms,
                     )
                 };
-                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
             }
 
             operation_usage = Some(OperationUsage::record_iteration(
@@ -4666,30 +4817,23 @@ fn spawn_turn(
             ));
 
             if let Some(err_msg) = iter_errored {
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(turn_error_body(
-                        &ctx.args,
-                        Some(&chat_id),
-                        &err_msg,
-                    )))
-                    .await;
+                checked_send(
+                    &ctx.out_tx,
+                    PluginOutgoing::event(turn_error_body(&ctx.args, Some(chat_id), &err_msg)),
+                )
+                .await?;
                 errored = true;
                 final_finish_reason = Some("error".into());
                 final_error = Some(err_msg);
                 break;
             }
-            if let Err(error) = provider_tool_names.map_output_to_internal(&mut iter_native_output)
-            {
+            if let Err(error) = provider_tool_names.map_output_to_internal(&mut iter_native_output) {
                 let message = error.to_string();
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(turn_error_body(
-                        &ctx.args,
-                        Some(&chat_id),
-                        &message,
-                    )))
-                    .await;
+                checked_send(
+                    &ctx.out_tx,
+                    PluginOutgoing::event(turn_error_body(&ctx.args, Some(chat_id), &message)),
+                )
+                .await?;
                 errored = true;
                 final_finish_reason = Some("error".into());
                 final_error = Some(message);
@@ -4714,14 +4858,15 @@ fn spawn_turn(
                     errored = true;
                     final_finish_reason = Some("error".into());
                     final_error = Some(error.to_string());
-                    let _ = ctx
-                        .out_tx
-                        .send(PluginOutgoing::event(turn_error_body(
+                    checked_send(
+                        &ctx.out_tx,
+                        PluginOutgoing::event(turn_error_body(
                             &ctx.args,
-                            Some(&chat_id),
+                            Some(chat_id),
                             &error.to_string(),
-                        )))
-                        .await;
+                        )),
+                    )
+                    .await?;
                     break;
                 }
             };
@@ -4729,11 +4874,7 @@ fn spawn_turn(
                 if iter_native_output.is_empty() {
                     let _ = ctx
                         .chats
-                        .push_assistant_tool_calls(
-                            &chat_id,
-                            output_text.clone(),
-                            tool_calls.clone(),
-                        )
+                        .push_assistant_tool_calls(&chat_id, output_text.clone(), tool_calls.clone())
                         .await;
                 } else {
                     let _ = ctx
@@ -4775,17 +4916,16 @@ fn spawn_turn(
         // unavoidable (it was emitted live), but no terminal completion
         // lands.
         if cancel.is_suppressed() {
-            ctx.chats.end_turn(&chat_id).await;
-            if let Some((request_id, owner)) = &direct_request {
-                ctx.direct_completions.finish(request_id, owner.owner).await;
-            }
-            return;
+            return Ok::<(), TransportError>(());
         }
 
-        if let Some((request_id, owner)) = &direct_request {
-            if !ctx.direct_completions.finish(request_id, owner.owner).await {
-                ctx.chats.end_turn(&chat_id).await;
-                return;
+        if let Some((request_id, owner)) = direct_request {
+            if !ctx
+                .direct_completions
+                .is_current(request_id, owner.owner)
+                .await
+            {
+                return Ok::<(), TransportError>(());
             }
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -4796,7 +4936,7 @@ fn spawn_turn(
                     "usage",
                     usage.completion_fields(&ctx.args.provider_name, &active_model, elapsed_ms),
                 );
-                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
             }
             for call in &final_tool_calls {
                 let arguments = serde_json::from_str(&call.function.arguments)
@@ -4811,7 +4951,7 @@ fn spawn_turn(
                         ("arguments", arguments),
                     ],
                 );
-                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+                checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
             }
             let mut body = if errored {
                 completion_event_body(
@@ -4821,9 +4961,7 @@ fn spawn_turn(
                     [
                         (
                             "message",
-                            Value::String(
-                                final_error.unwrap_or_else(|| "completion failed".into()),
-                            ),
+                            Value::String(final_error.unwrap_or_else(|| "completion failed".into())),
                         ),
                         ("model", Value::String(active_model.clone())),
                         ("duration_ms", Value::Number(elapsed_ms.into())),
@@ -4874,9 +5012,8 @@ fn spawn_turn(
                     ),
                 );
             }
-            let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
-            ctx.chats.end_turn(&chat_id).await;
-            return;
+            checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
+            return Ok::<(), TransportError>(());
         }
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -4907,24 +5044,20 @@ fn spawn_turn(
             elapsed_ms,
             final_finish_reason.as_deref(),
         );
-        let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
         if let Ok(stats) = ctx.chats.stats_snapshot(&chat_id).await {
-            let _ = ctx
-                .out_tx
-                .send(PluginOutgoing::event(session_stats_body(
-                    &ctx.args, &chat_id, &stats,
-                )))
-                .await;
+            checked_send(
+                &ctx.out_tx,
+                PluginOutgoing::event(session_stats_body(&ctx.args, &chat_id, &stats)),
+            )
+            .await?;
         }
         if interrupted && !errored {
-            let _ = ctx
-                .out_tx
-                .send(PluginOutgoing::event(turn_error_body(
-                    &ctx.args,
-                    Some(&chat_id),
-                    "interrupted",
-                )))
-                .await;
+            checked_send(
+                &ctx.out_tx,
+                PluginOutgoing::event(turn_error_body(&ctx.args, Some(chat_id), "interrupted")),
+            )
+            .await?;
         }
 
         let body = chat_complete_result_body(
@@ -4935,13 +5068,9 @@ fn spawn_turn(
             final_finish_reason.as_deref(),
             final_error.as_deref(),
         );
-        let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
-
-        ctx.chats.end_turn(&chat_id).await;
-        if let Some((request_id, owner)) = &direct_request {
-            ctx.direct_completions.finish(request_id, owner.owner).await;
-        }
-    });
+        checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
+        Ok::<(), TransportError>(())
+    }.await
 }
 
 fn structured_text_controls(output_schema: Option<&Value>) -> Option<TextControls> {

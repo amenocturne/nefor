@@ -138,3 +138,30 @@ catalog models whose `minimal_client_version` gate is newer. Run
 
 Spawned by the engine over stdio. Use `chatgpt-provider login` first to
 bootstrap OAuth credentials, then spawn normally in `init.lua`.
+
+## Output admission and transport loss
+
+Every NCP output is admitted through the SDK's checked framing boundary. Its
+success means enqueue admission, not a successful stdout write or consumer
+acceptance. Stream deltas are awaited in the invocation itself; a full output
+queue applies backpressure instead of dropping progress or spawning relay tasks.
+
+A rejected turn output stops the turn and drops its active response reader. A
+direct completion emits one bounded `completion.event` with its actual
+`request_id`, `event="error"`, and `message`; it does **not** report pre-start
+`event="failed"` for accepted work. Chat turns instead emit `chat.error` with
+`chat_id` and `message`. Admission terminals carry
+`error_category="output_admission_failed"` and `effects="unknown"`. The diagnostic
+states that earlier or external effects may have occurred; no work is retried
+because its output was rejected. Routed web output uses the existing
+`web.result` error with the original invocation `id`. Identities are never
+truncated. Failed fallback publication ends the plugin rather than recursively
+attempting another error. Hard cancellation suppresses turn terminals.
+
+Turn and completion slots are released by their exact generation, including
+when a chat has been deleted and recreated. Required uncorrelated output
+failure, writer closure, and terminal stdin faults end the local transport;
+owned HTTP/background tasks are cancelled and joined before dispatcher exit.
+Completed tasks are reaped during operation. Bounded malformed JSON remains
+parse noise. Transport loss leaves accepted effects unknown; downstream request
+owners must reconcile capability loss without replaying accepted work.
