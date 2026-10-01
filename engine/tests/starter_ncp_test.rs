@@ -98,6 +98,10 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
     // against PluginName (the tests pass well-formed names).
     let nefor_tbl = lua.create_table()?;
     let engine_tbl = lua.create_table()?;
+    engine_tbl.set(
+        "error_kind",
+        lua.create_function(|_, _: Value| Ok(Value::Nil))?,
+    )?;
 
     let s1 = std::sync::Arc::clone(&shared);
     let send_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {

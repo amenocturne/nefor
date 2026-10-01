@@ -1182,7 +1182,34 @@ local function test_delivery_failures_are_bounded_local_and_not_replayed()
   assert_true(found, "ordinary enqueue rejection is observed")
 end
 
+local function test_typed_admission_failures_are_not_enqueue_failures()
+  local deliver, classify = nefor.engine.deliver, nefor.engine.error_kind
+  for _, kind in ipairs({ "frame_too_large", "invalid_framing", "writer_closed", "unavailable" }) do
+    reset()
+    _test.set_plugins({ "src", "peer" })
+    ready_each({ "src", "peer" })
+    nefor.engine.deliver = function() error("opaque typed rejection") end
+    nefor.engine.error_kind = function() return kind end
+    _test.calls_clear()
+    drive_inbound("src", make_event({ kind = "tool.invoke", id = "rejected" }))
+    local found = false
+    for _, call in ipairs(_test.calls()) do
+      local body = json.decode(call.payload).body
+      if body.kind == "ncp.delivery_failed" then
+        found = true
+        assert_eq(body.phase, (kind == "frame_too_large" or kind == "invalid_framing")
+          and "admission" or "enqueue")
+        assert_eq(body.extent, "none")
+        assert_eq(body.correlations[1].id, "rejected")
+      end
+    end
+    assert_true(found)
+    nefor.engine.deliver, nefor.engine.error_kind = deliver, classify
+  end
+end
+
 local tests = {
+  { name = "typed_admission_failures_are_not_enqueue_failures", fn = test_typed_admission_failures_are_not_enqueue_failures },
   { name = "delivery_failures_are_bounded_local_and_not_replayed", fn = test_delivery_failures_are_bounded_local_and_not_replayed },
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
   { name = "ready_with_wrong_version_triggers_error", fn = test_ready_with_wrong_version_triggers_error },

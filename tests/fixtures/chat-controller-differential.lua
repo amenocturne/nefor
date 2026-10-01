@@ -118,6 +118,15 @@ local function apply(label, msg)
   local current_msg = materialize(msg, current_state)
   local next_legacy, legacy_effects = legacy.update(legacy_msg, legacy_state)
   local next_current, current_effects = current(current_msg, current_state)
+  -- Session activation now establishes a correlated cold-start failure surface.
+  -- Keep the frozen reducer intact and model only that deliberate contract delta;
+  -- terminal replay failures are covered by session_replay_failure_test.lua.
+  if msg.kind == "sessions.session_start" and next_current ~= current_state then
+    next_legacy.resume_loading = current_msg.from_resume and {
+      session_id = current_msg.session_id, request_id = current_msg.request_id, replayed = 0,
+    } or nil
+    next_legacy.replay_mode = current_msg.from_resume and true or nil
+  end
   local legacy_state_view = stable(next_legacy)
   local current_state_view = stable(next_current)
   assert(legacy_state_view == current_state_view,

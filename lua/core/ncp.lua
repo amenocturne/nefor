@@ -348,7 +348,12 @@ local function default_deliver_for(target, env, entry_target, encoded_cache)
     if encoded_cache then encoded_cache[env] = payload end
   end
   local ok, err = pcall(nefor.engine.deliver, target, payload)
-  if not ok then delivery_failed(target, "enqueue", "none", err, { env }) end
+  if not ok then
+    local kind = nefor.engine.error_kind(err)
+    local phase = (kind == "frame_too_large" or kind == "invalid_framing")
+      and "admission" or "enqueue"
+    delivery_failed(target, phase, "none", err, { env })
+  end
 end
 
 -- Fan a per-peer batch of envelopes (already deep-copied for this
