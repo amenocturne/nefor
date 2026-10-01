@@ -13,7 +13,7 @@ The lead tool operates on a session MAG workspace:
 1. **Write** — `mag-write-file {file,new_string,old_string?}` creates or overwrites a workspace-relative source, or performs one exact unique replacement.
 2. **Compile and preview** — `mag-preview {file}` checks an existing program and returns its complete authored node tree. It neither writes nor executes.
 3. **Review** — inspect the tree. Before a write-capable graph, submit its concrete plan through `write-review`.
-4. **Apply** — after approval, `mag-apply {file}` compiles and applies an existing complete program to a fresh graph. Add `run_id` to apply a Delta to that directly dispatched live graph. Add `content` only to atomically create a new source file as part of the call; an existing file is an error, so modify it first and then apply without `content`.
+4. **Apply** — after approval, `mag-apply {file}` compiles and applies an existing complete program to a fresh graph. Add `run_id` to apply a Delta to that directly dispatched live graph. Add `content` to write the source file, replacing any existing contents, before compiling and applying it in the same call.
 
 Editing a graph function describes a different future run. It does not retrieve or mutate a running graph.
 

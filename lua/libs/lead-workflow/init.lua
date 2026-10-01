@@ -1838,10 +1838,18 @@ local function lead_workflow_tool_schemas()
           display_field("workflow", "result", "workflow_tree", "text",
             { omit = "missing", max_lines = 120, max_bytes = 12000 }),
         }, "delayed"),
-      description = "Execute a new MAG operation or workflow, including a single command. To execute a new graph in one call, pass file and content together: this atomically writes a new source file, compiles and validates it, then dispatches it. Source-write, compilation, or pre-dispatch validation errors return without dispatch; created source remains available for editing. Existing files cannot be overwritten via content; edit them with mag-write-file and omit content when applying. Quick runs return the terminal result. Asynchronous acknowledgments include run_id, the complete authored node tree, and completion instructions for the calling role.",
+      description =
+        "Validates, compiles, and runs a MAG workflow. With file and content, writes content " ..
+        "to file, replacing any existing contents, then runs it. With file only, runs the " ..
+        "workflow in that file as it is. If writing, validation, or compilation fails, nothing " ..
+        "runs and the error is returned; the file keeps what was written, so it can be edited " ..
+        "selectively with mag-write-file and applied again. A run that finishes within " ..
+        string.format("%g", SYNC_COMPLETION_GRACE_MS / 1000) .. " seconds returns its output, or " ..
+        "its failure together with the workflow tree. A longer run returns a run_id, the " ..
+        "workflow tree, and how its result will reach you.",
       parameters = { type = "object", additionalProperties = false, properties = {
         file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
-        content = { type = "string", description = "Optional complete source for a new file. Existing files are never overwritten here." },
+        content = { type = "string", description = "Optional complete source written to file before running, replacing any existing contents." },
       }, required = { "file" } },
     },
   }
@@ -2259,7 +2267,7 @@ local function mag_apply(firing_id, args, metadata)
   if not ws then return end
   local _, source_error
   if args.content ~= nil then
-    _, source_error = mag.create_file(ws, args.file, args.content)
+    _, source_error = mag.write_file(ws, args.file, args.content)
   else
     _, source_error = mag.require_file(ws, args.file)
   end

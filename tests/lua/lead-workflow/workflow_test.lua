@@ -1212,12 +1212,12 @@ do
   handle:close()
 end
 
--- Inline apply source is create-only: a failed compile remains editable, but
--- a later call cannot silently overwrite the same file.
+-- Inline apply source writes the file before compiling: a failed compile
+-- remains editable, and a later call replaces the same file and runs it.
 do
   fresh()
   invoke_tool("inline-create", "mag-apply", {
-    file = "inline.mag", content = READ_ONLY_MAG,
+    file = "inline.mag", content = "invalid",
   })
   local load = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end)
   assert_true(load ~= nil, "inline content creates source and starts compilation")
@@ -1230,17 +1230,16 @@ do
     return c.body.kind == "mag.execute" or c.body.kind == "mag.apply"
   end), nil, "inline compile failure dispatches no work")
   _test.calls_clear()
-  invoke_tool("inline-conflict", "mag-apply", {
+  invoke_tool("inline-replace", "mag-apply", {
     file = "inline.mag", content = READ_ONLY_MAG,
   })
-  local conflict = tool_result("inline-conflict")
-  assert_true(conflict and conflict.body.error:find("already exists", 1, true) ~= nil,
-    "inline content refuses to overwrite an existing source")
-  assert_true(conflict.body.error:find("mag-write-file", 1, true) ~= nil,
-    "inline conflict explains the repair flow")
-  assert_eq(find_call(decode_calls(), function(c)
-    return c.body.kind == "mag.load" or c.body.kind == "mag.execute" or c.body.kind == "mag.apply"
-  end), nil, "source creation failure stops before compilation and dispatch")
+  local reload = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end)
+  assert_true(reload ~= nil, "inline content replaces existing source and compiles it")
+  assert_eq(tool_result("inline-replace"), nil, "replacement is not an error")
+  local workspace = require("libs.mag-workspace").workspace_dir(sessions.current_id())
+  local handle = assert(io.open(workspace .. "/inline.mag", "r"))
+  assert_eq(handle:read("*a"), READ_ONLY_MAG, "inline content replaced the earlier source")
+  handle:close()
 end
 
 -- ------------------------------------------------------------------

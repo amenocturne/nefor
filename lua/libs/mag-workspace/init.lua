@@ -119,40 +119,16 @@ local function read_text(path)
   return value
 end
 
-local function write_text(path, content, exclusive)
+local function write_text(path, content)
   local ok, err = ensure_parent(path)
   if not ok then return nil, err end
-  local write_path = path
-  local temp_dir
-  if exclusive then
-    for _ = 1, 16 do
-      local candidate = path .. ".create-" .. tostring(os.time()) .. "-"
-        .. tostring(math.random(100000, 999999))
-      local made = os.execute("mkdir -m 700 " .. sh_quote(candidate) .. " >/dev/null 2>&1")
-      if made == true or made == 0 then temp_dir = candidate; break end
-    end
-    if not temp_dir then return nil, "cannot create a private temporary directory" end
-    write_path = temp_dir .. "/source"
-  end
-  local handle, open_error = io.open(write_path, "w")
-  if not handle then
-    if temp_dir then os.execute("rmdir " .. sh_quote(temp_dir) .. " >/dev/null 2>&1") end
-    return nil, open_error
-  end
+  local handle, open_error = io.open(path, "w")
+  if not handle then return nil, open_error end
   local wrote, write_error = handle:write(content)
   local closed, close_error = handle:close()
   if not wrote or not closed then
-    os.remove(write_path)
-    if temp_dir then os.execute("rmdir " .. sh_quote(temp_dir) .. " >/dev/null 2>&1") end
+    os.remove(path)
     return nil, write_error or close_error
-  end
-  if exclusive then
-    -- POSIX hard-link creation is atomic and refuses an existing destination;
-    -- unlike rename it cannot clobber a concurrently created source file.
-    local linked = os.execute("ln " .. sh_quote(write_path) .. " " .. sh_quote(path) .. " >/dev/null 2>&1")
-    os.remove(write_path)
-    os.execute("rmdir " .. sh_quote(temp_dir) .. " >/dev/null 2>&1")
-    if linked ~= true and linked ~= 0 then return nil, "file already exists or could not be created" end
   end
   return true
 end
@@ -163,7 +139,7 @@ function M.write_file(workspace, file, new_string, old_string)
   if type(new_string) ~= "string" then return nil, "new_string must be a string" end
   if old_string == nil then
     local existed = exists(path)
-    local ok, error = write_text(path, new_string, false)
+    local ok, error = write_text(path, new_string)
     if not ok then return nil, error end
     return { operation = existed and "overwritten" or "created", source_path = path }
   end
@@ -184,22 +160,9 @@ function M.write_file(workspace, file, new_string, old_string)
   if count > 1 then return nil, "old_string matched multiple locations; provide more context" end
   local start_at, end_at = content:find(old_string, 1, true)
   local replacement = content:sub(1, start_at - 1) .. new_string .. content:sub(end_at + 1)
-  local ok, error = write_text(path, replacement, false)
+  local ok, error = write_text(path, replacement)
   if not ok then return nil, error end
   return { operation = "edited", source_path = path }
-end
-
-function M.create_file(workspace, file, content)
-  local path, path_error = M.resolve_file(workspace, file)
-  if not path then return nil, path_error end
-  if exists(path) then
-    return nil, "file already exists: " .. file ..
-      "; omit content to use it, or modify it with mag-write-file before applying"
-  end
-  if type(content) ~= "string" then return nil, "content must be a string" end
-  local ok, error = write_text(path, content, true)
-  if not ok then return nil, error end
-  return { operation = "created", source_path = path }
 end
 
 function M.require_file(workspace, file)
