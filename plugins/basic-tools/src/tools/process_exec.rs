@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::ToolError;
-use crate::tools::process::{self, Request, StreamChunk};
+use crate::tools::process::{self, LivePreview, Request};
 
 pub const NAME: &str = "process.exec";
 pub const DESCRIPTION: &str =
@@ -49,9 +51,9 @@ pub async fn run(args: &Value) -> Result<Value, ToolError> {
 pub async fn run_cancellable_streaming(
     args: &Value,
     cancel: Option<oneshot::Receiver<()>>,
-    stream: Option<mpsc::UnboundedSender<StreamChunk>>,
+    preview: Option<Arc<LivePreview>>,
 ) -> Result<Value, ToolError> {
-    process::execute(parse_args(args)?, cancel, stream).await
+    process::execute(parse_args(args)?, cancel, preview).await
 }
 
 fn parse_args(args: &Value) -> Result<Request, ToolError> {

@@ -374,24 +374,20 @@ async fn handle_tool_invoke(
 
     // Process capabilities share streaming and cancellation mechanics.
     let outcome = if name == process_exec::NAME || name == shell_script::NAME {
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
-        let stream_out = out_tx.clone();
-        let stream_id = id.clone();
-        let forward = tokio::spawn(async move {
-            while let Some(chunk) = stream_rx.recv().await {
-                let (stream, bytes) = match chunk {
-                    process::StreamChunk::Stdout(bytes) => ("stdout", bytes),
-                    process::StreamChunk::Stderr(bytes) => ("stderr", bytes),
-                };
-                let text = String::from_utf8_lossy(&bytes);
-                let _ = send_event(&stream_out, tool_stream_body(&stream_id, stream, &text)).await;
-            }
-        });
+        let preview = Arc::new(process::LivePreview::default());
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let forward = tokio::spawn(forward_preview(
+            Arc::clone(&preview),
+            out_tx.clone(),
+            id.clone(),
+            finished_rx,
+        ));
         let result = if name == process_exec::NAME {
-            process_exec::run_cancellable_streaming(&args, cancel, Some(stream_tx)).await
+            process_exec::run_cancellable_streaming(&args, cancel, Some(preview)).await
         } else {
-            shell_script::run_cancellable_streaming(&args, cancel, Some(stream_tx)).await
+            shell_script::run_cancellable_streaming(&args, cancel, Some(preview)).await
         };
+        let _ = finished_tx.send(());
         let _ = forward.await;
         result
     } else {
@@ -407,6 +403,40 @@ async fn handle_tool_invoke(
         }
     }
     Ok(())
+}
+
+/// Live output is a lossy preview; the authoritative output is the
+/// `tool.result`. Flushing on a fixed cadence caps `tool.stream` traffic at
+/// one event per stream per interval, however fast the child writes.
+const PREVIEW_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+async fn forward_preview(
+    preview: Arc<process::LivePreview>,
+    out_tx: mpsc::Sender<PluginOutgoing>,
+    id: String,
+    mut finished: oneshot::Receiver<()>,
+) {
+    let mut ticks = tokio::time::interval(PREVIEW_FLUSH_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let done = tokio::select! {
+            _ = ticks.tick() => false,
+            _ = &mut finished => true,
+        };
+        for chunk in preview.take() {
+            let (stream, bytes) = match chunk {
+                process::StreamChunk::Stdout(bytes) => ("stdout", bytes),
+                process::StreamChunk::Stderr(bytes) => ("stderr", bytes),
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            if send_event(&out_tx, tool_stream_body(&id, stream, &text)).await.is_err() {
+                return;
+            }
+        }
+        if done {
+            return;
+        }
+    }
 }
 
 fn render_tool_error(e: &ToolError) -> String {
