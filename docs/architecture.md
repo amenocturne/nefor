@@ -93,6 +93,10 @@ make, archive tools, and OpenSSL development libraries. Linux runtime modules
 require the system OpenSSL 3 libraries and CA certificates. On macOS preparation
 copies non-system dylib dependencies into the tree, rewrites their loader paths,
 and signs the modified files; release CI prepares each target separately.
+The copied OpenSSL keeps the certificate store compiled into its build; for
+Homebrew this is `/opt/homebrew/etc/openssl@3/cert.pem`. On a Mac without that
+file, HTTPS downloads fail certificate verification unless `SSL_CERT_FILE`
+names a store such as the system `/etc/ssl/cert.pem`.
 A generated native tree must not be reused across operating systems or CPU
 architectures. Preparation may use external download tools through LuaRocks;
 the installed package manager's HTTP path does not depend on those tools.
