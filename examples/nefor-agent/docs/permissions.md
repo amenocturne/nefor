@@ -59,7 +59,7 @@ modification.
 
 ## 2. Write-review plan approval
 
-`write-review` (alias `submit-plan`) is a lead-workflow tool. Calling it does not
+`write-review` is a lead-workflow tool. Calling it does not
 itself write files: it submits one plan and renders a review block. The starter
 tool gate lists this submission tool as automatic, avoiding a redundant
 ordinary-tool popup. The **plan verdict** is the separate approval.
@@ -80,11 +80,6 @@ Both `auto` and `yolo` immediately mark write-review approved and return a
 mode-specific bypass notice. That is a starter policy choice, not an engine
 guarantee and not equivalent to a human verdict. Downstream configurations may
 choose a stricter policy.
-
-`view = "web"` routes review through the configured external review hook and
-maps its result back to approved, rejected, or discarded. That optional path
-has its own saved review files; the TUI docs do not promise their retention or
-export format.
 
 ## 3. MAG human approval
 

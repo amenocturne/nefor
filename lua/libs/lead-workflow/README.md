@@ -76,15 +76,12 @@ compile again after changing them.
 
 ## Plan review
 
-`write-review {plan, view}` submits a plan for the user's review. The gate
-mode decides what happens:
+`write-review {plan}` submits a plan for the user's review. The gate mode
+decides what happens:
 
 - `safe` (the default): the call blocks until the user responds. `/approve`
   authorizes the plan for the current turn, `/reject` returns a reason, and any
-  other reply discards the pending review and becomes new input. With
-  `view = "web"`, the plan is handed to the configured review hook
-  (`NEFOR_REVIEW_HOOK`, default `<config>/scripts/review-hook.sh`) instead of
-  the chat.
+  other reply discards the pending review and becomes new input.
 - `auto` and `yolo`: the plan is approved immediately.
 
 In `safe` mode, `mag-apply` rejects a program containing write-capable agents

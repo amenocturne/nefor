@@ -1868,8 +1868,8 @@ do
   assert_true(err ~= nil,
     "write-capable fresh MAG apply without plan must return a tool.result error")
   assert_true(err.body.error:find("write%-capable agents") ~= nil
-              and err.body.error:find("write%-review") ~= nil,
-    "gate-error message names the write-review precondition")
+              and err.body.error:find("approved plan") ~= nil,
+    "gate-error message names the approved-plan precondition")
   -- No mag.execute should leak through.
   local leaked = find_call(calls, function(c)
     return c.body.kind == "mag.execute"
@@ -1889,7 +1889,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-pre",
     name = "write-review",
-    args = { plan = "test plan", view = "inline" },
+    args = { plan = "test plan" },
   })
   feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
   _test.calls_clear()
@@ -1920,7 +1920,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-1",
     name = "write-review",
-    args = { plan = "1. Read auth.lua\n2. Add login flow\n3. Test it", view = "inline" },
+    args = { plan = "1. Read auth.lua\n2. Add login flow\n3. Test it" },
   })
 
   local calls = decode_calls()
@@ -1965,7 +1965,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-2",
     name = "write-review",
-    args = { plan = "Plan A", view = "inline" },
+    args = { plan = "Plan A" },
   })
   _test.calls_clear()
 
@@ -2011,7 +2011,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-3",
     name = "write-review",
-    args = { plan = "Plan B", view = "inline" },
+    args = { plan = "Plan B" },
   })
   _test.calls_clear()
 
@@ -2048,7 +2048,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-discard",
     name = "write-review",
-    args = { plan = "Plan C", view = "inline" },
+    args = { plan = "Plan C" },
   })
   _test.calls_clear()
 
@@ -2084,7 +2084,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-single-use",
     name = "write-review",
-    args = { plan = "Plan D", view = "inline" },
+    args = { plan = "Plan D" },
   })
   feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
   assert_eq(lw._internals.state.active_plan.status, "approved",
@@ -2165,7 +2165,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-live",
     name = "write-review",
-    args = { plan = "Live plan body", view = "inline" },
+    args = { plan = "Live plan body" },
   })
 
   -- Simulate the bus feedback (in production, actor.lua's bus.on_event
@@ -2201,7 +2201,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-auto",
     name = "write-review",
-    args = { plan = "Auto mode plan", view = "inline" },
+    args = { plan = "Auto mode plan" },
   })
 
   local calls = decode_calls()
@@ -2274,7 +2274,7 @@ do
   fresh()
   local session_id = sessions.current_id()
   invoke_tool_with_metadata("dead-plan", "write-review",
-    { plan = "dead run plan", view = "inline" },
+    { plan = "dead run plan" },
     { invocation = invocation(session_id, "lead", "dead-run/cap-1") })
   local plan = lw._internals.state.active_plan
   assert_eq(plan.pending_firing_id, "dead-plan", "write-review parks the firing")
@@ -2290,14 +2290,14 @@ do
   end), nil, "late approval for a dead run emits no verdict")
 
   invoke_tool_with_metadata("cancelled-plan", "write-review",
-    { plan = "cancelled plan", view = "inline" },
+    { plan = "cancelled plan" },
     { invocation = invocation(session_id, "lead", "cancelled-run/cap-1") })
   feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "cancelled-plan" })
   assert_eq(lw._internals.state.active_plan, nil,
     "hard cancellation clears the parked write-review state")
 
   invoke_tool_with_metadata("fresh-plan", "write-review",
-    { plan = "fresh run plan", view = "inline" },
+    { plan = "fresh run plan" },
     { invocation = invocation(session_id, "lead", "fresh-run/cap-1") })
   assert_eq(lw._internals.state.active_plan.pending_firing_id, "fresh-plan",
     "future write-review remains usable")
@@ -2326,7 +2326,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-at-end",
     name = "write-review",
-    args = { plan = "in-flight plan", view = "inline" },
+    args = { plan = "in-flight plan" },
   })
   assert_eq(lw._internals.state.active_plan.status, "pending",
     "plan slot is pending before session_end")

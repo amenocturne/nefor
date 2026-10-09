@@ -34,9 +34,6 @@
 --                                their reply: <text>". active_plan is
 --                                cleared.
 --
--- Web review resolves from the browser review tool's saved markdown,
--- mapped back into the same approved/rejected/discarded contract.
---
 -- After the verdict resolves, the approval is single-use per turn: the
 -- next genuine user message clears `state.active_plan`. Combined with
 -- the no-replay rule (state.active_plan does not survive session
@@ -50,8 +47,7 @@
 -- this actor handles the forwarded envelopes and emits `tool.result`
 -- back. The gate's id-rewriting machinery handles the round-trip.
 --
---   * `write-review` (alias `submit-plan`) — args:
---       { plan = <string>, view = "inline"|"web" }
+--   * `write-review` — args: { plan = <string> }
 --     Stores the plan in `state.active_plan`, broadcasts
 --     `lead-workflow.plan.submitted { plan, submitted_at }` for the
 --     chat surface to render the yellow review block. Does NOT emit
@@ -426,140 +422,12 @@ local function compose_agent_params(inventory, session_id)
   return overlay
 end
 
-local function sh_quote(value)
-  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
-end
-
-local function data_root()
-  if nefor and nefor.fs and type(nefor.fs.data_root) == "function" then
-    local ok, root = pcall(nefor.fs.data_root)
-    if ok and type(root) == "string" and root ~= "" then return root end
-  end
-  local override = os.getenv("NEFOR_DATA_DIR")
-  if override ~= nil and override ~= "" then return override end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
-  local home = os.getenv("HOME") or ""
-  if home == "" then return nil end
-  return home .. "/.local/share/nefor"
-end
-
-local function review_hook_path()
-  local override = os.getenv("NEFOR_REVIEW_HOOK")
-  if override ~= nil and override ~= "" then return override end
-  local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
-  return config_dir .. "/scripts/review-hook.sh"
-end
-
-local function mkdir_p(path)
-  if nefor and nefor.fs and type(nefor.fs.mkdir_p) == "function" then
-    local ok = pcall(nefor.fs.mkdir_p, path)
-    if ok then return true end
-  end
-  local ok = os.execute("mkdir -p " .. sh_quote(path) .. " >/dev/null 2>&1")
-  return ok == true or ok == 0
-end
-
-local function write_text(path, content)
-  local fh, err = io.open(path, "w")
-  if not fh then return nil, tostring(err) end
-  fh:write(content)
-  fh:close()
-  return true, nil
-end
-
-local function web_review_dirs()
-  local root = data_root()
-  if not root then return nil, nil, "no Nefor data root available" end
-  local save_dir = os.getenv("REVIEW_SAVE_DIR")
-  if save_dir == nil or save_dir == "" then save_dir = root .. "/reviews/plans" end
-  return save_dir, root .. "/reviews/tmp", nil
-end
-
-local function run_web_review(plan)
-  local save_dir, scratch_dir, dir_err = web_review_dirs()
-  if dir_err then return nil, dir_err end
-  if not mkdir_p(save_dir) then return nil, "failed to create review save dir: " .. save_dir end
-  if not mkdir_p(scratch_dir) then return nil, "failed to create review scratch dir: " .. scratch_dir end
-
-  local stamp = tostring(now_ms()):gsub("[^%w%-_]", "-")
-  local plan_path = scratch_dir .. "/write-review-plan-" .. stamp .. ".md"
-  local input_path = scratch_dir .. "/write-review-input-" .. stamp .. ".json"
-  local ok, err = write_text(plan_path, plan)
-  if not ok then return nil, "failed to write review plan: " .. tostring(err) end
-  ok, err = write_text(input_path, json.encode({ plan_path = plan_path, content = plan }))
-  if not ok then return nil, "failed to write review hook input: " .. tostring(err) end
-
-  local cmd = "REVIEW_SAVE_DIR=" .. sh_quote(save_dir) .. " " ..
-    sh_quote(review_hook_path()) .. " < " .. sh_quote(input_path) .. " 2>&1"
-  local pipe = io.popen(cmd, "r")
-  if not pipe then return nil, "failed to launch review hook" end
-  local raw = pipe:read("*a") or ""
-  local close_ok, close_reason, close_code = pipe:close()
-  if close_ok ~= true then
-    return nil, "review hook failed (" .. tostring(close_reason) .. ":" .. tostring(close_code) .. "): " .. raw
-  end
-
-  local decoded_ok, decoded = pcall(json.decode, raw)
-  if not decoded_ok or type(decoded) ~= "table" then
-    return nil, "review hook returned invalid JSON: " .. raw
-  end
-  decoded.save_dir = decoded.save_dir or save_dir
-  return decoded, nil
-end
-
-local function resolve_web_review(firing_id, result)
-  if type(result) ~= "table" then
-    state.active_plan = nil
-    emit_verdict_discarded(firing_id, "Web review returned no verdict.")
-    return
-  end
-  local status = result.status
-  local comments = result.comments
-  local plan = state.active_plan
-  if type(plan) == "table" then
-    plan.pending_firing_id = nil
-    plan.pending_correlation = nil
-    plan.pending_run_id = nil
-    plan.reason = comments
-  end
-
-  if status == "approved" then
-    if type(plan) == "table" then plan.status = "approved" end
-    emit_as(SOURCE_NAME, nil, {
-      kind             = "lead-workflow.plan.approved",
-      plan_id          = type(plan) == "table" and plan.plan_id or nil,
-      submitted_at     = type(plan) == "table" and plan.submitted_at or nil,
-      approved         = true,
-      approval_reason  = comments,
-    })
-    emit_verdict_approved(firing_id, comments)
-    return
-  end
-
-  if status == "changes_needed" then
-    if type(plan) == "table" then plan.status = "rejected" end
-    emit_as(SOURCE_NAME, nil, {
-      kind             = "lead-workflow.plan.approved",
-      plan_id          = type(plan) == "table" and plan.plan_id or nil,
-      submitted_at     = type(plan) == "table" and plan.submitted_at or nil,
-      approved         = false,
-      approval_reason  = comments,
-    })
-    emit_verdict_rejected(firing_id, comments)
-    return
-  end
-
-  state.active_plan = nil
-  emit_verdict_discarded(firing_id, comments or "Web review was closed without a verdict.")
-end
-
 local function has_approved_plan()
   return type(state.active_plan) == "table"
          and state.active_plan.status == "approved"
 end
 
--- Tool: write-review (alias submit-plan).
+-- Tool: write-review.
 --
 -- Blocking semantics: stores the plan + the firing_id, emits the chat-
 -- surface envelope, then returns WITHOUT calling emit_tool_result_ok.
@@ -570,11 +438,6 @@ local function submit_plan(firing_id, args, metadata)
   local plan = args and args.plan
   if type(plan) ~= "string" or #plan == 0 then
     emit_tool_result_err(firing_id, "write-review: args.plan must be a non-empty string")
-    return
-  end
-  local view = args and args.view
-  if view ~= "inline" and view ~= "web" then
-    emit_tool_result_err(firing_id, "write-review: args.view must be `inline` or `web`")
     return
   end
   -- Calling write-review while another plan is in-flight discards the
@@ -628,25 +491,14 @@ local function submit_plan(firing_id, args, metadata)
     })
     local notice
     if yolo_approved then
-      notice = "YOLO mode: write-review approval gate bypassed; proceed with implementation."
+      notice = "Plan approved automatically (yolo mode)."
     else
-      notice = "AUTO mode: write-review approval gate bypassed; proceed with implementation."
+      notice = "Plan approved automatically (auto mode)."
     end
     emit_tool_result_ok(firing_id, {
       status = "approved",
       notice = notice,
     })
-    return
-  end
-
-  if view == "web" then
-    local result, err = run_web_review(plan)
-    if err then
-      state.active_plan = nil
-      emit_tool_result_err(firing_id, "write-review web review failed: " .. tostring(err))
-      return
-    end
-    resolve_web_review(firing_id, result)
     return
   end
 
@@ -659,35 +511,20 @@ end
 -- a status code. /approve carries no reason field by spec; if the user
 -- typed `/approve <text>`, the trailing text rides along as a `note`.
 emit_verdict_approved = function(firing_id, note)
-  local notice = "Plan approved by user. Proceed with the implementation " ..
-                 "now — use mag to apply the implementation graph " ..
-                 "as the next tool call. The approval is valid for this " ..
-                 "turn only."
-  local out = { status = "approved", notice = notice }
+  local out = { status = "approved", notice = "Plan approved by the user. The approval is valid for this turn only." }
   if type(note) == "string" and #note > 0 then out.note = note end
   emit_tool_result_ok(firing_id, out)
 end
 
 emit_verdict_rejected = function(firing_id, reason)
-  local why = (type(reason) == "string" and #reason > 0)
-    and ("\n\n--- reason ---\n" .. reason) or ""
-  local notice = "Plan rejected by user." .. why .. "\n\n" ..
-    "Revise the plan to address the feedback, then call write-review " ..
-    "again. If the rejection reason is unclear, ask the user a " ..
-    "clarifying question instead of re-submitting blindly. Do NOT " ..
-    "dispatch the rejected plan."
-  local out = { status = "rejected", notice = notice }
+  local out = { status = "rejected", notice = "Plan rejected by the user." }
   if type(reason) == "string" and #reason > 0 then out.reason = reason end
   emit_tool_result_ok(firing_id, out)
 end
 
 emit_verdict_discarded = function(firing_id, comment)
-  local notice = "User replied with a comment instead of a verdict; the " ..
-    "submitted plan is discarded. Treat the user's reply as the next " ..
-    "turn's input — answer questions, incorporate feedback, and submit " ..
-    "a fresh plan via write-review when ready. Do NOT dispatch the " ..
-    "discarded plan."
-  local out = { status = "discarded", notice = notice }
+  local out = { status = "discarded",
+    notice = "The user replied without a verdict; the plan is discarded and the reply is new input." }
   if type(comment) == "string" and #comment > 0 then out.comment = comment end
   emit_tool_result_ok(firing_id, out)
 end
@@ -1785,23 +1622,19 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "write-review",
-      display = display_contract("write review", display_field("view", "args", "view", "scalar"), {}, "receipt", "AWAITING USER REVIEW", { display_field("status", "result", "$", "status", { sensitive = "omit" }) }),
+      display = display_contract("write review", nil, {}, "receipt", "AWAITING USER REVIEW", { display_field("status", "result", "$", "status", { sensitive = "omit" }) }),
       description =
-        "Submit a plan for user review. BLOCKING — the call does not " ..
-        "return until the user responds. /approve resolves it with " ..
-        "an approval directive (then dispatch the implementation). " ..
-        "/reject resolves it with a rejection + reason (revise and " ..
-        "call write-review again). Any other user reply resolves it " ..
-        "as 'discarded' (treat the reply as fresh input). The approval " ..
-        "is valid for one turn only — flushed by the next non-verdict " ..
-        "user message and across session boundaries.",
+        "Submits a plan for the user's review and returns their decision: approved, rejected with " ..
+        "a reason, or discarded when the user replies with something else, in which case that reply " ..
+        "is new input. Waits until the user responds; depending on the session's mode, the plan may " ..
+        "be approved immediately. An approval is valid for the current turn only.",
       parameters  = {
         type = "object",
+        additionalProperties = false,
         properties = {
-          plan = { type = "string" },
-          view = { type = "string", enum = { "inline", "web" } },
+          plan = { type = "string", description = "The plan to review." },
         },
-        required = { "plan", "view" },
+        required = { "plan" },
       },
     },
     {
@@ -2025,7 +1858,7 @@ submit_loaded_run = function(pending, body, error_prefix)
   local inventory = mag.actor_inventory(decoded)
   if not validate_factories(inventory, pending.firing_id) then return false end
   if actors_have_writers(inventory) and state.gate_mode == "safe" and not has_approved_plan() then
-    return reject("Program contains write-capable agents. Submit a plan via write-review and get approval before executing.")
+    return reject("This program contains write-capable agents and needs an approved plan first.")
   end
   local terminal_id, result_err = result_boundary(modification)
   if not terminal_id then return reject(error_prefix .. ": " .. result_err) end
@@ -2077,7 +1910,7 @@ local function submit_loaded_apply(pending, body)
   if not validate_factories(inventory, pending.firing_id) then return false end
   if actors_have_writers(inventory) and state.gate_mode == "safe" and not has_approved_plan() then
     emit_tool_result_err(pending.firing_id,
-      "Modification contains write-capable agents. Submit a plan via write-review and get approval before applying it.")
+      "This modification contains write-capable agents and needs an approved plan first.")
     return false
   end
   local overlay = compose_agent_params(inventory, pending.session_id)
@@ -2288,7 +2121,6 @@ local TOOL_HANDLERS = {
   ["mag-await"]      = await_run,
   ["mag-terminate"]  = terminate_graph,
   ["write-review"]   = submit_plan,
-  ["submit-plan"]    = submit_plan,
   ["mag-write-file"] = mag_write_file,
   ["mag-preview"]    = mag_preview,
   ["mag-apply"]      = mag_apply,
@@ -2608,7 +2440,6 @@ local M = {
     summarize_run = summarize_run,
     graph_status = graph_status,
     terminate_graph = terminate_graph,
-    run_web_review = run_web_review,
     run_registry = run_registry,
     await_run = await_run,
     graph_status_cooldown_limit = GRAPH_STATUS_COOLDOWN_LIMIT,
