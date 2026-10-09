@@ -5,8 +5,13 @@ A test/dev NCP peer plugin. Speaks the [current NCP behavior](../../docs/protoco
 ## Usage
 
 ```
-mock-plugin --script <path-to-lua-file>
+mock-plugin --script <path-to-lua-file> [--lua-root <dir>]
 ```
+
+`--lua-root <dir>` prepends `<dir>/?.lua;<dir>/?/init.lua` to the script's
+`package.path`. Pointing it at Nefor's `lua/` tree lets a script build on
+`require("libs.mock-provider")`, which impersonates an openai-compatible
+provider and leaves every answer to the script's `respond(request)` behavior.
 
 Example:
 

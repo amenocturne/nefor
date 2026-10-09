@@ -35,6 +35,11 @@ struct Args {
     /// Path to the Lua script that defines this plugin's handlers.
     #[arg(long, value_name = "PATH")]
     script: PathBuf,
+
+    /// Shared Lua tree prepended to `package.path` (`<dir>/?.lua`,
+    /// `<dir>/?/init.lua`), so the script can `require("libs.mock-provider")`.
+    #[arg(long, value_name = "DIR")]
+    lua_root: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -80,6 +85,9 @@ async fn run() -> Result<(), MockError> {
     // syntax errors immediately and never talk to the engine with a
     // broken script.
     let host = LuaHost::new(PLUGIN_NAME, out_tx.clone())?;
+    if let Some(lua_root) = &args.lua_root {
+        host.prepend_package_path(lua_root)?;
+    }
     host.exec_script(&script_name, &script_src).await?;
 
     // Handshake.
@@ -145,7 +153,7 @@ async fn run_dispatch_loop(
                                 //
                                 // Custom scripts whose handlers yield opt in
                                 // through the same `*.completion.request`
-                                // shape used by the bundled mock provider.
+                                // shape used by `libs.mock-provider`.
                                 let kind_is_complete = map
                                     .get("kind")
                                     .and_then(|v| v.as_str())

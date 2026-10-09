@@ -367,39 +367,37 @@ async fn emit_before_ready_errors_in_script_load() {
     cleanup(&script);
 }
 
-/// The bundled mock provider uses the same stateless direct-completion
-/// contract as openai-provider: history arrives on each correlated request,
-/// and a hard cancellation suppresses that request's terminal result. The
-/// cancellation handler must nevertheless settle its registry entry
-/// immediately so the correlation id can be reused without racing the
-/// detached stream task.
-#[tokio::test]
-async fn production_completion_cancel_settles_request_without_terminal_result() {
-    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("plugins/")
-        .parent()
-        .expect("repo root")
-        .join("examples/nefor-agent/mock-provider/init.lua");
-    assert!(
-        script_path.exists(),
-        "production mock_provider.lua not found at {script_path:?}",
-    );
+fn repo_lua_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lua")
+        .canonicalize()
+        .expect("repository lua/ tree")
+}
 
+/// Spawn mock-plugin with a `libs.mock-provider` behavior script, complete the
+/// handshake, and consume the two ready announcements.
+async fn spawn_mock_provider(
+    name: &str,
+    behavior: &str,
+) -> (
+    Child,
+    tokio::process::ChildStdin,
+    BufReader<tokio::process::ChildStdout>,
+    PathBuf,
+) {
+    let script = temp_script(name, behavior);
     let mut child = Command::new(binary_path())
         .arg("--script")
-        .arg(&script_path)
-        // Leave pacing active so cancellation lands while the help response
-        // is suspended between chunks.
-        .env_remove("NEFOR_TEST_FAST_MOCK")
+        .arg(&script)
+        .arg("--lua-root")
+        .arg(repo_lua_root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mock-plugin");
     let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
 
     let ready_line = read_line(&mut reader).await.expect("ready");
     let ready = parse_outgoing(&ready_line).await.expect("parse ready");
@@ -408,8 +406,6 @@ async fn production_completion_cancel_settles_request_without_terminal_result() 
         nefor_protocol::Body::System(SystemBody::Ready { .. })
     ));
     send_ready_ok(&mut stdin).await;
-
-    // Ready completion has exactly two observable provider announcements.
     for expected_kind in ["mock-plugin.hello", "mock-plugin.auth.status"] {
         let line = read_line(&mut reader).await.expect("ready announcement");
         let outgoing = parse_outgoing(&line).await.expect("parse announcement");
@@ -421,112 +417,42 @@ async fn production_completion_cancel_settles_request_without_terminal_result() 
             Some(expected_kind),
         );
     }
+    (child, stdin, reader, script)
+}
 
-    let request_id = "cancel-and-reuse-1";
+async fn send_event(stdin: &mut tokio::process::ChildStdin, body: serde_json::Value) {
     let plugin = PluginName::new("mock-plugin").expect("valid");
-    let request_body = serde_json::json!({
-        "kind": "mock-plugin.completion.request",
-        "request_id": request_id,
-        "messages": [{
-            "role": "user",
-            "content": "zxqv-no-trigger-route-to-help"
-        }]
-    })
-    .as_object()
-    .expect("request object")
-    .clone();
-    let request = Envelope::event(plugin.clone(), Timestamp::now(), request_body);
+    let body = body.as_object().expect("event object").clone();
+    let envelope = Envelope::event(plugin, Timestamp::now(), body);
     stdin
-        .write_all(request.to_line().as_bytes())
+        .write_all(envelope.to_line().as_bytes())
         .await
         .expect("w");
     stdin.write_all(b"\n").await.expect("nl");
     stdin.flush().await.expect("flush");
+}
 
-    // Three correlated deltas establish that the request is actively
-    // streaming through yield points, rather than merely queued.
-    let mut delta_count = 0;
-    while delta_count < 3 {
-        let line = read_line(&mut reader).await.expect("completion delta");
-        let outgoing = parse_outgoing(&line).await.expect("parse completion delta");
+/// Next `completion.event` body for `request_id`, skipping everything else.
+async fn next_completion_event<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    request_id: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    loop {
+        let line = read_line(reader).await.expect("completion event");
+        let outgoing = parse_outgoing(&line).await.expect("parse completion event");
         let nefor_protocol::Body::Event(body) = outgoing.body else {
-            panic!("expected completion event: {line}");
+            continue;
         };
         if body.get("kind").and_then(serde_json::Value::as_str)
             == Some("mock-plugin.completion.event")
             && body.get("request_id").and_then(serde_json::Value::as_str) == Some(request_id)
-            && body.get("event").and_then(serde_json::Value::as_str) == Some("text_delta")
         {
-            delta_count += 1;
+            return body;
         }
     }
+}
 
-    let cancel_body = serde_json::json!({
-        "kind": "mock-plugin.completion.cancel",
-        "request_id": request_id,
-    })
-    .as_object()
-    .expect("cancel object")
-    .clone();
-    let cancel = Envelope::event(plugin.clone(), Timestamp::now(), cancel_body);
-    stdin
-        .write_all(cancel.to_line().as_bytes())
-        .await
-        .expect("w");
-    stdin.write_all(b"\n").await.expect("nl");
-
-    // Reusing the id is the protocol-visible settlement probe. The new error
-    // request must be accepted; "already in flight" would prove cancellation
-    // left stale ownership behind. The cancelled request itself must not emit
-    // usage or a successful terminal result.
-    let reuse_body = serde_json::json!({
-        "kind": "mock-plugin.completion.request",
-        "request_id": request_id,
-        "messages": [{"role": "user", "content": "fail"}]
-    })
-    .as_object()
-    .expect("reuse object")
-    .clone();
-    let reuse = Envelope::event(plugin, Timestamp::now(), reuse_body);
-    stdin
-        .write_all(reuse.to_line().as_bytes())
-        .await
-        .expect("w");
-    stdin.write_all(b"\n").await.expect("nl");
-    stdin.flush().await.expect("flush");
-
-    loop {
-        let line = read_line(&mut reader)
-            .await
-            .expect("reused request terminal");
-        let outgoing = parse_outgoing(&line)
-            .await
-            .expect("parse reused request event");
-        let nefor_protocol::Body::Event(body) = outgoing.body else {
-            panic!("expected completion event: {line}");
-        };
-        if body.get("kind").and_then(serde_json::Value::as_str)
-            != Some("mock-plugin.completion.event")
-            || body.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id)
-        {
-            continue;
-        }
-        match body.get("event").and_then(serde_json::Value::as_str) {
-            Some("text_delta") => {}
-            Some("error") => {
-                assert_eq!(
-                    body.get("message").and_then(serde_json::Value::as_str),
-                    Some("Mock provider triggered error on user request."),
-                    "the reused request must be accepted after cancellation",
-                );
-                break;
-            }
-            other => {
-                panic!("cancelled request emitted unexpected terminal event {other:?}: {line}")
-            }
-        }
-    }
-
+async fn finish(mut child: Child, mut stdin: tokio::process::ChildStdin, script: PathBuf) {
     send_shutdown(&mut stdin).await;
     drop(stdin);
     let status = timeout(Duration::from_secs(5), child.wait())
@@ -534,4 +460,150 @@ async fn production_completion_cancel_settles_request_without_terminal_result() 
         .expect("exit in time")
         .expect("wait");
     assert!(status.success(), "plugin did not exit cleanly: {status:?}");
+    cleanup(&script);
+}
+
+/// `libs.mock-provider` uses the same stateless direct-completion contract as
+/// openai-provider: history arrives on each correlated request, and a hard
+/// cancellation suppresses that request's terminal result. The cancellation
+/// handler must nevertheless settle its registry entry immediately so the
+/// correlation id can be reused without racing the detached stream task.
+#[tokio::test]
+async fn mock_provider_cancel_settles_request_without_terminal_result() {
+    let (child, mut stdin, mut reader, script) = spawn_mock_provider(
+        "provider-cancel",
+        r#"
+        local mock = require("libs.mock-provider")
+        mock.serve {
+          pace_ms = 20,
+          respond = function(request)
+            local prompt = request.messages[#request.messages].content
+            if prompt == "fail" then return mock.error("scripted failure") end
+            return mock.text(string.rep("streamed text ", 40))
+          end,
+        }
+        "#,
+    )
+    .await;
+
+    let request_id = "cancel-and-reuse-1";
+    send_event(
+        &mut stdin,
+        serde_json::json!({
+            "kind": "mock-plugin.completion.request",
+            "request_id": request_id,
+            "request": {"input": {"messages": [{"role": "user", "content": "stream"}]}}
+        }),
+    )
+    .await;
+
+    // Three correlated deltas establish that the request is actively
+    // streaming through yield points, rather than merely queued.
+    for _ in 0..3 {
+        let body = next_completion_event(&mut reader, request_id).await;
+        assert_eq!(
+            body.get("event").and_then(serde_json::Value::as_str),
+            Some("text_delta")
+        );
+    }
+
+    send_event(
+        &mut stdin,
+        serde_json::json!({"kind": "mock-plugin.completion.cancel", "request_id": request_id}),
+    )
+    .await;
+
+    // Reusing the id is the protocol-visible settlement probe. The new error
+    // request must be accepted; "already in flight" would prove cancellation
+    // left stale ownership behind. The cancelled request itself must not emit
+    // usage or a successful terminal result.
+    send_event(
+        &mut stdin,
+        serde_json::json!({
+            "kind": "mock-plugin.completion.request",
+            "request_id": request_id,
+            "request": {"input": {"messages": [{"role": "user", "content": "fail"}]}}
+        }),
+    )
+    .await;
+
+    loop {
+        let body = next_completion_event(&mut reader, request_id).await;
+        match body.get("event").and_then(serde_json::Value::as_str) {
+            Some("text_delta") => {}
+            Some("error") => {
+                assert_eq!(
+                    body.get("message").and_then(serde_json::Value::as_str),
+                    Some("scripted failure"),
+                    "the reused request must be accepted after cancellation",
+                );
+                break;
+            }
+            other => panic!("cancelled request emitted unexpected terminal event {other:?}"),
+        }
+    }
+
+    finish(child, stdin, script).await;
+}
+
+/// The behavior sees the request's system and messages unchanged, tool-call
+/// responses complete without deltas, and a behavior fault becomes a
+/// correlated completion error instead of a silent hang.
+#[tokio::test]
+async fn mock_provider_completes_tool_calls_and_reports_behavior_faults() {
+    let (child, mut stdin, mut reader, script) = spawn_mock_provider(
+        "provider-tools",
+        r#"
+        local mock = require("libs.mock-provider")
+        mock.serve {
+          respond = function(request)
+            local last = request.messages[#request.messages]
+            if last.content == "boom" then error("scenario has no answer") end
+            return mock.tool_call("read_file", { path = request.system .. "/" .. last.content })
+          end,
+        }
+        "#,
+    )
+    .await;
+
+    send_event(
+        &mut stdin,
+        serde_json::json!({
+            "kind": "mock-plugin.completion.request",
+            "request_id": "tools-1",
+            "request": {"system": "docs", "input": {"messages": [{"role": "user", "content": "README.md"}]}}
+        }),
+    )
+    .await;
+    let usage = next_completion_event(&mut reader, "tools-1").await;
+    assert_eq!(usage["event"], "usage");
+    let completed = next_completion_event(&mut reader, "tools-1").await;
+    assert_eq!(completed["event"], "completed");
+    let result = &completed["result"];
+    assert_eq!(result["finish_reason"], "tool_calls");
+    assert_eq!(result["tool_calls"][0]["name"], "read_file");
+    assert_eq!(
+        result["tool_calls"][0]["arguments"]["path"],
+        "docs/README.md"
+    );
+    assert!(result["tool_calls"][0]["id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+
+    send_event(
+        &mut stdin,
+        serde_json::json!({
+            "kind": "mock-plugin.completion.request",
+            "request_id": "fault-1",
+            "request": {"input": {"messages": [{"role": "user", "content": "boom"}]}}
+        }),
+    )
+    .await;
+    let fault = next_completion_event(&mut reader, "fault-1").await;
+    assert_eq!(fault["event"], "error");
+    assert!(fault["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("scenario has no answer")));
+
+    finish(child, stdin, script).await;
 }

@@ -91,6 +91,15 @@ impl LuaHost {
         &self.inner.lua
     }
 
+    /// Prepend `<root>/?.lua;<root>/?/init.lua` to `package.path`.
+    pub fn prepend_package_path(&self, root: &std::path::Path) -> Result<(), MockError> {
+        let package: Table = self.inner.lua.globals().get("package")?;
+        let current: String = package.get("path")?;
+        let root = root.display();
+        package.set("path", format!("{root}/?.lua;{root}/?/init.lua;{current}"))?;
+        Ok(())
+    }
+
     /// Execute the user script.
     pub async fn exec_script(&self, name: &str, source: &str) -> Result<(), MockError> {
         self.inner
