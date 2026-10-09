@@ -120,6 +120,10 @@ test-provider:
 test-openai-provider target="openai_provider_default" *args:
     cargo test -p openai-provider --features full-tests --test {{target}} {{args}}
 
+# One ChatGPT-provider integration target with optional filters.
+test-chatgpt-provider target *args:
+    cargo test -p chatgpt-provider --features full-tests --test {{target}} {{args}}
+
 # Real engine + tool-gate + ChatGPT provider against a deterministic local web endpoint.
 test-routed-web-e2e:
     cargo build -p nefor -p tool-gate-plugin -p chatgpt-provider

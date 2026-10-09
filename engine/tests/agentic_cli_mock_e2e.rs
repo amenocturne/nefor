@@ -919,7 +919,7 @@ end)
 }
 
 #[test]
-fn oversized_real_tool_result_routes_small_failure_and_later_work() {
+fn noisy_real_tool_result_is_bounded_omitted_and_accepts_later_work() {
     let dir = isolated_starter("tool-output-admission-");
     let turn = dir.join("fixture-config/agentic-loop/lead-turn.mag");
     let turn_source = std::fs::read_to_string(&turn).unwrap();
@@ -935,10 +935,13 @@ fn oversized_real_tool_result_routes_small_failure_and_later_work() {
     std::fs::write(dir.join("README.md"), "later operation").unwrap();
     let source = source.replace(
         "  -- Tool-result relay for the new interactive triggers.",
-        r#"  if last_tool ~= nil and tostring(last_tool):find("frame_too_large", 1, true)
+        r#"  if last_tool ~= nil and not tostring(last_tool):find("later operation", 1, true)
       and string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
     return {text="", finish_reason="tool_calls", tool_calls={{
       id=mint_tool_id("later"), name="read_file", arguments={path="README.md"}}}}
+  end
+  if last_tool ~= nil and string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
+    return {text="bounded result and later operation completed", finish_reason="stop"}
   end
   -- Tool-result relay for the new interactive triggers."#,
     );
@@ -977,11 +980,8 @@ fn oversized_real_tool_result_routes_small_failure_and_later_work() {
             .join(format!("{session}.jsonl")),
     )
     .unwrap();
-    assert!(
-        persisted.contains("frame_too_large"),
-        "native small admission failure must reach canonical tool result"
-    );
-    assert!(persisted.contains("effects may have occurred"));
+    assert!(persisted.contains("bytes of output omitted"));
+    assert!(!persisted.contains("frame_too_large"));
     let trace = std::fs::read_to_string(dir.join("boundary-trace.jsonl")).unwrap();
     let trace = trace
         .lines()
@@ -1001,9 +1001,20 @@ fn oversized_real_tool_result_routes_small_failure_and_later_work() {
         })
         .collect::<Vec<_>>();
     assert_eq!(native.len(), 1);
+    let process = &native[0]["body"]["output"];
+    let bounded = serde_json::to_string(process).unwrap();
+    let text = process["stdout"].as_str().unwrap();
+    assert!(text.contains("16777216 bytes of output omitted"));
+    assert!(text.starts_with(&"x".repeat(512 * 1024)));
+    assert!(text.ends_with(&"x".repeat(512 * 1024)));
+    assert!(bounded.len() < 2 * 1024 * 1024);
+    assert!(native[0]["body"]["error"].is_null());
     assert!(
-        native[0]["body"]["output"].is_null(),
-        "no giant native terminal was admitted"
+        trace
+            .iter()
+            .any(|row| row["body"]["kind"] == "basic-tools.tool.invoke"
+                && row["body"]["name"] == "read_file"),
+        "later work in same physical tool process"
     );
     assert!(trace.iter().any(|row| row["from"] == "tool-gate"
         && row["body"]["kind"] == "tool.result"
@@ -1174,12 +1185,10 @@ fn accepted_real_mag_giant_join_has_small_authoritative_terminal() {
     let source = std::fs::read_to_string(&script).unwrap();
     let start = source.find("local CANNED_MAG_PROGRAM = [=[").unwrap();
     let end = start + source[start..].find("]=]").unwrap() + 3;
-    let program = r#"local CANNED_MAG_PROGRAM = [=[
-import nefor.{compile_graph, script, ShellScriptParams, Timeout, &&&}
-let left = script("left", ShellScriptParams {script: "head -c 9437184 /dev/zero | tr '\\000' x", cwd: ".", timeout: named(Timeout, Seconds, 10)})
-let right = script("right", ShellScriptParams {script: "head -c 9437184 /dev/zero | tr '\\000' y", cwd: ".", timeout: named(Timeout, Seconds, 10)})
-compile_graph(left &&& right)
-]=]"#;
+    let branches = (0..18).map(|index| format!(
+        "script(\"branch-{index}\", ShellScriptParams {{script: \"head -c 9437184 /dev/zero | tr '\\\\000' x\", cwd: \".\", timeout: named(Timeout, Seconds, 10)}})"
+    )).collect::<Vec<_>>().join(",\n");
+    let program = format!("local CANNED_MAG_PROGRAM = [=[\nimport nefor.{{compile_graph, script, ShellScriptParams, Timeout, sequence}}\ncompile_graph(sequence([{branches}]))\n]=]");
     std::fs::write(
         script,
         format!("{}{}{}", &source[..start], program, &source[end..]),
