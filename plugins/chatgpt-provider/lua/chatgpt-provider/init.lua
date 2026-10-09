@@ -1,5 +1,6 @@
 local oa = require("openai-provider")
 local json_data = require("core.json_data")
+local tool = require("libs.tool")
 
 local function copy(value)
   return json_data.copy(value or {})
@@ -79,13 +80,18 @@ end
 
 local citation_guidance = " When citing web sources in a user-facing answer, use regular Markdown links with URLs returned by these tools. Raw OpenAI citation markers are not rendered in this interface, so do not use them as citations. Keep opaque source IDs for tool navigation."
 
-local function tools(provider)
-  assert(type(provider) == "string" and #provider > 0,
-    "chatgpt-provider.tools: provider required")
-
-  local routed = { kind = "routed" }
+-- Model-facing definitions for the routed web reads. Argument validation is
+-- the constructor's closed-schema check; `handle(name, args, call)` only lowers
+-- already-valid arguments into the private provider command.
+local function definitions(handle)
+  local function define(spec)
+    spec.execution = { kind = "routed" }
+    local name = spec.name
+    spec.handler = function(args, call) return handle(name, args, call) end
+    return tool.define(spec)
+  end
   return {
-    {
+    define {
       name = "web_search",
       description = "Search the public web. Use separate calls for separate queries." .. citation_guidance,
       parameters = query_schema(),
@@ -94,10 +100,8 @@ local function tools(provider)
         field("recency days", "args", "recency_days", "scalar", "missing"),
         field("domains", "args", "domains", "list", "missing"),
       }),
-      access = "read",
-      execution = copy(routed),
     },
-    {
+    define {
       name = "web_open",
       description = "Open a URL or web result reference, optionally near a zero-indexed line number." .. citation_guidance,
       parameters = object_schema({
@@ -109,10 +113,8 @@ local function tools(provider)
         field("page", "args", "url", "path", "missing"),
         field("line (zero-indexed)", "args", "line", "scalar", "missing"),
       }),
-      access = "read",
-      execution = copy(routed),
     },
-    {
+    define {
       name = "web_click",
       description = "Open a numbered link from a URL or provider-issued web result reference." .. citation_guidance,
       parameters = object_schema({
@@ -127,10 +129,8 @@ local function tools(provider)
         field("page", "args", "url", "path", "missing"),
         field("link", "args", "link", "scalar", "missing"),
       }),
-      access = "read",
-      execution = copy(routed),
     },
-    {
+    define {
       name = "web_find",
       description = "Find text within a URL or provider-issued web result reference." .. citation_guidance,
       parameters = object_schema({
@@ -146,10 +146,8 @@ local function tools(provider)
         field("pattern", "args", "pattern", "scalar", "missing"),
         field("page", "args", "url", "path", "missing"),
       }),
-      access = "read",
-      execution = copy(routed),
     },
-    {
+    define {
       name = "web_image_search",
       description = "Search the public web for images. This remains an image query on the provider wire." .. citation_guidance,
       parameters = query_schema(),
@@ -158,10 +156,8 @@ local function tools(provider)
         field("recency days", "args", "recency_days", "scalar", "missing"),
         field("domains", "args", "domains", "list", "missing"),
       }),
-      access = "read",
-      execution = copy(routed),
     },
-    {
+    define {
       name = "web_screenshot",
       description = "Request a zero-indexed PDF page screenshot. Open the PDF with web_open first, then pass the provider-issued PDF reference returned in its output; direct PDF URLs may not resolve. The endpoint currently returns plaintext and opaque references, not proven image media." .. citation_guidance,
       parameters = object_schema({
@@ -176,8 +172,6 @@ local function tools(provider)
         field("page reference", "args", "url", "path", "missing"),
         field("page (zero-indexed)", "args", "page", "scalar", "missing"),
       }),
-      access = "read",
-      execution = copy(routed),
     },
   }
 end
@@ -195,79 +189,18 @@ local function nonempty(value)
   return type(value) == "string" and value ~= ""
 end
 
-local function nonnegative_integer(value)
-  return type(value) == "number" and value >= 0 and value % 1 == 0
-end
-
-local function dense_string_list(value)
-  if type(value) ~= "table" or json_data.is_array(value) == false then return false end
-  for _, item in ipairs(value) do
-    if not nonempty(item) then return false end
-  end
-  return true
-end
-
-local function reject_unknown(args, allowed)
-  for key, _ in pairs(args) do
-    if not allowed[key] then return nil, "unknown argument `" .. tostring(key) .. "`" end
-  end
-  return true
-end
-
-local function lower_query(args)
-  local ok, err = reject_unknown(args, { query = true, recency_days = true, domains = true })
-  if not ok then return nil, err end
-  if not nonempty(args.query) then return nil, "argument `query` must be a non-empty string" end
-  if args.recency_days ~= nil and not nonnegative_integer(args.recency_days) then
-    return nil, "argument `recency_days` must be a non-negative integer"
-  end
-  if args.domains ~= nil and not dense_string_list(args.domains) then
-    return nil, "argument `domains` must be an array of non-empty strings"
-  end
-  local command = { q = args.query }
-  if args.recency_days ~= nil then command.recency = args.recency_days end
-  if args.domains ~= nil then command.domains = copy(args.domains) end
-  return command
-end
-
+-- Lower schema-validated arguments into the provider's command shape.
 local function lower_operation(name, args)
-  if type(args) ~= "table" or json_data.is_array(args) then
-    return nil, "arguments must be a JSON object"
-  end
-  if name == "web_search" or name == "web_image_search" then return lower_query(args) end
-  if name == "web_open" then
-    local ok, err = reject_unknown(args, { url = true, line = true })
-    if not ok then return nil, err end
-    if not nonempty(args.url) then return nil, "argument `url` must be a non-empty string" end
-    if args.line ~= nil and not nonnegative_integer(args.line) then
-      return nil, "argument `line` must be a non-negative integer"
-    end
-    local command = { ref_id = args.url }
-    if args.line ~= nil then command.lineno = args.line end
+  if name == "web_search" or name == "web_image_search" then
+    local command = { q = args.query }
+    if args.recency_days ~= nil then command.recency = args.recency_days end
+    if args.domains ~= nil then command.domains = copy(args.domains) end
     return command
   end
-  if name == "web_click" then
-    local ok, err = reject_unknown(args, { url = true, link = true })
-    if not ok then return nil, err end
-    if not nonempty(args.url) then return nil, "argument `url` must be a non-empty string" end
-    if not nonnegative_integer(args.link) then return nil, "argument `link` must be a non-negative integer" end
-    return { ref_id = args.url, id = args.link }
-  end
-  if name == "web_find" then
-    local ok, err = reject_unknown(args, { url = true, pattern = true })
-    if not ok then return nil, err end
-    if not nonempty(args.url) then return nil, "argument `url` must be a non-empty string" end
-    if not nonempty(args.pattern) then return nil, "argument `pattern` must be a non-empty string" end
-    return { ref_id = args.url, pattern = args.pattern }
-  end
-  if name == "web_screenshot" then
-    local ok, err = reject_unknown(args, { url = true, page = true })
-    if not ok then return nil, err end
-    if not nonempty(args.url) then return nil, "argument `url` must be a non-empty string" end
-    if not nonnegative_integer(args.page) then return nil, "argument `page` must be a non-negative integer" end
-    return { ref_id = args.url, pageno = args.page }
-  end
-  return nil, "unsupported routed web tool `" .. tostring(name) .. "`"
+  if name == "web_open" then return { ref_id = args.url, lineno = args.line } end
+  if name == "web_click" then return { ref_id = args.url, id = args.link } end
+  if name == "web_find" then return { ref_id = args.url, pattern = args.pattern } end
+  return { ref_id = args.url, pageno = args.page }
 end
 
 local function stable_scope(invocation)
@@ -287,7 +220,6 @@ local function translator(name, options)
   local base_inbound = t.inbound
   options = options or {}
   local trusted_tool_gate = options.tool_gate
-  local pending_web = {}
 
   t.kinds.completion_request = prefix .. "completion.request"
   t.kinds.completion_cancel = prefix .. "completion.cancel"
@@ -329,23 +261,22 @@ local function translator(name, options)
     return { kind = t.kinds.completion_cancel, request_id = request_id }
   end
 
-  t.web_request = function(body)
-    if type(body) ~= "table" then return nil end
-    local tool_name = body.name
-    if WEB_COMMANDS[tool_name] == nil then return nil end
-    if not nonempty(body.id) then return nil end
-
-    local operation, err = lower_operation(tool_name, body.args or {})
+  -- The routed web tools. A valid invocation's handler lowers it into the
+  -- private web request that `inbound` returns for delivery to the provider
+  -- process; invalid arguments settle from this source without reaching Rust.
+  local lowered = nil
+  local function handle(tool_name, args, call)
+    local body = call.request
     local invocation = type(body.invocation) == "table" and body.invocation or nil
     local invocation_provider = invocation and invocation.provider or nil
     if nonempty(invocation_provider) and invocation_provider ~= name then
-      operation = nil
-      err = "routed web tools owned by `" .. name
-        .. "` cannot execute an invocation for provider `" .. invocation_provider .. "`"
+      call.err("routed web tools owned by `" .. name
+        .. "` cannot execute an invocation for provider `" .. invocation_provider .. "`")
+      return
     end
-    local request = {
+    lowered = {
       kind = t.kinds.web_request,
-      id = body.id,
+      id = call.id,
       caller_id = body.caller_id,
       invoking_from = body.from,
       name = tool_name,
@@ -353,22 +284,14 @@ local function translator(name, options)
       scope = stable_scope(invocation),
       invocation = invocation and copy(invocation) or nil,
       settings = { allowed_callers = { "direct" }, external_web_access = true },
+      commands = { [WEB_COMMANDS[tool_name]] = { lower_operation(tool_name, args) } },
     }
-    if operation then
-      request.commands = { [WEB_COMMANDS[tool_name]] = { operation } }
-    else
-      request.validation_error = "invalid arguments for `" .. tool_name .. "`: " .. tostring(err)
-    end
-    if invocation then
-      pending_web[body.id] = {
-        caller_id = request.caller_id,
-        invoking_from = request.invoking_from,
-        model = request.model,
-        invocation = copy(invocation),
-      }
-    end
-    return request
   end
+  t.tool_source = tool.source {
+    name = name,
+    tools = definitions(handle),
+    emit = function(body) t.publish(name, body) end,
+  }
 
   -- Interpret provider-owned checkpoints here, at the provider boundary.
   t.compact_context = function(change)
@@ -416,19 +339,24 @@ local function translator(name, options)
       if body.kind == t.kinds.completion_request or body.kind == "ProviderRequest" then return nil end
       if body.kind == prefix .. "tool.invoke" then
         if not nonempty(trusted_tool_gate) or env.from ~= trusted_tool_gate then return nil end
-        return t.web_request(body)
+        lowered = nil
+        t.tool_source.invoke(body)
+        local request = lowered
+        lowered = nil
+        return request
       end
       if body.kind == prefix .. "tool.cancel" and nonempty(body.id) then
         if not nonempty(trusted_tool_gate) or env.from ~= trusted_tool_gate then return nil end
-        local pending = pending_web[body.id]
-        if not pending then return nil end
+        local call = t.tool_source.cancel(body)
+        local request = call and call.request
+        if not request or type(request.invocation) ~= "table" then return nil end
         return {
           kind = t.kinds.web_cancel,
           id = body.id,
-          caller_id = pending.caller_id,
-          invoking_from = pending.invoking_from,
-          model = pending.model,
-          invocation = copy(pending.invocation),
+          caller_id = request.caller_id,
+          invoking_from = request.from,
+          model = request.model or request.invocation.model,
+          invocation = copy(request.invocation),
         }
       end
     end
@@ -442,8 +370,7 @@ local function translator(name, options)
 
     if kind == t.kinds.web_result then
       if not nonempty(body.id) then return nil end
-      pending_web[body.id] = nil
-      local result = { kind = "tool.result", id = body.id }
+      local result = {}
       if body.error ~= nil then result.error = body.error end
       if type(body.output) == "table" then
         result.output = copy(body.output)
@@ -451,7 +378,8 @@ local function translator(name, options)
         result.error = "web result missing output"
       end
       if body.provider_state ~= nil then result.provider_state = copy(body.provider_state) end
-      return result
+      t.tool_source.result(body.id, result)
+      return nil
     end
     if kind == t.kinds.completion_event then
       if type(body.request_id) ~= "string" or #body.request_id == 0 then return nil end
@@ -493,4 +421,4 @@ local function translator(name, options)
   return t
 end
 
-return { translator = translator, tools = tools }
+return { translator = translator }

@@ -2047,9 +2047,6 @@ async fn handle_web_request(
         Ok(provenance) => provenance,
         Err(error) => return send_web_error(ctx, Some(&id), error).await,
     };
-    if let Some(error) = body.get("validation_error").and_then(Value::as_str) {
-        return send_web_error(ctx, Some(&id), error.to_owned()).await;
-    }
     let command = match body.get("commands") {
         Some(commands) => match WebCommand::from_commands(commands) {
             Ok(command) => command,

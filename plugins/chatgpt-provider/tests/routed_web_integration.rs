@@ -399,19 +399,12 @@ async fn validation_errors_return_without_http() {
                 ),
                 ("model".into(), Value::String("gpt-test".into())),
                 ("invocation".into(), invocation()),
-                (
-                    "validation_error".into(),
-                    Value::String("invalid arguments for `web_open`: missing url".into()),
-                ),
             ]),
         )))
         .await
         .expect("validation request");
     let result = wait_for_web_result(&mut out_rx, "gate-bad").await;
-    assert_eq!(
-        result["error"],
-        "invalid arguments for `web_open`: missing url"
-    );
+    assert_eq!(result["error"], "web request missing `commands`");
 
     let direct = event_env_from(
         "direct-attacker",

@@ -46,7 +46,8 @@ structured output, and reasoning controls each enter through their one wire
 representation. Events carry only counts and accuracy, never request content.
 Aggregate input/output usage remains separate from current request occupancy.
 
-The provider advertises six ordinary routed read tools through the
+The provider's Lua adapter defines six ordinary routed read tools with the
+shared `libs.tool` constructor and advertises them through the
 composition-selected tool gate: `web_search`, `web_open`, `web_click`,
 `web_find`, `web_image_search`, and `web_screenshot`. They are ordinary
 function tools in Responses requests. When invoked, the gate routes them back
@@ -63,8 +64,10 @@ Successful results preserve the endpoint's exact plaintext output, optional
 opaque result JSON, and opaque encrypted provider state. Empty text remains
 empty. Errors remain specific and are returned as ordinary tool errors; an
 observed screenshot-resolution diagnostic can carry both the error marker and
-the unchanged provider output as evidence. Invalid Lua arguments are rejected
-before HTTP. `web_image_search` remains `image_query`. For `web_screenshot`,
+the unchanged provider output as evidence. Arguments are checked against each
+tool's closed schema in Lua; invalid calls settle there with the constructor's
+uniform error (for example ``web_open: unknown argument `foo`; accepted
+arguments: url, line``) and never reach this process. `web_image_search` remains `image_query`. For `web_screenshot`,
 open the PDF first and pass the provider-issued PDF reference from that output;
 direct PDF URLs may fail semantically even with HTTP 200. A resolved screenshot
 currently returns plaintext plus an opaque reference, not image bytes, so media
