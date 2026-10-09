@@ -144,15 +144,24 @@ function M.construct(id, params, emit, deps)
   provider_params.tools[#provider_params.tools + 1] = "submit_output"
   provider_params.tool_specs = {
     { name = "write_output", owner = "mag-runtime", execution = { kind = "routed" },
-      description = "Create or edit this activation's private output draft. The runtime supplies its schema and path. Without old_string, replace the whole draft; with old_string, replace exactly one matching substring. validate defaults to false. true saves first, then validates the complete resulting canonical MAG JSON (no provider-only root value envelope). Invalid edited contents remain saved for repair. A failed edit leaves the file unchanged and does not validate. Validation returns structured diagnostics and never completes the activation; submit_output separately to finish.",
+      description =
+        "Writes your result draft: the JSON value of your result for this assignment. It must match this schema:\n"
+        .. json_encode(output_schema) .. "\n\n"
+        .. "- new_string only: replaces the whole draft.\n"
+        .. "- old_string and new_string: replaces the single exact occurrence of old_string. If it occurs zero or several times, the draft is unchanged and an error is returned.\n\n"
+        .. "With validate: true, the saved draft is also checked against the schema and any problems are returned. Validation does not submit anything; an invalid draft stays saved so it can be fixed. Submit with submit_output.",
       parameters = { type = "object", additionalProperties = false, required = { "new_string" },
         properties = {
           new_string = { type = "string", description = "Whole draft contents when old_string is absent, or literal replacement text for its unique match." },
           old_string = { type = "string", description = "Optional literal substring to replace. It must occur exactly once in the existing draft; zero or multiple matches fail without changing it." },
-          validate = { type = "boolean", default = false, description = "Defaults false: save without validation while building an incomplete draft. Set true when expecting a complete result: save the edit then validate the whole saved draft. Invalid JSON/schema contents stay saved; validation success does not submit or finish." },
+          validate = { type = "boolean", default = false, description = "Also check the saved draft against the schema. Defaults to false." },
         } } },
     { name = "submit_output", owner = "mag-runtime", execution = { kind = "routed" },
-      description = "Finish this activation by submitting its current private draft. Call with {} as the sole tool call in the model response. The runtime rereads and validates canonical MAG JSON against its supplied schema, then captures the accepted snapshot and completes without another model call. No path, schema, body or prior successful validation is required. Failures return structured repair diagnostics and keep the activation open. When batched with any other call, submission is rejected while other permitted calls run; use write_output with validate:true for immediate edit feedback, then submit separately.",
+      description =
+        "Submits your result draft and finishes the assignment. The draft is checked against the schema given in write_output. "
+        .. "If it matches, it becomes your result and your work on this assignment ends. If not, nothing is submitted, "
+        .. "the problems are returned, and you can fix the draft with write_output and submit again.\n\n"
+        .. "Takes no arguments. It is accepted only as the only tool call in a response; alongside other calls it is rejected and the other calls still run.",
       parameters = { type = "object", additionalProperties = false, properties = {} } },
   }
   local function receipt(operation, status, extra)
@@ -254,12 +263,6 @@ function M.construct(id, params, emit, deps)
       last_output = nefor.json.decode("null")
       directory = nefor.fs.data_root() .. "/output-drafts/" .. nefor.opaque_id()
       draft = directory .. "/output.json"
-      state:append({ role = "system", content = "This activation produces a typed result. Its private draft is " .. draft
-        .. ". Expected canonical MAG JSON schema: " .. json_encode(output_schema)
-        .. ". Write the value directly, without a provider-only root {\"value\":...} envelope. "
-        .. "Use write_output to build or repair it. validate defaults false; true saves then validates the complete draft, retaining invalid edited contents. "
-        .. "Validation does not complete this activation. Finish by calling submit_output({}) alone in a separate response. "
-        .. 'Example: write_output({"new_string":"{\\\"count\\\":1}","validate":true}); if needed edit with old_string and new_string, then submit_output({}) in the next response. Follow the supplied schema, not this generic example.' })
     end,
     on_final = function(state, result)
       last_output = result

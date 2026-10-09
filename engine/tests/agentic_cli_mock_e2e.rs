@@ -675,10 +675,10 @@ fn shipped_mock_keeps_submission_receipts_within_activation() {
         .unwrap();
     lua.globals().set("select_typed", select).unwrap();
     lua.load(r#"
-        local instruction = {role="system",content='Expected canonical MAG JSON schema: {"type":"object","properties":{"content":{"type":"string"}}}. Write the value directly'}
+        local instruction = {role="user",content="assignment"}
         local valid = {role="tool",name="write_output",content={write="saved",validation={status="valid"}}}
         local invalid = {role="tool",name="write_output",content={write="saved",validation={status="invalid"}}}
-        local request = {tools={"write_output","submit_output"}}
+        local request = {tools={"write_output","submit_output"},tool_specs={{name="write_output",description='It must match this schema:\n{"type":"object","properties":{"content":{"type":"string"}}}\n\n- new_string only'}}}
         assert(select_typed(request, {instruction,valid}).tool_calls[1].name == "submit_output")
         assert(select_typed(request, {instruction,valid,invalid}).tool_calls[1].name == "write_output")
         assert(select_typed(request, {instruction,valid,instruction}).tool_calls[1].name == "write_output")

@@ -83,14 +83,12 @@ local request = last(out, "capability.invoke").request
 assert(request.output_schema == nil and #request.tools == 2 and #request.tool_specs == 2)
 assert(request.tool_specs[1].parameters.properties.validate.default == false)
 assert(request.tool_specs[1].parameters.properties.new_string.description:find("Whole draft", 1, true))
-assert(request.tool_specs[2].description:find("sole tool call", 1, true))
-local example
+assert(request.tool_specs[2].description:find("only tool call in a response", 1, true))
+local described = request.tool_specs[1].description:match("It must match this schema:\n(.-)\n\n")
+assert(described and nefor.json.decode(described).type ~= nil, "write_output carries the activation's result schema")
 for _, f in ipairs(facts) do
-  if f.kind == "content_chunk_appended" and f.chunk.kind == "text" then
-    example = example or f.chunk.data:match('Example: write_output%((.-)%);')
-  end
+  assert(not (f.kind == "message_started" and f.role == "system"), "typed activation adds no system instruction")
 end
-assert(example and nefor.json.decode(example).new_string == '{"count":1}')
 -- Malformed native arguments quarantine the entire batch before any draft edit.
 local original_request = last(out, "capability.invoke").ref
 reply(actor, out, {call("write_output", {new_string = "must not write"}), {id = "bad", name = "submit_output", arguments = "["}})

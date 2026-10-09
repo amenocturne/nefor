@@ -819,19 +819,19 @@ local function typed_response(request, history)
   local typed = false
   for _, name in ipairs(request.tools or {}) do if name == "write_output" then typed = true end end
   if not typed then return nil end
-  local schema, instruction_index
-  for i = #history, 1, -1 do
-    local message = history[i]
-    if message.role == "system" and type(message.content) == "string" then
-      local encoded = message.content:match("Expected canonical MAG JSON schema: (.-)%. Write the value directly")
-      if encoded then
-        schema = nefor.json.decode(encoded)
-        instruction_index = i
-        break
-      end
+  local schema
+  for _, spec in ipairs(request.tool_specs or {}) do
+    if spec.name == "write_output" and type(spec.description) == "string" then
+      local encoded = spec.description:match("It must match this schema:\n(.-)\n\n")
+      if encoded then schema = nefor.json.decode(encoded) end
     end
   end
-  assert(schema, "typed mock request requires runtime output schema instructions")
+  assert(schema, "typed mock request requires the write_output result schema")
+  -- The latest assignment message opens the current activation.
+  local instruction_index = 0
+  for i = #history, 1, -1 do
+    if history[i].role == "user" then instruction_index = i; break end
+  end
   for i = #history, instruction_index + 1, -1 do
     local message = history[i]
     if message.role == "tool" and message.name == "write_output" then

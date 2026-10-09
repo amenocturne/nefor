@@ -466,9 +466,8 @@ ordered completion consumer.
 Typed agents use the `structured-output` provider boundary; nominal `TextAnswer`
 keeps direct terminal prose completion. The runtime consumes the unchanged MAG
 `type_schema` descriptor and canonical `TypeSchema.to_json_schema` and
-`validate_json` APIs. Draft JSON encodes the output type directly, without the
-provider-only root `{"value": ...}` envelope. Native final-response schema
-forcing is absent for these workers.
+`validate_json` APIs. Draft JSON encodes the output type directly. Native
+final-response schema forcing is absent for these workers.
 
 Each activation owns a private draft and intrinsic result tools even with
 `tools: []`. `write_output({new_string, old_string?, validate?})` replaces the
@@ -495,9 +494,10 @@ rounds in the same activation. Cancellation and drain remain terminal lifecycle
 controls. Genuine provider failures retain `AgentError` with `ProviderError`
 and the last provider output; correction exhaustion is no longer a result.
 
-Runtime instructions and request-local definitions own this protocol, including
-parameter descriptions and an edit/validate/submit example. Distribution role
-prompts need no duplicate contract. Result tools coexist with the normal tool
+The request-local tool definitions own this protocol: `write_output`'s
+description carries the activation's result schema, and the runtime adds no
+separate instruction message. Distribution role prompts need no duplicate
+contract. Result tools coexist with the normal tool
 catalog; conflicting tool names fail explicitly rather than shadowing.
 
 The canonical constructor is `nefor.actors.agent`, generic over the
