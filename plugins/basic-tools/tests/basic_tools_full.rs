@@ -148,6 +148,43 @@ mod tools {
                 );
             }
 
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn timeout_includes_descendant_pipes_after_leader_exit() {
+                let directory = tempfile::tempdir().unwrap();
+                let descendant = directory.path().join("descendant");
+                let script = format!(
+                    "printf started; sleep 30 & echo $! > {}; exit 0",
+                    descendant.display()
+                );
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    run(&json!({
+                        "argv": ["/bin/sh", "-c", script], "cwd": "/",
+                        "timeout": {"present": true, "milliseconds": 100}
+                    })),
+                )
+                .await
+                .expect("deadline survives leader exit")
+                .unwrap_err();
+                assert!(
+                    matches!(error, ToolError::ProcessTimeout {timeout_ms:100, stdout, stderr}
+                    if stdout == "started" && stderr.is_empty())
+                );
+                let pid: i32 = std::fs::read_to_string(descendant)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while unsafe { libc::kill(pid, 0) } != -1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("descendant does not survive timeout");
+            }
+
             #[tokio::test]
             async fn streams_stdout_and_stderr_independently() {
                 let preview = std::sync::Arc::new(process::LivePreview::default());
@@ -595,7 +632,11 @@ mod producer_failure_tests {
             };
         input.send(Ok(envelope(active))).await.unwrap();
         timeout(Duration::from_secs(2), async {
-            while !pid_path.exists() {
+            while std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_none()
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -631,7 +672,11 @@ mod producer_failure_tests {
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
         let task = spawn_tool_invoke(&out, &body, &cancels);
         timeout(Duration::from_secs(2), async {
-            while !pid_path.exists() {
+            while std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_none()
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -652,6 +697,99 @@ mod producer_failure_tests {
             .parse()
             .unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+    #[tokio::test]
+    async fn closed_writer_during_shell_descendant_spawn_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let body = request(
+            "active",
+            &format!("echo $$ > {}; sleep 30", pid_path.display()),
+        );
+        let (out, incoming) = mpsc::channel(4);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let task = spawn_tool_invoke(&out, &body, &cancels);
+        timeout(Duration::from_secs(2), async {
+            while std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(incoming);
+        assert!(matches!(
+            timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(TransportError::WriterClosed)
+        ));
+        assert!(cancels.lock().unwrap().is_empty());
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+    #[tokio::test]
+    async fn closed_writer_reclaims_coordinated_descendant_pipes() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let descendant = directory.path().join("descendant");
+        let body = request(
+            "active",
+            &format!(
+                "sleep 30 & echo $! > {}; echo $$ > {}; wait",
+                descendant.display(),
+                pid_path.display()
+            ),
+        );
+        let (out, incoming) = mpsc::channel(4);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let task = spawn_tool_invoke(&out, &body, &cancels);
+        timeout(Duration::from_secs(2), async {
+            while std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(incoming);
+        assert!(matches!(
+            timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(TransportError::WriterClosed)
+        ));
+        assert!(cancels.lock().unwrap().is_empty());
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let child: i32 = std::fs::read_to_string(descendant)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(child, 0) } != -1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant reclaimed, not only leader");
     }
 }
 
@@ -937,7 +1075,52 @@ mod runtime_cancellation_and_real_frame_tests {
         );
         let task = spawn_tool_invoke(&tx, &body, &cancels);
         timeout(Duration::from_secs(5), async {
-            while !pid.exists() {
+            while std::fs::read_to_string(&pid)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle_tool_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(cancels.lock().unwrap().is_empty());
+        let leader: i32 = std::fs::read_to_string(pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(leader, 0) }, -1);
+    }
+    #[tokio::test]
+    async fn cancellation_interrupts_blocked_shell_descendant_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = directory.path().join("pid");
+        let (tx, _rx) = mpsc::channel(1);
+        send_event(&tx, tool_result_error_body("occupier", "full"))
+            .await
+            .unwrap();
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let body = request(
+            "blocked",
+            &format!("echo $$ > {}; printf first; sleep 30", pid.display()),
+        );
+        let task = spawn_tool_invoke(&tx, &body, &cancels);
+        timeout(Duration::from_secs(5), async {
+            while std::fs::read_to_string(&pid)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_none()
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

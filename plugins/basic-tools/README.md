@@ -148,9 +148,14 @@ immediately before those bytes; marker-like source text is ordinary data.
 The decoder helper defers incomplete UTF-8 suffixes across contiguous spans,
 finishes/resets at an explicit discontinuity, and flushes a partial EOF suffix
 lossily exactly once. Complete invalid sequences use whole-buffer lossy
-replacement semantics. The current wire adapter still decodes each drain
-lossily and renders a textual gap; incremental decoding and machine-observable
-wire gap metadata require the runtime migration.
+replacement semantics. The wire adapter maintains independent incremental
+decoders per stream and publishes explicit `skipped_bytes` alongside textual
+gap markers. The invocation deadline includes pipe and stdin draining after
+the group leader exits. During termination the owner repeats group signalling
+until pipe/stdin tasks finish, retaining partial captures rather than abandoning
+readers held open by a concurrently spawned descendant. Descendants that escape
+the dedicated process group and unconditional OS cleanup guarantees are outside
+this mechanism.
 
 Pipe readers never await the outbound queue. With 8192-byte reads, lazy buffers
 have logical lengths of at most 32KiB pending preview and 512KiB head plus 1MiB

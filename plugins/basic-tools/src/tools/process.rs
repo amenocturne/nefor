@@ -193,7 +193,17 @@ pub async fn execute(
         }
     };
     tokio::pin!(cancelled);
-    let mut outcome = wait_for_outcome(&mut child, request.timeout, &mut cancelled).await;
+    let deadline = async {
+        match request.timeout {
+            Timeout::Unbounded => std::future::pending::<Duration>().await,
+            Timeout::Bounded(duration) => {
+                tokio::time::sleep(duration).await;
+                duration
+            }
+        }
+    };
+    tokio::pin!(deadline);
+    let mut outcome = wait_for_outcome(&mut child, &mut deadline, &mut cancelled).await;
     let reap = if !matches!(outcome, WaitOutcome::Exited(_)) {
         kill_process_group(process_group);
         child
@@ -223,11 +233,16 @@ pub async fn execute(
             _ = &mut cancelled => {
                 kill_process_group(process_group);
                 outcome = WaitOutcome::Cancelled;
-                readers.await?
+                drain_terminated_group(process_group, &mut readers).await?
+            }
+            duration = &mut deadline => {
+                kill_process_group(process_group);
+                outcome = WaitOutcome::TimedOut(duration);
+                drain_terminated_group(process_group, &mut readers).await?
             }
         }
     } else {
-        readers.await?
+        drain_terminated_group(process_group, &mut readers).await?
     };
 
     reap?;
@@ -249,6 +264,25 @@ pub async fn execute(
     }
 }
 
+// A shell can fork concurrently with killpg: a descendant in the still-owned
+// group can survive the first signal and retain the pipes after leader reap.
+// Keep terminating that group until its pipe/stdin tasks finish; do not abort
+// the readers and discard their partial captures or detach surviving work.
+async fn drain_terminated_group<T>(
+    process_group: Option<u32>,
+    readers: &mut (impl std::future::Future<Output = T> + Unpin),
+) -> T {
+    let mut retry = tokio::time::interval(Duration::from_millis(10));
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut *readers => return result,
+            _ = retry.tick() => kill_process_group(process_group),
+        }
+    }
+}
+
 enum WaitOutcome {
     Exited(ExitStatus),
     WaitFailed(std::io::Error),
@@ -258,18 +292,9 @@ enum WaitOutcome {
 
 async fn wait_for_outcome(
     child: &mut Child,
-    timeout: Timeout,
+    deadline: &mut (impl std::future::Future<Output = Duration> + Unpin),
     cancelled: &mut (impl std::future::Future<Output = ()> + Unpin),
 ) -> WaitOutcome {
-    let deadline = async move {
-        match timeout {
-            Timeout::Unbounded => std::future::pending::<Duration>().await,
-            Timeout::Bounded(duration) => {
-                tokio::time::sleep(duration).await;
-                duration
-            }
-        }
-    };
     tokio::select! {
         status = child.wait() => match status {
             Ok(status) => WaitOutcome::Exited(status),

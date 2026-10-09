@@ -60,9 +60,16 @@ async fn main() -> anyhow::Result<()> {
         None => {
             // No subcommand → plugin mode. Engines spawn the binary
             // with `--name`/`--base-url` and we take over stdio.
-            run_serve(ServeArgs::from(&cli))
-                .await
-                .map_err(|e| anyhow::Error::new(e).context("serve loop failed"))
+            let result = run_serve(ServeArgs::from(&cli)).await;
+            // Dispatcher-owned work has settled before serve returns. Tokio's
+            // blocking stdin read cannot be aborted and must not delay exit.
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    tracing::error!(%error, "serve loop failed");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

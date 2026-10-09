@@ -1867,10 +1867,9 @@ async fn full_publisher_queue_backpressures_without_losing_required_deltas() {
 }
 
 /// Writer loss cancels accepted HTTP siblings without further bus input.
-/// Process reap is checked separately AFTER releasing stdin: automatic exit
-/// with a parked stdin reader is a retained, failing acceptance witness.
+/// A parked stdin reader must not delay serve-mode exit after owned work settles.
 #[tokio::test]
-async fn physical_stdout_loss_cancels_http_before_stdin_release_then_reaps() {
+async fn physical_stdout_loss_cancels_http_and_reaps_with_stdin_open() {
     use nefor_protocol::SystemBody;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2014,10 +2013,9 @@ async fn physical_stdout_loss_cancels_http_before_stdin_release_then_reaps() {
             .unwrap(),
         0
     );
-    drop(stdin);
     let status = timeout(wait, child.wait())
         .await
-        .expect("process exit after stdin release")
+        .expect("process exit with stdin held open")
         .unwrap();
     assert!(
         !status.success(),
