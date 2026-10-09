@@ -1,0 +1,47 @@
+{
+  "kind": "tool-gate.tools.advertise",
+  "source": "git-worktree",
+  "tools": [
+    {
+      "name": "git_worktree_create",
+      "description": "Create a fresh Git worktree; existing paths or branches are errors.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repository": { "type": "string" },
+          "path": { "type": "string" },
+          "branch": { "type": "string" },
+          "base": { "type": "string" }
+        },
+        "required": ["repository", "path", "branch", "base"],
+        "additionalProperties": false
+      },
+      "context": {},
+      "display": {
+        "compact": { "label": "create worktree", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
+        "expanded": { "label": "create worktree", "fields": [] },
+        "result": { "kind": "receipt", "text": "worktree created", "fields": [] }
+      }
+    },
+    {
+      "name": "git_worktree_open",
+      "description": "Open and validate an explicitly named existing Git worktree.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repository": { "type": "string" },
+          "path": { "type": "string" },
+          "branch": { "type": "string" }
+        },
+        "required": ["repository", "path", "branch"],
+        "additionalProperties": false
+      },
+      "context": {},
+      "display": {
+        "compact": { "label": "open worktree", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
+        "expanded": { "label": "open worktree", "fields": [] },
+        "result": { "kind": "receipt", "text": "worktree opened", "fields": [] }
+      }
+    }
+  ]
+}

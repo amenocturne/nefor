@@ -1,9 +1,10 @@
 //! Unit tests for the per-plugin Lua libs that still ship Lua source.
 //!
 //! Post Phase-2 shape consolidation:
-//!   * `basic-tools` no longer ships Lua libs —
-//!     their actor-spec wiring is the generic identity passthrough in
-//!     `core.actor.identity_spec`, exercised by `tests/lua/core/actor_test.lua`.
+//!   * `basic-tools` and `git-worktree` ship no plugin-local Lua: their
+//!     tools are `lua/libs/basic-tools` and `lua/libs/git-worktree`, wrapped
+//!     by `libs.compositors.tools.capability_tools_spec` and exercised by
+//!     `tests/lua/tool/capability_tools_test.lua`.
 //!   * `nefor-tui` keeps its widget primitives.
 //!
 //! Each surviving lib lives at `plugins/<plugin>/lua/<plugin>/...`

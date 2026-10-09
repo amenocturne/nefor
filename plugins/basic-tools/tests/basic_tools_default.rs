@@ -17,6 +17,7 @@ mod tools {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use serde_json::json;
 
             fn unbounded() -> Value {
                 json!({ "present": false, "milliseconds": 0 })
@@ -41,6 +42,7 @@ mod tools {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use serde_json::json;
             use std::io::Write;
             use tempfile::NamedTempFile;
 
@@ -378,24 +380,6 @@ mod tools {
                     "`max_bytes` must not exceed the configured maximum of 32768 bytes (requested 32769)"
                 ), "got {err}");
             }
-
-            #[test]
-            fn display_preview_remains_twenty_lines_and_1600_bytes() {
-                let result = display()["result"]["fields"][0].clone();
-                assert_eq!(result["max_lines"], 20);
-                assert_eq!(result["max_bytes"], 1600);
-            }
-
-            #[test]
-            fn schema_has_required_path() {
-                let s = schema();
-                assert_eq!(s.get("type").and_then(Value::as_str), Some("object"));
-                let required = s
-                    .get("required")
-                    .and_then(Value::as_array)
-                    .expect("required");
-                assert!(required.iter().any(|v| v.as_str() == Some("path")));
-            }
         }
     }
 
@@ -409,6 +393,7 @@ mod tools {
         mod tests {
             use super::*;
             use image::ImageEncoder;
+            use serde_json::json;
             use std::io::Write;
             use tempfile::NamedTempFile;
 
@@ -514,17 +499,6 @@ mod tools {
             }
 
             #[test]
-            fn schema_has_required_path() {
-                let s = schema();
-                assert_eq!(s.get("type").and_then(Value::as_str), Some("object"));
-                let required = s
-                    .get("required")
-                    .and_then(Value::as_array)
-                    .expect("required");
-                assert!(required.iter().any(|v| v.as_str() == Some("path")));
-            }
-
-            #[test]
             fn large_png_is_reencoded_under_target_cap() {
                 let width = 2048u32;
                 let height = 2048u32;
@@ -576,6 +550,7 @@ mod tools {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use serde_json::json;
             use tempfile::tempdir;
 
             #[tokio::test]
@@ -646,15 +621,6 @@ mod tools {
                 assert!(matches!(err, ToolError::BadArgs { .. }));
             }
 
-            #[test]
-            fn schema_requires_path_and_new_string() {
-                let s = schema();
-                let req = s.get("required").and_then(Value::as_array).unwrap();
-                let names: Vec<&str> = req.iter().filter_map(Value::as_str).collect();
-                assert!(names.contains(&"path"));
-                assert!(names.contains(&"new_string"));
-            }
-
             #[tokio::test]
             async fn replaces_one_exact_match() {
                 let dir = tempdir().unwrap();
@@ -712,45 +678,20 @@ mod tools {
 
     #[cfg(test)]
     mod tests {
-        use std::collections::HashSet;
-
         use super::*;
 
         #[test]
-        fn actual_advertised_inventory_has_complete_display_coverage() {
-            let expected = [
-                read_file::NAME,
-                read_image::NAME,
-                write_file::NAME,
-                process_exec::NAME,
-                shell_script::NAME,
-            ]
-            .into_iter()
-            .collect::<HashSet<_>>();
-            let actual = TOOLS.iter().map(|tool| tool.name).collect::<HashSet<_>>();
+        fn capability_inventory_is_the_shipped_set() {
             assert_eq!(
-                actual, expected,
-                "update semantic display coverage when the active registry changes"
+                CAPABILITIES,
+                &[
+                    read_file::NAME,
+                    read_image::NAME,
+                    write_file::NAME,
+                    process_exec::NAME,
+                    shell_script::NAME,
+                ]
             );
-            for descriptor in TOOLS {
-                let display = (descriptor.display)();
-                assert!(display.get("compact").is_some(), "{}", descriptor.name);
-                assert!(display.get("expanded").is_some(), "{}", descriptor.name);
-                assert!(display.get("result").is_some(), "{}", descriptor.name);
-            }
-        }
-
-        #[test]
-        fn module_owned_display_functions_compile() {
-            let displays: [fn() -> Value; 5] = [
-                read_file::display,
-                read_image::display,
-                write_file::display,
-                process_exec::display,
-                shell_script::display,
-            ];
-            assert_eq!(displays.len(), TOOLS.len());
-            assert!(displays.into_iter().all(|display| display().is_object()));
         }
     }
 }
@@ -776,60 +717,24 @@ mod tests {
     }
 
     #[test]
-    fn tool_register_body_lists_every_tool_with_schema() {
-        let b = tool_register_body();
-        assert_eq!(b.get("kind").and_then(Value::as_str), Some("tool.register"));
-        let arr = b.get("tools").and_then(Value::as_array).expect("tools");
-        assert_eq!(arr.len(), TOOLS.len());
-        let read_file = arr
-            .iter()
-            .find(|v| v.get("name").and_then(Value::as_str) == Some("read_file"))
-            .expect("read_file in tools");
-        assert!(read_file
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some());
-        let params = read_file.get("parameters").expect("parameters");
-        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
-        assert!(
-            read_file.get("context").is_none(),
-            "public tool.register must not expose internal context metadata"
-        );
-    }
-
-    #[test]
-    fn tools_advertise_body_carries_private_context_metadata() {
-        let b = tools_advertise_body("tool-gate");
+    fn result_ok_body_carries_id_and_output() {
+        let b = result_ok_body("call-1", Value::String("hello".into()));
         assert_eq!(
             b.get("kind").and_then(Value::as_str),
-            Some("tool-gate.tools.advertise")
+            Some("capability.result")
         );
-        let arr = b.get("tools").and_then(Value::as_array).expect("tools");
-        let read_file = arr
-            .iter()
-            .find(|v| v.get("name").and_then(Value::as_str) == Some("read_file"))
-            .expect("read_file in tools");
-        let folders = read_file
-            .get("context")
-            .and_then(|v| v.get("folders"))
-            .and_then(Value::as_array)
-            .expect("context.folders");
-        assert_eq!(folders.len(), 1);
-    }
-
-    #[test]
-    fn tool_result_ok_body_carries_id_and_output() {
-        let b = tool_result_ok_body("call-1", Value::String("hello".into()));
-        assert_eq!(b.get("kind").and_then(Value::as_str), Some("tool.result"));
         assert_eq!(b.get("id").and_then(Value::as_str), Some("call-1"));
         assert_eq!(b.get("output").and_then(Value::as_str), Some("hello"));
         assert!(!b.contains_key("error"));
     }
 
     #[test]
-    fn tool_result_error_body_carries_id_and_error() {
-        let b = tool_result_error_body("call-2", "boom");
-        assert_eq!(b.get("kind").and_then(Value::as_str), Some("tool.result"));
+    fn result_error_body_carries_id_and_error() {
+        let b = result_error_body("call-2", "boom");
+        assert_eq!(
+            b.get("kind").and_then(Value::as_str),
+            Some("capability.result")
+        );
         assert_eq!(b.get("id").and_then(Value::as_str), Some("call-2"));
         assert_eq!(b.get("error").and_then(Value::as_str), Some("boom"));
         assert!(!b.contains_key("output"));
@@ -845,8 +750,8 @@ mod tests {
         assert!(b.get("reason").and_then(Value::as_str).is_some());
     }
 
-    // End-to-end dispatch: feed a `basic-tools.tool.invoke` event into
-    // `dispatch_event` and verify a matching `tool.result { output }`
+    // End-to-end dispatch: feed a `basic-tools.capability.invoke` event into
+    // `handle_invoke` and verify a matching `capability.result { output }`
     // emerges on the writer channel.
     #[tokio::test]
     async fn dispatch_invoke_read_file_emits_result() {
@@ -860,16 +765,16 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let body = json!({
-            "kind": "basic-tools.tool.invoke",
+            "kind": "basic-tools.capability.invoke",
             "id": "call-7",
-            "name": "read_file",
+            "capability": "read_file",
             "args": { "path": path }
         })
         .as_object()
         .expect("obj")
         .clone();
 
-        dispatch_event(&tx, &body).await.expect("dispatch ok");
+        handle_invoke(&tx, &body, None).await.expect("dispatch ok");
 
         let msg = rx.recv().await.expect("got reply");
         let line = msg.to_line();
@@ -877,28 +782,28 @@ mod tests {
         let body = v.get("body").expect("body");
         assert_eq!(
             body.get("kind").and_then(Value::as_str),
-            Some("tool.result")
+            Some("capability.result")
         );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("call-7"));
         assert_eq!(body.get("output").and_then(Value::as_str), Some("abc"));
     }
 
-    // Invoke with a non-existent path produces a `tool.result { error }`.
+    // Invoke with a non-existent path produces a `capability.result { error }`.
     #[tokio::test]
     async fn dispatch_invoke_missing_file_emits_error() {
         crate::tools::read_file::configure_max_bytes(1024 * 1024).ok();
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let body = json!({
-            "kind": "basic-tools.tool.invoke",
+            "kind": "basic-tools.capability.invoke",
             "id": "call-8",
-            "name": "read_file",
+            "capability": "read_file",
             "args": { "path": "/definitely/does/not/exist/qzx" }
         })
         .as_object()
         .expect("obj")
         .clone();
 
-        dispatch_event(&tx, &body).await.expect("dispatch ok");
+        handle_invoke(&tx, &body, None).await.expect("dispatch ok");
 
         let msg = rx.recv().await.expect("got reply");
         let line = msg.to_line();
@@ -906,7 +811,7 @@ mod tests {
         let body = v.get("body").expect("body");
         assert_eq!(
             body.get("kind").and_then(Value::as_str),
-            Some("tool.result")
+            Some("capability.result")
         );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("call-8"));
         let err = body.get("error").and_then(Value::as_str).expect("error");
@@ -920,14 +825,14 @@ mod tests {
     async fn dispatch_invoke_missing_id_is_dropped() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let body = json!({
-            "kind": "basic-tools.tool.invoke",
-            "name": "read_file",
+            "kind": "basic-tools.capability.invoke",
+            "capability": "read_file",
             "args": { "path": "/tmp/whatever" }
         })
         .as_object()
         .expect("obj")
         .clone();
-        dispatch_event(&tx, &body).await.expect("dispatch ok");
+        handle_invoke(&tx, &body, None).await.expect("dispatch ok");
         // Drop the sender so try_recv returns Disconnected (or Empty if
         // we got here too fast).
         drop(tx);
@@ -937,19 +842,19 @@ mod tests {
         }
     }
 
-    // Missing `name` — but with a valid `id` — produces a tool.result with
+    // Missing `capability` — but with a valid `id` — produces a result with
     // an error so the caller can correlate.
     #[tokio::test]
-    async fn dispatch_invoke_missing_name_emits_error() {
+    async fn dispatch_invoke_missing_capability_emits_error() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let body = json!({
-            "kind": "basic-tools.tool.invoke",
+            "kind": "basic-tools.capability.invoke",
             "id": "call-9"
         })
         .as_object()
         .expect("obj")
         .clone();
-        dispatch_event(&tx, &body).await.expect("dispatch ok");
+        handle_invoke(&tx, &body, None).await.expect("dispatch ok");
         let msg = rx.recv().await.expect("reply");
         let line = msg.to_line();
         let v: Value = serde_json::from_str(&line).expect("json");
@@ -968,7 +873,7 @@ mod tests {
             .as_object()
             .expect("obj")
             .clone();
-        dispatch_event(&tx, &body).await.expect("dispatch ok");
+        handle_invoke(&tx, &body, None).await.expect("dispatch ok");
         drop(tx);
         assert!(rx.recv().await.is_none());
     }

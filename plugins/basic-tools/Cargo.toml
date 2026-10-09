@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NCP v0.1 plugin: file/process/etc. tool primitives. v1 ships read_file only; write and process execution are gated behind permission gating."
+description = "NCP v0.1 plugin: file, image, and process capabilities behind Lua-defined tools."
 
 [[bin]]
 name = "basic-tools"

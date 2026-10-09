@@ -111,6 +111,6 @@ The starter currently derives `read_only_tools` from `mag/lib/nefor/toolsets.jso
 
 ## Tool plugins
 
-For tools that need a separate process, author an NCP plugin and advertise to `tool-gate`. The gate forwards invocations to the advertising source and correlates `tool.result`. Use [Plugin authoring](../../../docs/plugin-authoring.md) for transport and lifecycle, and inspect the bundled `basic-tools` and `git-worktree` plugins for current higher-level event shapes.
+For tools that need a separate process, author an NCP plugin that executes capabilities and define the model-facing tools in Lua with `libs.tool`. `libs.compositors.tools.capability_tools_spec` wraps such a process as a tool source: it advertises the Lua definitions to `tool-gate`, validates each forwarded invocation, and sends `<name>.capability.invoke` to the plugin. Use [Plugin authoring](../../../docs/plugin-authoring.md) for transport and lifecycle, and see the bundled `basic-tools` and `git-worktree` plugins with `lua/libs/basic-tools` and `lua/libs/git-worktree` for the current shapes.
 
 Tool advertisement, invocation, and approval are ecosystem protocols layered over NCP. Replacing `tool-gate` means owning their routing, provenance, permission, replay, and instruction-file integration.

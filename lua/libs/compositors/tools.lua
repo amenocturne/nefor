@@ -6,18 +6,26 @@
 --     translation primitives with the dump-to-file swap and AGENTS.md
 --     emission ordering.
 --
---   tools.basic_actor_spec { max_read_bytes = N }
---     Actor spec for the basic-tools Rust binary. The composition must supply
---     the read_file maximum explicitly.
+--   tools.capability_tools_spec { name, command, gate, tools }
+--     Wraps a capability-provider binary as a tool source: Lua tool
+--     definitions (`libs.tool`) are advertised to the gate under the actor
+--     name, invocations are validated in Lua, and handlers reach the binary
+--     through `<name>.capability.invoke` / `<name>.capability.cancel`.
 --
---   tools.git_worktree_actor_spec
---     Git worktree capability provider used by MAG's worktree factories.
+--   tools.basic_actor_spec { max_read_bytes = N, gate = "tool-gate" }
+--     The basic-tools capability binary with the `libs.basic-tools` tools.
+--     The composition must supply the read_file maximum explicitly.
+--
+--   tools.git_worktree_actor_spec { gate = "tool-gate" }
+--     The git-worktree capability binary with the `libs.git-worktree` tools,
+--     used by MAG's worktree factories.
 
 local json = nefor.json
 
 local actor        = require("core.actor")
 local envelope     = require("core.envelope")
 local gate_lib         = require("tool-gate")
+local tool             = require("libs.tool")
 local chat_emitter     = require("libs.chat-emitter")
 local mag_run_bindings = require("libs.mag-run-bindings")
 
@@ -131,31 +139,130 @@ function M.gate_spec(gate_name, command)
   }
 end
 
--- Default actor spec for the basic-tools Rust binary. Tools register
--- against tool-gate; no orchestrator coupling at this layer. The
--- binary speaks the canonical tool contract directly (no translation
--- needed), so the spec is the generic identity-passthrough shape from
--- core.actor.
+-- A capability provider binary wrapped as a tool source.
+--
+-- `tools(capability)` returns `libs.tool` definitions; `capability.invoke(call,
+-- name, args)` delivers `<name>.capability.invoke { id, capability, args }` to
+-- the binary and `capability.cancel(call)` delivers `<name>.capability.cancel
+-- { id }`. The binary answers `capability.result { id, output | error }` and
+-- may report `capability.stream { id, stream, text }`; both settle or update
+-- the pending call, which emits `tool.result` / `tool.stream` as this actor.
+--
+-- to_plugin only runs once the binary is ready, so advertising on
+-- `<gate>.hello` there implies the capabilities can be served.
+function M.capability_tools_spec(opts)
+  if type(opts) ~= "table" then error("tools.capability_tools_spec: options must be a table", 2) end
+  local name, command, gate = opts.name, opts.command, opts.gate
+  if type(name) ~= "string" or name == "" then
+    error("tools.capability_tools_spec: name must be a non-empty string", 2)
+  end
+  if type(command) ~= "table" then error("tools.capability_tools_spec: command must be a table", 2) end
+  if type(gate) ~= "string" or gate == "" then
+    error("tools.capability_tools_spec: gate must be a non-empty string", 2)
+  end
+  if type(opts.tools) ~= "function" then
+    error("tools.capability_tools_spec: tools must be a function(capability)", 2)
+  end
+
+  local pending = {}
+  local function deliver(body)
+    nefor.engine.deliver(name, json.encode({
+      type = "event", from = name, ts = nefor.engine.now(), body = body,
+    }))
+  end
+  local capability = {}
+  function capability.invoke(call, capability_name, args)
+    pending[call.id] = call
+    deliver({ kind = name .. ".capability.invoke", id = call.id,
+      capability = capability_name, args = args })
+  end
+  function capability.cancel(call)
+    pending[call.id] = nil
+    deliver({ kind = name .. ".capability.cancel", id = call.id })
+  end
+
+  local source = tool.source { name = name, tools = opts.tools(capability) }
+
+  local function from_plugin(envs)
+    for _, env in ipairs(envs) do
+      local body = env.body
+      if type(body) == "table" and body.kind == "capability.result" then
+        local call = pending[body.id]
+        pending[body.id] = nil
+        if call then
+          if body.error ~= nil then call.err(body.error) else call.ok(body.output) end
+        end
+      elseif type(body) == "table" and body.kind == "capability.stream" then
+        local call = pending[body.id]
+        if call then call.stream(body.stream, body.text) end
+      elseif type(body) == "table" then
+        nefor.engine.send(json.encode({
+          type = "event", from = env.from or name, ts = nefor.engine.now(), body = body,
+        }))
+      end
+    end
+  end
+
+  local function to_plugin(envs)
+    for _, env in ipairs(envs) do
+      local body = env.body
+      if not env.replay and env.from ~= name and type(body) == "table" then
+        if body.kind == gate .. ".hello" then
+          source.advertise(gate)
+        else
+          source.receive(body)
+        end
+      end
+    end
+  end
+
+  return {
+    name        = name,
+    command     = command,
+    source      = source,
+    from_plugin = from_plugin,
+    to_plugin   = to_plugin,
+    to_plugin_readonly = true,
+    receive_msg = function(_) end,
+  }
+end
+
 function M.basic_actor_spec(options)
   local config = require("config")
   options = options or {}
-  local max_read_bytes = options.max_read_bytes
-  if type(max_read_bytes) ~= "number" or max_read_bytes < 1 or max_read_bytes % 1 ~= 0 then
+  local max_read_bytes = type(options.max_read_bytes) == "number"
+    and math.tointeger(options.max_read_bytes) or nil
+  if max_read_bytes == nil or max_read_bytes < 1 then
     error("tools.basic_actor_spec: max_read_bytes must be a positive integer")
   end
-  return actor.identity_spec("basic-tools", {
-    config.bin("basic-tools"),
-    "--gate", "tool-gate",
-    "--read-file-max-bytes", tostring(max_read_bytes),
-  })
+  return M.capability_tools_spec {
+    name = "basic-tools",
+    command = {
+      config.bin("basic-tools"),
+      "--read-file-max-bytes", tostring(max_read_bytes),
+    },
+    gate = options.gate or "tool-gate",
+    tools = function(capability)
+      return require("libs.basic-tools").tools {
+        max_read_bytes = max_read_bytes,
+        invoke = capability.invoke,
+        cancel = capability.cancel,
+      }
+    end,
+  }
 end
 
-function M.git_worktree_actor_spec()
+function M.git_worktree_actor_spec(options)
   local config = require("config")
-  return actor.identity_spec("git-worktree", {
-    config.bin("git-worktree"),
-    "--gate", "tool-gate",
-  })
+  options = options or {}
+  return M.capability_tools_spec {
+    name = "git-worktree",
+    command = { config.bin("git-worktree") },
+    gate = options.gate or "tool-gate",
+    tools = function(capability)
+      return require("libs.git-worktree").tools { invoke = capability.invoke }
+    end,
+  }
 end
 
 return M

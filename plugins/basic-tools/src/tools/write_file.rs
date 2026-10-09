@@ -7,46 +7,12 @@
 // Trust model matches `read_file` v1: basic-tools is trusted on the bus.
 // Path-traversal / sandboxing decisions live in the gate, not here.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::ToolError;
 
 pub const NAME: &str = "write_file";
-pub const DESCRIPTION: &str =
-    "Write a complete text file, or edit an existing text file by replacing one exact unique string. Without old_string, new_string becomes the complete file contents and existing content is overwritten. With old_string, exactly one match is replaced. Empty new_string is allowed.";
-
-pub fn schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Absolute or relative path to the destination file."
-            },
-            "new_string": {
-                "type": "string",
-                "description": "New UTF-8 text. Without old_string this is the complete file content; with old_string this is the replacement text. May be empty."
-            },
-            "old_string": {
-                "type": "string",
-                "description": "Optional exact text to replace in an existing UTF-8 file. When present it must be non-empty and occur exactly once."
-            }
-        },
-        "required": ["path", "new_string"],
-        "additionalProperties": false
-    })
-}
-
-/// Declarative presentation metadata advertised with this tool.
-pub fn display() -> Value {
-    json!({
-        "compact": { "label": "write file", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
-        "expanded": { "label": "write file", "fields": [] },
-        "result": { "kind": "receipt", "text": "file written", "fields": [] }
-    })
-}
-
 pub async fn run(args: &Value) -> Result<String, ToolError> {
     let parsed = parse_args(args)?;
     match parsed.old_string {

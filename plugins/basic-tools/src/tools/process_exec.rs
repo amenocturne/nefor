@@ -1,46 +1,10 @@
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ToolError;
 use crate::tools::process::{self, Request, StreamChunk};
 
 pub const NAME: &str = "process.exec";
-pub const DESCRIPTION: &str =
-    "Execute a program from a structured argv without shell interpretation.";
-
-pub fn schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "argv": {
-                "type": "array",
-                "items": { "type": "string" },
-                "minItems": 1,
-                "description": "Program argv. argv[0] is the executable."
-            },
-            "cwd": { "type": "string", "minLength": 1 },
-            "timeout": {
-                "type": "object",
-                "properties": {
-                    "present": { "type": "boolean" },
-                    "milliseconds": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["present", "milliseconds"],
-                "additionalProperties": false
-            },
-            "stdin": { "type": "string" }
-        },
-        "required": ["argv", "cwd", "timeout"]
-    })
-}
-
-pub fn display() -> Value {
-    json!({
-        "compact": { "label": "execute process", "primary": { "label": "argv", "select": { "source": "args", "path": "argv" }, "kind": "scalar" } },
-        "expanded": { "label": "execute process", "fields": [] },
-        "result": { "kind": "content", "fields": [] }
-    })
-}
 
 pub async fn run(args: &Value) -> Result<Value, ToolError> {
     run_cancellable_streaming(args, None, None).await

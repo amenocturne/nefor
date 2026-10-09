@@ -17,6 +17,7 @@ mod tools {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use serde_json::json;
 
             fn unbounded() -> Value {
                 json!({ "present": false, "milliseconds": 0 })
@@ -142,6 +143,7 @@ mod tools {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use serde_json::json;
 
             #[tokio::test]
             async fn lowers_to_shell_and_returns_structured_result() {
@@ -182,9 +184,9 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(8);
 
         let slow = json!({
-            "kind": "basic-tools.tool.invoke",
+            "kind": "basic-tools.capability.invoke",
             "id": "slow-call",
-            "name": "shell.script",
+            "capability": "shell.script",
             "args": {
                 "script": "sleep 0.2; echo SLOW_DONE",
                 "cwd": ".",
@@ -195,9 +197,9 @@ mod tests {
         .expect("obj")
         .clone();
         let fast = json!({
-            "kind": "basic-tools.tool.invoke",
+            "kind": "basic-tools.capability.invoke",
             "id": "fast-call",
-            "name": "shell.script",
+            "capability": "shell.script",
             "args": {
                 "script": "echo FAST_DONE",
                 "cwd": ".",
@@ -209,8 +211,8 @@ mod tests {
         .clone();
 
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
-        let slow_task = spawn_tool_invoke(&out_tx, &slow, &cancels);
-        let fast_task = spawn_tool_invoke(&out_tx, &fast, &cancels);
+        let slow_task = spawn_invoke(&out_tx, &slow, &cancels);
+        let fast_task = spawn_invoke(&out_tx, &fast, &cancels);
 
         let first = recv_result_body(&mut out_rx).await;
         let second = recv_result_body(&mut out_rx).await;
@@ -239,11 +241,11 @@ mod tests {
         loop {
             let msg = timeout(Duration::from_secs(2), rx.recv())
                 .await
-                .expect("timed out waiting for tool.result")
-                .expect("tool.result message");
+                .expect("timed out waiting for capability.result")
+                .expect("capability.result message");
             match msg.body {
                 Body::Event(body)
-                    if body.get("kind").and_then(Value::as_str) == Some("tool.result") =>
+                    if body.get("kind").and_then(Value::as_str) == Some("capability.result") =>
                 {
                     return body;
                 }
@@ -252,7 +254,4 @@ mod tests {
             }
         }
     }
-
-    // Events with a different kind (e.g. another plugin's broadcast) are
-    // ignored — no spurious replies.
 }

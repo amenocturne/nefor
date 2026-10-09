@@ -1,40 +1,10 @@
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ToolError;
 use crate::tools::process::{self, Request, StreamChunk};
 
 pub const NAME: &str = "shell.script";
-pub const DESCRIPTION: &str = "Execute a script through /bin/sh -c.";
-
-pub fn schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "script": { "type": "string" },
-            "cwd": { "type": "string", "minLength": 1 },
-            "timeout": {
-                "type": "object",
-                "properties": {
-                    "present": { "type": "boolean" },
-                    "milliseconds": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["present", "milliseconds"],
-                "additionalProperties": false
-            },
-            "stdin": { "type": "string" }
-        },
-        "required": ["script", "cwd", "timeout"]
-    })
-}
-
-pub fn display() -> Value {
-    json!({
-        "compact": { "label": "execute shell script", "primary": { "label": "script", "select": { "source": "args", "path": "script" }, "kind": "scalar" } },
-        "expanded": { "label": "execute shell script", "fields": [] },
-        "result": { "kind": "content", "fields": [] }
-    })
-}
 
 pub async fn run(args: &Value) -> Result<Value, ToolError> {
     run_cancellable_streaming(args, None, None).await

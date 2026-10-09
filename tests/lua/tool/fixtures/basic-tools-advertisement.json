@@ -1,0 +1,377 @@
+{
+  "kind": "tool-gate.tools.advertise",
+  "source": "basic-tools",
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read the UTF-8 contents of a regular file. Returns the file's text content or an error.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to the file."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working directory. Relative paths are resolved against this."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Byte offset to start reading from. Optional; defaults to 0."
+          },
+          "max_bytes": {
+            "type": "integer",
+            "description": "Maximum bytes to read. Optional; maximum 12345 bytes.",
+            "maximum": 12345
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "display": {
+        "compact": {
+          "label": "read file",
+          "primary": {
+            "label": "path",
+            "select": {
+              "source": "args",
+              "path": "path"
+            },
+            "kind": "path"
+          }
+        },
+        "expanded": {
+          "label": "read file",
+          "fields": [
+            {
+              "label": "offset",
+              "select": {
+                "source": "args",
+                "path": "offset"
+              },
+              "kind": "scalar",
+              "omit": "missing"
+            },
+            {
+              "label": "max bytes",
+              "select": {
+                "source": "args",
+                "path": "max_bytes"
+              },
+              "kind": "bytes",
+              "omit": "missing"
+            }
+          ]
+        },
+        "result": {
+          "kind": "content",
+          "fields": [
+            {
+              "label": "content",
+              "select": {
+                "source": "result",
+                "path": "$"
+              },
+              "kind": "text",
+              "max_lines": 20,
+              "max_bytes": 1600
+            }
+          ]
+        }
+      },
+      "context": {
+        "folders": [
+          {
+            "from": "file_path",
+            "arg": "path",
+            "cwd_arg": "cwd"
+          }
+        ]
+      }
+    },
+    {
+      "name": "read_image",
+      "description": "Read a regular image file for visual inspection. Returns image bytes and metadata; only vision-capable models can use the result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to the image file."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working directory. Relative paths are resolved against this."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "display": {
+        "compact": {
+          "label": "read image",
+          "primary": {
+            "label": "path",
+            "select": {
+              "source": "args",
+              "path": "path"
+            },
+            "kind": "path"
+          }
+        },
+        "expanded": {
+          "label": "read image",
+          "fields": []
+        },
+        "result": {
+          "kind": "receipt",
+          "text": "image loaded",
+          "fields": [
+            {
+              "label": "media type",
+              "select": {
+                "source": "result",
+                "path": "media_type"
+              },
+              "kind": "scalar",
+              "omit": "missing"
+            },
+            {
+              "label": "filename",
+              "select": {
+                "source": "result",
+                "path": "filename"
+              },
+              "kind": "path",
+              "omit": "missing"
+            },
+            {
+              "label": "encoded bytes",
+              "select": {
+                "source": "result",
+                "path": "data"
+              },
+              "kind": "bytes",
+              "omit": "missing"
+            }
+          ]
+        }
+      },
+      "context": {
+        "folders": [
+          {
+            "from": "file_path",
+            "arg": "path",
+            "cwd_arg": "cwd"
+          }
+        ]
+      }
+    },
+    {
+      "name": "write_file",
+      "description": "Write a complete text file, or edit an existing text file by replacing one exact unique string. Without old_string, new_string becomes the complete file contents and existing content is overwritten. With old_string, exactly one match is replaced. Empty new_string is allowed.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to the destination file."
+          },
+          "new_string": {
+            "type": "string",
+            "description": "New UTF-8 text. Without old_string this is the complete file content; with old_string this is the replacement text. May be empty."
+          },
+          "old_string": {
+            "type": "string",
+            "description": "Optional exact text to replace in an existing UTF-8 file. When present it must be non-empty and occur exactly once."
+          }
+        },
+        "required": [
+          "path",
+          "new_string"
+        ],
+        "additionalProperties": false
+      },
+      "display": {
+        "compact": {
+          "label": "write file",
+          "primary": {
+            "label": "path",
+            "select": {
+              "source": "args",
+              "path": "path"
+            },
+            "kind": "path"
+          }
+        },
+        "expanded": {
+          "label": "write file",
+          "fields": []
+        },
+        "result": {
+          "kind": "receipt",
+          "text": "file written",
+          "fields": []
+        }
+      },
+      "context": {
+        "folders": [
+          {
+            "from": "file_path",
+            "arg": "path"
+          }
+        ]
+      }
+    },
+    {
+      "name": "process.exec",
+      "description": "Execute a program from a structured argv without shell interpretation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "argv": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Program argv. argv[0] is the executable."
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "timeout": {
+            "type": "object",
+            "properties": {
+              "present": {
+                "type": "boolean"
+              },
+              "milliseconds": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "present",
+              "milliseconds"
+            ],
+            "additionalProperties": false
+          },
+          "stdin": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "argv",
+          "cwd",
+          "timeout"
+        ]
+      },
+      "display": {
+        "compact": {
+          "label": "execute process",
+          "primary": {
+            "label": "argv",
+            "select": {
+              "source": "args",
+              "path": "argv"
+            },
+            "kind": "scalar"
+          }
+        },
+        "expanded": {
+          "label": "execute process",
+          "fields": []
+        },
+        "result": {
+          "kind": "content",
+          "fields": []
+        }
+      },
+      "context": {
+        "folders": [
+          {
+            "from": "cwd",
+            "arg": "cwd",
+            "default": "."
+          }
+        ]
+      }
+    },
+    {
+      "name": "shell.script",
+      "description": "Execute a script through /bin/sh -c.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "script": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "timeout": {
+            "type": "object",
+            "properties": {
+              "present": {
+                "type": "boolean"
+              },
+              "milliseconds": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "present",
+              "milliseconds"
+            ],
+            "additionalProperties": false
+          },
+          "stdin": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script",
+          "cwd",
+          "timeout"
+        ]
+      },
+      "display": {
+        "compact": {
+          "label": "execute shell script",
+          "primary": {
+            "label": "script",
+            "select": {
+              "source": "args",
+              "path": "script"
+            },
+            "kind": "scalar"
+          }
+        },
+        "expanded": {
+          "label": "execute shell script",
+          "fields": []
+        },
+        "result": {
+          "kind": "content",
+          "fields": []
+        }
+      },
+      "context": {
+        "folders": [
+          {
+            "from": "cwd",
+            "arg": "cwd",
+            "default": "."
+          }
+        ]
+      }
+    }
+  ]
+}

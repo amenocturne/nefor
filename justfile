@@ -48,6 +48,7 @@ test-fast:
     cargo test -p nefor --test starter_tool_gate_test
     cargo test -p nefor --test read_only_tools_test
     cargo test -p nefor --test tool_constructor_test
+    cargo test -p nefor --test capability_tools_test
     cargo test -p tool-gate-plugin
     cargo test -p nefor-tui --test chat_smoke_test chat_lua_loads_and_renders_initial_frame -- --exact
 

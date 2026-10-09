@@ -5,8 +5,8 @@ use std::process::{Command, Output};
 
 use serde::{Deserialize, Serialize};
 
-pub const CREATE_TOOL: &str = "git_worktree_create";
-pub const OPEN_TOOL: &str = "git_worktree_open";
+pub const CREATE_CAPABILITY: &str = "git_worktree_create";
+pub const OPEN_CAPABILITY: &str = "git_worktree_open";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

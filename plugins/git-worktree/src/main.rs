@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 
 use clap::Parser;
-use git_worktree_plugin::{CreateSpec, OpenSpec, WorktreeError, CREATE_TOOL, OPEN_TOOL};
+use git_worktree_plugin::{
+    CreateSpec, OpenSpec, WorktreeError, CREATE_CAPABILITY, OPEN_CAPABILITY,
+};
 use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde::Serialize;
@@ -12,12 +14,11 @@ const PLUGIN_NAME: &str = "git-worktree";
 const PROTOCOL_VERSION: &str = "0.1";
 const CHANNEL_CAP: usize = 64;
 
+/// Stateless Git worktree capability provider. Model-facing tool definitions
+/// live in Lua (`lua/libs/git-worktree`).
 #[derive(Debug, Parser)]
 #[command(name = "git-worktree", version, about)]
-struct Args {
-    #[arg(long, default_value = "tool-gate")]
-    gate: String,
-}
+struct Args {}
 
 #[tokio::main]
 async fn main() {
@@ -37,16 +38,15 @@ async fn main() {
     std::process::exit(0);
 }
 
-async fn run(args: Args) -> Result<(), TransportError> {
+async fn run(_args: Args) -> Result<(), TransportError> {
     let (out_tx, _writer) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
     let engine_version = await_ready_ok(&mut in_rx).await?;
-    tracing::info!(%engine_version, gate = %args.gate, "ready");
+    tracing::info!(%engine_version, "ready");
     send_event(&out_tx, hello_body()).await?;
-    send_event(&out_tx, tools_advertise_body(&args.gate)).await?;
 
     loop {
         match in_rx.recv().await {
@@ -66,7 +66,7 @@ async fn run(args: Args) -> Result<(), TransportError> {
 }
 
 fn is_invoke(body: &Map<String, Value>) -> bool {
-    body.get("kind").and_then(Value::as_str) == Some("git-worktree.tool.invoke")
+    body.get("kind").and_then(Value::as_str) == Some(&format!("{PLUGIN_NAME}.capability.invoke"))
 }
 
 fn spawn_invoke(out_tx: mpsc::Sender<PluginOutgoing>, body: Map<String, Value>) {
@@ -76,7 +76,7 @@ fn spawn_invoke(out_tx: mpsc::Sender<PluginOutgoing>, body: Map<String, Value>) 
             None => return,
         };
         let name = body
-            .get("name")
+            .get("capability")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
@@ -90,27 +90,27 @@ fn spawn_invoke(out_tx: mpsc::Sender<PluginOutgoing>, body: Map<String, Value>) 
                 message: format!("worktree task failed: {error}"),
             }),
         };
-        let _ = send_event(&out_tx, tool_result_body(&id, output)).await;
+        let _ = send_event(&out_tx, result_body(&id, output)).await;
     });
 }
 
 fn invoke(name: &str, args: Value) -> Value {
     match name {
-        CREATE_TOOL => match serde_json::from_value::<CreateSpec>(args) {
+        CREATE_CAPABILITY => match serde_json::from_value::<CreateSpec>(args) {
             Ok(spec) => match git_worktree_plugin::create(&spec) {
                 Ok(worktree) => success(worktree),
                 Err(error) => failure(error),
             },
             Err(error) => invalid_args("create", error),
         },
-        OPEN_TOOL => match serde_json::from_value::<OpenSpec>(args) {
+        OPEN_CAPABILITY => match serde_json::from_value::<OpenSpec>(args) {
             Ok(spec) => match git_worktree_plugin::open(&spec) {
                 Ok(worktree) => success(worktree),
                 Err(error) => failure(error),
             },
             Err(error) => invalid_args("open", error),
         },
-        _ => invalid_args("invoke", format!("unknown tool {name}")),
+        _ => invalid_args("invoke", format!("unknown capability {name}")),
     }
 }
 
@@ -137,65 +137,8 @@ fn hello_body() -> Map<String, Value> {
     }))
 }
 
-fn tools_advertise_body(gate: &str) -> Map<String, Value> {
-    let compact = |label: &str, primary: &str, receipt: &str| {
-        json!({
-            "compact": { "label": label, "primary": { "label": primary, "select": { "source": "args", "path": primary }, "kind": "path" } },
-            "expanded": { "label": label, "fields": [] },
-            "result": { "kind": "receipt", "text": receipt, "fields": [] }
-        })
-    };
-    object(json!({
-        "kind": format!("{gate}.tools.advertise"),
-        "source": PLUGIN_NAME,
-        "tools": [
-            {
-                "name": CREATE_TOOL,
-                "description": "Create a fresh Git worktree; existing paths or branches are errors.",
-                "parameters": create_schema(),
-                "context": {},
-                "display": compact("create worktree", "path", "worktree created")
-            },
-            {
-                "name": OPEN_TOOL,
-                "description": "Open and validate an explicitly named existing Git worktree.",
-                "parameters": open_schema(),
-                "context": {},
-                "display": compact("open worktree", "path", "worktree opened")
-            }
-        ]
-    }))
-}
-
-fn create_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "repository": { "type": "string" },
-            "path": { "type": "string" },
-            "branch": { "type": "string" },
-            "base": { "type": "string" }
-        },
-        "required": ["repository", "path", "branch", "base"],
-        "additionalProperties": false
-    })
-}
-
-fn open_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "repository": { "type": "string" },
-            "path": { "type": "string" },
-            "branch": { "type": "string" }
-        },
-        "required": ["repository", "path", "branch"],
-        "additionalProperties": false
-    })
-}
-
-fn tool_result_body(id: &str, output: Value) -> Map<String, Value> {
-    object(json!({ "kind": "tool.result", "id": id, "output": output }))
+fn result_body(id: &str, output: Value) -> Map<String, Value> {
+    object(json!({ "kind": "capability.result", "id": id, "output": output }))
 }
 
 fn object(value: Value) -> Map<String, Value> {
@@ -226,31 +169,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_create_and_open_as_distinct_tools() {
-        let body = tools_advertise_body("gate");
-        let tools = body.get("tools").and_then(Value::as_array).expect("tools");
-        assert_eq!(tools.len(), 2);
-        assert_eq!(
-            tools[0].get("name").and_then(Value::as_str),
-            Some(CREATE_TOOL)
-        );
-        assert_eq!(
-            tools[1].get("name").and_then(Value::as_str),
-            Some(OPEN_TOOL)
-        );
-        for tool in tools {
-            assert!(tool.pointer("/display/compact/label").is_some());
-            assert!(tool
-                .pointer("/display/compact/primary/select/path")
-                .is_some());
-            assert!(tool.pointer("/display/expanded/fields").is_some());
-            assert!(tool.pointer("/display/result/kind").is_some());
-        }
-    }
-
-    #[test]
     fn malformed_create_returns_structured_failure() {
-        let output = invoke(CREATE_TOOL, json!({ "repository": "/tmp" }));
+        let output = invoke(CREATE_CAPABILITY, json!({ "repository": "/tmp" }));
         assert_eq!(output.get("ok").and_then(Value::as_bool), Some(false));
         assert_eq!(
             output.pointer("/error/kind").and_then(Value::as_str),

@@ -1,34 +1,34 @@
 # basic-tools
 
-NCP plugin: file, image, edit, and process capability primitives.
+NCP plugin: file, image, edit, and process capabilities.
 
-The shipped tool set is `read_file`, `read_image`, `write_file`,
-`process.exec`, and `shell.script`. Destructive or long-running
-operations are intended to be run behind `tool-gate` in the starter composition.
+The shipped capabilities are `read_file`, `read_image`, `write_file`,
+`process.exec`, and `shell.script`. The plugin defines no model-facing tools:
+the tools of the same names — descriptions, parameter schemas, display
+contracts, argument validation, and tool-gate advertisement — are Lua
+definitions in [`lua/libs/basic-tools`](../../lua/libs/basic-tools/init.lua),
+built with [`libs.tool`](../../lua/libs/tool/init.lua). The starter wraps this
+process with `libs.compositors.tools.basic_actor_spec`, which advertises those
+tools to `tool-gate` as source `basic-tools` and forwards each validated
+invocation to the capability. Destructive or long-running operations are run
+behind `tool-gate` in the starter composition.
 
 ## Wire contract
 
-Quick reference:
+| Event                                                    | Direction            |
+| -------------------------------------------------------- | -------------------- |
+| `basic-tools.capability.invoke { id, capability, args }` | caller → basic-tools |
+| `basic-tools.capability.cancel { id }`                   | caller → basic-tools |
+| `capability.stream { id, stream, text }`                 | basic-tools → caller |
+| `capability.result { id, output \| error }`              | basic-tools → caller |
 
-| Event                       | Direction            | Routing                               |
-| --------------------------- | -------------------- | ------------------------------------- |
-| `tool.register`             | basic-tools → bus    | broadcast (standalone mode)           |
-| `tool-gate.tools.advertise` | basic-tools → gate   | private advertisement (`--gate`)      |
-| `basic-tools.tool.invoke`   | caller → basic-tools | targeted (engine prefix-routing)      |
-| `basic-tools.tool.cancel`   | caller → basic-tools | cancel by `{ id }` where supported    |
-| `tool.result`               | basic-tools → bus    | broadcast (caller correlates by `id`) |
+Each capability still parses its own typed input and reports malformed
+arguments as `capability.result { error }`; model-facing argument validation
+happens in Lua before a request reaches the plugin. `--read-file-max-bytes`
+supplies the read_file cap; the composition passes the same value to the Lua
+`read_file` definition, which advertises it as the `max_bytes` maximum.
 
-`tool.invoke`'s kind is prefixed with `basic-tools` so the engine's
-`<peer>.<rest>` routing in `examples/nefor-agent/ncp.lua` delivers it directly to us.
-`tool.register` and `tool.result` are unprefixed because consumers — the
-provider's tool-call loop, debug listeners — need to see them.
-
-When started with `--gate <name>`, basic-tools suppresses public
-`tool.register` events and instead sends a private `<name>.tools.advertise`
-event. Private advertisements include internal `context.folders` metadata;
-public registrations strip that context before tools are exposed to models.
-
-## v1 tool list
+## Capabilities
 
 ### `read_file`
 
@@ -77,7 +77,7 @@ the source file read has a 50 MiB hard cap. The tool does not describe or OCR
 the image; providers either pass the media to a vision-capable model or replace
 it with an explicit error when the active model does not support image input.
 
-### Other shipped tools
+### Other shipped capabilities
 
 - `write_file` — with `path` and `new_string`, create or overwrite a complete
   text file; add non-empty `old_string` to replace exactly one match in an
@@ -117,7 +117,7 @@ translates the raw capability result into the nominal `ProcessExited {code}` or
 data. Validation, spawn, I/O, timeout, and cancellation
 failures use the error channel; timeout and cancellation diagnostics retain
 partial stdout/stderr after killing and reaping the dedicated process group.
-Both capabilities support `basic-tools.tool.cancel { id }`.
+Both capabilities support `basic-tools.capability.cancel { id }`.
 
 These two names replace the old ambiguous command helpers; there is no current
 `bash`, `BashOptions`, `command-with-options`, or `pipe-command` API.

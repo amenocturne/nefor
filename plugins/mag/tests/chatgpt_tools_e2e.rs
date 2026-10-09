@@ -3,8 +3,12 @@
 //! This routes real MAG, tool-gate, and basic-tools processes over NCP. The
 //! harness plays the provider behind conversation-manager's generic relay: the
 //! first response calls the shipped `read_file` tool and the second returns the
-//! structured final answer after observing the real file contents. Provider
-//! native request/HTTP lowering is covered by the provider-owned suites.
+//! structured final answer after observing the real file contents. It also
+//! plays the Lua basic-tools tool source: it advertises the Lua-owned tool
+//! definitions (the fixture `tests/lua/tool/capability_tools_test.lua` proves
+//! equal to `libs.basic-tools`) and turns the gate's forwarded invocation into
+//! a real `basic-tools.capability.invoke`. Provider native request/HTTP
+//! lowering is covered by the provider-owned suites.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -77,8 +81,6 @@ async fn spawn_tool_gate() -> Child {
 
 async fn spawn_basic_tools() -> Child {
     tokio::process::Command::new(prepared_binary("basic-tools"))
-        .arg("--gate")
-        .arg("tool-gate")
         .arg("--read-file-max-bytes")
         .arg("32768")
         .stdin(Stdio::piped())
@@ -193,8 +195,14 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
     let mut basic_tools_out =
         BufReader::new(basic_tools.stdout.take().expect("basic-tools stdout"));
     handshake(&mut basic_tools_out, &mut basic_tools_in).await;
-    let advertisement = next_kind(&mut basic_tools_out, "tool-gate.tools.advertise").await;
-    send(&mut gate_in, "basic-tools", advertisement).await;
+    let advertisement: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            repo_root().join("tests/lua/tool/fixtures/basic-tools-advertisement.json"),
+        )
+        .expect("read Lua basic-tools advertisement fixture"),
+    )
+    .expect("advertisement fixture is JSON");
+    send(&mut gate_in, "basic-tools", object(advertisement)).await;
     let register = next_kind(&mut gate_out, "tool.register").await;
     send(&mut mag_in, "tool-gate", register.clone()).await;
 
@@ -419,9 +427,20 @@ nefor.artifact.compile(topology)
             assert!(source_invoke["invocation"]["run_scope"]
                 .as_str()
                 .is_some_and(|scope| scope.starts_with('r')));
-            send(&mut basic_tools_in, "tool-gate", source_invoke).await;
-            let source_result = next_kind(&mut basic_tools_out, "tool.result").await;
-            assert_eq!(source_result["output"], FIXTURE_CONTENT);
+            let capability_invoke = object(json!({
+                "kind": "basic-tools.capability.invoke",
+                "id": source_invoke["id"],
+                "capability": source_invoke["name"],
+                "args": source_invoke["args"],
+            }));
+            send(&mut basic_tools_in, "basic-tools", capability_invoke).await;
+            let capability_result = next_kind(&mut basic_tools_out, "capability.result").await;
+            assert_eq!(capability_result["output"], FIXTURE_CONTENT);
+            let source_result = object(json!({
+                "kind": "tool.result",
+                "id": capability_result["id"],
+                "output": capability_result["output"],
+            }));
             send(&mut gate_in, "basic-tools", source_result).await;
             let gated_result = next_kind(&mut gate_out, "tool.result").await;
             assert_eq!(gated_result["name"], "read_file");

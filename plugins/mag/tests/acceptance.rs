@@ -1010,14 +1010,14 @@ async fn execute_worktree_program<R: AsyncBufReadExt + Unpin>(
                 let name = body.get("name").and_then(Value::as_str).expect("tool name");
                 let args = body.get("args").cloned().expect("tool args");
                 let output = match name {
-                    git_worktree_plugin::CREATE_TOOL => {
+                    git_worktree_plugin::CREATE_CAPABILITY => {
                         let spec = serde_json::from_value(args).expect("create spec");
                         match git_worktree_plugin::create(&spec) {
                             Ok(worktree) => json!({"ok": true, "worktree": worktree}),
                             Err(error) => json!({"ok": false, "error": error}),
                         }
                     }
-                    git_worktree_plugin::OPEN_TOOL => {
+                    git_worktree_plugin::OPEN_CAPABILITY => {
                         let spec = serde_json::from_value(args).expect("open spec");
                         match git_worktree_plugin::open(&spec) {
                             Ok(worktree) => json!({"ok": true, "worktree": worktree}),

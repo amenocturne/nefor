@@ -17,17 +17,13 @@
 
 use std::sync::OnceLock;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::error::ToolError;
 
 /// Wire name for this tool.
 pub const NAME: &str = "read_file";
-
-/// Human-readable description shipped to the LLM via the provider.
-pub const DESCRIPTION: &str =
-    "Read the UTF-8 contents of a regular file. Returns the file's text content or an error.";
 
 /// The maximum is supplied by composition at process startup.
 static CONFIGURED_MAX_BYTES: OnceLock<u64> = OnceLock::new();
@@ -47,53 +43,6 @@ pub(crate) fn configured_max_bytes() -> Option<u64> {
 
 /// First N bytes inspected for a NUL byte to flag binary content.
 pub const BINARY_PROBE_BYTES: usize = 8 * 1024;
-
-/// JSON Schema (OpenAI tool-call format) for `read_file`'s parameters.
-pub fn schema() -> Value {
-    schema_with_limit(configured_max_bytes())
-}
-
-pub fn schema_with_limit(max_read_bytes: Option<u64>) -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Absolute or relative path to the file."
-            },
-            "cwd": {
-                "type": "string",
-                "description": "Working directory. Relative paths are resolved against this."
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Byte offset to start reading from. Optional; defaults to 0."
-            },
-            "max_bytes": {
-                "type": "integer",
-                "description": max_read_bytes
-                    .map(|limit| format!("Maximum bytes to read. Optional; maximum {limit} bytes."))
-                    .unwrap_or_else(|| "Maximum bytes to read. Optional; bounded by tool configuration.".into()),
-                "maximum": max_read_bytes
-            }
-        },
-        "required": ["path"]
-    })
-}
-
-/// Declarative presentation metadata advertised with this tool.
-pub fn display() -> Value {
-    json!({
-        "compact": { "label": "read file", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
-        "expanded": { "label": "read file", "fields": [
-            { "label": "offset", "select": { "source": "args", "path": "offset" }, "kind": "scalar", "omit": "missing" },
-            { "label": "max bytes", "select": { "source": "args", "path": "max_bytes" }, "kind": "bytes", "omit": "missing" }
-        ] },
-        "result": { "kind": "content", "fields": [
-            { "label": "content", "select": { "source": "result", "path": "$" }, "kind": "text", "max_lines": 20, "max_bytes": 1600 }
-        ] }
-    })
-}
 
 /// Execute `read_file` with the given args. See module docs for rejection
 /// rules.

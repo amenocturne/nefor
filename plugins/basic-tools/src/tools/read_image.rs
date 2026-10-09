@@ -18,10 +18,6 @@ use crate::error::ToolError;
 /// Wire name for this tool.
 pub const NAME: &str = "read_image";
 
-/// Human-readable description shipped to the LLM via the provider.
-pub const DESCRIPTION: &str =
-    "Read a regular image file for visual inspection. Returns image bytes and metadata; only vision-capable models can use the result.";
-
 /// Hard cap on the source image read. Larger files are probably not a
 /// pasted screenshot and should fail instead of loading into memory.
 pub const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
@@ -29,37 +25,6 @@ pub const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 /// Target cap for the media bytes returned to the provider. Larger
 /// source images are downscaled/re-encoded before base64 wrapping.
 pub const TARGET_OUTPUT_BYTES: usize = 5 * 1024 * 1024;
-
-/// JSON Schema (OpenAI tool-call format) for `read_image`'s parameters.
-pub fn schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Absolute or relative path to the image file."
-            },
-            "cwd": {
-                "type": "string",
-                "description": "Working directory. Relative paths are resolved against this."
-            }
-        },
-        "required": ["path"]
-    })
-}
-
-/// Declarative presentation metadata advertised with this tool.
-pub fn display() -> Value {
-    json!({
-        "compact": { "label": "read image", "primary": { "label": "path", "select": { "source": "args", "path": "path" }, "kind": "path" } },
-        "expanded": { "label": "read image", "fields": [] },
-        "result": { "kind": "receipt", "text": "image loaded", "fields": [
-            { "label": "media type", "select": { "source": "result", "path": "media_type" }, "kind": "scalar", "omit": "missing" },
-            { "label": "filename", "select": { "source": "result", "path": "filename" }, "kind": "path", "omit": "missing" },
-            { "label": "encoded bytes", "select": { "source": "result", "path": "data" }, "kind": "bytes", "omit": "missing" }
-        ] }
-    })
-}
 
 /// Execute `read_image` with the given args.
 pub async fn run(args: &Value) -> Result<Value, ToolError> {
