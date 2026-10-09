@@ -155,15 +155,9 @@ do
   assert_eq(apply_schema.parameters.properties.run_id, nil, "apply exposes only fresh workflow dispatch")
   assert_true(await_schema ~= nil, "the mag-await schema is advertised")
   assert_true(graph_status_schema ~= nil, "the mag-status schema is advertised")
-  assert_true(graph_status_schema.description:find("One-shot snapshot", 1, true) ~= nil
-      and graph_status_schema.description:find("not an await or wait mechanism", 1, true) ~= nil
-      and graph_status_schema.description:find("Never call it in a polling loop", 1, true) ~= nil,
-    "mag-status is described only as a current-state snapshot, not an await")
-  assert_true(graph_status_schema.description:find("immediately after dispatch merely to wait", 1, true) ~= nil,
-    "mag-status explicitly rejects post-dispatch waiting")
-  assert_true(graph_status_schema.description:find("when your next step depends", 1, true) == nil
-      and graph_status_schema.description:find("Block until", 1, true) == nil,
-    "mag-status carries no dependency-wait affordance")
+  assert_true(graph_status_schema.description:find("returns immediately", 1, true) ~= nil
+      and graph_status_schema.description:find("doesn't wait for runs", 1, true) ~= nil,
+    "mag-status is described as a current-state snapshot, not a wait")
   assert_eq(await_schema.display.compact.label, "await run", "mag-await has semantic display metadata")
   assert_eq(await_schema.display.compact.primary.select.path, "invocation_label",
     "mag-await prefers the registry-owned presentation label")
@@ -171,8 +165,8 @@ do
     "mag-await falls back to its stable raw handle")
   assert_eq(await_schema.display.compact.primary.select.fallback.path, "run_id",
     "mag-await raw fallback is the exact addressed handle")
-  assert_true(await_schema.description:find("waits indefinitely", 1, true) ~= nil,
-    "mag-await canonically warns about persistent foreground processes")
+  assert_true(await_schema.description:find("never returns", 1, true) ~= nil,
+    "mag-await states that a never-ending run never returns")
   for _, schema in ipairs(advertised.body.tools or {}) do
     assert_true(schema.name ~= "mag" and schema.name ~= "mag-eval",
       "legacy overloaded MAG tools are not advertised")

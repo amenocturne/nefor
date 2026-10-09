@@ -149,7 +149,7 @@ function M.construct(id, params, emit, deps)
         .. json_encode(output_schema) .. "\n\n"
         .. "- new_string only: replaces the whole draft.\n"
         .. "- old_string and new_string: replaces the single exact occurrence of old_string. If it occurs zero or several times, the draft is unchanged and an error is returned.\n\n"
-        .. "With validate: true, the saved draft is also checked against the schema and any problems are returned. Validation does not submit anything; an invalid draft stays saved so it can be fixed. Submit with submit_output.",
+        .. "With validate: true, the saved draft is also checked against the schema and any problems are returned. Validation does not submit anything; an invalid draft stays saved so it can be fixed.",
       parameters = { type = "object", additionalProperties = false, required = { "new_string" },
         properties = {
           new_string = { type = "string", description = "Whole draft contents when old_string is absent, or literal replacement text for its unique match." },
@@ -158,9 +158,9 @@ function M.construct(id, params, emit, deps)
         } } },
     { name = "submit_output", owner = "mag-runtime", execution = { kind = "routed" },
       description =
-        "Submits your result draft and finishes the assignment. The draft is checked against the schema given in write_output. "
+        "Submits your result draft and finishes the assignment. The draft is checked against the result schema. "
         .. "If it matches, it becomes your result and your work on this assignment ends. If not, nothing is submitted, "
-        .. "the problems are returned, and you can fix the draft with write_output and submit again.\n\n"
+        .. "the problems are returned, and you can fix the draft and submit again.\n\n"
         .. "Takes no arguments. It is accepted only as the only tool call in a response; alongside other calls it is rejected and the other calls still run.",
       parameters = { type = "object", additionalProperties = false, properties = {} } },
   }

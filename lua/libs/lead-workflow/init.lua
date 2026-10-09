@@ -1731,11 +1731,9 @@ local function lead_workflow_tool_schemas()
       name        = "mag-status",
       display = display_contract("graph status", run_label_field(false), {}, "content", nil, { display_field("state", "result", "$", "structured") }),
       description =
-        "Report active graph runs, or one active/recent completed run " ..
-        "when run_id is provided. One-shot snapshot for when you or the " ..
-        "user need to know what's in flight — not an await or wait mechanism. " ..
-        "Never call it in a polling loop or immediately after dispatch merely " ..
-        "to wait; run outcomes are delivered to you when they land.",
+        "Returns the current state of MAG workflow runs: all active runs and recently completed ones, " ..
+        "or a single run when run_id is given. It returns immediately; it doesn't wait for runs and " ..
+        "isn't intended for polling.",
       parameters  = {
         type = "object",
         additionalProperties = false,
@@ -1751,14 +1749,9 @@ local function lead_workflow_tool_schemas()
       name        = "mag-await",
       display = display_contract("await run", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
-        "Block until a previously acknowledged detached MAG run reaches its canonical " ..
-        "terminal result. The root lead may address same-session runs globally; a non-root " ..
-        "agent may address only runs that exact actor directly dispatched. This attaches to " ..
-        "the existing run and does not poll mag-status or cancel it. Use this when your next " ..
-        "step depends on completion. A run reaches terminal state only when its processes exit; " ..
-        "awaiting a persistent foreground server or watcher therefore waits indefinitely. Never " ..
-        "launch such a process as a normal run and await it. Cancellation detaches only this " ..
-        "waiter; use mag-terminate separately to stop the run.",
+        "Waits until a run you started finishes and returns its result. A run finishes only when all " ..
+        "its processes exit, so waiting on a run that never ends, such as a server, never returns. " ..
+        "Cancelling this wait doesn't stop the run.",
       parameters  = {
         type = "object",
         additionalProperties = false,
@@ -1774,7 +1767,10 @@ local function lead_workflow_tool_schemas()
     {
       name        = "mag-terminate",
       display = display_contract("terminate graph", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
-      description = "Request termination of exactly one active graph run by explicit run_id and block until its exact canonical terminal confirmation. The confirmation is returned synchronously and the redundant owner completion is suppressed; a defensive named timeout returns an ordinary tool failure.",
+      description =
+        "Stops one active run, identified by run_id, and returns once the run confirms it has stopped. " ..
+        "You won't also receive that run's completion notification. If the run doesn't confirm within " ..
+        string.format("%g", TERMINATION_CONFIRM_TIMEOUT_MS / 1000) .. " seconds, an error is returned.",
       parameters  = {
         type = "object",
         additionalProperties = false,
@@ -1812,7 +1808,13 @@ local function lead_workflow_tool_schemas()
       name = "mag-write-file",
       display = display_contract("mag write file", display_field("file", "args", "file", "path"),
         {}, "receipt", "MAG source written", {}),
-      description = "Prepare or edit a session MAG source file without executing it. Use this for changes to existing source or to save source for inspection. Omit old_string to make new_string the complete contents, creating or overwriting the file. Supply old_string to replace one exact unique string. Empty new_string is valid. The file path is relative to this session's MAG workspace; absolute, non-normalized, traversal, and symlink paths are rejected.",
+      description =
+        "Writes or edits a MAG source file in this session's MAG workspace without running it.\n\n" ..
+        "- new_string only: becomes the file's complete contents, creating or replacing the file.\n" ..
+        "- old_string and new_string: replaces the single exact occurrence of old_string. If it occurs " ..
+        "zero or several times, the file is unchanged and an error is returned.\n\n" ..
+        "new_string may be empty. Paths are relative to the workspace; absolute paths, .. segments " ..
+        "and symlinks are rejected.",
       parameters = { type = "object", additionalProperties = false, properties = {
         file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
         new_string = { type = "string", description = "Complete contents or replacement text; may be empty." },
@@ -1824,7 +1826,10 @@ local function lead_workflow_tool_schemas()
       display = display_contract("mag preview", display_field("file", "args", "file", "path"),
         {}, "content", nil, { display_field("workflow", "result", "workflow_tree", "text",
           { max_lines = 120, max_bytes = 12000 }) }, "delayed"),
-      description = "Inspect the fully expanded authored node tree of an existing session MAG source file without changing the file or executing the workflow. This optional preview compiles and validates the source; mag-apply also compiles and validates on execution. Compilation errors are returned as tool errors.",
+      description =
+        "Validates and compiles a MAG source file in this session's workspace without running it, " ..
+        "and returns the complete node tree the workflow would run. Compilation errors are returned " ..
+        "as errors.",
       parameters = { type = "object", additionalProperties = false, properties = {
         file = { type = "string", pattern = "\\.(mag|magl)$", description = "Existing MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
       }, required = { "file" } },
@@ -1839,14 +1844,17 @@ local function lead_workflow_tool_schemas()
             { omit = "missing", max_lines = 120, max_bytes = 12000 }),
         }, "delayed"),
       description =
-        "Validates, compiles, and runs a MAG workflow. With file and content, writes content " ..
-        "to file, replacing any existing contents, then runs it. With file only, runs the " ..
-        "workflow in that file as it is. If writing, validation, or compilation fails, nothing " ..
-        "runs and the error is returned; the file keeps what was written, so it can be edited " ..
-        "selectively with mag-write-file and applied again. A run that finishes within " ..
-        string.format("%g", SYNC_COMPLETION_GRACE_MS / 1000) .. " seconds returns its output, or " ..
-        "its failure together with the workflow tree. A longer run returns a run_id, the " ..
-        "workflow tree, and how its result will reach you.",
+        "Runs MAG code. This is the easiest way to execute it: pass the code as content together " ..
+        "with a file name, and this tool writes the file, validates and compiles it, and runs the " ..
+        "workflow in one call. If validation or compilation fails, nothing runs and the error is " ..
+        "returned.\n\n" ..
+        "- file and content: writes content to file, replacing any existing contents, then runs it.\n" ..
+        "- file only: runs the workflow already in that file.\n\n" ..
+        "After a failed validation or compilation the file keeps what was written, so it can be fixed " ..
+        "with a selective edit and run again. A run that finishes within " ..
+        string.format("%g", SYNC_COMPLETION_GRACE_MS / 1000) .. " seconds returns its output, or its " ..
+        "failure together with the workflow tree. A longer run returns a run_id, the workflow tree, " ..
+        "and how its result will reach you.",
       parameters = { type = "object", additionalProperties = false, properties = {
         file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
         content = { type = "string", description = "Optional complete source written to file before running, replacing any existing contents." },
