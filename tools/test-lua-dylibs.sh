@@ -5,9 +5,11 @@ mkdir -p "$repo/tmp"
 fixture=$(mktemp -d "$repo/tmp/lua-dylibs.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 export DYLIB_FIXTURE_ROOT="$fixture"
-mkdir -p "$fixture/bin" "$fixture/source" "$fixture/tree/lib/lua/5.4/nested"
+mkdir -p "$fixture/bin" "$fixture/source" "$fixture/opt" "$fixture/tree/lib/lua/5.4/nested"
 printf ssl > "$fixture/source/libssl.3.dylib"
 printf crypto > "$fixture/source/libcrypto.3.dylib"
+# Homebrew modules link the opt symlink while libssl links the versioned Cellar file.
+ln -s ../source/libcrypto.3.dylib "$fixture/opt/libcrypto.3.dylib"
 printf module > "$fixture/tree/lib/lua/5.4/module.so"
 printf nested > "$fixture/tree/lib/lua/5.4/nested/module_nested.so"
 cat > "$fixture/bin/uname" <<'SH'
@@ -31,6 +33,7 @@ else
         printf '\t@rpath/libssl.3.dylib (compatibility version 1.0.0, current version 1.0.0)\n'
       else
         printf '\t%s/source/libssl.3.dylib (compatibility version 1.0.0, current version 1.0.0)\n' "$DYLIB_FIXTURE_ROOT"
+        printf '\t%s/opt/libcrypto.3.dylib (compatibility version 1.0.0, current version 1.0.0)\n' "$DYLIB_FIXTURE_ROOT"
       fi;;
     libssl*) printf '\t%s/source/libssl.3.dylib (compatibility version 1.0.0, current version 1.0.0)\n\t%s/source/libcrypto.3.dylib (compatibility version 1.0.0, current version 1.0.0)\n' "$DYLIB_FIXTURE_ROOT" "$DYLIB_FIXTURE_ROOT";;
     libcrypto*) printf '\t%s/source/libcrypto.3.dylib (compatibility version 1.0.0, current version 1.0.0)\n' "$DYLIB_FIXTURE_ROOT";;
@@ -55,6 +58,13 @@ grep -F -- '@loader_path/../../../native/libssl.3.dylib' "$fixture/relocations" 
 grep -F -- '@loader_path/../native/libcrypto.3.dylib' "$fixture/relocations" >/dev/null
 grep -F -- '-id @loader_path/libssl.3.dylib' "$fixture/relocations" >/dev/null
 test "$(wc -l < "$fixture/signatures" | tr -d ' ')" = 4
+test "$(find "$fixture/tree/lib/native" -type f | wc -l | tr -d ' ')" = 2
+grep -F -- "-change $fixture/opt/libcrypto.3.dylib @loader_path/../../native/libcrypto.3.dylib" "$fixture/relocations" >/dev/null
+while read -r option original replacement target; do
+  [ "$option" = -change ] || continue
+  copied="$(dirname "$target")/${replacement#@loader_path/}"
+  [ -f "$copied" ] || { echo "relocated $original in $target to missing $copied" >&2; exit 1; }
+done < "$fixture/relocations"
 if DYLIB_FIXTURE_MODE=unresolved "$repo/tools/vendor-lua-dylibs.sh" "$fixture/tree" >"$fixture/error" 2>&1; then
   echo 'unresolved native dependency incorrectly accepted' >&2
   exit 1

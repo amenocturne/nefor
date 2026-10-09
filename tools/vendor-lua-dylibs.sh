@@ -7,6 +7,7 @@ mkdir -p "$tree/lib/native"
 files=()
 while IFS= read -r file; do files+=("$file"); done < <(find "$tree/lib/lua/5.4" -type f \( -name '*.so' -o -name '*.dylib' \))
 origins=()
+names=()
 index=0
 while [ "$index" -lt "${#files[@]}" ]; do
   file=${files[$index]}
@@ -27,19 +28,27 @@ while [ "$index" -lt "${#files[@]}" ]; do
       /System/Library/*|/usr/lib/*) continue;;
       @*) echo "unresolved native dependency $dependency in $file" >&2; exit 1;;
     esac
-    name=$(basename "$dependency")
-    destination="$tree/lib/native/$name"
-    found=0
-    for origin in ${origins[@]+"${origins[@]}"}; do
-      if [ "$origin" = "$dependency" ]; then found=1; break; fi
-      if [ "$(basename "$origin")" = "$name" ]; then
-        echo "conflicting native library basename: $name" >&2; exit 1
-      fi
+    # Package managers reference one library through several symlinked paths,
+    # so copies are keyed by the resolved file and keep the first referenced name.
+    origin_path=$(realpath "$dependency") || { echo "missing native dependency $dependency in $file" >&2; exit 1; }
+    name=""
+    position=0
+    while [ "$position" -lt "${#origins[@]}" ]; do
+      if [ "${origins[$position]}" = "$origin_path" ]; then name=${names[$position]}; break; fi
+      position=$((position + 1))
     done
-    if [ "$found" -eq 0 ]; then
+    if [ -z "$name" ]; then
+      name=$(basename "$dependency")
+      for existing in ${names[@]+"${names[@]}"}; do
+        if [ "$existing" = "$name" ]; then
+          echo "conflicting native library basename: $name" >&2; exit 1
+        fi
+      done
+      destination="$tree/lib/native/$name"
       cp -L "$dependency" "$destination"
       chmod u+w "$destination"
-      origins+=("$dependency")
+      origins+=("$origin_path")
+      names+=("$name")
       files+=("$destination")
     fi
     chmod u+w "$file"
