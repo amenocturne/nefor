@@ -24,6 +24,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      - uses: astral-sh/setup-uv@v6
+
       - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@v2
         with:
@@ -50,6 +52,11 @@ jobs:
 
       - name: Run full deterministic lane
         run: just test-full
+
+      - name: Exercise prepared native Lua HTTP stack
+        run: |
+          cargo build -p nefor --locked
+          just test-pm-http "$PWD/target/debug/nefor" "$NEFOR_LUA_DEPENDENCIES_ROOT" "$PWD/tmp/pm-http"
 
       - name: Upload TUI scenario artifacts
         if: failure()
