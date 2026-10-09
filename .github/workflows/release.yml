@@ -100,7 +100,7 @@ jobs:
 
       - name: Prepare private Lua dependencies
         shell: bash
-        run: tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock target/${{ matrix.target }}/lua-dependencies "$PWD"
+        run: tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock target/${{ matrix.target }}/lua-dependencies
 
       - name: cargo build release
         run: cargo build --release --workspace --locked --target ${{ matrix.target }}

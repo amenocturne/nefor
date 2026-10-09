@@ -237,7 +237,7 @@ build:
 
 # Prepare the starter's declared Lua dependencies into a private platform-specific tree.
 prepare-distribution-lua-dependencies tree="target/lua-dependencies":
-    tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock "{{tree}}" "{{justfile_directory()}}"
+    tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock "{{tree}}"
 
 # Build this checkout and copy a channel-neutral runtime without pruning sibling distributions.
 # `expected_commit` lets an installer prove it is building the pm-resolved checkout.

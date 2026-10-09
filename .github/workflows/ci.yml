@@ -37,7 +37,7 @@ jobs:
           brew install lua@5.4 luarocks openssl@3
           export LUA_DEPENDENCIES_LUA_DIR="$(brew --prefix lua@5.4)"
           export LUA_DEPENDENCIES_OPENSSL_DIR="$(brew --prefix openssl@3)"
-          tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock target/lua-dependencies "$PWD"
+          tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock target/lua-dependencies
           echo "NEFOR_LUA_DEPENDENCIES_ROOT=$PWD/target/lua-dependencies" >> "$GITHUB_ENV"
 
       - name: Check verification-lane completeness

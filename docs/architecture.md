@@ -78,7 +78,9 @@ The starter's package manager declares its Lua dependencies in
 `lua/nefor-pm/nefor-pm-dev-1.rockspec`. Its resolved artifact closure is pinned by
 version and SHA-256 in `lua/nefor-pm/dependencies.lock`. Distribution preparation
 uses LuaRocks to build a private platform-specific tree before runtime startup;
-the engine does not execute or discover this preparation.
+the engine does not execute or discover this preparation. The tree contains only
+the locked closure. Preparation fails, without resolving new versions, when that
+closure does not satisfy the rockspec or one of the locked rocks.
 
 Source installers and release bundles carry that tree as `lua-dependencies`
 under the immutable runtime root. The starter adds its ordinary Lua 5.4 search

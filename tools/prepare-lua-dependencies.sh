@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-  echo "usage: $0 <rockspec> <dependency-lock> <output-tree> <source-root>" >&2
+if [ "$#" -ne 3 ]; then
+  echo "usage: $0 <rockspec> <dependency-lock> <output-tree>" >&2
   exit 2
 fi
 rockspec=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 lock=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
-source_root=$(cd "$4" && pwd)
 tools_root=$(cd "$(dirname "$0")" && pwd)
 lua_options=(--lua-version=5.4)
 if [ -n "${LUA_DEPENDENCIES_LUA_DIR:-}" ]; then lua_options+=(--lua-dir="$LUA_DEPENDENCIES_LUA_DIR"); fi
@@ -44,13 +43,20 @@ while read -r name version architecture digest extra; do
   fi
   luarocks "${lua_options[@]}" --tree="$stage/tree" install --deps-mode=none "$archive" ${build_options[@]+"${build_options[@]}"}
 done < "$lock"
-(
-  cd "$source_root"
-  luarocks "${lua_options[@]}" --tree="$stage/tree" make --deps-mode=none "$rockspec" ${build_options[@]+"${build_options[@]}"}
-)
+# The declared rock and every locked rock must be satisfied by the locked closure.
+# An empty server makes an unsatisfied dependency fail instead of resolving a new version.
+mkdir -p "$stage/no-server"
+satisfied() {
+  luarocks "${lua_options[@]}" --tree="$stage/tree" --only-server="$stage/no-server" \
+    make --only-deps --deps-mode=one "$1" >/dev/null \
+    || { echo "locked dependency closure does not satisfy $1" >&2; exit 1; }
+}
+satisfied "$rockspec"
+while IFS= read -r installed; do satisfied "$installed"; done \
+  < <(find "$stage/tree/lib/luarocks" -name '*.rockspec' | sort)
 "$tools_root/vendor-lua-dylibs.sh" "$stage/tree"
 cp "$lock" "$stage/tree/dependencies.lock"
-luarocks "${lua_options[@]}" --tree="$stage/tree" list --porcelain > "$stage/tree/installed-packages.tsv"
+luarocks "${lua_options[@]}" --tree="$stage/tree" list --porcelain | cut -f 1-3 > "$stage/tree/installed-packages.tsv"
 if [ -e "$tree" ]; then
   backup=$(mktemp -d "${tree}.previous.XXXXXX")
   rmdir "$backup"
