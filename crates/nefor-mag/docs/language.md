@@ -2,7 +2,7 @@
 
 MAG is a small, typed, expression-oriented language. Programs compose immutable graph values from namespaced libraries. This reference covers the supported author-facing layer; runtime implementation structures are intentionally not public API.
 
-See [Orchestrating MAG](orchestrating.md) for lead tools, [Patterns](../../../plugins/mag/docs/patterns.md) for common topologies, and [Errors](errors.md) for diagnostics.
+See [Compiling MAG](compiling.md) for the standalone compiler, [Patterns](../../../plugins/mag/docs/patterns.md) for common topologies, and [Errors](errors.md) for diagnostics.
 
 ## Modules and data
 
@@ -232,7 +232,7 @@ Timeouts are mandatory and explicit. <code>named(nefor.contracts.Timeout, Unlimi
 
 ## Human approvals
 
-<code>nefor.human.approval_gate</code> turns a `TextAnswer` into `nefor.human.HumanWorkflowDecision`, with `Approved(HumanWorkflowApproval {content})` and `Rejected(HumanWorkflowRejection {reason})` alternatives. Use it when human judgment is part of the graph's meaning. It is distinct from lead `write-review`, which authorizes execution of a write-capable orchestration plan before launch. See [Orchestrating MAG](orchestrating.md#author-and-launch-a-program).
+<code>nefor.human.approval_gate</code> turns a `TextAnswer` into `nefor.human.HumanWorkflowDecision`, with `Approved(HumanWorkflowApproval {content})` and `Rejected(HumanWorkflowRejection {reason})` alternatives. Use it when human judgment is part of the graph's meaning.
 
 ## Runtime expansion
 

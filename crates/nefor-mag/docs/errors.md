@@ -2,7 +2,7 @@
 
 MAG failures occur at different boundaries. Diagnose the boundary first; changing prompts cannot repair a malformed graph, and recompiling cannot make a hung process exit.
 
-See [Authoring reference](language.md) for valid forms and [Orchestrating MAG](orchestrating.md) for run control.
+See [Authoring reference](language.md) for valid forms and [Compiling MAG](compiling.md) for the standalone compiler.
 
 ## Compile-time language errors
 
@@ -68,32 +68,9 @@ The agent requests correction up to `max_corrections`. When the budget is exhaus
 
 ## Shell failures and hangs
 
-Process and shell nodes are unbounded when their authored timeout is `named(Timeout, Unlimited, nil)`. A process that never exits keeps its run nonterminal, so `mag-await` also waits indefinitely. Use `named(Timeout, Milliseconds, N)`, `named(Timeout, Seconds, N)`, or `named(Timeout, Minutes, N)` in the `process.exec` or `shell.script` parameter record when an operation needs a wall-clock bound. Never launch a persistent foreground server or watcher as a normal awaited run.
+Process and shell nodes are unbounded when their authored timeout is `named(Timeout, Unlimited, nil)`. A process that never exits keeps its run nonterminal. Use `named(Timeout, Milliseconds, N)`, `named(Timeout, Seconds, N)`, or `named(Timeout, Minutes, N)` in the `process.exec` or `shell.script` parameter record when an operation needs a wall-clock bound.
 
 A compile success proves the command node is well-formed, not that its executable, working directory, permissions, or exit status will succeed. Handle routeable command outcomes where the library exposes them; otherwise an unhandled runtime failure fails the run.
-
-## Approval errors
-
-Compilation and preview are not approval. A write-capable lead graph must pass `write-review` before execution.
-
-- In safe mode, the call waits for `/approve` or `/reject`.
-- In autonomous mode, human judgment cannot be fabricated and the review is denied.
-- In yolo mode, the gate approves.
-- Approval is turn- and session-scoped; new ordinary user input invalidates it.
-
-A rejected plan should be revised and submitted again. A discarded review means the user's reply is fresh input, not authorization. Tool-level risk checks remain independent of plan approval.
-
-## Run-control errors
-
-Run ids are opaque and session-scoped. Common outcomes include:
-
-- **malformed** — the value is not a valid MAG run handle;
-- **unknown** — no lead-dispatched run is retained for it;
-- **wrong session** — the handle belongs elsewhere;
-- **expired** — its retained terminal outcome aged out;
-- **unauthorized** — a delegated agent tried to control a run it did not directly dispatch.
-
-Use the exact `run_id` returned by a fresh `mag-apply`. Call `mag-await` once when dependent work needs completion; use `mag-status` only as a one-shot snapshot. Canceling an await detaches that waiter but leaves the run alive. Use `mag-terminate(run_id)` to request termination, then wait for canonical confirmation rather than assuming the request itself killed the run.
 
 ## Declarative-operation errors
 

@@ -100,4 +100,4 @@ acceptance: embedders must still validate artifacts against their current runtim
 - [The MAG Book](../../mag/book/README.md)
 - [Language and authoring reference](docs/language.md)
 - [Compiler errors and recovery](docs/errors.md)
-- [Compilation and orchestration](docs/orchestrating.md)
+- [Compiling MAG](docs/compiling.md)
