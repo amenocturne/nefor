@@ -25,6 +25,10 @@ The remaining source tools are single steps of that path:
 Every call to `mag-apply` starts a new run. Editing source describes a
 different future run; it never changes a running one.
 
+The tools are built with [`libs.tool`](../tool/init.lua), so their schemas are
+closed: an undeclared argument such as `run_id` on `mag-apply` is rejected
+with the same message format every tool uses, before the handler runs.
+
 ## Runs
 
 A run that finishes within the completion grace period
@@ -94,7 +98,7 @@ whose human decision is part of the workflow's meaning.
 
 ## Files
 
-- `init.lua` — tool schemas and handlers, MAG load/apply coordination, run
-  control and result delivery.
+- `init.lua` — tool definitions and handlers, MAG load/apply coordination,
+  run control and result delivery.
 - `run-registry.lua` — ownership and waiter registry for detached runs.
 - `role.lua` — loads the config-owned lead and worker system prompts.

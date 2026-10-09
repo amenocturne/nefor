@@ -84,24 +84,36 @@ assert_true(next(advertise(rot.build {})) == nil, "base tools remain opt-in")
 assert_true(not pcall(rot.build, { include = { "does_not_exist" } }), "unknown base name fails")
 assert_true(not pcall(rot.build, { include = { "skill", "skill" } }), "duplicate base name fails")
 
-local custom_schema = {
-  name = "custom", description = "Custom lookup", parameters = { type = "object" },
-  display = {
-    compact = { label = "Custom" }, expanded = { label = "Custom", fields = {} },
+local tool = require("libs.tool")
+local function custom_display(label)
+  return {
+    compact = { label = label }, expanded = { label = label, fields = {} },
     result = { kind = "content", fields = {} },
-  },
+  }
+end
+local custom = tool.define {
+  name = "custom", description = "Custom lookup",
+  parameters = { type = "object", properties = { value = { type = "string" } }, required = { "value" } },
+  display = custom_display("Custom"),
+  handler = function(args, call) call.ok(args.value) end,
 }
-local extras = rot.build {
-  include = { "skill" },
-  extra_tools = { { schema = custom_schema, handler = function(args, emit) emit.ok(args.value) end } },
-}
+local extras = rot.build { include = { "skill" }, extra_tools = { custom } }
 local extra_names = advertise(extras)
 assert_true(extra_names.skill and extra_names.custom, "config extras compose with remaining base tools")
 assert_true(invoke(extras, "custom", { value = "custom result" }).output == "custom result",
   "custom handler still receives its arguments and settles the invocation")
+local undeclared = invoke(extras, "custom", { value = "x", path = "alias" })
+assert_true(undeclared.error == "custom: unknown argument `path`; accepted arguments: value",
+  "extra tool schemas are closed: " .. tostring(undeclared.error))
+assert_true(invoke(extras, "skill", { name = 3 }).error
+  == "skill: argument `name` must be exactly one of: string or array of string, got integer",
+  "base tool arguments are validated before the handler")
+assert_true(invoke(extras, "skill", { name = {} }).error == "skill: name must list at least one skill",
+  "an empty skill list is a semantic error")
 assert_true(not pcall(rot.build, {
-  include = { "skill" }, extra_tools = { {
-    schema = { name = "skill" }, handler = function(_, emit) emit.ok("unexpected") end,
+  include = { "skill" }, extra_tools = { tool.define {
+    name = "skill", description = "x", parameters = { type = "object" },
+    display = custom_display("skill"), handler = function(_, call) call.ok("unexpected") end,
   } },
 }), "extra tool cannot collide with an included base name")
 

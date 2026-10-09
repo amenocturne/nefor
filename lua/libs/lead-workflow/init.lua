@@ -78,6 +78,7 @@ local envelope       = require("core.envelope")
 local replay_window  = require("core.replay_window")
 local results_lib    = require("libs.agentic-loop.results")
 local tool_display   = require("libs.chat.tool_display")
+local tool           = require("libs.tool")
 local model_snapshot = require("libs.model-snapshot")
 
 local function display_field(label, source, path, kind, extra)
@@ -273,41 +274,34 @@ local expire_completion_grace
 local take_termination_waiters
 local expire_termination_waiter
 
+-- The tool source is built once the handlers below exist; every result,
+-- immediate or deferred, settles through it by invocation id.
+local tool_source
+
 local function emit_tool_result_ok(firing_id, output, completion_delivery)
-  local body = {
-    kind   = "tool.result",
-    id     = firing_id,
-    output = output,
-  }
-  if completion_delivery ~= nil then body.completion_delivery = completion_delivery end
-  emit_as(SOURCE_NAME, nil, body)
+  tool_source.result(firing_id, { output = output, completion_delivery = completion_delivery })
 end
 
 local function emit_await_outcome(firing_id, outcome, completion_delivery)
-  local body = { kind = "tool.result", id = firing_id }
-  if completion_delivery ~= nil then body.completion_delivery = completion_delivery end
+  local fields = { completion_delivery = completion_delivery }
   if type(outcome) == "table" and outcome.output ~= nil then
-    body.output = outcome.output
+    fields.output = outcome.output
   else
-    body.error = type(outcome) == "table" and outcome.error or "mag-await failed"
+    fields.error = type(outcome) == "table" and outcome.error or "mag-await failed"
     if type(outcome) == "table" then
-      body.error_code = outcome.error_code
-      body.run_id = outcome.run_id
-      body.status = outcome.status
-      body.run_name = outcome.run_name
-      body.invocation_label = outcome.invocation_label
-      body.terminal = outcome.terminal
+      fields.error_code = outcome.error_code
+      fields.run_id = outcome.run_id
+      fields.status = outcome.status
+      fields.run_name = outcome.run_name
+      fields.invocation_label = outcome.invocation_label
+      fields.terminal = outcome.terminal
     end
   end
-  emit_as(SOURCE_NAME, nil, body)
+  tool_source.result(firing_id, fields)
 end
 
 local function emit_tool_result_err(firing_id, err)
-  emit_as(SOURCE_NAME, nil, {
-    kind  = "tool.result",
-    id    = firing_id,
-    error = tostring(err),
-  })
+  tool_source.result(firing_id, { error = tostring(err) })
 end
 
 local TERMINATION_CONFIRMATION_STATUSES = {
@@ -435,9 +429,9 @@ end
 -- handle_chat_input resolves the ack when the user types /approve,
 -- /reject, or any other text.
 local function submit_plan(firing_id, args, metadata)
-  local plan = args and args.plan
-  if type(plan) ~= "string" or #plan == 0 then
-    emit_tool_result_err(firing_id, "write-review: args.plan must be a non-empty string")
+  local plan = args.plan
+  if #plan == 0 then
+    emit_tool_result_err(firing_id, "write-review: plan must not be empty")
     return
   end
   -- Calling write-review while another plan is in-flight discards the
@@ -1325,9 +1319,9 @@ expire_termination_waiter = function(run_id, firing_id)
 end
 
 terminate_graph = function(firing_id, args, metadata)
-  local run_id = args and args.run_id
-  if type(run_id) ~= "string" or run_id == "" then
-    emit_tool_result_err(firing_id, "mag-terminate: args.run_id must be a non-empty active graph run id")
+  local run_id = args.run_id
+  if run_id == "" then
+    emit_tool_result_err(firing_id, "mag-terminate: run_id must not be empty")
     return
   end
 
@@ -1562,7 +1556,7 @@ end
 
 local advertised = false
 
-local function lead_workflow_tool_schemas()
+local function lead_workflow_tool_specs()
   return {
     {
       name        = "mag-status",
@@ -1699,18 +1693,7 @@ end
 local function advertise_tools(gate_name)
   if advertised then return end
   advertised = true
-  local schemas = lead_workflow_tool_schemas()
-  for _, schema in ipairs(schemas) do
-    local ok, err = tool_display.validate(schema.display)
-    if not ok then
-      error("lead-workflow: tool '" .. tostring(schema.name) .. "' has invalid display: " .. tostring(err))
-    end
-  end
-  emit_as(SOURCE_NAME, nil, {
-    kind   = (gate_name or "tool-gate") .. ".tools.advertise",
-    source = SOURCE_NAME,
-    tools  = schemas,
-  })
+  tool_source.advertise(gate_name or "tool-gate")
 end
 
 -- MAG tool handlers.
@@ -2055,10 +2038,6 @@ local function mag_workspace(firing_id, args, metadata, tool_name)
     emit_tool_result_err(firing_id, tool_name .. ": " .. provenance_error)
     return nil
   end
-  if type(args.file) ~= "string" or #args.file == 0 then
-    emit_tool_result_err(firing_id, tool_name .. ": requires a non-empty 'file' argument")
-    return nil
-  end
   local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
   local ws, ws_err = mag.init_workspace(provenance.session_id, config_dir)
   if not ws then
@@ -2099,11 +2078,6 @@ end
 -- with completed-node outputs. Live modification is not sufficiently supported
 -- and may be removed; this tool deliberately exposes only fresh dispatches.
 local function mag_apply(firing_id, args, metadata)
-  if args.run_id ~= nil then
-    emit_tool_result_err(firing_id,
-      "mag-apply: run_id is not supported; each call starts a new workflow. Omit run_id and pass file with optional content.")
-    return
-  end
   local ws, provenance = mag_workspace(firing_id, args, metadata, "mag-apply")
   if not ws then return end
   local _, source_error
@@ -2126,20 +2100,28 @@ local TOOL_HANDLERS = {
   ["mag-apply"]      = mag_apply,
 }
 
-local function handle_tool_invoke(body)
-  local firing_id = body.id
-  if type(firing_id) ~= "string" then return end
-  local name = body.name
-  local handler = TOOL_HANDLERS[name]
-  if not handler then
-    emit_tool_result_err(firing_id, "lead-workflow: unknown tool '" .. tostring(name) .. "'")
-    return
+-- Handlers keep firing-id addressing so deferred settlement (plan verdicts,
+-- run completion, termination confirmation) can resolve later by id.
+local function tool_definitions()
+  local definitions = {}
+  for _, spec in ipairs(lead_workflow_tool_specs()) do
+    local handler = assert(TOOL_HANDLERS[spec.name], spec.name)
+    spec.handler = function(args, call)
+      handler(call.id, args, {
+        caller_id = call.request.caller_id,
+        from = call.request.from,
+        invocation = call.request.invocation,
+      })
+    end
+    definitions[#definitions + 1] = tool.define(spec)
   end
-  handler(firing_id, body.args or {}, {
-    caller_id = body.caller_id,
-    from = body.from,
-    invocation = body.invocation,
-  })
+  return definitions
+end
+
+tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions() }
+
+local function handle_tool_invoke(body)
+  tool_source.invoke(body)
 end
 
 local function mark_user_terminated_runs(body)
@@ -2194,6 +2176,7 @@ local function receive_msg(entry)
   -- Gate-forwarded cancel addresses the source's inner firing id.
   if kind == "lead-workflow.tool.cancel" then
     if replay_window.active() then return end
+    tool_source.cancel(body)
     local plan = state.active_plan
     if type(plan) == "table" and (plan.pending_firing_id == body.id
         or plan.pending_correlation == body.id) then

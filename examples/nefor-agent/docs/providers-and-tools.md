@@ -32,44 +32,46 @@ standard UI as routed tools.
 
 ## Config-defined read-only tools
 
-`libs.read-only-tools` exposes a supported registration seam:
+`libs.read-only-tools` exposes a supported registration seam. Extra tools are
+built with [`libs.tool`](../../../lua/libs/tool/init.lua), the constructor every
+Nefor tool uses:
 
 ```lua
+local tool = require("libs.tool")
+
 return require("libs.read-only-tools").build {
   include = {
     "discover_instruction_files",
     "skill",
   },
   extra_tools = {
-    {
-      schema = {
-        name = "my_read_tool",
-        description = "Look up a value without changing external state.",
-        parameters = {
-          type = "object",
-          properties = {
-            query = { type = "string" },
-          },
-          required = { "query" },
+    tool.define {
+      name = "my_read_tool",
+      description = "Look up a value without changing external state.",
+      parameters = {
+        type = "object",
+        properties = {
+          query = { type = "string" },
         },
-        display = {
-          compact = { label = "My read tool" },
-          expanded = { label = "My read tool", fields = {} },
-          result = { kind = "content", fields = {} },
-        },
+        required = { "query" },
       },
-      handler = function(args, emit)
-        emit.ok("result for " .. args.query)
-        -- On expected failure, call emit.err("message") instead.
+      display = {
+        compact = { label = "My read tool" },
+        expanded = { label = "My read tool", fields = {} },
+        result = { kind = "content", fields = {} },
+      },
+      handler = function(args, call)
+        call.ok("result for " .. args.query)
+        -- On expected failure, call call.err("message") instead.
       end,
     },
   },
 }
 ```
 
-Base tools are opt-in: `build {}` advertises none. The available base tools are repository instruction discovery and ordinary workflow skill loading; shell/process capabilities handle directory listings, searches, and Python analysis. Extra schemas require Nefor's `display` metadata in addition to JSON Schema. Handlers should call exactly one emitter and results are stringified. All tools built here share source identity `read-only-tools`.
+Base tools are opt-in: `build {}` advertises none. The available base tools are repository instruction discovery and ordinary workflow skill loading; shell/process capabilities handle directory listings, searches, and Python analysis. `tool.define` checks the schema and Nefor's `display` metadata when the tool is defined, and rejects schema keywords its validator does not support. Every schema is closed: arguments not declared in `properties` are rejected, and invalid arguments never reach the handler; the caller receives an error such as ``my_read_tool: unknown argument `q`; accepted arguments: query``. Handlers settle exactly once through `call.ok` or `call.err`. All tools built here share source identity `read-only-tools`.
 
-Spawn the actor before `tool-gate`, which triggers its one-shot advertisement. A tool intended for delegated agents may also need entries in the MAG toolset/allowlist, the validator's read-only inventory, gate policy, and startup readiness.
+Spawn the actor before `tool-gate`; it advertises on the gate's hello. A tool intended for delegated agents may also need entries in the MAG toolset/allowlist, the validator's read-only inventory, gate policy, and startup readiness.
 
 ## Permission policy
 

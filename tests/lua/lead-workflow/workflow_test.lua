@@ -1307,10 +1307,9 @@ for _, run_id in ipairs({ "", "orient", "mag-run-live-apply" }) do
     file = "fresh-only.mag", content = READ_ONLY_MAG, run_id = run_id,
   })
   local rejected = tool_result("apply-with-run-id")
-  assert_true(rejected and rejected.body.error:find("run_id is not supported", 1, true) ~= nil,
-    "apply rejects every supplied run_id")
-  assert_true(rejected.body.error:find("Omit run_id", 1, true) ~= nil,
-    "rejection explains how to start the workflow")
+  assert_eq(rejected and rejected.body.error,
+    "mag-apply: unknown argument `run_id`; accepted arguments: file, content",
+    "apply rejects every supplied run_id through its closed schema")
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "mag.load" or c.body.kind == "mag.build"
       or c.body.kind == "mag.execute" or c.body.kind == "mag.apply"
@@ -2577,7 +2576,8 @@ do
     file = "authority-delta.mag", content = "(artifact nil)", run_id = child_id,
   }, metadata)
   local result = tool_result("apply-child")
-  assert_true(result and result.body.error:find("run_id is not supported", 1, true) ~= nil,
+  assert_eq(result and result.body.error,
+    "mag-apply: unknown argument `run_id`; accepted arguments: file, content",
     "workers cannot modify even their own dispatched live run")
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "mag.load" or c.body.kind == "mag.build"
