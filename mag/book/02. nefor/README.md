@@ -20,7 +20,9 @@ Read the chapters in order:
 4. [Hierarchical Composition](<03. Hierarchical Composition.md>)
 5. [Development Workflows](<04. Development Workflows.md>)
 6. [Lowering and Execution](<05. Lowering and Execution.md>)
+7. [Capability Nodes](<06. Capability Nodes.md>)
 
 The first chapter is sufficient for authoring most workflows. Later chapters
 explain the representation, live graph changes, and lowering boundary when that
-additional control is needed.
+additional control is needed; the last is a reference for the deterministic and
+human capability nodes.

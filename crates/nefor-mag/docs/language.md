@@ -1,19 +1,19 @@
-# MAG authoring reference
+# MAG language reference
 
-MAG is a small, typed, expression-oriented language. Programs compose immutable graph values from namespaced libraries. This reference covers the supported author-facing layer; runtime implementation structures are intentionally not public API.
+MAG is a small, typed, expression-oriented language. A program evaluates pure, immutable values from namespaced modules and returns one artifact. This reference covers the supported author-facing language; compiler implementation structures are intentionally not public API. What an artifact means is decided by the application that embeds MAG, not by the language.
 
-See [Compiling MAG](compiling.md) for the standalone compiler, [Patterns](../../../plugins/mag/docs/patterns.md) for common topologies, and [Errors](errors.md) for diagnostics.
+See [Compiling MAG](compiling.md) for the standalone compiler, [Errors](errors.md) for diagnostics, and the [core part of the MAG Book](<../../../mag/book/01. core/README.md>) for a guided introduction.
 
 ## Modules and data
 
 Imports are declarations, not runtime values. Each supported form has a distinct visibility effect:
 
 ```mag
-import nefor.actors        // open every direct export and permit nefor.actors.name
-import nefor.graph.{}      // qualified-only
-import nefor.node.{named, rename as rename_node} // selected local names
-import nefor.shell as shell // static namespace alias; only shell.name is permitted
-import nefor.actors.{adapter_factory as `_`} // suppress an automatic spelling from an open import
+import core.types        // open every direct export and permit core.types.name
+import core.map.{}        // qualified-only
+import core.validated.{valid, invalid as reject} // selected local names
+import core.set as sets   // static namespace alias; only sets.name is permitted
+import core.types.{some as `_`} // suppress an automatic spelling from an open import
 ```
 
 Imports compose order-independently. Suppressions affect only automatic names from a bare import, not explicit selectors. Namespace roots, namespace aliases, builtins, local declarations, and opened or selected exports share one collision domain; collisions are errors, never source-order choices. Use qualified-only imports, narrower selectors, selector or namespace renames, or `as _` to repair them. `import m.*` is not syntax.
@@ -26,10 +26,11 @@ Declare nominal records and algebraic data types with `type`:
 
 ```mag
 type Finding {path: String, summary: String}
-type Decision = Finding(Finding) | AgentError(nefor.contracts.AgentError)
+type Failure {reason: String}
+type Decision = Finding(Finding) | Failure(Failure)
 ```
 
-Algebraic alternatives are owned by their declared ADT. Construct one through the owner, such as `Decision.Finding(finding)` or `Decision.AgentError(failure)`. `(A, B)` is an anonymous all-of product type, not a nominal declaration. Product occurrences matter: `(T, T)` requires two matching incoming edges from distinct senders.
+Algebraic alternatives are owned by their declared ADT. Construct one through the owner, such as `Decision.Finding(finding)` or `Decision.Failure(failure)`; a payload is never accepted as though it were the owner value. `(A, B)` is an anonymous all-of product type, not a nominal declaration. Product components are positional, so `(T, T)` has two distinct occurrences of `T`.
 
 Alias-shaped declarations are transparent after generic substitution: `type Label = String` and `type Pair<T> = (T, T)` introduce alternate spellings but no semantic identity. Compatibility, inference, construction, type descriptors, schemas, and semantic IDs see the target type.
 
@@ -40,7 +41,7 @@ Eliminate an ADT with an exhaustive `match`. Each case names one constructor, bi
 ```mag
 let describe: fn(Decision) -> String = |decision| => match decision {
   case Finding(finding) => get(finding, "summary"),
-  case AgentError(failure) => canonical(get(failure, "last_output")),
+  case Failure(failure) => get(failure, "reason"),
 }
 ```
 
@@ -87,12 +88,14 @@ Descriptor operations do not forge witnesses or cast values:
   and product components retain their structural order. Primitives have none.
 - `list_type(descriptor)` constructs the descriptor of the ordinary native
   `List` type. `descriptor_schema(descriptor)` derives its validation schema.
-  Neither operation converts a value into a runtime `DynamicList` protocol.
+  Neither operation converts a value.
 
-The internal relocation checker uses `packed_path_strings(packed, path, list)`
-to inspect a record path containing a String or, when `list` is true, a
+`packed_path_strings(packed, path, list)` inspects a record path inside a
+compiler-packed value: the path must hold a String or, when `list` is true, a
 `List<String>`. Missing paths and wrong shapes fail during compilation; the
 operation does not reinterpret arbitrary packed values as typed application data.
+Packed values cannot be forged by building a map with matching fields; only the
+operations that produce them do so.
 
 ## Bindings and lexical blocks
 
@@ -125,126 +128,6 @@ selection and work through qualified module names and import aliases. The form
 specializes only that immediate call; it does not create a specialized
 function value.
 
-Ordinary word identifiers use snake_case without quoting. Backticks are reserved for names that genuinely require escaping, such as the qualified symbolic operator <code>nefor.node.`>>>`</code> or the reserved field name <code>`type`</code>.
+Ordinary word identifiers use snake_case without quoting. Backticks are reserved for names that genuinely require escaping, such as a module-qualified symbolic operator like <code>m.`>>>`</code> or the reserved field name <code>`type`</code>.
 
-Symbolic operators may be used as ordinary values and called with parentheses, or declared with a fixity and applied infix. `left op right` is the ordinary binary call `(op)(left, right)`, not a curried application. Infix application requires ASCII whitespace on both sides of a symbolic operator: write `left >>> right`, never `left>>>right`, `left >>>right`, or `(left)>>> right`. Spaces, tabs, and line breaks are separators; delimiters are not. A line may continue when a newline follows the operator (`left >>>` with `right` on the next line), while an operator at the start of the next line begins a new expression and is rejected. A `//` comment does not replace the required whitespace: write a space before the comment in `left >>> // explanation`. Alphabetic infix names use the same expression-separated position (`1 add 2`) without a separate symbolic-spacing check. This rule does not affect prefix calls such as `(>>>)(left, right)`, qualified calls such as <code>nefor.node.`>>>`(left, right)</code>, `->` in types, lambda delimiters, or signed numeric literals.
-
-## A complete graph
-
-```mag
-import core.types.{}
-import agents.{}
-import nefor.actors.{}
-import nefor.artifact.{}
-import nefor.contracts.{}
-import nefor.graph.{}
-
-type InspectionInput {prompt: String}
-
-let start = nefor.graph.source("task", InspectionInput {prompt: "Inspect the repository."})
-let worker = agents.agent<InspectionInput, nefor.contracts.TextAnswer>("worker", agents.AgentConfig {model: agents.standard, system: "Inspect the repository and report the result.", tools: nefor.actors.read_only_tools, tool_approval_policy: named(nefor.contracts.ToolApprovalPolicy, Default, nil), max_corrections: 2})
-let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
-
-nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [
-  nefor.graph.edge(start, worker),
-  nefor.graph.edge(worker, result),
-])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
-```
-
-An authored program is a pure `Graph -> Graph` function. `nefor.artifact.compile` applies it to <code>nefor.graph.empty_graph</code>, validates the complete topology, and prepares a fresh run. Build one flat edge list; compose edge families with `concat` and `map` rather than nested lists.
-
-### Sources and output
-
-`nefor.graph.source<T>` captures and emits a value checked against `T`. More generally, any exposed node whose complete input type is exactly `Unit` may be an unfed root and receives one automatic activation; feeding it through an edge suppresses that activation. An ADT or product that merely contains `Unit` still requires an explicit input.
-
-`nefor.graph.output<T>` is a concrete `T -> T` identity node and the result boundary. A graph must contain exactly one, it must be terminal, and every ordinary node must be reachable from a root and able to reach it. <code>nefor.graph.output_for</code> derives the compatible type from a preceding node.
-
-### Semantic types and runtime wires
-
-A port stores compiler-checked semantic evidence and a runtime protocol wire. Public constructors derive the latter internally:
-
-- Any input type other than `nefor.contracts.ProviderInput` starts a fresh typed user turn.
-- `nefor.contracts.ProviderInput` is the nominal continuation type and passes an already-built provider turn through unchanged.
-
-MAG programs provide only `type_tag<T>()` and connect compatible typed ports. They do not name, invent, or construct the runtime wire protocol. Prefer public constructors such as `source`, `agent`, `output`, `process.exec`, and `worktree.create`.
-
-## Agents
-
-`nefor.actors.agent` has semantic type:
-
-```text
-I -> core.types.Result<nefor.contracts.AgentError, O>
-```
-
-The whole result must be handled by a compatible downstream node or terminal output. `AgentError` preserves `last_output` and classifies the reason as provider failure or structured-output validation failure. The structured agent automatically asks the model to correct invalid output up to `max_corrections`; `0` means only the initial attempt. Exhaustion emits `AgentError` as data—it is not a successful `O` and should be routed deliberately.
-
-`tools` is the agent's capability boundary. Use <code>nefor.actors.read_only_tools</code>, <code>nefor.actors.general_tools</code>, or an explicit list. A tool call not in the invocation allowlist is rejected even if the tool exists globally. `tool_approval_policy` configures command policy; it does not replace the runtime approval gate.
-
-If a downstream reviewer can work with partial failed output, accept the full result as input. Otherwise bind the successful continuation with <code>nefor.result.`>=>`</code>, consume the full `Result`, or use an explicit Result unpack/repack node. `nefor.node.choose` is the corresponding branching combinator for `core.types.Either<A, B>`.
-
-## Edges, products, ADTs, and joins
-
-`nefor.graph.edge` connects compatible nodes. A producer may fan out through several edges; a consumer may fan in through several edges.
-
-- A single input fires for each matching arrival.
-- A nominal ADT input is one owner type and fires for each complete owner value; constructors are unpacked only by explicit branching nodes.
-- A product input `(A, B)` fires only after every product occurrence is filled. This is the all-of join mechanism.
-- Multiple edges from one producer express fan-out.
-- A `Unit` dependency edge expresses ordering without transferring domain data.
-- Cycles are legal if all nodes remain source-reachable and output-reachable.
-
-There is no graph mutation API. `graph`, <code>add_edges</code>, and <code>remove_edges</code> are total pure set operations over the graph being authored.
-
-## Process and shell nodes
-
-Use structured `process.exec` when one executable plus arguments expresses the operation:
-
-```mag
-import nefor.contracts.{}
-import nefor.process.{}
-
-nefor.process.exec("search", nefor.process.ProcessExecParams {
-  argv: ["rg", "-n", "TODO", "src/"],
-  cwd: nefor.process.cwd,
-  timeout: named(nefor.contracts.Timeout, Unlimited, nil),
-})
-```
-
-`argv` is passed directly to process spawn: no shell is inserted, so operators such as `|`, `>`, glob expansion, and shell built-ins are ordinary arguments. For shell syntax, use explicit POSIX `shell.script`, which lowers to `["/bin/sh", "-c", script]`:
-
-```mag
-import nefor.contracts.{}
-import nefor.shell.{}
-
-nefor.shell.script("bounded-search", nefor.shell.ShellScriptParams {
-  script: strip_margin("""|rg -n 'TODO|FIXME' src/
-                            |  | sort"""),
-  cwd: ".",
-  timeout: named(nefor.contracts.Timeout, Seconds, 30),
-})
-```
-
-POSIX shell does not imply Bash. When Bash semantics are required, invoke it explicitly with `process.exec`, for example `argv: ["/bin/bash", "-lc", "set -o pipefail; command"]`.
-
-Both nodes require a non-empty `cwd`; relative paths resolve from the MAG host's inherited working directory, exposed as `nefor.process.cwd` (`"."`). They accept `Unit`; an unfed node receives one automatic activation, while an incoming `Unit` edge makes it dependency-driven. The output is `ProcessResult`, containing separate `stdout`, `stderr`, and a nominal `ProcessExited` or `ProcessSignaled` termination value. Use exhaustive `match` to distinguish the two constructors; authored MAG never compares process-termination strings. Nonzero exit is result data, not a compilation failure.
-
-Timeouts are mandatory and explicit. <code>named(nefor.contracts.Timeout, Unlimited, nil)</code> is unbounded; use it only when waiting indefinitely is intentional. <code>named(nefor.contracts.Timeout, Milliseconds, N)</code> sets a positive wall-clock bound. `named(Timeout, Seconds, N)` and `named(Timeout, Minutes, N)` normalize through the same checked signed-integer conversion. Zero, negative, and overflowing durations fail when constructing a node during compilation. A process that never exits keeps its run nonterminal, so an awaited run also waits indefinitely. The current API has no `bash`, `BashOptions`, `command-with-options`, or `pipe-command` compatibility surface.
-
-## Human approvals
-
-<code>nefor.human.approval_gate</code> turns a `TextAnswer` into `nefor.human.HumanWorkflowDecision`, with `Approved(HumanWorkflowApproval {content})` and `Rejected(HumanWorkflowRejection {reason})` alternatives. Use it when human judgment is part of the graph's meaning.
-
-## Runtime expansion
-
-Most workflows should be fully static. When runtime data determines cardinality, a producer exposes the indexed-items-plus-completion `DynamicList<T>` protocol. Consumers retain that same nominal boundary: <code>nefor.dynamic.traverse</code> materializes one worker per item, while `nefor.dynamic.context` buffers through completion and activates once with the ordered list. The operation or factory owns this interpretation; the compiler grants no privileges from type-name spelling. Fixed worker lists use `nefor.node.sequence`.
-
-Version 1 evaluates only the closed Trigger, Capture, Field, IntToDecimalString, and ConcatStrings expression forms while materializing a structural delta template. There is no general runtime expression language or post-compilation MAG function application. Operations are program metadata, not graph edges, and do not give actors authority to alter the graph. See [MAG composition semantics](../../../plugins/mag/docs/patterns.md).
-
-## Worktrees
-
-`nefor.worktree.create` and `nefor.worktree.open` are explicit, typed workflow nodes:
-
-- `create` requires absolute repository and worktree paths plus branch and base. It creates only a fresh branch/worktree and refuses to adopt an existing path or local branch.
-- `open` validates an existing repository/path/branch triple and never creates or changes it.
-
-Successful worktrees outlive the MAG run. The public capability intentionally has no merge, removal, inventory, or cleanup operation. Route the returned `Worktree` into agents that need the isolated path, and keep integration or cleanup outside the graph unless an explicit capability owns it.
+Symbolic operators may be used as ordinary values and called with parentheses, or declared with a fixity and applied infix. `left op right` is the ordinary binary call `(op)(left, right)`, not a curried application. Infix application requires ASCII whitespace on both sides of a symbolic operator: write `left >>> right`, never `left>>>right`, `left >>>right`, or `(left)>>> right`. Spaces, tabs, and line breaks are separators; delimiters are not. A line may continue when a newline follows the operator (`left >>>` with `right` on the next line), while an operator at the start of the next line begins a new expression and is rejected. A `//` comment does not replace the required whitespace: write a space before the comment in `left >>> // explanation`. Alphabetic infix names use the same expression-separated position (`1 add 2`) without a separate symbolic-spacing check. This rule does not affect prefix calls such as `(>>>)(left, right)`, qualified calls such as <code>m.`>>>`(left, right)</code>, `->` in types, lambda delimiters, or signed numeric literals.

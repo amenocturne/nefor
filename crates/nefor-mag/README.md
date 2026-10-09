@@ -62,8 +62,8 @@ and `.magl` selects Lisp. CLI `--syntax new|lisp` and Rust `*_with_syntax`
 functions explicitly override only the entry. In-memory APIs default to the new
 syntax. Required modules always use their own suffix, both suffixes for one
 module identity are ambiguous, and a syntax error never retries another
-frontend. Evaluation stays syntax-independent and MAG core contains no Nefor or
-graph-language behavior.
+frontend. Evaluation stays syntax-independent and MAG core contains no
+application-specific behavior.
 
 ## Explicit project builds for embedders
 
@@ -97,7 +97,7 @@ acceptance: embedders must still validate artifacts against their current runtim
 
 ## Documentation
 
-- [The MAG Book](../../mag/book/README.md)
-- [Language and authoring reference](docs/language.md)
+- [The MAG Book: core language](<../../mag/book/01. core/README.md>)
+- [Language reference](docs/language.md)
 - [Compiler errors and recovery](docs/errors.md)
 - [Compiling MAG](docs/compiling.md)
