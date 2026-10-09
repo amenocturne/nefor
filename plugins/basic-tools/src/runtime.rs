@@ -340,6 +340,15 @@ async fn handle_invoke(
         .cloned()
         .unwrap_or(Value::Object(Map::new()));
 
+    let cancelled = async {
+        match cancel {
+            Some(receiver) => { let _ = receiver.await; }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(cancelled);
+    let mut cancellation_seen = false;
+
     // Process capabilities share streaming and cancellation mechanics.
     let outcome = if name == process_exec::NAME || name == shell_script::NAME {
         let preview = Arc::new(process::LivePreview::default());
@@ -354,20 +363,13 @@ async fn handle_invoke(
             } else {
                 shell_script::run_cancellable_streaming(&args, Some(stop_rx), Some(preview)).await
             };
-            let _ = finished_tx.send(());
+            let _ = finished_tx.send(is_deadline_outcome(&result));
             result
         };
         tokio::pin!(execution);
-        let cancelled = async {
-            match cancel {
-                Some(receiver) => { let _ = receiver.await; }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(cancelled);
         tokio::select! {
             result = &mut execution => {
-                if let Err(error) = publisher_result(forward.await) {
+                if let Err(error) = join_publisher(&mut forward, &mut cancelled).await {
                     return delivery_failure(out_tx, &id, error).await;
                 }
                 result
@@ -383,6 +385,7 @@ async fn handle_invoke(
                 }
             }
             _ = &mut cancelled => {
+                cancellation_seen = true;
                 let _ = stop_tx.send(());
                 let result = execution.await;
                 if let Err(error) = publisher_result(forward.await) {
@@ -393,20 +396,51 @@ async fn handle_invoke(
             _ = out_tx.closed() => {
                 let _ = stop_tx.send(());
                 let _ = execution.await;
-                let _ = forward.await;
+                publisher_result(forward.await)?;
                 return Err(TransportError::WriterClosed);
             }
         }
     } else {
         run_capability(&name, &args).await
     };
+    tokio::select! {
+        biased;
+        result = publish_outcome(out_tx, &id, outcome) => result,
+        _ = &mut cancelled, if !cancellation_seen => Err(blocked_cancellation()),
+    }
+}
+
+fn blocked_cancellation() -> TransportError {
+    TransportError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted,
+        "outbound delivery interrupted by cancellation; accepted work has unknown attribution"))
+}
+
+async fn join_publisher<F: std::future::Future<Output = ()>>(
+    forward: &mut tokio::task::JoinHandle<Result<(), TransportError>>,
+    cancelled: &mut std::pin::Pin<&mut F>,
+) -> Result<(), TransportError> {
+    tokio::select! {
+        biased;
+        result = &mut *forward => publisher_result(result),
+        _ = cancelled => {
+            forward.abort();
+            match forward.await {
+                Err(error) if error.is_cancelled() => Err(blocked_cancellation()),
+                result => publisher_result(result),
+            }
+        }
+    }
+}
+
+async fn publish_outcome(out_tx: &mpsc::Sender<PluginOutgoing>, id: &str, outcome: Result<Value, ToolError>) -> Result<(), TransportError> {
+    let urgent = is_deadline_outcome(&outcome);
     let terminal = match outcome {
-        Ok(output) => result_ok_body(&id, output),
-        Err(error) => result_error_body(&id, &error.to_string()),
+        Ok(output) => result_ok_body(id, output),
+        Err(error) => result_error_body(id, &error.to_string()),
     };
-    match send_event(out_tx, terminal).await {
+    match send_terminal(out_tx, terminal, urgent).await {
         Ok(()) => Ok(()),
-        Err(error) => delivery_failure(out_tx, &id, error).await,
+        Err(error) => delivery_failure_mode(out_tx, id, error, urgent).await,
     }
 }
 
@@ -419,12 +453,18 @@ fn publisher_result(
 async fn delivery_failure(
     out_tx: &mpsc::Sender<PluginOutgoing>, id: &str, error: TransportError,
 ) -> Result<(), TransportError> {
+    // A failed publisher has already stopped/reaped execution. Do not wait on
+    // a blocked peer to report that publication failure.
+    delivery_failure_mode(out_tx, id, error, true).await
+}
+
+async fn delivery_failure_mode(out_tx: &mpsc::Sender<PluginOutgoing>, id: &str, error: TransportError, urgent: bool) -> Result<(), TransportError> {
     let message = match error {
         TransportError::FrameTooLarge { .. } => "Output admission failed: frame_too_large; earlier/external effects may have occurred.",
         TransportError::InvalidFraming => "Output admission failed: invalid_framing; earlier/external effects may have occurred.",
         other => return Err(other),
     };
-    send_event(out_tx, result_error_body(id, message)).await
+    send_terminal(out_tx, result_error_body(id, message), urgent).await
 }
 
 /// Live output is a lossy preview; the authoritative output is the
@@ -432,35 +472,118 @@ async fn delivery_failure(
 /// one event per stream per interval, however fast the child writes.
 const PREVIEW_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+fn is_deadline_outcome(result: &Result<Value, ToolError>) -> bool {
+    matches!(result, Err(ToolError::ProcessTimeout { .. } | ToolError::ProcessCancelled { .. }))
+}
+
+// Existing process deadlines/cancellation must not turn into indefinite queue
+// waits. A blocked live peer is a transport failure, not successful settlement.
+async fn send_terminal(
+    out: &mpsc::Sender<PluginOutgoing>, body: Map<String, Value>, urgent: bool,
+) -> Result<(), TransportError> {
+    if urgent {
+        tokio::time::timeout(std::time::Duration::ZERO, send_event(out, body))
+            .await.map_err(|_| TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut, "outbound queue blocked at process deadline/cancellation",
+            )))?
+    } else {
+        send_event(out, body).await
+    }
+}
+
+fn decode_preview(decoder: &mut process::StreamDecoder, chunk: process::PreviewChunk) -> String {
+    let mut text = String::new();
+    if chunk.skipped_bytes > 0 {
+        text.push_str(&decoder.discontinuity());
+        text.push_str(&format!("[... {} bytes skipped in live output ...]\n", chunk.skipped_bytes));
+    }
+    text.push_str(&decoder.push(&chunk.bytes));
+    text
+}
+
 async fn forward_preview(
     preview: Arc<process::LivePreview>,
     out_tx: mpsc::Sender<PluginOutgoing>,
     id: String,
-    mut finished: oneshot::Receiver<()>,
+    mut finished: oneshot::Receiver<bool>,
 ) -> Result<(), TransportError> {
     let mut ticks = tokio::time::interval(PREVIEW_FLUSH_INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut decoders = [process::StreamDecoder::default(), process::StreamDecoder::default()];
+    let mut done = false;
+    let mut urgent = false;
     loop {
-        let done = tokio::select! {
-            _ = ticks.tick() => false,
-            _ = &mut finished => true,
-        };
+        if !done {
+            tokio::select! {
+                _ = ticks.tick() => {},
+                result = &mut finished => { done = true; urgent = result.unwrap_or(true); },
+                _ = out_tx.closed() => return Err(TransportError::WriterClosed),
+            }
+        }
+        let mut rows = Vec::new();
         for chunk in preview.take() {
-            let (stream, bytes) = match chunk {
-                process::StreamChunk::Stdout(bytes) => ("stdout", bytes),
-                process::StreamChunk::Stderr(bytes) => ("stderr", bytes),
+            let (index, stream, chunk) = match chunk {
+                process::StreamChunk::Stdout(chunk) => (0, "stdout", chunk),
+                process::StreamChunk::Stderr(chunk) => (1, "stderr", chunk),
             };
-            // Transitional display adapter; incremental decoding belongs to the
-            // following runtime migration, not to the raw preview buffer.
-            let marker = if bytes.skipped_bytes > 0 {
-                format!("[... {} bytes skipped in live output ...]\n", bytes.skipped_bytes)
-            } else {
-                String::new()
-            };
-            let text = format!("{marker}{}", String::from_utf8_lossy(&bytes.bytes));
-            send_event(&out_tx, stream_body(&id, stream, &text)).await?;
+            let skipped = chunk.skipped_bytes;
+            let text = decode_preview(&mut decoders[index], chunk);
+            if !text.is_empty() || skipped > 0 {
+                let mut row = stream_body(&id, stream, &text);
+                row.insert("skipped_bytes".into(), Value::from(skipped));
+                rows.push(row);
+            }
         }
         if done {
+            for (decoder, stream) in decoders.iter_mut().zip(["stdout", "stderr"]) {
+                let suffix = decoder.finish();
+                if !suffix.is_empty() {
+                    let mut row = stream_body(&id, stream, &suffix);
+                    row.insert("skipped_bytes".into(), Value::from(0));
+                    rows.push(row);
+                }
+            }
+        }
+        for row in rows {
+            if done {
+                send_terminal(&out_tx, row, urgent).await?;
+            } else {
+                let sending = send_event(&out_tx, row.clone());
+                tokio::pin!(sending);
+                tokio::select! {
+                    biased;
+                    result = &mut sending => result?,
+                    result = &mut finished => {
+                        done = true;
+                        urgent = result.unwrap_or(true);
+                        // The interrupted checked send has not enqueued this row.
+                        send_terminal(&out_tx, row, urgent).await?;
+                    }
+                }
+            }
+        }
+        if done {
+            // Completion may have arrived during a send. Drain once more so
+            // bytes captured after the previous take precede the terminal.
+            for chunk in preview.take() {
+                let (index, stream, chunk) = match chunk {
+                    process::StreamChunk::Stdout(chunk) => (0, "stdout", chunk),
+                    process::StreamChunk::Stderr(chunk) => (1, "stderr", chunk),
+                };
+                let skipped = chunk.skipped_bytes;
+                let text = decode_preview(&mut decoders[index], chunk);
+                let mut row = stream_body(&id, stream, &text);
+                row.insert("skipped_bytes".into(), Value::from(skipped));
+                send_terminal(&out_tx, row, urgent).await?;
+            }
+            for (decoder, stream) in decoders.iter_mut().zip(["stdout", "stderr"]) {
+                let suffix = decoder.finish();
+                if !suffix.is_empty() {
+                    let mut row = stream_body(&id, stream, &suffix);
+                    row.insert("skipped_bytes".into(), Value::from(0));
+                    send_terminal(&out_tx, row, urgent).await?;
+                }
+            }
             return Ok(());
         }
     }
