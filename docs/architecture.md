@@ -89,7 +89,11 @@ selects another prepared tree for development or an alternate launcher. A
 separate composition may select different dependencies and a different manager.
 
 Preparation needs LuaRocks, a Lua 5.4 interpreter and headers, a C compiler,
-make, archive tools, and OpenSSL development libraries. Linux runtime modules
+make, archive tools, and OpenSSL development libraries. `just
+prepare-distribution-lua-dependencies [tree]` runs it. `LUA_DEPENDENCIES_LUA_DIR`
+selects the Lua 5.4 installation LuaRocks builds against, and
+`LUA_DEPENDENCIES_OPENSSL_DIR` selects the OpenSSL prefix; on macOS the OpenSSL
+prefix defaults to Homebrew's `openssl@3`. Linux runtime modules
 require the system OpenSSL 3 libraries and CA certificates. On macOS preparation
 copies non-system dylib dependencies into the tree, rewrites their loader paths,
 and signs the modified files; release CI prepares each target separately.

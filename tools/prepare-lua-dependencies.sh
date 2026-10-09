@@ -11,7 +11,14 @@ tools_root=$(cd "$(dirname "$0")" && pwd)
 lua_options=(--lua-version=5.4)
 if [ -n "${LUA_DEPENDENCIES_LUA_DIR:-}" ]; then lua_options+=(--lua-dir="$LUA_DEPENDENCIES_LUA_DIR"); fi
 build_options=()
+# LuaRocks does not search Homebrew prefixes, so macOS defaults to Homebrew's OpenSSL 3.
+if [ -z "${LUA_DEPENDENCIES_OPENSSL_DIR:-}" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null; then
+  LUA_DEPENDENCIES_OPENSSL_DIR=$(brew --prefix openssl@3)
+  [ -d "$LUA_DEPENDENCIES_OPENSSL_DIR/include/openssl" ] || {
+    echo "OpenSSL 3 is required: brew install openssl@3, or set LUA_DEPENDENCIES_OPENSSL_DIR" >&2; exit 1; }
+fi
 if [ -n "${LUA_DEPENDENCIES_OPENSSL_DIR:-}" ]; then
+  echo "Lua dependencies use OpenSSL from $LUA_DEPENDENCIES_OPENSSL_DIR" >&2
   build_options+=("OPENSSL_DIR=$LUA_DEPENDENCIES_OPENSSL_DIR" "CRYPTO_DIR=$LUA_DEPENDENCIES_OPENSSL_DIR")
 fi
 mkdir -p "$(dirname "$3")"
