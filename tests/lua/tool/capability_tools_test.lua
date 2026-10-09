@@ -192,4 +192,56 @@ basic.from_plugin({ { type = "event", body = { kind = "capability.result", id = 
 eq(#sent, settled_count, "rejected invocation releases capability waiter")
 nefor.engine.deliver = deliver
 
+-- Cancellation rejection is authority loss, even when source.cancel catches
+-- handler errors. Stream rejection must still settle its actual invocation.
+local losses = {}
+local old_loop = package.loaded["libs.agentic-loop"]
+package.loaded["libs.agentic-loop"] = {
+  capability_lost = function(peer, message)
+    losses[#losses + 1] = { peer = peer, message = message }
+  end,
+}
+local function result_count(id)
+  local total = 0
+  for _, env in ipairs(sent) do
+    if env.body.kind == "tool.result" and env.body.id == id then total = total + 1 end
+  end
+  return total
+end
+for _, stream_failure in ipairs({ false, true }) do
+  local id = stream_failure and "rejected-stream-cancel" or "rejected-cancel"
+  invoke(basic, id, "shell.script", { script = "sleep 9", cwd = ".",
+    timeout = { present = false, milliseconds = 0 } })
+  nefor.engine.deliver = function(_, payload)
+    if json.decode(payload).body.kind == "basic-tools.capability.cancel" then
+      error("typed_admission", 0)
+    end
+    return deliver("basic-tools", payload)
+  end
+  local before_losses = #losses
+  if stream_failure then
+    nefor.engine.send = function(payload)
+      if json.decode(payload).body.kind == "tool.stream" then error("frame_too_large") end
+      return send(payload)
+    end
+    basic.from_plugin({ { body = {
+      kind = "capability.stream", id = id, stream = "stdout", text = "rejected",
+    } } })
+    eq(last_sent("tool.result", id).error_code, "output_rejected", "stream failure still settles actual id")
+    eq(result_count(id), 1, "one physical stream-failure terminal")
+  else
+    basic.source.cancel({ id = id })
+    eq(result_count(id), 0, "cancel authority loss is not fabricated completion")
+  end
+  eq(#losses, before_losses + 1, "cancel rejection reconciles once through surviving authority")
+  eq(losses[#losses].peer, "basic-tools", "lost capability identity")
+  assert(losses[#losses].message:find("outcomes are unknown", 1, true))
+  eq(basic.source.cancel({ id = id }), nil, "invocation ownership released")
+  local before_late = #sent
+  basic.from_plugin({ { body = { kind = "capability.result", id = id, output = "late" } } })
+  eq(#sent, before_late, "late result cannot duplicate settlement after cancel rejection")
+  nefor.engine.deliver, nefor.engine.send = deliver, send
+end
+package.loaded["libs.agentic-loop"] = old_loop
+
 return true

@@ -207,12 +207,14 @@ function M.source(opts)
     local id = body.id
     local call = { id = id, name = definition.name, args = args, request = body }
     function call.ok(output, fields)
+      if pending[id] ~= call then return end
       local result = copy_fields(fields, {})
       result.output = output
       result.error = nil
       source.result(id, result)
     end
     function call.err(message, fields)
+      if pending[id] ~= call then return end
       local result = copy_fields(fields, {})
       result.error = tostring(message)
       result.output = nil

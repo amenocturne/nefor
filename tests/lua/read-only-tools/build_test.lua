@@ -160,6 +160,45 @@ for _, already_settled in ipairs({ false, true }) do
   nefor.engine.send = send
 end
 
+-- Count physical publications, not dictionary entries: retained callbacks
+-- cannot settle twice or publish a terminal after cancellation.
+do
+  local terminals, retained = 0, nil
+  local send = nefor.engine.send
+  nefor.engine.send = function(payload)
+    if nefor.json.decode(payload).body.kind == "tool.result" then terminals = terminals + 1 end
+    return send(payload)
+  end
+  local guarded = rot.build { extra_tools = { tool.define {
+    name = "custom", description = "Callback settlement guard",
+    parameters = { type = "object" }, display = custom_display("custom"),
+    handler = function(_, call)
+      retained = call
+      call.ok("first")
+      call.err("second")
+      call.ok("third")
+    end,
+  } } }
+  assert_true(invoke(guarded, "custom", {}).output == "first", "first callback owns the result")
+  assert_true(terminals == 1 and retained.settled(), "callbacks publish once")
+  local delayed = rot.build { extra_tools = { tool.define {
+    name = "custom", description = "Deferred callback",
+    parameters = { type = "object" }, display = custom_display("custom"),
+    handler = function(_, call) retained = call end,
+  } } }
+  delayed.receive_msg({ payload = nefor.json.encode({ body = {
+    kind = "read-only-tools.tool.invoke", id = "late-callback", name = "custom", args = {},
+  } }) })
+  assert_true(not retained.settled(), "deferred invocation is pending")
+  delayed.receive_msg({ payload = nefor.json.encode({ body = {
+    kind = "read-only-tools.tool.cancel", id = "late-callback",
+  } }) })
+  retained.ok("late success")
+  retained.err("late failure")
+  assert_true(retained.settled() and terminals == 1, "cancelled callbacks publish nothing")
+  nefor.engine.send = send
+end
+
 local display = require("libs.chat.tool_display")
 local contract = {
   compact = { label = "Read file", primary = { label = "path", select = { source = "args", path = "path" }, kind = "path" } },

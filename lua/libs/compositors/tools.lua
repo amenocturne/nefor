@@ -184,8 +184,15 @@ function M.capability_tools_spec(opts)
     call.err("Capability invocation publication failed; prior effects are unknown")
   end
   function capability.cancel(call)
+    local admitted, fault = pcall(deliver, { kind = name .. ".capability.cancel", id = call.id })
+    if not admitted then
+      if not (nefor.engine.error_kind and nefor.engine.error_kind(fault)) then error(fault, 0) end
+      -- A rejected cancel cannot prove that the native operation stopped.
+      -- Reconcile through request authority before releasing its waiter.
+      require("libs.agentic-loop").capability_lost(name,
+        "Capability cancellation publication failed; accepted outcomes are unknown")
+    end
     pending[call.id] = nil
-    deliver({ kind = name .. ".capability.cancel", id = call.id })
   end
 
   local source
@@ -193,8 +200,8 @@ function M.capability_tools_spec(opts)
     local admitted = envelope.checked_emit_as(name, nil, body)
     if admitted then return end
     local call = pending[body.id]
-    pending[body.id] = nil
     if call and body.kind == "tool.stream" then capability.cancel(call) end
+    pending[body.id] = nil
     if body.kind == "tool.stream" then
       source.result(body.id, { error_code = "output_rejected",
         error = "Capability stream publication failed; prior effects are unknown" })
