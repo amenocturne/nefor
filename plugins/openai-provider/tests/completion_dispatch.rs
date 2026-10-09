@@ -44,7 +44,10 @@ async fn spawn_provider(base_url: &str) -> (Child, ChildStdin, BufReader<ChildSt
             base_url,
             "--model",
             "fixture-model",
+            "--api-key",
+            "offline-fixture-token",
         ])
+        .env_remove("OPENAI_PROVIDER_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

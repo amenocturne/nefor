@@ -1865,3 +1865,170 @@ async fn full_publisher_queue_backpressures_without_losing_required_deltas() {
     finish_harness(in_tx, handle).await;
     server.await.expect("mock server");
 }
+
+/// Writer loss cancels accepted HTTP siblings without further bus input.
+/// Process reap is checked separately AFTER releasing stdin: automatic exit
+/// with a parked stdin reader is a retained, failing acceptance witness.
+#[tokio::test]
+async fn physical_stdout_loss_cancels_http_before_stdin_release_then_reaps() {
+    use nefor_protocol::SystemBody;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::time::timeout;
+    async fn accept_completion(listener: &TcpListener) -> tokio::net::TcpStream {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                if headers.starts_with("GET ") {
+                    assert!(
+                        headers.contains("/models") || headers.contains("/usage"),
+                        "unexpected local request: {headers}"
+                    );
+                    let catalog = r#"{"models":[]}"#;
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", catalog.len(), catalog).as_bytes()).await.unwrap();
+                    break;
+                }
+                assert!(headers.starts_with("POST "));
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    let request: Value =
+                        serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                    assert_eq!(request["model"], "gpt-test");
+                    return stream;
+                }
+            }
+        }
+    }
+    let wait = Duration::from_secs(10);
+    let data = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_chatgpt-provider"))
+        .args([
+            "--base-url",
+            &format!("http://{}", listener.local_addr().unwrap()),
+        ])
+        .env("NEFOR_DATA_DIR", data.path())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CHATGPT_ACCESS_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    timeout(wait, stdout.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        PluginOutgoing::parse_line(line.trim_end()).unwrap().body,
+        Body::System(SystemBody::Ready { .. })
+    ));
+    let ready = Envelope::system(
+        PluginName::engine(),
+        Timestamp::now(),
+        SystemBody::ReadyOk {
+            engine_version: "offline-test".into(),
+        },
+    );
+    stdin
+        .write_all(format!("{}\n", ready.to_line()).as_bytes())
+        .await
+        .unwrap();
+    // auth.set uses a synthetic token without refresh/login; endpoint is loopback only.
+    let auth = Envelope::event(
+        PluginName::engine(),
+        Timestamp::now(),
+        serde_json::json!({"kind":"chatgpt.auth.set","token":"offline-fixture-token"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    stdin
+        .write_all(format!("{}\n", auth.to_line()).as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let (mut models, _) = timeout(wait, listener.accept()).await.unwrap().unwrap();
+    let request = timeout(wait, read_request(&mut models)).await.unwrap();
+    assert!(
+        request.starts_with("GET "),
+        "only local catalog fetch: {request}"
+    );
+    let catalog = r#"{"models":[]}"#;
+    models.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", catalog.len(), catalog).as_bytes()).await.unwrap();
+    drop(models);
+    let body = serde_json::json!({"kind":"chatgpt.completion.request","request_id":"writer-trigger",
+        "model":"gpt-test","messages":[{"role":"user","content":"fixture"}]});
+    let envelope = Envelope::event(
+        PluginName::engine(),
+        Timestamp::now(),
+        body.as_object().unwrap().clone(),
+    );
+    stdin
+        .write_all(format!("{}\n", envelope.to_line()).as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let mut trigger = timeout(wait, accept_completion(&listener)).await.unwrap();
+    let body = serde_json::json!({"kind":"chatgpt.completion.request","request_id":"pending-sibling",
+        "model":"gpt-test","messages":[{"role":"user","content":"fixture"}]});
+    let envelope = Envelope::event(
+        PluginName::engine(),
+        Timestamp::now(),
+        body.as_object().unwrap().clone(),
+    );
+    stdin
+        .write_all(format!("{}\n", envelope.to_line()).as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let mut pending = timeout(wait, accept_completion(&listener)).await.unwrap();
+    drop(stdout);
+    let sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"trigger writer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"offline-response\"}}\n\ndata: [DONE]\n\n";
+    trigger.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}", sse.len(), sse).as_bytes()).await.unwrap();
+    let mut cancelled_byte = [0; 1];
+    assert_eq!(
+        timeout(wait, pending.read(&mut cancelled_byte))
+            .await
+            .expect("HTTP sibling cancellation before process exit")
+            .unwrap(),
+        0
+    );
+    drop(stdin);
+    let status = timeout(wait, child.wait())
+        .await
+        .expect("process exit after stdin release")
+        .unwrap();
+    assert!(
+        !status.success(),
+        "stdout loss cannot be reported as successful shutdown"
+    );
+    let mut byte = [0; 1];
+    assert_eq!(
+        timeout(wait, pending.read(&mut byte))
+            .await
+            .expect("accepted sibling HTTP cancelled")
+            .unwrap(),
+        0
+    );
+}
