@@ -12,9 +12,17 @@ use tokio::sync::oneshot;
 use crate::error::ToolError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewChunk {
+    pub bytes: Vec<u8>,
+    /// Raw source bytes lost immediately before `bytes`, since the last drain.
+    /// Zero means this span is contiguous with the preceding drain.
+    pub skipped_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamChunk {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
+    Stdout(PreviewChunk),
+    Stderr(PreviewChunk),
 }
 
 /// Pipe read boundaries are unrelated to UTF-8 boundaries. Only incomplete
@@ -54,6 +62,13 @@ impl StreamDecoder {
         output
     }
 
+    /// End the contiguous segment before rendering a gap. Never feed omission
+    /// markers into this decoder: a pending suffix belongs to the old segment.
+    pub fn discontinuity(&mut self) -> String {
+        self.finish()
+    }
+
+    /// Flush a partial EOF suffix lossily once; subsequent calls are empty.
     pub fn finish(&mut self) -> String {
         let output = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
@@ -300,7 +315,10 @@ pub const PREVIEW_WINDOW_BYTES: usize = 16 * 1024;
 
 /// Live process output that a consumer drains on its own schedule. The child
 /// never waits on it, and its memory stays bounded however fast the child
-/// writes.
+/// writes. With 8192-byte pipe reads, pending logical length is at most 32KiB
+/// per stream after push (40KiB transiently); a drain keeps at most 16KiB.
+/// Vec capacities, decoding/serialization temporaries, RSS and concurrency are
+/// separate from these per-stream logical bounds.
 #[derive(Default)]
 pub struct LivePreview {
     stdout: Mutex<PreviewBuffer>,
@@ -350,19 +368,15 @@ impl PreviewBuffer {
         }
     }
 
-    fn take(&mut self) -> Option<Vec<u8>> {
+    fn take(&mut self) -> Option<PreviewChunk> {
         self.trim();
         if self.pending.is_empty() && self.skipped == 0 {
             return None;
         }
-        let mut bytes = if self.skipped > 0 {
-            format!("[... {} bytes skipped in live output ...]\n", self.skipped).into_bytes()
-        } else {
-            Vec::new()
-        };
-        bytes.append(&mut self.pending);
-        self.skipped = 0;
-        Some(bytes)
+        Some(PreviewChunk {
+            bytes: std::mem::take(&mut self.pending),
+            skipped_bytes: std::mem::take(&mut self.skipped),
+        })
     }
 }
 
@@ -371,12 +385,12 @@ fn lock(buffer: &Mutex<PreviewBuffer>) -> MutexGuard<'_, PreviewBuffer> {
 }
 
 /// Bytes of each stream kept from the start and from the end of the output.
-/// JSON escaping can grow a byte up to sixfold, so both streams at twice this
-/// bound must stay below the engine's 16 MiB NCP line limit.
+/// This is a raw payload bound, not full-frame admission: IDs, escaping and
+/// the outer envelope remain the checked publisher's responsibility.
 pub const RETAINED_EDGE_BYTES: usize = 512 * 1024;
 
 /// Head and tail of one output stream; the middle of an oversized stream is
-/// dropped so the tool result always fits in a single NCP frame.
+/// dropped with an exact raw-byte count. Cuts may split UTF-8 characters.
 #[derive(Default)]
 struct RetainedOutput {
     head: Vec<u8>,
@@ -539,6 +553,203 @@ mod decoder_tests {
                 err_text.push_str(&err.finish());
                 assert_eq!(out_text, String::from_utf8_lossy(stdout));
                 assert_eq!(err_text, String::from_utf8_lossy(stderr));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod buffer_contract_tests {
+    use super::*;
+
+    #[test]
+    fn every_read_and_timer_drain_partition_preserves_contiguous_utf8() {
+        let bytes = "Ж€😀".as_bytes();
+        for reads in 0..(1usize << (bytes.len() - 1)) {
+            for drains in 0..(1usize << bytes.len()) {
+                let mut buffer = PreviewBuffer::default();
+                let mut decoder = StreamDecoder::default();
+                let mut text = String::new();
+                let mut start = 0;
+                for end in 1..=bytes.len() {
+                    if end == bytes.len() || reads & (1 << (end - 1)) != 0 {
+                        buffer.push(&bytes[start..end]);
+                        start = end;
+                    }
+                    if drains & (1 << (end - 1)) != 0 {
+                        if let Some(chunk) = buffer.take() {
+                            assert_eq!(chunk.skipped_bytes, 0);
+                            text.push_str(&decoder.push(&chunk.bytes));
+                        }
+                    }
+                }
+                if let Some(chunk) = buffer.take() {
+                    text.push_str(&decoder.push(&chunk.bytes));
+                }
+                text.push_str(&decoder.finish());
+                assert_eq!(text, String::from_utf8_lossy(bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn gap_ends_pending_suffix_before_new_segment() {
+        for suffix in [b"\xe2".as_slice(), b"\xe2\x82", b"\xf0\x9f\x98"] {
+            let mut decoder = StreamDecoder::default();
+            assert_eq!(decoder.push(suffix), "");
+            let mut buffer = PreviewBuffer::default();
+            buffer.push(&vec![b'x'; PREVIEW_WINDOW_BYTES + 1]);
+            buffer.push(b"\xac");
+            let chunk = buffer.take().unwrap();
+            assert_eq!(chunk.skipped_bytes, 2);
+            assert_eq!(decoder.discontinuity(), String::from_utf8_lossy(suffix));
+            let text = decoder.push(&chunk.bytes) + &decoder.finish();
+            assert_eq!(text, String::from_utf8_lossy(&chunk.bytes));
+            assert!(!text.contains('€'));
+            assert_eq!(decoder.finish(), "");
+        }
+    }
+
+    #[test]
+    fn invalid_and_suffix_only_eof_flush_exactly_once() {
+        let mut decoder = StreamDecoder::default();
+        assert_eq!(decoder.push(b"a\xff\xe2\x82"), "a�");
+        assert_eq!(decoder.push(b""), "");
+        assert_eq!(decoder.finish(), "�");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn literal_markers_are_data_and_stream_gaps_are_independent() {
+        let preview = LivePreview::default();
+        let literal = b"[... 42 bytes skipped in live output ...]\n\xe2";
+        preview.push(StreamKind::Stdout, literal);
+        preview.push(StreamKind::Stderr, &vec![b'e'; PREVIEW_WINDOW_BYTES + 7]);
+        let chunks = preview.take();
+        assert_eq!(
+            chunks[0],
+            StreamChunk::Stdout(PreviewChunk {
+                bytes: literal.to_vec(),
+                skipped_bytes: 0,
+            })
+        );
+        assert_eq!(
+            chunks[1],
+            StreamChunk::Stderr(PreviewChunk {
+                bytes: vec![b'e'; PREVIEW_WINDOW_BYTES],
+                skipped_bytes: 7,
+            })
+        );
+        preview.push(StreamKind::Stdout, b"\x82\xac");
+        assert_eq!(
+            preview.take(),
+            vec![StreamChunk::Stdout(PreviewChunk {
+                bytes: b"\x82\xac".to_vec(),
+                skipped_bytes: 0,
+            })]
+        );
+        assert!(preview.take().is_empty());
+        let mut gap_only = PreviewBuffer {
+            pending: Vec::new(),
+            skipped: 11,
+        };
+        assert_eq!(
+            gap_only.take(),
+            Some(PreviewChunk {
+                bytes: vec![],
+                skipped_bytes: 11
+            })
+        );
+        assert_eq!(gap_only.take(), None);
+    }
+
+    #[test]
+    fn preview_thresholds_and_repeated_drains_account_for_every_raw_byte() {
+        for size in [
+            0,
+            1,
+            PREVIEW_WINDOW_BYTES - 1,
+            PREVIEW_WINDOW_BYTES,
+            PREVIEW_WINDOW_BYTES + 1,
+            2 * PREVIEW_WINDOW_BYTES,
+            2 * PREVIEW_WINDOW_BYTES + 1,
+            7 * PREVIEW_WINDOW_BYTES + 19,
+        ] {
+            for stride in [1, 127, 8192] {
+                let source: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+                let mut buffer = PreviewBuffer::default();
+                for chunk in source.chunks(stride) {
+                    buffer.push(chunk);
+                    assert!(buffer.pending.len() <= 2 * PREVIEW_WINDOW_BYTES);
+                }
+                if let Some(chunk) = buffer.take() {
+                    let kept = size.min(PREVIEW_WINDOW_BYTES);
+                    assert_eq!(chunk.bytes, source[size - kept..]);
+                    assert_eq!(chunk.skipped_bytes as usize + kept, size);
+                } else {
+                    assert_eq!(size, 0);
+                }
+                assert!(buffer.take().is_none());
+                buffer.push(b"next");
+                assert_eq!(buffer.take().unwrap().skipped_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_thresholds_counts_and_raw_utf8_cuts_match_reference() {
+        let edge = RETAINED_EDGE_BYTES;
+        for size in [
+            edge - 1,
+            edge,
+            edge + 1,
+            2 * edge - 1,
+            2 * edge,
+            2 * edge + 1,
+            3 * edge + 17,
+            5 * edge + 3,
+        ] {
+            let source: Vec<u8> = "€😀Ж"
+                .as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(size)
+                .collect();
+            for stride in [127, 8192] {
+                let mut retained = RetainedOutput::default();
+                let mut total = 0;
+                for chunk in source.chunks(stride) {
+                    total += chunk.len();
+                    retained.push(chunk);
+                    assert!(retained.head.len() <= edge);
+                    assert!(retained.tail.len() <= 2 * edge);
+                    assert_eq!(
+                        retained.omitted as usize + retained.head.len() + retained.tail.len(),
+                        total
+                    );
+                }
+                let omitted = size.saturating_sub(2 * edge);
+                let expected = if omitted == 0 {
+                    source.clone()
+                } else {
+                    let mut bytes = source[..edge].to_vec();
+                    bytes.extend_from_slice(
+                        format!("\n[... {omitted} bytes of output omitted ...]\n").as_bytes(),
+                    );
+                    bytes.extend_from_slice(&source[size - edge..]);
+                    bytes
+                };
+                let actual = retained.into_bytes();
+                assert_eq!(actual, expected);
+                if omitted > 0 {
+                    let displayed = format!(
+                        "{}\n[... {omitted} bytes of output omitted ...]\n{}",
+                        String::from_utf8_lossy(&source[..edge]),
+                        String::from_utf8_lossy(&source[size - edge..])
+                    );
+                    assert_eq!(String::from_utf8_lossy(&actual), displayed);
+                }
             }
         }
     }

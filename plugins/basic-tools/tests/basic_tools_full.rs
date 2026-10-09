@@ -102,6 +102,53 @@ mod tools {
             }
 
             #[tokio::test]
+            async fn cancellation_retains_group_authority_after_leader_exits() {
+                let directory = tempfile::tempdir().unwrap();
+                let pid_file = directory.path().join("leader");
+                let script = format!(
+                    "echo $$ > {}; printf started; sleep 30 & exit 0",
+                    pid_file.display()
+                );
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                let invocation = tokio::spawn(async move {
+                    run_cancellable_streaming(
+                        &json!({ "argv": ["/bin/sh", "-c", script], "cwd": "/", "timeout": unbounded() }),
+                        Some(cancel_rx), None,
+                    ).await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                            let pid = pid.trim().parse::<libc::pid_t>().unwrap();
+                            if unsafe { libc::kill(pid, 0) } == -1
+                                && std::io::Error::last_os_error().raw_os_error()
+                                    == Some(libc::ESRCH)
+                            {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    !invocation.is_finished(),
+                    "descendant still holds stdout/stderr"
+                );
+                cancel_tx.send(()).unwrap();
+                let error = tokio::time::timeout(std::time::Duration::from_secs(5), invocation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(
+                    matches!(error, ToolError::ProcessCancelled { stdout, stderr }
+                    if stdout == "started" && stderr.is_empty())
+                );
+            }
+
+            #[tokio::test]
             async fn streams_stdout_and_stderr_independently() {
                 let preview = std::sync::Arc::new(process::LivePreview::default());
                 let _ = run_cancellable_streaming(
@@ -112,8 +159,14 @@ mod tools {
                 assert_eq!(
                     preview.take(),
                     vec![
-                        process::StreamChunk::Stdout(b"out".to_vec()),
-                        process::StreamChunk::Stderr(b"err".to_vec()),
+                        process::StreamChunk::Stdout(process::PreviewChunk {
+                            bytes: b"out".to_vec(),
+                            skipped_bytes: 0
+                        }),
+                        process::StreamChunk::Stderr(process::PreviewChunk {
+                            bytes: b"err".to_vec(),
+                            skipped_bytes: 0
+                        }),
                     ]
                 );
                 assert!(preview.take().is_empty(), "a drain forwards each byte once");
@@ -131,11 +184,9 @@ mod tools {
                 let [process::StreamChunk::Stdout(bytes)] = chunks.as_slice() else {
                     panic!("expected one stdout chunk, got {chunks:?}");
                 };
-                let text = String::from_utf8(bytes.clone()).unwrap();
+                let text = String::from_utf8(bytes.bytes.clone()).unwrap();
                 let skipped = 1_048_576 + 3 - process::PREVIEW_WINDOW_BYTES;
-                assert!(text.starts_with(&format!(
-                    "[... {skipped} bytes skipped in live output ...]\n"
-                )));
+                assert_eq!(bytes.skipped_bytes, skipped as u64);
                 assert!(text.ends_with("aaaEND"));
                 assert!(text.len() < process::PREVIEW_WINDOW_BYTES + 64);
             }
@@ -158,8 +209,10 @@ mod tools {
             }
 
             #[tokio::test]
-            async fn worst_case_escaped_output_on_both_streams_fits_one_ncp_frame() {
-                // \x01 escapes to six JSON bytes (`\u0001`), the largest per-byte growth.
+            async fn worst_case_escaped_retained_payload_has_bounded_inner_json() {
+                // This checks only the inner payload; full-envelope admission also
+                // includes the real correlation ID, error rendering and LF.
+                // \x01 escapes to six JSON bytes (`\u0001`).
                 let result = run(&json!({
                     "argv": ["/bin/sh", "-c", "head -c 20971520 /dev/zero | tr '\\0' '\\001' | tee /dev/stderr"],
                     "cwd": "/",

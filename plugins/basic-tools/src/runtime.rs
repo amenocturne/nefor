@@ -450,7 +450,14 @@ async fn forward_preview(
                 process::StreamChunk::Stdout(bytes) => ("stdout", bytes),
                 process::StreamChunk::Stderr(bytes) => ("stderr", bytes),
             };
-            let text = String::from_utf8_lossy(&bytes);
+            // Transitional display adapter; incremental decoding belongs to the
+            // following runtime migration, not to the raw preview buffer.
+            let marker = if bytes.skipped_bytes > 0 {
+                format!("[... {} bytes skipped in live output ...]\n", bytes.skipped_bytes)
+            } else {
+                String::new()
+            };
+            let text = format!("{marker}{}", String::from_utf8_lossy(&bytes.bytes));
             send_event(&out_tx, stream_body(&id, stream, &text)).await?;
         }
         if done {

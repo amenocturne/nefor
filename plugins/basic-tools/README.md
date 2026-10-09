@@ -136,10 +136,27 @@ active policy/mode.
 basic-tools is composed into the default starter. To run it ad-hoc against a
 fake engine, see [`tools/fake-engine`](../../tools/fake-engine).
 
-Process stream decoding retains incomplete UTF-8 suffixes independently for
-stdout and stderr. Complete invalid sequences and incomplete EOF suffixes use
-the same lossy replacement policy as the captured terminal process result;
-concatenated stream text therefore does not depend on pipe-read partitioning.
+Process capture retains the first and last 512KiB of each stream. Up to 1MiB
+is complete; larger output omits the middle with an exact raw-byte count.
+Cuts are byte-based: valid UTF-8 characters split at retained edges may be
+replaced lossily. Results and timeout/cancel diagnostics are bounded captures,
+not recoverable transcripts.
+
+Live preview independently keeps the latest 16KiB per stream per drain.
+The internal `PreviewChunk { bytes, skipped_bytes }` reports source-byte loss
+immediately before those bytes; marker-like source text is ordinary data.
+The decoder helper defers incomplete UTF-8 suffixes across contiguous spans,
+finishes/resets at an explicit discontinuity, and flushes a partial EOF suffix
+lossily exactly once. Complete invalid sequences use whole-buffer lossy
+replacement semantics. The current wire adapter still decodes each drain
+lossily and renders a textual gap; incremental decoding and machine-observable
+wire gap metadata require the runtime migration.
+
+Pipe readers never await the outbound queue. With 8192-byte reads, lazy buffers
+have logical lengths of at most 32KiB pending preview and 512KiB head plus 1MiB
+tail per stream after push; transient overshoot is at most one read. Finalized
+raw capture is at most 1MiB plus its marker. These are not Vec capacity, RSS,
+serialized-frame or global/concurrent invocation bounds.
 
 ## Output admission and transport loss
 
@@ -157,5 +174,5 @@ closed, the error reaches the task supervisor. It cancels and joins owned work
 before exiting. Terminal stdin framing, UTF-8, and I/O faults take the same
 cleanup path; malformed bounded JSON remains parse noise. Accepted effects are
 unknown after transport loss. Required startup/advertisement failures are fatal;
-goodbye is checked but best effort during selected teardown. Frame admission does
-not bound captured process output or the upstream stream channel's memory.
+goodbye is checked but best effort during selected teardown. Frame admission is separate from the per-stream logical capture and preview
+bounds; IDs, rendered errors and serialization add further memory.
