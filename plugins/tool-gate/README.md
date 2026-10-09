@@ -1,7 +1,11 @@
 # tool-gate
 
 NCP plugin: per-tool permission gate. Transparent proxy between
-providers and tool-providing plugins (basic-tools, etc.).
+providers and tool sources (the Lua `libs.tool` sources wrapping
+basic-tools and git-worktree, lead-workflow, read-only-tools, provider web
+tools). The gate only decides whether an invocation may execute; argument
+validation belongs to each tool's source, which checks the arguments it
+actually receives, including arguments an approval replaced.
 
 Tool sources advertise privately to the gate via
 `tool-gate.tools.advertise`. The gate aggregates and re-emits a single

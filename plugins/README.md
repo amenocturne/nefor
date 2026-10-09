@@ -9,7 +9,7 @@ Process-isolated NCP plugins. Each plugin is its own crate with a binary entry p
 - `chatgpt-provider/` — ChatGPT-subscription Responses API provider with OAuth login.
 - `mag/` — MAG actor kernel: executes compiled `.mag` programs as actor constellations.
 - `tool-gate/` — tool advertisement + permission gate.
-- `basic-tools/` — file/image/edit/process tools (`read_file`, `read_image`, `write_file`, `process.exec`, `shell.script`).
+- `basic-tools/` — file/image/edit/process capabilities behind the Lua-defined `read_file`, `read_image`, `write_file`, `process.exec`, `shell.script` tools.
 - `git-worktree/` — explicit Git worktree creation and reuse validation for MAG workflows.
 - `generic-provider/`, `generic-tool/` — passive hubs that emit type-registry events for graph composition.
 - `mock-plugin/` — scriptable NCP actor for integration tests.
