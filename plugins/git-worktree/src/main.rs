@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 
 use clap::Parser;
-use git_worktree_plugin::{CreateSpec, OpenSpec, WorktreeError, CREATE_CAPABILITY, OPEN_CAPABILITY};
+use git_worktree_plugin::{
+    CreateSpec, OpenSpec, WorktreeError, CREATE_CAPABILITY, OPEN_CAPABILITY,
+};
 use nefor_plugin_sdk::{
     await_ready_ok, checked_send, spawn_stdin_reader, spawn_stdout_writer, TransportError,
 };

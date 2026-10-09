@@ -56,7 +56,9 @@ mod producer_admission {
             assert_eq!(plugin.recv()["body"]["kind"], "ready");
             plugin.send(json!({"kind": "ready_ok", "engine_version": "test"}));
             plugin.recv(); // hello
-            plugin.recv(); // mode or advertisement
+            if name == "tool-gate" {
+                plugin.recv();
+            } // gate mode; capability providers do not advertise
             plugin
         }
 
@@ -116,10 +118,9 @@ mod producer_admission {
     #[test]
     fn real_worktree_rejected_output_settles_actual_id_then_accepts_later_tool() {
         let mut plugin = Plugin::start("git-worktree", &[]);
-        let mut invoke =
-            json!({"kind": "git-worktree.tool.invoke", "id": "actual", "name": "", "args": {}});
+        let mut invoke = json!({"kind": "git-worktree.capability.invoke", "id": "actual", "capability": "", "args": {}});
         let overhead = serde_json::to_string(&wire(invoke.clone())).unwrap().len() + 1;
-        invoke["name"] = Value::String("x".repeat(16 * 1024 * 1024 - overhead - 4));
+        invoke["capability"] = Value::String("x".repeat(16 * 1024 * 1024 - overhead - 4));
         plugin.send(invoke);
         let failure = plugin.recv();
         assert_eq!(failure["body"]["id"], "actual");
@@ -128,7 +129,7 @@ mod producer_admission {
             .unwrap()
             .contains("Git effects"));
         assert!(failure["body"].get("output").is_none());
-        plugin.send(json!({"kind": "git-worktree.tool.invoke", "id": "later", "name": "git_worktree_create", "args": {}}));
+        plugin.send(json!({"kind": "git-worktree.capability.invoke", "id": "later", "capability": "git_worktree_create", "args": {}}));
         assert_eq!(plugin.recv()["body"]["id"], "later");
         plugin.finish("git-worktree.goodbye");
     }

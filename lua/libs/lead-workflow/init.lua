@@ -2385,7 +2385,9 @@ local function receive_msg(entry)
       for _, correlation in ipairs(body.correlations or {}) do
         -- Source and id are supplied by the failed egress, never parsed from
         -- opaque actor identities. The gate owns inner-to-outer rewriting.
-        if correlation.kind == peer .. ".tool.invoke" and type(correlation.id) == "string" then
+        local invoke_kind = (peer == "basic-tools" or peer == "git-worktree")
+          and peer .. ".capability.invoke" or peer .. ".tool.invoke"
+        if correlation.kind == invoke_kind and type(correlation.id) == "string" then
           identified = true
           emit_as(peer, nil, { kind = "tool.result", id = correlation.id,
             error = "Invocation was not delivered; earlier effects are unknown" })

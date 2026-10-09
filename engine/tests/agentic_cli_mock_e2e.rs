@@ -151,7 +151,14 @@ end
         .env("NEFOR_EXECUTABLE_ROOT", dir.join("bin"))
         .env(
             "NEFOR_MOCK_PROVIDER_SCRIPT",
-            root().join("engine/tests/agentic_cli_mock_e2e/provider.lua"),
+            if dir
+                .join("fixture-config/mock-provider/acceptance.lua")
+                .exists()
+            {
+                dir.join("fixture-config/mock-provider/acceptance.lua")
+            } else {
+                root().join("engine/tests/agentic_cli_mock_e2e/provider.lua")
+            },
         )
         .env("NEFOR_STARTUP_TIMEOUT_MS", "10000")
         .env("OPENAI_PROVIDER_API_KEY", "offline-sentinel")
@@ -720,18 +727,18 @@ fn shipped_mock_keeps_submission_receipts_within_activation() {
         std::fs::read_to_string(root().join("examples/nefor-agent/mock-provider/init.lua"))
             .unwrap();
     let select: mlua::Function = lua
-        .load(format!("{source}\nreturn typed_response"))
+        .load(format!("package.preload[\"libs.mock-provider\"] = function() return {{ serve = function(opts) captured_respond = opts.respond end, tool_call = function(name,args) return {{ tool_calls = {{{{name=name,arguments=args}}}} }} end, text=function(text) return {{text=text}} end, error=function(text) return {{error=text}} end }} end\n{source}\nreturn captured_respond"))
         .eval()
         .unwrap();
     lua.globals().set("select_typed", select).unwrap();
     lua.load(r#"
-        local instruction = {role="system",content='Expected canonical MAG JSON schema: {"type":"object","properties":{"content":{"type":"string"}}}. Write the value directly'}
+        local instruction = {role="system",content="Summarise octopuses in one sentence."}
         local valid = {role="tool",name="write_output",content={write="saved",validation={status="valid"}}}
         local invalid = {role="tool",name="write_output",content={write="saved",validation={status="invalid"}}}
-        local request = {tools={"write_output","submit_output"}}
-        assert(select_typed(request, {instruction,valid}).tool_calls[1].name == "submit_output")
-        assert(select_typed(request, {instruction,valid,invalid}).tool_calls[1].name == "write_output")
-        assert(select_typed(request, {instruction,valid,instruction}).tool_calls[1].name == "write_output")
+        local function select(messages) return select_typed({system=instruction.content,messages=messages}) end
+        assert(select({instruction,valid}).tool_calls[1].name == "submit_output")
+        assert(select({instruction,valid,invalid}).tool_calls[1].name == "write_output")
+        assert(select({instruction,valid,instruction}).tool_calls[1].name == "write_output")
     "#).exec().unwrap();
 }
 
@@ -773,25 +780,23 @@ fn rejected_provider_frame_closes_whole_request_and_resume_remains_usable() {
                 .success());
         }
     }
-    let script =
-        std::fs::read_to_string(root().join("examples/nefor-agent/mock-provider/init.lua"))
-            .unwrap();
-    let injected = script.replace(
-        "local function complete_request(body)",
+    std::fs::write(
+        dir.join("fixture-config/mock-provider/acceptance.lua"),
         r#"
-local function complete_request(body)
+local mock = require("libs.mock-provider")
+mock.serve { respond = function(request)
   if os.getenv("OWNER_REJECT_FRAME") == "1" then
     local ok = pcall(nefor.emit, "completion.event", {
-      request_id = body.request_id, event = "text_delta", text = string.rep("x", 17 * 1024 * 1024),
+      request_id = request.id, event = "text_delta", text = string.rep("x", 17 * 1024 * 1024),
     })
     assert(not ok, "fixture must exercise actual output admission")
-    nefor.emit("completion.event", {request_id = body.request_id, event = "error",
-      message = "output admission rejected; prior effects unknown", effects = "unknown"})
-    return
+    return mock.error("output admission rejected; prior effects unknown", { effects = "unknown" })
   end
+  return mock.text("Octopuses are intelligent cephalopods.")
+end }
 "#,
-    );
-    std::fs::write(dir.join("fixture-config/mock-provider/init.lua"), injected).unwrap();
+    )
+    .unwrap();
     let rejected = run_with_env(
         &dir,
         &[
@@ -928,38 +933,22 @@ fn noisy_real_tool_result_is_bounded_omitted_and_accepts_later_work() {
         turn_source.replace("tools: [", "tools: [\"shell.script\", "),
     )
     .unwrap();
-    let script = dir.join("fixture-config/mock-provider/init.lua");
-    let source = std::fs::read_to_string(&script).unwrap();
-    let marker = "  -- 5a. read readme -> read_file tool call";
-    assert_eq!(source.matches(marker).count(), 1);
     std::fs::write(dir.join("README.md"), "later operation").unwrap();
-    let source = source.replace(
-        "  -- Tool-result relay for the new interactive triggers.",
-        r#"  if last_tool ~= nil and not tostring(last_tool):find("later operation", 1, true)
-      and string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
-    return {text="", finish_reason="tool_calls", tool_calls={{
-      id=mint_tool_id("later"), name="read_file", arguments={path="README.md"}}}}
+    std::fs::write(dir.join("fixture-config/mock-provider/acceptance.lua"), r#"
+local mock = require("libs.mock-provider")
+mock.serve { respond = function(request)
+  local last = request.messages[#request.messages]
+  if last.role == "tool" and last.name == "shell.script" then
+    return mock.tool_call("read_file", {path="README.md"})
   end
-  if last_tool ~= nil and string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
-    return {text="bounded result and later operation completed", finish_reason="stop"}
+  if last.role == "tool" and last.name == "read_file" then
+    return mock.text("bounded result and later operation completed")
   end
-  -- Tool-result relay for the new interactive triggers."#,
-    );
-    std::fs::write(
-        script,
-        source.replace(
-            marker,
-            r#"
-  if string.find(last_user, "GIANT_TOOL_OUTPUT", 1, true) then
-    return {text="", finish_reason="tool_calls", tool_calls={{
-      id=mint_tool_id("giant"), name="shell.script",
-      arguments={script="head -c 17825792 /dev/zero | tr '\\000' x", cwd=".",
-        timeout={present=true,milliseconds=10000}}}}}
-  end
-"#,
-        ),
-    )
-    .unwrap();
+  if tostring(last.content) == "read readme" then return mock.tool_call("read_file", {path="README.md"}) end
+  return mock.tool_call("shell.script", {script="head -c 17825792 /dev/zero | tr '\\000' x", cwd=".",
+    timeout={present=true,milliseconds=10000}})
+end }
+"#).unwrap();
     let output = run(
         &dir,
         &[
@@ -1181,17 +1170,29 @@ end
 #[test]
 fn accepted_real_mag_giant_join_has_small_authoritative_terminal() {
     let dir = isolated_starter("mag-output-admission-");
-    let script = dir.join("fixture-config/mock-provider/init.lua");
-    let source = std::fs::read_to_string(&script).unwrap();
-    let start = source.find("local CANNED_MAG_PROGRAM = [=[").unwrap();
-    let end = start + source[start..].find("]=]").unwrap() + 3;
     let branches = (0..18).map(|index| format!(
         "script(\"branch-{index}\", ShellScriptParams {{script: \"head -c 9437184 /dev/zero | tr '\\\\000' x\", cwd: \".\", timeout: named(Timeout, Seconds, 10)}})"
     )).collect::<Vec<_>>().join(",\n");
-    let program = format!("local CANNED_MAG_PROGRAM = [=[\nimport nefor.{{compile_graph, script, ShellScriptParams, Timeout, sequence}}\ncompile_graph(sequence([{branches}]))\n]=]");
+    let program = format!("import nefor.{{compile_graph, script, ShellScriptParams, Timeout, sequence}}\ncompile_graph(sequence([{branches}]))\n");
+    let behavior = format!(
+        r#"
+local mock = require("libs.mock-provider")
+local program = [=[{program}]=]
+mock.serve {{ respond = function(request)
+  local last = request.messages[#request.messages]
+  if last.role == "tool" and last.name == "mag-write-file" then
+    return mock.tool_call("mag-apply", {{file="giant-join.mag"}})
+  end
+  if last.role == "tool" or nefor.json.encode(last.content):find("mag_run", 1, true) or nefor.json.encode(last.content):find("Summarise octopuses in one sentence.", 1, true) then
+    return mock.text("observed bounded MAG terminal")
+  end
+  return mock.tool_call("mag-write-file", {{file="giant-join.mag",new_string=program}})
+end }}
+"#
+    );
     std::fs::write(
-        script,
-        format!("{}{}{}", &source[..start], program, &source[end..]),
+        dir.join("fixture-config/mock-provider/acceptance.lua"),
+        behavior,
     )
     .unwrap();
     let output = run(

@@ -83,7 +83,7 @@ end
 --- A terminal provider error for this request.
 function M.error(message, opts)
   assert(type(message) == "string", "mock.error: message must be a string")
-  return with_options({ kind = "error", message = message }, opts)
+  return with_options({ kind = "error", message = message, effects = opts and opts.effects }, opts)
 end
 
 local function normalize_request(body)
@@ -218,7 +218,7 @@ function M.serve(config)
     end
 
     if response.kind == "error" then
-      emit_event(request_id, "error", { message = response.message })
+      emit_event(request_id, "error", { message = response.message, effects = response.effects })
       return
     end
 

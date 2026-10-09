@@ -329,14 +329,14 @@ mod tests {
     #[tokio::test]
     async fn forwarding_flushes_invalid_suffixes_independently_before_terminal_result() {
         let (tx, mut rx) = mpsc::channel(32);
-        let body = json!({"id":"suffix", "name":"shell.script", "args":{
+        let body = json!({"id":"suffix", "capability":"shell.script", "args":{
             "script": "printf '\\320\\226\\342\\202'; printf '\\360\\237\\230\\200\\320' >&2",
             "cwd":".", "timeout":{"present":false,"milliseconds":0}
         }})
         .as_object()
         .unwrap()
         .clone();
-        let task = tokio::spawn(async move { handle_tool_invoke(&tx, &body, None).await });
+        let task = tokio::spawn(async move { handle_invoke(&tx, &body, None).await });
         let mut stdout = String::new();
         let mut stderr = String::new();
         let result = loop {
@@ -346,7 +346,7 @@ mod tests {
                 .unwrap();
             if let Body::Event(body) = message.body {
                 match body["kind"].as_str().unwrap() {
-                    "tool.stream" => {
+                    "capability.stream" => {
                         let text = body["text"].as_str().unwrap();
                         match body["stream"].as_str().unwrap() {
                             "stdout" => stdout.push_str(text),
@@ -354,7 +354,7 @@ mod tests {
                             other => panic!("unexpected stream {other}"),
                         }
                     }
-                    "tool.result" => break body,
+                    "capability.result" => break body,
                     other => panic!("unexpected message {other}"),
                 }
             }
@@ -399,8 +399,8 @@ mod tests {
         .clone();
 
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
-        let slow_task = spawn_invoke(&out_tx, &slow, &cancels);
-        let fast_task = spawn_invoke(&out_tx, &fast, &cancels);
+        let slow_task = spawn_tool_invoke(&out_tx, &slow, &cancels);
+        let fast_task = spawn_tool_invoke(&out_tx, &fast, &cancels);
 
         let first = recv_result_body(&mut out_rx).await;
         let second = recv_result_body(&mut out_rx).await;
@@ -431,9 +431,9 @@ mod tests {
     async fn flooding_process_streams_at_the_flush_cadence() {
         let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(8);
         let flood = json!({
-            "kind": "basic-tools.tool.invoke",
+            "kind": "basic-tools.capability.invoke",
             "id": "flood",
-            "name": "shell.script",
+            "capability": "shell.script",
             "args": {
                 "script": "head -c 536870912 /dev/zero | tr '\\0' a | tee /dev/stderr; printf END",
                 "cwd": ".",
@@ -458,13 +458,13 @@ mod tests {
                 continue;
             };
             match body.get("kind").and_then(Value::as_str) {
-                Some("tool.stream") => {
+                Some("capability.stream") => {
                     stream_events += 1;
                     if body.get("stream").and_then(Value::as_str) == Some("stdout") {
                         last_stdout = body["text"].as_str().expect("text").to_owned();
                     }
                 }
-                Some("tool.result") => break body,
+                Some("capability.result") => break body,
                 _ => {}
             }
         };
@@ -511,7 +511,7 @@ mod producer_failure_tests {
     use tokio::time::{timeout, Duration};
 
     fn request(id: &str, script: &str) -> Map<String, Value> {
-        json!({"kind": "basic-tools.tool.invoke", "id": id, "name": "shell.script",
+        json!({"kind": "basic-tools.capability.invoke", "id": id, "capability": "shell.script",
             "args": {"script": script, "cwd": "/", "timeout": {"present": false, "milliseconds": 0}}})
             .as_object().unwrap().clone()
     }
@@ -527,7 +527,7 @@ mod producer_failure_tests {
             loop {
                 let message = incoming.recv().await.unwrap();
                 if let Body::Event(body) = message.body {
-                    if body["kind"] == "tool.result" {
+                    if body["kind"] == "capability.result" {
                         break body;
                     }
                     streamed += body["text"].as_str().unwrap().len();
@@ -549,7 +549,7 @@ mod producer_failure_tests {
         let terminal = timeout(Duration::from_secs(2), async {
             loop {
                 if let Body::Event(body) = incoming.recv().await.unwrap().body {
-                    if body["kind"] == "tool.result" {
+                    if body["kind"] == "capability.result" {
                         break body;
                     }
                 }
@@ -642,8 +642,8 @@ mod producer_failure_tests {
         })
         .await
         .unwrap();
-        let failed = serde_json::json!({"kind": "basic-tools.tool.invoke", "id": "x".repeat(16 * 1024 * 1024),
-            "name": "process.exec", "args": {"argv": []}}).as_object().unwrap().clone();
+        let failed = serde_json::json!({"kind": "basic-tools.capability.invoke", "id": "x".repeat(16 * 1024 * 1024),
+            "capability": "process.exec", "args": {"argv": []}}).as_object().unwrap().clone();
         input.send(Ok(envelope(failed))).await.unwrap();
         assert!(matches!(
             timeout(Duration::from_secs(5), supervisor)
@@ -833,7 +833,7 @@ mod runtime_boundary_contract_tests {
     #[tokio::test]
     async fn lf_inclusive_exact_full_envelope_cap_and_unencodable_fallback() {
         let (tx, mut rx) = mpsc::channel(2);
-        let overhead = PluginOutgoing::event(tool_result_ok_body("", json!("")))
+        let overhead = PluginOutgoing::event(result_ok_body("", json!("")))
             .to_line()
             .len()
             + 1;
@@ -894,11 +894,11 @@ mod runtime_boundary_contract_tests {
     async fn blocked_peer_at_timeout_reaps_process_and_returns_transport_failure() {
         let directory = tempfile::tempdir().unwrap();
         let pid = directory.path().join("pid");
-        let body = json!({"kind": "basic-tools.tool.invoke", "id": "blocked", "name": "shell.script",
+        let body = json!({"kind": "basic-tools.capability.invoke", "id": "blocked", "capability": "shell.script",
             "args": {"script": format!("echo $$ > {}; printf first; exec sleep 30", pid.display()), "cwd": "/",
                 "timeout": {"present": true, "milliseconds": 100}}}).as_object().unwrap().clone();
         let (tx, _rx) = mpsc::channel(1);
-        send_event(&tx, tool_result_error_body("occupier", "full"))
+        send_event(&tx, result_error_body("occupier", "full"))
             .await
             .unwrap();
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
@@ -923,11 +923,11 @@ mod runtime_boundary_contract_tests {
 
     #[tokio::test]
     async fn slow_receiver_keeps_loss_metadata_and_final_eof_before_once_only_terminal() {
-        let body = json!({"kind": "basic-tools.tool.invoke", "id": "slow", "name": "shell.script",
+        let body = json!({"kind": "basic-tools.capability.invoke", "id": "slow", "capability": "shell.script",
             "args": {"script": "head -c 2097152 /dev/zero | tr '\\000' x; printf '\\342'; printf '\\360' >&2", "cwd": "/",
                 "timeout": {"present": false, "milliseconds": 0}}}).as_object().unwrap().clone();
         let (tx, mut rx) = mpsc::channel(1);
-        send_event(&tx, tool_result_error_body("occupier", "full"))
+        send_event(&tx, result_error_body("occupier", "full"))
             .await
             .unwrap();
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
@@ -942,7 +942,7 @@ mod runtime_boundary_contract_tests {
                 let Body::Event(row) = rx.recv().await.unwrap().body else {
                     panic!("event")
                 };
-                if row["kind"] == "tool.result" {
+                if row["kind"] == "capability.result" {
                     assert!(row.get("output").is_some());
                     break;
                 }
@@ -972,7 +972,7 @@ mod runtime_cancellation_and_real_frame_tests {
     use tokio::time::{timeout, Duration};
 
     fn request(id: &str, script: &str) -> Map<String, Value> {
-        json!({"kind": "basic-tools.tool.invoke", "id": id, "name": "shell.script",
+        json!({"kind": "basic-tools.capability.invoke", "id": id, "capability": "shell.script",
             "args": {"script": script, "cwd": "/", "timeout": {"present": false, "milliseconds": 0}}})
             .as_object().unwrap().clone()
     }
@@ -994,7 +994,7 @@ mod runtime_cancellation_and_real_frame_tests {
                 let Body::Event(body) = row.body else {
                     panic!("event")
                 };
-                if body["kind"] == "tool.result" {
+                if body["kind"] == "capability.result" {
                     break body;
                 }
             }
@@ -1015,7 +1015,7 @@ mod runtime_cancellation_and_real_frame_tests {
                 let Body::Event(body) = rx.recv().await.unwrap().body else {
                     panic!("event")
                 };
-                if body["kind"] == "tool.result" {
+                if body["kind"] == "capability.result" {
                     assert_eq!(body["output"]["stdout"], "ok");
                     break;
                 }
@@ -1032,7 +1032,7 @@ mod runtime_cancellation_and_real_frame_tests {
         let directory = tempfile::tempdir().unwrap();
         let completed = directory.path().join("completed");
         let (tx, _rx) = mpsc::channel(1);
-        send_event(&tx, tool_result_error_body("occupier", "full"))
+        send_event(&tx, result_error_body("occupier", "full"))
             .await
             .unwrap();
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
@@ -1049,7 +1049,7 @@ mod runtime_cancellation_and_real_frame_tests {
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        handle_tool_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
+        handle_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
         let result = timeout(Duration::from_secs(5), task)
             .await
             .unwrap()
@@ -1065,7 +1065,7 @@ mod runtime_cancellation_and_real_frame_tests {
         let directory = tempfile::tempdir().unwrap();
         let pid = directory.path().join("pid");
         let (tx, _rx) = mpsc::channel(1);
-        send_event(&tx, tool_result_error_body("occupier", "full"))
+        send_event(&tx, result_error_body("occupier", "full"))
             .await
             .unwrap();
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
@@ -1085,7 +1085,7 @@ mod runtime_cancellation_and_real_frame_tests {
         })
         .await
         .unwrap();
-        handle_tool_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
+        handle_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
         let result = timeout(Duration::from_secs(5), task)
             .await
             .unwrap()
@@ -1106,7 +1106,7 @@ mod runtime_cancellation_and_real_frame_tests {
         let directory = tempfile::tempdir().unwrap();
         let pid = directory.path().join("pid");
         let (tx, _rx) = mpsc::channel(1);
-        send_event(&tx, tool_result_error_body("occupier", "full"))
+        send_event(&tx, result_error_body("occupier", "full"))
             .await
             .unwrap();
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
@@ -1126,7 +1126,7 @@ mod runtime_cancellation_and_real_frame_tests {
         })
         .await
         .unwrap();
-        handle_tool_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
+        handle_cancel(&cancels, json!({"id": "blocked"}).as_object().unwrap());
         let result = timeout(Duration::from_secs(5), task)
             .await
             .unwrap()

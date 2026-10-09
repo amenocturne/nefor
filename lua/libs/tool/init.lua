@@ -218,8 +218,8 @@ function M.source(opts)
       result.output = nil
       source.result(id, result)
     end
-    function call.stream(stream, text)
-      emit({ kind = "tool.stream", id = id, stream = stream, text = text })
+    function call.stream(stream, text, fields)
+      emit(copy_fields(fields, { kind = "tool.stream", id = id, stream = stream, text = text }))
     end
     function call.settled() return pending[id] ~= call end
     return call

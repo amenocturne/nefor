@@ -131,11 +131,12 @@ eq(last_sent("tool.result", "gate-2").error, "io error", "capability error becom
 invoke(basic, "gate-3", "shell.script", { script = "sleep 9", cwd = ".",
   timeout = { present = false, milliseconds = 0 } })
 basic.from_plugin({ { type = "event", from = "basic-tools", body = {
-  kind = "capability.stream", id = "gate-3", stream = "stdout", text = "partial",
+  kind = "capability.stream", id = "gate-3", stream = "stdout", text = "partial", skipped_bytes = 17,
 } } })
 local stream = last_sent("tool.stream", "gate-3")
 eq(stream.text, "partial", "capability stream becomes tool.stream")
 eq(stream.stream, "stdout", "stream channel preserved")
+eq(stream.skipped_bytes, 17, "preview byte loss survives the capability wrapper")
 basic.to_plugin({ { type = "event", from = "tool-gate", replay = false, body = {
   kind = "basic-tools.tool.cancel", id = "gate-3",
 } } })
@@ -159,5 +160,36 @@ eq(last_sent("tool.result", "gate-4").output.error.kind, "git-failed", "structur
 -- Other binary events are republished verbatim.
 basic.from_plugin({ { type = "event", from = "basic-tools", body = { kind = "basic-tools.hello", version = "v" } } })
 eq(last_sent("basic-tools.hello").version, "v", "hello republished")
+
+-- Rejection at the new capability-to-tool boundary cancels process work and
+-- settles the original invocation once; the binary's later result is inert.
+local send = nefor.engine.send
+nefor.engine.send = function(payload)
+  local body = json.decode(payload).body
+  if body.kind == "tool.stream" then error("frame_too_large") end
+  return send(payload)
+end
+invoke(basic, "rejected-stream", "shell.script", { script = "sleep 9", cwd = ".",
+  timeout = { present = false, milliseconds = 0 } })
+basic.from_plugin({ { type = "event", body = {
+  kind = "capability.stream", id = "rejected-stream", stream = "stdout", text = "rejected",
+} } })
+eq(delivered[#delivered].envelope.body.kind, "basic-tools.capability.cancel", "rejection cancels owned process")
+eq(last_sent("tool.result", "rejected-stream").error_code, "output_rejected", "bounded owner failure")
+eq(basic.source.cancel({ id = "rejected-stream" }), nil, "source settlement releases invocation ownership")
+local settled_count = #sent
+basic.from_plugin({ { type = "event", body = { kind = "capability.result", id = "rejected-stream", output = "late" } } })
+eq(#sent, settled_count, "no duplicate terminal")
+nefor.engine.send = send
+
+local deliver = nefor.engine.deliver
+nefor.engine.deliver = function() error("typed_admission", 0) end
+nefor.engine.error_kind = function(fault) return fault == "typed_admission" and "frame_too_large" or nil end
+invoke(basic, "rejected-invoke", "read_file", { path = "x" })
+assert(last_sent("tool.result", "rejected-invoke").error:find("prior effects are unknown", 1, true))
+settled_count = #sent
+basic.from_plugin({ { type = "event", body = { kind = "capability.result", id = "rejected-invoke", output = "late" } } })
+eq(#sent, settled_count, "rejected invocation releases capability waiter")
+nefor.engine.deliver = deliver
 
 return true

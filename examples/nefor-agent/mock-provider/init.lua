@@ -170,7 +170,15 @@ end
 -- A typed demo agent writes its result, validates it, then submits.
 local function typed_result(last, value)
   if last and last.role == "tool" and last.name == "write_output" then
-    return mock.tool_call("submit_output", {})
+    local receipt = last.content
+    if type(receipt) == "string" then
+      local ok, decoded = pcall(nefor.json.decode, receipt)
+      receipt = ok and decoded or nil
+    end
+    if type(receipt) == "table" and type(receipt.validation) == "table"
+        and receipt.validation.status == "valid" then
+      return mock.tool_call("submit_output", {})
+    end
   end
   if last and last.role == "tool" and last.name == "submit_output" then
     return mock.error("demo typed result was rejected: " .. text_of(last.content))

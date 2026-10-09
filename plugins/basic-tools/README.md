@@ -167,7 +167,7 @@ serialized-frame or global/concurrent invocation bounds.
 
 Every outgoing frame is checked before enqueue (16 MiB including LF). Admission
 is not proof of write, receipt, or execution. A rejected result or stream stops
-that invocation's output and produces one checked `tool.result {id, error}` with
+that invocation's output and produces one checked `capability.result {id, error}` with
 the actual invocation ID, `frame_too_large` or `invalid_framing`, and an explicit
 warning that earlier/external effects may have occurred. No operation is retried.
 Stream publication failure cancels, kills, and reaps its owned process group

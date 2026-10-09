@@ -22,6 +22,7 @@ use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::error::ToolError;
 use crate::tools::{process, process_exec, run_capability, shell_script, CAPABILITIES};
 
 const CHANNEL_CAP: usize = 256;

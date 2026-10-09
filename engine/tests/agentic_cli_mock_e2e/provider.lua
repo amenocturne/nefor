@@ -81,6 +81,7 @@ local function respond(request)
   if contains(prompt, COMBINED_TEXT) then return mock.text(COMBINED_TEXT) end
   if prompt == "Summarise octopuses in one sentence." then return mock.text(OCTOPUS_TEXT) end
   if prompt == "read readme" then return mock.tool_call("read_file", { path = "README.md" }) end
+  if prompt == "hello" then return mock.text("hello") end
   if prompt == "fail" then return mock.error("scripted provider failure") end
   if contains(prompt, DISPATCH_PROMPT) then
     return mock.tool_call("mag-write-file", { file = MAG_FILE, new_string = MAG_PROGRAM })

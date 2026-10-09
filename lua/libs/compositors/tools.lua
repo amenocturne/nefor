@@ -173,15 +173,44 @@ function M.capability_tools_spec(opts)
   local capability = {}
   function capability.invoke(call, capability_name, args)
     pending[call.id] = call
-    deliver({ kind = name .. ".capability.invoke", id = call.id,
-      capability = capability_name, args = args })
+    local encoded, payload = pcall(json.encode, { type = "event", from = name,
+      ts = nefor.engine.now(), body = { kind = name .. ".capability.invoke",
+        id = call.id, capability = capability_name, args = args } })
+    local admitted, fault
+    if encoded then admitted, fault = pcall(nefor.engine.deliver, name, payload) end
+    if admitted then return end
+    pending[call.id] = nil
+    if encoded and not (nefor.engine.error_kind and nefor.engine.error_kind(fault)) then error(fault, 0) end
+    call.err("Capability invocation publication failed; prior effects are unknown")
   end
   function capability.cancel(call)
     pending[call.id] = nil
     deliver({ kind = name .. ".capability.cancel", id = call.id })
   end
 
-  local source = tool.source { name = name, tools = opts.tools(capability) }
+  local source
+  local function publish(body)
+    local admitted = envelope.checked_emit_as(name, nil, body)
+    if admitted then return end
+    local call = pending[body.id]
+    pending[body.id] = nil
+    if call and body.kind == "tool.stream" then capability.cancel(call) end
+    if body.kind == "tool.stream" then
+      source.result(body.id, { error_code = "output_rejected",
+        error = "Capability stream publication failed; prior effects are unknown" })
+      return
+    end
+    if body.kind ~= "tool.result" then error({ kind = "tool_output_unavailable" }, 0) end
+    local fallback = envelope.checked_emit_as(name, nil, {
+      kind = "tool.result", id = body.id, error_code = "output_rejected",
+      error = "Capability response publication failed; prior effects are unknown",
+    })
+    if not fallback then
+      require("libs.agentic-loop").capability_lost(name,
+        "Capability response authority unavailable; accepted outcomes are unknown")
+    end
+  end
+  source = tool.source { name = name, tools = opts.tools(capability), emit = publish }
 
   local function from_plugin(envs)
     for _, env in ipairs(envs) do
@@ -194,7 +223,7 @@ function M.capability_tools_spec(opts)
         end
       elseif type(body) == "table" and body.kind == "capability.stream" then
         local call = pending[body.id]
-        if call then call.stream(body.stream, body.text) end
+        if call then call.stream(body.stream, body.text, { skipped_bytes = body.skipped_bytes }) end
       elseif type(body) == "table" then
         nefor.engine.send(json.encode({
           type = "event", from = env.from or name, ts = nefor.engine.now(), body = body,

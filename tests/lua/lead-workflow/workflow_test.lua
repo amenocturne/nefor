@@ -3200,7 +3200,7 @@ do
     end
     return encode(value)
   end
-  invoke_tool("encoding-plan", "write-review", { plan = "proposal", view = "inline" })
+  invoke_tool("encoding-plan", "write-review", { plan = "proposal" })
   json.encode = encode
   local result = assert(tool_result("encoding-plan"))
   assert_true(result.body.error:find("prior effects are unknown", 1, true) ~= nil)
@@ -3216,7 +3216,7 @@ end
 do
   fresh()
   feed("engine", { kind = "ncp.delivery_failed", peer = "basic-tools", extent = "none",
-    correlations = {{ kind = "basic-tools.tool.invoke", id = "actual-inner" }} })
+    correlations = {{ kind = "basic-tools.capability.invoke", id = "actual-inner" }} })
   local result = assert(tool_result("actual-inner"))
   assert_eq(result.from, "basic-tools", "native source correlation reaches the gate")
 end

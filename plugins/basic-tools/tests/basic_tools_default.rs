@@ -937,11 +937,12 @@ mod admission_tests {
     async fn minimal_fallback_failure_reaches_supervisor_and_releases_registration() {
         let (out, mut incoming) = mpsc::channel(4);
         let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
-        let body = json!({"kind": "basic-tools.tool.invoke", "id": "x".repeat(16 * 1024 * 1024),
-            "name": "process.exec", "args": {"argv": []}})
-        .as_object()
-        .unwrap()
-        .clone();
+        let body =
+            json!({"kind": "basic-tools.capability.invoke", "id": "x".repeat(16 * 1024 * 1024),
+            "capability": "process.exec", "args": {"argv": []}})
+            .as_object()
+            .unwrap()
+            .clone();
         let task = spawn_tool_invoke(&out, &body, &cancels);
         assert!(matches!(
             task.await.unwrap(),
