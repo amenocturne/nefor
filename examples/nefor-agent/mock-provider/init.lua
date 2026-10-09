@@ -1,61 +1,25 @@
--- examples/nefor-agent/mock-provider/init.lua — script for mock-plugin to
--- impersonate an openai-provider for deterministic smoke testing of
--- the mag kernel-dispatch pipeline AND a self-documenting interactive test
--- machine for developers who launch `nefor --config ./examples/nefor-agent`. Spawns
--- alongside the openai-provider/ollama instance unconditionally; both
--- register on the bus and show up in the /model picker.
+-- examples/nefor-agent/mock-provider/init.lua — the starter's interactive mock.
 --
--- Speaks the same direct-completion wire shape as openai-provider:
---   <name>.completion.request { request_id, messages, model?, ... }
--- responds with:
---   <name>.completion.event { request_id, event="text_delta", text }
---   <name>.completion.event { request_id, event="usage", model, duration_ms, ... }
---   <name>.completion.event { request_id, event="completed", result, model, duration_ms }
---
--- ProviderInput shape (matching openai-provider's chat_complete_result_body):
---   { text, tool_calls?: [{id, name, arguments: object}], finish_reason?, usage }
---
--- ### Response selection (state machine, applied in order)
---
--- For each completion request, inspect its supplied history and pattern-match
--- the latest user message against this priority list:
---
---   1. Deferred result / failure / submitted-ack from a prior kernel
---      dispatch (relay path — must run first to keep the original
---      octopus+lighthouse workflow intact), plus the mag pipeline's
---      write→apply intermediate step.
---   2. Orchestrator-turn octopus + lighthouse + parallel/combine →
---      write + apply the canned MAG program via the lead's `mag`
---      tool (must come before sub-agent canned text since the
---      canonical prompt matches both).
---   3. Sub-agent canned text (agents inside the canned MAG run —
---      Summarise octopuses / lighthouses / Combine paragraph, matched
---      on their :system instruction).
---   4. SLOW_STREAM_REGRESSION_ marker — long-stream watchdog regression hook.
---   5. Interactive triggers (read readme, cwd/pwd, secret key memory,
---      list files, count to N, think out loud, fail).
---   6. Help fallback — the banner-prefixed help block is also what
---      shows up on the very first turn (no other trigger matched yet).
---
--- ### Why a Lua script and not a new Rust plugin
---
--- mock-plugin is already a scriptable NCP peer; reusing it costs a Lua
--- file instead of a fresh crate.
+-- A canned demo for developers who launch `nefor --config ./examples/nefor-agent`
+-- without a real model: each recognised input exercises one part of the chat
+-- surface, tool gate, or MAG kernel; anything else prints the help below.
+-- The provider wire protocol comes from `libs.mock-provider`; this file holds
+-- only the demo's behavior. Tests supply their own behavior beside the test.
 
-local NAME = nefor.name -- "mock-plugin"
+local mock = require("libs.mock-provider")
 
--- The MAG program the orchestrator turn writes + applies via the
--- lead's `mag-apply` tool. A chain — sx feeds sy feeds
--- combine — rather than a parallel join: the agent template's entry
--- adapter lifts exactly one boundary message per activation, so an
--- all-of product join would silently drop one branch; the chain keeps
--- the smoke deterministic while still exercising a multi-agent kernel
--- run end to end. Each agent carries its instruction in :system; the
--- kernel seeds source agents with a placeholder task prompt, so the
--- mock pattern-matches sub-agent chats on their SYSTEM message (see
--- pick_response_for).
-local CANNED_MAG_FILE = "octo-lighthouse.mag"
-local CANNED_MAG_PROGRAM = [=[
+-- Tests that drive this demo through the TUI opt out of pacing.
+local fast = os.getenv("NEFOR_TEST_FAST_MOCK") == "1" or os.getenv("NEFOR_TEST_FAST_MOCK") == "true"
+local function delay(ms) if fast then return nil end return ms end
+
+-- The demo's MAG program: a chain sx -> sy -> combine. The demo authors the
+-- agents' system instructions and result types here, so it recognises its own
+-- agents by those instructions and writes their typed results directly.
+local MAG_FILE = "octo-lighthouse.mag"
+local OCTOPUS_SYSTEM = "Summarise octopuses in one sentence."
+local LIGHTHOUSE_SYSTEM = "Summarise lighthouses in one sentence."
+local COMBINE_SYSTEM = "Combine the two summaries above into one paragraph."
+local MAG_PROGRAM = [=[
 import core.types.{}
 import nefor.actors.{}
 import nefor.artifact.{}
@@ -78,48 +42,30 @@ let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.grap
 nefor.artifact.compile(topology)
 ]=]
 
--- Canned text responses keyed by pattern in the last user message.
--- Order matters: more specific patterns must come before general ones.
-local CANNED_TEXT = {
-  -- Combiner sees three user messages: octopus summary, lighthouse summary,
-  -- and the explicit "Combine..." instruction. Match the instruction first.
-  { pattern = "[Cc]ombine.*paragraph",
-    text = "Octopuses, with their remarkable intelligence and adaptive camouflage, share an unlikely kinship with the steadfast lighthouse — both serve as vigilant sentinels of their respective worlds, the cephalopod beneath the waves and the beacon above them, each watchful in its solitary post." },
-  { pattern = "[Ss]ummarise octopuses",
-    text = "Octopuses are highly intelligent invertebrate cephalopods known for problem-solving, dynamic camouflage, and eight prehensile arms lined with chemosensitive suckers." },
-  { pattern = "[Ss]ummarise lighthouses",
-    text = "Lighthouses are tall coastal towers crowned with bright rotating beams that guide ships safely past hazards and into harbours, dating back to the Pharos of Alexandria." },
+local OCTOPUS_TEXT = "Octopuses are highly intelligent invertebrate cephalopods known for problem-solving, dynamic camouflage, and eight prehensile arms lined with chemosensitive suckers."
+local LIGHTHOUSE_TEXT = "Lighthouses are tall coastal towers crowned with bright rotating beams that guide ships safely past hazards and into harbours, dating back to the Pharos of Alexandria."
+local COMBINED_TEXT = "Octopuses, with their remarkable intelligence and adaptive camouflage, share an unlikely kinship with the steadfast lighthouse — both serve as vigilant sentinels of their respective worlds, the cephalopod beneath the waves and the beacon above them, each watchful in its solitary post."
+
+local RELAY_REASONING = {
+  "Reading the MAG run result.\n",
+  "It carries a single combined paragraph already, so",
+  " I don't need to recompose anything — relaying it",
+  " verbatim is the right call.\n",
+  "Producing the final answer now.",
 }
 
--- Prefix for relayed final answers (tool results / deferred run
--- results echoed back as the assistant's reply).
-local FINAL_RELAY_PREFIX = ""
+local THINK_REASONING = {
+  "Considering the topic.\n",
+  "A deterministic mock has no opinion of its own,",
+  " but it can still show the reasoning channel streaming",
+  " before the answer.",
+}
 
--- Async kernel dispatch: the fresh mag apply's immediate `tool.result` is
--- just an ack ("Program submitted to the MAG actor kernel..."). The
--- real result arrives later as a USER-role message starting with
--- "[mag_run(run_id=... ) result]". Pattern-match on that prefix in the
--- latest user message to drive the relay turn.
---
--- The marker shape comes from `agentic-loop.results.format_deferred`;
--- the ack text from lead-workflow's fresh mag apply tool.result.
-local DEFERRED_RESULT_MARKER = "%[mag_run%([^)]*run_id="
-local DEFERRED_FAILURE_MARKER = "%[mag_run%(run_id=[^)]*%) FAILED%]"
-local SUBMITTED_ACK_MARKER = "submitted to the MAG actor kernel"
+local BANNER = "**MOCK PROVIDER** -- this is a deterministic test machine, not a real model."
 
--- Banner prepended to first-turn output and to every help-fallback
--- response. The marker (`MOCK_PROVIDER_BANNER`) is the substring tests
--- can pin on to distinguish the help/banner path from canned-text
--- replies without locking to the full banner string.
-local MOCK_PROVIDER_BANNER =
-  "**MOCK PROVIDER** -- this is a deterministic test machine, not a real model."
-
--- Markdown body deliberately exercises every block kind the chat
--- surface's renderer should handle — headings, emphasis variants,
--- inline code, fenced code, lists, blockquote, table, link, hr,
--- emojis, and a CJK example. Broken rendering surfaces visually here
--- so a developer launching `nefor --config ./examples/nefor-agent` sees what
--- works and what doesn't on the first turn.
+-- The help body deliberately exercises every markdown block kind the chat
+-- renderer handles, including emoji and CJK, so broken rendering is visible on
+-- the first turn.
 local HELP_BODY = table.concat({
   "",
   "# 🤖 Mock test machine",
@@ -133,8 +79,7 @@ local HELP_BODY = table.concat({
   "a cloud round-trip.",
   "",
   "Switch to a real model with `/model` 🚀 — the picker lists every connected",
-  "provider, including the local **ollama**/qwen instance spawned alongside.",
-  "Once you pick one, you're talking to it ⚡ at real-LLM latency.",
+  "provider. Once you pick one, you're talking to it ⚡ at real-LLM latency.",
   "",
   "---",
   "",
@@ -160,8 +105,8 @@ local HELP_BODY = table.concat({
   "tool calls back to back:",
   "",
   "```json",
-  "{ \"name\": \"mag\", \"arguments\": { \"action\": \"write\", \"file\": \"octo-lighthouse.mag\", \"content\": \"…\" } }",
-  "{ \"name\": \"mag\", \"arguments\": { \"action\": \"apply\", \"file\": \"octo-lighthouse.mag\" } }",
+  "{ \"name\": \"mag-write-file\", \"arguments\": { \"file\": \"octo-lighthouse.mag\", \"new_string\": \"…\" } }",
+  "{ \"name\": \"mag-apply\", \"arguments\": { \"file\": \"octo-lighthouse.mag\" } }",
   "```",
   "",
   "### 2. Tool calls",
@@ -188,854 +133,163 @@ local HELP_BODY = table.concat({
   "",
   "### 5. Error path",
   "",
-  "- 💥 `fail` — returns `finish_reason=error` to exercise the run-error",
+  "- 💥 `fail` — returns a provider error to exercise the run-error",
   "  rendering path",
   "",
   "---",
   "",
-  "*Any other input prints this help.* See the [nefor README](https://github.com/anthropics/nefor)",
-  "for the full architecture; this provider is the dev surface for ***fast***,",
-  "***deterministic*** smoke testing.",
+  "*Any other input prints this help.* This provider is the dev surface for",
+  "***fast***, ***deterministic*** smoke testing.",
 }, "\n")
 
-local HELP_TEXT = MOCK_PROVIDER_BANNER .. "\n" .. HELP_BODY
+local function contains(haystack, needle)
+  return type(haystack) == "string" and string.find(haystack, needle, 1, true) ~= nil
+end
 
--- UTF-8-safe truncate: returns `s` truncated to at most `n` codepoints.
--- `string.sub` is byte-indexed; slicing inside a multibyte codepoint
--- yields invalid UTF-8 that downstream `json.encode` chokes on. Use
--- `utf8.offset` (Lua 5.3+) to find the byte offset of codepoint n+1.
+local function text_of(content)
+  if type(content) == "string" then return content end
+  if type(content) == "table" then
+    if type(content.message) == "string" then return content.message end
+    return nefor.json.encode(content)
+  end
+  return tostring(content)
+end
+
+-- Truncate to `n` codepoints; byte slicing could split a multibyte sequence.
 local function utf8_truncate(s, n)
-  if type(s) ~= "string" then return s end
   local end_byte = utf8.offset(s, n + 1)
-  if end_byte == nil then return s end
-  return string.sub(s, 1, end_byte - 1)
+  return end_byte and string.sub(s, 1, end_byte - 1) or s
 end
 
--- Lowercased copy used by the interactive trigger router.
-local function lc(s)
-  if type(s) ~= "string" then return "" end
-  return string.lower(s)
+local function latest_user(messages)
+  for i = #messages, 1, -1 do
+    if messages[i].role == "user" then return text_of(messages[i].content), i end
+  end
 end
 
--- Per-chat tool-call id minter. The chat-side reducer correlates
--- tool.result back to its tool block by exact id match (chat.lua's
--- attach_tool_end matches the FIRST entry with the given id and stops),
--- so a static id like "call_mock_pwd" repeated across turns means the
--- second turn's deny / approve clobbers the first turn's already-done
--- block and the second block never receives its own result. Mint a
--- fresh id every call.
-local tool_id_counter = 0
-local function mint_tool_id(label)
-  tool_id_counter = tool_id_counter + 1
-  return "call_mock_" .. label .. "_" .. tostring(tool_id_counter)
+-- A typed demo agent writes its result, validates it, then submits.
+local function typed_result(last, value)
+  if last and last.role == "tool" and last.name == "write_output" then
+    return mock.tool_call("submit_output", {})
+  end
+  if last and last.role == "tool" and last.name == "submit_output" then
+    return mock.error("demo typed result was rejected: " .. text_of(last.content))
+  end
+  return mock.tool_call("write_output", { new_string = nefor.json.encode(value), validate = true },
+    { delay_ms = delay(5000) })
 end
 
--- Tool results ride the provider wire with structured (table) content
--- when the tool returned a JSON object (the kernel's tool-result
--- factory passes structured outputs through verbatim). Flatten to a
--- matchable string: the human-readable `message` field carries the
--- markers the orchestrator state machine keys on; fall back to sorted
--- key=value pairs. Strings pass through untouched.
-local function flatten_content(content)
-  if type(content) ~= "table" then return content end
-  if type(content.message) == "string" then return content.message end
-  if type(content.value) == "table" and type(content.value.prompt) == "string" then
-    return content.value.prompt
-  end
-  local keys = {}
-  for k in pairs(content) do keys[#keys + 1] = tostring(k) end
-  table.sort(keys)
-  local parts = {}
-  for _, k in ipairs(keys) do
-    parts[#parts + 1] = k .. "=" .. tostring(content[k])
-  end
-  return table.concat(parts, " ")
+local function demo_agent(request)
+  local last = request.messages[#request.messages]
+  if contains(request.system, OCTOPUS_SYSTEM) then return typed_result(last, { content = OCTOPUS_TEXT }) end
+  if contains(request.system, LIGHTHOUSE_SYSTEM) then return typed_result(last, { content = LIGHTHOUSE_TEXT }) end
+  if contains(request.system, COMBINE_SYSTEM) then return mock.text(COMBINED_TEXT, { delay_ms = delay(5000) }) end
 end
 
-local function pick_response_for(history)
-  history = history or {}
-
-  -- Find the most recent user message and detect whether a tool message
-  -- has landed (chat-orchestrator wrap node, second turn).
-  local last_user
-  local last_user_idx
-  local last_tool
-  local last_tool_idx
-  for i = #history, 1, -1 do
-    local m = history[i]
-    if m.role == "tool" and not last_tool then
-      last_tool = m.content
-      last_tool_idx = i
+local function after_tool(tool, user)
+  local output = text_of(tool.content)
+  local low = string.lower(user or "")
+  if tool.name == "mag-write-file" then
+    return mock.tool_call("mag-apply", { file = MAG_FILE })
+  end
+  if tool.name == "mag-apply" then
+    if contains(output, COMBINED_TEXT) then
+      return mock.text(COMBINED_TEXT, { reasoning = RELAY_REASONING })
     end
-    if m.role == "user" and not last_user then
-      last_user = m.content
-      last_user_idx = i
-    end
+    return mock.text("Started the MAG run; I'll relay the results when they arrive.")
   end
+  if tool.name == "read_file" then
+    return mock.text(string.format("Tool returned README.md (length: %d chars). Snippet: %s...",
+      #output, utf8_truncate(output, 200)))
+  end
+  if tool.name == "process.exec" and contains(low, "list files") then
+    return mock.text("Files in cwd:\n" .. output)
+  end
+  if tool.name == "process.exec" then
+    return mock.text("Working directory: " .. (string.match(output, "^%s*(.-)%s*$") or output))
+  end
+  return mock.text(output)
+end
 
-  -- A tool message is "pending relay" only when it's MORE RECENT than
-  -- the latest user message — i.e. a tool result just landed and we
-  -- should respond to it. If the user has spoken since (next-turn
-  -- after a prior dispatch completed), last_tool is stale chat
-  -- history; pattern-match the new user input instead. Without this
-  -- gate, a later user message in the supplied request history would
-  -- incorrectly fall into the SUBMITTED_ACK_MARKER branch.
-  local tool_is_pending_relay
-  if last_tool_idx == nil then
-    tool_is_pending_relay = false
-  elseif last_user_idx == nil then
-    tool_is_pending_relay = true
-  else
-    tool_is_pending_relay = last_tool_idx > last_user_idx
-  end
-  if not tool_is_pending_relay then last_tool = nil end
-
-  -- ----------------------------------------------------------------
-  -- 1. Deferred-result branch (async kernel run). MUST stay first —
-  --    the relay turn looks like an ordinary user message but starts
-  --    with the deferred marker, and routing it through the help
-  --    fallback would break the existing workflow.
-  -- ----------------------------------------------------------------
-  if type(last_user) == "string"
-      and string.find(last_user, DEFERRED_RESULT_MARKER) then
-    -- Strip the leading marker line; what remains is the actual
-    -- combined paragraph the model should relay.
-    local body = string.match(last_user, "%-%-%- output %-%-%-\n(.*)$")
-    return {
-      text = FINAL_RELAY_PREFIX .. tostring(body or last_user),
-      finish_reason = "stop",
-      with_reasoning = true,
-    }
-  end
-  if type(last_user) == "string"
-      and string.find(last_user, DEFERRED_FAILURE_MARKER) then
-    return {
-      text = "The dispatched MAG run failed: " .. tostring(last_user),
-      finish_reason = "stop",
-    }
-  end
-
-  -- Fast MAG runs return their terminal receipt through the original tool
-  -- exchange instead of creating a deferred turn. Relay the typed TextAnswer
-  -- value just as the deferred branch above relays its framed output.
-  if type(last_tool) == "string" then
-    local ok, receipt = pcall(nefor.json.decode, last_tool)
-    local result = ok and type(receipt) == "table" and receipt.result or nil
-    local semantic = type(result) == "table" and result.semantic_type or nil
-    if type(receipt) == "table"
-        and receipt.status == "completed"
-        and type(semantic) == "table"
-        and semantic.name == "nefor.contracts.TextAnswer"
-        and type(result.value) == "string" then
-      return {
-        text = result.value,
-        finish_reason = "stop",
-        with_reasoning = true,
-      }
-    end
-  end
-
-  -- Async ack branch: the pending tool message is the fresh mag apply's
-  -- immediate ack. We can't relay that to the user as a final answer —
-  -- emit a short transitional ack so the turn terminates and the chat
-  -- unblocks; the kernel run's result relays as a fresh deferred turn.
-  if last_tool ~= nil and string.find(tostring(last_tool), SUBMITTED_ACK_MARKER) then
-    return {
-      text = "Started the MAG run; I'll relay the results when they arrive.",
-      finish_reason = "stop",
-    }
-  end
-
-  -- mag write→apply step 2: the workspace write acked; submit the
-  -- run. Scoped to the canonical octopus+lighthouse orchestrator turn
-  -- so unrelated write-tool relays keep their generic handling below.
-  if last_tool ~= nil and type(last_user) == "string"
-      and string.find(tostring(last_tool), '"operation"', 1, true)
-      and string.find(last_user, "octopus") and string.find(last_user, "lighthouse") then
-    return {
-      text = "",
-      finish_reason = "tool_calls",
-      tool_calls = {
-        {
-          id        = mint_tool_id("mag_apply"),
-          name      = "mag-apply",
-          arguments = { file = CANNED_MAG_FILE },
-        },
-      },
-    }
-  end
-
-  -- ----------------------------------------------------------------
-  -- Tool-result relay for the new interactive triggers. When the wrap
-  -- node fires after a read_file / process tool result, render a
-  -- friendly response that quotes the tool output. Keyed off the most
-  -- recent user-role trigger string already in history.
-  -- ----------------------------------------------------------------
-  if last_tool ~= nil and type(last_user) == "string" then
-    local low_user = lc(last_user)
-    if string.find(low_user, "read readme", 1, true) then
-      local content = tostring(last_tool)
-      local snippet = utf8_truncate(content, 200)
-      return {
-        text = string.format(
-          "Tool returned README.md (length: %d chars). Snippet: %s...",
-          #content, snippet),
-        finish_reason = "stop",
-      }
-    end
-    if string.find(low_user, "pwd", 1, true)
-        or string.find(low_user, "cwd")
-        or string.find(low_user, "where am i", 1, true) then
-      -- bash tool output may include a trailing newline / exit-code
-      -- footer; keep it terse for the common pwd case.
-      local trimmed = string.match(tostring(last_tool), "^%s*(.-)%s*$") or tostring(last_tool)
-      return {
-        text = "Working directory: " .. trimmed,
-        finish_reason = "stop",
-      }
-    end
-    if string.find(low_user, "list files", 1, true) then
-      return {
-        text = "Files in cwd:\n" .. tostring(last_tool),
-        finish_reason = "stop",
-      }
-    end
-    -- Fallback: relay the tool result text as the final answer —
-    -- covers unrecognised tool calls in tests.
-    return {
-      text = FINAL_RELAY_PREFIX .. tostring(last_tool),
-      finish_reason = "stop",
-    }
-  end
-  if last_tool ~= nil then
-    return {
-      text = FINAL_RELAY_PREFIX .. tostring(last_tool),
-      finish_reason = "stop",
-    }
-  end
-
-  if type(last_user) ~= "string" then
-    return { text = "[mock provider: no user message]", finish_reason = "stop" }
-  end
-
-  -- ----------------------------------------------------------------
-  -- 2. Orchestrator turn: octopus + lighthouse anywhere in the latest
-  --    user message → step 1 of the mag pipeline: write the canned
-  --    program into the session's MAG workspace (the apply call
-  --    follows once the write's tool.result relays back — see the
-  --    write→apply step above). MUST come before CANNED_TEXT. Inner
-  --    sub-agent chats never match here: their latest user message is
-  --    the kernel's task seed or an upstream summary, never both words
-  --    at once, and their instructions ride the SYSTEM message.
-  -- ----------------------------------------------------------------
-  if string.find(last_user, "octopus") and string.find(last_user, "lighthouse") then
-    return {
-      text = "",
-      finish_reason = "tool_calls",
-      -- Brief pre-emit pause so the user can see the tool call land
-      -- deliberately rather than appearing in the same frame as their
-      -- input (interactive runs only; tests skip pacing).
-      pre_delay_ms = 1500,
-      tool_calls = {
-        {
-          id        = mint_tool_id("mag_write"),
-          name      = "mag-write-file",
-          arguments = {
-            file       = CANNED_MAG_FILE,
-            new_string = CANNED_MAG_PROGRAM,
-          },
-        },
-      },
-    }
-  end
-
-  -- ----------------------------------------------------------------
-  -- 3. Sub-agent canned text. Used by the agents inside the canned
-  --    MAG run. Their instructions ride the SYSTEM message ("Summarise
-  --    octopuses…", "Combine the two summaries…") because the kernel
-  --    seeds source agents with a placeholder task prompt and mid-chain
-  --    agents receive the upstream summary as their user message — so
-  --    match the system first, then the user text. The lead chat's
-  --    system prompt (cli-config / starter config) must not contain
-  --    these patterns, or every unrecognised lead turn would return
-  --    canned text instead of the help banner.
-  --    Each match gets a 5s pre-emit pause (interactive runs only) so
-  --    a developer watching the run panel can see the run progress
-  --    through the chain instead of it flashing done in <100ms.
-  -- ----------------------------------------------------------------
-  local system_content
-  for i = 1, #history do
-    if history[i].role == "system" and type(history[i].content) == "string" then
-      system_content = history[i].content
-      break
-    end
-  end
-  for _, entry in ipairs(CANNED_TEXT) do
-    if (system_content ~= nil and string.find(system_content, entry.pattern))
-        or string.find(last_user, entry.pattern) then
-      return { text = entry.text, finish_reason = "stop", pre_delay_ms = 5000 }
-    end
-  end
-
-  -- SLOW_STREAM_REGRESSION_ marker: triggered by the literal
-  -- substring; mock blocks for ~1.2s before emitting. Long-stream
-  -- watchdog regression hook for the agentic-cli timeout path.
-  if string.find(last_user, "SLOW_STREAM_REGRESSION_") then
-    -- Coarse sleep — `os.execute` is fine because the mock already
-    -- runs in its own subprocess.
-    os.execute("sleep 1.2")
-    return {
-      text = "slow regression payload acknowledged",
-      finish_reason = "stop",
-    }
-  end
-
-  -- ----------------------------------------------------------------
-  -- 5. Interactive triggers — the developer-facing test machine.
-  -- ----------------------------------------------------------------
-  local low = lc(last_user)
-
-  -- 5a. read readme -> read_file tool call
-  if string.find(low, "read readme", 1, true) then
-    return {
-      text = "",
-      finish_reason = "tool_calls",
-      tool_calls = {
-        {
-          id        = mint_tool_id("read_readme"),
-          name      = "read_file",
-          arguments = { path = "README.md" },
-        },
-      },
-    }
-  end
-
-  -- 5b. cwd / pwd / where am i -> one shell fragment.
-  if string.find(low, "pwd", 1, true)
-      or string.find(low, "current cwd", 1, true)
-      or string.find(low, "where am i", 1, true)
-      or low == "cwd"
-      or string.find(low, "what is my cwd", 1, true)
-      or string.find(low, "my cwd", 1, true) then
-    return {
-      text = "",
-      finish_reason = "tool_calls",
-      tool_calls = {
-        {
-          id        = mint_tool_id("pwd"),
-          name      = "process.exec",
-          arguments = { argv = { "pwd" }, cwd = ".", timeout = { present = true, milliseconds = 5000 } },
-        },
-      },
-    }
-  end
-
-  -- 5c. list files -> one shell fragment.
-  if string.find(low, "list files", 1, true) then
-    return {
-      text = "",
-      finish_reason = "tool_calls",
-      tool_calls = {
-        {
-          id        = mint_tool_id("ls"),
-          name      = "process.exec",
-          arguments = { argv = { "ls", "-la" }, cwd = ".", timeout = { present = true, milliseconds = 5000 } },
-        },
-      },
-    }
-  end
-
-  -- 5d. fail / trigger error -> error-shaped close
-  if low == "fail" or string.find(low, "trigger error", 1, true) then
-    return {
-      text          = "",
-      finish_reason = "error",
-      error_message = "Mock provider triggered error on user request.",
-    }
-  end
-
-  -- 5e. secret-key memory (history-aware lookup)
-  if string.find(low, "what is the secret key") then
-    -- Look for any prior user message of the form "secret key is X".
-    -- Use a non-anchored case-insensitive scan.
-    local value
-    for i = #history - 1, 1, -1 do
-      local m = history[i]
-      if m.role == "user" and type(m.content) == "string" then
-        local lc_content = lc(m.content)
-        local capture = string.match(lc_content, "secret key is (.+)")
-        if capture then
-          -- Re-extract from the original (case-preserving) content
-          -- using the same offset so we keep the user's casing.
-          local start_idx = string.find(lc_content, "secret key is ", 1, true)
-          if start_idx then
-            value = string.sub(m.content, start_idx + #"secret key is ")
-            -- Strip a trailing `?` or `.` if user phrased as a sentence.
-            value = string.match(value, "^(.-)%s*[%?%.]*%s*$") or value
-          end
-          break
-        end
+local function recall_secret(messages, before)
+  for i = before - 1, 1, -1 do
+    local m = messages[i]
+    if m.role == "user" and type(m.content) == "string" then
+      local start = string.find(string.lower(m.content), "secret key is ", 1, true)
+      if start then
+        local value = string.sub(m.content, start + #"secret key is ")
+        return string.match(value, "^(.-)%s*[%?%.]*%s*$") or value
       end
     end
-    if value and value ~= "" then
-      return {
-        text = "The secret key is: " .. value,
-        finish_reason = "stop",
-      }
-    end
-    return {
-      text = "I don't know yet -- tell me with: \"the secret key is <value>\"",
-      finish_reason = "stop",
-    }
   end
-
-  -- 5f. set the secret key (no special branch — value is now in
-  -- history and will be retrieved on the next "what is the secret
-  -- key?" turn). Acknowledge cleanly so the chat doesn't fall through
-  -- to help.
-  if string.find(low, "secret key is ") then
-    return {
-      text = "Got it. The secret key is now in this chat's history.",
-      finish_reason = "stop",
-    }
-  end
-
-  -- 5f-bilingual. translate hello to japanese -> canned reply, used by
-  -- the help text's "Bilingual example" and renders CJK in the
-  -- assistant text channel so the wide-char rendering is visible
-  -- outside the help block.
-  if string.find(low, "translate hello to japanese", 1, true)
-      or string.find(low, "translate hello to chinese", 1, true)
-      or string.find(low, "translate hello", 1, true) then
-    local greeting = "こんにちは"
-    if string.find(low, "chinese", 1, true) then greeting = "你好" end
-    return {
-      text = "**Hello** in that language is `" .. greeting .. "`.",
-      finish_reason = "stop",
-    }
-  end
-
-  -- 5g. count to N (cap at 50)
-  do
-    local n_str = string.match(low, "count to (%d+)")
-    if n_str then
-      local n = tonumber(n_str) or 0
-      if n > 50 then n = 50 end
-      if n < 1 then n = 1 end
-      local parts = {}
-      for i = 1, n do parts[i] = tostring(i) end
-      return {
-        text = table.concat(parts, ", "),
-        finish_reason = "stop",
-      }
-    end
-  end
-
-  -- 5h. think out loud about / reason about <topic>
-  do
-    local topic = string.match(low, "think out loud about (.+)")
-                or string.match(low, "reason about (.+)")
-    if topic then
-      -- Strip a trailing punctuation block if user typed a sentence.
-      topic = string.match(topic, "^(.-)%s*[%?%.!]*%s*$") or topic
-      return {
-        text = "Reasoned about " .. topic
-            .. "; conclusion: deterministic mock has no opinion, but the reasoning channel works.",
-        finish_reason = "stop",
-        with_reasoning = true,
-      }
-    end
-  end
-
-  -- ----------------------------------------------------------------
-  -- 6. Help fallback. Same body whether this is the first turn (chat
-  --    history has only the just-arrived user message) or a later
-  --    unrecognised input — the banner-prefixed help block is the
-  --    deterministic "I don't know what you mean, here's what I do
-  --    know" answer.
-  -- ----------------------------------------------------------------
-  return {
-    text = MOCK_PROVIDER_BANNER
-        .. "\n\n[mock unmatched input: " .. tostring(last_user) .. "]\n"
-        .. HELP_BODY,
-    finish_reason = "stop",
-  }
 end
 
--- Canned reasoning chunks emitted ahead of content for the orchestrator's
--- relay turn. Five chunks, deterministic — this is what the user sees as
--- the live "thinking" preview before it collapses on first content delta.
-local CANNED_REASONING_CHUNKS = {
-  "Reading the deferred run result.\n",
-  "It carries a single combined paragraph already, so",
-  " I don't need to recompose anything — relaying it",
-  " verbatim is the right call.\n",
-  "Producing the final answer now.",
+local function respond(request)
+  local messages = request.messages
+  local last = messages[#messages]
+  local agent = demo_agent(request)
+  if agent then return agent end
+
+  local user, user_index = latest_user(messages)
+  if last and last.role == "tool" then return after_tool(last, user) end
+  if user == nil then return mock.text("[mock provider: no user message]") end
+
+  -- The MAG run's result returns to the lead as a later user message.
+  if contains(user, COMBINED_TEXT) then
+    return mock.text(COMBINED_TEXT, { reasoning = RELAY_REASONING })
+  end
+
+  local low = string.lower(user)
+  if string.find(low, "octopus", 1, true) and string.find(low, "lighthouse", 1, true) then
+    return mock.tool_call("mag-write-file", { file = MAG_FILE, new_string = MAG_PROGRAM },
+      { delay_ms = delay(1500) })
+  end
+  if contains(low, "read readme") then
+    return mock.tool_call("read_file", { path = "README.md" })
+  end
+  if contains(low, "pwd") or contains(low, "where am i") or contains(low, "cwd") then
+    return mock.tool_call("process.exec",
+      { argv = { "pwd" }, cwd = ".", timeout = { present = true, milliseconds = 5000 } })
+  end
+  if contains(low, "list files") then
+    return mock.tool_call("process.exec",
+      { argv = { "ls", "-la" }, cwd = ".", timeout = { present = true, milliseconds = 5000 } })
+  end
+  if low == "fail" or contains(low, "trigger error") then
+    return mock.error("Mock provider triggered error on user request.")
+  end
+  if contains(low, "what is the secret key") then
+    local value = recall_secret(messages, user_index)
+    if value and value ~= "" then return mock.text("The secret key is: " .. value) end
+    return mock.text("I don't know yet -- tell me with: \"the secret key is <value>\"")
+  end
+  if contains(low, "secret key is ") then
+    return mock.text("Got it. The secret key is now in this chat's history.")
+  end
+  if contains(low, "translate hello") then
+    local greeting = contains(low, "chinese") and "你好" or "こんにちは"
+    return mock.text("**Hello** in that language is `" .. greeting .. "`.")
+  end
+  local count = string.match(low, "count to (%d+)")
+  if count then
+    local n = math.max(1, math.min(50, tonumber(count) or 1))
+    local parts = {}
+    for i = 1, n do parts[i] = tostring(i) end
+    return mock.text(table.concat(parts, ", "))
+  end
+  local topic = string.match(low, "think out loud about (.+)") or string.match(low, "reason about (.+)")
+  if topic then
+    topic = string.match(topic, "^(.-)%s*[%?%.!]*%s*$") or topic
+    return mock.text("Reasoned about " .. topic
+      .. "; conclusion: deterministic mock has no opinion, but the reasoning channel works.",
+      { reasoning = THINK_REASONING })
+  end
+
+  return mock.text(BANNER .. "\n\n[mock unmatched input: " .. user .. "]\n" .. HELP_BODY)
+end
+
+mock.serve {
+  respond = respond,
+  -- ~200 tok/s: 16-codepoint chunks every 20ms read as live output.
+  pace_ms = fast and 0 or 20,
 }
-
--- Stream pacing — mimic ~200 tok/s, fast cloud LLM territory. ~4
--- chars/token English × 200 tok/s = ~800 chars/sec → 16-char chunks
--- at 20ms intervals. Slower than instant so streaming reads as live
--- output instead of paste; faster than 80 tok/s so it doesn't become
--- the dominant cost of an interactive turn.
-local STREAM_CHUNK_CODEPOINTS = 16
-local STREAM_PACE_MS          = 20
-local DIRECT_TURN_DURATION_MS = 250
-
--- Skip pacing under tests — agentic_cli_mock_e2e fires several
--- scenarios with a 10s wall-clock cap and the long-stream regression
--- already exercises a deliberate slow path. The cli harness sets
--- NEFOR_TEST_FAST_MOCK=1 explicitly to opt into instant streaming;
--- interactive launches don't, so they see paced output.
-local function pacing_enabled()
-  local v = os.getenv("NEFOR_TEST_FAST_MOCK")
-  return not (v == "1" or v == "true")
-end
-
--- Yield-style pace: `nefor.sleep` is a tokio timer awaited from inside
--- the host's async task, so the runtime can poll other dispatch tasks
--- (notably `<NAME>.completion.cancel`) while paused between chunks. Earlier shape
--- used `os.execute("sleep …")`, which spawns a blocking subprocess and
--- holds the Lua coroutine; the dispatch loop still couldn't deliver an
--- cancel mid-stream, so /cancel only landed after the canned text
--- finished — visible bug.
-local function pace()
-  if pacing_enabled() then
-    nefor.sleep(STREAM_PACE_MS)
-  end
-end
-
-local completion_runs = {}
-
-local function is_cancelled(cancellation, request_id)
-  return cancellation.cancelled or cancellation[request_id]
-end
-
-local function emit_reasoning(request_id, cancellation)
-  -- Emit reasoning chunks ahead of the content stream, then a
-  -- reasoning_end carrying the full accumulated text. Mirrors what
-  -- openai-provider does on a real Qwen 3 turn.
-  local full = ""
-  for i, chunk in ipairs(CANNED_REASONING_CHUNKS) do
-    if is_cancelled(cancellation, request_id) then return false end
-    full = full .. chunk
-    nefor.emit("completion.event", {
-      request_id = request_id,
-      event      = "reasoning_delta",
-      text       = chunk,
-    })
-    if i < #CANNED_REASONING_CHUNKS then pace() end
-  end
-  if is_cancelled(cancellation, request_id) then return false end
-  nefor.emit("completion.event", {
-    request_id  = request_id,
-    event       = "reasoning_end",
-    text        = full,
-    duration_ms = DIRECT_TURN_DURATION_MS,
-  })
-  return true
-end
-
--- Emit the full response stream. Returns `(completed, partial)` where
--- `completed` is true if the stream ran to completion and `partial` is
--- the substring emitted before cancellation. Direct requests discard that
--- request-local partial value when the handler returns.
-local function emit_stream(request_id, text, opts, cancellation)
-  if type(text) ~= "string" or #text == 0 then return true, "" end
-  opts = opts or {}
-  cancellation = cancellation or {}
-  if opts.with_reasoning then
-    if not emit_reasoning(request_id, cancellation) then return false, "" end
-  end
-
-  -- Stream the response in small fixed-size chunks paced to ~200 tok/s
-  -- to mimic a real cloud LLM. Chunk boundaries snap to UTF-8
-  -- codepoint edges (string.sub is byte-indexed; slicing inside a
-  -- multibyte codepoint produces invalid UTF-8 that downstream
-  -- serde_json can't deserialise).
-  local cp_count = utf8.len(text) or #text
-  local cp_per_chunk = STREAM_CHUNK_CODEPOINTS
-  local cp_i = 1
-  local emitted = ""
-  while cp_i <= cp_count do
-    if is_cancelled(cancellation, request_id) then return false, emitted end
-    local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
-    local byte_start = utf8.offset(text, cp_i)
-    local byte_after_stop = utf8.offset(text, cp_stop + 1)
-    local byte_stop = byte_after_stop and (byte_after_stop - 1) or #text
-    local chunk = string.sub(text, byte_start, byte_stop)
-    nefor.emit("completion.event", {
-      request_id = request_id,
-      event      = "text_delta",
-      text       = chunk,
-    })
-    emitted = emitted .. chunk
-    cp_i = cp_stop + 1
-    if cp_i <= cp_count then pace() end
-  end
-  if is_cancelled(cancellation, request_id) then return false, emitted end
-  return true, text
-end
-
-nefor.on_ready_ok(function()
-  -- Deterministic startup-readiness fixture. Production/default behavior is
-  -- unchanged; isolated process tests may delay or withhold the current hello.
-  local hello_behavior = os.getenv("NEFOR_TEST_PROVIDER_HELLO")
-  if hello_behavior == "delay" then nefor.sleep(500) end
-  if hello_behavior ~= "withhold" then
-    nefor.emit("hello", { model = "mock-model" })
-  end
-  -- Announce auth state so the chat reducer marks this provider
-  -- "connected" — the /model picker fans out a list_requested per
-  -- connected provider, so without this the mock would be invisible
-  -- in the picker. Mock has no auth; "connected" is permanent.
-  nefor.emit("auth.status", { state = "connected" })
-end)
-
--- The mock chooses deterministic data from the runtime's published schema;
--- schema validation and activation completion remain runtime responsibilities.
-local function sample_output(schema, text)
-  if schema.const ~= nil then return schema.const end
-  if schema.oneOf then return sample_output(schema.oneOf[1], text) end
-  if schema.type == "string" then return text end
-  if schema.type == "integer" or schema.type == "number" then return 0 end
-  if schema.type == "boolean" then return false end
-  if schema.type == "array" then
-    local value = nefor.json.decode("[]")
-    for _, component in ipairs(schema.prefixItems or {}) do
-      value[#value + 1] = sample_output(component, text)
-    end
-    return value
-  end
-  if schema.type == "object" then
-    local value = {}
-    for name, property in pairs(schema.properties or {}) do value[name] = sample_output(property, text) end
-    return value
-  end
-  return nefor.json.decode("null")
-end
-
-local function typed_response(request, history)
-  local typed = false
-  for _, name in ipairs(request.tools or {}) do if name == "write_output" then typed = true end end
-  if not typed then return nil end
-  local schema
-  for _, spec in ipairs(request.tool_specs or {}) do
-    if spec.name == "write_output" and type(spec.description) == "string" then
-      local encoded = spec.description:match("It must match this schema:\n(.-)\n\n")
-      if encoded then schema = nefor.json.decode(encoded) end
-    end
-  end
-  assert(schema, "typed mock request requires the write_output result schema")
-  -- The latest assignment message opens the current activation.
-  local instruction_index = 0
-  for i = #history, 1, -1 do
-    if history[i].role == "user" then instruction_index = i; break end
-  end
-  for i = #history, instruction_index + 1, -1 do
-    local message = history[i]
-    if message.role == "tool" and message.name == "write_output" then
-      local ok, receipt = true, message.content
-      if type(receipt) == "string" then ok, receipt = pcall(nefor.json.decode, receipt) end
-      if ok and type(receipt) == "table" and receipt.write == "saved" and receipt.validation.status == "valid" then
-        return { text = "", finish_reason = "tool_calls", tool_calls = {
-          { id = mint_tool_id("submit_output"), name = "submit_output", arguments = {} },
-        } }
-      end
-      break
-    end
-  end
-  local authored = {}
-  for _, message in ipairs(history) do
-    if message.role ~= "tool" or (message.name ~= "write_output" and message.name ~= "submit_output") then
-      authored[#authored + 1] = message
-    end
-  end
-  local response = pick_response_for(authored)
-  if response.tool_calls or response.finish_reason == "error" then return response end
-  local contents = nefor.json.encode(sample_output(schema, response.text or "Mock typed result"))
-  return { text = "", finish_reason = "tool_calls", pre_delay_ms = response.pre_delay_ms, tool_calls = {
-    { id = mint_tool_id("write_output"), name = "write_output", arguments = {new_string = contents, validate = true} },
-  } }
-end
-
-local function complete_request(body)
-  local request_id = body.request_id
-  if type(request_id) ~= "string" or request_id == "" then return end
-  local request = type(body.request) == "table" and body.request or body
-  local input = type(request.input) == "table" and request.input or {}
-  local messages = type(input.messages) == "table" and input.messages or request.messages
-  local history = {}
-  if type(request.system) == "string" and #request.system > 0 then
-    table.insert(history, { role = "system", content = request.system })
-  end
-  for _, message in ipairs(type(messages) == "table" and messages or {}) do
-    table.insert(history, {
-      role         = message.role,
-      content      = (message.name == "write_output" or message.name == "submit_output")
-          and message.content or flatten_content(message.content),
-      tool_call_id = message.tool_call_id,
-      name         = message.name or message.tool_name,
-      tool_calls   = message.tool_calls,
-    })
-  end
-
-  if completion_runs[request_id] then
-    nefor.emit("completion.event", {
-      request_id = request_id,
-      event = "error",
-      message = "completion request `" .. request_id .. "` is already in flight",
-    })
-    return
-  end
-  local run = { cancelled = false }
-  completion_runs[request_id] = run
-
-  local resp = typed_response(request, history) or pick_response_for(history)
-  -- TextAnswer is the direct-text provider path: the LLM factory assigns the
-  -- semantic constructor, while providers return the ordinary response text.
-  -- Tool-call and error turns use their own wire shapes.
-  local result_text = resp.text
-  nefor.log(string.format(
-    "completion.request request_id=%s finish=%s text_len=%d tool_calls=%s",
-    request_id,
-    tostring(resp.finish_reason),
-    type(resp.text) == "string" and #resp.text or 0,
-    resp.tool_calls and #resp.tool_calls or 0))
-
-  -- Pre-emit "thinking" pause for interactive smoke tests. Skipped
-  -- under NEFOR_TEST_FAST_MOCK so harness runs stay fast. Sliced into
-  -- 100ms chunks so a /cancel during the wait actually lands — the
-  -- yielding `nefor.sleep` lets the dispatch loop deliver the
-  -- `<NAME>.completion.cancel` envelope between slices.
-  if pacing_enabled() and type(resp.pre_delay_ms) == "number" and resp.pre_delay_ms > 0 then
-    local remaining = resp.pre_delay_ms
-    while remaining > 0 do
-      if run.cancelled then
-        if completion_runs[request_id] == run then completion_runs[request_id] = nil end
-        return
-      end
-      local slice = remaining > 100 and 100 or remaining
-      nefor.sleep(slice)
-      remaining = remaining - slice
-    end
-  end
-
-  -- Error branch: emit a canonical terminal completion event and skip the
-  -- successful result wire.
-  if resp.finish_reason == "error" then
-    nefor.emit("completion.event", {
-      request_id = request_id,
-      event = "error",
-      message = resp.error_message or "mock provider error",
-    })
-    if completion_runs[request_id] == run then completion_runs[request_id] = nil end
-    return
-  end
-
-  -- Stream phase (only when there's text — tool-call turns skip
-  -- streaming, matching openai-provider's behaviour). The
-  -- `with_reasoning` flag is set on the deferred-result relay turn so
-  -- the orchestrator's wrap node demonstrates the live thinking →
-  -- collapse rendering path. `partial` is the prefix actually emitted
-  -- before the loop ran out (full text on completion, cancel-boundary
-  -- prefix on cancellation).
-  local completed = true
-  if type(resp.text) == "string" and #resp.text > 0 then
-    completed = emit_stream(request_id, resp.text, { with_reasoning = resp.with_reasoning }, run)
-  end
-
-  -- Cancelled mid-stream: skip the result wire. Direct completion history is
-  -- request-local and is not persisted after this handler returns.
-  if not completed then
-    if completion_runs[request_id] == run then completion_runs[request_id] = nil end
-    return
-  end
-
-  -- Canonical completion result with ProviderInput shape.
-  local output = {
-    text          = result_text or "",
-    finish_reason = resp.finish_reason,
-    usage         = {
-      prompt_tokens     = 0,
-      completion_tokens = type(resp.text) == "string" and #resp.text or 0,
-      model             = "mock-model",
-    },
-  }
-  if resp.tool_calls and #resp.tool_calls > 0 then
-    output.tool_calls = resp.tool_calls
-  end
-  if resp.with_reasoning then
-    -- Mirrors openai-provider's completion result reasoning
-    -- field — non-streaming consumers (kernel node outputs, audit
-    -- listeners) get the full trace alongside the content.
-    local full = ""
-    for _, chunk in ipairs(CANNED_REASONING_CHUNKS) do full = full .. chunk end
-    output.reasoning = full
-  end
-  nefor.emit("completion.event", {
-    request_id        = request_id,
-    event             = "usage",
-    prompt_tokens     = 0,
-    completion_tokens = type(resp.text) == "string" and #resp.text or 0,
-    model             = "mock-model",
-    duration_ms       = DIRECT_TURN_DURATION_MS,
-  })
-  nefor.emit("completion.event", {
-    request_id = request_id,
-    event      = "completed",
-    result     = output,
-    model      = "mock-model",
-    duration_ms = DIRECT_TURN_DURATION_MS,
-  })
-
-  if completion_runs[request_id] == run then completion_runs[request_id] = nil end
-end
-
-nefor.on(NAME .. ".completion.request", complete_request)
-
-nefor.on(NAME .. ".completion.cancel", function(body)
-  local request_id = body and body.request_id
-  local run = type(request_id) == "string" and completion_runs[request_id] or nil
-  if run then
-    run.cancelled = true
-    -- Cancellation settles ownership of this request immediately. The
-    -- detached completion still holds `run` and observes its flag at the
-    -- next yield; clearing only the registry slot lets a caller reuse the
-    -- correlation id without the cancelled task deleting its replacement.
-    completion_runs[request_id] = nil
-    nefor.log("completion.cancel request_id=" .. request_id)
-  end
-end)
-
--- Tool-result accumulation is handled kernel-side; the next direct request
--- carries the resulting tool message in its complete history.
-
--- The auth dance — chat_orchestrator's openai_provider_adapter expects
--- to inject a static_token via `<name>.auth.set` after seeing
--- `<name>.ready`. Mock has no auth, but we acknowledge the set so the
--- adapter doesn't think auth failed. Re-affirm "connected" because the
--- ready-time emit is synchronous with handshake; the `auth.set` here
--- arrives later from the wrapper's static-token injection.
-nefor.on(NAME .. ".auth.set", function(_body)
-  nefor.emit("auth.status", { state = "connected" })
-end)
-
--- /model picker discovery. The TUI fans out one
--- `chat.model.list_requested { provider }` per connected provider when
--- the user opens the picker; the wrapper translates that to
--- `<NAME>.models.list_requested`. We answer with a single-model list.
-nefor.on(NAME .. ".models.list_requested", function(_body)
-  nefor.emit("models.listed", { models = { "mock-model" } })
-end)
-
-
--- /model <name> selection. Mock has only one model; whatever model the
--- user picks we ack back unchanged so chat.lua's reducer records the
--- selection. The wrapper translates `<NAME>.model.set_ack` →
--- `chat.model.set_ack { provider, model }`.
-nefor.on(NAME .. ".model.set", function(body)
-  local model = body and body.model
-  if type(model) ~= "string" or model == "" then return end
-  nefor.emit("model.set_ack", { model = model })
-end)

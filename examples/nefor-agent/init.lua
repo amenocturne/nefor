@@ -221,12 +221,16 @@ local provider = require("libs.compositors.provider")
 for _, p in ipairs(cfg.providers or {}) do
   if p.kind == "mock" then
     -- mock-plugin speaks the same wire protocol as the openai-provider
-    -- binary, so the same actor spec works — only the binary differs.
+    -- binary, so the same actor spec works — only the binary differs. The
+    -- script's behavior builds on libs.mock-provider from this lua/ tree.
+    local mock_script = p.mock_script:sub(1, 1) == "/" and p.mock_script
+      or (STARTER_ROOT .. "/" .. p.mock_script)
     actor.spawn(provider.spawn_spec(
       p.name,
       {
         require("config").bin("mock-plugin"),
-        "--script", STARTER_ROOT .. "/" .. p.mock_script,
+        "--script", mock_script,
+        "--lua-root", LUA_ROOT,
       },
       { agentic_loop = agentic_loop, conversations = conversation_reader }
     ))

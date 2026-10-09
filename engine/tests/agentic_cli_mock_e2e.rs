@@ -106,7 +106,10 @@ fn run_inner(
         .env("XDG_CACHE_HOME", dir.join("cache"))
         .env("NEFOR_RUNTIME_ROOT", root())
         .env("NEFOR_EXECUTABLE_ROOT", dir.join("bin"))
-        .env("NEFOR_TEST_FAST_MOCK", "1")
+        .env(
+            "NEFOR_MOCK_PROVIDER_SCRIPT",
+            root().join("engine/tests/agentic_cli_mock_e2e/provider.lua"),
+        )
         .env("NEFOR_STARTUP_TIMEOUT_MS", "10000")
         .env("OPENAI_PROVIDER_API_KEY", "offline-sentinel")
         .arg("--config")
@@ -627,60 +630,4 @@ fn headless_starter_request_resume_tools_and_failures() {
     assert_eq!(mag_death.status.code(), Some(1));
     assert_authority_loss(&dir, &mag_death);
     println!("retained headless artifacts: {}", dir.display());
-}
-
-#[test]
-fn shipped_mock_keeps_submission_receipts_within_activation() {
-    use mlua::LuaSerdeExt;
-    let lua = mlua::Lua::new();
-    let nefor = lua.create_table().unwrap();
-    nefor.set("name", "mock-plugin").unwrap();
-    for name in ["on", "on_ready_ok"] {
-        nefor
-            .set(
-                name,
-                lua.create_function(|_, _: mlua::Variadic<mlua::Value>| Ok(()))
-                    .unwrap(),
-            )
-            .unwrap();
-    }
-    let json = lua.create_table().unwrap();
-    json.set(
-        "decode",
-        lua.create_function(|lua, text: String| {
-            let value: serde_json::Value =
-                serde_json::from_str(&text).map_err(mlua::Error::external)?;
-            lua.to_value(&value)
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    json.set(
-        "encode",
-        lua.create_function(|lua, value: mlua::Value| {
-            let value: serde_json::Value = lua.from_value(value)?;
-            serde_json::to_string(&value).map_err(mlua::Error::external)
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    nefor.set("json", json).unwrap();
-    lua.globals().set("nefor", nefor).unwrap();
-    let source =
-        std::fs::read_to_string(root().join("examples/nefor-agent/mock-provider/init.lua"))
-            .unwrap();
-    let select: mlua::Function = lua
-        .load(format!("{source}\nreturn typed_response"))
-        .eval()
-        .unwrap();
-    lua.globals().set("select_typed", select).unwrap();
-    lua.load(r#"
-        local instruction = {role="user",content="assignment"}
-        local valid = {role="tool",name="write_output",content={write="saved",validation={status="valid"}}}
-        local invalid = {role="tool",name="write_output",content={write="saved",validation={status="invalid"}}}
-        local request = {tools={"write_output","submit_output"},tool_specs={{name="write_output",description='It must match this schema:\n{"type":"object","properties":{"content":{"type":"string"}}}\n\n- new_string only'}}}
-        assert(select_typed(request, {instruction,valid}).tool_calls[1].name == "submit_output")
-        assert(select_typed(request, {instruction,valid,invalid}).tool_calls[1].name == "write_output")
-        assert(select_typed(request, {instruction,valid,instruction}).tool_calls[1].name == "write_output")
-    "#).exec().unwrap();
 }

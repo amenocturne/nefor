@@ -31,7 +31,10 @@ local providers = {
   {
     kind        = "mock",
     name        = "mock-plugin",
-    mock_script = "mock-provider/init.lua",
+    -- The interactive demo behavior; relative paths resolve against the
+    -- starter root. NEFOR_MOCK_PROVIDER_SCRIPT selects another behavior
+    -- script, e.g. a test's own scenario.
+    mock_script = os.getenv("NEFOR_MOCK_PROVIDER_SCRIPT") or "mock-provider/init.lua",
   },
 }
 

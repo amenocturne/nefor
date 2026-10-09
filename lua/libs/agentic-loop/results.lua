@@ -7,7 +7,7 @@ local M = {}
 -- Format a deferred kernel-run completion into a user-role message.
 -- The `[mag_run(…) result]` / `[mag_run(…) FAILED]` tag is load-bearing:
 -- the lead saw the dispatch ack promise a tagged follow-up, and surfaces
--- (mock provider, tests) key on the marker shape. A readable run_name leads
+-- and tests key on the marker shape. A readable run_name leads
 -- when available; the opaque run_id always remains for exact control.
 function M.format_deferred(completion)
   local run_id = completion.run_id or "?"

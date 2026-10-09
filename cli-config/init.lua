@@ -178,6 +178,7 @@ actor.spawn(provider.spawn_spec(
   {
     require("config").bin("mock-plugin"),
     "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
+    "--lua-root", LUA_ROOT,
   },
   { agentic_loop = agentic_loop, conversations = conversation_reader }
 ))
