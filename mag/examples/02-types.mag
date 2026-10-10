@@ -6,7 +6,7 @@ type Entry<K, V> {key: K, value: V}
 type ExampleArtifact {decision: Decision, entry: Entry<String, Int>}
 
 // Functions return the declared sum while selecting one concrete arm.
-let decide: fn(Score) -> Decision = |score| => if get(score, "accepted") then named(Decision, Accepted, Accepted {score: score}) else named(Decision, Rejected, Rejected {score: score, reason: "score was not accepted"})
+let decide: fn(Score) -> Decision = |score| => if get(score, "accepted") then Decision.Accepted(Accepted {score: score}) else Decision.Rejected(Rejected {score: score, reason: "score was not accepted"})
 
 // Entry demonstrates one reusable type with two independent parameters: this
 // value instantiates it as Entry<String, Int>.

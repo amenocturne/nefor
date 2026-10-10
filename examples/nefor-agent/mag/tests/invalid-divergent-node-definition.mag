@@ -6,7 +6,7 @@ import nefor.shell.{}
 // Edge identity is logical endpoints plus route, but duplicate identities must
 // not erase evidence that one node id denotes divergent immutable definitions.
 let start = nefor.graph.source("start", nil)
-let operation_a = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf a", cwd: ".", timeout: named(nefor.contracts.Timeout, Unlimited, nil)})
-let operation_b = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf b", cwd: ".", timeout: named(nefor.contracts.Timeout, Unlimited, nil)})
+let operation_a = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf a", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
+let operation_b = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf b", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
 let result = nefor.graph.output_for("result", operation_a)
 nefor.artifact.compile((|base| => nefor.graph.add_edges(base, [nefor.graph.edge(start, operation_a), nefor.graph.edge(start, operation_b), nefor.graph.edge(operation_a, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)

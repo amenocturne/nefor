@@ -14,5 +14,5 @@ let approval_gate: fn(String, ApprovalConfig) -> nefor.graph.Node<nefor.contract
   let actor_id = str(id, ".human")
   let input = nefor.graph.port(actor_id, type_tag<nefor.contracts.TextAnswer>(), "generic-provider.TextAnswer")
   let result = nefor.graph.port(actor_id, type_tag<HumanWorkflowDecision>(), "human.Decision")
-  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.with_templateability(nefor.graph.actor(actor_id, factory, [type_evidence(type_tag<HumanWorkflowDecision>())], HumanParams {prompt: get(config, "prompt")}, nefor.graph.store_port(input), [nefor.graph.store_port(result)]), named(nefor.graph.Templateability, Unsupported, "human approval requires interactive lifecycle"))], [], [], [], [nefor.graph.logical_node([id], [actor_id])], input, result)
+  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.with_templateability(nefor.graph.actor(actor_id, factory, [type_evidence(type_tag<HumanWorkflowDecision>())], HumanParams {prompt: get(config, "prompt")}, nefor.graph.store_port(input), [nefor.graph.store_port(result)]), nefor.graph.Templateability.Unsupported("human approval requires interactive lifecycle"))], [], [], [], [nefor.graph.logical_node([id], [actor_id])], input, result)
 }

@@ -77,7 +77,7 @@ type Modification {actors: List<LowerActor>, routes: List<LowerRoute>, messages:
 type Delta {actors: List<Actor>, routes: List<StoredRoute>, messages: List<Message>, nodes: List<LogicalNode>, kills: List<String>}
 type LowerDelta {actors: List<LowerActor>, routes: List<LowerRoute>, messages: List<LowerMessage>, kills: List<String>, types: Map<String, TypeDescriptor>, nodes: List<LogicalNode>}
 
-let actor_endpoint: fn(String) -> Endpoint = |id| => named(nefor.mag.Endpoint, ActorEndpoint, nefor.mag.ActorEndpoint {id: id})
+let actor_endpoint: fn(String) -> Endpoint = |id| => nefor.mag.Endpoint.ActorEndpoint(nefor.mag.ActorEndpoint {id: id})
 let endpoint_id: fn(Endpoint) -> String = |endpoint| => match endpoint { case ActorEndpoint(value) => get(value, "id") }
 let endpoint_is_actor: fn(Endpoint) -> Bool = |endpoint| => match endpoint { case ActorEndpoint(value) => true }
 let boundary<T>: fn(TypeTag<T>, List<BoundaryLeaf>, List<Flow>) -> Port<T> = |tag, leaves, through| => Port<T> {`type`: tag, boundary: StoredBoundary {`type`: type_evidence(tag), type_id: type_id(type_evidence(tag)), leaves: leaves, through: through}}
@@ -745,12 +745,12 @@ let downstream_slots: fn(List<Transform>) -> List<Int> = |steps| => flat_map(((|
 let normalize_transforms: fn(List<Transform>) -> List<Transform> = |steps| => if (=)(count(steps), 0) then [] else (((| | => {
   let tail = remove_at(steps, 0)
   let head = match first(steps) {
-    case Assemble(spec) => named(Transform, Assemble, Assembly {inputs: get(spec, "inputs"), output: get(spec, "output"), slot: get(spec, "slot"), path: concat([count(tail)], downstream_slots(tail)), kind: get(spec, "kind")}),
-    case Project(value) => named(Transform, Project, value),
-    case Unit(value) => named(Transform, Unit, value),
-    case Pack(value) => named(Transform, Pack, value),
-    case Unpack(value) => named(Transform, Unpack, value),
-    case EmptyList(value) => named(Transform, EmptyList, value),
+    case Assemble(spec) => Transform.Assemble(Assembly {inputs: get(spec, "inputs"), output: get(spec, "output"), slot: get(spec, "slot"), path: concat([count(tail)], downstream_slots(tail)), kind: get(spec, "kind")}),
+    case Project(value) => Transform.Project(value),
+    case Unit(value) => Transform.Unit(value),
+    case Pack(value) => Transform.Pack(value),
+    case Unpack(value) => Transform.Unpack(value),
+    case EmptyList(value) => Transform.EmptyList(value),
   }
   concat([head], normalize_transforms(tail))
 }) : fn() -> List<Transform>))()

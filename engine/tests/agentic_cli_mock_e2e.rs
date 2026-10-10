@@ -1171,7 +1171,7 @@ end
 fn accepted_real_mag_giant_join_has_small_authoritative_terminal() {
     let dir = isolated_starter("mag-output-admission-");
     let branches = (0..18).map(|index| format!(
-        "script(\"branch-{index}\", ShellScriptParams {{script: \"head -c 9437184 /dev/zero | tr '\\\\000' x\", cwd: \".\", timeout: named(Timeout, Seconds, 10)}})"
+        "script(\"branch-{index}\", ShellScriptParams {{script: \"head -c 9437184 /dev/zero | tr '\\\\000' x\", cwd: \".\", timeout: Timeout.Seconds(10)}})"
     )).collect::<Vec<_>>().join(",\n");
     let program = format!("import nefor.{{compile_graph, script, ShellScriptParams, Timeout, sequence}}\ncompile_graph(sequence([{branches}]))\n");
     let behavior = format!(

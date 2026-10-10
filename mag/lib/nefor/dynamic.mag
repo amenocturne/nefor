@@ -66,7 +66,7 @@ let merge_captures: fn(List<Map<String, nefor.mag.TypedCapture>>) -> Map<String,
 
 let trigger_ref<T>: fn(TypeTag<T>) -> ValueRef<T> = |`type`| => {
   let descriptor = type_evidence(`type`)
-  ValueRef<T> {id: "trigger", `type`: `type`, captures: (core.map.empty<String, _>(): Map<String, nefor.mag.TypedCapture>), expressions: [named(nefor.mag.Expression, Trigger, nefor.mag.Trigger {id: "trigger", result_type: type_id(descriptor)})]}
+  ValueRef<T> {id: "trigger", `type`: `type`, captures: (core.map.empty<String, _>(): Map<String, nefor.mag.TypedCapture>), expressions: [nefor.mag.Expression.Trigger(nefor.mag.Trigger {id: "trigger", result_type: type_id(descriptor)})]}
 }
 
 let capture_ref<T>: fn(T) -> ValueRef<T> = |value| => {
@@ -75,37 +75,37 @@ let capture_ref<T>: fn(T) -> ValueRef<T> = |value| => {
   let capture_id = expression_id(CaptureValueIdentity {`type`: type_id(descriptor), value: pack(value)})
   let id = expression_id(CaptureIdentity {capture: capture_id, `type`: type_id(descriptor)})
   let captured = nefor.mag.TypedCapture {semantic_type: descriptor, semantic_type_id: type_id(descriptor), value: pack(value)}
-  ValueRef<T> {id: id, `type`: `type`, captures: core.map.insert((core.map.empty<String, _>(): Map<String, nefor.mag.TypedCapture>), capture_id, captured), expressions: [named(nefor.mag.Expression, Capture, nefor.mag.Capture {id: id, result_type: type_id(descriptor), capture: capture_id})]}
+  ValueRef<T> {id: id, `type`: `type`, captures: core.map.insert((core.map.empty<String, _>(): Map<String, nefor.mag.TypedCapture>), capture_id, captured), expressions: [nefor.mag.Expression.Capture(nefor.mag.Capture {id: id, result_type: type_id(descriptor), capture: capture_id})]}
 }
 
 let field_ref<R, T>: fn(ValueRef<R>, String, TypeTag<T>) -> ValueRef<T> = |record, field, `type`| => {
   let id = expression_id(FieldIdentity {field: field, record: get(record, "id"), `type`: type_id(type_evidence(`type`))})
-  ValueRef<T> {id: id, `type`: `type`, captures: get(record, "captures"), expressions: concat(get(record, "expressions"), [named(nefor.mag.Expression, Field, nefor.mag.Field {id: id, result_type: type_id(type_evidence(`type`)), record: get(record, "id"), field: field})])}
+  ValueRef<T> {id: id, `type`: `type`, captures: get(record, "captures"), expressions: concat(get(record, "expressions"), [nefor.mag.Expression.Field(nefor.mag.Field {id: id, result_type: type_id(type_evidence(`type`)), record: get(record, "id"), field: field})])}
 }
 
 let int_to_decimal_string_ref: fn(ValueRef<Int>) -> ValueRef<String> = |value| => {
   let id = expression_id(DecimalIdentity {int_to_decimal_string: get(value, "id")})
-  ValueRef<String> {id: id, `type`: type_tag<String>(), captures: get(value, "captures"), expressions: concat(get(value, "expressions"), [named(nefor.mag.Expression, IntToDecimalString, nefor.mag.IntToDecimalString {id: id, result_type: type_id(type_evidence(type_tag<String>())), value: get(value, "id")})])}
+  ValueRef<String> {id: id, `type`: type_tag<String>(), captures: get(value, "captures"), expressions: concat(get(value, "expressions"), [nefor.mag.Expression.IntToDecimalString(nefor.mag.IntToDecimalString {id: id, result_type: type_id(type_evidence(type_tag<String>())), value: get(value, "id")})])}
 }
 
 let concat_strings_ref: fn(List<ValueRef<String>>) -> ValueRef<String> = |values| => {
   let ids = map(((|value| => get(value, "id")) : fn(ValueRef<String>) -> String), values)
   let id = expression_id(ConcatIdentity {concat_strings: ids})
-  ValueRef<String> {id: id, `type`: type_tag<String>(), captures: merge_captures(map(((|value| => get(value, "captures")) : fn(ValueRef<String>) -> Map<String, nefor.mag.TypedCapture>), values)), expressions: concat(merge_expressions(map(((|value| => get(value, "expressions")) : fn(ValueRef<String>) -> List<nefor.mag.Expression>), values)), [named(nefor.mag.Expression, ConcatStrings, nefor.mag.ConcatStrings {id: id, result_type: type_id(type_evidence(type_tag<String>())), values: ids})])}
+  ValueRef<String> {id: id, `type`: type_tag<String>(), captures: merge_captures(map(((|value| => get(value, "captures")) : fn(ValueRef<String>) -> Map<String, nefor.mag.TypedCapture>), values)), expressions: concat(merge_expressions(map(((|value| => get(value, "expressions")) : fn(ValueRef<String>) -> List<nefor.mag.Expression>), values)), [nefor.mag.Expression.ConcatStrings(nefor.mag.ConcatStrings {id: id, result_type: type_id(type_evidence(type_tag<String>())), values: ids})])}
 }
 
-let local_actor_ref: fn(String) -> nefor.mag.TemplateEndpoint = |slot| => named(nefor.mag.TemplateEndpoint, LocalActorRef, nefor.mag.LocalActorRef {slot: slot})
+let local_actor_ref: fn(String) -> nefor.mag.TemplateEndpoint = |slot| => nefor.mag.TemplateEndpoint.LocalActorRef(nefor.mag.LocalActorRef {slot: slot})
 
-let existing_actor_ref: fn(String) -> nefor.mag.TemplateEndpoint = |id| => named(nefor.mag.TemplateEndpoint, ExistingActorRef, nefor.mag.ExistingActorRef {id: id})
+let existing_actor_ref: fn(String) -> nefor.mag.TemplateEndpoint = |id| => nefor.mag.TemplateEndpoint.ExistingActorRef(nefor.mag.ExistingActorRef {id: id})
 
 let template_port<T>: fn(nefor.mag.TemplateEndpoint, TypeTag<T>, String) -> nefor.mag.TemplatePort = |endpoint, `type`, wire| => {
   let descriptor = type_evidence(`type`)
   nefor.mag.TemplatePort {endpoint: endpoint, `type`: descriptor, type_id: type_id(descriptor), wire: wire}
 }
 
-let fixed_segment: fn(String) -> nefor.mag.PathSegment = |value| => named(nefor.mag.PathSegment, FixedPathSegment, nefor.mag.FixedPathSegment {value: value})
+let fixed_segment: fn(String) -> nefor.mag.PathSegment = |value| => nefor.mag.PathSegment.FixedPathSegment(nefor.mag.FixedPathSegment {value: value})
 
-let bound_segment: fn(ValueRef<String>) -> nefor.mag.PathSegment = |value| => named(nefor.mag.PathSegment, BoundPathSegment, nefor.mag.BoundPathSegment {value: get(value, "id")})
+let bound_segment: fn(ValueRef<String>) -> nefor.mag.PathSegment = |value| => nefor.mag.PathSegment.BoundPathSegment(nefor.mag.BoundPathSegment {value: get(value, "id")})
 
 let actor_id_relocation: fn(String, List<String>) -> nefor.mag.ActorReferenceRelocation = |slot, path| => nefor.mag.ActorReferenceRelocation {actor: nefor.mag.LocalActorRef {slot: slot}, path: path, shape: "actor_id"}
 
@@ -212,7 +212,7 @@ let output_template_route: fn(nefor.graph.BoundaryLeaf, nefor.mag.TemplatePort) 
 
 let input_template_message<I>: fn(nefor.graph.BoundaryLeaf, ValueRef<I>) -> nefor.mag.TemplateMessage = |leaf, item| => {
   let port = get(leaf, "port")
-  nefor.mag.TemplateMessage {to: template_stored_port(port), transforms: get(leaf, "steps"), semantic_type: type_evidence(get(item, "type")), semantic_type_id: type_id(type_evidence(get(item, "type"))), content: named(nefor.mag.TemplatePayload, Expression, get(item, "id"))}
+  nefor.mag.TemplateMessage {to: template_stored_port(port), transforms: get(leaf, "steps"), semantic_type: type_evidence(get(item, "type")), semantic_type_id: type_id(type_evidence(get(item, "type"))), content: nefor.mag.TemplatePayload.Expression(get(item, "id"))}
 }
 
 let traverse<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<DynamicList<I>, DynamicList<O>> = |id, value| => {
@@ -245,16 +245,16 @@ let traverse<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<Dynam
   let result_routes = map(((|leaf| => output_template_route(leaf, result_input)) : fn(nefor.graph.BoundaryLeaf) -> nefor.mag.TemplateRoute), get(worker_output, "leaves"))
   let collect_route = nefor.mag.TemplateRoute {from: result_output, to: nefor.mag.TemplatePort {endpoint: existing_actor_ref(output_id), `type`: type_evidence(type_tag<DynamicEvent<O>>()), type_id: type_id(type_evidence(type_tag<DynamicEvent<O>>())), wire: "nefor.dynamic.Collect"}, transforms: []}
   let occurrence_segment = concat_strings_ref([collection, capture_ref(":"), index_text])
-  let occurrence_path = [named(nefor.mag.PathSegment, TriggerPathSegment, nefor.mag.TriggerPathSegment {}), bound_segment(occurrence_segment)]
+  let occurrence_path = [nefor.mag.PathSegment.TriggerPathSegment(nefor.mag.TriggerPathSegment {}), bound_segment(occurrence_segment)]
   let nodes = concat([nefor.mag.TemplateLogicalNode {path: occurrence_path, members: [nefor.mag.LocalActorRef {slot: result_slot}]}], map(((|node| => nefor.mag.TemplateLogicalNode {path: concat(occurrence_path, map(fixed_segment, get(node, "path"))), members: map(((|member| => nefor.mag.LocalActorRef {slot: member}) : fn(String) -> nefor.mag.LocalActorRef), get(node, "members"))}) : fn(nefor.graph.LogicalNode) -> nefor.mag.TemplateLogicalNode), get(worker, "nodes")))
   let relocations = flat_map(((|actor| => map(((|relocation| => nefor.mag.ActorReferenceRelocation {actor: nefor.mag.LocalActorRef {slot: get(actor, "id")}, path: get(relocation, "path"), shape: get(relocation, "shape")}) : fn(nefor.graph.Relocation) -> nefor.mag.ActorReferenceRelocation), checked_relocations(nefor.graph.actor_ids(worker_actors), actor))) : fn(nefor.graph.Actor) -> List<nefor.mag.ActorReferenceRelocation>), worker_actors)
   let input_messages = map(((|leaf| => input_template_message<I>(leaf, item)) : fn(nefor.graph.BoundaryLeaf) -> nefor.mag.TemplateMessage), get(worker_input, "leaves"))
-  let anonymous_messages = map(((|flow| => nefor.mag.TemplateMessage {to: result_input, transforms: get(flow, "steps"), semantic_type: type_evidence(type_tag<I>()), semantic_type_id: type_id(type_evidence(type_tag<I>())), content: named(nefor.mag.TemplatePayload, Expression, get(item, "id"))}) : fn(nefor.graph.Flow) -> nefor.mag.TemplateMessage), get(worker_output, "through"))
+  let anonymous_messages = map(((|flow| => nefor.mag.TemplateMessage {to: result_input, transforms: get(flow, "steps"), semantic_type: type_evidence(type_tag<I>()), semantic_type_id: type_id(type_evidence(type_tag<I>())), content: nefor.mag.TemplatePayload.Expression(get(item, "id"))}) : fn(nefor.graph.Flow) -> nefor.mag.TemplateMessage), get(worker_output, "through"))
   let template = nefor.mag.DeltaTemplate {types: descriptor_table(concat(nefor.graph.actor_descriptors(worker_actors), [type_evidence(type_tag<I>()), type_evidence(type_tag<O>()), type_evidence(type_tag<DynamicEvent<O>>())])), actors: concat(template_actors, [result_actor]), routes: concat(worker_routes, concat(result_routes, [collect_route])), messages: concat(input_messages, anonymous_messages), nodes: nodes, actor_reference_relocations: relocations}
   let refs = concat(actor_ids, [result_id, collection, index_text, occurrence_segment])
   let captures = merge_captures(concat(map(((|ref| => get(ref, "captures")) : fn(ValueRef<String>) -> Map<String, nefor.mag.TypedCapture>), refs), [get(item, "captures")]))
   let expressions = merge_expressions(concat(map(((|ref| => get(ref, "expressions")) : fn(ValueRef<String>) -> List<nefor.mag.Expression>), refs), [get(item, "expressions")]))
   let operation = nefor.graph.instantiate_delta_template(str(id, ".expand"), indexed, captures, expressions, template)
-  let completion = nefor.graph.transformed_route(nefor.graph.store_port(completed), nefor.graph.store_port(collect), [named(nefor.graph.Transform, Pack, nefor.graph.AdtTransform {owner: type_evidence(type_tag<DynamicEvent<O>>()), payload: type_evidence(type_tag<DynamicCount>()), constructor: "Complete"})])
+  let completion = nefor.graph.transformed_route(nefor.graph.store_port(completed), nefor.graph.store_port(collect), [nefor.graph.Transform.Pack(nefor.graph.AdtTransform {owner: type_evidence(type_tag<DynamicEvent<O>>()), payload: type_evidence(type_tag<DynamicCount>()), constructor: "Complete"})])
   nefor.graph.node_with_operations_and_nodes(id, "ordinary", [input_actor, output_actor], [completion], [], [operation], [nefor.graph.logical_node([id], [input_id, output_id])], input, output)
 }

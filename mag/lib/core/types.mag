@@ -6,22 +6,22 @@ type Either<L, R> = Left(L) | Right(R)
 
 type Result<E, T> = Ok(T) | Error(E)
 
-let some<T>: fn(T) -> Option<T> = |value| => named(Option<T>, Some, value)
+let some<T>: fn(T) -> Option<T> = |value| => Option<T>.Some(value)
 
-let none<T>: fn() -> Option<T> = | | => named(Option<T>, None, nil)
+let none<T>: fn() -> Option<T> = | | => Option<T>.None()
 
-let left<L, R>: fn(L) -> Either<L, R> = |value| => named(Either<L, R>, Left, value)
+let left<L, R>: fn(L) -> Either<L, R> = |value| => Either<L, R>.Left(value)
 
-let right<L, R>: fn(R) -> Either<L, R> = |value| => named(Either<L, R>, Right, value)
+let right<L, R>: fn(R) -> Either<L, R> = |value| => Either<L, R>.Right(value)
 
-let ok<E, T>: fn(T) -> Result<E, T> = |value| => named(Result<E, T>, Ok, value)
+let ok<E, T>: fn(T) -> Result<E, T> = |value| => Result<E, T>.Ok(value)
 
-let error<E, T>: fn(E) -> Result<E, T> = |value| => named(Result<E, T>, Error, value)
+let error<E, T>: fn(E) -> Result<E, T> = |value| => Result<E, T>.Error(value)
 
-let option_map<T, U>: fn(fn(T) -> U, Option<T>) -> Option<U> = |f, option| => match option { case Some(present) => named(Option<U>, Some, f(present)), case None(absent) => named(Option<U>, None, nil) }
+let option_map<T, U>: fn(fn(T) -> U, Option<T>) -> Option<U> = |f, option| => match option { case Some(present) => Option<U>.Some(f(present)), case None(absent) => Option<U>.None() }
 
-let either_map<L, T, U>: fn(fn(T) -> U, Either<L, T>) -> Either<L, U> = |f, either| => match either { case Left(left_value) => named(Either<L, U>, Left, left_value), case Right(right_value) => named(Either<L, U>, Right, f(right_value)) }
+let either_map<L, T, U>: fn(fn(T) -> U, Either<L, T>) -> Either<L, U> = |f, either| => match either { case Left(left_value) => Either<L, U>.Left(left_value), case Right(right_value) => Either<L, U>.Right(f(right_value)) }
 
-let result_map<E, T, U>: fn(fn(T) -> U, Result<E, T>) -> Result<E, U> = |f, result| => match result { case Error(failure) => named(Result<E, U>, Error, failure), case Ok(value) => named(Result<E, U>, Ok, f(value)) }
+let result_map<E, T, U>: fn(fn(T) -> U, Result<E, T>) -> Result<E, U> = |f, result| => match result { case Error(failure) => Result<E, U>.Error(failure), case Ok(value) => Result<E, U>.Ok(f(value)) }
 
-let result_and_then<E, T, U>: fn(fn(T) -> Result<E, U>, Result<E, T>) -> Result<E, U> = |f, result| => match result { case Error(failure) => named(Result<E, U>, Error, failure), case Ok(value) => f(value) }
+let result_and_then<E, T, U>: fn(fn(T) -> Result<E, U>, Result<E, T>) -> Result<E, U> = |f, result| => match result { case Error(failure) => Result<E, U>.Error(failure), case Ok(value) => f(value) }

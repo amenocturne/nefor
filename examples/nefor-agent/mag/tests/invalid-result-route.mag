@@ -5,7 +5,7 @@ import nefor.shell.{}
 
 // Regression: the concrete output node is terminal and cannot source an edge.
 let start = nefor.graph.source("start", nil)
-let first = nefor.shell.script("first", nefor.shell.ShellScriptParams {script: "printf first", cwd: ".", timeout: named(nefor.contracts.Timeout, Unlimited, nil)})
+let first = nefor.shell.script("first", nefor.shell.ShellScriptParams {script: "printf first", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
 let result = nefor.graph.output_for("result", first)
-let second = nefor.shell.script("second", nefor.shell.ShellScriptParams {script: "cat", cwd: ".", timeout: named(nefor.contracts.Timeout, Unlimited, nil)})
+let second = nefor.shell.script("second", nefor.shell.ShellScriptParams {script: "cat", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, first), nefor.graph.edge(first, result), nefor.graph.edge(result, second), nefor.graph.edge(second, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)

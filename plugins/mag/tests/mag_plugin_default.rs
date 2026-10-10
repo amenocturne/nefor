@@ -1425,7 +1425,7 @@ compile_graph(source("input", "MARKER") >>> identity<String>("answer"))"#,
         let mut artifact = compile(
             &host,
             r#"import nefor.{compile_graph, script, ShellScriptParams, Timeout}
-compile_graph(script("shell", ShellScriptParams {script: "MARKER", cwd: ".", timeout: named(Timeout, Seconds, 30)}))"#,
+compile_graph(script("shell", ShellScriptParams {script: "MARKER", cwd: ".", timeout: Timeout.Seconds(30)}))"#,
         );
         replace_marker(&mut artifact, &"x".repeat(16 * 1024 * 1024));
         let (tx, mut rx) = mpsc::channel(128);
@@ -1467,8 +1467,8 @@ compile_graph(script("shell", ShellScriptParams {script: "MARKER", cwd: ".", tim
         let artifact = compile(
             &host,
             r#"import nefor.{compile_graph, script, ShellScriptParams, Timeout, &&&}
-let left = script("left", ShellScriptParams {script: "left", cwd: ".", timeout: named(Timeout, Seconds, 30)})
-let right = script("right", ShellScriptParams {script: "right", cwd: ".", timeout: named(Timeout, Seconds, 30)})
+let left = script("left", ShellScriptParams {script: "left", cwd: ".", timeout: Timeout.Seconds(30)})
+let right = script("right", ShellScriptParams {script: "right", cwd: ".", timeout: Timeout.Seconds(30)})
 compile_graph(left &&& right)"#,
         );
         let (tx, mut rx) = mpsc::channel(128);

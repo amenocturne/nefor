@@ -404,14 +404,6 @@ fn is_operator_byte(byte: u8) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
-struct VariantMetadata {
-    owner: String,
-    owner_params: Vec<String>,
-    payload: authored::Type,
-    field_order: Vec<String>,
-}
-
 #[derive(Clone)]
 struct Parser<'a> {
     source: &'a SourceSnapshot,
@@ -419,13 +411,10 @@ struct Parser<'a> {
     cursor: usize,
     fixities: HashMap<String, Fixity>,
     aliases: HashMap<String, authored::NamePath>,
-    variants: HashMap<String, VariantMetadata>,
     requires: Vec<authored::Require>,
     namespace_aliases: HashSet<String>,
     bound_names: HashSet<String>,
-    local_types: HashSet<String>,
     allow_brace_construct: bool,
-    specialized_constructors: HashMap<String, (authored::Type, String)>,
 }
 
 impl<'a> Parser<'a> {
@@ -438,13 +427,10 @@ impl<'a> Parser<'a> {
             cursor: 0,
             fixities,
             aliases: HashMap::new(),
-            variants: HashMap::new(),
             requires: Vec::new(),
             namespace_aliases: HashSet::new(),
             bound_names,
-            local_types: HashSet::new(),
             allow_brace_construct: true,
-            specialized_constructors: HashMap::new(),
         })
     }
 
@@ -560,7 +546,6 @@ impl<'a> Parser<'a> {
             self.expect_word("type")?;
         }
         let name = self.expect_name()?;
-        self.local_types.insert(name.clone());
         let params = self.parse_generic_names()?;
         if is_newtype && self.at_punct('{') {
             return Err(self.here("newtype requires '= TypeExpr'"));
@@ -605,7 +590,6 @@ impl<'a> Parser<'a> {
             self.eat_operator("|");
             self.newlines();
             let constructor = self.expect_name()?;
-            let mut field_order = Vec::new();
             let payload = if self.eat_punct('(') {
                 let items = self.parse_type_list(')')?;
                 match items.as_slice() {
@@ -615,7 +599,6 @@ impl<'a> Parser<'a> {
                 }
             } else if self.eat_punct('{') {
                 let fields = self.parse_type_fields('}')?;
-                field_order = fields.iter().map(|(field, _)| field.clone()).collect();
                 let helper = format!("{name}.{constructor}");
                 helper_forms.push(authored::Form::Type(authored::TypeDeclaration {
                     name: helper.clone(),
@@ -638,15 +621,6 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.here("constructor requires a positional or named payload"));
             };
-            self.variants.insert(
-                format!("{name}.{constructor}"),
-                VariantMetadata {
-                    owner: name.clone(),
-                    owner_params: params.clone(),
-                    payload: payload.clone(),
-                    field_order,
-                },
-            );
             variants.push(authored::ConstructorDeclaration {
                 name: constructor,
                 payload,
@@ -805,10 +779,21 @@ impl<'a> Parser<'a> {
                     };
                     if self.eat_punct('.') {
                         let constructor = self.expect_name()?;
-                        let marker = format!("#constructor{}", self.specialized_constructors.len());
-                        self.specialized_constructors
-                            .insert(marker.clone(), (owner_type, constructor));
-                        value = authored::Expr::Name(marker.into());
+                        let arguments = if self.eat_punct('(') {
+                            let args = self.parse_arguments()?;
+                            self.constructor_arguments(args)?
+                        } else if self.allow_brace_construct && self.eat_punct('{') {
+                            authored::ConstructorArguments::Named(self.parse_value_fields('}')?)
+                        } else {
+                            return Err(self.here(
+                                "a constructor must be applied; write Type<...>.Constructor(...)",
+                            ));
+                        };
+                        value = authored::Expr::Construct {
+                            owner: owner_type,
+                            constructor,
+                            arguments,
+                        };
                     } else if self.allow_brace_construct && self.eat_punct('{') {
                         value = authored::Expr::Ascribe {
                             target: owner_type,
@@ -822,7 +807,7 @@ impl<'a> Parser<'a> {
                 }
             } else if self.eat_punct('(') {
                 let args = self.parse_arguments()?;
-                value = self.lower_call(value, args, expected)?;
+                value = self.lower_call(value, args)?;
             } else if self.eat_punct('.') {
                 let field = self.expect_name()?;
                 value = authored::Expr::Call {
@@ -842,42 +827,6 @@ impl<'a> Parser<'a> {
                         callee: Box::new(authored::Expr::Name(owner)),
                         type_args: None,
                         args: vec![authored::Expr::Fields(fields)],
-                    }
-                } else if let Some(owner_prefix) = owner.owner() {
-                    let constructor = owner.last();
-                    if let Some(metadata) = self.variants.get(owner.as_str()) {
-                        if metadata.owner != owner_prefix.as_str()
-                            || metadata.field_order.is_empty()
-                        {
-                            return Err(
-                                self.here("named constructor owner or payload does not match")
-                            );
-                        }
-                        let (sum_type, _) =
-                            constructor_types(&metadata.owner, constructor, expected);
-                        let payload_type = specialize_variant_payload(metadata, &sum_type);
-                        let payload = authored::Expr::Ascribe {
-                            target: payload_type,
-                            value: Box::new(authored::Expr::Fields(fields)),
-                        };
-                        authored::Expr::Construct {
-                            owner: sum_type,
-                            constructor: constructor.to_owned(),
-                            payload: Box::new(payload),
-                        }
-                    } else if expected_owner_name(expected) == Some(owner_prefix.as_str()) {
-                        authored::Expr::Construct {
-                            owner: expected
-                                .cloned()
-                                .unwrap_or(authored::Type::Name(owner_prefix)),
-                            constructor: constructor.to_owned(),
-                            payload: Box::new(authored::Expr::Fields(fields)),
-                        }
-                    } else {
-                        authored::Expr::Ascribe {
-                            target: authored::Type::Name(owner),
-                            value: Box::new(authored::Expr::Fields(fields)),
-                        }
                     }
                 } else {
                     authored::Expr::Ascribe {
@@ -908,7 +857,6 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(word) if word == "if" => self.parse_if(expected),
             TokenKind::Ident(word) if word == "match" => self.parse_match(expected),
             TokenKind::Ident(word) if word == "type_tag" => self.parse_type_tag(),
-            TokenKind::Ident(word) if word == "named" => self.parse_named(),
             TokenKind::Ident(word) => self.parse_name_expression(word, expected),
             TokenKind::Operator(word) if word == "|" => self.parse_lambda(expected, token.span),
             TokenKind::Operator(word) => Ok(authored::Expr::Name(self.resolve_name(&word).into())),
@@ -1105,7 +1053,14 @@ impl<'a> Parser<'a> {
         let mut arms = Vec::new();
         while !self.eat_punct('}') {
             self.expect_word("case")?;
-            let pattern = self.expect_name_path()?;
+            // A bare pattern names a constructor of the scrutinee's type, which
+            // lives in that type's scope; only a qualifying owner is a
+            // module-scope name that import aliases may rewrite.
+            let pattern = if self.peek_n(1).kind == TokenKind::Punct('.') {
+                self.expect_name_path()?
+            } else {
+                authored::NamePath::single(self.expect_name()?)
+            };
             self.expect_punct('(')?;
             let binding = self.expect_name()?;
             self.expect_punct(')')?;
@@ -1138,21 +1093,6 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         self.expect_punct(')')?;
         Ok(authored::Expr::TypeTag(ty))
-    }
-
-    fn parse_named(&mut self) -> Result<authored::Expr, MagError> {
-        self.expect_punct('(')?;
-        let owner = self.parse_type()?;
-        self.expect_punct(',')?;
-        let constructor = self.expect_name()?;
-        self.expect_punct(',')?;
-        let payload = self.parse_expr(None)?;
-        self.expect_punct(')')?;
-        Ok(authored::Expr::Construct {
-            owner,
-            constructor,
-            payload: Box::new(payload),
-        })
     }
 
     fn parse_list(&mut self) -> Result<authored::Expr, MagError> {
@@ -1216,19 +1156,20 @@ impl<'a> Parser<'a> {
         }
         let target = match expected {
             Some(authored::Type::Product(types)) if types.len() == items.len() => {
-                authored::Type::Product(types.clone())
+                Some(authored::Type::Product(types.clone()))
             }
-            _ => authored::Type::Product(
-                items
-                    .iter()
-                    .map(obvious_expr_type)
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| self.here("tuple element types require an annotation"))?,
-            ),
+            _ => items
+                .iter()
+                .map(obvious_expr_type)
+                .collect::<Option<Vec<_>>>()
+                .map(authored::Type::Product),
         };
-        Ok(authored::Expr::Ascribe {
-            target,
-            value: Box::new(authored::Expr::Vector(items)),
+        Ok(match target {
+            Some(target) => authored::Expr::Ascribe {
+                target,
+                value: Box::new(authored::Expr::Vector(items)),
+            },
+            None => authored::Expr::Tuple(items),
         })
     }
 
@@ -1254,163 +1195,64 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
+    /// Lowers `callee(args)`. Labelled arguments exist only for constructors, so
+    /// they select a construction syntactically. A positional dotted call stays
+    /// a call: only the checker knows, after imports, whether its path names a
+    /// function or a constructor.
     fn lower_call(
         &mut self,
         callee: authored::Expr,
         args: Vec<CallArgument>,
-        expected: Option<&authored::Type>,
     ) -> Result<authored::Expr, MagError> {
-        if let authored::Expr::Name(constructor_reference) = &callee {
-            let specialized = self
-                .specialized_constructors
-                .get(constructor_reference.as_str())
-                .cloned();
-            let constructor = specialized
-                .as_ref()
-                .map(|(_, name)| name.clone())
-                .unwrap_or_else(|| constructor_reference.last().to_owned());
-            let owner_hint = specialized
-                .as_ref()
-                .and_then(|(owner, _)| match owner {
-                    authored::Type::Name(name) => Some(name.clone()),
-                    authored::Type::Apply { constructor, .. } => Some(constructor.clone()),
-                    _ => None,
-                })
-                .or_else(|| constructor_reference.owner());
-            let variant = owner_hint
-                .as_ref()
-                .and_then(|owner| self.variants.get(&format!("{owner}.{constructor}")))
-                .cloned()
-                .or_else(|| {
-                    let mut matching = self
-                        .variants
-                        .iter()
-                        .filter(|(name, _)| name.ends_with(&format!(".{constructor}")))
-                        .map(|(_, metadata)| metadata.clone());
-                    let first = matching.next()?;
-                    matching.next().is_none().then_some(first)
-                });
-            if let Some(metadata) = variant {
-                let owner_type = if let Some((owner_type, _)) = specialized.clone() {
-                    owner_type
-                } else {
-                    constructor_types(&metadata.owner, &constructor, expected).0
-                };
-                let payload_type = specialize_variant_payload(&metadata, &owner_type);
-                let payload = if metadata.field_order.is_empty()
-                    && args
-                        .iter()
-                        .all(|arg| matches!(arg, CallArgument::Positional(_)))
-                {
-                    let values = args
-                        .into_iter()
-                        .map(|arg| match arg {
-                            CallArgument::Positional(value) => value,
-                            CallArgument::Named(_, _) => unreachable!(),
-                        })
-                        .collect::<Vec<_>>();
-                    match values.as_slice() {
-                        [] => authored::Expr::Unit,
-                        [value] => value.clone(),
-                        _ => authored::Expr::Ascribe {
-                            target: payload_type,
-                            value: Box::new(authored::Expr::Vector(values)),
-                        },
-                    }
-                } else {
-                    let fields = args
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, arg)| match arg {
-                            CallArgument::Named(name, value) => (name, value),
-                            CallArgument::Positional(value) => (
-                                metadata
-                                    .field_order
-                                    .get(index)
-                                    .cloned()
-                                    .unwrap_or_else(|| index.to_string()),
-                                value,
-                            ),
-                        })
-                        .collect();
-                    authored::Expr::Ascribe {
-                        target: payload_type,
-                        value: Box::new(authored::Expr::Fields(fields)),
-                    }
-                };
-                return Ok(authored::Expr::Construct {
-                    owner: owner_type,
-                    constructor: constructor.to_owned(),
-                    payload: Box::new(payload),
-                });
-            }
-            let imported_owner = specialized
-                .as_ref()
-                .map(|(owner, _)| owner.clone())
-                .or_else(|| {
-                    owner_hint.as_ref().and_then(|owner| {
-                        (expected_owner_name(expected) == Some(owner.as_str()))
-                            .then(|| expected.cloned())
-                            .flatten()
-                    })
-                });
-            if let Some(owner) = imported_owner {
-                let all_positional = args
-                    .iter()
-                    .all(|argument| matches!(argument, CallArgument::Positional(_)));
-                let all_named = args
-                    .iter()
-                    .all(|argument| matches!(argument, CallArgument::Named(_, _)));
-                let payload = if all_positional {
-                    let values = args
-                        .into_iter()
-                        .map(|argument| match argument {
-                            CallArgument::Positional(value) => value,
-                            CallArgument::Named(_, _) => unreachable!(),
-                        })
-                        .collect::<Vec<_>>();
-                    match values.as_slice() {
-                        [] => authored::Expr::Unit,
-                        [value] => value.clone(),
-                        _ => authored::Expr::Vector(values),
-                    }
-                } else if all_named {
-                    authored::Expr::Fields(
-                        args.into_iter()
-                            .map(|argument| match argument {
-                                CallArgument::Named(name, value) => (name, value),
-                                CallArgument::Positional(_) => unreachable!(),
-                            })
-                            .collect(),
-                    )
-                } else {
-                    return Err(self
-                        .here("constructor arguments must be either all positional or all named"));
-                };
-                return Ok(authored::Expr::Construct {
-                    owner,
-                    constructor,
-                    payload: Box::new(payload),
-                });
-            }
-        }
         if args
             .iter()
-            .any(|argument| matches!(argument, CallArgument::Named(_, _)))
+            .all(|argument| matches!(argument, CallArgument::Positional(_)))
         {
-            return Err(self.here("named arguments are only valid for named constructor payloads"));
+            return Ok(authored::Expr::Call {
+                callee: Box::new(callee),
+                type_args: None,
+                args: args
+                    .into_iter()
+                    .filter_map(|argument| match argument {
+                        CallArgument::Positional(value) => Some(value),
+                        CallArgument::Named(_, _) => None,
+                    })
+                    .collect(),
+            });
         }
-        Ok(authored::Expr::Call {
-            callee: Box::new(callee),
-            type_args: None,
-            args: args
-                .into_iter()
-                .map(|arg| match arg {
-                    CallArgument::Positional(value) => value,
-                    CallArgument::Named(_, _) => unreachable!(),
-                })
-                .collect(),
+        let owner = match &callee {
+            authored::Expr::Name(path) => path.owner().map(|owner| (owner, path.last().to_owned())),
+            _ => None,
+        };
+        let Some((owner, constructor)) = owner else {
+            return Err(self.here("named arguments are only valid for named constructor payloads"));
+        };
+        Ok(authored::Expr::Construct {
+            owner: authored::Type::Name(owner),
+            constructor,
+            arguments: self.constructor_arguments(args)?,
         })
+    }
+
+    fn constructor_arguments(
+        &self,
+        args: Vec<CallArgument>,
+    ) -> Result<authored::ConstructorArguments, MagError> {
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        for argument in args {
+            match argument {
+                CallArgument::Positional(value) => positional.push(value),
+                CallArgument::Named(name, value) => named.push((name, value)),
+            }
+        }
+        match (positional.is_empty(), named.is_empty()) {
+            (_, true) => Ok(authored::ConstructorArguments::Positional(positional)),
+            (true, false) => Ok(authored::ConstructorArguments::Named(named)),
+            (false, false) => {
+                Err(self.here("constructor arguments must be either all positional or all named"))
+            }
+        }
     }
 
     fn parse_value_fields(&mut self, end: char) -> Result<Vec<(String, authored::Expr)>, MagError> {
@@ -1938,99 +1780,6 @@ enum CallArgument {
     Named(String, authored::Expr),
 }
 
-fn expected_owner_name(expected: Option<&authored::Type>) -> Option<&str> {
-    match expected {
-        Some(authored::Type::Name(name)) => Some(name),
-        Some(authored::Type::Apply { constructor, .. }) => Some(constructor),
-        _ => None,
-    }
-}
-
-fn constructor_types(
-    owner: &str,
-    constructor: &str,
-    expected: Option<&authored::Type>,
-) -> (authored::Type, authored::Type) {
-    match expected {
-        Some(authored::Type::Apply {
-            constructor: expected_owner,
-            arguments,
-        }) if expected_owner == owner => (
-            authored::Type::Apply {
-                constructor: expected_owner.clone(),
-                arguments: arguments.clone(),
-            },
-            authored::Type::Apply {
-                constructor: constructor.into(),
-                arguments: arguments.clone(),
-            },
-        ),
-        Some(authored::Type::Name(expected_owner)) if expected_owner == owner => (
-            authored::Type::Name(owner.into()),
-            authored::Type::Name(constructor.into()),
-        ),
-        _ => (
-            authored::Type::Name(owner.into()),
-            authored::Type::Name(constructor.into()),
-        ),
-    }
-}
-
-fn specialize_variant_payload(
-    metadata: &VariantMetadata,
-    owner: &authored::Type,
-) -> authored::Type {
-    let arguments = match owner {
-        authored::Type::Apply { arguments, .. } => arguments,
-        _ => return metadata.payload.clone(),
-    };
-    let substitutions = metadata
-        .owner_params
-        .iter()
-        .map(String::as_str)
-        .zip(arguments)
-        .collect::<HashMap<_, _>>();
-    substitute_authored_type(&metadata.payload, &substitutions)
-}
-
-fn substitute_authored_type(
-    ty: &authored::Type,
-    substitutions: &HashMap<&str, &authored::Type>,
-) -> authored::Type {
-    match ty {
-        authored::Type::Name(name) => substitutions
-            .get(name.as_str())
-            .map_or_else(|| ty.clone(), |replacement| (*replacement).clone()),
-        authored::Type::Product(items) => authored::Type::Product(
-            items
-                .iter()
-                .map(|item| substitute_authored_type(item, substitutions))
-                .collect(),
-        ),
-        authored::Type::Tag(item) => {
-            authored::Type::Tag(Box::new(substitute_authored_type(item, substitutions)))
-        }
-        authored::Type::Function { params, result } => authored::Type::Function {
-            params: params
-                .iter()
-                .map(|parameter| substitute_authored_type(parameter, substitutions))
-                .collect(),
-            result: Box::new(substitute_authored_type(result, substitutions)),
-        },
-        authored::Type::Apply {
-            constructor,
-            arguments,
-        } => authored::Type::Apply {
-            constructor: constructor.clone(),
-            arguments: arguments
-                .iter()
-                .map(|argument| substitute_authored_type(argument, substitutions))
-                .collect(),
-        },
-        authored::Type::Invalid(_) => ty.clone(),
-    }
-}
-
 fn obvious_expr_type(expression: &authored::Expr) -> Option<authored::Type> {
     match expression {
         authored::Expr::Unit => Some(authored::Type::Name("Unit".into())),
@@ -2304,26 +2053,100 @@ mod tests {
         );
     }
 
+    fn last_let_value(module: &authored::Module) -> &authored::Expr {
+        let authored::Form::Block(authored::BlockItem::Let { value, .. }) =
+            module.forms.last().unwrap()
+        else {
+            panic!("let binding")
+        };
+        value
+    }
+
     #[test]
-    fn generic_constructor_uses_expected_owner_arguments() {
+    fn explicit_owner_arguments_select_a_construction() {
         let module = parse(
-            "type Option<T> = Some(T) | None()\nlet value: Option<Int> = Option<Int>.Some(1)\n",
+            "type Option<T> = Some(T) | None()
+let value = Option<Int>.Some(1)
+",
         )
         .unwrap();
-        let authored::Form::Block(authored::BlockItem::Let {
-            value: authored::Expr::Annotate { value, .. },
-            ..
-        }) = module.forms.last().unwrap()
+        let authored::Expr::Construct {
+            owner,
+            constructor,
+            arguments,
+        } = last_let_value(&module)
         else {
-            panic!("constructor binding")
-        };
-        let authored::Expr::Construct { owner, payload, .. } = value.as_ref() else {
             panic!("constructor")
         };
         assert!(
             matches!(owner, authored::Type::Apply { constructor, arguments } if constructor == "Option" && arguments == &[authored::Type::Name("Int".into())])
         );
-        assert!(matches!(payload.as_ref(), authored::Expr::Int(1)));
+        assert_eq!(constructor, "Some");
+        assert_eq!(
+            arguments,
+            &authored::ConstructorArguments::Positional(vec![authored::Expr::Int(1)])
+        );
+    }
+
+    #[test]
+    fn dotted_calls_stay_calls_for_the_checker_to_resolve() {
+        // The parser has no constructor table: a local type's constructor, an
+        // imported one and a qualified function all lower to the same call.
+        let module = parse(
+            "import support.{Imported}
+type Local = On(Int)
+let a = Local.On(1)
+let b = Imported.On(1)
+let c = On(1)
+",
+        )
+        .unwrap();
+        let callees = module
+            .forms
+            .iter()
+            .filter_map(|form| match form {
+                authored::Form::Block(authored::BlockItem::Let {
+                    value: authored::Expr::Call { callee, .. },
+                    ..
+                }) => match callee.as_ref() {
+                    authored::Expr::Name(name) => Some(name.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(callees, ["Local.On", "support.Imported.On", "On"]);
+    }
+
+    #[test]
+    fn labelled_arguments_select_a_construction() {
+        let module = parse("let value = support.Outcome.Error(message: \"failed\")\n").unwrap();
+        let authored::Expr::Construct {
+            owner,
+            constructor,
+            arguments,
+        } = last_let_value(&module)
+        else {
+            panic!("constructor")
+        };
+        assert!(matches!(owner, authored::Type::Name(name) if name == "support.Outcome"));
+        assert_eq!(constructor, "Error");
+        assert!(matches!(
+            arguments,
+            authored::ConstructorArguments::Named(fields) if fields.len() == 1 && fields[0].0 == "message"
+        ));
+        assert!(parse("let value = plain(message: 1)\n").is_err());
+        assert!(parse("let value = Owner.Mixed(1, message: 2)\n").is_err());
+    }
+
+    #[test]
+    fn named_is_an_ordinary_identifier() {
+        let module = parse("let value = named(1, 2, 3)\n").unwrap();
+        assert!(matches!(
+            last_let_value(&module),
+            authored::Expr::Call { callee, args, .. }
+                if matches!(callee.as_ref(), authored::Expr::Name(name) if name == "named") && args.len() == 3
+        ));
     }
 
     #[test]
@@ -2639,40 +2462,22 @@ mod tests {
     }
 
     #[test]
-    fn constructor_product_uses_its_declared_payload_type() {
-        let module = parse(
-            "type PairResult = Pair(Int, String)\nlet number = 1\nlet text = \"x\"\nlet result: PairResult = PairResult.Pair(number, text)\n",
-        )
-        .unwrap();
-        let authored::Form::Block(authored::BlockItem::Let {
-            value: authored::Expr::Annotate { value, .. },
-            ..
-        }) = module.forms.last().unwrap()
-        else {
-            panic!("constructor")
-        };
-        let authored::Expr::Construct { payload, .. } = value.as_ref() else {
-            panic!("constructor")
-        };
+    fn tuples_defer_unknown_element_types_to_the_checker() {
+        let module = parse("let pair = (Owner.On(1), 2)\nlet plain = (1, \"x\")\n").unwrap();
         assert!(matches!(
-            payload.as_ref(),
+            &module.forms[0],
+            authored::Form::Block(authored::BlockItem::Let {
+                value: authored::Expr::Tuple(items),
+                ..
+            }) if items.len() == 2
+        ));
+        assert!(matches!(
+            last_let_value(&module),
             authored::Expr::Ascribe {
                 target: authored::Type::Product(items),
                 ..
             } if items == &[authored::Type::Name("Int".into()), authored::Type::Name("String".into())]
         ));
-    }
-
-    #[test]
-    fn expected_generic_owner_reaches_if_and_match_arms() {
-        assert!(parse(
-            "type Option<T> = Some(T) | None(Unit)\nlet value: Option<Int> = if true then Option.Some(1) else Option.None(nil)\n",
-        )
-        .is_ok());
-        assert!(parse(
-            "type Option<T> = Some(T) | None(Unit)\ntype Flag = Yes(Unit) | No(Unit)\nlet flag: Flag = Flag.Yes(nil)\nlet value: Option<Int> = match flag { case Yes(unit) => Option.Some(1), case No(unit) => Option.None(nil) }\n",
-        )
-        .is_ok());
     }
 
     #[test]

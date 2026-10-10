@@ -5,12 +5,12 @@ type ValidationErrors<E> {errors: List<E>}
 
 type Validated<E, T> = Valid(T) | Invalid(ValidationErrors<E>)
 
-let valid<E, T>: fn(T) -> Validated<E, T> = |value| => named(Validated<E, T>, Valid, value)
+let valid<E, T>: fn(T) -> Validated<E, T> = |value| => Validated<E, T>.Valid(value)
 
-let invalid<E, T>: fn(List<E>) -> Validated<E, T> = |errors| => named(Validated<E, T>, Invalid, ValidationErrors<E> {errors: errors})
+let invalid<E, T>: fn(List<E>) -> Validated<E, T> = |errors| => Validated<E, T>.Invalid(ValidationErrors<E> {errors: errors})
 
 let valid<E, T>: fn(Validated<E, T>) -> Bool = |validated| => match validated { case Valid(accepted) => true, case Invalid(rejected) => false }
 
-let map<E, T, U>: fn(fn(T) -> U, Validated<E, T>) -> Validated<E, U> = |f, validated| => match validated { case Valid(accepted) => named(Validated<E, U>, Valid, f(accepted)), case Invalid(rejected) => named(Validated<E, U>, Invalid, rejected) }
+let map<E, T, U>: fn(fn(T) -> U, Validated<E, T>) -> Validated<E, U> = |f, validated| => match validated { case Valid(accepted) => Validated<E, U>.Valid(f(accepted)), case Invalid(rejected) => Validated<E, U>.Invalid(rejected) }
 
-let and_then<E, T, U>: fn(fn(T) -> Validated<E, U>, Validated<E, T>) -> Validated<E, U> = |f, validated| => match validated { case Valid(accepted) => f(accepted), case Invalid(rejected) => named(Validated<E, U>, Invalid, rejected) }
+let and_then<E, T, U>: fn(fn(T) -> Validated<E, U>, Validated<E, T>) -> Validated<E, U> = |f, validated| => match validated { case Valid(accepted) => f(accepted), case Invalid(rejected) => Validated<E, U>.Invalid(rejected) }

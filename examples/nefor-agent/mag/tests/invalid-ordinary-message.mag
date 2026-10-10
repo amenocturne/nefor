@@ -7,7 +7,7 @@ import nefor.shell.{}
 // may obtain by placing a message in their record.
 type InitialContent {kind: String}
 let start = nefor.graph.source("start", nil)
-let operation = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "true", cwd: ".", timeout: named(nefor.contracts.Timeout, Unlimited, nil)})
+let operation = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "true", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
 let injected = nefor.graph.node(get(operation, "id"), "ordinary", get(operation, "actors"), get(operation, "routes"), [nefor.graph.message(get(operation, "input"), InitialContent {kind: "mag.Unit"})], get(operation, "input"), get(operation, "output"))
 let result = nefor.graph.output_for("result", injected)
 nefor.artifact.compile((|base| => nefor.graph.add_edges(base, [nefor.graph.edge(start, injected), nefor.graph.edge(injected, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)

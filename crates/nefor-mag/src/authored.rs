@@ -153,16 +153,22 @@ pub enum Expr {
     Keyword(String),
     Name(NamePath),
     Vector(Vec<Expr>),
+    /// A tuple whose element types are not evident from syntax alone; the
+    /// checker gives it the product of its elements' types.
+    Tuple(Vec<Expr>),
     Fields(Vec<(String, Expr)>),
     If {
         condition: Box<Expr>,
         then_branch: Box<Expr>,
         else_branch: Box<Expr>,
     },
+    /// `Owner.Constructor(arguments)` whose owner is syntactically a type. A
+    /// plain dotted call stays a `Call`; the checker decides after imports
+    /// whether its path names a function or a constructor.
     Construct {
         owner: Type,
         constructor: String,
-        payload: Box<Expr>,
+        arguments: ConstructorArguments,
     },
     Match {
         value: Box<Expr>,
@@ -184,6 +190,14 @@ pub enum Expr {
     },
     TypeTag(Type),
     Invalid(AuthoringError),
+}
+
+/// Constructor arguments as written. The checker shapes them into the payload
+/// once the constructor's declared payload type is known.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstructorArguments {
+    Positional(Vec<Expr>),
+    Named(Vec<(String, Expr)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

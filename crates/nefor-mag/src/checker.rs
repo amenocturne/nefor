@@ -2,7 +2,9 @@ use crate::ast::{
     BindingId, CheckedBinding, CheckedBlock, CheckedExpr, CheckedExprKind, CheckedFn,
     CheckedMatchArm, CheckedParam, ConstructorDecl, ConstructorDeclarationId, TypeDeclBody, Value,
 };
-use crate::authored::{BlockItem, Expr, Function, NamePath, Type, TypeArgument};
+use crate::authored::{
+    BlockItem, ConstructorArguments, Expr, Function, NamePath, Type, TypeArgument,
+};
 use crate::env::Env;
 use crate::error::MagError;
 use crate::types::MagType;
@@ -329,6 +331,12 @@ fn infer(env: &Env, locals: &mut Locals, expr: &Expr) -> Result<MagType, MagErro
                 .ok_or_else(|| MagError::Unresolved(name.to_string())),
         },
         Expr::Vector(items) => infer_list(env, locals, items),
+        Expr::Tuple(items) => Ok(MagType::Product(
+            items
+                .iter()
+                .map(|item| infer(env, locals, item))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
         Expr::Fields(_) => Err(MagError::Type(
             "standalone record values are unsupported; use a named type or Map".into(),
         )),
@@ -362,13 +370,18 @@ fn infer(env: &Env, locals: &mut Locals, expr: &Expr) -> Result<MagType, MagErro
         Expr::Construct {
             owner,
             constructor,
-            payload,
-        } => infer_construct(env, locals, owner, constructor, payload),
+            arguments,
+        } => {
+            let owner = resolve_constructor_owner(env, &local_type_variables(locals), owner)?;
+            infer_construct(env, locals, owner, constructor, arguments.into())
+        }
         Expr::Match { value, arms } => infer_match(env, locals, value, arms),
         Expr::Ascribe { target, value } => {
-            let mut vars = HashSet::new();
-            for candidate in locals.values().flatten() {
-                collect_vars(&candidate.ty, &mut vars);
+            let vars = local_type_variables(locals);
+            if let Some((owner, constructor, fields)) =
+                braced_construction(env, &vars, target, value)
+            {
+                return infer_construct(env, locals, owner, constructor, fields);
             }
             let target = resolve_type(env, target, &vars)?;
             match value.as_ref() {
@@ -410,9 +423,6 @@ fn infer(env: &Env, locals: &mut Locals, expr: &Expr) -> Result<MagType, MagErro
                 collect_vars(&candidate.ty, &mut vars);
             }
             let target = resolve_type(env, target, &vars)?;
-            if matches!(value.as_ref(), Expr::Construct { .. }) {
-                return Ok(target);
-            }
             let actual = if matches!(value.as_ref(), Expr::Fields(_)) {
                 infer_fields_against(env, locals, value, &target)?
             } else {
@@ -597,6 +607,21 @@ fn infer_call(
         } else if builtin && explicit_type_args.is_none() {
             return infer_builtin(env, locals, name, args);
         }
+        let names_value = locals.contains_key(name.as_str())
+            || env_candidates
+                .iter()
+                .any(|candidate| !matches!(candidate, Value::Type(_) | Value::TypeDecl(_)));
+        if explicit_type_args.is_none() && !names_value {
+            if let Some(owner) = constructor_owner(env, &local_type_variables(locals), name) {
+                return infer_construct(
+                    env,
+                    locals,
+                    owner,
+                    name.last(),
+                    ConstructorPayload::Positional(args),
+                );
+            }
+        }
     }
     if explicit_type_args.is_some() {
         return Err(MagError::Type(
@@ -633,25 +658,153 @@ fn infer_call(
     Ok(substitute(&result, &substitution))
 }
 
-fn infer_construct(
-    env: &Env,
-    locals: &mut Locals,
-    owner: &Type,
-    constructor: &str,
-    payload: &Expr,
-) -> Result<MagType, MagError> {
+fn local_type_variables(locals: &Locals) -> HashSet<String> {
     let mut vars = HashSet::new();
     for candidate in locals.values().flatten() {
         collect_vars(&candidate.ty, &mut vars);
     }
-    let owner = resolve_type(env, owner, &vars)?;
-    let (_, payload_type) = instantiated_constructor(env, &owner, constructor)?;
-    if matches!(payload, Expr::Fields(_)) {
-        infer_fields_against(env, locals, payload, &payload_type)?;
-    } else {
-        let actual = infer(env, locals, payload)?;
-        compatible(env, &actual, &payload_type, &mut HashMap::new()).map_err(MagError::Type)?;
+    vars
+}
+
+/// Constructor arguments from either authored spelling: an explicit
+/// construction node or a dotted call the checker resolved to a constructor.
+#[derive(Clone, Copy)]
+enum ConstructorPayload<'a> {
+    Positional(&'a [Expr]),
+    Named(&'a [(String, Expr)]),
+}
+
+impl<'a> From<&'a ConstructorArguments> for ConstructorPayload<'a> {
+    fn from(arguments: &'a ConstructorArguments) -> Self {
+        match arguments {
+            ConstructorArguments::Positional(values) => Self::Positional(values),
+            ConstructorArguments::Named(fields) => Self::Named(fields),
+        }
     }
+}
+
+/// The type that owns `Owner.Constructor`, when the path's owner names a type.
+/// A constructor lives in its type's scope, so this is ordinary type
+/// resolution: local, imported, aliased and re-exported owners all resolve.
+fn constructor_owner(env: &Env, vars: &HashSet<String>, path: &NamePath) -> Option<MagType> {
+    resolve_type(env, &Type::Name(path.owner()?), vars).ok()
+}
+
+/// `Owner.Constructor {field: value}` parses as a braced record of a type
+/// named `Owner.Constructor`; it is a construction when `Owner` is a type.
+fn braced_construction<'a>(
+    env: &Env,
+    vars: &HashSet<String>,
+    target: &'a Type,
+    value: &'a Expr,
+) -> Option<(MagType, &'a str, ConstructorPayload<'a>)> {
+    let (Type::Name(path), Expr::Fields(fields)) = (target, value) else {
+        return None;
+    };
+    Some((
+        constructor_owner(env, vars, path)?,
+        path.last(),
+        ConstructorPayload::Named(fields),
+    ))
+}
+
+fn resolve_constructor_owner(
+    env: &Env,
+    vars: &HashSet<String>,
+    owner: &Type,
+) -> Result<MagType, MagError> {
+    resolve_type(env, owner, vars).map_err(|error| match (error, owner) {
+        (MagError::Unresolved(_), Type::Name(name)) => MagError::Type(format!(
+            "named arguments are only valid for constructor payloads; {name} is not a type in scope"
+        )),
+        (error, _) => error,
+    })
+}
+
+fn payload_arity_error(
+    constructor: &ConstructorDeclarationId,
+    payload_type: &MagType,
+    got: usize,
+) -> MagError {
+    MagError::Type(format!(
+        "constructor {}.{} takes a payload of type {payload_type}, got {got} arguments",
+        constructor.owner, constructor.name
+    ))
+}
+
+fn constructor_fields(
+    env: &Env,
+    constructor: &ConstructorDeclarationId,
+    payload_type: &MagType,
+    fields: &[(String, Expr)],
+) -> Result<BTreeMap<String, MagType>, MagError> {
+    let expected_fields = named_field_types(env, payload_type).ok_or_else(|| {
+        MagError::Type(format!(
+            "constructor {}.{} takes a payload of type {payload_type}, not named fields",
+            constructor.owner, constructor.name
+        ))
+    })?;
+    let authored_names = fields.iter().map(|(name, _)| name).collect::<HashSet<_>>();
+    let expected_names = expected_fields.keys().collect::<HashSet<_>>();
+    if authored_names != expected_names || authored_names.len() != fields.len() {
+        return Err(MagError::Type(format!(
+            "constructor fields must exactly match {payload_type}"
+        )));
+    }
+    Ok(expected_fields)
+}
+
+fn infer_construct(
+    env: &Env,
+    locals: &mut Locals,
+    owner: MagType,
+    constructor: &str,
+    arguments: ConstructorPayload<'_>,
+) -> Result<MagType, MagError> {
+    let (constructor, payload_type) = constructor_payload(env, &owner, constructor)?;
+    let actual = match arguments {
+        ConstructorPayload::Positional([Expr::Fields(fields)]) => {
+            return infer_construct(
+                env,
+                locals,
+                owner,
+                &constructor.name,
+                ConstructorPayload::Named(fields),
+            );
+        }
+        ConstructorPayload::Named(fields) => {
+            let expected_fields = constructor_fields(env, &constructor, &payload_type, fields)?;
+            for (name, value) in fields {
+                let actual = infer(env, locals, value)?;
+                if let Some(expected) = expected_fields.get(name) {
+                    compatible(env, &actual, expected, &mut HashMap::new())
+                        .map_err(MagError::Type)?;
+                }
+            }
+            return Ok(owner);
+        }
+        ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
+            return Err(payload_arity_error(&constructor, &payload_type, 0));
+        }
+        ConstructorPayload::Positional([]) => MagType::Unit,
+        ConstructorPayload::Positional([value]) => infer(env, locals, value)?,
+        ConstructorPayload::Positional(values) => {
+            if !matches!(payload_type, MagType::Product(_)) {
+                return Err(payload_arity_error(
+                    &constructor,
+                    &payload_type,
+                    values.len(),
+                ));
+            }
+            MagType::Product(
+                values
+                    .iter()
+                    .map(|value| infer(env, locals, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
+    };
+    compatible(env, &actual, &payload_type, &mut HashMap::new()).map_err(MagError::Type)?;
     Ok(owner)
 }
 
@@ -2355,6 +2508,7 @@ fn compile_expr(
         Expr::Keyword(value) => checked(MagType::String, CheckedExprKind::Keyword(value.clone())),
         Expr::Name(name) => compile_symbol(env, scopes, name, expected)?,
         Expr::Vector(items) => compile_vector(env, scopes, items, expected)?,
+        Expr::Tuple(items) => compile_tuple(env, scopes, items, expected)?,
         Expr::Fields(_) => {
             return Err(MagError::Type(
                 "standalone record values are unsupported; use a named type or Map".into(),
@@ -2368,8 +2522,11 @@ fn compile_expr(
         Expr::Construct {
             owner,
             constructor,
-            payload,
-        } => compile_construct(env, scopes, owner, constructor, payload)?,
+            arguments,
+        } => {
+            let owner = resolve_constructor_owner(env, &visible_type_variables(scopes), owner)?;
+            compile_construct(env, scopes, owner, constructor, arguments.into())?
+        }
         Expr::Match { value, arms } => compile_match(env, scopes, value, arms, expected)?,
         Expr::Ascribe { target, value } => compile_ascribe(env, scopes, target, value)?,
         Expr::Annotate { target, value } => compile_annotate(env, scopes, target, value)?,
@@ -2532,6 +2689,33 @@ fn compile_vector(
     Ok(checked(ty, CheckedExprKind::Vector(checked_items)))
 }
 
+fn compile_tuple(
+    env: &Env,
+    scopes: &[CheckedScope],
+    items: &[Expr],
+    expected: Option<&MagType>,
+) -> Result<CheckedExpr, MagError> {
+    let expected_items = match expected {
+        Some(MagType::Product(types)) if types.len() == items.len() => Some(types),
+        _ => None,
+    };
+    let checked_items = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            compile_expr(env, scopes, item, expected_items.map(|types| &types[index]))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let target = MagType::Product(checked_items.iter().map(|item| item.ty.clone()).collect());
+    Ok(checked(
+        target.clone(),
+        CheckedExprKind::Ascribe {
+            target: target.clone(),
+            value: Box::new(checked(target, CheckedExprKind::Vector(checked_items))),
+        },
+    ))
+}
+
 fn compile_map(
     env: &Env,
     scopes: &[CheckedScope],
@@ -2572,6 +2756,19 @@ fn compile_call(
 ) -> Result<CheckedExpr, MagError> {
     if let Expr::Name(name) = callee_expression {
         let candidates = all_candidates(env, scopes, name);
+        // A constructor is not a module-scope symbol, so a dotted path that
+        // names no value is looked up in the scope of its owner type.
+        if candidates.is_empty() && explicit_type_args.is_none() {
+            if let Some(owner) = constructor_owner(env, &visible_type_variables(scopes), name) {
+                return compile_construct(
+                    env,
+                    scopes,
+                    owner,
+                    name.last(),
+                    ConstructorPayload::Positional(expressions),
+                );
+            }
+        }
         let function_candidates = candidates
             .into_iter()
             .filter(|candidate| matches!(candidate.ty, MagType::Function(_, _)))
@@ -2642,29 +2839,51 @@ fn compile_call(
 fn compile_construct(
     env: &Env,
     scopes: &[CheckedScope],
-    authored_owner: &Type,
+    owner: MagType,
     constructor_name: &str,
-    payload_expression: &Expr,
+    arguments: ConstructorPayload<'_>,
 ) -> Result<CheckedExpr, MagError> {
-    let owner = parse_checked_type(env, scopes, authored_owner)?;
-    let (constructor, payload_type) = instantiated_constructor(env, &owner, constructor_name)?;
-    let payload = match payload_expression {
-        Expr::Fields(fields) => {
-            let expected_fields = named_field_types(env, &payload_type).ok_or_else(|| {
-                MagError::Type(format!(
-                    "constructor field payload cannot construct {payload_type}"
-                ))
-            })?;
-            let authored_names = fields.iter().map(|(name, _)| name).collect::<HashSet<_>>();
-            let expected_names = expected_fields.keys().collect::<HashSet<_>>();
-            if authored_names != expected_names || authored_names.len() != fields.len() {
-                return Err(MagError::Type(format!(
-                    "constructor fields must exactly match {payload_type}"
-                )));
-            }
+    let (constructor, payload_type) = constructor_payload(env, &owner, constructor_name)?;
+    // Several arguments and labelled arguments are sugar for a tuple or record
+    // payload; ascribing the declared payload type gives them its identity.
+    let shaped = |value: CheckedExpr| {
+        checked(
+            payload_type.clone(),
+            CheckedExprKind::Ascribe {
+                target: payload_type.clone(),
+                value: Box::new(value),
+            },
+        )
+    };
+    let payload = match arguments {
+        ConstructorPayload::Named(fields) => {
+            constructor_fields(env, &constructor, &payload_type, fields)?;
+            shaped(compile_map(env, scopes, fields, Some(&payload_type))?)
+        }
+        ConstructorPayload::Positional([Expr::Fields(fields)]) => {
+            constructor_fields(env, &constructor, &payload_type, fields)?;
             compile_map(env, scopes, fields, Some(&payload_type))?
         }
-        expression => compile_expr(env, scopes, expression, Some(&payload_type))?,
+        ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
+            return Err(payload_arity_error(&constructor, &payload_type, 0));
+        }
+        ConstructorPayload::Positional([]) => checked(MagType::Unit, CheckedExprKind::Unit),
+        ConstructorPayload::Positional([value]) => {
+            compile_expr(env, scopes, value, Some(&payload_type))?
+        }
+        ConstructorPayload::Positional(values) => {
+            if !matches!(payload_type, MagType::Product(_)) {
+                return Err(payload_arity_error(
+                    &constructor,
+                    &payload_type,
+                    values.len(),
+                ));
+            }
+            let tuple = compile_vector(env, scopes, values, Some(&payload_type))?;
+            compatible_static(env, &tuple.ty, &payload_type, &mut HashMap::new())
+                .map_err(MagError::Type)?;
+            shaped(tuple)
+        }
     };
     Ok(checked(
         owner.clone(),
@@ -2820,11 +3039,70 @@ fn instantiated_constructor(
     name: &str,
 ) -> Result<(ConstructorDeclarationId, MagType), MagError> {
     let constructors = adt_constructors(env, owner)?;
-    constructors
-        .into_iter()
+    if let Some(constructor) = constructors
+        .iter()
         .find(|constructor| constructor.id.name == name)
-        .map(|constructor| (constructor.id, constructor.payload))
-        .ok_or_else(|| MagError::Type(format!("constructor {name} is not a member of {owner}")))
+    {
+        return Ok((constructor.id.clone(), constructor.payload.clone()));
+    }
+    Err(unknown_constructor(
+        name,
+        owner,
+        constructors.iter().map(|constructor| &constructor.id),
+    ))
+}
+
+fn unknown_constructor<'a>(
+    name: &str,
+    owner: &MagType,
+    constructors: impl Iterator<Item = &'a ConstructorDeclarationId>,
+) -> MagError {
+    MagError::Type(format!(
+        "constructor {name} is not a member of {owner}; available constructors: {}",
+        constructors
+            .map(|constructor| constructor.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// Looks `name` up in the scope of the type being constructed.
+fn constructor_payload(
+    env: &Env,
+    owner: &MagType,
+    name: &str,
+) -> Result<(ConstructorDeclarationId, MagType), MagError> {
+    let not_an_adt = || {
+        MagError::Type(format!(
+            "{owner} is not an ADT and has no constructor {name}; only ADT alternatives are constructed as Type.Constructor(...)"
+        ))
+    };
+    let MagType::Named(type_name, arguments) = owner else {
+        return Err(not_an_adt());
+    };
+    let declaration = env.type_decl(type_name).ok_or_else(not_an_adt)?;
+    let TypeDeclBody::Adt(constructors) = &declaration.body else {
+        return Err(not_an_adt());
+    };
+    if !constructors
+        .iter()
+        .any(|constructor| constructor.id.name == name)
+    {
+        return Err(unknown_constructor(
+            name,
+            owner,
+            constructors.iter().map(|constructor| &constructor.id),
+        ));
+    }
+    if declaration.params.len() != arguments.len() {
+        return Err(MagError::Type(format!(
+            "{type_name} expects {} type arguments, got {}; construct it with explicit arguments as {}<...>.{name}(...)",
+            declaration.params.len(),
+            arguments.len(),
+            type_name.rsplit('.').next().unwrap_or(type_name),
+        )));
+    }
+    instantiated_constructor(env, owner, name)
 }
 
 fn ensure_adt_exhaustive(
@@ -2888,6 +3166,14 @@ fn compile_ascribe(
     authored_target: &Type,
     source: &Expr,
 ) -> Result<CheckedExpr, MagError> {
+    if let Some((owner, constructor, fields)) = braced_construction(
+        env,
+        &visible_type_variables(scopes),
+        authored_target,
+        source,
+    ) {
+        return compile_construct(env, scopes, owner, constructor, fields);
+    }
     let target = parse_checked_type(env, scopes, authored_target)?;
     let source_expected = match source {
         Expr::Fields(_) => Some(&target),
@@ -2978,9 +3264,6 @@ fn compile_annotate(
     source: &Expr,
 ) -> Result<CheckedExpr, MagError> {
     let target = parse_checked_type(env, scopes, authored_target)?;
-    if matches!(source, Expr::Construct { .. }) {
-        return compile_ascribe(env, scopes, authored_target, source);
-    }
     let value = match source {
         Expr::Fields(fields) => compile_map(env, scopes, fields, Some(&target))?,
         Expr::Vector(values) if matches!(target, MagType::Product(_)) => {

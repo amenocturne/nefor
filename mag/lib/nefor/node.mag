@@ -44,19 +44,19 @@ let compose<A, B, C>: fn(String, nefor.graph.Node<A, B>, nefor.graph.Node<B, C>)
 }
 let (>>>)<A, B, C>: fn(nefor.graph.Node<A, B>, nefor.graph.Node<B, C>) -> nefor.graph.Node<A, C> = |left, right| => compose(get(left, "id"), left, right)
 
-let unit_transform<I>: fn(String) -> nefor.graph.Node<I, Unit> = |id| => pure_transform<I, Unit>(id, [named(nefor.graph.Transform, Unit, type_evidence(type_tag<I>()))])
+let unit_transform<I>: fn(String) -> nefor.graph.Node<I, Unit> = |id| => pure_transform<I, Unit>(id, [nefor.graph.Transform.Unit(type_evidence(type_tag<I>()))])
 let discard<T>: fn(String) -> nefor.graph.Node<T, Unit> = |id| => unit_transform<T>(id)
 let then_anonymous<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, B> = |id, left, right| => compose<I, Unit, B>(id, compose<I, A, Unit>(id, left, unit_transform<A>(id)), right)
 let then<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, B> = |id, left, right| => named_node<I, B>(id, then_anonymous<I, A, B>(id, left, right))
 let (*>)<I, A, B>: fn(nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, B> = |left, right| => then_anonymous(get(left, "id"), left, right)
 
-let project<A, B>: fn(String, Int) -> nefor.graph.Node<A, B> = |id, index| => pure_transform<A, B>(id, [named(nefor.graph.Transform, Project, nefor.graph.Projection {input: type_evidence(type_tag<A>()), output: type_evidence(type_tag<B>()), index: index})])
+let project<A, B>: fn(String, Int) -> nefor.graph.Node<A, B> = |id, index| => pure_transform<A, B>(id, [nefor.graph.Transform.Project(nefor.graph.Projection {input: type_evidence(type_tag<A>()), output: type_evidence(type_tag<B>()), index: index})])
 let keep_left<A, B>: fn(String) -> nefor.graph.Node<(A, B), A> = |id| => project<(A, B), A>(id, 0)
 let before_anonymous<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, A> = |id, left, right| => compose(id, left, compose(id, fanout_anonymous(id, nefor.graph.identity<A>(id), compose(id, unit_transform<A>(id), right)), keep_left<A, B>(id)))
 let before<I, A, B>: fn(String, nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, A> = |id, left, right| => named_node<I, A>(id, before_anonymous<I, A, B>(id, left, right))
 let (<*)<I, A, B>: fn(nefor.graph.Node<I, A>, nefor.graph.Node<Unit, B>) -> nefor.graph.Node<I, A> = |left, right| => before_anonymous(get(left, "id"), left, right)
 
-let assembly_step<T, O>: fn(List<TypeDescriptor>, Int, String) -> nefor.graph.Transform = |inputs, slot, kind| => named(nefor.graph.Transform, Assemble, nefor.graph.Assembly {inputs: inputs, output: type_evidence(type_tag<O>()), slot: slot, path: [], kind: kind})
+let assembly_step<T, O>: fn(List<TypeDescriptor>, Int, String) -> nefor.graph.Transform = |inputs, slot, kind| => nefor.graph.Transform.Assemble(nefor.graph.Assembly {inputs: inputs, output: type_evidence(type_tag<O>()), slot: slot, path: [], kind: kind})
 let assemble_leaf<T, O>: fn(List<TypeDescriptor>, Int, String, nefor.graph.BoundaryLeaf) -> nefor.graph.BoundaryLeaf = |inputs, slot, kind, leaf| => append_leaf_steps(leaf, [assembly_step<T, O>(inputs, slot, kind)])
 let assemble_flow<T, O>: fn(List<TypeDescriptor>, Int, String, nefor.graph.Flow) -> nefor.graph.Flow = |inputs, slot, kind, flow| => append_flow_steps(flow, [assembly_step<T, O>(inputs, slot, kind)])
 
@@ -79,8 +79,8 @@ let parallel_anonymous<A, B, C, D>: fn(String, nefor.graph.Node<A, B>, nefor.gra
 let parallel<A, B, C, D>: fn(String, nefor.graph.Node<A, B>, nefor.graph.Node<C, D>) -> nefor.graph.Node<(A, C), (B, D)> = |id, left, right| => named_node<(A, C), (B, D)>(id, parallel_anonymous<A, B, C, D>(id, left, right))
 let (***)<A, B, C, D>: fn(nefor.graph.Node<A, B>, nefor.graph.Node<C, D>) -> nefor.graph.Node<(A, C), (B, D)> = |left, right| => parallel_anonymous(get(left, "id"), left, right)
 
-let pack_adt<T, O>: fn(String, String) -> nefor.graph.Node<T, O> = |id, constructor| => pure_transform<T, O>(id, [named(nefor.graph.Transform, Pack, nefor.graph.AdtTransform {owner: type_evidence(type_tag<O>()), payload: type_evidence(type_tag<T>()), constructor: constructor})])
-let unpack_adt<I, T>: fn(String, String) -> nefor.graph.Node<I, T> = |id, constructor| => pure_transform<I, T>(id, [named(nefor.graph.Transform, Unpack, nefor.graph.AdtTransform {owner: type_evidence(type_tag<I>()), payload: type_evidence(type_tag<T>()), constructor: constructor})])
+let pack_adt<T, O>: fn(String, String) -> nefor.graph.Node<T, O> = |id, constructor| => pure_transform<T, O>(id, [nefor.graph.Transform.Pack(nefor.graph.AdtTransform {owner: type_evidence(type_tag<O>()), payload: type_evidence(type_tag<T>()), constructor: constructor})])
+let unpack_adt<I, T>: fn(String, String) -> nefor.graph.Node<I, T> = |id, constructor| => pure_transform<I, T>(id, [nefor.graph.Transform.Unpack(nefor.graph.AdtTransform {owner: type_evidence(type_tag<I>()), payload: type_evidence(type_tag<T>()), constructor: constructor})])
 
 let merge_alternatives<I, O>: fn(String, nefor.graph.Node<I, O>, nefor.graph.Node<I, O>) -> nefor.graph.Node<I, O> = |id, left, right| => {
   let left_input = nefor.graph.store_boundary(get(left, "input"))
@@ -115,4 +115,4 @@ let sequence_nonempty<I, O>: fn(String, List<nefor.graph.Node<I, O>>) -> nefor.g
     map(((|flow| => assemble_flow<O, List<O>>(input_descriptors, get(indexed, "index"), "list", flow)) : fn(nefor.graph.Flow) -> nefor.graph.Flow), get(nefor.graph.store_boundary(get(candidate, "output")), "through")) }) : fn(IndexedNode<I, O>) -> List<nefor.graph.Flow>), index_nodes(nodes))
   merged_node(id, "ordinary", actors, routes, messages, operations, logical_nodes, occurrences, executions, nefor.graph.boundary(type_tag<I>(), input_leaves, input_flows), nefor.graph.boundary(type_tag<List<O>>(), output_leaves, output_flows))
 }
-let sequence<I, O>: fn(List<nefor.graph.Node<I, O>>) -> nefor.graph.Node<I, List<O>> = |nodes| => if (=)(count(nodes), 0) then pure_transform<I, List<O>>("", [named(nefor.graph.Transform, EmptyList, type_evidence(type_tag<O>()))]) else sequence_nonempty(get(first(nodes), "id"), nodes)
+let sequence<I, O>: fn(List<nefor.graph.Node<I, O>>) -> nefor.graph.Node<I, List<O>> = |nodes| => if (=)(count(nodes), 0) then pure_transform<I, List<O>>("", [nefor.graph.Transform.EmptyList(type_evidence(type_tag<O>()))]) else sequence_nonempty(get(first(nodes), "id"), nodes)
