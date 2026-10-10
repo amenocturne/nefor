@@ -24,6 +24,17 @@ Parsing, name resolution, and type checking reject a program before evaluation. 
 
 Nominal ADTs never accept a payload as though it were the owner value. Construct the owner explicitly with `Owner.Constructor(payload)`, for example `Result<String, Int>.Ok(42)`. The compiler reports both source and target types for an invalid refinement, but does not currently attach a source span to this evaluation-time diagnostic.
 
+Construction is checked before evaluation. The checker reports:
+
+- `constructor C is not a member of T; available constructors: A, B` when the owner is an ADT that does not declare the constructor (the same message covers a foreign `match` case);
+- `T is not an ADT and has no constructor C` when the owner is a record, alias target, or built-in type;
+- `T expects N type arguments, got 0; construct it with explicit arguments as T<...>.C(...)` when a generic owner is written without its arguments;
+- `constructor T.C takes a payload of type P, got N arguments` when the argument count cannot form the payload, and an ordinary type mismatch when the payload has the wrong type;
+- `duplicate constructor C in T` when one ADT declares a constructor name twice;
+- `unresolved symbol: C` for a bare `C(...)`, because constructors are not module-scope names. Write `T.C(...)`.
+
+A construction whose owner differs from an annotation, such as `let value: Other = T.C(1)`, is a type error at the binding.
+
 ## Library-reported errors
 
 Evaluation may also fail because a library rejects a value, for example through `fail([...])`. The diagnostic message then comes from that library, and its documentation describes the rule and the repair. The compiler only reports that evaluation stopped.

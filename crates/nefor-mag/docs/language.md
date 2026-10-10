@@ -30,7 +30,11 @@ type Failure {reason: String}
 type Decision = Finding(Finding) | Failure(Failure)
 ```
 
-Algebraic alternatives are owned by their declared ADT. Construct one through the owner, such as `Decision.Finding(finding)` or `Decision.Failure(failure)`; a payload is never accepted as though it were the owner value. `(A, B)` is an anonymous all-of product type, not a nominal declaration. Product components are positional, so `(T, T)` has two distinct occurrences of `T`.
+Algebraic alternatives are owned by their declared ADT. Construct one through the owner, such as `Decision.Finding(finding)` or `Decision.Failure(failure)`; a payload is never accepted as though it were the owner value.
+
+`Owner.Constructor(arguments)` is the only construction form. The owner is resolved as an ordinary type name after imports, so a local, imported, qualified, namespace-aliased, or transparently aliased name all work, in any expression position and without an annotation. A generic owner states its arguments: `Result<String, Int>.Ok(42)`; they are not inferred. No arguments construct a `Unit` payload (`Flag.Off()`), one argument is the payload, several arguments form the constructor's tuple payload, and `name: value` arguments (or `Owner.Constructor {name: value}`) form its inline record payload.
+
+Constructors are scoped by their ADT rather than by the module. A bare `Constructor(...)` is an ordinary call and never constructs, two ADTs in one module may declare the same constructor name, and a constructor never collides with a function, import, or type of the same name. Constructor names are unique within one ADT. A constructor is not a function value: `Owner.Constructor` must be applied. `(A, B)` is an anonymous all-of product type, not a nominal declaration. Product components are positional, so `(T, T)` has two distinct occurrences of `T`.
 
 Alias-shaped declarations are transparent after generic substitution: `type Label = String` and `type Pair<T> = (T, T)` introduce alternate spellings but no semantic identity. Compatibility, inference, construction, type descriptors, schemas, and semantic IDs see the target type.
 
