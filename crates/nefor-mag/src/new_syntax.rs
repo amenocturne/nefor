@@ -487,12 +487,11 @@ impl<'a> Parser<'a> {
             authored::ImportExposure::NamespaceAlias(alias)
         } else if self.eat_punct('.') {
             self.expect_punct('{')?;
-            let mut selectors = Vec::new();
-            if !self.eat_punct('}') {
-                loop {
-                    let export = self.expect_name()?;
-                    let local = if self.eat_word("as") {
-                        let name = self.expect_binding_name()?;
+            let selectors =
+                self.comma_separated(Closer::Punct('}'), "import selector", |parser| {
+                    let export = parser.expect_name()?;
+                    let local = if parser.eat_word("as") {
+                        let name = parser.expect_binding_name()?;
                         (name != "_").then_some(name)
                     } else {
                         Some(export.clone())
@@ -501,21 +500,13 @@ impl<'a> Parser<'a> {
                         // A selected name stays as written. It may gather
                         // overloads from other imports and from local
                         // bindings, which only the checker can resolve.
-                        self.aliases.insert(
+                        parser.aliases.insert(
                             local_name.clone(),
                             authored::NamePath::single(local_name.clone()),
                         );
                     }
-                    selectors.push(authored::ImportSelector { export, local });
-                    if self.eat_punct('}') {
-                        break;
-                    }
-                    self.expect_punct(',')?;
-                    if self.eat_punct('}') {
-                        break;
-                    }
-                }
-            }
+                    Ok(authored::ImportSelector { export, local })
+                })?;
             if selectors.is_empty() {
                 authored::ImportExposure::Qualified
             } else {
@@ -904,16 +895,8 @@ impl<'a> Parser<'a> {
         let authored::Type::Function { params: expected_params, result } = expected.ok_or_else(|| self.parse_error("lambda requires a complete expected function type from a let annotation or ascription", start))? else {
             return Err(self.parse_error("lambda expected type must be a function type", start));
         };
-        let mut names = Vec::new();
-        if !self.eat_operator("|") {
-            loop {
-                names.push(self.expect_name()?);
-                if self.eat_operator("|") {
-                    break;
-                }
-                self.expect_punct(',')?;
-            }
-        }
+        let names =
+            self.comma_separated(Closer::Operator("|"), "lambda parameter", Self::expect_name)?;
         if names.len() != expected_params.len() {
             return Err(self.parse_error(
                 format!(
@@ -1092,16 +1075,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_list(&mut self) -> Result<authored::Expr, MagError> {
-        let mut items = Vec::new();
-        self.separators();
-        while !self.eat_punct(']') {
-            items.push(self.parse_expr(None)?);
-            if self.eat_punct(']') {
-                break;
-            }
-            self.expect_punct(',')?;
-            self.separators();
-        }
+        let items = self.comma_separated(Closer::Punct(']'), "list element", |parser| {
+            parser.parse_expr(None)
+        })?;
         Ok(authored::Expr::Vector(items))
     }
 
@@ -1134,21 +1110,16 @@ impl<'a> Parser<'a> {
             return Ok(value);
         }
         let first = self.parse_expr(None)?;
-        if !self.eat_punct(',') {
-            self.expect_punct(')')?;
+        // Only a comma makes a tuple: `(value)` on one line or several is grouping.
+        let after_first = self.cursor;
+        self.newlines();
+        if self.eat_punct(')') {
             return Ok(first);
         }
+        self.cursor = after_first;
         let mut items = vec![first];
-        loop {
-            self.newlines();
-            if self.eat_punct(')') {
-                break;
-            }
+        while self.sequence_continues(Closer::Punct(')'), "parenthesized expression")? {
             items.push(self.parse_expr(None)?);
-            if self.eat_punct(')') {
-                break;
-            }
-            self.expect_punct(',')?;
         }
         let target = match expected {
             Some(authored::Type::Product(types)) if types.len() == items.len() => {
@@ -1170,25 +1141,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_arguments(&mut self) -> Result<Vec<CallArgument>, MagError> {
-        let mut args = Vec::new();
-        self.separators();
-        while !self.eat_punct(')') {
-            if matches!(self.peek().kind, TokenKind::Ident(_))
-                && self.peek_n(1).kind == TokenKind::Punct(':')
+        self.comma_separated(Closer::Punct(')'), "argument", |parser| {
+            if matches!(parser.peek().kind, TokenKind::Ident(_))
+                && parser.peek_n(1).kind == TokenKind::Punct(':')
             {
-                let name = self.expect_name()?;
-                self.expect_punct(':')?;
-                args.push(CallArgument::Named(name, self.parse_expr(None)?));
+                let name = parser.expect_name()?;
+                parser.expect_punct(':')?;
+                Ok(CallArgument::Named(name, parser.parse_expr(None)?))
             } else {
-                args.push(CallArgument::Positional(self.parse_expr(None)?));
+                Ok(CallArgument::Positional(parser.parse_expr(None)?))
             }
-            if self.eat_punct(')') {
-                break;
-            }
-            self.expect_punct(',')?;
-            self.separators();
-        }
-        Ok(args)
+        })
     }
 
     /// Lowers `callee(args)`. Labelled arguments exist only for constructors, so
@@ -1335,59 +1298,72 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_call_type_arguments(&mut self) -> Result<Vec<authored::TypeArgument>, MagError> {
-        let mut values = Vec::new();
-        self.newlines();
-        if self.eat_operator(">") {
-            return Ok(values);
-        }
-        loop {
-            if self.at_word("_") {
-                self.bump();
-                values.push(authored::TypeArgument::Infer);
+        self.comma_separated(Closer::Operator(">"), "type argument", |parser| {
+            if parser.at_word("_") {
+                parser.bump();
+                Ok(authored::TypeArgument::Infer)
             } else {
-                values.push(authored::TypeArgument::Explicit(self.parse_type()?));
+                Ok(authored::TypeArgument::Explicit(parser.parse_type()?))
             }
-            if self.eat_operator(">") {
-                break;
-            }
-            self.expect_punct(',')?;
-            self.newlines();
-        }
-        Ok(values)
+        })
     }
 
     fn parse_type_arguments(&mut self) -> Result<Vec<authored::Type>, MagError> {
-        let mut values = Vec::new();
-        self.newlines();
-        if self.eat_operator(">") {
-            return Ok(values);
-        }
-        loop {
-            values.push(self.parse_type()?);
-            if self.eat_operator(">") {
-                break;
-            }
-            self.expect_punct(',')?;
-            self.newlines();
-        }
-        Ok(values)
+        self.comma_separated(Closer::Operator(">"), "type argument", Self::parse_type)
     }
 
     fn parse_type_list(&mut self, end: char) -> Result<Vec<authored::Type>, MagError> {
-        let mut values = Vec::new();
+        self.comma_separated(Closer::Punct(end), "type", Self::parse_type)
+    }
+
+    /// Parses the elements of a comma-separated sequence whose opening
+    /// delimiter is already consumed, through its closing delimiter. Every
+    /// such form shares these rules: line breaks around elements and commas
+    /// are insignificant, and a comma after the last element is optional.
+    fn comma_separated<T>(
+        &mut self,
+        closer: Closer,
+        element: &str,
+        mut parse_element: impl FnMut(&mut Self) -> Result<T, MagError>,
+    ) -> Result<Vec<T>, MagError> {
+        let mut elements = Vec::new();
         self.newlines();
-        if self.eat_punct(end) {
-            return Ok(values);
+        if self.eat_closer(closer) {
+            return Ok(elements);
         }
         loop {
-            values.push(self.parse_type()?);
-            if self.eat_punct(end) {
-                break;
+            elements.push(parse_element(self)?);
+            if !self.sequence_continues(closer, element)? {
+                return Ok(elements);
             }
-            self.expect_punct(',')?;
-            self.newlines();
         }
-        Ok(values)
+    }
+
+    /// Consumes what follows one element of a comma-separated sequence and
+    /// reports whether another element follows. A missing comma is reported
+    /// at the end of the element it should follow, so the diagnostic points at
+    /// the gap rather than at whatever token comes next, possibly lines later.
+    fn sequence_continues(&mut self, closer: Closer, element: &str) -> Result<bool, MagError> {
+        let element_end = self.tokens[self.cursor.saturating_sub(1)].span.end;
+        self.newlines();
+        if self.eat_closer(closer) {
+            return Ok(false);
+        }
+        if !self.eat_punct(',') {
+            return Err(self.parse_error(
+                format!("expected ',' or '{closer}' after {element}"),
+                ByteSpan::new(element_end, element_end),
+            ));
+        }
+        self.newlines();
+        Ok(!self.eat_closer(closer))
+    }
+
+    fn eat_closer(&mut self, closer: Closer) -> bool {
+        match closer {
+            Closer::Punct(punct) => self.eat_punct(punct),
+            Closer::Operator(operator) => self.eat_operator(operator),
+        }
     }
 
     fn reassociate(
@@ -1454,10 +1430,16 @@ impl<'a> Parser<'a> {
                 (self.resolve_name(op), true)
             }
             TokenKind::Arrow => (self.resolve_name("->"), true),
+            // A name directly before a closing delimiter, a comma or a colon
+            // has no right operand, so it is the next element of a sequence
+            // that lacks its separator, not an infix operator.
             TokenKind::Ident(name)
                 if !matches!(
                     name.as_str(),
                     "then" | "else" | "case" | "let" | "type" | "import" | "as"
+                ) && !matches!(
+                    self.peek_n(1).kind,
+                    TokenKind::Punct(')' | ']' | '}' | ',' | ':') | TokenKind::Eof
                 ) =>
             {
                 (self.resolve_name(name), name.bytes().all(is_operator_byte))
@@ -1500,17 +1482,11 @@ impl<'a> Parser<'a> {
         if !self.eat_operator("<") {
             return Ok(vec![]);
         }
-        let mut names = Vec::new();
-        if self.eat_operator(">") {
-            return Ok(names);
-        }
-        loop {
-            names.push(self.expect_name()?);
-            if self.eat_operator(">") {
-                break;
-            }
-            self.expect_punct(',')?;
-        }
+        let names = self.comma_separated(
+            Closer::Operator(">"),
+            "generic parameter",
+            Self::expect_name,
+        )?;
         let mut seen = HashSet::new();
         if let Some(duplicate) = names.iter().find(|name| !seen.insert((*name).clone())) {
             return Err(self.here(format!("duplicate generic parameter {duplicate}")));
@@ -1791,6 +1767,22 @@ impl<'a> Parser<'a> {
             span,
             related,
         )))
+    }
+}
+
+/// The token that closes a comma-separated sequence.
+#[derive(Debug, Clone, Copy)]
+enum Closer {
+    Punct(char),
+    Operator(&'static str),
+}
+
+impl std::fmt::Display for Closer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Punct(punct) => write!(formatter, "{punct}"),
+            Self::Operator(operator) => formatter.write_str(operator),
+        }
     }
 }
 
@@ -2496,6 +2488,379 @@ let c = On(1)
                 ..
             } if items == &[authored::Type::Name("Int".into()), authored::Type::Name("String".into())]
         ));
+    }
+
+    /// One comma-separated form: the source before its opening delimiter, the
+    /// delimiters, two elements, and the source after its closing delimiter.
+    struct Sequence {
+        form: &'static str,
+        before: &'static str,
+        open: &'static str,
+        elements: [&'static str; 2],
+        close: &'static str,
+        after: &'static str,
+    }
+
+    impl Sequence {
+        fn source(&self, multiline: bool, trailing_comma: bool, separator: &str) -> String {
+            let [first, second] = self.elements;
+            let trailing = if trailing_comma { "," } else { "" };
+            let body = if multiline {
+                format!("\n  {first}{separator}\n  {second}{trailing}\n")
+            } else {
+                format!("{first}{separator} {second}{trailing}")
+            };
+            format!(
+                "{}{}{body}{}{}\n",
+                self.before, self.open, self.close, self.after
+            )
+        }
+    }
+
+    const COMMA_ONLY_SEQUENCES: &[Sequence] = &[
+        Sequence {
+            form: "list literal",
+            before: "let xs = ",
+            open: "[",
+            elements: ["\"a\"", "\"b\""],
+            close: "]",
+            after: "",
+        },
+        Sequence {
+            form: "tuple",
+            before: "let pair = ",
+            open: "(",
+            elements: ["1", "\"one\""],
+            close: ")",
+            after: "",
+        },
+        Sequence {
+            form: "tuple type",
+            before: "let pair: ",
+            open: "(",
+            elements: ["Int", "String"],
+            close: ")",
+            after: " = value",
+        },
+        Sequence {
+            form: "positional call arguments",
+            before: "let value = f",
+            open: "(",
+            elements: ["left", "right"],
+            close: ")",
+            after: "",
+        },
+        Sequence {
+            form: "positional constructor arguments",
+            before: "let value = Owner.Make",
+            open: "(",
+            elements: ["1", "2"],
+            close: ")",
+            after: "",
+        },
+        Sequence {
+            form: "named constructor arguments",
+            before: "let value = Owner.Make",
+            open: "(",
+            elements: ["left: 1", "right: 2"],
+            close: ")",
+            after: "",
+        },
+        Sequence {
+            form: "constructor payload declaration",
+            before: "type Shape = Rect",
+            open: "(",
+            elements: ["Int", "String"],
+            close: ")",
+            after: " | Dot",
+        },
+        Sequence {
+            form: "function type parameters",
+            before: "let f: fn",
+            open: "(",
+            elements: ["Int", "String"],
+            close: ")",
+            after: " -> Int = |number, text| => number",
+        },
+        Sequence {
+            form: "generic parameters of a type",
+            before: "type Pair",
+            open: "<",
+            elements: ["A", "B"],
+            close: ">",
+            after: " { first: A, second: B }",
+        },
+        Sequence {
+            form: "generic parameters of a let",
+            before: "let first",
+            open: "<",
+            elements: ["A", "B"],
+            close: ">",
+            after: ": fn(A, B) -> A = |left, right| => left",
+        },
+        Sequence {
+            form: "type arguments",
+            before: "let value: Map",
+            open: "<",
+            elements: ["String", "Int"],
+            close: ">",
+            after: " = other",
+        },
+        Sequence {
+            form: "nested type arguments",
+            before: "let value: List<Map",
+            open: "<",
+            elements: ["String", "Int"],
+            close: ">",
+            after: "> = other",
+        },
+        Sequence {
+            form: "call type arguments",
+            before: "let value = convert",
+            open: "<",
+            elements: ["Int", "_"],
+            close: ">",
+            after: "(1)",
+        },
+        Sequence {
+            form: "construction type arguments",
+            before: "let value = Either",
+            open: "<",
+            elements: ["Int", "String"],
+            close: ">",
+            after: ".Left(1)",
+        },
+        Sequence {
+            form: "import selectors",
+            before: "import support.",
+            open: "{",
+            elements: ["first", "second as other"],
+            close: "}",
+            after: "",
+        },
+        Sequence {
+            form: "lambda parameters",
+            before: "let f: fn(Int, Int) -> Int = ",
+            open: "|",
+            elements: ["left", "right"],
+            close: "|",
+            after: " => left",
+        },
+    ];
+
+    /// Fields and match arms also accept a line break as their separator.
+    const COMMA_OR_NEWLINE_SEQUENCES: &[Sequence] = &[
+        Sequence {
+            form: "record literal",
+            before: "let point = Point ",
+            open: "{",
+            elements: ["x: 1", "y: 2"],
+            close: "}",
+            after: "",
+        },
+        Sequence {
+            form: "generic record literal",
+            before: "let pair = Pair<Int, Int> ",
+            open: "{",
+            elements: ["first: 1", "second: 2"],
+            close: "}",
+            after: "",
+        },
+        Sequence {
+            form: "braced constructor arguments",
+            before: "let value = Either<Int, Int>.Both ",
+            open: "{",
+            elements: ["left: 1", "right: 2"],
+            close: "}",
+            after: "",
+        },
+        Sequence {
+            form: "record type declaration",
+            before: "type Point ",
+            open: "{",
+            elements: ["x: Int", "y: Int"],
+            close: "}",
+            after: "",
+        },
+        Sequence {
+            form: "inline record payload declaration",
+            before: "type Shape = Rect ",
+            open: "{",
+            elements: ["width: Int", "height: Int"],
+            close: "}",
+            after: " | Dot",
+        },
+        Sequence {
+            form: "match arms",
+            before: "let value = match choice ",
+            open: "{",
+            elements: ["case Left(left) => left", "case Right(right) => right"],
+            close: "}",
+            after: "",
+        },
+    ];
+
+    fn syntax_error(source: &str) -> SyntaxDiagnostic {
+        match parse(source) {
+            Err(MagError::Syntax(diagnostic)) => *diagnostic,
+            other => panic!("expected a syntax diagnostic for {source:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_is_optional_on_one_line_or_many() {
+        for sequence in COMMA_ONLY_SEQUENCES
+            .iter()
+            .chain(COMMA_OR_NEWLINE_SEQUENCES)
+        {
+            let expected = parse(&sequence.source(false, false, ","))
+                .unwrap_or_else(|error| panic!("{}: {error}", sequence.form));
+            for (multiline, trailing_comma) in [(false, true), (true, false), (true, true)] {
+                let source = sequence.source(multiline, trailing_comma, ",");
+                let module = parse(&source)
+                    .unwrap_or_else(|error| panic!("{} in {source:?}: {error}", sequence.form));
+                assert_eq!(module, expected, "{} in {source:?}", sequence.form);
+            }
+        }
+    }
+
+    #[test]
+    fn the_reported_multiline_list_without_a_trailing_comma_parses() {
+        let module = parse("let xs = [\n  \"a\",\n  \"b\"\n]\n").unwrap();
+        assert!(matches!(
+            last_let_value(&module),
+            authored::Expr::Vector(items) if items.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_missing_comma_between_elements_is_reported_at_the_gap() {
+        for sequence in COMMA_ONLY_SEQUENCES {
+            let source = sequence.source(true, false, "");
+            let diagnostic = syntax_error(&source);
+            assert_eq!(
+                diagnostic.message,
+                format!(
+                    "expected ',' or '{}' after {}",
+                    sequence.close,
+                    diagnostic_element(sequence)
+                ),
+                "{} in {source:?}",
+                sequence.form
+            );
+            // The first element sits alone on line 2, indented by two spaces;
+            // the diagnostic points just past it, not at the next line.
+            assert_eq!(diagnostic.location.start.line, 2, "{}", sequence.form);
+            assert_eq!(
+                diagnostic.location.start.column,
+                3 + sequence.elements[0].len(),
+                "{}",
+                sequence.form
+            );
+        }
+    }
+
+    fn diagnostic_element(sequence: &Sequence) -> &'static str {
+        match sequence.form {
+            "list literal" => "list element",
+            "tuple" => "parenthesized expression",
+            "tuple type" | "constructor payload declaration" | "function type parameters" => "type",
+            "positional call arguments"
+            | "positional constructor arguments"
+            | "named constructor arguments" => "argument",
+            "generic parameters of a type" | "generic parameters of a let" => "generic parameter",
+            "type arguments"
+            | "nested type arguments"
+            | "call type arguments"
+            | "construction type arguments" => "type argument",
+            "import selectors" => "import selector",
+            "lambda parameters" => "lambda parameter",
+            other => panic!("no diagnostic wording for {other}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_comma_on_one_line_is_an_error_in_every_form() {
+        for (source, message) in [
+            (
+                "let xs = [\"a\" \"b\"]\n",
+                "expected ',' or ']' after list element",
+            ),
+            (
+                "let pair = (1 \"one\")\n",
+                "expected ',' or ')' after parenthesized expression",
+            ),
+            ("let value = f(1 2)\n", "expected ',' or ')' after argument"),
+            (
+                "let xs = [first second]\n",
+                "expected ',' or ']' after list element",
+            ),
+            (
+                "let value = f(first second)\n",
+                "expected ',' or ')' after argument",
+            ),
+            (
+                "let value: Map<String Int> = other\n",
+                "expected ',' or '>' after type argument",
+            ),
+            (
+                "type Pair<A B> { first: A }\n",
+                "expected ',' or '>' after generic parameter",
+            ),
+            (
+                "import support.{first second}\n",
+                "expected ',' or '}' after import selector",
+            ),
+            (
+                "let f: fn(Int, Int) -> Int = |left right| => left\n",
+                "expected ',' or '|' after lambda parameter",
+            ),
+            (
+                "let point = Point { x: 1 y: 2 }\n",
+                "expected ',' or newline between fields",
+            ),
+            (
+                "type Point { x: Int y: Int }\n",
+                "expected ',' or newline between fields",
+            ),
+        ] {
+            assert_eq!(syntax_error(source).message, message, "{source:?}");
+        }
+        assert!(parse("let value = match choice { case A => 1 case B => 2 }\n").is_err());
+    }
+
+    #[test]
+    fn fields_and_match_arms_also_separate_by_line_break() {
+        for sequence in COMMA_OR_NEWLINE_SEQUENCES {
+            let source = sequence.source(true, false, "");
+            assert_eq!(
+                parse(&source).unwrap_or_else(|error| panic!("{}: {error}", sequence.form)),
+                parse(&sequence.source(false, false, ",")).unwrap(),
+                "{} in {source:?}",
+                sequence.form
+            );
+        }
+    }
+
+    #[test]
+    fn grouping_parentheses_and_empty_sequences_span_lines() {
+        let module = parse("let grouped = (\n  1\n)\nlet single = (\n  1,\n)\n").unwrap();
+        assert!(matches!(
+            &module.forms[0],
+            authored::Form::Block(authored::BlockItem::Let {
+                value: authored::Expr::Int(1),
+                ..
+            })
+        ));
+        assert!(matches!(
+            last_let_value(&module),
+            authored::Expr::Ascribe { value, .. }
+                if matches!(value.as_ref(), authored::Expr::Vector(items) if items.len() == 1)
+        ));
+        assert_eq!(
+            parse("let empty = [\n]\nlet called = f(\n)\n").unwrap(),
+            parse("let empty = []\nlet called = f()\n").unwrap()
+        );
     }
 
     #[test]

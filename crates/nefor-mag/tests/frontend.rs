@@ -1769,3 +1769,26 @@ fn a_call_that_leaves_a_type_argument_undetermined_is_rejected() {
     .unwrap_err();
     assert!(conflict.contains("expected String, got Int"), "{conflict}");
 }
+
+#[test]
+fn a_multiline_list_compiles_with_or_without_a_trailing_comma() {
+    let compile = |source: &str| compile_with_syntax(source, Path::new("."), SyntaxMode::New);
+    let expected = serde_json::json!(["a", "b"]);
+    for source in [
+        "let xs = [\"a\", \"b\"]\nartifact(xs)\n",
+        "let xs = [\"a\", \"b\",]\nartifact(xs)\n",
+        "let xs = [\n  \"a\",\n  \"b\"\n]\nartifact(xs)\n",
+        "let xs = [\n  \"a\",\n  \"b\",\n]\nartifact(xs)\n",
+    ] {
+        assert_eq!(compile(source).unwrap(), expected, "{source:?}");
+    }
+
+    let error = compile("let xs = [\n  \"a\"\n  \"b\"\n]\nartifact(xs)\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("expected ',' or ']' after list element"),
+        "{error}"
+    );
+    assert!(error.contains(":2:6"), "{error}");
+}

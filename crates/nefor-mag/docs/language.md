@@ -62,7 +62,7 @@ let command = replace(script, "\n", " ")
 
 ## Native data collections and equality
 
-`[...]` constructs the single native `List` representation. Parenthesized comma-separated values construct a product such as `(A, B, ...)`. A nominal record value uses `Type {field: value}`; a generic record uses `Type<A, B> {field: value}`. Braced fields without a nominal type name are blocks, not anonymous record values. Use `Map<K, V>` for homogeneous dynamically keyed data.
+`[...]` constructs the single native `List` representation. Parenthesized comma-separated values construct a product such as `(A, B, ...)`. Every comma-separated form enclosed in delimiters (lists, tuples, call and constructor arguments, type and generic argument lists, import selectors, lambda parameters, fields, and `match` arms) may span lines, and a comma after its last element is optional; a comma between elements is required, except that fields and `match` arms may be separated by a line break instead. A nominal record value uses `Type {field: value}`; a generic record uses `Type<A, B> {field: value}`. Braced fields without a nominal type name are blocks, not anonymous record values. Use `Map<K, V>` for homogeneous dynamically keyed data.
 
 Native `Map<K, V>` and `Set<T>` values have no literal syntax. Import `core.map.{}` or `core.set.{}` and construct them through those ordinary modules. Map/Set lookup, membership, count, and insertion do not reveal storage order; no ordered fold or enumeration API is exposed. Inserting an equal existing key or member is an evaluation error. Map and Set equality is extensional and unordered.
 
