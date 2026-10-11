@@ -958,11 +958,32 @@ do
     "provider interruption records the turn terminal only after tool settlement")
 end
 
+-- ==================================================================
+-- a round with neither text nor a tool call is not an answer
+-- ==================================================================
+
+local function facts_of_kind(facts, kind)
+  local found = {}
+  for _, fact in ipairs(facts) do
+    if fact.kind == kind then found[#found + 1] = fact end
+  end
+  return found
+end
+
+local function reply_to_last_invoke(instance, msgs, result)
+  instance.deliver({
+    kind = "reply", ref = find_last_kind(msgs, "capability.invoke").ref, result = result,
+  })
+end
+
+-- A reasoning-only stop (an upstream that cuts the response inside its
+-- reasoning still reports "stop") is retried from the same context, and its
+-- reasoning never becomes a completed conversation message.
 do
   local instance, msgs, facts = make("reasoning-only.llm", { provider = "p" })
   instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   instance.handle_observation({ binding = "transcript", value = {
-    kind = "reasoning", text = "waiting for asynchronous work",
+    kind = "reasoning", text = "The worker also may want to run shell greps. Actually",
   } })
 
   local before_reply = #facts
@@ -972,11 +993,128 @@ do
   assert_eq(#facts, before_reply,
     "an empty intermediate observation does not settle the stream")
 
-  instance.deliver({
-    kind = "reply",
-    ref = find_kind(msgs, "capability.invoke").ref,
-    result = { text = "", finish_reason = "stop" },
+  local first_request = find_last_kind(msgs, "capability.invoke")
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+
+  assert_eq(count_kind(msgs, "capability.invoke"), 2, "the empty round is requested again")
+  assert_true(find_last_kind(msgs, "capability.invoke").ref ~= first_request.ref,
+    "the retry is a new provider request")
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 0, "an empty round is not a terminal answer")
+  local discarded = facts_of_kind(facts, "message_interrupted")
+  assert_eq(#discarded, 1, "the reasoning-only attempt is closed exactly once")
+  assert_eq(discarded[1].visibility, "discarded",
+    "the reasoning-only attempt is audit history outside model context")
+  assert_eq(discarded[1].detail.reason, "empty_model_response", "the discard names its cause")
+  local retries = facts_of_kind(facts, "retry_started")
+  assert_eq(#retries, 1, "the retry is a recorded conversation fact")
+  assert_eq(retries[1].reason, "empty_model_response", "the retry names its cause")
+  assert_eq(retries[1].provenance.attempt, 1, "the retry counts the failed attempt")
+  assert_eq(retries[1].provenance.max_attempts, 3, "the retry states its bound")
+  assert_eq(retries[1].provenance.finish_reason, "stop", "the retry keeps the reported finish reason")
+
+  reply_to_last_invoke(instance, msgs, { text = "the real answer", finish_reason = "stop" })
+
+  local final = find_kind(msgs, "nefor.agent.Result")
+  assert_eq(final.value.constructor, "Ok", "the retried round's answer completes the turn")
+  assert_eq(final.value.value, "the real answer", "the answer comes from the retried round")
+  assert_eq(count_kind(msgs, "capability.invoke"), 2, "one retry was enough")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 1, "a real answer starts no further retry")
+  assert_eq(facts[#facts].kind, "turn_completed", "the turn reaches its terminal fact")
+  local assistants = 0
+  for _, message in ipairs(conversation_messages(facts)) do
+    if message.role == "assistant" then
+      assistants = assistants + 1
+      assert_eq(message.content, "the real answer", "no empty assistant message was recorded")
+    end
+  end
+  assert_eq(assistants, 1, "the conversation holds only the real assistant answer")
+end
+
+-- Every attempt empty: the turn ends as the typed provider error, never as a
+-- successful empty answer. Whitespace is not an answer either.
+do
+  local diagnostics = {}
+  local msgs, emit = capture()
+  local dependency, facts = conversation("always-empty.llm")
+  local instance = llm.construct("always-empty.llm", with_contracts({ provider = "p" }), emit, {
+    conversation = dependency,
+    diagnostic = function(diagnostic) diagnostics[#diagnostics + 1] = diagnostic end,
   })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+  reply_to_last_invoke(instance, msgs, { text = " \n\t", finish_reason = "length" })
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 0, "the turn is still open before the last attempt")
+  reply_to_last_invoke(instance, msgs, {})
+
+  assert_eq(count_kind(msgs, "capability.invoke"), 3, "the request is attempted three times in total")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 2, "two retries follow the first attempt")
+  assert_eq(#diagnostics, 2, "each retry is reported on the run diagnostic stream")
+  assert_eq(diagnostics[2].kind, "empty_model_response", "the diagnostic names the empty response")
+  assert_eq(diagnostics[2].attempt, 2, "the diagnostic counts attempts")
+  local final = find_kind(msgs, "nefor.agent.Result")
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 1, "exactly one terminal result is emitted")
+  assert_eq(final.value.constructor, "Error", "exhausted attempts select the typed error")
+  assert_eq(final.value.value.reason.constructor, "ProviderError", "the error keeps the provider-error shape")
+  assert_eq(final.value.value.reason.value.message,
+    "model returned no answer and no tool call after 3 attempts",
+    "the error says what was missing and how often it was tried")
+  for _, message in ipairs(conversation_messages(facts)) do
+    assert_true(message.role ~= "assistant", "no empty assistant message was recorded")
+  end
+  reply_to_last_invoke(instance, msgs, { text = "late" })
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 1, "a settled turn ignores later replies")
+end
+
+-- The attempt bound belongs to one request: a round that makes progress
+-- resets it, so a long tool-using turn is not failed by scattered empties.
+do
+  local instance, msgs, facts = make("empty-between-tools.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  for round = 1, 3 do
+    reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+    reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+    reply_to_last_invoke(instance, msgs, {
+      text = "", finish_reason = "tool_calls",
+      tool_calls = { { id = "call-" .. round, name = "read_file", args = { path = "x" } } },
+    })
+    instance.deliver(turn({ messages = { {
+      role = "tool", tool_call_id = "call-" .. round, name = "read_file", content = "contents",
+    } } }))
+  end
+  reply_to_last_invoke(instance, msgs, { text = "done", finish_reason = "stop" })
+  assert_eq(find_kind(msgs, "nefor.agent.Result").value.value, "done",
+    "empties separated by progress never exhaust the bound")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 6, "each empty round was retried")
+end
+
+-- An ordinary answer is never retried.
+do
+  local instance, msgs, facts = make("plain-answer.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  reply_to_last_invoke(instance, msgs, { text = "answer", finish_reason = "stop" })
+  assert_eq(count_kind(msgs, "capability.invoke"), 1, "a normal answer makes one provider request")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 0, "a normal answer starts no retry")
+  assert_eq(find_kind(msgs, "nefor.agent.Result").value.value, "answer", "the answer is delivered")
+end
+
+-- Ending a turn silently is a deliberate wait once a tool acknowledged
+-- asynchronous delivery: its result starts a later turn. The reply still closes
+-- the reasoning-only streamed message so the turn reaches a terminal fact.
+do
+  local instance, msgs, facts = make("async-wait.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  reply_to_last_invoke(instance, msgs, {
+    text = "", finish_reason = "tool_calls",
+    tool_calls = { { id = "apply-1", name = "mag-apply", args = { file = "work.mag" } } },
+  })
+  instance.deliver(turn({ messages = { {
+    role = "tool", tool_call_id = "apply-1", name = "mag-apply",
+    content = "submitted; wait for the completion notification", completion_delivery = "async",
+  } } }))
+  instance.handle_observation({ binding = "transcript", value = {
+    kind = "reasoning", text = "waiting for asynchronous work",
+  } })
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
 
   local assistant_message_id
   local completed = false
@@ -991,9 +1129,62 @@ do
     "the terminal provider reply closes a reasoning-only streamed message")
   assert_eq(facts[#facts].kind, "turn_completed",
     "the terminal provider reply closes the reasoning-only turn")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 0, "a deliberate wait is not retried")
+  assert_eq(count_kind(msgs, "capability.invoke"), 2, "no further provider request is made")
   local final = find_kind(msgs, "nefor.agent.Result")
-  assert_eq(final.value.constructor, "Ok", "the empty terminal answer selects Ok")
-  assert_eq(final.value.value, "", "the empty terminal answer remains empty")
+  assert_eq(final.value.constructor, "Ok", "the silent wait selects Ok")
+  assert_eq(final.value.value, "", "the silent wait has no answer text")
+end
+
+-- The asynchronous acknowledgment belongs to the firing that received it.
+do
+  local instance, msgs, facts = make("async-wait-scope.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  reply_to_last_invoke(instance, msgs, {
+    text = "", finish_reason = "tool_calls",
+    tool_calls = { { id = "apply-1", name = "mag-apply", args = {} } },
+  })
+  instance.deliver(turn({ messages = { {
+    role = "tool", tool_call_id = "apply-1", name = "mag-apply", content = "submitted",
+    completion_delivery = "async",
+  } } }))
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 1, "the waiting firing ends silently")
+
+  instance.deliver(turn({ messages = { { role = "user", content = "the run finished" } } }))
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 1,
+    "an empty round in the next firing is not a terminal answer")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 1, "the next firing retries its empty round")
+end
+
+-- A drained actor cannot request again; it fails instead of answering empty.
+do
+  local instance, msgs, facts = make("empty-drain.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  instance.handle_drain()
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+  assert_eq(count_kind(msgs, "capability.invoke"), 1, "a drained actor does not retry")
+  assert_eq(count_kind(msgs, "nefor.agent.Result"), 0, "a drained empty round is not an answer")
+  assert_eq(count_kind(msgs, "mag.failed"), 1, "a drained empty round fails the actor")
+  assert_eq(facts[#facts].kind, "turn_failed", "the drained turn records its failure")
+end
+
+-- Steered input changes the request, so it continues without spending an
+-- attempt; the empty round is still kept out of the conversation.
+do
+  local instance, msgs, facts = make("empty-steered.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  instance.handle_observation({ binding = "transcript", value = { kind = "reasoning", text = "cut" } })
+  assert_true(instance.handle_steer({ role = "user", content = "also check the tests" }),
+    "the actor accepts steering")
+  reply_to_last_invoke(instance, msgs, { text = "", finish_reason = "stop" })
+  assert_eq(count_kind(msgs, "capability.invoke"), 2, "steering continues with a new request")
+  assert_eq(#facts_of_kind(facts, "retry_started"), 0, "a steered continuation is not a retry")
+  assert_eq(facts_of_kind(facts, "message_interrupted")[1].visibility, "discarded",
+    "the empty round is discarded before the steered input")
+  reply_to_last_invoke(instance, msgs, { text = "checked", finish_reason = "stop" })
+  assert_eq(find_kind(msgs, "nefor.agent.Result").value.value, "checked", "the steered answer completes the turn")
 end
 
 do

@@ -1293,3 +1293,130 @@ end }}
     );
     println!("retained accepted MAG output artifacts: {}", dir.display());
 }
+
+/// Conversation facts of one kind recorded in a session, in order.
+fn session_facts(dir: &Path, session: &str, kind: &str) -> Vec<serde_json::Value> {
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap();
+    persisted
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| row["payload"].as_str().map(str::to_owned))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .filter(|envelope| envelope["body"]["kind"] == "conversation.fact.recorded")
+        .map(|envelope| envelope["body"]["event"].clone())
+        .filter(|event| event["kind"] == kind)
+        .collect()
+}
+
+fn empty_response_retries(dir: &Path, session: &str) -> Vec<serde_json::Value> {
+    session_facts(dir, session, "retry_started")
+        .into_iter()
+        .filter(|fact| fact["reason"] == "empty_model_response")
+        .collect()
+}
+
+#[test]
+fn empty_model_responses_are_retried_and_never_complete_a_request() {
+    let dir = isolated_starter("empty-model-response-");
+    std::fs::copy(
+        root().join("engine/tests/agentic_cli_mock_e2e/empty_responses.lua"),
+        dir.join("fixture-config/mock-provider/acceptance.lua"),
+    )
+    .unwrap();
+    let ask = |prompt: &str| {
+        run(
+            &dir,
+            &[
+                "--frontend",
+                "cli",
+                "--mode",
+                "yolo",
+                "--format",
+                "json",
+                "--prompt",
+                prompt,
+            ],
+        )
+    };
+
+    // The lead's first response is empty or reasoning-only; the same request
+    // is made again and its answer completes the turn.
+    for prompt in ["EMPTY_THEN_ANSWER", "REASONING_ONLY_THEN_ANSWER"] {
+        let result: serde_json::Value = serde_json::from_str(&success(&ask(prompt))).unwrap();
+        assert_eq!(result["status"], "success", "{prompt}");
+        assert_eq!(result["answer"], "recovered answer", "{prompt}");
+        let session = result["session_id"].as_str().unwrap();
+        let retries = empty_response_retries(&dir, session);
+        assert_eq!(retries.len(), 1, "{prompt}: one retry is recorded");
+        assert_eq!(retries[0]["actor_id"], "lead.llm", "{prompt}");
+        assert_eq!(retries[0]["provenance"]["attempt"], 1, "{prompt}");
+        assert_eq!(retries[0]["provenance"]["max_attempts"], 3, "{prompt}");
+        assert!(
+            session_facts(&dir, session, "message_completed")
+                .iter()
+                .all(|fact| fact["visibility"] != "discarded"),
+            "{prompt}"
+        );
+        let discarded = session_facts(&dir, session, "message_interrupted");
+        if prompt == "REASONING_ONLY_THEN_ANSWER" {
+            assert_eq!(discarded.len(), 1, "the reasoning-only attempt is closed");
+            assert_eq!(discarded[0]["visibility"], "discarded");
+        } else {
+            assert!(discarded.is_empty(), "nothing streamed, nothing to discard");
+        }
+    }
+
+    // Every attempt empty: the request fails with the explicit error.
+    let exhausted = ask("ALWAYS_EMPTY");
+    assert_eq!(
+        exhausted.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&exhausted.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&exhausted.stdout).unwrap();
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["answer"], "");
+    assert_eq!(result["error"]["code"], "agent_error");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("model returned no answer and no tool call after 3 attempts"),
+        "{result}"
+    );
+    let session = result["session_id"].as_str().unwrap();
+    assert_eq!(empty_response_retries(&dir, session).len(), 2);
+
+    // An ordinary answer is not retried.
+    let result: serde_json::Value =
+        serde_json::from_str(&success(&ask("ORDINARY_ANSWER"))).unwrap();
+    assert_eq!(result["answer"], "ordinary answer");
+    let session = result["session_id"].as_str().unwrap();
+    assert!(session_facts(&dir, session, "retry_started").is_empty());
+
+    // Graph agents: a typed worker and a plain text worker each answer empty
+    // once, and the run still delivers their results.
+    let result: serde_json::Value =
+        serde_json::from_str(&success(&ask("EMPTY_WORKER_RESPONSES"))).unwrap();
+    assert_eq!(result["status"], "success");
+    assert!(
+        result["answer"]
+            .as_str()
+            .unwrap()
+            .contains("octopuses are intelligent cephalopods"),
+        "{result}"
+    );
+    let session = result["session_id"].as_str().unwrap();
+    let mut actors = empty_response_retries(&dir, session)
+        .iter()
+        .map(|fact| fact["actor_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    actors.sort();
+    assert_eq!(actors, ["plain.llm", "typed.llm"]);
+    println!("retained empty-response artifacts: {}", dir.display());
+}
