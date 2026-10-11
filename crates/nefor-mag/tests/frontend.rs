@@ -522,12 +522,12 @@ fn constructor_workspace(name: &str) -> std::path::PathBuf {
     fs::write(
         root.join("support.mag"),
         r#"
-type Sw = On(Int) | Off(Unit)
-type Box<T> = Full(T) | Empty(Unit)
+type Sw = On(Int) | Off
+type Box<T> = Full(T) | Empty
 type Pt = At {x: Int, y: Int} | Pair(Int, Int)
 type Holder {sw: Sw}
 type Plain {value: Int}
-let show: fn(Sw) -> Int = |sw| => match sw { case On(n) => n, case Off(unit) => 0 }
+let show: fn(Sw) -> Int = |sw| => match sw { case On(n) => n, case Off => 0 }
 let On: fn(String) -> String = |text| => str("fn:", text)
 let On: fn(Bool) -> String = |flag| => str("fn:", flag)
 "#,
@@ -565,17 +565,17 @@ import support.{}
 import support as s
 import facade.{Switch, Crate}
 type Local = support.Sw
-type Mine = Yes(Int) | No(Unit)
+type Mine = Yes(Int) | No
 let selective = Sw.On(1)
 let renamed = Renamed.On(2)
 let qualified = support.Sw.On(3)
 let namespaced = s.Sw.On(4)
 let through_facade = Switch.On(5)
 let through_local_alias = Local.On(6)
-let unit = Switch.Off()
+let unit = Switch.Off
 let generic = Box<Int>.Full(7)
 let generic_qualified = support.Box<String>.Full("x")
-let generic_facade = Crate<Int>.Empty()
+let generic_facade = Crate<Int>.Empty
 let local = Mine.Yes(8)
 artifact {
   shown: map(support.show, [selective, renamed, qualified, namespaced, through_facade, through_local_alias, unit]),
@@ -608,11 +608,11 @@ import facade.{Switch}
 let unannotated = Sw.On(1)
 let argument = show(Sw.On(2))
 let field = Holder {sw: Switch.On(3)}
-let list = [Sw.On(4), Switch.Off()]
+let list = [Sw.On(4), Switch.Off]
 let tuple = (Sw.On(5), "label")
 let lambda: fn(Int) -> Sw = |n| => Sw.On(n)
-let branch: fn(Bool) -> Sw = |flag| => if flag then Sw.On(6) else Sw.Off()
-let flip: fn(Sw) -> Sw = |sw| => match sw { case On(n) => Sw.Off(), case Off(unit) => Sw.On(7) }
+let branch: fn(Bool) -> Sw = |flag| => if flag then Sw.On(6) else Sw.Off
+let flip: fn(Sw) -> Sw = |sw| => match sw { case On(n) => Sw.Off, case Off => Sw.On(7) }
 let wrap<T>: fn(T) -> Box<T> = |value| => Box<T>.Full(value)
 let several = Pt.Pair(8, 9)
 let labelled = Pt.At(x: 10, y: 11)
@@ -626,7 +626,7 @@ artifact {
   tuple: tuple,
   lambda: show(lambda(15)),
   branch: [show(branch(true)), show(branch(false))],
-  flip: [show(flip(Sw.On(1))), show(flip(Sw.Off()))],
+  flip: [show(flip(Sw.On(1))), show(flip(Sw.Off))],
   wrap: wrap<Int>(16),
   several: several,
   labelled: labelled,
@@ -664,7 +664,7 @@ fn constructors_are_scoped_by_their_type() {
         r#"
 type Accepted {score: Int}
 type Review = Accepted(Accepted) | Rejected(String)
-type BuildStatus = Accepted(String) | Failed(Unit)
+type BuildStatus = Accepted(String) | Failed
 let review = Review.Accepted(Accepted {score: 9})
 let build = BuildStatus.Accepted("green")
 let show_review: fn(Review) -> String = |value| => match value {
@@ -673,9 +673,9 @@ let show_review: fn(Review) -> String = |value| => match value {
 }
 let show_build: fn(BuildStatus) -> String = |value| => match value {
   case Accepted(label) => label,
-  case Failed(unit) => "failed",
+  case Failed => "failed",
 }
-artifact([show_review(review), show_build(build), show_build(BuildStatus.Failed())])
+artifact([show_review(review), show_build(build), show_build(BuildStatus.Failed)])
 "#,
     );
     assert_eq!(artifact, serde_json::json!(["9", "green", "failed"]));
@@ -684,7 +684,7 @@ artifact([show_review(review), show_build(build), show_build(BuildStatus.Failed(
         "constructor-scopes-mismatch",
         r#"
 type Review = Accepted(Int) | Rejected(String)
-type BuildStatus = Accepted(Int) | Failed(Unit)
+type BuildStatus = Accepted(Int) | Failed
 let review: Review = BuildStatus.Accepted(1)
 artifact(1)
 "#,
@@ -705,12 +705,12 @@ fn functions_and_constructors_with_one_simple_name_coexist() {
 import support.{Sw}
 import support.{}
 import support as s
-type Mine = On(Int) | Off(Unit)
+type Mine = On(Int) | Off
 let On: fn(Int) -> Int = |n| => int_mul(n, 100)
 let local_call = On(2)
 let local_constructor = Mine.On(2)
 let imported_constructor = Sw.On(3)
-let describe: fn(Mine) -> Int = |value| => match value { case On(n) => n, case Off(unit) => 0 }
+let describe: fn(Mine) -> Int = |value| => match value { case On(n) => n, case Off => 0 }
 artifact {
   local_call: local_call,
   local_constructor: describe(local_constructor),
@@ -735,8 +735,8 @@ artifact {
         "constructor-imported-function-coexistence",
         r#"
 import support.{Sw, On, show}
-let flip: fn(Sw) -> Sw = |sw| => match sw { case On(n) => Sw.Off(), case Off(unit) => Sw.On(1) }
-artifact([On("text"), On(false), str(show(Sw.On(5))), str(show(flip(Sw.Off())))])
+let flip: fn(Sw) -> Sw = |sw| => match sw { case On(n) => Sw.Off, case Off => Sw.On(1) }
+artifact([On("text"), On(false), str(show(Sw.On(5))), str(show(flip(Sw.Off)))])
 "#,
     );
     assert_eq!(
@@ -756,19 +756,19 @@ artifact([On("text"), On(false), str(show(Sw.On(5))), str(show(flip(Sw.Off())))]
 fn bare_constructors_and_named_are_not_construction_spellings() {
     let bare = constructor_error(
         "constructor-bare",
-        "type Sw = On(Int) | Off(Unit)\nlet value = On(1)\nartifact(1)\n",
+        "type Sw = On(Int) | Off\nlet value = On(1)\nartifact(1)\n",
     );
     assert!(bare.contains("unresolved symbol: On"), "{bare}");
 
     let annotated = constructor_error(
         "constructor-bare-annotated",
-        "type Sw = On(Int) | Off(Unit)\nlet value: Sw = On(1)\nartifact(1)\n",
+        "type Sw = On(Int) | Off\nlet value: Sw = On(1)\nartifact(1)\n",
     );
     assert!(annotated.contains("unresolved symbol: On"), "{annotated}");
 
     let named = constructor_error(
         "constructor-named-removed",
-        "type Sw = On(Int) | Off(Unit)\nlet one = 1\nlet value = named(one, one, one)\nartifact(1)\n",
+        "type Sw = On(Int) | Off\nlet one = 1\nlet value = named(one, one, one)\nartifact(1)\n",
     );
     assert!(named.contains("unresolved symbol: named"), "{named}");
 
@@ -879,7 +879,7 @@ fn annotations_statically_reject_a_construction_of_another_type() {
         "constructor-annotation-mismatch",
         r#"
 import support.{Sw}
-type Other = On(Int) | Off(Unit)
+type Other = On(Int) | Off
 let later = fail(["must not evaluate"])
 let value: Other = Sw.On(1)
 artifact(1)
@@ -900,10 +900,10 @@ import support.{Sw, Box}
 import support.{}
 import facade.{Switch, Crate}
 type Mine = On(String) | Full(Int)
-let imported: fn(Sw) -> Int = |sw| => match sw { case On(n) => n, case Off(unit) => 0 }
-let aliased: fn(Switch) -> Int = |sw| => match sw { case Switch.On(n) => n, case support.Sw.Off(unit) => 0 }
-let generic: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty(unit) => 0 }
-let generic_alias: fn(Crate<String>) -> String = |box| => match box { case Full(text) => text, case Empty(unit) => "" }
+let imported: fn(Sw) -> Int = |sw| => match sw { case On(n) => n, case Off => 0 }
+let aliased: fn(Switch) -> Int = |sw| => match sw { case Switch.On(n) => n, case support.Sw.Off => 0 }
+let generic: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty => 0 }
+let generic_alias: fn(Crate<String>) -> String = |box| => match box { case Full(text) => text, case Empty => "" }
 let mine: fn(Mine) -> String = |value| => match value { case On(text) => text, case Full(n) => str(n) }
 artifact {
   imported: imported(Switch.On(1)),
@@ -927,7 +927,7 @@ artifact {
 
     let foreign = constructor_error(
         "constructor-foreign-pattern",
-        "import support.{Sw}\ntype Mine = On(Int) | Off(Unit)\nlet show: fn(Sw) -> Int = |sw| => match sw { case Mine.On(n) => n, case Off(unit) => 0 }\nartifact(1)\n",
+        "import support.{Sw}\ntype Mine = On(Int) | Off(Unit)\nlet show: fn(Sw) -> Int = |sw| => match sw { case Mine.On(n) => n, case Off => 0 }\nartifact(1)\n",
     );
     assert!(
         foreign.contains("does not match scrutinee owner"),
@@ -944,19 +944,19 @@ import support.{Box, Sw}
 import facade.{Crate}
 type Result<E, T> = Ok(T) | Error(E)
 type IntResult<T> = Result<Int, T>
-type Pair<A, B> = Both {left: A, right: B} | Neither(Unit)
+type Pair<A, B> = Both {left: A, right: B} | Neither
 type Holder {box: Box<Int>}
-let size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty(unit) => 0 }
+let size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty => 0 }
 let from_payload = Box.Full(42)
-let from_annotation: Box<Int> = Box.Empty()
-let from_argument = size(Box.Empty())
-let from_field = Holder {box: Box.Empty()}
-let from_return: fn(Bool) -> Box<Int> = |flag| => if flag then Box.Empty() else Box.Full(1)
-let from_list_annotation: List<Box<Int>> = [Box.Empty(), Box.Full(2)]
-let from_earlier_element = [Box.Full(3), Box.Empty()]
-let from_later_element = [Box.Empty(), Box.Full(4)]
-let from_branch = if true then Box.Empty() else Box.Full(5)
-let from_arm = match Sw.Off() { case On(n) => Box.Full(n), case Off(unit) => Box.Empty() }
+let from_annotation: Box<Int> = Box.Empty
+let from_argument = size(Box.Empty)
+let from_field = Holder {box: Box.Empty}
+let from_return: fn(Bool) -> Box<Int> = |flag| => if flag then Box.Empty else Box.Full(1)
+let from_list_annotation: List<Box<Int>> = [Box.Empty, Box.Full(2)]
+let from_earlier_element = [Box.Full(3), Box.Empty]
+let from_later_element = [Box.Empty, Box.Full(4)]
+let from_branch = if true then Box.Empty else Box.Full(5)
+let from_arm = match Sw.Off { case On(n) => Box.Full(n), case Off => Box.Empty }
 let combined: Result<String, Int> = Result.Ok(6)
 let through_alias = Crate.Full("aliased")
 let partial_alias = IntResult.Ok("partial")
@@ -964,11 +964,11 @@ let partial_alias_expected: IntResult<String> = IntResult.Error(7)
 let labelled = Pair.Both(left: 8, right: "right")
 let braced = Pair.Both {left: true, right: [9]}
 let nested = Box.Full(Box.Full(10))
-let nested_expected: Box<Box<Int>> = Box.Full(Box.Empty())
+let nested_expected: Box<Box<Int>> = Box.Full(Box.Empty)
 let explicit = Box<Int>.Full(11)
 let wrap<T>: fn(T) -> Box<T> = |value| => Box.Full(value)
-let empty<T>: fn() -> Box<T> = | | => Box.Empty()
-let generic_argument<U>: fn(Box<U>, U) -> U = |box, default| => match box { case Full(value) => value, case Empty(unit) => default }
+let empty<T>: fn() -> Box<T> = | | => Box.Empty
+let generic_argument<U>: fn(Box<U>, U) -> U = |box, default| => match box { case Full(value) => value, case Empty => default }
 artifact {
   from_payload: size(from_payload),
   from_annotation: size(from_annotation),
@@ -991,7 +991,7 @@ artifact {
   explicit: size(explicit),
   wrap: wrap("wrapped"),
   empty: size(empty<Int>()),
-  generic_argument: generic_argument(Box.Empty(), 12),
+  generic_argument: generic_argument(Box.Empty, 12),
 }
 "#,
     );
@@ -1028,11 +1028,11 @@ artifact {
 fn undetermined_and_conflicting_type_arguments_are_rejected() {
     let undetermined = constructor_error(
         "constructor-inference-undetermined",
-        "import support.{Box}\nlet value = Box.Empty()\nartifact(1)\n",
+        "import support.{Box}\nlet value = Box.Empty\nartifact(1)\n",
     );
     assert!(
         undetermined.contains("cannot infer type argument T of support.Box")
-            && undetermined.contains("Box<...>.Empty()"),
+            && undetermined.contains("Box<...>.Empty"),
         "{undetermined}"
     );
 
@@ -1048,7 +1048,7 @@ fn undetermined_and_conflicting_type_arguments_are_rejected() {
 
     let in_tuple = constructor_error(
         "constructor-inference-undetermined-tuple",
-        "import support.{Box}\nlet value = (Box.Empty(), 1)\nartifact(1)\n",
+        "import support.{Box}\nlet value = (Box.Empty, 1)\nartifact(1)\n",
     );
     assert!(
         in_tuple.contains("cannot infer type argument T of support.Box"),
@@ -1098,8 +1098,8 @@ fn annotated_bindings_infer_generic_call_results_from_their_annotation() {
         "generic-call-annotation",
         r#"
 import support.{Box}
-let empty<T>: fn() -> Box<T> = | | => Box<T>.Empty()
-let size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty(unit) => 0 }
+let empty<T>: fn() -> Box<T> = | | => Box<T>.Empty
+let size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty => 0 }
 let annotated: Box<Int> = empty()
 let listed: List<Box<Int>> = [empty(), Box.Full(1)]
 artifact([size(annotated), size(first(listed)), size(empty())])
@@ -1113,7 +1113,7 @@ fn positional_arguments_fill_named_fields_in_declared_order() {
     let root = constructor_workspace("constructor-positional-fields");
     fs::write(
         root.join("shapes.mag"),
-        "type Pt = At {y: Int, x: String} | Pair(Int, Int) | One {only: Int}\ntype Gen<A, B> = Both {right: B, left: A} | Neither(Unit)\n",
+        "type Pt = At {y: Int, x: String} | Pair(Int, Int) | One {only: Int}\ntype Gen<A, B> = Both {right: B, left: A} | Neither\n",
     )
     .unwrap();
     fs::write(
@@ -1187,84 +1187,171 @@ artifact {
 }
 
 #[test]
-fn unit_payload_constructors_take_no_arguments() {
-    let artifact = constructor_artifact(
-        "constructor-unit-rule",
+fn payloadless_constructors_are_written_as_bare_names() {
+    let root = constructor_workspace("constructor-payloadless");
+    fs::write(
+        root.join("shapes.mag"),
+        "type Timeout = Unlimited | Seconds(Int) | Explicit(Unit)\ntype Maybe<T> = Just(T) | Nothing\ntype Inner {depth: Int}\ntype Outer {inner: Inner, label: String}\nlet outer = Outer {inner: Inner {depth: 7}, label: \"outer\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.mag"),
         r#"
-import support.{Box, Sw}
-type Flag = Yes(Unit) | No()
-let unit = nil
+import shapes.{Timeout, Maybe, outer}
+import shapes.{}
+import shapes as s
+type Local = Idle | Busy(Int)
+type Single = | Only
+type Alias = Timeout
+let unannotated = Timeout.Unlimited
+let show: fn(Timeout) -> String = |timeout| => match timeout {
+  case Unlimited => "unlimited",
+  case Seconds(n) => str(n),
+  case Explicit(unit) => "explicit",
+}
+let local: fn(Local) -> Int = |value| => match value { case Idle => 0, case Busy(n) => n }
+let size: fn(Maybe<Int>) -> Int = |maybe| => match maybe { case Just(n) => n, case shapes.Maybe.Nothing => 0 }
+let annotated: Maybe<Int> = Maybe.Nothing
+let nested: fn(Maybe<shapes.Outer>) -> Int = |maybe| => match maybe { case Just(found) => found.inner.depth, case Nothing => 0 }
 artifact {
-  declared_unit: [Flag.Yes(), Flag.No()],
-  imported: Sw.Off(),
-  generic_unit_constructor: Box<Int>.Empty(),
-  parameter_at_unit: Box<Unit>.Full(nil),
-  parameter_at_unit_value: Box<Unit>.Full(unit),
-  parameter_inferred_unit: Box.Full(nil),
+  owners: map(show, [unannotated, shapes.Timeout.Unlimited, s.Timeout.Unlimited, Alias.Unlimited]),
+  payloads: [show(Timeout.Seconds(3)), show(Timeout.Explicit(nil))],
+  local: [local(Local.Idle), local(Local.Busy(5))],
+  single: Single.Only,
+  generic: [size(annotated), size(Maybe.Nothing), size(Maybe<Int>.Nothing), size(Maybe.Just(4))],
+  list: map(size, [Maybe.Just(1), Maybe.Nothing]),
+  value: Timeout.Unlimited,
+  unit_parameter: Maybe<Unit>.Just(nil),
+  fields: [str(outer.inner.depth), outer.label, str(shapes.outer.inner.depth), str(nested(Maybe.Just(outer)))],
 }
 "#,
-    );
+    )
+    .unwrap();
     assert_eq!(
-        artifact,
+        compile_file_with_syntax(&root, "main.mag", SyntaxMode::New).unwrap(),
         serde_json::json!({
-            "declared_unit": [
-                {"constructor": "Yes", "value": null},
-                {"constructor": "No", "value": null},
-            ],
-            "imported": {"constructor": "Off", "value": null},
-            "generic_unit_constructor": {"constructor": "Empty", "value": null},
-            "parameter_at_unit": {"constructor": "Full", "value": null},
-            "parameter_at_unit_value": {"constructor": "Full", "value": null},
-            "parameter_inferred_unit": {"constructor": "Full", "value": null},
+            "owners": ["unlimited", "unlimited", "unlimited", "unlimited"],
+            "payloads": ["3", "explicit"],
+            "local": [0, 5],
+            "single": {"constructor": "Only", "value": null},
+            "generic": [0, 0, 0, 4],
+            "list": [1, 0],
+            "value": {"constructor": "Unlimited", "value": null},
+            "unit_parameter": {"constructor": "Just", "value": null},
+            "fields": ["7", "outer", "7", "7"],
         })
     );
 
-    for (name, body, expected) in [
+    let error = |body: &str| {
+        fs::write(
+            root.join("main.mag"),
+            format!("import shapes.{{Timeout, Maybe, outer}}\n{body}\nartifact(1)\n"),
+        )
+        .unwrap();
+        compile_file_with_syntax(&root, "main.mag", SyntaxMode::New)
+            .map(|artifact| format!("unexpectedly compiled: {artifact}"))
+            .unwrap_or_else(|error| error.to_string())
+    };
+    for (body, expected) in [
         (
-            "nil",
-            "Sw.Off(nil)",
-            "constructor support.Sw.Off takes no arguments, got 1; write Sw.Off()",
+            "let value = Timeout.Unlimited()",
+            "constructor shapes.Timeout.Unlimited has no payload and takes no argument list; write Timeout.Unlimited",
         ),
         (
-            "value",
-            "Sw.Off(1)",
-            "constructor support.Sw.Off takes no arguments, got 1",
+            "let value = Timeout.Unlimited(nil)",
+            "constructor shapes.Timeout.Unlimited has no payload and takes no argument list; write Timeout.Unlimited",
         ),
         (
-            "several",
-            "Sw.Off(1, 2)",
-            "constructor support.Sw.Off takes no arguments, got 2",
+            "let value = Maybe<Int>.Nothing()",
+            "constructor shapes.Maybe.Nothing has no payload and takes no argument list; write Maybe.Nothing",
         ),
         (
-            "labelled",
-            "Sw.Off(unit: nil)",
-            "constructor support.Sw.Off takes no arguments, got 1",
+            "let value = Timeout.Seconds",
+            "constructor shapes.Timeout.Seconds takes a payload of type Int; write Timeout.Seconds(...)",
         ),
         (
-            "generic",
-            "Box<Int>.Empty(nil)",
-            "constructor support.Box.Empty takes no arguments, got 1; write Box.Empty()",
+            "let value = Timeout.Explicit",
+            "constructor shapes.Timeout.Explicit takes a payload of type Unit; write Timeout.Explicit(...)",
         ),
         (
-            "parameter-needs-argument",
-            "Box<Unit>.Full()",
-            "constructor support.Box.Full takes a payload of type Unit, got 0 arguments",
+            "let value = Timeout.Explicit()",
+            "constructor shapes.Timeout.Explicit takes a payload of type Unit, got 0 arguments",
         ),
+        (
+            "let value = Maybe<Int>.Just",
+            "constructor shapes.Maybe.Just takes a payload of type Int; write Maybe.Just(...)",
+        ),
+        (
+            "let value = Maybe.Nothing",
+            "cannot infer type argument T of shapes.Maybe from the payload or the expected type; write Maybe<...>.Nothing with explicit type arguments",
+        ),
+        (
+            "let value = Timeout.Bogus",
+            "constructor Bogus is not a member of shapes.Timeout; available constructors: Unlimited, Seconds, Explicit",
+        ),
+        (
+            "let show: fn(Timeout) -> Int = |t| => match t { case Unlimited(unit) => 0, case Seconds(n) => n, case Explicit(unit) => 1 }",
+            "constructor shapes.Timeout.Unlimited has no payload to bind; write case Unlimited =>",
+        ),
+        (
+            "let show: fn(Timeout) -> Int = |t| => match t { case Unlimited => 0, case Seconds => 2, case Explicit(unit) => 1 }",
+            "constructor shapes.Timeout.Seconds has a payload of type Int; write case Seconds(name) =>",
+        ),
+        (
+            "let show: fn(Timeout) -> Int = |t| => match t { case Unlimted => 0, case Seconds(n) => n, case Explicit(unit) => 1 }",
+            "constructor Unlimted is not a member of shapes.Timeout; available constructors: Unlimited, Seconds, Explicit",
+        ),
+        (
+            "let show: fn(Timeout) -> Int = |t| => match t { case Unlimited => 0, case Seconds(n) => n }",
+            "non-exhaustive match; missing Explicit",
+        ),
+        (
+            "let show: fn(Timeout) -> Int = |t| => match t { case Unlimited() => 0, case Seconds(n) => n, case Explicit(unit) => 1 }",
+            "a constructor without a payload is matched as the bare name",
+        ),
+        ("let value = outer.missing", "missing"),
     ] {
-        let error = constructor_error(
-            &format!("constructor-unit-rule-{name}"),
-            &format!("import support.{{Box, Sw}}\nlet value = {body}\nartifact(1)\n"),
-        );
-        assert!(error.contains(expected), "{body}: {error}");
+        let message = error(body);
+        assert!(message.contains(expected), "{body}: {message}");
     }
 
-    // An alternative always declares its payload; there is no bare form.
-    for declaration in [
-        "type Bare = Unlimited | Seconds(Int)\nartifact(1)\n",
-        "type Bare = Seconds(Int) | Unlimited\nartifact(1)\n",
-    ] {
-        assert!(compile_with_syntax(declaration, Path::new("."), SyntaxMode::New).is_err());
-    }
+    // `C()` is not a declaration form, and a bare name alone is an alias.
+    let empty = compile_with_syntax(
+        "type Flag = Yes() | No\nartifact(1)\n",
+        Path::new("."),
+        SyntaxMode::New,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        empty.contains("constructor Yes() declares no payload; write it as the bare name Yes"),
+        "{empty}"
+    );
+    let alias = compile_with_syntax(
+        "type Label = String\nlet label: Label = \"plain\"\nartifact(label)\n",
+        Path::new("."),
+        SyntaxMode::New,
+    )
+    .unwrap();
+    assert_eq!(alias, serde_json::json!("plain"));
+}
+
+#[test]
+fn bare_and_unit_payload_declarations_share_one_identity() {
+    let identity = |declaration: &str, construction: &str| {
+        compile_with_syntax(
+            &format!(
+                "{declaration}\ntype Evidence {{id: SemanticTypeId, descriptor: TypeDescriptor, schema: TypeSchema, value: Flag}}\nartifact(Evidence {{id: type_id(type_evidence(type_tag<Flag>())), descriptor: type_evidence(type_tag<Flag>()), schema: type_schema(type_tag<Flag>()), value: {construction}}})\n"
+            ),
+            Path::new("."),
+            SyntaxMode::New,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        identity("type Flag = Off | On(Int)", "Flag.Off"),
+        identity("type Flag = Off(Unit) | On(Int)", "Flag.Off(nil)")
+    );
 }
 
 #[test]

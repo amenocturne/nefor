@@ -324,11 +324,25 @@ fn infer(env: &Env, locals: &mut Locals, expr: &Expr) -> Result<MagType, MagErro
                     ))),
                 }
             }
-            None => env
-                .lookup(name)
-                .ok()
-                .and_then(|value| value_type(&value))
-                .ok_or_else(|| MagError::Unresolved(name.to_string())),
+            None => {
+                if let Some(ty) = env.lookup(name).ok().and_then(|value| value_type(&value)) {
+                    return Ok(ty);
+                }
+                let names_value = |path: &str| {
+                    locals.contains_key(path)
+                        || env
+                            .lookup_candidates(path)
+                            .iter()
+                            .any(|value| !matches!(value, Value::Type(_) | Value::TypeDecl(_)))
+                };
+                match dotted_reference(env, &local_type_variables(locals), name, names_value) {
+                    Some(DottedReference::Constructor(owner)) => {
+                        infer_construct(env, locals, owner, name.last(), ConstructorPayload::Bare)
+                    }
+                    Some(DottedReference::Field(access)) => infer(env, locals, &access),
+                    None => Err(MagError::Unresolved(name.to_string())),
+                }
+            }
         },
         Expr::Vector(items) => infer_list(env, locals, items),
         Expr::Tuple(items) => Ok(MagType::Product(
@@ -659,6 +673,9 @@ fn local_type_variables(locals: &Locals) -> HashSet<String> {
 enum ConstructorPayload<'a> {
     Positional(&'a [Expr]),
     Named(&'a [(String, Expr)]),
+    /// No argument list: `Owner.Constructor`, the spelling of a constructor
+    /// declared without a payload.
+    Bare,
     /// The payload value itself, with no argument sugar (the Lisp
     /// `construct` form).
     Whole(&'a Expr),
@@ -674,16 +691,6 @@ impl<'a> ConstructorPayload<'a> {
             other => other,
         }
     }
-
-    /// How many arguments were written, or `None` for a whole payload, which
-    /// is not subject to argument-count rules.
-    fn argument_count(self) -> Option<usize> {
-        match self {
-            Self::Positional(values) => Some(values.len()),
-            Self::Named(fields) => Some(fields.len()),
-            Self::Whole(_) | Self::Record(_) => None,
-        }
-    }
 }
 
 impl<'a> From<&'a ConstructorArguments> for ConstructorPayload<'a> {
@@ -692,6 +699,7 @@ impl<'a> From<&'a ConstructorArguments> for ConstructorPayload<'a> {
             ConstructorArguments::Positional(values) => Self::Positional(values),
             ConstructorArguments::Named(fields) => Self::Named(fields),
             ConstructorArguments::Payload(payload) => Self::Whole(payload),
+            ConstructorArguments::Bare => Self::Bare,
         }
     }
 }
@@ -729,7 +737,7 @@ impl ConstructionOwner {
     fn undetermined(
         &self,
         constructor: &str,
-        argument_count: usize,
+        applied: bool,
         substitution: &HashMap<String, MagType>,
     ) -> Option<MagError> {
         let undetermined = self
@@ -748,10 +756,10 @@ impl ConstructionOwner {
         }
         let short = self.declared.rsplit('.').next().unwrap_or(&self.declared);
         Some(MagError::Type(format!(
-            "cannot infer type argument {} of {} from the payload or the expected type; write {short}<...>.{constructor}({}) with explicit type arguments",
+            "cannot infer type argument {} of {} from the payload or the expected type; write {short}<...>.{constructor}{} with explicit type arguments",
             undetermined.join(", "),
             self.declared,
-            if argument_count == 0 { "" } else { "..." },
+            if applied { "(...)" } else { "" },
         )))
     }
 }
@@ -845,6 +853,53 @@ fn resolve_construction_owner(
         ty,
         open: Vec::new(),
     })
+}
+
+/// What a dotted path that names no value refers to.
+enum DottedReference {
+    /// `Owner.Constructor`: a constructor in the scope of a type.
+    Constructor(ConstructionOwner),
+    /// `value.field`: field access on the longest prefix that names a value.
+    Field(Expr),
+}
+
+/// Resolves a dotted path once imports are known. A value named by the whole
+/// path wins; then a constructor of an owner type; then field access.
+fn dotted_reference(
+    env: &Env,
+    vars: &HashSet<String>,
+    path: &NamePath,
+    names_value: impl Fn(&str) -> bool,
+) -> Option<DottedReference> {
+    let segments = path.segments();
+    if segments.len() < 2 || names_value(path.as_str()) {
+        return None;
+    }
+    if let Some(owner) = constructor_owner(env, vars, path) {
+        return Some(DottedReference::Constructor(owner));
+    }
+    (1..segments.len()).rev().find_map(|split| {
+        let prefix = NamePath::from_segments(segments[..split].to_vec());
+        names_value(prefix.as_str()).then(|| {
+            DottedReference::Field(segments[split..].iter().fold(
+                Expr::Name(prefix),
+                |value, field| Expr::Call {
+                    callee: Box::new(Expr::Name("get".into())),
+                    type_args: None,
+                    args: vec![value, Expr::Str(field.clone())],
+                },
+            ))
+        })
+    })
+}
+
+/// Whether a visible candidate is a value rather than a type declaration. An
+/// inline record payload is declared as a type named like its constructor.
+fn is_value_candidate(env: &Env, candidate: &CheckedCandidate) -> bool {
+    !matches!(
+        env.ready_binding(candidate.id),
+        Ok(Value::Type(_) | Value::TypeDecl(_))
+    )
 }
 
 /// The type that owns `Owner.Constructor`, when the path's owner names a type.
@@ -950,7 +1005,7 @@ fn constructor_fields<'a>(
     let (fields, ascribed) = match arguments {
         ConstructorPayload::Named(fields) => (fields, true),
         ConstructorPayload::Record(fields) => (fields, false),
-        ConstructorPayload::Whole(_) => return Ok(None),
+        ConstructorPayload::Bare | ConstructorPayload::Whole(_) => return Ok(None),
         ConstructorPayload::Positional(values) => {
             let Some(order) = inline_field_order(env, constructor, payload_type) else {
                 return Ok(None);
@@ -1016,8 +1071,7 @@ fn infer_construct(
     arguments: ConstructorPayload<'_>,
 ) -> Result<MagType, MagError> {
     let resolved = constructor_payload(env, &owner.ty, constructor)?;
-    resolved.check_argument_count(arguments)?;
-    let takes_no_arguments = resolved.takes_no_arguments;
+    resolved.check_spelling(arguments)?;
     let (constructor, payload_type) = (resolved.id, resolved.payload);
     let bindable = owner.bindable();
     let mut substitution = HashMap::new();
@@ -1032,10 +1086,10 @@ fn infer_construct(
     }
     match arguments {
         ConstructorPayload::Named(_) | ConstructorPayload::Record(_) => {}
-        ConstructorPayload::Positional([]) if !takes_no_arguments => {
+        ConstructorPayload::Bare => {}
+        ConstructorPayload::Positional([]) => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
-        ConstructorPayload::Positional([]) => {}
         ConstructorPayload::Positional([value]) | ConstructorPayload::Whole(value) => {
             unify_payload(
                 env,
@@ -1089,7 +1143,9 @@ fn infer_match(
         };
         let constructor_name =
             match_constructor_name(&owner, resolved_pattern_owner.as_ref(), &arm.pattern)?;
-        let (constructor, payload_type) = instantiated_constructor(env, &owner, constructor_name)?;
+        let declared = instantiated_constructor(env, &owner, constructor_name)?;
+        check_pattern_spelling(&declared, arm.binding.as_deref())?;
+        let (constructor, payload_type) = (declared.id, declared.payload);
         if !seen.insert(constructor.clone()) {
             return Err(MagError::Type(format!(
                 "duplicate match arm for {}",
@@ -1097,7 +1153,9 @@ fn infer_match(
             )));
         }
         let mut arm_locals = locals.clone();
-        add_local(&mut arm_locals, arm.binding.clone(), payload_type)?;
+        if let Some(binding) = &arm.binding {
+            add_local(&mut arm_locals, binding.clone(), payload_type)?;
+        }
         let body_type = infer(env, &mut arm_locals, &arm.body)?;
         if result.as_ref() == Some(&MagType::Never) && body_type != MagType::Never {
             result = Some(body_type);
@@ -2786,7 +2844,27 @@ fn compile_expr(
         Expr::Float(value) => checked(MagType::Float, CheckedExprKind::Float(*value)),
         Expr::Str(value) => checked(MagType::String, CheckedExprKind::Str(value.clone())),
         Expr::Keyword(value) => checked(MagType::String, CheckedExprKind::Keyword(value.clone())),
-        Expr::Name(name) => compile_symbol(env, scopes, name, expected)?,
+        Expr::Name(name) => {
+            let names_value = |path: &str| {
+                all_candidates(env, scopes, path)
+                    .iter()
+                    .any(|candidate| is_value_candidate(env, candidate))
+            };
+            match dotted_reference(env, &visible_type_variables(scopes), name, names_value) {
+                Some(DottedReference::Constructor(owner)) => compile_construct(
+                    env,
+                    scopes,
+                    owner,
+                    name.last(),
+                    ConstructorPayload::Bare,
+                    expected,
+                )?,
+                Some(DottedReference::Field(access)) => {
+                    return compile_expr(env, scopes, &access, expected)
+                }
+                None => compile_symbol(env, scopes, name, expected)?,
+            }
+        }
         Expr::Vector(items) => compile_vector(env, scopes, items, expected)?,
         Expr::Tuple(items) => compile_tuple(env, scopes, items, expected)?,
         Expr::Fields(_) => {
@@ -3045,14 +3123,9 @@ fn compile_call(
         let candidates = all_candidates(env, scopes, name);
         // A constructor is not a module-scope symbol, so a dotted path that
         // names no value is looked up in the scope of its owner type.
-        // (An inline record payload is declared as a type named like its
-        // constructor, so type declarations are not values here.)
-        let names_value = candidates.iter().any(|candidate| {
-            !matches!(
-                env.ready_binding(candidate.id),
-                Ok(Value::Type(_) | Value::TypeDecl(_))
-            )
-        });
+        let names_value = candidates
+            .iter()
+            .any(|candidate| is_value_candidate(env, candidate));
         if !names_value && explicit_type_args.is_none() {
             if let Some(owner) = constructor_owner(env, &visible_type_variables(scopes), name) {
                 return compile_construct(
@@ -3141,8 +3214,7 @@ fn compile_construct(
     expected: Option<&MagType>,
 ) -> Result<CheckedExpr, MagError> {
     let resolved = constructor_payload(env, &owner.ty, constructor_name)?;
-    resolved.check_argument_count(arguments)?;
-    let takes_no_arguments = resolved.takes_no_arguments;
+    resolved.check_spelling(arguments)?;
     let (constructor, payload_type) = (resolved.id, resolved.payload);
     let bindable = owner.bindable();
     let mut substitution = HashMap::new();
@@ -3208,11 +3280,11 @@ fn compile_construct(
                 constructor.owner, constructor.name
             )));
         }
-        (None, ConstructorPayload::Positional([])) if !takes_no_arguments => {
-            return Err(payload_arity_error(&constructor, &payload_type, 0));
+        (None, ConstructorPayload::Bare) => {
+            (checked(MagType::Unit, CheckedExprKind::Unit), Shape::Plain)
         }
         (None, ConstructorPayload::Positional([])) => {
-            (checked(MagType::Unit, CheckedExprKind::Unit), Shape::Plain)
+            return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
         (None, ConstructorPayload::Positional([value]) | ConstructorPayload::Whole(value)) => {
             let value_expected = substitute_fully(&payload_type, &substitution);
@@ -3234,8 +3306,8 @@ fn compile_construct(
             (tuple, Shape::Ascribed)
         }
     };
-    let argument_count = arguments.argument_count().unwrap_or(1);
-    if let Some(error) = owner.undetermined(&constructor.name, argument_count, &substitution) {
+    let applied = !matches!(arguments, ConstructorPayload::Bare);
+    if let Some(error) = owner.undetermined(&constructor.name, applied, &substitution) {
         return Err(error);
     }
     let owner = owner.resolved(&substitution);
@@ -3287,30 +3359,35 @@ fn compile_match(
             resolved_pattern_owner.as_ref(),
             &arm_expression.pattern,
         )?;
-        let (constructor, payload_type) =
-            instantiated_constructor(env, &value.ty, constructor_name)?;
+        let declared = instantiated_constructor(env, &value.ty, constructor_name)?;
+        check_pattern_spelling(&declared, arm_expression.binding.as_deref())?;
+        let (constructor, payload_type) = (declared.id, declared.payload);
         if !seen.insert(constructor.clone()) {
             return Err(MagError::Type(format!(
                 "duplicate match arm for {}",
                 arm_expression.pattern
             )));
         }
-        let binding_name = &arm_expression.binding;
-        let binding_id = env.allocate_binding_id(binding_name, Some(payload_type.clone()));
+        // A pattern without a binding still receives the (Unit) payload at
+        // evaluation; its slot has no name the arm could refer to.
+        let binding_name = arm_expression.binding.clone().unwrap_or_default();
+        let binding_id = env.allocate_binding_id(&binding_name, Some(payload_type.clone()));
         let mut arm_scope = CheckedScope::new();
-        insert_checked_candidate(
-            env,
-            scopes,
-            &mut arm_scope,
-            binding_name,
-            CheckedCandidate {
-                id: binding_id,
-                ty: payload_type.clone(),
-                generic_binders: vec![],
-                parameter_names: None,
-                contributes_type_vars: false,
-            },
-        )?;
+        if arm_expression.binding.is_some() {
+            insert_checked_candidate(
+                env,
+                scopes,
+                &mut arm_scope,
+                &binding_name,
+                CheckedCandidate {
+                    id: binding_id,
+                    ty: payload_type.clone(),
+                    generic_binders: vec![],
+                    parameter_names: None,
+                    contributes_type_vars: false,
+                },
+            )?;
+        }
         let mut arm_scopes = scopes.to_vec();
         arm_scopes.push(arm_scope);
         let arm_expected = result.as_ref().filter(|ty| **ty != MagType::Never);
@@ -3377,6 +3454,7 @@ fn adt_constructors(env: &Env, owner: &MagType) -> Result<Vec<ConstructorDecl>, 
     Ok(constructors
         .into_iter()
         .map(|constructor| ConstructorDecl {
+            payloadless: constructor.payloadless,
             id: constructor.id,
             payload: substitute(&constructor.payload, &substitutions),
         })
@@ -3406,13 +3484,13 @@ fn instantiated_constructor(
     env: &Env,
     owner: &MagType,
     name: &str,
-) -> Result<(ConstructorDeclarationId, MagType), MagError> {
+) -> Result<ConstructorDecl, MagError> {
     let constructors = adt_constructors(env, owner)?;
     if let Some(constructor) = constructors
         .iter()
         .find(|constructor| constructor.id.name == name)
     {
-        return Ok((constructor.id.clone(), constructor.payload.clone()));
+        return Ok(constructor.clone());
     }
     Err(unknown_constructor(
         name,
@@ -3453,17 +3531,16 @@ fn constructor_payload(
     let TypeDeclBody::Adt(constructors) = &declaration.body else {
         return Err(not_an_adt());
     };
-    let Some(declared) = constructors
+    if !constructors
         .iter()
-        .find(|constructor| constructor.id.name == name)
-    else {
+        .any(|constructor| constructor.id.name == name)
+    {
         return Err(unknown_constructor(
             name,
             owner,
             constructors.iter().map(|constructor| &constructor.id),
         ));
-    };
-    let takes_no_arguments = declared.payload == MagType::Unit;
+    }
     if declaration.params.len() != arguments.len() {
         return Err(MagError::Type(format!(
             "{type_name} expects {} type arguments, got {}; construct it with explicit arguments as {}<...>.{name}(...)",
@@ -3472,11 +3549,11 @@ fn constructor_payload(
             type_name.rsplit('.').next().unwrap_or(type_name),
         )));
     }
-    let (id, payload) = instantiated_constructor(env, owner, name)?;
+    let constructor = instantiated_constructor(env, owner, name)?;
     Ok(ResolvedConstructor {
-        id,
-        payload,
-        takes_no_arguments,
+        id: constructor.id,
+        payload: constructor.payload,
+        payloadless: constructor.payloadless,
     })
 }
 
@@ -3485,26 +3562,56 @@ fn constructor_payload(
 struct ResolvedConstructor {
     id: ConstructorDeclarationId,
     payload: MagType,
-    /// Whether the constructor is declared with a `Unit` payload. The
-    /// declaration decides this, not the instantiation: `Full(T)` takes one
-    /// argument even at `T = Unit`.
-    takes_no_arguments: bool,
+    /// Declared as a bare name. The declaration decides this, not the payload
+    /// type: `Empty(Unit)` and `Full(T)` at `T = Unit` both take a `nil`.
+    payloadless: bool,
 }
 
 impl ResolvedConstructor {
-    /// A constructor declared with a `Unit` payload has nothing to pass and is
-    /// written `Type.C()`; every other constructor needs its payload.
-    fn check_argument_count(&self, arguments: ConstructorPayload<'_>) -> Result<(), MagError> {
-        match arguments.argument_count() {
-            Some(count) if self.takes_no_arguments && count > 0 => {
-                let short = self.id.owner.rsplit('.').next().unwrap_or(&self.id.owner);
-                Err(MagError::Type(format!(
-                    "constructor {}.{} takes no arguments, got {count}; write {short}.{}()",
-                    self.id.owner, self.id.name, self.id.name
-                )))
-            }
-            _ => Ok(()),
+    fn spelling(&self) -> String {
+        let short = self.id.owner.rsplit('.').next().unwrap_or(&self.id.owner);
+        format!("{short}.{}", self.id.name)
+    }
+
+    /// A constructor declared without a payload is written `Type.C`, with no
+    /// argument list; every other constructor is applied to its payload.
+    fn check_spelling(&self, arguments: ConstructorPayload<'_>) -> Result<(), MagError> {
+        match (self.payloadless, arguments) {
+            (true, ConstructorPayload::Bare | ConstructorPayload::Whole(_))
+            | (false, ConstructorPayload::Positional(_) | ConstructorPayload::Named(_))
+            | (false, ConstructorPayload::Whole(_) | ConstructorPayload::Record(_)) => Ok(()),
+            (true, _) => Err(MagError::Type(format!(
+                "constructor {}.{} has no payload and takes no argument list; write {}",
+                self.id.owner,
+                self.id.name,
+                self.spelling()
+            ))),
+            (false, ConstructorPayload::Bare) => Err(MagError::Type(format!(
+                "constructor {}.{} takes a payload of type {}; write {}(...)",
+                self.id.owner,
+                self.id.name,
+                self.payload,
+                self.spelling()
+            ))),
         }
+    }
+}
+
+/// How a `case` pattern must be written for a constructor.
+fn check_pattern_spelling(
+    constructor: &ConstructorDecl,
+    binding: Option<&str>,
+) -> Result<(), MagError> {
+    match (constructor.payloadless, binding) {
+        (true, Some(_)) => Err(MagError::Type(format!(
+            "constructor {}.{} has no payload to bind; write case {} =>",
+            constructor.id.owner, constructor.id.name, constructor.id.name
+        ))),
+        (false, None) => Err(MagError::Type(format!(
+            "constructor {}.{} has a payload of type {}; write case {}(name) =>",
+            constructor.id.owner, constructor.id.name, constructor.payload, constructor.id.name
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -3581,7 +3688,7 @@ fn compile_ascribe(
     let target = parse_checked_type(env, scopes, authored_target)?;
     let source_expected = match source {
         Expr::Fields(_) => Some(&target),
-        Expr::Name(name) if all_candidates(env, scopes, name).len() > 1 => Some(&target),
+        Expr::Name(name) if all_candidates(env, scopes, name).len() != 1 => Some(&target),
         _ => None,
     };
     let value = match source {

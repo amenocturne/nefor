@@ -30,11 +30,11 @@ type AgentError {last_output: JsonValue, reason: AgentErrorReason}
 // carries mechanism-neutral per-agent approval-rule metadata.
 type ToolApprovalRules {rules: Map<String, String>}
 
-type ToolApprovalPolicy = Default(Unit) | Rules(ToolApprovalRules)
+type ToolApprovalPolicy = Default | Rules(ToolApprovalRules)
 
 type ToolApprovalRuntimeRules {rules: Map<String, String>}
 
-type Timeout = Unlimited(Unit) | Milliseconds(Int) | Seconds(Int) | Minutes(Int)
+type Timeout = Unlimited | Milliseconds(Int) | Seconds(Int) | Minutes(Int)
 
 type ProcessExited {code: Int}
 
@@ -54,6 +54,6 @@ let identifier: fn(String) -> OptionalIdentifier = |value| => OptionalIdentifier
 
 
 let normalize_tool_approval_policy: fn(ToolApprovalPolicy) -> ToolApprovalRuntimeRules = |policy| => match policy {
-  case Default(unit) => ToolApprovalRuntimeRules {rules: core.map.empty<String, String>()},
+  case Default => ToolApprovalRuntimeRules {rules: core.map.empty<String, String>()},
   case Rules(policy_rules) => ToolApprovalRuntimeRules {rules: get(policy_rules, "rules")},
 }

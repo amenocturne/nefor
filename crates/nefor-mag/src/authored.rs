@@ -134,6 +134,9 @@ pub enum TypeDeclarationBody {
 pub struct ConstructorDeclaration {
     pub name: String,
     pub payload: Type,
+    /// Declared as a bare name, with no payload. Its payload type is `Unit`,
+    /// so its identity equals that of `Name(Unit)`; only its spelling differs.
+    pub payloadless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +204,8 @@ pub enum ConstructorArguments {
     /// The payload value itself, with no argument sugar (the Lisp
     /// `construct` form, which always states its payload).
     Payload(Box<Expr>),
+    /// No argument list at all: `Owner<Args>.Constructor`.
+    Bare,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,7 +217,8 @@ pub enum TypeArgument {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: NamePath,
-    pub binding: String,
+    /// The payload binding; absent for `case Constructor =>`.
+    pub binding: Option<String>,
     pub body: Box<Expr>,
 }
 

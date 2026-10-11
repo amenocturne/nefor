@@ -52,7 +52,7 @@ can expire.
   its processes exit, so awaiting a run that never ends, such as a server,
   never returns. Cancelling the wait does not stop the run.
 Script and process nodes run without a wall-clock bound when their timeout is
-`Timeout.Unlimited()`; give a bound with `Timeout.Milliseconds(n)`,
+`Timeout.Unlimited`; give a bound with `Timeout.Milliseconds(n)`,
 `Timeout.Seconds(n)`, or `Timeout.Minutes(n)` when an operation needs one.
 
 A `run_id` that cannot be used reports why: malformed (not a run handle),

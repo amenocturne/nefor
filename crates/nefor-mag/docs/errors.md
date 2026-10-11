@@ -28,8 +28,11 @@ Construction is checked before evaluation. The checker reports:
 
 - `constructor C is not a member of T; available constructors: A, B` when the owner is an ADT that does not declare the constructor (the same message covers a foreign `match` case);
 - `T is not an ADT and has no constructor C` when the owner is a record, alias target, or built-in type;
-- `cannot infer type argument P of T from the payload or the expected type; write T<...>.C(...) with explicit type arguments` when a generic owner is written without arguments and neither the payload nor an expected type determines parameter `P`, as in an unannotated `let absent = Option.None()`;
-- `constructor T.C takes no arguments, got N; write T.C()` when a constructor declared with a `Unit` payload is given any argument, including `nil`;
+- `cannot infer type argument P of T from the payload or the expected type; write T<...>.C(...) with explicit type arguments` when a generic owner is written without arguments and neither the payload nor an expected type determines parameter `P`, as in an unannotated `let absent = Option.None`;
+- `constructor T.C has no payload and takes no argument list; write T.C` when an alternative declared as a bare name is given an argument list, including `()` and `(nil)`;
+- `constructor T.C takes a payload of type P; write T.C(...)` when a constructor with a payload is named without arguments;
+- `constructor T.C has no payload to bind; write case C =>` and `constructor T.C has a payload of type P; write case C(name) =>` when a `match` case uses the other constructor kind's form;
+- `constructor C() declares no payload; write it as the bare name C` for the removed `C()` declaration form;
 - `constructor T.C takes a payload of type P, got N arguments` when the argument count cannot form the payload, and an ordinary type mismatch when the payload has the wrong type;
 - `constructor T.C takes N fields (a, b), got M arguments` when positional arguments do not match an inline record payload, `field a of constructor T.C: expected A, got B` when a field's value has the wrong type, and `constructor arguments must be either all positional or all named` when the two forms are mixed;
 - `duplicate constructor C in T` when one ADT declares a constructor name twice;

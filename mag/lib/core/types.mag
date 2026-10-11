@@ -1,6 +1,6 @@
 // Small algebraic types shared by MAG libraries. These are ordinary nominal
 // data types; the evaluator has no special knowledge of them.
-type Option<T> = Some(T) | None(Unit)
+type Option<T> = Some(T) | None
 
 type Either<L, R> = Left(L) | Right(R)
 
@@ -8,7 +8,7 @@ type Result<E, T> = Ok(T) | Error(E)
 
 let some<T>: fn(T) -> Option<T> = |value| => Option<T>.Some(value)
 
-let none<T>: fn() -> Option<T> = | | => Option<T>.None()
+let none<T>: fn() -> Option<T> = | | => Option<T>.None
 
 let left<L, R>: fn(L) -> Either<L, R> = |value| => Either<L, R>.Left(value)
 
@@ -18,7 +18,7 @@ let ok<E, T>: fn(T) -> Result<E, T> = |value| => Result<E, T>.Ok(value)
 
 let error<E, T>: fn(E) -> Result<E, T> = |value| => Result<E, T>.Error(value)
 
-let option_map<T, U>: fn(fn(T) -> U, Option<T>) -> Option<U> = |f, option| => match option { case Some(present) => Option<U>.Some(f(present)), case None(absent) => Option<U>.None() }
+let option_map<T, U>: fn(fn(T) -> U, Option<T>) -> Option<U> = |f, option| => match option { case Some(present) => Option<U>.Some(f(present)), case None => Option<U>.None }
 
 let either_map<L, T, U>: fn(fn(T) -> U, Either<L, T>) -> Either<L, U> = |f, either| => match either { case Left(left_value) => Either<L, U>.Left(left_value), case Right(right_value) => Either<L, U>.Right(f(right_value)) }
 

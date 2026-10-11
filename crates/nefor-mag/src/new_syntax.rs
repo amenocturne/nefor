@@ -412,7 +412,6 @@ struct Parser<'a> {
     fixities: HashMap<String, Fixity>,
     aliases: HashMap<String, authored::NamePath>,
     requires: Vec<authored::Require>,
-    namespace_aliases: HashSet<String>,
     bound_names: HashSet<String>,
     allow_brace_construct: bool,
 }
@@ -428,7 +427,6 @@ impl<'a> Parser<'a> {
             fixities,
             aliases: HashMap::new(),
             requires: Vec::new(),
-            namespace_aliases: HashSet::new(),
             bound_names,
             allow_brace_construct: true,
         };
@@ -484,7 +482,6 @@ impl<'a> Parser<'a> {
             if alias == "_" {
                 return Err(self.here("'_' is only valid after 'as' in an import selector"));
             }
-            self.namespace_aliases.insert(alias.clone());
             self.aliases
                 .insert(alias.clone(), authored::NamePath::single(alias.clone()));
             authored::ImportExposure::NamespaceAlias(alias)
@@ -591,10 +588,15 @@ impl<'a> Parser<'a> {
             self.eat_operator("|");
             self.newlines();
             let constructor = self.expect_name()?;
+            let mut payloadless = false;
             let payload = if self.eat_punct('(') {
                 let items = self.parse_type_list(')')?;
                 match items.as_slice() {
-                    [] => authored::Type::Name("Unit".into()),
+                    [] => {
+                        return Err(self.here(format!(
+                            "constructor {constructor}() declares no payload; write it as the bare name {constructor}"
+                        )))
+                    }
                     [item] => item.clone(),
                     _ => authored::Type::Product(items),
                 }
@@ -620,11 +622,13 @@ impl<'a> Parser<'a> {
                     }
                 }
             } else {
-                return Err(self.here("constructor requires a positional or named payload"));
+                payloadless = true;
+                authored::Type::Name("Unit".into())
             };
             variants.push(authored::ConstructorDeclaration {
                 name: constructor,
                 payload,
+                payloadless,
             });
             let separator = self.cursor;
             self.newlines();
@@ -786,9 +790,7 @@ impl<'a> Parser<'a> {
                         } else if self.allow_brace_construct && self.eat_punct('{') {
                             authored::ConstructorArguments::Named(self.parse_value_fields('}')?)
                         } else {
-                            return Err(self.here(
-                                "a constructor must be applied; write Type<...>.Constructor(...)",
-                            ));
+                            authored::ConstructorArguments::Bare
                         };
                         value = authored::Expr::Construct {
                             owner: owner_type,
@@ -881,26 +883,10 @@ impl<'a> Parser<'a> {
                 .map(|path| path.segments().to_vec())
                 .unwrap_or_else(|| vec![word.clone()])
         };
-        let imported_alias = self.aliases.contains_key(&word);
-        // Bound values and selectively imported values own dot access. An import
-        // alias is consumed as a qualified owner only when the next segment is
-        // immediately constructed or called.
-        let alias_qualifies = self.namespace_aliases.contains(&word)
-            || (imported_alias
-                && self.at_punct('.')
-                && matches!(
-                    self.peek_n(1).kind,
-                    TokenKind::Ident(_) | TokenKind::Operator(_)
-                )
-                && (matches!(self.peek_n(2).kind, TokenKind::Punct('(' | '{'))
-                    || matches!(
-                        self.peek_n(2).kind,
-                        TokenKind::Operator(ref operator) if operator == "<"
-                    )));
-        if !self.bound_names.contains(&word)
-            && self.at_punct('.')
-            && (!imported_alias || alias_qualifies)
-        {
+        // A lexically bound value owns dot access as field access. Any other
+        // dotted path is kept whole: after imports the checker decides whether
+        // it names a value, a field of a value, or a constructor.
+        if !self.bound_names.contains(&word) && self.at_punct('.') {
             while self.eat_punct('.') {
                 segments.push(self.expect_name()?);
             }
@@ -1062,9 +1048,18 @@ impl<'a> Parser<'a> {
             } else {
                 authored::NamePath::single(self.expect_name()?)
             };
-            self.expect_punct('(')?;
-            let binding = self.expect_name()?;
-            self.expect_punct(')')?;
+            let binding = if self.eat_punct('(') {
+                if self.at_punct(')') {
+                    return Err(self.here(
+                        "a case binds its payload as Constructor(name); a constructor without a payload is matched as the bare name",
+                    ));
+                }
+                let binding = self.expect_name()?;
+                self.expect_punct(')')?;
+                Some(binding)
+            } else {
+                None
+            };
             self.expect_fat_arrow()?;
             let body = self.parse_expr(expected)?;
             arms.push(authored::MatchArm {
@@ -1528,13 +1523,37 @@ impl<'a> Parser<'a> {
         while matches!(self.tokens[index].kind, TokenKind::Newline) {
             index += 1;
         }
-        if matches!(&self.tokens[index].kind, TokenKind::Operator(op) if op == "|") {
+        let is_pipe = |token: &Token| matches!(&token.kind, TokenKind::Operator(op) if op == "|");
+        let leading_pipe = is_pipe(&self.tokens[index]);
+        if leading_pipe {
             index += 1;
         }
-        matches!(self.tokens[index].kind, TokenKind::Ident(_))
-            && self.tokens.get(index + 1).is_some_and(|token| {
-                matches!(token.kind, TokenKind::Punct('(') | TokenKind::Punct('{'))
-            })
+        if !matches!(self.tokens[index].kind, TokenKind::Ident(_)) {
+            return false;
+        }
+        let Some(next) = self.tokens.get(index + 1) else {
+            return false;
+        };
+        if matches!(next.kind, TokenKind::Punct('(') | TokenKind::Punct('{')) {
+            return true;
+        }
+        // A bare name is an alternative without a payload only where a `|`
+        // makes the declaration a sum; alone it is an alias of that type.
+        if matches!(
+            next.kind,
+            TokenKind::Punct('.') | TokenKind::Operator(_) | TokenKind::Arrow
+        ) && !is_pipe(next)
+        {
+            return false;
+        }
+        let mut following = index + 1;
+        while matches!(
+            self.tokens.get(following).map(|token| &token.kind),
+            Some(TokenKind::Newline)
+        ) {
+            following += 1;
+        }
+        leading_pipe || self.tokens.get(following).is_some_and(is_pipe)
     }
 
     fn resolve_name(&mut self, name: &str) -> String {
@@ -2064,7 +2083,7 @@ mod tests {
     #[test]
     fn explicit_owner_arguments_select_a_construction() {
         let module = parse(
-            "type Option<T> = Some(T) | None()
+            "type Option<T> = Some(T) | None
 let value = Option<Int>.Some(1)
 ",
         )

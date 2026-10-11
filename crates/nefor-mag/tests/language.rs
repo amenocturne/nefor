@@ -1320,10 +1320,10 @@ fn never_branch_adopts_the_returning_branch_type() {
     let root = workspace("never-branch");
     let artifact = compile(
         r#"
-        type Choice = Stop(Unit) | Go(String)
+        type Choice = Stop | Go(String)
 type Unreachable {kind: String}
 let choice = Choice.Go("matched")
-artifact {conditional: if true then "ok" else fail(Unreachable {kind: "unreachable"}), matched: match choice { case Stop(value) => fail(Unreachable {kind: "unreachable"}), case Go(value) => value }}
+artifact {conditional: if true then "ok" else fail(Unreachable {kind: "unreachable"}), matched: match choice { case Stop => fail(Unreachable {kind: "unreachable"}), case Go(value) => value }}
         "#,
         &root,
     )

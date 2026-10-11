@@ -151,6 +151,7 @@ fn lower_declaration_body(expression: &ast::Expr) -> authored::TypeDeclarationBo
         constructors.push(authored::ConstructorDeclaration {
             name: name.to_owned(),
             payload: lower_type(payload),
+            payloadless: false,
         });
     }
     authored::TypeDeclarationBody::Adt(constructors)
@@ -283,7 +284,7 @@ fn lower_match(items: &[ast::Expr]) -> authored::Expr {
         };
         arms.push(authored::MatchArm {
             pattern: authored::NamePath::single(constructor.to_owned()),
-            binding: binding.to_owned(),
+            binding: Some(binding.to_owned()),
             body: Box::new(lower_expr(body)),
         });
     }

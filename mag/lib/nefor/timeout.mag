@@ -8,7 +8,7 @@ let bounded: fn(Int, Int) -> RuntimeTimeout = |value, factor| =>
   if int_gt(value, 0) then RuntimeTimeout {present: true, milliseconds: int_mul(value, factor)} else fail(["Timeout must be strictly positive"])
 
 let normalize: fn(nefor.contracts.Timeout) -> RuntimeTimeout = |timeout| => match timeout {
-  case Unlimited(unit) => RuntimeTimeout {present: false, milliseconds: 0},
+  case Unlimited => RuntimeTimeout {present: false, milliseconds: 0},
   case Milliseconds(value) => bounded(value, 1),
   case Seconds(value) => bounded(value, 1000),
   case Minutes(value) => bounded(value, 60000),

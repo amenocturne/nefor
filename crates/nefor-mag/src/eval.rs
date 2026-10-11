@@ -288,6 +288,7 @@ fn eval_type_declaration(env: &mut Env, authored: &TypeDeclaration) -> Result<Va
                             name: constructor.name.clone(),
                         },
                         payload: crate::checker::resolve_type(env, &constructor.payload, &vars)?,
+                        payloadless: constructor.payloadless,
                     })
                 })
                 .collect::<Result<Vec<_>, MagError>>()?;

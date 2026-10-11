@@ -221,12 +221,12 @@ import nefor.graph.{}
 import nefor.node.{}
 import nefor.shell.{}
 
-let first_base = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf first", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
-let second_base = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf second", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
+let first_base = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf first", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
+let second_base = nefor.shell.script("operation", nefor.shell.ShellScriptParams {script: "printf second", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
 let first = nefor.graph.node_with_operations_and_nodes("left-child", "ordinary", get(first_base, "actors"), get(first_base, "routes"), get(first_base, "messages"), get(first_base, "operations"), [nefor.graph.logical_node(["left-child"], ["operation"])], get(first_base, "input"), get(first_base, "output"))
 let second = nefor.graph.node_with_operations_and_nodes("right-child", "ordinary", get(second_base, "actors"), get(second_base, "routes"), get(second_base, "messages"), get(second_base, "operations"), [nefor.graph.logical_node(["right-child"], ["operation"])], get(second_base, "input"), get(second_base, "output"))
-let left_peer = nefor.shell.script("left-peer", nefor.shell.ShellScriptParams {script: "printf peer", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
-let right_peer = nefor.shell.script("right-peer", nefor.shell.ShellScriptParams {script: "printf peer", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
+let left_peer = nefor.shell.script("left-peer", nefor.shell.ShellScriptParams {script: "printf peer", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
+let right_peer = nefor.shell.script("right-peer", nefor.shell.ShellScriptParams {script: "printf peer", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
 let left = nefor.node.fanout("left-wrapper", first, left_peer)
 let right = nefor.node.fanout("right-wrapper", second, right_peer)
 let conflicting = nefor.node.fanout("outer", left, right)
@@ -821,7 +821,7 @@ fn only_exact_unit_ports_are_root_capable() {
 import nefor.graph.{}
 import nefor.contracts.{}
 import core.map.{}
-type Maybe = Ready(Unit) | Waiting(String)
+type Maybe = Ready | Waiting(String)
 let exact = nefor.graph.store_port(nefor.graph.port("exact", type_tag<Unit>(), "wire"))
 let sum = nefor.graph.store_port(nefor.graph.port("sum", type_tag<Maybe>(), "wire"))
 let product = nefor.graph.store_port(nefor.graph.port("product", type_tag<(Unit, String)>(), "wire"))
@@ -1128,7 +1128,7 @@ let mapped_error = nefor.result.map_error(result_input, error_mapper)
 let bound = nefor.result.and_then("bound", result_input, lifted)
 let operator_bound = nefor.result.`>=>`(result_input, lifted)
 let policy = nefor.contracts.ToolApprovalPolicy.Rules(nefor.contracts.ToolApprovalRules {rules: core.map.insert((core.map.empty<String, String>(): Map<String, String>), "bash", "deny")})
-let no_policy = nefor.contracts.ToolApprovalPolicy.Default()
+let no_policy = nefor.contracts.ToolApprovalPolicy.Default
 let resolve_model: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
 let agent = nefor.actors.agent<String, Input, Output>("agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: policy})
 let dynamic_agent = nefor.actors.agent<String, Input, nefor.dynamic.DynamicList<Output>>("dynamic-agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: no_policy})
@@ -1240,7 +1240,7 @@ type RecordAlias = Record
 type DynamicList<T> {value: T}
 
 let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
-let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default()}
+let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}
 let dynamic = nefor.actors.agent<String, Unit, nefor.dynamic.DynamicList<RecordAlias>>("dynamic", resolve, config)
 let lookalike = nefor.actors.agent<String, Unit, DynamicList<Record>>("lookalike", resolve, config)
 let ordinary = nefor.actors.agent<String, Unit, Record>("ordinary", resolve, config)
@@ -1312,7 +1312,7 @@ import nefor.node.{}
 type Input {value: String}
 type Output {value: String}
 let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
-let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default()}
+let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}
 let identity = nefor.dynamic.traverse("identity-traverse", nefor.graph.identity<Input>("identity"))
 let composition = nefor.dynamic.traverse("composition-traverse", nefor.node.compose("composition", nefor.graph.identity<Input>("composition-left"), nefor.graph.identity<Input>("composition-right")))
 let fanout = nefor.dynamic.traverse("fanout-traverse", nefor.node.fanout("fanout", nefor.graph.identity<Input>("fanout-left"), nefor.graph.identity<Input>("fanout-right")))
@@ -1445,7 +1445,7 @@ fn traverse_rejects_streaming_boundaries_inside_compound_types() {
 import nefor.dynamic.{{}}
 import nefor.graph.{{}}
 type Wrapped {{values: nefor.dynamic.DynamicList<String>}}
-type Choice = Value(Wrapped) | Empty(Unit)
+type Choice = Value(Wrapped) | Empty
 newtype Distinct = Wrapped
 artifact(nefor.dynamic.traverse("bad", nefor.graph.identity<{ty}>("worker")))
 "#
@@ -1489,7 +1489,7 @@ import nefor.human.{}
 import nefor.contracts.{}
 import nefor.dynamic.{}
 let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ModelProfile(nefor.actors.model_profile(model))
-let worker = nefor.actors.agent<String, String, nefor.dynamic.DynamicList<String>>("worker", resolve, nefor.actors.AgentConfig<String> {model: "test", system: "Return items", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default()})
+let worker = nefor.actors.agent<String, String, nefor.dynamic.DynamicList<String>>("worker", resolve, nefor.actors.AgentConfig<String> {model: "test", system: "Return items", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
             "dynamic producers are streaming workers",
@@ -1529,7 +1529,7 @@ import nefor.dynamic.{}
 import nefor.graph.{}
 let input = nefor.graph.port("worker", type_tag<nefor.contracts.ToolCalls>(), "generic-tool.ToolCalls")
 let output = nefor.graph.port("worker", type_tag<nefor.contracts.ToolHandle>(), "generic-tool.ToolHandle")
-let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.actors.RunToolParams {model: "", provider: "", model_profile: nefor.actors.no_model_profile, conversation_peer: "external", tools: [], tool_approval_policy: nefor.contracts.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default())}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}])
+let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.actors.RunToolParams {model: "", provider: "", model_profile: nefor.actors.no_model_profile, conversation_peer: "external", tools: [], tool_approval_policy: nefor.contracts.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}])
 let worker = nefor.graph.node("worker", "ordinary", [actor], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1542,8 +1542,8 @@ import nefor.contracts.{}
 import nefor.dynamic.{}
 import nefor.node.{}
 import nefor.shell.{}
-let first = nefor.shell.script("duplicate", nefor.shell.ShellScriptParams {script: "printf first", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
-let second = nefor.shell.script("duplicate", nefor.shell.ShellScriptParams {script: "printf second", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
+let first = nefor.shell.script("duplicate", nefor.shell.ShellScriptParams {script: "printf first", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
+let second = nefor.shell.script("duplicate", nefor.shell.ShellScriptParams {script: "printf second", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
 let worker = nefor.node.fanout("worker", first, second)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1560,7 +1560,7 @@ import nefor.graph.{}
 let input = nefor.graph.port("worker", type_tag<nefor.contracts.ToolCalls>(), "generic-tool.ToolCalls")
 let output = nefor.graph.port("worker", type_tag<nefor.contracts.ToolHandle>(), "generic-tool.ToolHandle")
 let relocation = nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}
-let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.actors.RunToolParams {model: "", provider: "", model_profile: nefor.actors.no_model_profile, conversation_peer: "worker", tools: [], tool_approval_policy: nefor.contracts.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default())}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [relocation, relocation])
+let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.actors.RunToolParams {model: "", provider: "", model_profile: nefor.actors.no_model_profile, conversation_peer: "worker", tools: [], tool_approval_policy: nefor.contracts.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [relocation, relocation])
 let worker = nefor.graph.node("worker", "ordinary", [actor], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1616,12 +1616,17 @@ fn authored_timeouts_normalize_at_both_node_boundaries() {
     .into_iter()
     .enumerate()
     {
+        let construction = if payload.is_empty() {
+            variant.to_owned()
+        } else {
+            format!("{variant}({payload})")
+        };
         let result = run(
             &format!("timeout-{index}"),
             &format!(
                 r#"
 import nefor
-let duration = Timeout.{variant}({payload})
+let duration = Timeout.{construction}
 let process = exec("process", ProcessExecParams {{argv: ["true"], cwd: ".", timeout: duration}})
 let shell = script("shell", ShellScriptParams {{script: "true", cwd: ".", timeout: duration}})
 artifact([get(first(get(process, "actors")), "params"), get(first(get(shell, "actors")), "params")])
@@ -1648,7 +1653,7 @@ fn authored_timeouts_reject_nonpositive_overflowing_and_wrong_payloads() {
         ("Minutes", "153722867280913", "int_mul overflow"),
         ("Milliseconds", "1.5", "Int"),
         ("Seconds", "\"2\"", "Int"),
-        ("Unlimited", "1", "takes no arguments"),
+        ("Unlimited", "1", "has no payload"),
     ] {
         for (module, function, params) in [
             (
@@ -1725,7 +1730,7 @@ fn authored_tool_policies_lower_without_changing_agent_configuration() {
 import nefor
 import core.map.{}
 let resolver: fn(String) -> AuthoredModel = |model| => AuthoredModel.ResolvedModel(ResolvedModel {provider: "test", model: model, reasoning_effort: no_reasoning_effort})
-let policies = [ToolApprovalPolicy.Default(), ToolApprovalPolicy.Rules(ToolApprovalRules {rules: core.map.insert(core.map.empty<String, String>(), "cargo build", "deny")})]
+let policies = [ToolApprovalPolicy.Default, ToolApprovalPolicy.Rules(ToolApprovalRules {rules: core.map.insert(core.map.empty<String, String>(), "cargo build", "deny")})]
 let config: fn(ToolApprovalPolicy) -> AgentConfig<String> = |policy| => AgentConfig<String> {model: "test", system: "", tools: [], tool_approval_policy: policy}
 let configs = map(config, policies)
 let nodes = map(((|settings| => agent<String, String, TextAnswer>("worker", resolver, settings)): fn(AgentConfig<String>) -> Node<String, core.types.Result<AgentError, TextAnswer>>), configs)
@@ -1866,11 +1871,11 @@ fn nefor_facade_imports_specialize_and_construct() {
     }
     source.push_str(r#"
 let timeout = Timeout.Seconds(1)
-let policy = ToolApprovalPolicy.Default()
+let policy = ToolApprovalPolicy.Default
 let decision = HumanWorkflowDecision.Approved(HumanWorkflowApproval {content: "yes"})
 let retry = RetryDecision<Int>.Continue(1)
 let process = exec("process", ProcessExecParams {argv: ["true"], cwd: ".", timeout: timeout})
-let shell = script("shell", ShellScriptParams {script: "true", cwd: ".", timeout: Timeout.Unlimited()})
+let shell = script("shell", ShellScriptParams {script: "true", cwd: ".", timeout: Timeout.Unlimited})
 let value = source("value", 1)
 let next = identity<Int>("next")
 let composed = value >>> next

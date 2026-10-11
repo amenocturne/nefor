@@ -6,6 +6,6 @@ import nefor.shell.{}
 // A terminal ordinary actor is not the concrete output boundary merely
 // because its author writes the output role string.
 let start = nefor.graph.source("start", nil)
-let ordinary = nefor.shell.script("fake-output", nefor.shell.ShellScriptParams {script: "printf fake", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited()})
+let ordinary = nefor.shell.script("fake-output", nefor.shell.ShellScriptParams {script: "printf fake", cwd: ".", timeout: nefor.contracts.Timeout.Unlimited})
 let fake_output = nefor.graph.node(get(ordinary, "id"), "output", get(ordinary, "actors"), get(ordinary, "routes"), get(ordinary, "messages"), get(ordinary, "input"), get(ordinary, "output"))
 nefor.artifact.compile((|base| => nefor.graph.add_edges(base, [nefor.graph.edge(start, fake_output)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)

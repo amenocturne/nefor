@@ -15,6 +15,6 @@ let get<K, V>: fn(Map<K, V>, K) -> V = |map, key| => __map_get(map, key)
 
 let get_or<K, V>: fn(Map<K, V>, K, V) -> V = |map, key, fallback| => __map_get_or(map, key, fallback)
 
-let lookup<K, V>: fn(Map<K, V>, K) -> core.types.Option<V> = |map, key| => if __map_contains(map, key) then core.types.Option<V>.Some(__map_get(map, key)) else core.types.Option<V>.None()
+let lookup<K, V>: fn(Map<K, V>, K) -> core.types.Option<V> = |map, key| => if __map_contains(map, key) then core.types.Option<V>.Some(__map_get(map, key)) else core.types.Option<V>.None
 
 let count<K, V>: fn(Map<K, V>) -> Int = |map| => __map_count(map)

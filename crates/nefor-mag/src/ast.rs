@@ -173,6 +173,9 @@ pub struct ConstructorDeclarationId {
 pub struct ConstructorDecl {
     pub id: ConstructorDeclarationId,
     pub payload: MagType,
+    /// Declared without a payload. Type and constructor identity are derived
+    /// from `id` and `payload` (which is `Unit` here), never from this flag.
+    pub payloadless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
