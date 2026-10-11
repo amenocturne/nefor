@@ -1648,7 +1648,7 @@ fn authored_timeouts_reject_nonpositive_overflowing_and_wrong_payloads() {
         ("Minutes", "153722867280913", "int_mul overflow"),
         ("Milliseconds", "1.5", "Int"),
         ("Seconds", "\"2\"", "Int"),
-        ("Unlimited", "1", "Unit"),
+        ("Unlimited", "1", "takes no arguments"),
     ] {
         for (module, function, params) in [
             (

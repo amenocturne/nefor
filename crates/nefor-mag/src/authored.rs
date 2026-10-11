@@ -198,6 +198,9 @@ pub enum Expr {
 pub enum ConstructorArguments {
     Positional(Vec<Expr>),
     Named(Vec<(String, Expr)>),
+    /// The payload value itself, with no argument sugar (the Lisp
+    /// `construct` form, which always states its payload).
+    Payload(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

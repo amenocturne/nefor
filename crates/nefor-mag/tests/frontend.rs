@@ -1169,3 +1169,98 @@ artifact {
         "{mixed}"
     );
 }
+
+#[test]
+fn unit_payload_constructors_take_no_arguments() {
+    let artifact = constructor_artifact(
+        "constructor-unit-rule",
+        r#"
+import support.{Box, Sw}
+type Flag = Yes(Unit) | No()
+let unit = nil
+artifact {
+  declared_unit: [Flag.Yes(), Flag.No()],
+  imported: Sw.Off(),
+  generic_unit_constructor: Box<Int>.Empty(),
+  parameter_at_unit: Box<Unit>.Full(nil),
+  parameter_at_unit_value: Box<Unit>.Full(unit),
+  parameter_inferred_unit: Box.Full(nil),
+}
+"#,
+    );
+    assert_eq!(
+        artifact,
+        serde_json::json!({
+            "declared_unit": [
+                {"constructor": "Yes", "value": null},
+                {"constructor": "No", "value": null},
+            ],
+            "imported": {"constructor": "Off", "value": null},
+            "generic_unit_constructor": {"constructor": "Empty", "value": null},
+            "parameter_at_unit": {"constructor": "Full", "value": null},
+            "parameter_at_unit_value": {"constructor": "Full", "value": null},
+            "parameter_inferred_unit": {"constructor": "Full", "value": null},
+        })
+    );
+
+    for (name, body, expected) in [
+        (
+            "nil",
+            "Sw.Off(nil)",
+            "constructor support.Sw.Off takes no arguments, got 1; write Sw.Off()",
+        ),
+        (
+            "value",
+            "Sw.Off(1)",
+            "constructor support.Sw.Off takes no arguments, got 1",
+        ),
+        (
+            "several",
+            "Sw.Off(1, 2)",
+            "constructor support.Sw.Off takes no arguments, got 2",
+        ),
+        (
+            "labelled",
+            "Sw.Off(unit: nil)",
+            "constructor support.Sw.Off takes no arguments, got 1",
+        ),
+        (
+            "generic",
+            "Box<Int>.Empty(nil)",
+            "constructor support.Box.Empty takes no arguments, got 1; write Box.Empty()",
+        ),
+        (
+            "parameter-needs-argument",
+            "Box<Unit>.Full()",
+            "constructor support.Box.Full takes a payload of type Unit, got 0 arguments",
+        ),
+    ] {
+        let error = constructor_error(
+            &format!("constructor-unit-rule-{name}"),
+            &format!("import support.{{Box, Sw}}\nlet value = {body}\nartifact(1)\n"),
+        );
+        assert!(error.contains(expected), "{body}: {error}");
+    }
+
+    // An alternative always declares its payload; there is no bare form.
+    for declaration in [
+        "type Bare = Unlimited | Seconds(Int)\nartifact(1)\n",
+        "type Bare = Seconds(Int) | Unlimited\nartifact(1)\n",
+    ] {
+        assert!(compile_with_syntax(declaration, Path::new("."), SyntaxMode::New).is_err());
+    }
+}
+
+#[test]
+fn lisp_construct_states_its_payload_including_nil() {
+    let artifact = compile_with_syntax(
+        "(type Flag (adt [Yes Unit] [No Unit]))\n(artifact (construct Flag Yes nil))\n",
+        Path::new("."),
+        SyntaxMode::Lisp,
+    )
+    .unwrap();
+    assert_eq!(
+        artifact,
+        serde_json::json!({"constructor": "Yes", "value": null})
+    );
+}

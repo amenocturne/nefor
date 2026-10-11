@@ -654,16 +654,29 @@ fn local_type_variables(locals: &Locals) -> HashSet<String> {
 enum ConstructorPayload<'a> {
     Positional(&'a [Expr]),
     Named(&'a [(String, Expr)]),
-    /// A single record literal passed as the whole payload (the Lisp
-    /// `construct` form); it is used as written, without ascription.
+    /// The payload value itself, with no argument sugar (the Lisp
+    /// `construct` form).
+    Whole(&'a Expr),
+    /// A record literal given as the whole payload; it is used as written,
+    /// without ascription.
     Record(&'a [(String, Expr)]),
 }
 
 impl<'a> ConstructorPayload<'a> {
     fn normalized(self) -> Self {
         match self {
-            Self::Positional([Expr::Fields(fields)]) => Self::Record(fields),
+            Self::Whole(Expr::Fields(fields)) => Self::Record(fields),
             other => other,
+        }
+    }
+
+    /// How many arguments were written, or `None` for a whole payload, which
+    /// is not subject to argument-count rules.
+    fn argument_count(self) -> Option<usize> {
+        match self {
+            Self::Positional(values) => Some(values.len()),
+            Self::Named(fields) => Some(fields.len()),
+            Self::Whole(_) | Self::Record(_) => None,
         }
     }
 }
@@ -673,6 +686,7 @@ impl<'a> From<&'a ConstructorArguments> for ConstructorPayload<'a> {
         match arguments {
             ConstructorArguments::Positional(values) => Self::Positional(values),
             ConstructorArguments::Named(fields) => Self::Named(fields),
+            ConstructorArguments::Payload(payload) => Self::Whole(payload),
         }
     }
 }
@@ -931,6 +945,7 @@ fn constructor_fields<'a>(
     let (fields, ascribed) = match arguments {
         ConstructorPayload::Named(fields) => (fields, true),
         ConstructorPayload::Record(fields) => (fields, false),
+        ConstructorPayload::Whole(_) => return Ok(None),
         ConstructorPayload::Positional(values) => {
             let Some(order) = inline_field_order(env, constructor, payload_type) else {
                 return Ok(None);
@@ -995,7 +1010,10 @@ fn infer_construct(
     constructor: &str,
     arguments: ConstructorPayload<'_>,
 ) -> Result<MagType, MagError> {
-    let (constructor, payload_type) = constructor_payload(env, &owner.ty, constructor)?;
+    let resolved = constructor_payload(env, &owner.ty, constructor)?;
+    resolved.check_argument_count(arguments)?;
+    let takes_no_arguments = resolved.takes_no_arguments;
+    let (constructor, payload_type) = (resolved.id, resolved.payload);
     let bindable = owner.bindable();
     let mut substitution = HashMap::new();
     let arguments = arguments.normalized();
@@ -1009,11 +1027,11 @@ fn infer_construct(
     }
     match arguments {
         ConstructorPayload::Named(_) | ConstructorPayload::Record(_) => {}
-        ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
+        ConstructorPayload::Positional([]) if !takes_no_arguments => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
         ConstructorPayload::Positional([]) => {}
-        ConstructorPayload::Positional([value]) => {
+        ConstructorPayload::Positional([value]) | ConstructorPayload::Whole(value) => {
             unify_payload(
                 env,
                 &infer(env, locals, value)?,
@@ -3103,7 +3121,10 @@ fn compile_construct(
     arguments: ConstructorPayload<'_>,
     expected: Option<&MagType>,
 ) -> Result<CheckedExpr, MagError> {
-    let (constructor, payload_type) = constructor_payload(env, &owner.ty, constructor_name)?;
+    let resolved = constructor_payload(env, &owner.ty, constructor_name)?;
+    resolved.check_argument_count(arguments)?;
+    let takes_no_arguments = resolved.takes_no_arguments;
+    let (constructor, payload_type) = (resolved.id, resolved.payload);
     let bindable = owner.bindable();
     let mut substitution = HashMap::new();
     // The expected type goes first so that the payload is checked against the
@@ -3168,13 +3189,13 @@ fn compile_construct(
                 constructor.owner, constructor.name
             )));
         }
-        (None, ConstructorPayload::Positional([])) if payload_type != MagType::Unit => {
+        (None, ConstructorPayload::Positional([])) if !takes_no_arguments => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
         (None, ConstructorPayload::Positional([])) => {
             (checked(MagType::Unit, CheckedExprKind::Unit), Shape::Plain)
         }
-        (None, ConstructorPayload::Positional([value])) => {
+        (None, ConstructorPayload::Positional([value]) | ConstructorPayload::Whole(value)) => {
             let value_expected = substitute_fully(&payload_type, &substitution);
             let value = compile_expr(env, scopes, value, Some(&value_expected))?;
             unify_payload(env, &value.ty, &payload_type, &mut substitution, &bindable)?;
@@ -3194,10 +3215,7 @@ fn compile_construct(
             (tuple, Shape::Ascribed)
         }
     };
-    let argument_count = match arguments {
-        ConstructorPayload::Positional(values) => values.len(),
-        ConstructorPayload::Named(fields) | ConstructorPayload::Record(fields) => fields.len(),
-    };
+    let argument_count = arguments.argument_count().unwrap_or(1);
     if let Some(error) = owner.undetermined(&constructor.name, argument_count, &substitution) {
         return Err(error);
     }
@@ -3403,7 +3421,7 @@ fn constructor_payload(
     env: &Env,
     owner: &MagType,
     name: &str,
-) -> Result<(ConstructorDeclarationId, MagType), MagError> {
+) -> Result<ResolvedConstructor, MagError> {
     let not_an_adt = || {
         MagError::Type(format!(
             "{owner} is not an ADT and has no constructor {name}; only ADT alternatives are constructed as Type.Constructor(...)"
@@ -3416,16 +3434,17 @@ fn constructor_payload(
     let TypeDeclBody::Adt(constructors) = &declaration.body else {
         return Err(not_an_adt());
     };
-    if !constructors
+    let Some(declared) = constructors
         .iter()
-        .any(|constructor| constructor.id.name == name)
-    {
+        .find(|constructor| constructor.id.name == name)
+    else {
         return Err(unknown_constructor(
             name,
             owner,
             constructors.iter().map(|constructor| &constructor.id),
         ));
-    }
+    };
+    let takes_no_arguments = declared.payload == MagType::Unit;
     if declaration.params.len() != arguments.len() {
         return Err(MagError::Type(format!(
             "{type_name} expects {} type arguments, got {}; construct it with explicit arguments as {}<...>.{name}(...)",
@@ -3434,7 +3453,40 @@ fn constructor_payload(
             type_name.rsplit('.').next().unwrap_or(type_name),
         )));
     }
-    instantiated_constructor(env, owner, name)
+    let (id, payload) = instantiated_constructor(env, owner, name)?;
+    Ok(ResolvedConstructor {
+        id,
+        payload,
+        takes_no_arguments,
+    })
+}
+
+/// A constructor of the type being constructed, with the payload type at the
+/// owner's type arguments.
+struct ResolvedConstructor {
+    id: ConstructorDeclarationId,
+    payload: MagType,
+    /// Whether the constructor is declared with a `Unit` payload. The
+    /// declaration decides this, not the instantiation: `Full(T)` takes one
+    /// argument even at `T = Unit`.
+    takes_no_arguments: bool,
+}
+
+impl ResolvedConstructor {
+    /// A constructor declared with a `Unit` payload has nothing to pass and is
+    /// written `Type.C()`; every other constructor needs its payload.
+    fn check_argument_count(&self, arguments: ConstructorPayload<'_>) -> Result<(), MagError> {
+        match arguments.argument_count() {
+            Some(count) if self.takes_no_arguments && count > 0 => {
+                let short = self.id.owner.rsplit('.').next().unwrap_or(&self.id.owner);
+                Err(MagError::Type(format!(
+                    "constructor {}.{} takes no arguments, got {count}; write {short}.{}()",
+                    self.id.owner, self.id.name, self.id.name
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 fn ensure_adt_exhaustive(

@@ -249,7 +249,7 @@ fn lower_construct(items: &[ast::Expr]) -> authored::Expr {
     authored::Expr::Construct {
         owner: lower_type(owner),
         constructor: constructor.to_owned(),
-        arguments: authored::ConstructorArguments::Positional(vec![lower_expr(payload)]),
+        arguments: authored::ConstructorArguments::Payload(Box::new(lower_expr(payload))),
     }
 }
 
