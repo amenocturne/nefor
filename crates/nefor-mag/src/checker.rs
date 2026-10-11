@@ -870,6 +870,17 @@ fn resolve_authored_constructor_owner(
     })
 }
 
+fn field_error(constructor: &ConstructorDeclarationId, field: &str, error: MagError) -> MagError {
+    let detail = match &error {
+        MagError::Type(message) => message.clone(),
+        other => other.to_string(),
+    };
+    MagError::Type(format!(
+        "field {field} of constructor {}.{}: {detail}",
+        constructor.owner, constructor.name
+    ))
+}
+
 fn payload_arity_error(
     constructor: &ConstructorDeclarationId,
     payload_type: &MagType,
@@ -881,12 +892,80 @@ fn payload_arity_error(
     ))
 }
 
-fn constructor_fields(
+/// The fields a construction fills, each paired with its declared type.
+struct ConstructorFields<'a> {
+    values: Vec<(String, &'a Expr, MagType)>,
+    /// Whether the record is built from sugar and takes the payload's identity
+    /// by ascription, or is a record literal passed as the whole payload.
+    ascribed: bool,
+}
+
+/// Field names of a constructor declared with an inline record payload
+/// (`C {a: A, b: B}`), in declared order. Such a payload type is private to
+/// its constructor, so positional arguments can only mean its fields.
+fn inline_field_order(
     env: &Env,
     constructor: &ConstructorDeclarationId,
     payload_type: &MagType,
-    fields: &[(String, Expr)],
-) -> Result<BTreeMap<String, MagType>, MagError> {
+) -> Option<Vec<String>> {
+    let MagType::Named(name, _) = payload_type else {
+        return None;
+    };
+    if *name != format!("{}.{}", constructor.owner, constructor.name) {
+        return None;
+    }
+    match env.type_decl(name)?.body {
+        TypeDeclBody::Fields(fields) => Some(fields.declared_order),
+        _ => None,
+    }
+}
+
+/// Shapes constructor arguments into the fields of a record payload, or
+/// `None` when the arguments are the payload itself.
+fn constructor_fields<'a>(
+    env: &Env,
+    constructor: &ConstructorDeclarationId,
+    payload_type: &MagType,
+    arguments: ConstructorPayload<'a>,
+) -> Result<Option<ConstructorFields<'a>>, MagError> {
+    let (fields, ascribed) = match arguments {
+        ConstructorPayload::Named(fields) => (fields, true),
+        ConstructorPayload::Record(fields) => (fields, false),
+        ConstructorPayload::Positional(values) => {
+            let Some(order) = inline_field_order(env, constructor, payload_type) else {
+                return Ok(None);
+            };
+            if order.len() != values.len() {
+                return Err(MagError::Type(format!(
+                    "constructor {}.{} takes {} fields ({}), got {} arguments",
+                    constructor.owner,
+                    constructor.name,
+                    order.len(),
+                    order.join(", "),
+                    values.len()
+                )));
+            }
+            let types = named_field_types(env, payload_type).unwrap_or_default();
+            // Positional arguments fill the fields in declared order.
+            let values = order
+                .into_iter()
+                .zip(values)
+                .map(|(name, value)| {
+                    let ty = types.get(&name).cloned().ok_or_else(|| {
+                        MagError::Type(format!(
+                            "constructor {}.{} has no declared type for field {name}",
+                            constructor.owner, constructor.name
+                        ))
+                    })?;
+                    Ok((name, value, ty))
+                })
+                .collect::<Result<Vec<_>, MagError>>()?;
+            return Ok(Some(ConstructorFields {
+                values,
+                ascribed: true,
+            }));
+        }
+    };
     let expected_fields = named_field_types(env, payload_type).ok_or_else(|| {
         MagError::Type(format!(
             "constructor {}.{} takes a payload of type {payload_type}, not named fields",
@@ -900,7 +979,13 @@ fn constructor_fields(
             "constructor fields must exactly match {payload_type}"
         )));
     }
-    Ok(expected_fields)
+    Ok(Some(ConstructorFields {
+        values: fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value, expected_fields[name].clone()))
+            .collect(),
+        ascribed,
+    }))
 }
 
 fn infer_construct(
@@ -913,16 +998,17 @@ fn infer_construct(
     let (constructor, payload_type) = constructor_payload(env, &owner.ty, constructor)?;
     let bindable = owner.bindable();
     let mut substitution = HashMap::new();
-    match arguments.normalized() {
-        ConstructorPayload::Named(fields) | ConstructorPayload::Record(fields) => {
-            let expected_fields = constructor_fields(env, &constructor, &payload_type, fields)?;
-            for (name, value) in fields.iter() {
-                let actual = infer(env, locals, value)?;
-                if let Some(expected) = expected_fields.get(name) {
-                    unify_payload(env, &actual, expected, &mut substitution, &bindable)?;
-                }
-            }
+    let arguments = arguments.normalized();
+    if let Some(fields) = constructor_fields(env, &constructor, &payload_type, arguments)? {
+        for (name, value, declared) in &fields.values {
+            let actual = infer(env, locals, value)?;
+            unify_payload(env, &actual, declared, &mut substitution, &bindable)
+                .map_err(|error| field_error(&constructor, name, error))?;
         }
+        return Ok(owner.resolved(&substitution));
+    }
+    match arguments {
+        ConstructorPayload::Named(_) | ConstructorPayload::Record(_) => {}
         ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
@@ -1060,7 +1146,7 @@ fn equality_admissible_in(
                 .zip(arguments.iter().cloned())
                 .collect::<HashMap<_, _>>();
             let result = match declaration.body {
-                TypeDeclBody::Fields(crate::ast::FieldTypes(fields)) => {
+                TypeDeclBody::Fields(crate::ast::FieldTypes { types: fields, .. }) => {
                     fields.values().try_for_each(|field| {
                         equality_admissible_in(
                             env,
@@ -2922,7 +3008,15 @@ fn compile_call(
         let candidates = all_candidates(env, scopes, name);
         // A constructor is not a module-scope symbol, so a dotted path that
         // names no value is looked up in the scope of its owner type.
-        if candidates.is_empty() && explicit_type_args.is_none() {
+        // (An inline record payload is declared as a type named like its
+        // constructor, so type declarations are not values here.)
+        let names_value = candidates.iter().any(|candidate| {
+            !matches!(
+                env.ready_binding(candidate.id),
+                Ok(Value::Type(_) | Value::TypeDecl(_))
+            )
+        });
+        if !names_value && explicit_type_args.is_none() {
             if let Some(owner) = constructor_owner(env, &visible_type_variables(scopes), name) {
                 return compile_construct(
                     env,
@@ -3034,22 +3128,28 @@ fn compile_construct(
         Ascribed,
     }
     let arguments = arguments.normalized();
-    let (mut payload, shape) = match arguments {
-        ConstructorPayload::Named(fields) | ConstructorPayload::Record(fields) => {
-            let expected_fields = constructor_fields(env, &constructor, &payload_type, fields)?;
+    let fields = constructor_fields(env, &constructor, &payload_type, arguments)?;
+    let (mut payload, shape) = match (fields, arguments) {
+        (Some(fields), _) => {
             let mut names = HashSet::new();
-            let mut checked_fields = Vec::with_capacity(fields.len());
-            for (name, value) in fields.iter() {
+            let mut checked_fields = Vec::with_capacity(fields.values.len());
+            for (name, value, declared) in &fields.values {
                 if !names.insert(name) {
                     return Err(MagError::Type(format!("duplicate named field {name}")));
                 }
-                let declared = &expected_fields[name];
                 let field_expected = substitute_fully(declared, &substitution);
-                let value = compile_expr(env, scopes, value, Some(&field_expected))?;
-                unify_payload(env, &value.ty, declared, &mut substitution, &bindable)?;
+                let value =
+                    compile_expr(env, scopes, value, Some(&field_expected)).map_err(|error| {
+                        match error {
+                            MagError::Type(_) => field_error(&constructor, name, error),
+                            other => other,
+                        }
+                    })?;
+                unify_payload(env, &value.ty, declared, &mut substitution, &bindable)
+                    .map_err(|error| field_error(&constructor, name, error))?;
                 checked_fields.push((name.clone(), value));
             }
-            let shape = if matches!(arguments, ConstructorPayload::Named(_)) {
+            let shape = if fields.ascribed {
                 Shape::Ascribed
             } else {
                 Shape::Plain
@@ -3062,19 +3162,25 @@ fn compile_construct(
                 shape,
             )
         }
-        ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
+        (None, ConstructorPayload::Named(_) | ConstructorPayload::Record(_)) => {
+            return Err(MagError::Type(format!(
+                "constructor {}.{} does not take named fields",
+                constructor.owner, constructor.name
+            )));
+        }
+        (None, ConstructorPayload::Positional([])) if payload_type != MagType::Unit => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
-        ConstructorPayload::Positional([]) => {
+        (None, ConstructorPayload::Positional([])) => {
             (checked(MagType::Unit, CheckedExprKind::Unit), Shape::Plain)
         }
-        ConstructorPayload::Positional([value]) => {
+        (None, ConstructorPayload::Positional([value])) => {
             let value_expected = substitute_fully(&payload_type, &substitution);
             let value = compile_expr(env, scopes, value, Some(&value_expected))?;
             unify_payload(env, &value.ty, &payload_type, &mut substitution, &bindable)?;
             (value, Shape::Plain)
         }
-        ConstructorPayload::Positional(values) => {
+        (None, ConstructorPayload::Positional(values)) => {
             if !matches!(payload_type, MagType::Product(_)) {
                 return Err(payload_arity_error(
                     &constructor,
@@ -4965,7 +5071,7 @@ pub(crate) fn named_field_types(env: &Env, ty: &MagType) -> Option<BTreeMap<Stri
             .zip(args.iter().cloned())
             .collect();
         match decl.body {
-            TypeDeclBody::Fields(crate::ast::FieldTypes(fields)) => Some(
+            TypeDeclBody::Fields(crate::ast::FieldTypes { types: fields, .. }) => Some(
                 fields
                     .iter()
                     .map(|(name, ty)| (name.clone(), substitute(ty, &substitutions)))

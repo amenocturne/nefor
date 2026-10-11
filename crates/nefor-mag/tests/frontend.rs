@@ -1091,3 +1091,81 @@ artifact([size(annotated), size(first(listed)), size(empty())])
     );
     assert_eq!(artifact, serde_json::json!([0, 0, 0]));
 }
+
+#[test]
+fn positional_arguments_fill_named_fields_in_declared_order() {
+    let root = constructor_workspace("constructor-positional-fields");
+    fs::write(
+        root.join("shapes.mag"),
+        "type Pt = At {y: Int, x: String} | Pair(Int, Int) | One {only: Int}\ntype Gen<A, B> = Both {right: B, left: A} | Neither(Unit)\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.mag"),
+        r#"
+import shapes.{Pt, Gen}
+type Local = Mk {b: Int, a: String}
+let unannotated = Pt.At(1, "declared order")
+artifact {
+  imported: unannotated,
+  single: Pt.One(2),
+  generic: Gen.Both("right", 3),
+  generic_explicit: Gen<Int, String>.Both("right", 4),
+  local: Local.Mk(5, "a"),
+  labelled: Pt.At(x: "labelled", y: 6),
+  braced: Pt.At {x: "braced", y: 7},
+  tuple: Pt.Pair(8, 9),
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        compile_file_with_syntax(&root, "main.mag", SyntaxMode::New).unwrap(),
+        serde_json::json!({
+            "imported": {"constructor": "At", "value": {"x": "declared order", "y": 1}},
+            "single": {"constructor": "One", "value": {"only": 2}},
+            "generic": {"constructor": "Both", "value": {"left": 3, "right": "right"}},
+            "generic_explicit": {"constructor": "Both", "value": {"left": 4, "right": "right"}},
+            "local": {"constructor": "Mk", "value": {"a": "a", "b": 5}},
+            "labelled": {"constructor": "At", "value": {"x": "labelled", "y": 6}},
+            "braced": {"constructor": "At", "value": {"x": "braced", "y": 7}},
+            "tuple": {"constructor": "Pair", "value": [8, 9]},
+        })
+    );
+
+    let error = |name: &str, body: &str| {
+        fs::write(
+            root.join("main.mag"),
+            format!("import shapes.{{Pt}}\nlet value = {body}\nartifact(1)\n"),
+        )
+        .unwrap();
+        compile_file_with_syntax(&root, "main.mag", SyntaxMode::New)
+            .map(|artifact| format!("{name} unexpectedly compiled: {artifact}"))
+            .unwrap_or_else(|error| error.to_string())
+    };
+    let too_few = error("too-few", "Pt.At(1)");
+    assert!(
+        too_few.contains("constructor shapes.Pt.At takes 2 fields (y, x), got 1 arguments"),
+        "{too_few}"
+    );
+    let too_many = error("too-many", "Pt.At(1, \"s\", 3)");
+    assert!(
+        too_many.contains("constructor shapes.Pt.At takes 2 fields (y, x), got 3 arguments"),
+        "{too_many}"
+    );
+    let swapped = error("swapped", "Pt.At(\"s\", 1)");
+    assert!(
+        swapped.contains("field y of constructor shapes.Pt.At: expected Int, got String"),
+        "{swapped}"
+    );
+    let labelled_mismatch = error("labelled-mismatch", "Pt.At(x: 1, y: 2)");
+    assert!(
+        labelled_mismatch.contains("field x of constructor shapes.Pt.At: expected String, got Int"),
+        "{labelled_mismatch}"
+    );
+    let mixed = error("mixed", "Pt.At(1, x: \"s\")");
+    assert!(
+        mixed.contains("constructor arguments must be either all positional or all named"),
+        "{mixed}"
+    );
+}

@@ -626,7 +626,9 @@ fn decode_typed_value(
                 .zip(args.iter().cloned())
                 .collect();
             match decl.body {
-                crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes(fields)) => Value::Typed(
+                crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes {
+                    types: fields, ..
+                }) => Value::Typed(
                     std::sync::Arc::new(decode_field_values(
                         env,
                         value,
@@ -826,7 +828,7 @@ mod tests {
             Value::TypeDecl(crate::ast::TypeDecl {
                 name: format!("main.{name}"),
                 params: vec![],
-                body: crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes(fields)),
+                body: crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes::sorted(fields)),
             }),
         );
         env

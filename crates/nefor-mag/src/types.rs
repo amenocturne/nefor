@@ -568,27 +568,27 @@ fn resolve(
                 .zip(args.iter().cloned())
                 .collect();
             let concrete = match decl.body {
-                crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes(fields)) => {
-                    ConcreteType::Named {
-                        name: name.clone(),
-                        arguments,
-                        body: ConcreteNamedBody::Fields {
-                            fields: fields
-                                .iter()
-                                .map(|(field, ty)| {
-                                    Ok((
-                                        field.clone(),
-                                        resolve(
-                                            env,
-                                            &crate::checker::substitute(ty, &substitutions),
-                                            resolving,
-                                        )?,
-                                    ))
-                                })
-                                .collect::<Result<_, MagError>>()?,
-                        },
-                    }
-                }
+                crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes {
+                    types: fields, ..
+                }) => ConcreteType::Named {
+                    name: name.clone(),
+                    arguments,
+                    body: ConcreteNamedBody::Fields {
+                        fields: fields
+                            .iter()
+                            .map(|(field, ty)| {
+                                Ok((
+                                    field.clone(),
+                                    resolve(
+                                        env,
+                                        &crate::checker::substitute(ty, &substitutions),
+                                        resolving,
+                                    )?,
+                                ))
+                            })
+                            .collect::<Result<_, MagError>>()?,
+                    },
+                },
                 crate::ast::TypeDeclBody::TransparentAlias(body) => resolve(
                     env,
                     &crate::checker::substitute(&body, &substitutions),
@@ -733,7 +733,7 @@ mod tests {
                 Value::TypeDecl(TypeDecl {
                     name: format!("main.{local}"),
                     params: vec![],
-                    body: crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes(fields)),
+                    body: crate::ast::TypeDeclBody::Fields(crate::ast::FieldTypes::sorted(fields)),
                 }),
             );
         }

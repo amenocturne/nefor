@@ -176,7 +176,26 @@ pub struct ConstructorDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FieldTypes(pub BTreeMap<String, MagType>);
+pub struct FieldTypes {
+    /// Field types by name. The sorted map is what type identity, schemas and
+    /// serialization are derived from.
+    pub types: BTreeMap<String, MagType>,
+    /// Field names in declaration order, for positional constructor arguments.
+    // TODO: represent record fields as one list in declared order and sort
+    // only when computing the type id and when serializing, so the order is
+    // not stored twice.
+    pub declared_order: Vec<String>,
+}
+
+impl FieldTypes {
+    /// Fields whose declared order is their name order.
+    pub fn sorted(types: BTreeMap<String, MagType>) -> Self {
+        Self {
+            declared_order: types.keys().cloned().collect(),
+            types,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeDeclBody {

@@ -255,9 +255,10 @@ fn eval_type_declaration(env: &mut Env, authored: &TypeDeclaration) -> Result<Va
     let vars = authored.params.iter().cloned().collect();
     let qualified = env.qualify(&authored.name);
     let body = match &authored.body {
-        TypeDeclarationBody::Fields(fields) => TypeDeclBody::Fields(crate::ast::FieldTypes(
-            crate::checker::resolve_field_types(env, fields, &vars)?,
-        )),
+        TypeDeclarationBody::Fields(fields) => TypeDeclBody::Fields(crate::ast::FieldTypes {
+            types: crate::checker::resolve_field_types(env, fields, &vars)?,
+            declared_order: fields.iter().map(|(name, _)| name.clone()).collect(),
+        }),
         TypeDeclarationBody::TransparentAlias(body) => {
             TypeDeclBody::TransparentAlias(crate::checker::resolve_type(env, body, &vars)?)
         }
@@ -667,7 +668,7 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
                 .zip(args.iter().cloned())
                 .collect();
             match decl.body {
-                TypeDeclBody::Fields(crate::ast::FieldTypes(fields)) => match value {
+                TypeDeclBody::Fields(crate::ast::FieldTypes { types: fields, .. }) => match value {
                     Value::Fields(map) => {
                         map.len() == fields.len()
                             && fields.iter().all(|(key, field)| {
