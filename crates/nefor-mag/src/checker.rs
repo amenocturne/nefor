@@ -360,19 +360,20 @@ fn infer(env: &Env, locals: &mut Locals, expr: &Expr) -> Result<MagType, MagErro
             if right == MagType::Never {
                 return Ok(left);
             }
-            compatible(env, &left, &right, &mut HashMap::new()).map_err(|_| {
+            compatible_shapes(env, &left, &right).map_err(|_| {
                 MagError::Type(format!(
                     "if branches must return one compatible type, got {left} and {right}"
                 ))
             })?;
-            Ok(right)
+            Ok(more_determined(left, right))
         }
         Expr::Construct {
             owner,
             constructor,
             arguments,
         } => {
-            let owner = resolve_constructor_owner(env, &local_type_variables(locals), owner)?;
+            let owner =
+                resolve_authored_constructor_owner(env, &local_type_variables(locals), owner)?;
             infer_construct(env, locals, owner, constructor, arguments.into())
         }
         Expr::Match { value, arms } => infer_match(env, locals, value, arms),
@@ -417,20 +418,10 @@ fn infer(env: &Env, locals: &mut Locals, expr: &Expr) -> Result<MagType, MagErro
             }
             Ok(target)
         }
-        Expr::Annotate { target, value } => {
-            let mut vars = HashSet::new();
-            for candidate in locals.values().flatten() {
-                collect_vars(&candidate.ty, &mut vars);
-            }
-            let target = resolve_type(env, target, &vars)?;
-            let actual = if matches!(value.as_ref(), Expr::Fields(_)) {
-                infer_fields_against(env, locals, value, &target)?
-            } else {
-                infer(env, locals, value)?
-            };
-            compatible(env, &actual, &target, &mut HashMap::new()).map_err(MagError::Type)?;
-            Ok(target)
-        }
+        // An annotation is the binding's type. Its value is checked against
+        // that type by the checking pass, which can use it as the expected type;
+        // inferring the value here, without one, would reject what it accepts.
+        Expr::Annotate { target, .. } => resolve_type(env, target, &local_type_variables(locals)),
         Expr::TypeTag(target) => {
             let mut vars = HashSet::new();
             for candidate in locals.values().flatten() {
@@ -454,41 +445,32 @@ fn infer_list(env: &Env, locals: &mut Locals, items: &[Expr]) -> Result<MagType,
     if items.is_empty() {
         return Ok(MagType::EmptyList);
     }
-    let first = infer(env, locals, &items[0])?;
+    let mut first = infer(env, locals, &items[0])?;
     for item in &items[1..] {
         let ty = infer(env, locals, item)?;
-        compatible(env, &ty, &first, &mut HashMap::new()).map_err(MagError::Type)?;
+        compatible_shapes(env, &ty, &first).map_err(MagError::Type)?;
+        first = more_determined(ty, first);
     }
     Ok(MagType::List(Box::new(first)))
 }
 
-fn infer_fields_against(
-    env: &Env,
-    locals: &mut Locals,
-    expression: &Expr,
-    expected: &MagType,
-) -> Result<MagType, MagError> {
-    let Expr::Fields(fields) = expression else {
-        return infer(env, locals, expression);
-    };
-    let expected_fields = named_field_types(env, expected).ok_or_else(|| {
-        MagError::Type(format!("named field literal cannot construct {expected}"))
-    })?;
-    let authored_names = fields.iter().map(|(name, _)| name).collect::<HashSet<_>>();
-    let expected_names = expected_fields.keys().collect::<HashSet<_>>();
-    if authored_names != expected_names || authored_names.len() != fields.len() {
-        return Err(MagError::Type(format!(
-            "named field literal must exactly match {expected}"
-        )));
+/// Compatibility for the shape pass, where a construction or generic call
+/// without an expected type may still carry open inference variables.
+fn compatible_shapes(env: &Env, actual: &MagType, expected: &MagType) -> Result<(), String> {
+    compatible(env, actual, expected, &mut HashMap::new()).or_else(|error| {
+        compatible_with_bindable(env, actual, expected, &mut HashMap::new(), &HashSet::new())
+            .map_err(|_| error)
+    })
+}
+
+/// Of two compatible types, the one without open inference variables;
+/// `fallback` when both or neither have them.
+fn more_determined(candidate: MagType, fallback: MagType) -> MagType {
+    if has_open_variables(&fallback) && !has_open_variables(&candidate) {
+        candidate
+    } else {
+        fallback
     }
-    for (name, value) in fields {
-        let actual = infer(env, locals, value)?;
-        let field = expected_fields
-            .get(name)
-            .ok_or_else(|| MagError::Type(format!("unexpected field {name} for {expected}")))?;
-        compatible(env, &actual, field, &mut HashMap::new()).map_err(MagError::Type)?;
-    }
-    Ok(expected.clone())
 }
 
 fn infer_call(
@@ -672,6 +654,18 @@ fn local_type_variables(locals: &Locals) -> HashSet<String> {
 enum ConstructorPayload<'a> {
     Positional(&'a [Expr]),
     Named(&'a [(String, Expr)]),
+    /// A single record literal passed as the whole payload (the Lisp
+    /// `construct` form); it is used as written, without ascription.
+    Record(&'a [(String, Expr)]),
+}
+
+impl<'a> ConstructorPayload<'a> {
+    fn normalized(self) -> Self {
+        match self {
+            Self::Positional([Expr::Fields(fields)]) => Self::Record(fields),
+            other => other,
+        }
+    }
 }
 
 impl<'a> From<&'a ConstructorArguments> for ConstructorPayload<'a> {
@@ -683,11 +677,166 @@ impl<'a> From<&'a ConstructorArguments> for ConstructorPayload<'a> {
     }
 }
 
+/// A type argument of a construction's owner that was not written and is
+/// inferred like the type argument of a generic call.
+struct OpenArgument {
+    parameter: String,
+    variable: String,
+}
+
+/// The type a construction builds. Written without type arguments, a generic
+/// owner is instantiated with fresh inference variables, so the construction is
+/// typed like a call of `fn(Payload<T...>) -> Owner<T...>`.
+struct ConstructionOwner {
+    ty: MagType,
+    declared: String,
+    open: Vec<OpenArgument>,
+}
+
+impl ConstructionOwner {
+    fn bindable(&self) -> HashSet<String> {
+        self.open
+            .iter()
+            .map(|argument| argument.variable.clone())
+            .collect()
+    }
+
+    /// The owner with every inferred argument substituted. An argument that
+    /// neither the payload nor the expected type determined stays open.
+    fn resolved(&self, substitution: &HashMap<String, MagType>) -> MagType {
+        substitute_fully(&self.ty, substitution)
+    }
+
+    fn undetermined(
+        &self,
+        constructor: &str,
+        argument_count: usize,
+        substitution: &HashMap<String, MagType>,
+    ) -> Option<MagError> {
+        let undetermined = self
+            .open
+            .iter()
+            .filter(|argument| {
+                has_open_variables(&substitute_fully(
+                    &MagType::Var(argument.variable.clone()),
+                    substitution,
+                ))
+            })
+            .map(|argument| argument.parameter.as_str())
+            .collect::<Vec<_>>();
+        if undetermined.is_empty() {
+            return None;
+        }
+        let short = self.declared.rsplit('.').next().unwrap_or(&self.declared);
+        Some(MagError::Type(format!(
+            "cannot infer type argument {} of {} from the payload or the expected type; write {short}<...>.{constructor}({}) with explicit type arguments",
+            undetermined.join(", "),
+            self.declared,
+            if argument_count == 0 { "" } else { "..." },
+        )))
+    }
+}
+
+/// Unifies an argument's type with the payload type it fills, binding the
+/// owner's inferred type arguments.
+fn unify_payload(
+    env: &Env,
+    actual: &MagType,
+    expected: &MagType,
+    substitution: &mut HashMap<String, MagType>,
+    bindable: &HashSet<String>,
+) -> Result<(), MagError> {
+    let expected = substitute_fully(expected, substitution);
+    compatible_with_bindable(env, actual, &expected, substitution, bindable).map_err(MagError::Type)
+}
+
+const OPEN_VARIABLE_PREFIX: &str = "\0open.";
+
+fn fresh_open_variable() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{OPEN_VARIABLE_PREFIX}{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+fn has_open_variables(ty: &MagType) -> bool {
+    let mut variables = HashSet::new();
+    collect_vars(ty, &mut variables);
+    variables
+        .iter()
+        .any(|name| name.starts_with(OPEN_VARIABLE_PREFIX))
+}
+
+/// Applies a substitution until no bound variable remains; inference binds
+/// variables to types that may themselves mention bound variables.
+fn substitute_fully(ty: &MagType, substitution: &HashMap<String, MagType>) -> MagType {
+    let mut current = ty.clone();
+    for _ in 0..64 {
+        let next = substitute(&current, substitution);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Resolves the owner of a construction by ordinary type resolution: local,
+/// imported, aliased and re-exported owners all resolve.
+fn resolve_construction_owner(
+    env: &Env,
+    vars: &HashSet<String>,
+    authored: &Type,
+) -> Result<ConstructionOwner, MagError> {
+    if let Type::Name(name) = authored {
+        if !vars.contains(name.as_str()) {
+            let candidates = env.lookup_candidates(name);
+            let mut types = candidates
+                .iter()
+                .filter(|value| matches!(value, Value::Type(_) | Value::TypeDecl(_)));
+            if let (Some(Value::TypeDecl(declaration)), None) = (types.next(), types.next()) {
+                if !declaration.params.is_empty() {
+                    let open = declaration
+                        .params
+                        .iter()
+                        .map(|parameter| OpenArgument {
+                            parameter: parameter.clone(),
+                            variable: fresh_open_variable(),
+                        })
+                        .collect::<Vec<_>>();
+                    let applied = MagType::Named(
+                        declaration.name.clone(),
+                        open.iter()
+                            .map(|argument| MagType::Var(argument.variable.clone()))
+                            .collect(),
+                    );
+                    return Ok(ConstructionOwner {
+                        ty: expand_transparent_alias(env, &applied)?,
+                        declared: declaration.name.clone(),
+                        open,
+                    });
+                }
+            }
+        }
+    }
+    let ty = resolve_type(env, authored, vars)?;
+    Ok(ConstructionOwner {
+        declared: ty.to_string(),
+        ty,
+        open: Vec::new(),
+    })
+}
+
 /// The type that owns `Owner.Constructor`, when the path's owner names a type.
-/// A constructor lives in its type's scope, so this is ordinary type
-/// resolution: local, imported, aliased and re-exported owners all resolve.
-fn constructor_owner(env: &Env, vars: &HashSet<String>, path: &NamePath) -> Option<MagType> {
-    resolve_type(env, &Type::Name(path.owner()?), vars).ok()
+/// A constructor lives in its type's scope, so a dotted call is a construction
+/// exactly when its owner resolves as a type.
+fn constructor_owner(
+    env: &Env,
+    vars: &HashSet<String>,
+    path: &NamePath,
+) -> Option<ConstructionOwner> {
+    resolve_construction_owner(env, vars, &Type::Name(path.owner()?)).ok()
 }
 
 /// `Owner.Constructor {field: value}` parses as a braced record of a type
@@ -697,7 +846,7 @@ fn braced_construction<'a>(
     vars: &HashSet<String>,
     target: &'a Type,
     value: &'a Expr,
-) -> Option<(MagType, &'a str, ConstructorPayload<'a>)> {
+) -> Option<(ConstructionOwner, &'a str, ConstructorPayload<'a>)> {
     let (Type::Name(path), Expr::Fields(fields)) = (target, value) else {
         return None;
     };
@@ -708,12 +857,12 @@ fn braced_construction<'a>(
     ))
 }
 
-fn resolve_constructor_owner(
+fn resolve_authored_constructor_owner(
     env: &Env,
     vars: &HashSet<String>,
     owner: &Type,
-) -> Result<MagType, MagError> {
-    resolve_type(env, owner, vars).map_err(|error| match (error, owner) {
+) -> Result<ConstructionOwner, MagError> {
+    resolve_construction_owner(env, vars, owner).map_err(|error| match (error, owner) {
         (MagError::Unresolved(_), Type::Name(name)) => MagError::Type(format!(
             "named arguments are only valid for constructor payloads; {name} is not a type in scope"
         )),
@@ -757,37 +906,36 @@ fn constructor_fields(
 fn infer_construct(
     env: &Env,
     locals: &mut Locals,
-    owner: MagType,
+    owner: ConstructionOwner,
     constructor: &str,
     arguments: ConstructorPayload<'_>,
 ) -> Result<MagType, MagError> {
-    let (constructor, payload_type) = constructor_payload(env, &owner, constructor)?;
-    let actual = match arguments {
-        ConstructorPayload::Positional([Expr::Fields(fields)]) => {
-            return infer_construct(
-                env,
-                locals,
-                owner,
-                &constructor.name,
-                ConstructorPayload::Named(fields),
-            );
-        }
-        ConstructorPayload::Named(fields) => {
+    let (constructor, payload_type) = constructor_payload(env, &owner.ty, constructor)?;
+    let bindable = owner.bindable();
+    let mut substitution = HashMap::new();
+    match arguments.normalized() {
+        ConstructorPayload::Named(fields) | ConstructorPayload::Record(fields) => {
             let expected_fields = constructor_fields(env, &constructor, &payload_type, fields)?;
-            for (name, value) in fields {
+            for (name, value) in fields.iter() {
                 let actual = infer(env, locals, value)?;
                 if let Some(expected) = expected_fields.get(name) {
-                    compatible(env, &actual, expected, &mut HashMap::new())
-                        .map_err(MagError::Type)?;
+                    unify_payload(env, &actual, expected, &mut substitution, &bindable)?;
                 }
             }
-            return Ok(owner);
         }
         ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
-        ConstructorPayload::Positional([]) => MagType::Unit,
-        ConstructorPayload::Positional([value]) => infer(env, locals, value)?,
+        ConstructorPayload::Positional([]) => {}
+        ConstructorPayload::Positional([value]) => {
+            unify_payload(
+                env,
+                &infer(env, locals, value)?,
+                &payload_type,
+                &mut substitution,
+                &bindable,
+            )?;
+        }
         ConstructorPayload::Positional(values) => {
             if !matches!(payload_type, MagType::Product(_)) {
                 return Err(payload_arity_error(
@@ -796,16 +944,18 @@ fn infer_construct(
                     values.len(),
                 ));
             }
-            MagType::Product(
+            let actual = MagType::Product(
                 values
                     .iter()
                     .map(|value| infer(env, locals, value))
                     .collect::<Result<Vec<_>, _>>()?,
-            )
+            );
+            unify_payload(env, &actual, &payload_type, &mut substitution, &bindable)?;
         }
-    };
-    compatible(env, &actual, &payload_type, &mut HashMap::new()).map_err(MagError::Type)?;
-    Ok(owner)
+    }
+    // This pass has no expected type, so an argument the payload leaves open
+    // stays an inference variable; the checking pass gives the final verdict.
+    Ok(owner.resolved(&substitution))
 }
 
 fn infer_match(
@@ -843,11 +993,12 @@ fn infer_match(
         if result.as_ref() == Some(&MagType::Never) && body_type != MagType::Never {
             result = Some(body_type);
         } else if let Some(current) = &result {
-            compatible(env, &body_type, current, &mut HashMap::new()).map_err(|_| {
+            compatible_shapes(env, &body_type, current).map_err(|_| {
                 MagError::Type(format!(
                     "match arms must return one compatible type, got {current} and {body_type}"
                 ))
             })?;
+            result = Some(more_determined(body_type, current.clone()));
         } else {
             result = Some(body_type);
         }
@@ -2349,6 +2500,12 @@ fn compile_block_in(
         } else {
             compile_expr(env, &scopes, initializer, Some(&candidate.ty))?
         };
+        if has_open_variables(&candidate.ty) {
+            return Err(MagError::Type(format!(
+                "cannot infer the type of {name}: {} has an undetermined type argument; annotate the binding",
+                checked.ty
+            )));
+        }
         bindings.push(CheckedBinding {
             id,
             name: name.into(),
@@ -2524,11 +2681,12 @@ fn compile_expr(
             constructor,
             arguments,
         } => {
-            let owner = resolve_constructor_owner(env, &visible_type_variables(scopes), owner)?;
-            compile_construct(env, scopes, owner, constructor, arguments.into())?
+            let owner =
+                resolve_authored_constructor_owner(env, &visible_type_variables(scopes), owner)?;
+            compile_construct(env, scopes, owner, constructor, arguments.into(), expected)?
         }
         Expr::Match { value, arms } => compile_match(env, scopes, value, arms, expected)?,
-        Expr::Ascribe { target, value } => compile_ascribe(env, scopes, target, value)?,
+        Expr::Ascribe { target, value } => compile_ascribe(env, scopes, target, value, expected)?,
         Expr::Annotate { target, value } => compile_annotate(env, scopes, target, value)?,
         Expr::TypeTag(target) => compile_type_tag(env, scopes, target)?,
         Expr::Function(function) => compile_function(env, scopes, None, function, expected, None)?,
@@ -2665,7 +2823,13 @@ fn compile_vector(
     let mut substitution = HashMap::new();
     for item in items {
         let item_expected = expected_item.map(|ty| substitute(ty, &substitution));
-        let value = compile_expr(env, scopes, item, item_expected.as_ref())?;
+        let value = match (&item_expected, &item_type) {
+            // Without a contextual list type, earlier elements are the only
+            // expected type a later generic call or construction can use.
+            (None, Some(established)) => compile_expr(env, scopes, item, Some(established))
+                .or_else(|_| compile_expr(env, scopes, item, None))?,
+            _ => compile_expr(env, scopes, item, item_expected.as_ref())?,
+        };
         if let Some(ty) = &item_expected {
             // Element constraints must survive the contextual list type: callers
             // infer their generic arguments from the vector's resulting type.
@@ -2766,6 +2930,7 @@ fn compile_call(
                     owner,
                     name.last(),
                     ConstructorPayload::Positional(expressions),
+                    expected,
                 );
             }
         }
@@ -2839,37 +3004,75 @@ fn compile_call(
 fn compile_construct(
     env: &Env,
     scopes: &[CheckedScope],
-    owner: MagType,
+    owner: ConstructionOwner,
     constructor_name: &str,
     arguments: ConstructorPayload<'_>,
+    expected: Option<&MagType>,
 ) -> Result<CheckedExpr, MagError> {
-    let (constructor, payload_type) = constructor_payload(env, &owner, constructor_name)?;
-    // Several arguments and labelled arguments are sugar for a tuple or record
-    // payload; ascribing the declared payload type gives them its identity.
-    let shaped = |value: CheckedExpr| {
-        checked(
-            payload_type.clone(),
-            CheckedExprKind::Ascribe {
-                target: payload_type.clone(),
-                value: Box::new(value),
-            },
-        )
-    };
-    let payload = match arguments {
-        ConstructorPayload::Named(fields) => {
-            constructor_fields(env, &constructor, &payload_type, fields)?;
-            shaped(compile_map(env, scopes, fields, Some(&payload_type))?)
+    let (constructor, payload_type) = constructor_payload(env, &owner.ty, constructor_name)?;
+    let bindable = owner.bindable();
+    let mut substitution = HashMap::new();
+    // The expected type goes first so that the payload is checked against the
+    // most specific payload type; a mismatch is reported once the construction
+    // has a type of its own.
+    if let (Some(MagType::Named(expected_name, _)), MagType::Named(owner_name, _)) =
+        (expected, &owner.ty)
+    {
+        if expected_name == owner_name && !owner.open.is_empty() {
+            let mut constrained = substitution.clone();
+            if let Some(expected) = expected {
+                if compatible_with_bindable(env, expected, &owner.ty, &mut constrained, &bindable)
+                    .is_ok()
+                {
+                    substitution = constrained;
+                }
+            }
         }
-        ConstructorPayload::Positional([Expr::Fields(fields)]) => {
-            constructor_fields(env, &constructor, &payload_type, fields)?;
-            compile_map(env, scopes, fields, Some(&payload_type))?
+    }
+    enum Shape {
+        Plain,
+        Ascribed,
+    }
+    let arguments = arguments.normalized();
+    let (mut payload, shape) = match arguments {
+        ConstructorPayload::Named(fields) | ConstructorPayload::Record(fields) => {
+            let expected_fields = constructor_fields(env, &constructor, &payload_type, fields)?;
+            let mut names = HashSet::new();
+            let mut checked_fields = Vec::with_capacity(fields.len());
+            for (name, value) in fields.iter() {
+                if !names.insert(name) {
+                    return Err(MagError::Type(format!("duplicate named field {name}")));
+                }
+                let declared = &expected_fields[name];
+                let field_expected = substitute_fully(declared, &substitution);
+                let value = compile_expr(env, scopes, value, Some(&field_expected))?;
+                unify_payload(env, &value.ty, declared, &mut substitution, &bindable)?;
+                checked_fields.push((name.clone(), value));
+            }
+            let shape = if matches!(arguments, ConstructorPayload::Named(_)) {
+                Shape::Ascribed
+            } else {
+                Shape::Plain
+            };
+            (
+                checked(
+                    payload_type.clone(),
+                    CheckedExprKind::Fields(checked_fields),
+                ),
+                shape,
+            )
         }
         ConstructorPayload::Positional([]) if payload_type != MagType::Unit => {
             return Err(payload_arity_error(&constructor, &payload_type, 0));
         }
-        ConstructorPayload::Positional([]) => checked(MagType::Unit, CheckedExprKind::Unit),
+        ConstructorPayload::Positional([]) => {
+            (checked(MagType::Unit, CheckedExprKind::Unit), Shape::Plain)
+        }
         ConstructorPayload::Positional([value]) => {
-            compile_expr(env, scopes, value, Some(&payload_type))?
+            let value_expected = substitute_fully(&payload_type, &substitution);
+            let value = compile_expr(env, scopes, value, Some(&value_expected))?;
+            unify_payload(env, &value.ty, &payload_type, &mut substitution, &bindable)?;
+            (value, Shape::Plain)
         }
         ConstructorPayload::Positional(values) => {
             if !matches!(payload_type, MagType::Product(_)) {
@@ -2879,12 +3082,35 @@ fn compile_construct(
                     values.len(),
                 ));
             }
-            let tuple = compile_vector(env, scopes, values, Some(&payload_type))?;
-            compatible_static(env, &tuple.ty, &payload_type, &mut HashMap::new())
-                .map_err(MagError::Type)?;
-            shaped(tuple)
+            let tuple_expected = substitute_fully(&payload_type, &substitution);
+            let tuple = compile_vector(env, scopes, values, Some(&tuple_expected))?;
+            unify_payload(env, &tuple.ty, &payload_type, &mut substitution, &bindable)?;
+            (tuple, Shape::Ascribed)
         }
     };
+    let argument_count = match arguments {
+        ConstructorPayload::Positional(values) => values.len(),
+        ConstructorPayload::Named(fields) | ConstructorPayload::Record(fields) => fields.len(),
+    };
+    if let Some(error) = owner.undetermined(&constructor.name, argument_count, &substitution) {
+        return Err(error);
+    }
+    let owner = owner.resolved(&substitution);
+    let payload_type = substitute_fully(&payload_type, &substitution);
+    // Several arguments and labelled arguments are sugar for a tuple or record
+    // payload; ascribing the declared payload type gives them its identity.
+    if matches!(payload.kind, CheckedExprKind::Fields(_)) {
+        payload.ty = payload_type.clone();
+    }
+    if matches!(shape, Shape::Ascribed) {
+        payload = checked(
+            payload_type.clone(),
+            CheckedExprKind::Ascribe {
+                target: payload_type,
+                value: Box::new(payload),
+            },
+        );
+    }
     Ok(checked(
         owner.clone(),
         CheckedExprKind::Construct {
@@ -3165,6 +3391,7 @@ fn compile_ascribe(
     scopes: &[CheckedScope],
     authored_target: &Type,
     source: &Expr,
+    expected: Option<&MagType>,
 ) -> Result<CheckedExpr, MagError> {
     if let Some((owner, constructor, fields)) = braced_construction(
         env,
@@ -3172,7 +3399,7 @@ fn compile_ascribe(
         authored_target,
         source,
     ) {
-        return compile_construct(env, scopes, owner, constructor, fields);
+        return compile_construct(env, scopes, owner, constructor, fields, expected);
     }
     let target = parse_checked_type(env, scopes, authored_target)?;
     let source_expected = match source {

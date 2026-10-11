@@ -28,7 +28,7 @@ Construction is checked before evaluation. The checker reports:
 
 - `constructor C is not a member of T; available constructors: A, B` when the owner is an ADT that does not declare the constructor (the same message covers a foreign `match` case);
 - `T is not an ADT and has no constructor C` when the owner is a record, alias target, or built-in type;
-- `T expects N type arguments, got 0; construct it with explicit arguments as T<...>.C(...)` when a generic owner is written without its arguments;
+- `cannot infer type argument P of T from the payload or the expected type; write T<...>.C(...) with explicit type arguments` when a generic owner is written without arguments and neither the payload nor an expected type determines parameter `P`, as in an unannotated `let absent = Option.None()`;
 - `constructor T.C takes a payload of type P, got N arguments` when the argument count cannot form the payload, and an ordinary type mismatch when the payload has the wrong type;
 - `duplicate constructor C in T` when one ADT declares a constructor name twice;
 - `unresolved symbol: C` for a bare `C(...)`, because constructors are not module-scope names. Write `T.C(...)`.

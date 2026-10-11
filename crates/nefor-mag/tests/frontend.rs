@@ -800,16 +800,6 @@ fn construction_diagnostics_name_the_type_and_its_constructors() {
         "{scalar}"
     );
 
-    let unapplied = constructor_error(
-        "constructor-unapplied-generic",
-        "import support.{Box}\nlet value: Box<Int> = Box.Full(1)\nartifact(1)\n",
-    );
-    assert!(
-        unapplied.contains("support.Box expects 1 type arguments, got 0")
-            && unapplied.contains("Box<...>.Full(...)"),
-        "{unapplied}"
-    );
-
     let missing_payload = constructor_error(
         "constructor-missing-payload",
         "import support.{Sw}\nlet value = Sw.On()\nartifact(1)\n",
@@ -927,4 +917,177 @@ artifact {
         foreign.contains("does not match scrutinee owner"),
         "{foreign}"
     );
+}
+
+#[test]
+fn generic_constructions_infer_type_arguments_from_payload_and_expected_type() {
+    let artifact = constructor_artifact(
+        "constructor-inference",
+        r#"
+import support.{Box, Sw}
+import facade.{Crate}
+type Result<E, T> = Ok(T) | Error(E)
+type IntResult<T> = Result<Int, T>
+type Pair<A, B> = Both {left: A, right: B} | Neither(Unit)
+type Holder {box: Box<Int>}
+let size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty(unit) => 0 }
+let from_payload = Box.Full(42)
+let from_annotation: Box<Int> = Box.Empty()
+let from_argument = size(Box.Empty())
+let from_field = Holder {box: Box.Empty()}
+let from_return: fn(Bool) -> Box<Int> = |flag| => if flag then Box.Empty() else Box.Full(1)
+let from_list_annotation: List<Box<Int>> = [Box.Empty(), Box.Full(2)]
+let from_earlier_element = [Box.Full(3), Box.Empty()]
+let from_later_element = [Box.Empty(), Box.Full(4)]
+let from_branch = if true then Box.Empty() else Box.Full(5)
+let from_arm = match Sw.Off() { case On(n) => Box.Full(n), case Off(unit) => Box.Empty() }
+let combined: Result<String, Int> = Result.Ok(6)
+let through_alias = Crate.Full("aliased")
+let partial_alias = IntResult.Ok("partial")
+let partial_alias_expected: IntResult<String> = IntResult.Error(7)
+let labelled = Pair.Both(left: 8, right: "right")
+let braced = Pair.Both {left: true, right: [9]}
+let nested = Box.Full(Box.Full(10))
+let nested_expected: Box<Box<Int>> = Box.Full(Box.Empty())
+let explicit = Box<Int>.Full(11)
+let wrap<T>: fn(T) -> Box<T> = |value| => Box.Full(value)
+let empty<T>: fn() -> Box<T> = | | => Box.Empty()
+let generic_argument<U>: fn(Box<U>, U) -> U = |box, default| => match box { case Full(value) => value, case Empty(unit) => default }
+artifact {
+  from_payload: size(from_payload),
+  from_annotation: size(from_annotation),
+  from_argument: from_argument,
+  from_field: size(get(from_field, "box")),
+  from_return: [size(from_return(true)), size(from_return(false))],
+  from_list_annotation: map(size, from_list_annotation),
+  from_earlier_element: map(size, from_earlier_element),
+  from_later_element: map(size, from_later_element),
+  from_branch: size(from_branch),
+  from_arm: size(from_arm),
+  combined: combined,
+  through_alias: through_alias,
+  partial_alias: partial_alias,
+  partial_alias_expected: partial_alias_expected,
+  labelled: labelled,
+  braced: braced,
+  nested: nested,
+  nested_expected: nested_expected,
+  explicit: size(explicit),
+  wrap: wrap("wrapped"),
+  empty: size(empty<Int>()),
+  generic_argument: generic_argument(Box.Empty(), 12),
+}
+"#,
+    );
+    assert_eq!(
+        artifact,
+        serde_json::json!({
+            "from_payload": 42,
+            "from_annotation": 0,
+            "from_argument": 0,
+            "from_field": 0,
+            "from_return": [0, 1],
+            "from_list_annotation": [0, 2],
+            "from_earlier_element": [3, 0],
+            "from_later_element": [0, 4],
+            "from_branch": 0,
+            "from_arm": 0,
+            "combined": {"constructor": "Ok", "value": 6},
+            "through_alias": {"constructor": "Full", "value": "aliased"},
+            "partial_alias": {"constructor": "Ok", "value": "partial"},
+            "partial_alias_expected": {"constructor": "Error", "value": 7},
+            "labelled": {"constructor": "Both", "value": {"left": 8, "right": "right"}},
+            "braced": {"constructor": "Both", "value": {"left": true, "right": [9]}},
+            "nested": {"constructor": "Full", "value": {"constructor": "Full", "value": 10}},
+            "nested_expected": {"constructor": "Full", "value": {"constructor": "Empty", "value": null}},
+            "explicit": 11,
+            "wrap": {"constructor": "Full", "value": "wrapped"},
+            "empty": 0,
+            "generic_argument": 12,
+        })
+    );
+}
+
+#[test]
+fn undetermined_and_conflicting_type_arguments_are_rejected() {
+    let undetermined = constructor_error(
+        "constructor-inference-undetermined",
+        "import support.{Box}\nlet value = Box.Empty()\nartifact(1)\n",
+    );
+    assert!(
+        undetermined.contains("cannot infer type argument T of support.Box")
+            && undetermined.contains("Box<...>.Empty()"),
+        "{undetermined}"
+    );
+
+    let one_of_two = constructor_error(
+        "constructor-inference-partly-undetermined",
+        "type Result<E, T> = Ok(T) | Error(E)\nlet value = Result.Ok(1)\nartifact(1)\n",
+    );
+    assert!(
+        one_of_two.contains("cannot infer type argument E of main.Result")
+            && one_of_two.contains("Result<...>.Ok(...)"),
+        "{one_of_two}"
+    );
+
+    let in_tuple = constructor_error(
+        "constructor-inference-undetermined-tuple",
+        "import support.{Box}\nlet value = (Box.Empty(), 1)\nartifact(1)\n",
+    );
+    assert!(
+        in_tuple.contains("cannot infer type argument T of support.Box"),
+        "{in_tuple}"
+    );
+
+    let through_alias = constructor_error(
+        "constructor-inference-undetermined-alias",
+        "type Result<E, T> = Ok(T) | Error(E)\ntype IntResult<T> = Result<Int, T>\nlet value = IntResult.Error(1)\nartifact(1)\n",
+    );
+    assert!(
+        through_alias.contains("cannot infer type argument T of main.IntResult"),
+        "{through_alias}"
+    );
+
+    let conflict = constructor_error(
+        "constructor-inference-conflict",
+        "import support.{Box}\nlet value: Box<String> = Box.Full(1)\nartifact(1)\n",
+    );
+    assert!(conflict.contains("expected String, got Int"), "{conflict}");
+
+    let explicit_conflict = constructor_error(
+        "constructor-inference-explicit-conflict",
+        "import support.{Box}\nlet value = Box<String>.Full(1)\nartifact(1)\n",
+    );
+    assert!(
+        explicit_conflict.contains("expected String, got Int"),
+        "{explicit_conflict}"
+    );
+
+    let explicit_against_annotation = constructor_error(
+        "constructor-inference-explicit-annotation",
+        "import support.{Box}\nlet value: Box<String> = Box<Int>.Full(1)\nartifact(1)\n",
+    );
+    assert!(
+        explicit_against_annotation.contains("String")
+            && explicit_against_annotation.contains("Int"),
+        "{explicit_against_annotation}"
+    );
+}
+
+#[test]
+fn annotated_bindings_infer_generic_call_results_from_their_annotation() {
+    // Constructions share the generic-call machinery: an annotation is the
+    // expected type for a return-only type parameter in both.
+    let artifact = constructor_artifact(
+        "generic-call-annotation",
+        r#"
+import support.{Box}
+let empty<T>: fn() -> Box<T> = | | => Box<T>.Empty()
+let size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty(unit) => 0 }
+let annotated: Box<Int> = empty()
+let listed: List<Box<Int>> = [empty(), Box.Full(1)]
+artifact([size(annotated), size(first(listed)), size(empty())])
+"#,
+    );
+    assert_eq!(artifact, serde_json::json!([0, 0, 0]));
 }
