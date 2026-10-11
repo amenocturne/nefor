@@ -4917,6 +4917,20 @@ pub(crate) fn resolve_type(
     }
 }
 
+/// The type a declaration's name stands for, with its parameters replaced by
+/// positional variables so that two declarations of one generic type compare
+/// equal. A transparent alias stands for its target; a `newtype` and every
+/// other nominal declaration stand for themselves.
+pub(crate) fn declared_type_identity(
+    env: &Env,
+    declaration: &crate::ast::TypeDecl,
+) -> Result<MagType, MagError> {
+    let arguments = (0..declaration.params.len())
+        .map(|index| MagType::Var(format!("${index}")))
+        .collect();
+    expand_transparent_alias(env, &MagType::Named(declaration.name.clone(), arguments))
+}
+
 fn expand_transparent_alias(env: &Env, ty: &MagType) -> Result<MagType, MagError> {
     let MagType::Named(name, arguments) = ty else {
         return Ok(ty.clone());

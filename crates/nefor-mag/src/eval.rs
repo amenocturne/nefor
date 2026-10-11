@@ -2424,6 +2424,11 @@ fn eval_imports(
     // and, for a local `let`, after it is checked. Every other pairing is
     // decided here by spelling alone.
     let mut value_candidates = BTreeSet::<(String, String)>::new();
+    // Types are not overloadable, but one type may reach a name through
+    // several imports, directly and through transparent aliases. Whether two
+    // imported type names are that one type is also known only after
+    // evaluation.
+    let mut imported_type_candidates = BTreeSet::<(String, String)>::new();
     let mut local_lets = BTreeSet::<String>::new();
     let mut candidates = BTreeMap::<String, BTreeSet<String>>::new();
     for form in &authored.forms {
@@ -2486,7 +2491,9 @@ fn eval_imports(
     for (local, declarations) in &opened {
         for (module, export) in declarations {
             let candidate = format!("imported export {module}.{export}");
-            if !exported_types.contains(&(module.clone(), export.clone())) {
+            if exported_types.contains(&(module.clone(), export.clone())) {
+                imported_type_candidates.insert((local.clone(), candidate.clone()));
+            } else {
                 value_candidates.insert((local.clone(), candidate.clone()));
             }
             candidates
@@ -2562,13 +2569,16 @@ fn eval_imports(
             conflicting.iter().cloned().collect::<Vec<_>>().join(", ")
         )
     };
-    let only_values = |spelling: &String, set: &BTreeSet<String>| {
-        set.iter()
-            .all(|candidate| value_candidates.contains(&(spelling.clone(), candidate.clone())))
+    let decided_after_evaluation = |spelling: &String, set: &BTreeSet<String>| {
+        let all_in = |group: &BTreeSet<(String, String)>| {
+            set.iter()
+                .all(|candidate| group.contains(&(spelling.clone(), candidate.clone())))
+        };
+        all_in(&value_candidates) || all_in(&imported_type_candidates)
     };
     if let Some((spelling, conflicting)) = candidates.iter().find(|(spelling, set)| {
         set.len() > 1
-            && !only_values(spelling, set)
+            && !decided_after_evaluation(spelling, set)
             && set.iter().any(|candidate| {
                 candidate.starts_with("imported export ")
                     || candidate.starts_with("canonical namespace ")
@@ -2602,6 +2612,48 @@ fn eval_imports(
         // One spelling may gather values from several declarations. They form
         // an overload set unless two of them have the same type.
         let mut installed = Vec::<((&String, &String), Value)>::new();
+        let imported_types = declarations
+            .iter()
+            .filter(|declaration| exported_types.contains(declaration))
+            .filter_map(
+                |(module, export)| match modules[module].get(export)?.first()? {
+                    Value::TypeDecl(declaration) => Some(declaration.clone()),
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+        if imported_types.len() > 1 && imported_types.len() == declarations.len() {
+            // The same type under one name, however it was reached, is one
+            // binding; two different types under one name are a collision.
+            let identities = imported_types
+                .iter()
+                .map(|declaration| crate::checker::declared_type_identity(env, declaration))
+                .collect::<Result<Vec<_>, _>>()?;
+            if identities.iter().any(|identity| *identity != identities[0]) {
+                let mut distinct = identities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                distinct.sort();
+                distinct.dedup();
+                return Err(MagError::Type(collision_message(
+                    &local,
+                    &candidates[&local],
+                    &format!("; distinct types {}", distinct.join(", ")),
+                )));
+            }
+            // Bind the nominal declaration itself when it is among them.
+            let binding = imported_types
+                .iter()
+                .zip(&identities)
+                .find(|(declaration, identity)| {
+                    matches!(identity, MagType::Named(name, _) if *name == declaration.name)
+                })
+                .map(|(declaration, _)| declaration)
+                .unwrap_or(&imported_types[0]);
+            env.define(&local, Value::TypeDecl(binding.clone()));
+            continue;
+        }
         for (module, export) in &declarations {
             let Some(values) = modules[module].get(export) else {
                 continue;

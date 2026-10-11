@@ -2095,3 +2095,24 @@ artifact {
         }));
     }
 }
+
+#[test]
+fn facade_type_and_open_contracts_import_are_one_binding() {
+    let artifact = run(
+        "facade-and-contracts-type",
+        r#"
+import nefor.{Timeout}
+import nefor.contracts
+let bounded: Timeout = Timeout.Seconds(3)
+artifact([bounded, Timeout.Unlimited])
+"#,
+        json!({}),
+    );
+    assert_eq!(
+        artifact,
+        json!([
+            {"constructor": "Seconds", "value": 3},
+            {"constructor": "Unlimited", "value": null}
+        ])
+    );
+}

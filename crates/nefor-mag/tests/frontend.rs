@@ -375,17 +375,16 @@ fn import_collisions_use_canonical_declarations_and_preserve_overload_sets() {
     assert!(error.contains("b.value"), "{error}");
     assert!(error.contains("same type Int"), "{error}");
 
-    // A collision that involves a type is decided by spelling alone, before
-    // any imported module is evaluated.
+    // A collision with a local declaration of another kind is decided by
+    // spelling alone, before any imported module is evaluated.
     fs::write(
         root.join("typed.mag"),
         "type Shared {value: Int}\nlet bomb = fail(\"must not evaluate before collision resolution\")\n",
     )
     .unwrap();
-    fs::write(root.join("other.mag"), "type Shared {value: Int}\n").unwrap();
     fs::write(
         root.join("type-collision.mag"),
-        "import typed\nimport other\nartifact(1)\n",
+        "import typed\ntype Shared {value: Int}\nartifact(1)\n",
     )
     .unwrap();
     let error = compile_file_with_syntax(&root, "type-collision.mag", SyntaxMode::New)
@@ -1568,23 +1567,102 @@ fn imports_of_one_name_with_the_same_type_collide() {
 }
 
 #[test]
-fn types_do_not_overload_across_imports() {
-    let root = overload_workspace("import-type-collisions");
-    // The same nominal type under one name through two paths is still a
-    // collision by spelling.
-    let alias = overload_result(
-        &root,
-        "import ints.{Shared}\nimport shared_alias.{Shared}\nartifact(1)\n",
-    )
-    .unwrap_err();
-    assert!(
-        alias.contains("import collision at 'Shared'; candidates: imported export ints.Shared, imported export shared_alias.Shared"),
-        "{alias}"
-    );
+fn one_type_reached_through_several_imports_is_one_binding() {
+    let root = overload_workspace("import-same-type-paths");
+    for (module, source) in [
+        (
+            "shapes",
+            "type Shape = Dot | Line(Int)\ntype Box<T> = Full(T) | Empty\nlet length: fn(Shape) -> Int = |shape| => match shape { case Dot => 0, case Line(n) => n }\n",
+        ),
+        (
+            "facade",
+            "import shapes.{}\ntype Shape = shapes.Shape\ntype Box<T> = shapes.Box<T>\n",
+        ),
+        ("second_facade", "import facade.{}\ntype Shape = facade.Shape\n"),
+        ("wrapped", "import shapes.{}\nnewtype Shape = shapes.Shape\n"),
+        ("unrelated", "type Shape = Dot | Line(Int)\n"),
+        ("ints_box", "import shapes.{}\ntype Box = shapes.Box<Int>\n"),
+    ] {
+        fs::write(root.join(format!("{module}.mag")), source).unwrap();
+    }
+
+    for (form, source) in [
+        (
+            "selective",
+            "import shapes.{Shape, length}\nimport facade.{Shape}\nlet line: Shape = Shape.Line(3)\nartifact(length(line))\n",
+        ),
+        (
+            "open and selective",
+            "import shapes\nimport facade.{Shape}\nartifact(length(Shape.Line(3)))\n",
+        ),
+        (
+            "both open",
+            "import shapes\nimport facade\nartifact(length(Shape.Line(3)))\n",
+        ),
+        (
+            "alias of an alias",
+            "import shapes.{length}\nimport facade.{Shape}\nimport second_facade.{Shape}\nartifact(length(Shape.Line(3)))\n",
+        ),
+        (
+            "renamed to one name",
+            "import shapes.{Shape as S, length}\nimport facade.{Shape as S}\nartifact(length(S.Line(3)))\n",
+        ),
+        (
+            "generic alias",
+            "import shapes.{Box}\nimport facade.{Box}\nlet size: fn(Box<Int>) -> Int = |box| => match box { case Full(n) => n, case Empty => 0 }\nartifact(size(Box.Full(3)))\n",
+        ),
+    ] {
+        assert_eq!(
+            overload_result(&root, source),
+            Ok(serde_json::json!(3)),
+            "{form}"
+        );
+    }
+
+    for (form, source, first, second) in [
+        (
+            "unrelated declaration",
+            "import shapes.{Shape}\nimport unrelated.{Shape}\nartifact(1)\n",
+            "shapes.Shape",
+            "unrelated.Shape",
+        ),
+        (
+            "newtype",
+            "import shapes.{Shape}\nimport wrapped.{Shape}\nartifact(1)\n",
+            "shapes.Shape",
+            "wrapped.Shape",
+        ),
+        (
+            "alias that fixes an argument",
+            "import shapes.{Box}\nimport ints_box.{Box}\nartifact(1)\n",
+            "(shapes.Box $0)",
+            "(shapes.Box Int)",
+        ),
+    ] {
+        let error = overload_result(&root, source).unwrap_err();
+        assert!(
+            error.contains("import collision at")
+                && error.contains(&format!("distinct types {first}, {second}"))
+                && error.contains("repairs: remove or rename selector"),
+            "{form}: {error}"
+        );
+    }
+
+    // A type and a value of one name, and an imported and a local type, still
+    // collide by spelling.
     let type_and_value =
         overload_result(&root, "import ints.{Shared}\nlet Shared = 1\nartifact(1)\n").unwrap_err();
     assert!(
         type_and_value.contains("import collision at 'Shared'"),
         "{type_and_value}"
+    );
+    let local_type = overload_result(
+        &root,
+        "import shapes.{Shape}\ntype Shape = Dot | Line(Int)\nartifact(1)\n",
+    )
+    .unwrap_err();
+    assert!(
+        local_type.contains("import collision at 'Shape'"),
+        "{local_type}"
     );
 }
