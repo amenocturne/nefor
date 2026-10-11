@@ -1666,3 +1666,106 @@ fn one_type_reached_through_several_imports_is_one_binding() {
         "{local_type}"
     );
 }
+
+fn call_inference_workspace(name: &str) -> std::path::PathBuf {
+    let root = workspace(name);
+    fs::write(
+        root.join("calls.mag"),
+        r#"
+type Box<T> = Full(T) | Empty
+type Twin<A> = Both {left: A, right: A} | Neither
+type Holder {box: Box<Int>}
+let none<T>: fn() -> Box<T> = | | => Box<T>.Empty
+let same<T>: fn(Box<T>, T) -> Bool = |box, value| => true
+let keep<T>: fn(Box<T>, T) -> Box<T> = |box, value| => box
+let later<T>: fn(T, Box<T>) -> Box<T> = |value, box| => box
+let pair<T>: fn(T, T) -> T = |left, right| => left
+let id<T>: fn(T) -> T = |value| => value
+"#,
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn one_call_solves_the_type_arguments_of_all_its_arguments_together() {
+    let root = call_inference_workspace("call-inference");
+    let empty = serde_json::json!({"constructor": "Empty", "value": null});
+    assert_eq!(
+        overload_result(
+            &root,
+            r#"
+import calls.{Box, Twin, Holder, none, same, keep, later, pair, id}
+let from_later_argument = same(Box.Empty, 1)
+let returned = keep(Box.Empty, 1)
+let from_earlier_argument = later(2, Box.Empty)
+let from_sibling_construction = pair(Box.Empty, Box.Full(3))
+let from_expected_result: Box<Int> = id(Box.Empty)
+let nested_call = id(pair(Box.Empty, Box.Full(4)))
+let generic_call_argument = keep(none(), 5)
+let fields = Twin.Both(Box.Empty, Box.Full(6))
+let labelled_fields = Twin.Both(left: Box.Empty, right: Box.Full(7))
+artifact {
+  from_later_argument: from_later_argument,
+  returned: returned,
+  from_earlier_argument: from_earlier_argument,
+  from_sibling_construction: from_sibling_construction,
+  from_expected_result: from_expected_result,
+  nested_call: nested_call,
+  generic_call_argument: generic_call_argument,
+  sibling_generic_call: pair(none(), Box.Full(8)),
+  in_field: Holder {box: keep(Box.Empty, 9)},
+  fields: fields,
+  labelled_fields: labelled_fields,
+}
+"#,
+        ),
+        Ok(serde_json::json!({
+            "from_later_argument": true,
+            "returned": empty,
+            "from_earlier_argument": empty,
+            "from_sibling_construction": empty,
+            "from_expected_result": empty,
+            "nested_call": empty,
+            "generic_call_argument": empty,
+            "sibling_generic_call": empty,
+            "in_field": {"box": empty},
+            "fields": {"constructor": "Both", "value": {
+                "left": empty,
+                "right": {"constructor": "Full", "value": 6},
+            }},
+            "labelled_fields": {"constructor": "Both", "value": {
+                "left": empty,
+                "right": {"constructor": "Full", "value": 7},
+            }},
+        }))
+    );
+}
+
+#[test]
+fn a_call_that_leaves_a_type_argument_undetermined_is_rejected() {
+    let root = call_inference_workspace("call-inference-undetermined");
+    for body in [
+        "let value = id(Box.Empty)",
+        "let value = pair(Box.Empty, Box.Empty)",
+        "let value = (Box.Empty, 1)",
+        "let value = Twin.Both(Box.Empty, Box.Empty)",
+    ] {
+        let error = overload_result(
+            &root,
+            &format!("import calls.{{Box, Twin, id, pair}}\n{body}\nartifact(1)\n"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("cannot infer type argument T of calls.Box")
+                && error.contains("Box<...>.Empty"),
+            "{body}: {error}"
+        );
+    }
+    let conflict = overload_result(
+        &root,
+        "import calls.{Box, same}\nartifact(same(Box.Full(\"text\"), 1))\n",
+    )
+    .unwrap_err();
+    assert!(conflict.contains("expected String, got Int"), "{conflict}");
+}

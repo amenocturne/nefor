@@ -582,7 +582,18 @@ fn infer_call(
                         )
                         .ok()?;
                     }
-                    Some((*concrete, substitute(result, &substitution)))
+                    // Binders are bound under their declared names, which a
+                    // caller's own type variables may share, so they are
+                    // substituted once; only inference variables chain.
+                    let inferred = substitution
+                        .iter()
+                        .filter(|(name, _)| name.starts_with('\0'))
+                        .map(|(name, ty)| (name.clone(), ty.clone()))
+                        .collect();
+                    Some((
+                        *concrete,
+                        substitute_fully(&substitute(result, &substitution), &inferred),
+                    ))
                 })
                 .collect::<Vec<_>>();
             if matching.len() > 1 {
@@ -2908,6 +2919,74 @@ fn compile_expr(
     Ok(value)
 }
 
+/// Applies a solved substitution to every type recorded in a checked
+/// expression. Function literals are left alone: their types are authored in
+/// full, so they carry no inference variables of an enclosing call.
+fn resolve_checked_types(expression: &mut CheckedExpr, substitution: &HashMap<String, MagType>) {
+    if substitution.is_empty() {
+        return;
+    }
+    expression.ty = substitute_fully(&expression.ty, substitution);
+    match &mut expression.kind {
+        CheckedExprKind::Vector(items) => {
+            for item in items {
+                resolve_checked_types(item, substitution);
+            }
+        }
+        CheckedExprKind::Fields(fields) => {
+            for (_, value) in fields {
+                resolve_checked_types(value, substitution);
+            }
+        }
+        CheckedExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            resolve_checked_types(condition, substitution);
+            resolve_checked_types(then_branch, substitution);
+            resolve_checked_types(else_branch, substitution);
+        }
+        CheckedExprKind::Construct { owner, payload, .. } => {
+            *owner = substitute_fully(owner, substitution);
+            resolve_checked_types(payload, substitution);
+        }
+        CheckedExprKind::Match { value, arms } => {
+            resolve_checked_types(value, substitution);
+            for arm in arms {
+                arm.binding.ty = substitute_fully(&arm.binding.ty, substitution);
+                resolve_checked_types(&mut arm.body, substitution);
+            }
+        }
+        CheckedExprKind::Call {
+            callee,
+            args,
+            type_bindings,
+        } => {
+            resolve_checked_types(callee, substitution);
+            for argument in args {
+                resolve_checked_types(argument, substitution);
+            }
+            for ty in type_bindings.values_mut() {
+                *ty = substitute_fully(ty, substitution);
+            }
+        }
+        CheckedExprKind::Ascribe { target, value } => {
+            *target = substitute_fully(target, substitution);
+            resolve_checked_types(value, substitution);
+        }
+        CheckedExprKind::TypeTag(ty) => *ty = substitute_fully(ty, substitution),
+        CheckedExprKind::Unit
+        | CheckedExprKind::Str(_)
+        | CheckedExprKind::Int(_)
+        | CheckedExprKind::Float(_)
+        | CheckedExprKind::Bool(_)
+        | CheckedExprKind::Keyword(_)
+        | CheckedExprKind::BindingRef(_)
+        | CheckedExprKind::Function(_) => {}
+    }
+}
+
 fn checked(ty: MagType, kind: CheckedExprKind) -> CheckedExpr {
     CheckedExpr { ty, kind }
 }
@@ -3245,21 +3324,47 @@ fn compile_construct(
         (Some(fields), _) => {
             let mut names = HashSet::new();
             let mut checked_fields = Vec::with_capacity(fields.values.len());
-            for (name, value, declared) in &fields.values {
+            for (name, _, _) in &fields.values {
                 if !names.insert(name) {
                     return Err(MagError::Type(format!("duplicate named field {name}")));
                 }
-                let field_expected = substitute_fully(declared, &substitution);
-                let value =
-                    compile_expr(env, scopes, value, Some(&field_expected)).map_err(|error| {
-                        match error {
+            }
+            // Like the arguments of a call, the fields of one construction
+            // are solved together: a field whose type is still undetermined
+            // waits for the constraints of the others.
+            let mut waiting = fields.values.iter().collect::<Vec<_>>();
+            loop {
+                let mut still_waiting = Vec::new();
+                let mut first_error = None;
+                let before = checked_fields.len();
+                for field in waiting {
+                    let (name, value, declared) = field;
+                    let field_expected = substitute_fully(declared, &substitution);
+                    let compiled = compile_expr(env, scopes, value, Some(&field_expected))
+                        .map_err(|error| match error {
                             MagError::Type(_) => field_error(&constructor, name, error),
                             other => other,
+                        })
+                        .and_then(|value| {
+                            unify_payload(env, &value.ty, declared, &mut substitution, &bindable)
+                                .map_err(|error| field_error(&constructor, name, error))?;
+                            Ok(value)
+                        });
+                    match compiled {
+                        Ok(value) => checked_fields.push((name.clone(), value)),
+                        Err(error) if has_type_variables(&field_expected) => {
+                            first_error.get_or_insert(error);
+                            still_waiting.push(field);
                         }
-                    })?;
-                unify_payload(env, &value.ty, declared, &mut substitution, &bindable)
-                    .map_err(|error| field_error(&constructor, name, error))?;
-                checked_fields.push((name.clone(), value));
+                        Err(error) => return Err(error),
+                    }
+                }
+                waiting = still_waiting;
+                match first_error {
+                    None => break,
+                    Some(error) if checked_fields.len() == before => return Err(error),
+                    Some(_) => {}
+                }
             }
             let shape = if fields.ascribed {
                 Shape::Ascribed
@@ -3312,6 +3417,7 @@ fn compile_construct(
     }
     let owner = owner.resolved(&substitution);
     let payload_type = substitute_fully(&payload_type, &substitution);
+    resolve_checked_types(&mut payload, &substitution);
     // Several arguments and labelled arguments are sugar for a tuple or record
     // payload; ascribing the declared payload type gives them its identity.
     if matches!(payload.kind, CheckedExprKind::Fields(_)) {
@@ -4099,15 +4205,34 @@ fn compile_overloaded_call(
             ));
             continue;
         }
-        let (args, mut substitution) = match compile_call_args(
-            env,
-            scopes,
-            expressions,
-            params,
-            candidate.parameter_names.as_deref(),
-            &bindable,
-            &holes,
-        ) {
+        let compile_args = |seed| {
+            compile_call_args(
+                env,
+                scopes,
+                expressions,
+                params,
+                candidate.parameter_names.as_deref(),
+                &bindable,
+                &holes,
+                seed,
+            )
+        };
+        // When the arguments alone leave a type argument undetermined, the
+        // expected result type is one more constraint of the same call.
+        let compiled = compile_args(HashMap::new()).or_else(|failure| {
+            let seed = expected_result.and_then(|expected| {
+                let mut seed = HashMap::new();
+                (has_type_variables(result)
+                    && constrain_result(env, result, expected, &mut seed, &bindable).is_ok()
+                    && !seed.is_empty())
+                .then_some(seed)
+            });
+            match seed {
+                Some(seed) => compile_args(seed).map_err(|_| failure),
+                None => Err(failure),
+            }
+        });
+        let (args, mut substitution) = match compiled {
             Ok(checked) => checked,
             Err(failure) => {
                 let reason = match failure.conflicting_hole {
@@ -4172,18 +4297,24 @@ fn compile_overloaded_call(
             ));
             continue;
         }
-        let output = substitute(result, &substitution);
+        let output = substitute_fully(result, &substitution);
         let callee_type = MagType::Function(
             params
                 .iter()
-                .map(|parameter| substitute(parameter, &substitution))
+                .map(|parameter| substitute_fully(parameter, &substitution))
                 .collect(),
             Box::new(output.clone()),
         );
         let type_bindings: BTreeMap<String, MagType> = type_bindings
             .into_iter()
-            .map(|(name, ty)| (name, substitute(&ty, &substitution)))
+            .map(|(name, ty)| (name, substitute_fully(&ty, &substitution)))
             .collect();
+        // An argument checked before the call was solved may still mention
+        // the call's inference variables; it is evaluated at its final type.
+        let mut args = args;
+        for argument in &mut args {
+            resolve_checked_types(argument, &substitution);
+        }
         matches.push((candidate, args, output, callee_type, type_bindings));
     }
     if matches.len() > 1 {
@@ -4245,6 +4376,65 @@ struct CallArgumentFailure {
 
 type CompiledCallArgs = (Vec<CheckedExpr>, HashMap<String, MagType>);
 
+/// Compiles one call argument against its parameter and unifies their types.
+#[allow(clippy::too_many_arguments)]
+fn compile_call_arg(
+    env: &Env,
+    scopes: &[CheckedScope],
+    expressions: &[Expr],
+    params: &[MagType],
+    parameter_names: Option<&[String]>,
+    bindable: &HashSet<String>,
+    holes: &[InferredTypeArgumentHole],
+    index: usize,
+    checked_arguments: usize,
+    substitution: &mut HashMap<String, MagType>,
+) -> Result<CheckedExpr, Box<CallArgumentFailure>> {
+    let expression = &expressions[index];
+    let parameter = substitute_fully(&params[index], substitution);
+    let name = parameter_names.and_then(|names| names.get(index)).cloned();
+    let argument = compile_expr(env, scopes, expression, Some(&parameter)).map_err(|error| {
+        let mut locals = visible_types(env, scopes, &CheckedScope::new());
+        let actual = infer(env, &mut locals, expression).ok();
+        let conflicting_hole = actual.as_ref().and_then(|actual| {
+            conflicting_explicit_hole(env, actual, &params[index], substitution, bindable, holes)
+                .map(|(hole_index, binder)| (hole_index, binder, actual.clone()))
+        });
+        Box::new(CallArgumentFailure {
+            index,
+            name: name.clone(),
+            checked_arguments,
+            expected: parameter.clone(),
+            actual,
+            conflicting_hole,
+            error: error.to_string(),
+        })
+    })?;
+    compatible_with_bindable(env, &argument.ty, &parameter, substitution, bindable).map_err(
+        |error| {
+            Box::new(CallArgumentFailure {
+                index,
+                name,
+                checked_arguments,
+                expected: parameter,
+                actual: Some(argument.ty.clone()),
+                conflicting_hole: conflicting_explicit_hole(
+                    env,
+                    &argument.ty,
+                    &params[index],
+                    substitution,
+                    bindable,
+                    holes,
+                )
+                .map(|(hole_index, binder)| (hole_index, binder, argument.ty.clone())),
+                error,
+            })
+        },
+    )?;
+    Ok(argument)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_call_args(
     env: &Env,
     scopes: &[CheckedScope],
@@ -4253,63 +4443,77 @@ fn compile_call_args(
     parameter_names: Option<&[String]>,
     bindable: &HashSet<String>,
     holes: &[InferredTypeArgumentHole],
+    seed: HashMap<String, MagType>,
 ) -> Result<CompiledCallArgs, Box<CallArgumentFailure>> {
-    let mut substitution = HashMap::new();
+    let mut substitution = seed;
     let mut args = vec![None; params.len()];
     let mut checked_arguments = 0;
     let mut order = (0..params.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| contains_union(&params[*index]));
+    // The arguments of one call are solved together. An argument that cannot
+    // be typed while its parameter still has undetermined type arguments
+    // waits until the other arguments have contributed their constraints.
+    let mut waiting = Vec::<(usize, usize, Box<CallArgumentFailure>)>::new();
     for index in order {
-        let expression = &expressions[index];
-        let parameter = substitute(&params[index], &substitution);
-        let name = parameter_names.and_then(|names| names.get(index)).cloned();
-        let argument =
-            compile_expr(env, scopes, expression, Some(&parameter)).map_err(|error| {
-                let mut locals = visible_types(env, scopes, &CheckedScope::new());
-                let actual = infer(env, &mut locals, expression).ok();
-                let conflicting_hole = actual.as_ref().and_then(|actual| {
-                    conflicting_explicit_hole(
-                        env,
-                        actual,
-                        &params[index],
-                        &substitution,
-                        bindable,
-                        holes,
-                    )
-                    .map(|(hole_index, binder)| (hole_index, binder, actual.clone()))
-                });
-                Box::new(CallArgumentFailure {
-                    index,
-                    name: name.clone(),
-                    checked_arguments,
-                    expected: parameter.clone(),
-                    actual,
-                    conflicting_hole,
-                    error: error.to_string(),
-                })
-            })?;
-        compatible_with_bindable(env, &argument.ty, &parameter, &mut substitution, bindable)
-            .map_err(|error| {
-                Box::new(CallArgumentFailure {
-                    index,
-                    name,
-                    checked_arguments,
-                    expected: parameter,
-                    actual: Some(argument.ty.clone()),
-                    conflicting_hole: conflicting_explicit_hole(
-                        env,
-                        &argument.ty,
-                        &params[index],
-                        &substitution,
-                        bindable,
-                        holes,
-                    )
-                    .map(|(hole_index, binder)| (hole_index, binder, argument.ty.clone())),
-                    error,
-                })
-            })?;
-        args[index] = Some(argument);
-        checked_arguments += 1;
+        let known = substitution.len();
+        match compile_call_arg(
+            env,
+            scopes,
+            expressions,
+            params,
+            parameter_names,
+            bindable,
+            holes,
+            index,
+            checked_arguments,
+            &mut substitution,
+        ) {
+            Ok(argument) => {
+                args[index] = Some(argument);
+                checked_arguments += 1;
+            }
+            Err(failure) if !internal_type_variables(&failure.expected).is_empty() => {
+                waiting.push((index, known, failure));
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+    while !waiting.is_empty() {
+        let mut still_waiting = Vec::new();
+        let mut progressed = false;
+        for (index, known, failure) in waiting {
+            if substitution.len() == known {
+                still_waiting.push((index, known, failure));
+                continue;
+            }
+            let known = substitution.len();
+            match compile_call_arg(
+                env,
+                scopes,
+                expressions,
+                params,
+                parameter_names,
+                bindable,
+                holes,
+                index,
+                checked_arguments,
+                &mut substitution,
+            ) {
+                Ok(argument) => {
+                    args[index] = Some(argument);
+                    checked_arguments += 1;
+                    progressed = true;
+                }
+                Err(failure) => still_waiting.push((index, known, failure)),
+            }
+        }
+        waiting = still_waiting;
+        if !progressed {
+            break;
+        }
+    }
+    if let Some((_, _, failure)) = waiting.into_iter().next() {
+        return Err(failure);
     }
     let args = args
         .into_iter()
