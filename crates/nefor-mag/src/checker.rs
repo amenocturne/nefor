@@ -500,6 +500,11 @@ fn infer_call(
             })
             .collect::<Vec<_>>();
         for signature in env_candidates.iter().filter_map(|candidate| {
+            // An annotated function binding is stored with its annotation.
+            let candidate = match candidate {
+                Value::Typed(function, _) => function.as_ref(),
+                other => other,
+            };
             let Value::Fn(function) = candidate else {
                 return None;
             };
@@ -2657,6 +2662,20 @@ fn insert_checked_candidate(
     candidate: CheckedCandidate,
 ) -> Result<(), MagError> {
     let canonical = canonical_type(&candidate.ty);
+    // An imported value and a local declaration of one name are overloads
+    // unless their types coincide; that pairing is an import collision.
+    if let Some(collision) = env.pending_import_collision(name) {
+        if env_candidates(env, name)
+            .iter()
+            .any(|imported| canonical_type(&imported.ty) == canonical)
+        {
+            return Err(MagError::Type(collision.replacen(
+                "; same type",
+                &format!("; same type {}", candidate.ty),
+                1,
+            )));
+        }
+    }
     if visible_candidates(env, outer, current, name)
         .iter()
         .any(|candidate| canonical_type(&candidate.ty) == canonical)
@@ -5078,6 +5097,11 @@ pub(crate) fn value_type(value: &Value) -> Option<MagType> {
 }
 
 pub(crate) fn canonical_value_type(value: &Value) -> Option<String> {
+    if let Value::Typed(function, _) = value {
+        if matches!(function.as_ref(), Value::Fn(_)) {
+            return canonical_value_type(function);
+        }
+    }
     if let Value::Type(ty) = value {
         return Some(format!("Type<{ty}>"));
     }

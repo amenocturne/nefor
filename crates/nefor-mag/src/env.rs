@@ -228,6 +228,10 @@ pub struct Env {
     module: String,
     state: Arc<Mutex<CompilationState>>,
     profiler: Option<CompileProfiler>,
+    /// Import-collision diagnostics for names this module both imports and
+    /// declares. Whether such a pair collides depends on the declaration's
+    /// type, which only the checker knows.
+    pending_import_collisions: Arc<BTreeMap<String, String>>,
 }
 
 impl Clone for Env {
@@ -246,6 +250,7 @@ impl Clone for Env {
             module: self.module.clone(),
             state: self.state.clone(),
             profiler: self.profiler.clone(),
+            pending_import_collisions: self.pending_import_collisions.clone(),
         }
     }
 }
@@ -296,6 +301,7 @@ impl Env {
             module: module.into(),
             state,
             profiler,
+            pending_import_collisions: Arc::default(),
         };
         for &name in crate::checker::BUILTIN_NAMES {
             env.define(name, Value::BuiltinFn(name.into()));
@@ -1109,7 +1115,16 @@ impl Env {
             module: self.module.clone(),
             state: self.state.clone(),
             profiler: self.profiler.clone(),
+            pending_import_collisions: self.pending_import_collisions.clone(),
         }
+    }
+    pub(crate) fn set_pending_import_collisions(&mut self, collisions: BTreeMap<String, String>) {
+        self.pending_import_collisions = Arc::new(collisions);
+    }
+    /// The import-collision diagnostic for `name` when this module imports a
+    /// value under that name and also declares one.
+    pub(crate) fn pending_import_collision(&self, name: &str) -> Option<&str> {
+        self.pending_import_collisions.get(name).map(String::as_str)
     }
     pub fn user_defs(&self, direct_names: &HashSet<String>) -> BTreeMap<String, Vec<Value>> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());

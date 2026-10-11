@@ -360,11 +360,7 @@ fn unresolved_names_get_static_non_evaluating_import_suggestions() {
 #[test]
 fn import_collisions_use_canonical_declarations_and_preserve_overload_sets() {
     let root = workspace("import-declaration-identity");
-    fs::write(
-        root.join("a.mag"),
-        "let value = 1\nlet bomb = fail(\"must not evaluate before collision resolution\")\n",
-    )
-    .unwrap();
+    fs::write(root.join("a.mag"), "let value = 1\n").unwrap();
     fs::write(root.join("b.mag"), "let value = 1\n").unwrap();
     fs::write(
         root.join("collision.mag"),
@@ -377,6 +373,26 @@ fn import_collisions_use_canonical_declarations_and_preserve_overload_sets() {
         .to_string();
     assert!(error.contains("a.value"), "{error}");
     assert!(error.contains("b.value"), "{error}");
+    assert!(error.contains("same type Int"), "{error}");
+
+    // A collision that involves a type is decided by spelling alone, before
+    // any imported module is evaluated.
+    fs::write(
+        root.join("typed.mag"),
+        "type Shared {value: Int}\nlet bomb = fail(\"must not evaluate before collision resolution\")\n",
+    )
+    .unwrap();
+    fs::write(root.join("other.mag"), "type Shared {value: Int}\n").unwrap();
+    fs::write(
+        root.join("type-collision.mag"),
+        "import typed\nimport other\nartifact(1)\n",
+    )
+    .unwrap();
+    let error = compile_file_with_syntax(&root, "type-collision.mag", SyntaxMode::New)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("import collision at 'Shared'"), "{error}");
+    assert!(!error.contains("must not evaluate"), "{error}");
 
     fs::write(
         root.join("overloads.mag"),
@@ -1262,5 +1278,226 @@ fn lisp_construct_states_its_payload_including_nil() {
     assert_eq!(
         artifact,
         serde_json::json!({"constructor": "Yes", "value": null})
+    );
+}
+
+fn overload_workspace(name: &str) -> std::path::PathBuf {
+    let root = workspace(name);
+    for (module, source) in [
+        (
+            "ints",
+            "let render: fn(Int) -> String = |value| => str(\"int:\", value)\nlet limit = 10\ntype Shared {value: Int}\n",
+        ),
+        (
+            "strings",
+            "let render: fn(String) -> String = |value| => str(\"string:\", value)\nlet limit = \"ten\"\n",
+        ),
+        (
+            "more_ints",
+            "let render: fn(Int) -> String = |value| => str(\"other-int:\", value)\n",
+        ),
+        (
+            "generic",
+            "let render<T>: fn(List<T>) -> String = |values| => str(\"list:\", count(values))\n",
+        ),
+        ("shared_alias", "import ints.{}\ntype Shared = ints.Shared\n"),
+        ("relay", "import ints\nlet relayed = render(1)\n"),
+    ] {
+        fs::write(root.join(format!("{module}.mag")), source).unwrap();
+    }
+    root
+}
+
+fn overload_result(root: &Path, source: &str) -> Result<serde_json::Value, String> {
+    fs::write(root.join("main.mag"), source).unwrap();
+    compile_file_with_syntax(root, "main.mag", SyntaxMode::New).map_err(|error| error.to_string())
+}
+
+#[test]
+fn imports_of_one_name_with_different_types_form_an_overload_set() {
+    let root = overload_workspace("import-overloads");
+    for (form, source) in [
+        (
+            "open",
+            "import ints\nimport strings\nartifact([render(1), render(\"x\")])\n",
+        ),
+        (
+            "selective",
+            "import ints.{render}\nimport strings.{render}\nartifact([render(1), render(\"x\")])\n",
+        ),
+        (
+            "renamed",
+            "import ints.{render as show}\nimport strings.{render as show}\nartifact([show(1), show(\"x\")])\n",
+        ),
+        (
+            "mixed open and selective",
+            "import ints\nimport strings.{render}\nartifact([render(1), render(\"x\")])\n",
+        ),
+        (
+            "selective import after its first use",
+            "import ints.{render}\nlet early = render(1)\nimport strings.{render}\nartifact([early, render(\"x\")])\n",
+        ),
+        (
+            "unannotated bindings",
+            "import ints\nimport strings\nlet first = render(1)\nlet second = render(\"x\")\nartifact([first, second])\n",
+        ),
+    ] {
+        assert_eq!(
+            overload_result(&root, source),
+            Ok(serde_json::json!(["int:1", "string:x"])),
+            "{form}"
+        );
+    }
+
+    assert_eq!(
+        overload_result(
+            &root,
+            "import ints\nimport strings\nimport generic\nartifact([render(1), render(\"x\"), render([1, 2])])\n",
+        ),
+        Ok(serde_json::json!(["int:1", "string:x", "list:2"]))
+    );
+    // Data values overload by type as functions do.
+    assert_eq!(
+        overload_result(
+            &root,
+            "import ints\nimport strings\nlet number: Int = limit\nlet text: String = limit\nartifact([str(number), text])\n",
+        ),
+        Ok(serde_json::json!(["10", "ten"]))
+    );
+    // A namespace alias keeps each module's overloads apart.
+    assert_eq!(
+        overload_result(
+            &root,
+            "import ints as i\nimport more_ints as m\nartifact([i.render(1), m.render(1)])\n",
+        ),
+        Ok(serde_json::json!(["int:1", "other-int:1"]))
+    );
+    // Suppressing one source removes it from the set.
+    assert_eq!(
+        overload_result(
+            &root,
+            "import ints\nimport more_ints\nimport more_ints.{render as _}\nartifact(render(1))\n",
+        ),
+        Ok(serde_json::json!("int:1"))
+    );
+    // Imports stay non-transitive: `relay` uses `ints.render` without exporting it.
+    let hidden =
+        overload_result(&root, "import relay\nartifact([relayed, render(1)])\n").unwrap_err();
+    assert!(hidden.contains("unresolved symbol: render"), "{hidden}");
+
+    let no_match = overload_result(
+        &root,
+        "import ints\nimport strings\nartifact(render(true))\n",
+    )
+    .unwrap_err();
+    assert!(
+        no_match.contains("no overload render matches call"),
+        "{no_match}"
+    );
+    assert!(no_match.contains("expected Int, got Bool"), "{no_match}");
+    assert!(no_match.contains("expected String, got Bool"), "{no_match}");
+
+    let ambiguous = overload_result(
+        &root,
+        "import ints\nimport strings\nlet chosen = limit\nartifact(1)\n",
+    )
+    .unwrap_err();
+    assert!(ambiguous.contains("limit"), "{ambiguous}");
+}
+
+#[test]
+fn an_imported_and_a_local_value_of_one_name_overload_by_type() {
+    let root = overload_workspace("import-local-overloads");
+    assert_eq!(
+        overload_result(
+            &root,
+            "import ints.{render}\nlet render: fn(Bool) -> String = |flag| => str(\"bool:\", flag)\nartifact([render(1), render(true)])\n",
+        ),
+        Ok(serde_json::json!(["int:1", "bool:true"]))
+    );
+    assert_eq!(
+        overload_result(
+            &root,
+            "import ints\nlet limit = \"local\"\nlet number: Int = limit\nlet text: String = limit\nartifact([str(number), text])\n",
+        ),
+        Ok(serde_json::json!(["10", "local"]))
+    );
+
+    let selective = overload_result(
+        &root,
+        "import ints.{render}\nlet render: fn(Int) -> String = |value| => \"local\"\nartifact(render(1))\n",
+    )
+    .unwrap_err();
+    assert!(
+        selective.contains(
+            "import collision at 'render'; candidates: imported export ints.render, local let render; same type (Fn Int String); repairs: remove or rename selector `ints.{render}`"
+        ),
+        "{selective}"
+    );
+
+    let open = overload_result(&root, "import ints\nlet limit = 3\nartifact(limit)\n").unwrap_err();
+    assert!(
+        open.contains("import collision at 'limit'")
+            && open.contains("same type Int")
+            && open.contains("add `import ints.{limit as _}`"),
+        "{open}"
+    );
+}
+
+#[test]
+fn imports_of_one_name_with_the_same_type_collide() {
+    let root = overload_workspace("import-same-type");
+    for (form, source, repair) in [
+        (
+            "open",
+            "import ints\nimport more_ints\nartifact(render(1))\n",
+            "add `import more_ints.{render as _}`",
+        ),
+        (
+            "selective",
+            "import ints.{render}\nimport more_ints.{render}\nartifact(render(1))\n",
+            "remove or rename selector `more_ints.{render}`",
+        ),
+        (
+            "renamed",
+            "import ints.{render as show}\nimport more_ints.{render as show}\nartifact(show(1))\n",
+            "remove or rename selector `ints.{render}`",
+        ),
+        (
+            "among overloads",
+            "import ints\nimport strings\nimport more_ints\nartifact(render(1))\n",
+            "add `import ints.{render as _}`",
+        ),
+    ] {
+        let error = overload_result(&root, source).unwrap_err();
+        assert!(
+            error.contains("imported export ints.render")
+                && error.contains("imported export more_ints.render")
+                && error.contains("same type (Fn Int String)")
+                && error.contains(repair),
+            "{form}: {error}"
+        );
+    }
+}
+
+#[test]
+fn types_do_not_overload_across_imports() {
+    let root = overload_workspace("import-type-collisions");
+    // The same nominal type under one name through two paths is still a
+    // collision by spelling.
+    let alias = overload_result(
+        &root,
+        "import ints.{Shared}\nimport shared_alias.{Shared}\nartifact(1)\n",
+    )
+    .unwrap_err();
+    assert!(
+        alias.contains("import collision at 'Shared'; candidates: imported export ints.Shared, imported export shared_alias.Shared"),
+        "{alias}"
+    );
+    let type_and_value =
+        overload_result(&root, "import ints.{Shared}\nlet Shared = 1\nartifact(1)\n").unwrap_err();
+    assert!(
+        type_and_value.contains("import collision at 'Shared'"),
+        "{type_and_value}"
     );
 }

@@ -14,7 +14,7 @@ Parsing, name resolution, and type checking reject a program before evaluation. 
 
 - using a Lisp `(require "...")` form in a `.mag` file instead of a supported direct `import module.identity`, `import module.identity.{...}`, or `import module.identity as alias` declaration;
 - referencing an undeclared name or type, or a qualified name without a matching direct import;
-- an import collision between namespace roots, aliases, builtins, local declarations, and opened or selected exports;
+- an import collision between namespace roots, aliases, builtins, local declarations, and opened or selected exports. Values of one name and different types are overloads, not a collision; two values of one name and the same type report `import collision at 'name'; candidates: ...; same type T; repairs: ...`;
 - passing a value that does not conform to a declared record, function parameter, or annotation;
 - a non-exhaustive, repeated, or foreign `match` case;
 - comparing values with `=` when they contain functions, type witnesses or descriptors, packed compiler values, or artifacts;

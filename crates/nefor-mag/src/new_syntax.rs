@@ -421,7 +421,7 @@ impl<'a> Parser<'a> {
     fn new(source: &'a SourceSnapshot, tokens: Vec<Token>) -> Result<Self, MagError> {
         let fixities = scan_fixities(source, &tokens)?;
         let bound_names = scan_top_level_lets(&tokens);
-        Ok(Self {
+        let parser = Self {
             source,
             tokens,
             cursor: 0,
@@ -431,7 +431,8 @@ impl<'a> Parser<'a> {
             namespace_aliases: HashSet::new(),
             bound_names,
             allow_brace_construct: true,
-        })
+        };
+        Ok(parser)
     }
 
     fn parse_module(mut self) -> Result<authored::Module, MagError> {
@@ -500,13 +501,13 @@ impl<'a> Parser<'a> {
                         Some(export.clone())
                     };
                     if let Some(local_name) = &local {
-                        let mut segments = path.segments().to_vec();
-                        segments.push(export.clone());
-                        let canonical = authored::NamePath::from_segments(segments);
-                        if let Some(fixity) = self.fixities.get(local_name).copied() {
-                            self.fixities.insert(canonical.to_string(), fixity);
-                        }
-                        self.aliases.insert(local_name.clone(), canonical);
+                        // A selected name stays as written. It may gather
+                        // overloads from other imports and from local
+                        // bindings, which only the checker can resolve.
+                        self.aliases.insert(
+                            local_name.clone(),
+                            authored::NamePath::single(local_name.clone()),
+                        );
                     }
                     selectors.push(authored::ImportSelector { export, local });
                     if self.eat_punct('}') {
@@ -2048,9 +2049,7 @@ mod tests {
         let authored::Expr::Call { callee, .. } = value else {
             panic!("call")
         };
-        assert!(
-            matches!(callee.as_ref(), authored::Expr::Name(name) if name == "nefor.graph.edge")
-        );
+        assert!(matches!(callee.as_ref(), authored::Expr::Name(name) if name == "edge"));
     }
 
     fn last_let_value(module: &authored::Module) -> &authored::Expr {
@@ -2115,7 +2114,7 @@ let c = On(1)
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(callees, ["Local.On", "support.Imported.On", "On"]);
+        assert_eq!(callees, ["Local.On", "Imported.On", "On"]);
     }
 
     #[test]
@@ -2297,7 +2296,7 @@ let c = On(1)
         let authored::Expr::Call { callee, args, .. } = value.as_ref() else {
             panic!("arrow infix application")
         };
-        assert!(matches!(callee.as_ref(), authored::Expr::Name(name) if name == "operators.->"));
+        assert!(matches!(callee.as_ref(), authored::Expr::Name(name) if name == "->"));
         assert_eq!(args.len(), 2);
         assert!(parse("let f: Int -> Int = |value| => value\n").is_ok());
         assert!(parse("let arrow = (->)\n").is_ok());
@@ -2494,9 +2493,7 @@ let c = On(1)
         let authored::Expr::Call { callee, args, .. } = value else {
             panic!("right-associated call")
         };
-        assert!(
-            matches!(callee.as_ref(), authored::Expr::Name(name) if name == "operators.append")
-        );
+        assert!(matches!(callee.as_ref(), authored::Expr::Name(name) if name == "plus"));
         assert!(
             matches!(args.as_slice(), [authored::Expr::Name(left), authored::Expr::Call { .. }] if left == "a")
         );

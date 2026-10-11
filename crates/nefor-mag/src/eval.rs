@@ -2293,7 +2293,8 @@ fn selected_value_type(
     Ok(declared.clone())
 }
 
-fn direct_module_exports(env: &Env, name: &str) -> Result<BTreeSet<String>, MagError> {
+/// A module's direct exports by name; `true` marks a type declaration.
+fn direct_module_exports(env: &Env, name: &str) -> Result<BTreeMap<String, bool>, MagError> {
     let resolve_phase = env.profile_phase(Phase::ModuleResolve);
     let resolved = crate::resolver::resolve_module(env.module_roots(), name)?;
     drop(resolve_phase);
@@ -2314,12 +2315,17 @@ fn direct_module_exports(env: &Env, name: &str) -> Result<BTreeSet<String>, MagE
         .iter()
         .filter_map(|form| match form {
             Form::Type(declaration) if !declaration.name.contains('.') => {
-                Some(declaration.name.clone())
+                Some((declaration.name.clone(), true))
             }
-            Form::Block(crate::authored::BlockItem::Let { name, .. }) => Some(name.clone()),
+            Form::Block(crate::authored::BlockItem::Let { name, .. }) => {
+                Some((name.clone(), false))
+            }
             _ => None,
         })
-        .collect())
+        .fold(BTreeMap::new(), |mut exports, (name, is_type)| {
+            *exports.entry(name).or_insert(false) |= is_type;
+            exports
+        }))
 }
 
 fn eval_imports(
@@ -2329,13 +2335,18 @@ fn eval_imports(
 ) -> Result<(), MagError> {
     use crate::authored::ImportExposure;
 
-    let mut direct_exports = BTreeMap::new();
+    let mut direct_exports = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut exported_types = BTreeSet::<(String, String)>::new();
     for require in requires {
         if !direct_exports.contains_key(&require.module) {
-            direct_exports.insert(
-                require.module.clone(),
-                direct_module_exports(env, &require.module)?,
+            let exports = direct_module_exports(env, &require.module)?;
+            exported_types.extend(
+                exports
+                    .iter()
+                    .filter(|(_, is_type)| **is_type)
+                    .map(|(name, _)| (require.module.clone(), name.clone())),
             );
+            direct_exports.insert(require.module.clone(), exports.into_keys().collect());
         }
     }
 
@@ -2407,6 +2418,12 @@ fn eval_imports(
         opened.entry(local).or_default().insert((module, export));
     }
 
+    // Values are overloadable: two values under one spelling collide only when
+    // they have the same type, which is known after the modules are evaluated
+    // and, for a local `let`, after it is checked. Every other pairing is
+    // decided here by spelling alone.
+    let mut value_candidates = BTreeSet::<(String, String)>::new();
+    let mut local_lets = BTreeSet::<String>::new();
     let mut candidates = BTreeMap::<String, BTreeSet<String>>::new();
     for form in &authored.forms {
         match form {
@@ -2417,10 +2434,13 @@ fn eval_imports(
                     .insert(format!("local type {}", declaration.name));
             }
             Form::Block(crate::authored::BlockItem::Let { name, .. }) => {
+                let candidate = format!("local let {name}");
+                value_candidates.insert((name.clone(), candidate.clone()));
+                local_lets.insert(name.clone());
                 candidates
                     .entry(name.clone())
                     .or_default()
-                    .insert(format!("local let {name}"));
+                    .insert(candidate);
             }
             _ => {}
         }
@@ -2464,10 +2484,14 @@ fn eval_imports(
     }
     for (local, declarations) in &opened {
         for (module, export) in declarations {
+            let candidate = format!("imported export {module}.{export}");
+            if !exported_types.contains(&(module.clone(), export.clone())) {
+                value_candidates.insert((local.clone(), candidate.clone()));
+            }
             candidates
                 .entry(local.clone())
                 .or_default()
-                .insert(format!("imported export {module}.{export}"));
+                .insert(candidate);
         }
     }
 
@@ -2494,20 +2518,11 @@ fn eval_imports(
         }
     }
 
-    if let Some((spelling, conflicting)) = candidates.iter().find(|(_, set)| {
-        set.len() > 1
-            && set.iter().any(|candidate| {
-                candidate.starts_with("imported export ")
-                    || candidate.starts_with("canonical namespace ")
-                    || candidate.starts_with("namespace alias ")
-            })
-    }) {
+    let collision_message = |spelling: &str, conflicting: &BTreeSet<String>, detail: &str| {
         let mut repairs = BTreeSet::new();
         for require in requires {
             match &require.exposure {
-                ImportExposure::Open
-                    if direct_exports[&require.module].contains(spelling.as_str()) =>
-                {
+                ImportExposure::Open if direct_exports[&require.module].contains(spelling) => {
                     repairs.insert(format!(
                         "replace `import {0}` with `import {0}.{{}}`, or add `import {0}.{{{1} as _}}`",
                         require.module, spelling
@@ -2516,7 +2531,7 @@ fn eval_imports(
                 ImportExposure::Selective(selectors) => {
                     for selector in selectors
                         .iter()
-                        .filter(|selector| selector.local.as_deref() == Some(spelling.as_str()))
+                        .filter(|selector| selector.local.as_deref() == Some(spelling))
                     {
                         repairs.insert(format!(
                             "remove or rename selector `{}.{{{}}}`",
@@ -2541,10 +2556,25 @@ fn eval_imports(
                 repairs.into_iter().collect::<Vec<_>>().join("; ")
             )
         };
-        return Err(MagError::Type(format!(
-            "import collision at '{spelling}'; candidates: {}{repairs}",
+        format!(
+            "import collision at '{spelling}'; candidates: {}{detail}{repairs}",
             conflicting.iter().cloned().collect::<Vec<_>>().join(", ")
-        )));
+        )
+    };
+    let only_values = |spelling: &String, set: &BTreeSet<String>| {
+        set.iter()
+            .all(|candidate| value_candidates.contains(&(spelling.clone(), candidate.clone())))
+    };
+    if let Some((spelling, conflicting)) = candidates.iter().find(|(spelling, set)| {
+        set.len() > 1
+            && !only_values(spelling, set)
+            && set.iter().any(|candidate| {
+                candidate.starts_with("imported export ")
+                    || candidate.starts_with("canonical namespace ")
+                    || candidate.starts_with("namespace alias ")
+            })
+    }) {
+        return Err(MagError::Type(collision_message(spelling, conflicting, "")));
     }
 
     let mut modules = BTreeMap::new();
@@ -2566,14 +2596,48 @@ fn eval_imports(
             env.install_module(alias, modules[module].clone());
         }
     }
+    let mut pending = BTreeMap::new();
     for (local, declarations) in opened {
-        let Some((module, export)) = declarations.into_iter().next() else {
-            continue;
-        };
-        for value in &modules[&module][&export] {
-            env.define(&local, value.clone());
+        // One spelling may gather values from several declarations. They form
+        // an overload set unless two of them have the same type.
+        let mut installed = Vec::<((&String, &String), Value)>::new();
+        for (module, export) in &declarations {
+            let Some(values) = modules[module].get(export) else {
+                continue;
+            };
+            for value in values {
+                let ty = crate::checker::canonical_value_type(value);
+                let duplicate = installed.iter().any(|(source, existing)| {
+                    *source != (module, export)
+                        && crate::checker::canonical_value_type(existing) == ty
+                });
+                if duplicate {
+                    let detail = format!(
+                        "; same type {}",
+                        crate::checker::value_type(value)
+                            .map(|ty| ty.to_string())
+                            .unwrap_or_else(|| "value".into())
+                    );
+                    return Err(MagError::Type(collision_message(
+                        &local,
+                        &candidates[&local],
+                        &detail,
+                    )));
+                }
+                installed.push(((module, export), value.clone()));
+            }
+        }
+        if local_lets.contains(&local) && !installed.is_empty() {
+            pending.insert(
+                local.clone(),
+                collision_message(&local, &candidates[&local], "; same type"),
+            );
+        }
+        for (_, value) in installed {
+            env.define(&local, value);
         }
     }
+    env.set_pending_import_collisions(pending);
     Ok(())
 }
 
