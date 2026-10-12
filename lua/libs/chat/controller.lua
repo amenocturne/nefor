@@ -107,8 +107,9 @@ local function retract_mag_approvals(state, run_id, correlation)
 end
 
 -- Per-model context window sizes reported by the provider's model list.
--- Populated by chat.models.listed events; keyed by model id.
+-- Populated by chat.models.listed events; keyed by provider/model pair.
 local model_context_windows = {}
+local model_max_context_windows = {}
 local model_reasoning_defaults = {}
 
 local function model_key(provider, model)
@@ -928,14 +929,10 @@ local function handle_error_append(msg, state)
   return transcript.flush_graph_results(next_state), {}
 end
 
-local function handle_context_usage(msg, state)
-  if msg.provider ~= nil and msg.provider ~= state.provider then return state, {} end
-  if msg.conversation_id ~= nil and msg.conversation_id ~= state.conversation_id then
-    return state, {}
-  end
-  local tokens = msg.context_input_tokens
-  if type(tokens) ~= "number" then return state, {} end
-  return shallow_merge(state, { current_context_tokens = tokens }), {}
+-- Provider observations become visible only after conversation-manager has
+-- correlated and recorded them. Raw observations are not a second authority.
+local function handle_context_usage(_, state)
+  return state, {}
 end
 
 local function handle_usage_values(msg, state)
@@ -1150,9 +1147,14 @@ local selection_lookups = {
     local k = model_key(provider, model)
     return k ~= nil and model_reasoning_defaults[k] or nil
   end,
-  context_window = function(_, model)
-    if type(model) ~= "string" then return nil end
-    return model_context_windows[model]
+  context_window = function(provider, model)
+    return model_context_windows[model_key(provider, model)]
+  end,
+  max_context_window = function(provider, model)
+    local key = model_key(provider, model)
+    local maximum, regular = model_max_context_windows[key], model_context_windows[key]
+    if maximum and regular and maximum < regular then return nil end
+    return maximum
   end,
 }
 
@@ -1185,15 +1187,25 @@ local function handle_reasoning_set_ack(msg, state)
 end
 
 local function handle_models_listed(msg, state)
-  -- Absorb per-model context windows if the provider reported them.
-  local active_ctx = nil
-  if type(msg.context_windows) == "table" then
-    for model_id, ctx_size in pairs(msg.context_windows) do
-      if type(ctx_size) == "number" and ctx_size > 0 then
-        model_context_windows[model_id] = ctx_size
-        if model_id == state.model then active_ctx = ctx_size end
+  local active_ctx, active_max = nil, nil
+  for _, item in ipairs({ { "context_windows", model_context_windows },
+      { "max_context_windows", model_max_context_windows } }) do
+    if type(msg.provider) == "string" then
+      local prefix = msg.provider .. "\0"
+      for key in pairs(item[2]) do
+        if key:sub(1, #prefix) == prefix then item[2][key] = nil end
       end
     end
+    for model_id, ctx_size in pairs(msg[item[1]] or {}) do
+      local key = model_key(msg.provider, model_id)
+      if key and context_usage.integer(ctx_size) and ctx_size > 0 then item[2][key] = ctx_size end
+    end
+  end
+  if msg.provider == state.provider then
+    local key = model_key(state.provider, state.model)
+    active_ctx = model_context_windows[key]
+    active_max = model_max_context_windows[key]
+    if active_max and active_ctx and active_max < active_ctx then active_max = nil end
   end
   local active_effort = nil
   if type(msg.model_capabilities) == "table" then
@@ -1216,9 +1228,10 @@ local function handle_models_listed(msg, state)
     model_catalog = model_selection.absorb_catalog(
       state.model_catalog, msg.provider, msg.models),
   })
-  if active_ctx ~= nil or (active_effort ~= nil and state.reasoning_effort == nil) then
+  if msg.provider == state.provider then
     next_state = shallow_merge(next_state, {
-      max_tokens       = active_ctx or state.max_tokens,
+      max_tokens       = active_ctx or NIL_SENTINEL,
+      max_context_tokens = active_max or NIL_SENTINEL,
       reasoning_effort = state.reasoning_effort or active_effort,
     })
   end
@@ -1654,6 +1667,7 @@ local function apply_conversation_action(state, item)
     local entries = retain_optimistic_entries(state)
     return shallow_merge(state, {
       conversation_id = item.conversation_id,
+      current_context_tokens = NIL_SENTINEL,
       entries = entries,
       in_flight = NIL_SENTINEL,
       active_turn_id = NIL_SENTINEL,
@@ -1667,6 +1681,7 @@ local function apply_conversation_action(state, item)
   if item.kind == "active_cleared" then
     return shallow_merge(state, {
       conversation_id = NIL_SENTINEL,
+      current_context_tokens = NIL_SENTINEL,
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
     })
@@ -1675,6 +1690,7 @@ local function apply_conversation_action(state, item)
     state = close_and_flush_lead_unit(state)
     return shallow_merge(state, {
       entries = {},
+      current_context_tokens = NIL_SENTINEL,
       raw_selector = raw_selector.initial(),
       raw_tool_id = NIL_SENTINEL,
     })
@@ -1722,6 +1738,16 @@ local function apply_conversation_action(state, item)
     return transcript.append_reasoning_delta(
       state, item.text, item.message_id, item.turn_id)
   end
+  if item.kind == "response_usage_restored" or item.kind == "response_usage_updated" then
+    local observed = item.response_usage or {}
+    local tokens = nil
+    if observed.provider == state.provider and (observed.model == nil or observed.model == state.model) then
+      tokens = context_usage.total(observed.latest_response_usage)
+    elseif item.kind == "response_usage_updated" then
+      return state
+    end
+    return shallow_merge(state, { current_context_tokens = tokens or NIL_SENTINEL })
+  end
   if item.kind == "assistant_completed" then
     local terminal = item.terminal or {}
     local next_state = transcript.finalize_assistant(
@@ -1732,6 +1758,11 @@ local function apply_conversation_action(state, item)
         next_state,
         terminal.usage.output_tokens or terminal.usage.completion_tokens,
         terminal.duration_ms)
+    end
+    local tokens = context_usage.total(terminal.latest_response_usage)
+    if tokens ~= nil and terminal.provider == next_state.provider
+        and (terminal.model == nil or terminal.model == next_state.model) then
+      next_state = shallow_merge(next_state, { current_context_tokens = tokens })
     end
     return next_state
   end
@@ -1800,12 +1831,8 @@ local function apply_conversation_action(state, item)
       active_turn_id = NIL_SENTINEL,
       active_turn_entry_start = NIL_SENTINEL,
       turn_discarded_assistant = NIL_SENTINEL,
-      current_context_tokens = context_usage.current_input_tokens(usage),
+
     }
-    if terminal.model ~= nil then
-      patch.model = terminal.model
-      patch.max_tokens = model_context_windows[terminal.model] or state.max_tokens
-    end
     return transcript.flush_graph_results_if_stable(shallow_merge(next_state, patch))
   end
   if item.kind == "turn_interrupted" then

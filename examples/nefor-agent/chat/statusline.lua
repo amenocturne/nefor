@@ -5,7 +5,7 @@
 local common = require("libs.chat.common")
 local C       = common.C
 local STYLE   = common.STYLE
-local humanize_tokens = common.humanize_tokens
+local context_bar = require("chat.context_bar")
 local usage_view = require("libs.chat.usage")
 local quota_policy = require("libs.chat.quota_policy")
 local extensions = require("libs.chat.extensions")
@@ -24,51 +24,6 @@ function M.input_border_style(state, focused)
   local canonical = not focused and STYLE.input_border_unfocused
     or M.MODE_BORDER_STYLES[state.mode or "default"] or STYLE.input_border
   return extensions.input_border_style(state, focused, canonical)
-end
-
-local function ctx_bar(used, max)
-  if used == nil and max ~= nil and max ~= 0 then
-    return {
-      spans = {
-        { text = "ctx " .. (humanize_tokens(max) or tostring(max)), fg = C.system },
-      },
-    }
-  end
-  if used == nil then return nil end
-  if max == nil or max == 0 then
-    return {
-      spans = {
-        { text = "ctx " .. (humanize_tokens(used) or tostring(used)), fg = C.system },
-      },
-    }
-  end
-  local pct = math.floor(100 * used / max + 0.5)
-  if pct < 0 then pct = 0 end
-  if pct > 100 then pct = 100 end
-  local bar_w = 8
-  local filled = math.floor(bar_w * used / max + 0.5)
-  if filled < 0 then filled = 0 end
-  if filled > bar_w then filled = bar_w end
-  local empty = bar_w - filled
-  local bar_style
-  if pct >= 90 then
-    bar_style = STYLE.status_danger
-  elseif pct >= 70 then
-    bar_style = STYLE.status_warn
-  else
-    bar_style = STYLE.status_bar_fill
-  end
-  local label = string.format("ctx %s/%s ",
-    humanize_tokens(used) or tostring(used),
-    humanize_tokens(max)  or tostring(max))
-  return {
-    spans = {
-      { text = label, fg = C.system },
-      { text = string.rep("█", filled), fg = bar_style.fg },
-      { text = string.rep("░", empty),  fg = C.status_dim },
-      { text = " " .. tostring(pct) .. "%", fg = C.system },
-    },
-  }
 end
 
 local function build_segments(state)
@@ -91,12 +46,9 @@ local function build_segments(state)
     segs[#segs + 1] = { spans = { { text = "Start chatting to see stats", fg = C.status_dim } } }
   end
 
-  local s = state.stats or {}
-  local current_ctx = state.current_context_tokens
-  if current_ctx ~= nil then
-    local cb = ctx_bar(current_ctx, state.max_tokens)
-    if cb then segs[#segs + 1] = cb end
-  end
+  local context_index = #segs + 1
+  segs[context_index] = context_bar.segment(
+    state.current_context_tokens, state.max_tokens, state.max_context_tokens)
 
   local function add_usage(usage_id)
     local value = type(state.usage) == "table" and state.usage[usage_id] or nil
@@ -111,21 +63,25 @@ local function build_segments(state)
     for _, usage_id in ipairs(usage_config.statusline_ids or {}) do add_usage(usage_id) end
   end
 
-  return segs
+  return segs, context_index
 end
 
 function M.view(state)
-  local segs = build_segments(state)
-  local out_spans = {}
+  local segs, context_index = build_segments(state)
+  local identity, measurements = {}, {}
   for i, seg in ipairs(segs) do
+    local out = i < context_index and identity or measurements
     if i > 1 then
-      out_spans[#out_spans + 1] = { text = " │ ", fg = C.status_dim }
+      out[#out + 1] = { text = " │ ", fg = C.status_dim }
     end
-    for _, sp in ipairs(seg.spans) do
-      out_spans[#out_spans + 1] = sp
-    end
+    for _, sp in ipairs(seg.spans) do out[#out + 1] = sp end
   end
-  return tui.spans { spans = out_spans }
+  -- Reserve the measured footer's natural width before allocating model text.
+  -- Long model names clip, rather than pushing the bar/percentage offscreen.
+  return tui.row { gap = 0, children = {
+    tui.expanded { child = tui.spans { spans = identity, wrap = "none" } },
+    tui.spans { spans = measurements, wrap = "none" },
+  } }
 end
 
 -- Welcome banner.

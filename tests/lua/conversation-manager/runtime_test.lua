@@ -428,14 +428,26 @@ eq(provider_event.provider_detail.opaque, true, "generic provider event detail i
 eq(provider_event.messages, nil, "provider event reports cannot smuggle full history")
 eq(actor._internals.active_invocations()["provider-1"].provider, "chatgpt")
 
+receive({ kind = "conversation.provider.event.reported", request_id = "provider-1",
+  provider = "chatgpt", event = "usage", model = "gpt-test",
+  latest_response_usage = { kind = "completed_response", total_tokens = 55 } })
+eq(reader:conversation("replayed").response_usage.latest_response_usage.total_tokens, 55,
+  "successful native round is recorded before operation settlement")
+receive({ kind = "conversation.provider.event.reported", request_id = "stale-request",
+  provider = "chatgpt", event = "usage", model = "gpt-test",
+  latest_response_usage = { kind = "completed_response", total_tokens = 999 } })
+eq(reader:conversation("replayed").response_usage.latest_response_usage.total_tokens, 55,
+  "stale request cannot become canonical occupancy")
 receive({
   kind = "conversation.provider.event.reported",
   request_id = "provider-1",
   provider = "chatgpt",
-  event = "completed",
+  event = "failed",
   result = { text = "hello" },
 })
 eq(last_body().kind, "conversation.provider.event")
+eq(reader:conversation("replayed").response_usage.latest_response_usage.total_tokens, 55,
+  "later failure preserves recorded native measurement")
 eq(actor._internals.active_invocations()["provider-1"], nil,
   "terminal provider event releases correlation")
 

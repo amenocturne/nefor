@@ -321,6 +321,7 @@ function M.build(options)
     active_invocations[body.request_id] = {
       conversation_id = body.conversation_id,
       provider = body.provider,
+      model = body.model,
     }
     local invocation = {
       kind = "conversation.provider.invoke",
@@ -369,7 +370,7 @@ function M.build(options)
     })
   end
 
-  local terminal_provider_events = { completed = true, failed = true, interrupted = true }
+  local terminal_provider_events = { completed = true, result = true, failed = true, error = true, interrupted = true }
   local provider_event_reserved = {
     kind = true, request_id = true, conversation_id = true, provider = true,
     event = true,
@@ -394,6 +395,16 @@ function M.build(options)
     }
     for field, value in pairs(body) do
       if not provider_event_reserved[field] then event[field] = domain.copy(value) end
+    end
+    local measured = require("libs.chat.context_usage").measurement(body.latest_response_usage)
+    if measured and (active.model == nil or body.model == nil or active.model == body.model)
+        and (body.event == "usage" or body.event == "completed" or body.event == "result") then
+      active.measurement_index = (active.measurement_index or 0) + 1
+      append_fact({ kind = "response_usage_recorded",
+        event_id = "response-usage:" .. body.request_id .. ":" .. active.measurement_index,
+        conversation_id = active.conversation_id, request_id = body.request_id,
+        provider = body.provider, model = body.model or active.model,
+        latest_response_usage = measured })
     end
     send(event)
     if terminal_provider_events[body.event] then active_invocations[body.request_id] = nil end

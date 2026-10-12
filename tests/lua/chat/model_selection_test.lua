@@ -88,7 +88,7 @@ assert_true(selection.unresolved_message(unresolved):find("/model <provider> no-
 
 local base = {
   provider = "chatgpt", model = "gpt-5",
-  reasoning_effort = "high", max_tokens = 400000,
+  reasoning_effort = "high", max_tokens = 400000, max_context_tokens = 800000,
   current_context_tokens = 1234,
 }
 
@@ -141,6 +141,7 @@ eq(did_roll, true, "a correlated rejection rolls the selection back")
 eq(rolled_back.provider, "chatgpt", "rollback restores the previous provider")
 eq(rolled_back.model, "gpt-5", "rollback restores the previous model")
 eq(rolled_back.reasoning_effort, "high", "rollback restores the previous reasoning effort")
+eq(rolled_back.max_context_tokens, 800000, "rollback restores advertised max")
 eq(rolled_back.max_tokens, 400000, "rollback restores the previous context window")
 eq(rolled_back.current_context_tokens, 1234, "rollback restores measured context usage")
 eq(rolled_back.pending_model_selection, nil, "rollback clears the pending selection")
@@ -178,4 +179,7 @@ eq(active.pending_model, "anthropic/claude-sonnet-4.5",
 eq(selection.active(adopted).pending_model, nil,
   "no pair is pending once the selection is adopted")
 
+local same = selection.acknowledge(base, { provider = "chatgpt", model = "gpt-5" }, lookups)
+eq(same.current_context_tokens, 1234, "same pair acknowledgement retains successful measurement")
+eq(plain.max_context_tokens, nil, "unknown pair cannot inherit maximum capacity")
 print("model_selection_test: all assertions passed")

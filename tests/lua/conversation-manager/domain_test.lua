@@ -680,3 +680,45 @@ do
 end
 
 print("conversation_manager_domain_test: all assertions passed")
+
+-- Measurements follow canonical ancestry and successful compaction, not global arrival.
+do
+  local store = manager.new()
+  local recorded = {}
+  local function add(id, kind, data)
+    local conversation, e, _, event = store:append(fact(id, "occupancy", kind, data))
+    ok(conversation, e)
+    recorded[#recorded + 1] = domain.copy(event)
+    return conversation
+  end
+  add("occupancy-created", "created", { provenance = { provider = "openai", model = "one" } })
+  local function measure(id, total)
+    add(id, "response_usage_recorded", { provider = "openai", model = "one", request_id = id,
+      latest_response_usage = { kind = "completed_response", total_tokens = total } })
+  end
+  add("u1", "message_started", { message_id = "u1", role = "user", authored_prompt = "first" })
+  add("u1-done", "message_completed", { message_id = "u1" })
+  measure("native-success", 100)
+  add("u2", "message_started", { message_id = "u2", role = "user", authored_prompt = "second" })
+  local head = require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).history_head
+  add("u2-done", "message_completed", { message_id = "u2" })
+  measure("later", 200)
+  eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 200)
+  add("rewind-usage", "rewind_committed", { target_history_id = head, expected_head = head })
+  eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 100,
+    "rewind removes later branch measurements")
+  add("compact-fail", "context_compaction_requested", { request_id = "cf", provider = "openai", history_cutoff = 0 })
+  add("compact-failed", "context_compaction_failed", { request_id = "cf", error = "failure" })
+  eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 100,
+    "failed compaction keeps prior snapshot")
+  add("compact-ok", "context_compaction_requested", { request_id = "co", provider = "openai", history_cutoff = 0 })
+  add("compact-completed", "context_compaction_completed", { request_id = "co", checkpoint = {} })
+  eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage, nil, "successful compaction invalidates measurement")
+  measure("after-compact", 0)
+  eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 0)
+  local resumed = manager.new()
+  for _, event in ipairs(recorded) do ok(resumed:apply_recorded(event)) end
+  eq(require("libs.conversation-manager.projection").conversation(resumed:peek("occupancy")).response_usage,
+    require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage,
+    "recorded fact replay reconstructs exactly the applicable successful snapshot")
+end

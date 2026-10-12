@@ -133,6 +133,7 @@ function M.request(state, provider, model)
       model = state.model,
       reasoning_effort = state.reasoning_effort,
       max_tokens = state.max_tokens,
+      max_context_tokens = state.max_context_tokens,
       current_context_tokens = state.current_context_tokens,
     },
   }
@@ -163,6 +164,7 @@ local function adopt(state, provider, model, effort, lookups)
     model = model,
     reasoning_effort = optional(effort),
     max_tokens = optional(max_tokens),
+    max_context_tokens = optional(lookups.max_context_window and lookups.max_context_window(provider, model)),
     pending_model_selection = NIL_SENTINEL,
   }
   if pair_changed then patch.current_context_tokens = NIL_SENTINEL end
@@ -208,6 +210,7 @@ function M.reject(state, msg)
     model = optional(previous.model),
     reasoning_effort = optional(previous.reasoning_effort),
     max_tokens = optional(previous.max_tokens),
+    max_context_tokens = optional(previous.max_context_tokens),
     current_context_tokens = optional(previous.current_context_tokens),
     pending_model_selection = NIL_SENTINEL,
   }), true

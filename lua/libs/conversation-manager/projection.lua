@@ -116,6 +116,32 @@ local function public_compaction(compaction, include_checkpoint)
   return out
 end
 
+local function latest_response(conversation)
+  local cutoff = 0
+  for _, compaction in ipairs(conversation.compactions) do
+    if compaction.status == "completed" and history_path.is_prefix(compaction.history_id, conversation.head) then
+      cutoff = math.max(cutoff, compaction.terminal_sequence or 0)
+    end
+  end
+  local latest
+  local function consider(usage)
+    if usage.sequence > cutoff and history_path.is_prefix(usage.history_id, conversation.head)
+        and (not latest or usage.sequence > latest.sequence) then latest = usage end
+  end
+  for _, usage in ipairs(conversation.response_usages or {}) do consider(usage) end
+  for _, message in ipairs(conversation.messages) do
+    local terminal = message.terminal or {}
+    local measured = require("libs.chat.context_usage").measurement(terminal.latest_response_usage)
+    if message.status == "completed" and message.visibility ~= "discarded" and measured then
+      local turn = message.turn_id and conversation.turn_by_id[message.turn_id]
+      consider({ history_id = message.history_id, sequence = message.completed_sequence,
+        provider = terminal.provider or (turn and turn.provenance.provider) or conversation.provenance.provider,
+        model = terminal.model, latest_response_usage = measured })
+    end
+  end
+  return domain.copy(latest)
+end
+
 function M.conversation(conversation)
   if not conversation then return nil end
   local messages, active_message_ids, active_turn_ids = {}, {}, {}
@@ -151,6 +177,7 @@ function M.conversation(conversation)
     retries = domain.copy(conversation.retries),
     turns = turns,
     compactions = compactions,
+    response_usage = latest_response(conversation),
     pending_edit = domain.copy(conversation.pending_edit),
     history_head = domain.copy(conversation.head),
     terminal = domain.copy(conversation.terminal),
@@ -240,6 +267,8 @@ function M.change(after, event)
     change.kind = kind:gsub("_requested$", "_pending")
     change.compaction = public_compaction(compaction, false)
     if kind == "context_compaction_requested" then change.context = M.context(after) end
+  elseif kind == "response_usage_recorded" then
+    change.response_usage = latest_response(after)
   elseif kind == "provenance_updated" then
     change.provenance = domain.copy(after.provenance)
   elseif kind:sub(1, 13) == "conversation_" then

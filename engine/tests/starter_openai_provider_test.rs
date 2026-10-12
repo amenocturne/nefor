@@ -525,7 +525,7 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         _test.sent()
         spec.from_plugin({{ type = "event", from = "meter", body = {
           kind = "meter.completion.event", event = "usage", request_id = "r1",
-          completion_id = "same-completion", usage = { prompt_tokens = 11,
+          completion_id = "same-completion", usage = { prompt_tokens = 11, completion_tokens = 7,
             extensions = { cost_a = 1e-7, cost_b = 2e-7, byok_b = false } } } }})
         assert(spec._internals.usage_value("meter/a").amount == "0.0000001")
         assert(spec._internals.usage_value("meter/b").amount == "0.0000002")
@@ -537,10 +537,46 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
           elseif event.kind == "meter.usage.b.recorded" then
             saw_b = event.body.amount == "0.0000002" and event.body.currency == "EUR"
           elseif event.kind == "conversation.provider.context_usage" then
-            saw_context = event.body.context_input_tokens == 11
+            saw_context = true
           end
         end
-        assert(saw_a and saw_b and saw_context)
+        assert(saw_a and saw_b and not saw_context)
+        spec.from_plugin({{ type = "event", from = "meter", body = {
+          kind = "meter.completion.event", event = "completed", request_id = "r1",
+          model = "one" } }})
+        local completed = _test.sent()
+        local measured = false
+        for _, event in ipairs(completed) do
+          if event.kind == "conversation.provider.context_usage" then
+            measured = event.body.latest_response_usage.total_tokens == 18
+              and event.body.model == "one" and event.body.conversation_id == "c"
+          end
+        end
+        assert(measured)
+
+        -- Generic usage is provisional until a successful response; failure
+        -- and late terminals cannot publish it as completed occupancy.
+        local occupancy_options = options()
+        occupancy_options.usage = nil
+        local occupancy = provider.spawn_spec("meter", { "/bin/true" }, occupancy_options)
+        occupancy.to_plugin({{ type = "event", from = "conversation-manager", body = {
+          kind = "conversation.provider.invoke", provider = "meter", model = "one",
+          request_id = "failed-usage", conversation_id = "c", watermark = 0 } }})
+        _test.delivered()
+        _test.sent()
+        for _, event in ipairs({
+          { event = "usage", usage = { input_tokens = 900, output_tokens = 100 } },
+          { event = "error", message = "failed response" },
+          { event = "completed", usage = { total_tokens = 1000 } },
+        }) do
+          event.kind = "meter.completion.event"
+          event.request_id = "failed-usage"
+          occupancy.from_plugin({{ type = "event", from = "meter", body = event }})
+          for _, emitted in ipairs(_test.sent()) do
+            assert(emitted.kind ~= "conversation.provider.context_usage",
+              "failed or stale generic usage must not become occupancy")
+          end
+        end
 
         -- A contradiction permanently poisons only its ledger until session reset.
         spec._internals.record_configured_usage({ event = "usage", request_id = "r2",

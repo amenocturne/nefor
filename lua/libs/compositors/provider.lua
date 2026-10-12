@@ -229,20 +229,32 @@ function M.spawn_spec(name, command, opts)
     emit_synthetic(name, reported)
   end
 
+  local response_usage = require("libs.chat.context_usage")
+
   local function publish_context_usage(body)
-    if type(body) ~= "table" or body.event ~= "usage" then return end
-    local usage = type(body.usage) == "table" and body.usage or {}
-    local context_input_tokens = body.context_input_tokens
-      or usage.context_input_tokens or usage.input_tokens or usage.prompt_tokens
-    if type(context_input_tokens) ~= "number" then return end
+    local pending = pending_requests[body.request_id]
+    if not pending then return end
+    if body.event ~= "usage" and body.event ~= "completed" and body.event ~= "result" then return end
+    if body.event == "usage" and body.latest_response_usage == nil
+        and body.billing_components == nil then
+      -- Generic usage may arrive before the response outcome is known. Stage
+      -- it under this request; failure drops it without publishing occupancy.
+      pending.response_usage = response_usage.from_response(body.usage or body)
+    end
+    local measured = response_usage.measurement(body.latest_response_usage)
+    if not measured and (body.event == "completed" or body.event == "result")
+        and body.billing_components == nil then
+      measured = response_usage.from_response(body.usage
+        or (type(body.result) == "table" and (body.result.usage or body.result)) or body)
+        or pending.response_usage
+    end
+    if not measured then return end
+    body.latest_response_usage = measured
+    body.model = body.model or pending.model
     emit_synthetic(name, {
-      kind = "conversation.provider.context_usage",
-      provider = name,
-      request_id = body.request_id,
-      conversation_id = pending_requests[body.request_id]
-        and pending_requests[body.request_id].conversation_id or nil,
-      context_input_tokens = context_input_tokens,
-      accuracy = body.context_input_accuracy or usage.context_input_accuracy or "authoritative",
+      kind = "conversation.provider.context_usage", provider = name,
+      request_id = body.request_id, conversation_id = pending.conversation_id,
+      model = body.model, latest_response_usage = measured,
     })
   end
 
@@ -301,6 +313,7 @@ function M.spawn_spec(name, command, opts)
     pending_requests[body.request_id] = {
       conversation_id = body.conversation_id,
       session_generation = session_generation,
+      model = body.model,
     }
     request_usage_versions[body.request_id] = {}
     for _, rule in ipairs((usage_config and usage_config.contributions) or {}) do

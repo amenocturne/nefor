@@ -234,6 +234,7 @@ local function snapshot_actions(state, projection, actions)
   for _, compaction in ipairs(projection.compactions or {}) do
     action(actions, "compaction_" .. compaction.status, { compaction = compaction })
   end
+  action(actions, "response_usage_restored", { response_usage = projection.response_usage })
   if type(projection.pending_edit) == "table" then
     action(actions, "rewind_restored", { pending_edit = projection.pending_edit })
   end
@@ -367,6 +368,8 @@ function M.reduce(previous, body)
       terminal = change.terminal,
       answer = state.turn_text[change.turn_id],
     })
+  elseif kind == "response_usage_recorded" then
+    action(actions, "response_usage_updated", { response_usage = change.response_usage })
   elseif kind == "context_compaction_pending" then
     action(actions, "compaction_pending", { compaction = change.compaction })
   elseif kind == "context_compaction_completed" then

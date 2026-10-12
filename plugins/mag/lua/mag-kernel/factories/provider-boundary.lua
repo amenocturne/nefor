@@ -219,7 +219,7 @@ function M.construct(id, params, emit, options)
     for key, value in pairs(detail or {}) do merged[key] = value end
     local result = merged.result
     if type(result) == "table" then
-      for _, key in ipairs({ "model", "duration_ms", "usage", "finish_reason" }) do
+      for _, key in ipairs({ "model", "duration_ms", "usage", "finish_reason", "latest_response_usage" }) do
         if merged[key] == nil then merged[key] = result[key] end
       end
     end
@@ -240,6 +240,11 @@ function M.construct(id, params, emit, options)
         usage.context_input_tokens = terminal_metadata.context_input_tokens
       end
       merged.usage = usage
+    end
+    if merged.latest_response_usage ~= nil then
+      merged.completion = json_data.copy(merged.completion or {})
+      merged.completion.latest_response_usage = json_data.copy(merged.latest_response_usage)
+      merged.completion.provider = provider
     end
     return merged
   end
@@ -546,6 +551,11 @@ function M.construct(id, params, emit, options)
       for key, value in pairs(type(result) == "table" and result or {}) do
         round_detail[key] = value
       end
+      if round_detail.latest_response_usage == nil and type(result) == "table"
+          and result.finish_reason ~= "error" and result.finish_reason ~= "interrupted"
+          and result.billing_components == nil then
+        round_detail.latest_response_usage = require("libs.chat.context_usage").from_response(result.usage)
+      end
       provider_round_completion = merge_terminal(round_detail)
       provider_round_metadata = {}
       settle_open_native("provider completion ended before native tool execution completed")
@@ -655,6 +665,9 @@ function M.construct(id, params, emit, options)
         facts:retry(value.error or value.message or value.retry_reason or "provider_retry", value)
       elseif value.kind == "usage" then
         provider_round_metadata = value
+        if value.latest_response_usage ~= nil then
+          terminal_metadata.latest_response_usage = value.latest_response_usage
+        end
         terminal_metadata.usage = value.usage or value.result or value
         terminal_metadata.context_input_tokens = value.context_input_tokens
           or (type(value.usage) == "table" and value.usage.context_input_tokens)

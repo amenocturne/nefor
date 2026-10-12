@@ -545,8 +545,8 @@ fn model_list_keeps_context_widget_hidden_until_usage_is_known() {
         "initial statusline should keep configured model: {out:?}"
     );
     assert!(
-        !out.contains("ctx "),
-        "context capacity alone must not masquerade as context used: {out:?}"
+        out.contains("128k") && out.contains("?%"),
+        "capacity alone must show unknown occupancy, not measured zero: {out:?}"
     );
 }
 
@@ -569,15 +569,108 @@ fn completed_turn_restores_context_used_widget() {
         Some("answer".into()),
         json!({
             "model": "mock-model",
-            "usage": { "input_tokens": 80_000, "output_tokens": 7 }
+            "usage": { "input_tokens": 80_000, "output_tokens": 7 },
+            "provider": "mock-plugin",
+            "latest_response_usage": { "kind": "completed_response", "total_tokens": 80_007 }
         }),
     );
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("ctx 80k/128k") && out.contains("63%"),
-        "completed-turn input usage should render the context-used widget: {out:?}"
+        out.contains("80k") && out.contains("128k") && out.contains("63%"),
+        "completed-response total should render the context-used widget: {out:?}"
     );
+}
+
+#[test]
+fn completed_response_total_renders_extended_background_bar_with_sidebar() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.models.listed", "provider": "mock-plugin",
+        "models": ["mock-model"], "context_windows": { "mock-model": 272000 },
+        "max_context_windows": { "mock-model": 872000 } }),
+    );
+    fixture_assistant_completed(
+        &mut engine,
+        Some("answer".into()),
+        json!({
+            "model": "mock-model", "usage": { "input_tokens": 999999, "output_tokens": 900000 },
+            "provider": "mock-plugin",
+            "latest_response_usage": { "kind": "completed_response", "total_tokens": 108000 }
+        }),
+    );
+    let output = render_str(&mut engine);
+    let snapshot = engine.snapshot();
+    let footer = snapshot
+        .lines()
+        .find(|line| line.contains("SAFE"))
+        .expect("footer");
+    for label in ["108k", "272k", "740k", "872k", "12%"] {
+        assert!(footer.contains(label), "{snapshot}");
+    }
+    assert!(
+        snapshot.contains("Workflows"),
+        "sidebar remains visible: {snapshot}"
+    );
+    for background in ["48;2;32;48;77", "48;2;70;57;32", "48;2;70;36;36"] {
+        assert!(
+            output.contains(background),
+            "bar region background missing: {output:?}"
+        );
+    }
+    assert_eq!(
+        engine
+            .state_table()
+            .expect("state")
+            .get::<i64>("current_context_tokens")
+            .unwrap(),
+        108000,
+        "whole-turn billing totals cannot overwrite the assistant response total"
+    );
+}
+
+#[test]
+fn context_bar_keeps_percentage_visible_with_long_model_and_sidebar() {
+    for width in [80, 120, 160] {
+        let mut engine = Engine::new(width, 24).expect("engine");
+        load_chat_scenario(&mut engine);
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.models.listed", "provider": "mock-plugin",
+                "models": ["mock-model"], "context_windows": { "mock-model": 272000 },
+                "max_context_windows": { "mock-model": 872000 }
+            }),
+        );
+        engine
+            .state_table()
+            .unwrap()
+            .set(
+                "model",
+                "mock-model-with-a-deliberately-long-provider-qualified-name",
+            )
+            .unwrap();
+        fixture_assistant_completed(
+            &mut engine,
+            Some("answer".into()),
+            json!({
+                "provider": "mock-plugin",
+                "latest_response_usage": { "kind": "completed_response", "total_tokens": 108000 }
+            }),
+        );
+        render_str(&mut engine);
+        let snapshot = engine.snapshot();
+        let footer = snapshot
+            .lines()
+            .find(|line| line.contains("12%"))
+            .expect("percentage remains visible");
+        for label in ["108k", "272k", "740k", "872k"] {
+            assert!(footer.contains(label), "{width}: {snapshot}");
+        }
+        assert!(snapshot.contains("Workflows"), "{snapshot}");
+    }
 }
 
 #[test]
@@ -598,10 +691,12 @@ fn slash_new_clears_session_owned_context_usage() {
         Some("answer".into()),
         json!({
             "model": "mock-model",
-            "usage": { "input_tokens": 80_000, "output_tokens": 7 }
+            "usage": { "input_tokens": 80_000, "output_tokens": 7 },
+            "provider": "mock-plugin",
+            "latest_response_usage": { "kind": "completed_response", "total_tokens": 80_007 }
         }),
     );
-    assert!(render_str(&mut engine).contains("ctx 80k/128k"));
+    assert!(render_str(&mut engine).contains("63%"));
 
     dispatch_event(
         &mut engine,
@@ -609,7 +704,7 @@ fn slash_new_clears_session_owned_context_usage() {
     );
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("ctx "),
+        !out.contains("63%"),
         "a fresh session must not display the previous session's context usage: {out:?}"
     );
 }
@@ -2100,7 +2195,7 @@ fn superseded_resume_events_cannot_mutate_acknowledged_replacement() {
     );
     assert_eq!(
         state.get::<Option<i64>>("current_context_tokens").unwrap(),
-        Some(41)
+        None
     );
     assert!(!state.get::<bool>("replay_mode").unwrap_or(false));
     assert!(state.get::<mlua::Value>("resume_loading").unwrap().is_nil());
@@ -5573,12 +5668,14 @@ fn slash_compact_renders_pending_entry_until_commit() {
         &mut engine,
         Some("prior answer".into()),
         json!({
-            "model": "mock-model", "usage": { "input_tokens": 80_000 }
+            "model": "mock-model", "usage": { "input_tokens": 80_000 },
+            "provider": "mock-plugin",
+            "latest_response_usage": { "kind": "completed_response", "total_tokens": 80_000 }
         }),
     );
     let before = render_str(&mut engine);
     assert!(
-        before.contains("ctx 80k/128k"),
+        before.contains("80k") && before.contains("63%"),
         "precondition: statusline should show the completed turn's context: {before:?}"
     );
 
@@ -5626,7 +5723,7 @@ fn slash_compact_renders_pending_entry_until_commit() {
         "completed compaction label should share a full-width separator row: {separator_row:?}"
     );
     assert!(
-        !engine.snapshot().contains("ctx 80k/128k"),
+        !engine.snapshot().contains("63%"),
         "commit should clear the stale current-context count immediately: {out:?}"
     );
     assert!(
@@ -6374,6 +6471,11 @@ fn statusline_renders_below_input_row() {
     // corner `╯` lies above the statusline, not below it.
     let mut engine = Engine::new(80, 24).expect("engine");
     load_chat_scenario(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack",
+        "provider": "mock-plugin", "model": "claude-test" }),
+    );
     fixture_assistant_completed(
         &mut engine,
         Some("answer".into()),
@@ -6559,7 +6661,9 @@ fn command_and_statusline_usage_ids_are_independent_and_context_bar_coexists() {
         &mut engine,
         None,
         json!({ "model": "mock-model", "usage": {
-            "input_tokens": 500, "output_tokens": 10 } }),
+            "input_tokens": 500, "output_tokens": 10 },
+            "provider": "mock-plugin",
+            "latest_response_usage": { "kind": "completed_response", "total_tokens": 510 } }),
     );
     dispatch_event(
         &mut engine,
@@ -6570,7 +6674,7 @@ fn command_and_statusline_usage_ids_are_independent_and_context_bar_coexists() {
     );
     let footer = render_snapshot(&mut engine);
     assert!(
-        footer.contains("50%") && footer.contains("free"),
+        footer.contains("51%") && footer.contains("free"),
         "{footer}"
     );
 
@@ -6704,6 +6808,11 @@ fn statusline_omits_loaded_providers_list() {
     // Canonical completion so the statusline carries the active model name —
     // anchors the assertion to a frame where the statusline is fully
     // populated rather than the pre-stats placeholder branch.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.model.set_ack",
+        "provider": "mock-plugin", "model": "claude-test" }),
+    );
     fixture_assistant_completed(
         &mut engine,
         Some("answer".into()),
@@ -11697,20 +11806,43 @@ fn consumer_projection_keeps_raw_tool_payloads_behind_details() {
         );
     }
     for (id, name, args, output, error) in [
-        ("call-1", "skill", json!({ "name": ["dev"], "debug_wrapper": "CALL-WRAPPER-MUST-STAY-HIDDEN" }),
-          Some("# Dev skill\nLARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN\nfull workflow body"), None),
-        ("list-raw-id", "list_dir", json!({ "path": "/project/src", "debug_wrapper": "LIST-WRAPPER-MUST-STAY-HIDDEN" }),
-          Some("(f) lib.rs\nLARGE-LIST-RESULT-MUST-STAY-HIDDEN\n"), None),
-        ("error-raw-id", "run_tool", json!({ "name": "deploy", "secret": "ERROR-CALL-MUST-STAY-HIDDEN" }),
-          None, Some("permission denied: concise cause. XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN")),
+        (
+            "call-1",
+            "skill",
+            json!({ "name": ["dev"], "debug_wrapper": "CALL-WRAPPER-MUST-STAY-HIDDEN" }),
+            Some("# Dev skill\nLARGE-SKILL-DOCUMENT-MUST-STAY-HIDDEN\nfull workflow body"),
+            None,
+        ),
+        (
+            "list-raw-id",
+            "list_dir",
+            json!({ "path": "/project/src", "debug_wrapper": "LIST-WRAPPER-MUST-STAY-HIDDEN" }),
+            Some("(f) lib.rs\nLARGE-LIST-RESULT-MUST-STAY-HIDDEN\n"),
+            None,
+        ),
+        (
+            "error-raw-id",
+            "run_tool",
+            json!({ "name": "deploy", "secret": "ERROR-CALL-MUST-STAY-HIDDEN" }),
+            None,
+            Some(
+                "permission denied: concise cause. XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-HUGE-ERROR-DETAIL-MUST-STAY-HIDDEN",
+            ),
+        ),
     ] {
-        dispatch_event(&mut engine, json!({
-            "kind": "tool-gate.tool.invoke", "id": id, "name": name, "args": args,
-            "invocation": { "run_id": "preview-run", "actor_id": "agent.node" }
-        }));
-        dispatch_event(&mut engine, json!({
-            "kind": "tool.result", "id": id, "output": output, "error": error
-        }));
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "tool-gate.tool.invoke", "id": id, "name": name, "args": args,
+                "invocation": { "run_id": "preview-run", "actor_id": "agent.node" }
+            }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "tool.result", "id": id, "output": output, "error": error
+            }),
+        );
     }
     let frame = render_snapshot(&mut engine);
     for expected in [

@@ -492,6 +492,7 @@ fn known_context_window(slug: &str) -> Option<u64> {
 fn provider_context_window(model: &ModelEntry) -> Option<u64> {
     model
         .context_length
+        .filter(|window| *window > 0)
         .or_else(|| known_context_window(&model.slug))
 }
 
@@ -516,6 +517,18 @@ fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Va
         .collect();
     if !ctx_map.is_empty() {
         m.insert("context_windows".into(), Value::Object(ctx_map));
+    }
+    let max_ctx_map: Map<String, Value> = resolved
+        .iter()
+        .filter_map(|(model, _)| {
+            model
+                .max_context_window
+                .filter(|window| *window > 0)
+                .map(|window| (model.slug.clone(), Value::Number(window.into())))
+        })
+        .collect();
+    if !max_ctx_map.is_empty() {
+        m.insert("max_context_windows".into(), Value::Object(max_ctx_map));
     }
     let caps: Map<String, Value> = models
         .iter()
@@ -3433,6 +3446,35 @@ impl ParsedTokenUsage {
     }
 }
 
+// Occupancy is one completed response, not billing summed across native iterations.
+fn response_event_usage(event: &ResponseEvent) -> Option<Value> {
+    match event {
+        ResponseEvent::Completed { response } => completed_response_usage(response),
+        _ => None,
+    }
+}
+
+fn completed_response_usage(response: &Value) -> Option<Value> {
+    let usage = response.get("usage")?;
+    let input = usage.get("input_tokens").and_then(Value::as_u64);
+    let output = usage.get("output_tokens").and_then(Value::as_u64);
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| input?.checked_add(output?))?;
+    let mut measurement = Map::from_iter([
+        ("kind".into(), Value::String("completed_response".into())),
+        ("total_tokens".into(), Value::Number(total.into())),
+    ]);
+    if let Some(input) = input {
+        measurement.insert("input_tokens".into(), Value::Number(input.into()));
+    }
+    if let Some(output) = output {
+        measurement.insert("output_tokens".into(), Value::Number(output.into()));
+    }
+    Some(Value::Object(measurement))
+}
+
 fn parsed_token_usage(response: &Value) -> Option<ParsedTokenUsage> {
     let usage = response.get("usage")?;
     Some(ParsedTokenUsage {
@@ -4019,6 +4061,7 @@ async fn run_turn(
         let mut interrupted = false;
         let mut errored = false;
         let mut operation_usage: Option<OperationUsage> = None;
+        let mut latest_response_usage: Option<Value> = None;
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
         let mut stream_recovery_started_at: Option<tokio::time::Instant> = None;
@@ -4188,10 +4231,8 @@ async fn run_turn(
                 text,
             };
 
-            // This request is the provider's exact model-visible representation.
-            // Publish a content-free estimate now so canonical user/tool/deferred
-            // additions move the statusline before the response completes. A later
-            // backend usage event replaces it with the authoritative token count.
+            // Request-size estimates remain diagnostic only; completed response
+            // occupancy is emitted separately and never derived from this estimate.
             if let Some((request_id, _)) = &direct_request {
                 let estimate = crate::request_usage::estimate_serialized_tokens(&req);
                 let body = completion_event_body(
@@ -4452,7 +4493,24 @@ async fn run_turn(
                         ctx.stream_retry_policy.budget.unwrap_or_default(),
                     ) => {
                         match next {
-                            Some(Ok(event)) => match event {
+                            Some(Ok(event)) => {
+                                if let Some(measurement) = response_event_usage(&event) {
+                                    let fields = [
+                                        ("provider", Value::String(ctx.args.provider_name.clone())),
+                                        ("model", Value::String(active_model.clone())),
+                                        ("latest_response_usage", measurement.clone()),
+                                    ];
+                                    let mut body = completion_event_body(
+                                        &ctx.args,
+                                        direct_request.as_ref().map(|(id, _)| id.as_str()).unwrap_or(&turn_id),
+                                        "usage",
+                                        fields,
+                                    );
+                                    body.insert("chat_id".into(), Value::String(chat_id.to_string()));
+                                    checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
+                                    latest_response_usage = Some(measurement);
+                                }
+                                match event {
                                 ResponseEvent::OutputTextDelta { delta, .. } => {
                                     visible_state_observed = true;
                                     output_text.push_str(&delta);
@@ -4660,6 +4718,7 @@ async fn run_turn(
                                     break;
                                 }
                                 _ => {}
+                                }
                             },
                             Some(Err(error)) => {
                                 iter_failure = Some(StreamFailure::from_error(error));
@@ -5002,6 +5061,9 @@ async fn run_turn(
                     ],
                 )
             };
+            if let Some(measurement) = latest_response_usage {
+                body.insert("latest_response_usage".into(), measurement);
+            }
             if !errored && !interrupted && !final_native_output.is_empty() {
                 body.insert(
                     "provider_context".into(),
@@ -5035,7 +5097,7 @@ async fn run_turn(
         } else {
             &final_text
         };
-        let body = stream_end_body(
+        let mut body = stream_end_body(
             &ctx.args,
             &turn_id,
             &chat_id,
@@ -5044,6 +5106,9 @@ async fn run_turn(
             elapsed_ms,
             final_finish_reason.as_deref(),
         );
+        if let Some(measurement) = &latest_response_usage {
+            body.insert("latest_response_usage".into(), measurement.clone());
+        }
         checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
         if let Ok(stats) = ctx.chats.stats_snapshot(&chat_id).await {
             checked_send(
@@ -5060,7 +5125,7 @@ async fn run_turn(
             .await?;
         }
 
-        let body = chat_complete_result_body(
+        let mut body = chat_complete_result_body(
             &ctx.args,
             &chat_id,
             &final_text,
@@ -5068,6 +5133,9 @@ async fn run_turn(
             final_finish_reason.as_deref(),
             final_error.as_deref(),
         );
+        if let Some(measurement) = latest_response_usage {
+            body.insert("latest_response_usage".into(), measurement);
+        }
         checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
         Ok::<(), TransportError>(())
     }.await
@@ -5622,6 +5690,7 @@ mod tests {
                 supports_reasoning_summaries: true,
                 supports_parallel_tool_calls: true,
                 context_length: None,
+                max_context_window: None,
             },
             ModelEntry {
                 slug: "gpt-5-codex".into(),
@@ -5631,6 +5700,7 @@ mod tests {
                 supports_reasoning_summaries: false,
                 supports_parallel_tool_calls: false,
                 context_length: None,
+                max_context_window: None,
             },
         ];
         let body = models_listed_body(&args(), &fetched);
@@ -5658,6 +5728,7 @@ mod tests {
             supports_reasoning_summaries: true,
             supports_parallel_tool_calls: true,
             context_length: None,
+            max_context_window: None,
         };
         assert_eq!(provider_context_window(&model), Some(272_000));
     }
@@ -5673,10 +5744,12 @@ mod tests {
                 supports_reasoning_summaries: true,
                 supports_parallel_tool_calls: true,
                 context_length: None,
+                max_context_window: None,
             };
             assert_eq!(provider_context_window(&model), Some(272_000), "{slug}");
             let upstream = ModelEntry {
                 context_length: Some(999_999),
+                max_context_window: None,
                 ..model
             };
             assert_eq!(provider_context_window(&upstream), Some(999_999), "{slug}");
@@ -5700,6 +5773,7 @@ mod tests {
             supports_reasoning_summaries: true,
             supports_parallel_tool_calls: true,
             context_length: Some(999_999),
+            max_context_window: None,
         };
         assert_eq!(provider_context_window(&model), Some(999_999));
     }
@@ -5714,6 +5788,7 @@ mod tests {
             supports_reasoning_summaries: false,
             supports_parallel_tool_calls: true,
             context_length: None,
+            max_context_window: None,
         };
         assert_eq!(provider_context_window(&model), Some(128_000));
     }
@@ -5728,6 +5803,7 @@ mod tests {
             supports_reasoning_summaries: false,
             supports_parallel_tool_calls: true,
             context_length: None,
+            max_context_window: None,
         };
         assert_eq!(provider_context_window(&unknown), None);
 
@@ -6008,6 +6084,96 @@ mod tests {
         fields
             .iter()
             .find_map(|(key, value)| (*key == name).then_some(value))
+    }
+
+    #[test]
+    fn completed_response_usage_uses_total_or_checked_components_without_subsets() {
+        let response = serde_json::json!({"usage": {
+            "total_tokens": 108, "input_tokens": 100, "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 10},
+            "output_tokens_details": {"reasoning_tokens": 5}
+        }});
+        assert_eq!(
+            completed_response_usage(&response).unwrap()["total_tokens"],
+            108
+        );
+        let components = serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 7}});
+        assert_eq!(
+            completed_response_usage(&components).unwrap()["total_tokens"],
+            107
+        );
+        let total_only = serde_json::json!({"usage": {"total_tokens": 0}});
+        assert_eq!(
+            completed_response_usage(&total_only).unwrap(),
+            serde_json::json!({
+                "kind": "completed_response", "total_tokens": 0
+            })
+        );
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"usage": {"input_tokens": 1}}),
+            serde_json::json!({"usage": {"total_tokens": -1}}),
+            serde_json::json!({"usage": {"input_tokens": "1", "output_tokens": 2}}),
+            serde_json::json!({"usage": {"input_tokens": u64::MAX, "output_tokens": 1}}),
+        ] {
+            assert_eq!(completed_response_usage(&response), None);
+        }
+    }
+
+    #[test]
+    fn latest_native_response_is_not_aggregate_and_survives_unmeasured_or_failed_events() {
+        let first = serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 7}});
+        let last = serde_json::json!({"usage": {"input_tokens": 200, "output_tokens": 11}});
+        let mut latest = None;
+        let events = [
+            ResponseEvent::Completed {
+                response: first.clone(),
+            },
+            ResponseEvent::Completed {
+                response: last.clone(),
+            },
+            ResponseEvent::Completed {
+                response: serde_json::json!({}),
+            },
+            ResponseEvent::Failed {
+                response: first.clone(),
+            },
+            ResponseEvent::Incomplete {
+                response: first.clone(),
+            },
+        ];
+        let mut measured_totals = Vec::new();
+        for event in events {
+            if let Some(measurement) = response_event_usage(&event) {
+                measured_totals.push(measurement["total_tokens"].as_u64().unwrap());
+                latest = Some(measurement);
+            }
+        }
+        assert_eq!(measured_totals, [107, 211]);
+        assert_eq!(latest.unwrap()["total_tokens"], 211);
+        let billing = OperationUsage::record_iteration(None, parsed_token_usage(&first));
+        let billing = OperationUsage::record_iteration(Some(billing), parsed_token_usage(&last));
+        assert_eq!(billing.totals(), Some((300, 18)));
+    }
+
+    #[test]
+    fn model_listing_separates_default_from_advertised_maximum() {
+        let mut model: ModelEntry = serde_json::from_value(serde_json::json!({
+            "slug": "custom", "context_window": 272_000, "max_context_window": 872_000
+        }))
+        .unwrap();
+        let body = models_listed_body(&args(), &[model.clone()]);
+        assert_eq!(body["context_windows"]["custom"], 272_000);
+        assert_eq!(body["max_context_windows"]["custom"], 872_000);
+        model.max_context_window = None;
+        assert!(!models_listed_body(&args(), &[model.clone()]).contains_key("max_context_windows"));
+        model.max_context_window = Some(0);
+        assert!(!models_listed_body(&args(), &[model]).contains_key("max_context_windows"));
+        let max_only: ModelEntry = serde_json::from_value(serde_json::json!({
+            "slug": "unknown", "max_context_window": 872_000
+        }))
+        .unwrap();
+        assert_eq!(provider_context_window(&max_only), None);
     }
 
     #[test]

@@ -115,6 +115,9 @@ pub struct ModelEntry {
     /// Context window size if the backend reports it.
     #[serde(default, alias = "max_input_tokens", alias = "context_window")]
     pub context_length: Option<u64>,
+    /// Advertised extended maximum, independent of the regular context window.
+    #[serde(default)]
+    pub max_context_window: Option<u64>,
 }
 
 fn default_supports_parallel_tool_calls() -> bool {

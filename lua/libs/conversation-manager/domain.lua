@@ -81,9 +81,24 @@ handlers.created = function(conversation, event)
     retries = {}, retry_by_id = {},
     turns = {}, turn_by_id = {},
     compactions = {}, compaction_by_id = {},
+    response_usages = {},
     open_messages = 0, open_exchanges = 0,
     last_sequence = 0,
   }
+end
+
+handlers.response_usage_recorded = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  ok, e = require_id(event, "provider"); if not ok then return nil, e end
+  ok, e = require_id(event, "request_id"); if not ok then return nil, e end
+  local measured = require("libs.chat.context_usage").measurement(event.latest_response_usage)
+  if not measured then return err("invalid_response_usage", {}) end
+  c.response_usages[#c.response_usages + 1] = {
+    history_id = copy(c.head), sequence = event.sequence,
+    provider = event.provider, model = event.model, request_id = event.request_id,
+    latest_response_usage = copy(measured),
+  }
+  return c
 end
 
 handlers.provenance_updated = function(c, event)
@@ -288,12 +303,15 @@ handlers.message_completed = function(c, event)
   c.open_messages = c.open_messages - 1
   local turn = message.turn_id and find_turn(c, message.turn_id) or nil
   if turn then turn.open_messages = turn.open_messages - 1 end
+  message.completed_sequence = event.sequence
   message.completion = copy(event.completion or {})
   if provider_context ~= nil then message.provider_context = copy(provider_context) end
   message.terminal = {
     model = event.model,
     duration_ms = event.duration_ms,
     usage = copy(event.usage),
+    latest_response_usage = copy(event.latest_response_usage or message.completion.latest_response_usage),
+    provider = event.provider or message.completion.provider,
     finish_reason = event.finish_reason,
   }
   return c

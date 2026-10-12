@@ -44,6 +44,7 @@ instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } })
 instance.handle_observation({ binding = "conversation", value = {
   kind = "usage", prompt_tokens = 12, completion_tokens = 7,
   model = "round-model", duration_ms = 31,
+  latest_response_usage = { kind = "completed_response", total_tokens = 19 },
 } })
 instance.deliver({ kind = "reply", ref = find_kind(emitted, "capability.invoke").ref,
   result = {
@@ -64,6 +65,7 @@ for _, fact in ipairs(facts) do
 end
 assert(tool_completion, "tool-call assistant entry has a terminal completion fact")
 assert_eq(tool_completion.model, "round-model", "tool-call completion keeps the provider model")
+assert_eq(tool_completion.completion.latest_response_usage.total_tokens, 19, "round exact total survives canonical metadata")
 assert_eq(tool_completion.duration_ms, 31, "tool-call completion keeps provider duration")
 assert_eq(tool_completion.usage.output_tokens, 7, "tool-call completion normalizes output tokens")
 assert_eq(tool_completion.provider_context.artifact.items[1].encrypted_content, "sealed",
@@ -74,6 +76,13 @@ instance.deliver(turn({ messages = { {
 } } }))
 local second = find_last_kind(emitted, "capability.invoke")
 instance.deliver({ kind = "reply", ref = second.ref,
-  result = { text = "done", finish_reason = "stop" } })
+  result = { text = "done", finish_reason = "stop", usage = { total_tokens = 22 } } })
 assert(find_kind(emitted, "nefor.agent.Result"), "the final provider round still emits its answer")
 assert_eq(facts[#facts].kind, "turn_completed", "the final provider round still completes the turn")
+
+local final_assistant
+for _, fact in ipairs(facts) do
+  if fact.kind == "message_completed" and fact.finish_reason == "stop" then final_assistant = fact end
+end
+assert_eq(final_assistant.completion.latest_response_usage.total_tokens, 22,
+  "generic successful total-only response supplies exact per-round metadata")
