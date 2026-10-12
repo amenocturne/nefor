@@ -10,6 +10,7 @@
 local Registry = require("registry")
 local adapter  = require("factories.adapter")
 local llm      = require("factories.llm")
+local Async = dofile(package.searchpath("kinds", package.path):match("^(.*)/") .. "/../../../../tests/lua/mag-kernel/async_compaction_fixture.lua")
 local schema = { version = 1, root = {
   kind = "named", name = "Task", body = { kind = "string" }
 } }
@@ -331,18 +332,21 @@ do
   } } }
   local provider_messages, provider_emit = capture()
   local facts = {}
+  local transport = Async.disabled()
   local provider = assert(llm.construct("fan-in.llm", {
     provider = "fake-provider",
     output_type = "final-id",
     error_type = "error-id",
     provider_error_type = "provider-error-id",
   }, provider_emit, {
+    compaction = transport.facet,
     conversation = {
       id = "fan-in:conversation",
       turn_id = "fan-in:turn",
       emit = function(fact) facts[#facts + 1] = fact end,
     },
   }))
+  transport.wrap(provider)
   local adapter_messages, adapter_emit = capture()
   local entry = adapter.construct("fan-in.entry", { schema = product_schema }, function(message)
     adapter_emit(message)

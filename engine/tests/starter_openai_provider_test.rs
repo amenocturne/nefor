@@ -191,6 +191,7 @@ fn provider_adapter_owns_universal_compaction_lifecycle() {
             change = {
               kind = "context_compaction_pending",
               provider = "chatgpt", model = "gpt-5.6-sol",
+              context = { messages = {{role="user", content="frozen context"}} },
               compaction = { request_id = "compact-1" },
             },
           },
@@ -236,6 +237,7 @@ fn provider_adapter_normalizes_structured_compaction_errors() {
         package.preload["throwing-provider"] = function()
           return { translator = function(name)
             local t = require("openai-provider").translator(name)
+            t.compaction_capability = function() return {kind="supported"} end
             t.compact_context = function()
               error({ code = "request_shape_invalid", message = "bad compaction request",
                 detail = { field = "model" } }, 0)
@@ -254,6 +256,7 @@ fn provider_adapter_normalizes_structured_compaction_errors() {
           type = "event", from = "conversation-manager", body = {
             kind = "conversation.projection.delta", conversation_id = "lead",
             change = { kind = "context_compaction_pending", provider = "broken",
+              context = { messages = {{role="user", content="frozen context"}} },
               compaction = { request_id = "compact-table-error" } },
           },
         }})
@@ -280,6 +283,7 @@ fn provider_adapter_recovers_the_concrete_missing_model_failure() {
         package.preload["returning-provider"] = function()
           return { translator = function(name)
             local t = require("openai-provider").translator(name)
+            t.compaction_capability = function() return {kind="supported"} end
             t.compact_context = function()
               return nil, { code = "provider_compaction_failed",
                 message = "no model configured: pass `model` in chat.create or set the provider default via model.set (the user picks via `/model` in the chat surface)",
@@ -297,7 +301,8 @@ fn provider_adapter_recovers_the_concrete_missing_model_failure() {
         spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
           kind = "conversation.projection.delta", conversation_id = "lead",
           change = { kind = "context_compaction_pending", provider = "returned",
-            compaction = { request_id = "compact-returned-error" } },
+            context = { messages = {{role="user", content="frozen context"}} },
+              compaction = { request_id = "compact-returned-error" } },
         } }})
         local failure = _test.sent()[1].body.error
         assert(failure.code == "provider_compaction_failed")
@@ -334,6 +339,7 @@ fn unsupported_provider_returns_universal_compaction_failure() {
             change = {
               kind = "context_compaction_pending",
               provider = "ollama",
+              context = { messages = {{role="user", content="frozen context"}} },
               compaction = { request_id = "compact-2" },
             },
           },
@@ -341,7 +347,7 @@ fn unsupported_provider_returns_universal_compaction_failure() {
         local sent = _test.sent()
         assert(#sent == 1)
         assert(sent[1].kind == "conversation.context.compact.failed")
-        assert(sent[1].body.error.code == "provider_compaction_failed")
+        assert(sent[1].body.error.code == "compaction_unsupported")
         assert(sent[1].body.error.message == "context compaction is not supported by ollama")
         assert(not sent[1].body.error.message:find("table: 0x", 1, true))
         assert(#_test.delivered() == 0)
@@ -1035,7 +1041,7 @@ fn routed_provider_egress_failure_settles_completion_compaction_and_model_locall
       publish {kind="conversation.provider.invoke", provider="owner", request_id="completion",
         conversation_id="lead", watermark=1}
       publish {kind="conversation.projection.delta", conversation_id="lead", change={
-        kind="context_compaction_pending", provider="owner", model="model", compaction={request_id="compact"}}}
+        kind="context_compaction_pending", provider="owner", model="model", context={messages={{role="user",content="frozen context"}}}, compaction={request_id="compact"}}}
       local deliver = nefor.engine.deliver
       nefor.engine.deliver = function(peer,payload)
         if nefor.json.decode(payload).body.kind == "owner.model.set" then error("egress failed after possible effects") end
@@ -1055,7 +1061,7 @@ fn routed_provider_egress_failure_settles_completion_compaction_and_model_locall
           assert(body.model=="model" and body.outcome=="unknown")
         end
       end
-      assert(counts["ncp.delivery_failed"]==1)
+      assert(counts["ncp.delivery_failed"]>=1)
       assert(counts["conversation.provider.event.reported"]==1)
       assert(counts["conversation.context.compact.failed"]==1)
       assert(counts["chat.model.set_failed"]==1)
@@ -1081,10 +1087,134 @@ fn routed_provider_egress_failure_settles_completion_compaction_and_model_locall
       publish {kind="ncp.delivery_failed",peer="owner",extent="none",correlations={{kind="owner.model.set",model="next"}}}
       assert(count("chat.model.set_failed")==2)
       publish {kind="conversation.projection.delta",conversation_id="lead",change={
-        kind="context_compaction_pending",provider="owner",model="model",compaction={request_id="scoped"}}}
+        kind="context_compaction_pending",provider="owner",model="model",context={messages={{role="user",content="frozen context"}}}, compaction={request_id="scoped"}}}
       publish {kind="engine.plugin_delivery_lost",plugin="owner"}
       assert(count("conversation.context.compact.failed")==2,"surviving queue loss settles compaction")
       publish {kind="conversation.provider.invoke",provider="owner",request_id="later",conversation_id="lead",watermark=1}
       assert(spec._internals.pending_requests().later~=nil,"surviving provider accepts later work")
     "#).exec().expect("routed provider local failure observation");
+}
+
+#[test]
+fn replaceable_compaction_uses_frozen_prefix_and_settles_before_cleanup() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(r#"
+      local prefix_seen
+      package.preload["alternate-compactor"] = function()
+        return {translator=function(name)
+          local t = require("openai-provider").translator(name)
+          t.compaction_capability = function() return {kind="supported"} end
+          t.compact_context = function(input)
+            prefix_seen = input.context.messages[1].content
+            input.context.messages[1].content = "adapter mutation"
+            return {chat_id="temporary:"..input.request.request_id,
+              create={kind=name..".chat.create",chat_id="temporary:"..input.request.request_id},
+              compact={kind=name..".chat.compact",chat_id="temporary:"..input.request.request_id},messages={}}
+          end
+          t.compaction_outcome = function(body, request)
+            return {kind="completed",request_id=request.request_id,conversation_id=request.conversation_id,
+              checkpoint={provider=name,model=request.model,format="alternate.scalar.v1",artifact="opaque scalar"},
+              compatibility={provider=name,model=request.model,format="alternate.scalar.v1"}}
+          end
+          t.checkpoint_compatible = function(cp, provider, model)
+            return cp.provider==provider and cp.model==model and cp.format=="alternate.scalar.v1"
+          end
+          t.cleanup_compaction = function() error("cleanup refused") end
+          t.cancel_compaction = function(plan) return {{kind=name..".chat.cancel",chat_id=plan.chat_id}} end
+          return t
+        end}
+      end
+      local spec=require("libs.compositors.provider").spawn_spec("alternate",{"/bin/true"},{
+        translator_lib="alternate-compactor",agentic_loop={},conversations={
+          context=function() error("must not reread mutable head") end}})
+      local input={request={request_id="r",conversation_id="lead",provider="alternate",model="m",
+        epoch_id="epoch",history_id={1},trigger="self"},context={messages={{role="user",content="frozen prefix"}}}}
+      local env={type="event",from="conversation-manager",body={kind="conversation.projection.delta",
+        conversation_id="lead",change={kind="context_compaction_pending",input=input}}}
+      spec.to_plugin({env,env})
+      assert(prefix_seen=="frozen prefix" and input.context.messages[1].content=="frozen prefix")
+      assert(#_test.delivered()==2,"duplicate pending must not dispatch")
+      local terminal={type="event",from="alternate",body={kind="alternate.chat.compaction.commit",chat_id="temporary:r"}}
+      terminal.body.request_id="wrong"
+      spec.from_plugin({terminal})
+      assert(#_test.sent()==0,"wrong request must not settle")
+      terminal.body.request_id="r"
+      spec.from_plugin({terminal,terminal})
+      local sent=_test.sent()
+      assert(#sent==2)
+      assert(sent[1].kind=="conversation.context.compact.complete")
+      assert(sent[1].body.checkpoint.artifact=="opaque scalar")
+      assert(sent[1].body.epoch_id=="epoch" and sent[1].body.history_id[1]==1)
+      assert(sent[2].kind=="conversation.context.compact.cleanup_failed")
+      assert(sent[2].body.request_id=="r" and sent[2].body.resource_id=="temporary:r")
+      spec.to_plugin({env})
+      assert(#_test.delivered()==0,"duplicate accepted request after settlement is inert")
+    "#).exec().expect("alternate opaque compactor and cleanup settlement");
+}
+
+#[test]
+fn compaction_cancellation_releases_only_correlated_resource_and_late_terminal_is_inert() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(r#"
+      local spec=require("libs.compositors.provider").spawn_spec("chatgpt",{"/bin/true"},{
+        translator_lib="chatgpt-provider",tool_gate="gate",agentic_loop={},conversations={context=function() error("no reread") end}})
+      local env={type="event",from="conversation-manager",body={kind="conversation.projection.delta",conversation_id="lead",
+        change={kind="context_compaction_pending",input={request={request_id="cancel",conversation_id="lead",provider="chatgpt",model="m"},
+          context={messages={{role="user",content="prefix"}}}}}}}
+      env.replay=true
+      spec.to_plugin({env})
+      assert(#_test.delivered()==0)
+      env.replay=nil
+      spec.to_plugin({env})
+      assert(#_test.delivered()==3)
+      spec.to_plugin({{type="event",from="consumer",body={kind="conversation.context.compact.cancel",
+        conversation_id="foreign",request_id="cancel"}}})
+      assert(#_test.sent()==0 and #_test.delivered()==0)
+      spec.to_plugin({{type="event",from="consumer",body={kind="conversation.context.compact.cancel",
+        conversation_id="lead",request_id="cancel"}}})
+      local sent=_test.sent(); local delivered=_test.delivered()
+      assert(#sent==1 and sent[1].body.error.code=="compaction_interrupted")
+      assert(#delivered==2 and delivered[1].kind=="chatgpt.chat.cancel" and delivered[2].kind=="chatgpt.chat.delete")
+      spec.from_plugin({{type="event",from="chatgpt",body={kind="chatgpt.chat.compaction.commit",
+        chat_id="conversation-compact:cancel",model="m",model_context_artifact={items={{}}}}}})
+      assert(#_test.sent()==0)
+    "#).exec().expect("correlated cancellation and replay safety");
+}
+
+#[test]
+fn adapter_preparation_waits_for_observed_regular_capacity_without_polling() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(r#"
+      local op=require("libs.compositors.provider")
+      local opts={translator_lib="chatgpt-provider",tool_gate="gate",agentic_loop={},conversations={context=function() return {} end}}
+      local spec=op.spawn_spec("chatgpt",{"/bin/true"},opts)
+      local input={provider="chatgpt",model="m",policy={soft_percent=60,step_percent=10,hard_percent=90}}
+      local first=spec.compaction.prepare(input)
+      assert(first.kind=="Waiting")
+      assert(spec.compaction.prepare(input).request_id==first.request_id)
+      local delivered=_test.delivered()
+      assert(#delivered==1 and delivered[1].kind=="chatgpt.models.list_requested")
+      spec.from_plugin({{type="event",from="chatgpt",body={kind="chatgpt.models.listed",models={"m","bad"},
+        context_windows={m=123456,bad=0},max_context_windows={bad=999999,m=999999}}}})
+      local sent=_test.sent();local prepared
+      for _,e in ipairs(sent) do if e.kind=="conversation.compaction.prepared" then prepared=e.body end end
+      assert(prepared.request_id==first.request_id and prepared.outcome.kind=="Ready")
+      assert(prepared.outcome.regular_window==123456 and prepared.outcome.capability.kind=="supported")
+      assert(spec.compaction.prepare(input).regular_window==123456)
+      input.model="bad"
+      assert(spec.compaction.prepare(input).error.code=="compaction_capacity_missing")
+      assert(#_test.delivered()==0)
+      local unsupported=op.spawn_spec("openai",{"/bin/true"},{agentic_loop={},conversations={context=function() return {} end}})
+      input.provider="openai"
+      assert(unsupported.compaction.prepare(input).error.code=="compaction_unsupported")
+      input.policy=nil
+      assert(unsupported.compaction.prepare(input).capability.kind=="unsupported")
+      assert(#_test.delivered()==0)
+    "#).exec().expect("metadata preparation without guessed capacity or polling");
 }

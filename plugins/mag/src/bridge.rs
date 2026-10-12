@@ -88,6 +88,9 @@ impl CapabilityBridge {
             "tools",
             "output_schema",
             "tool_specs",
+            "context_watermark",
+            "notice_id",
+            "epoch_id",
         ] {
             if let Some(value) = args.get(key).filter(|value| !value.is_null()) {
                 request.insert(key.into(), value.clone());
@@ -140,6 +143,24 @@ impl CapabilityBridge {
             body.get("provider").and_then(Value::as_str) == Some(pending.provider.as_str());
         (source == CONVERSATION_MANAGER && kind == PROVIDER_EVENT && provider_matches)
             .then_some(request_id)
+    }
+
+    /// Inclusion is reported by the registered provider edge after lowering,
+    /// not by the manager's normal response relay. It never closes a request.
+    pub fn context_inclusion_request_id<'a>(
+        &'a self,
+        source: &str,
+        kind: &str,
+        body: &'a Map<String, Value>,
+    ) -> Option<&'a str> {
+        if kind != "conversation.provider.context_included" {
+            return None;
+        }
+        let request_id = body.get("request_id").and_then(Value::as_str)?;
+        let pending = self.pending_providers.get(request_id)?;
+        (source == pending.provider
+            && body.get("provider").and_then(Value::as_str) == Some(pending.provider.as_str()))
+        .then_some(request_id)
     }
 
     pub fn is_structured_request(&self, request_id: &str) -> bool {

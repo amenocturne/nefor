@@ -63,3 +63,8 @@ required-features = ["full-tests"]
 nefor-mag = { path = "../crates/nefor-mag" }
 nefor-tui = { path = "../plugins/nefor-tui" }
 tempfile = "3"
+
+[[test]]
+name = "compaction_process"
+path = "tests/compaction_process.rs"
+required-features = ["full-tests"]

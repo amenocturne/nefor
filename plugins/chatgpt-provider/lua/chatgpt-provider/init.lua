@@ -244,6 +244,10 @@ local function translator(name, options)
     body.messages = {}
     for index, message in ipairs(context.messages) do body.messages[index] = t.context_message(message) end
     local lowered_context = copy(context)
+    local checkpoint = context.compaction and context.compaction.checkpoint
+    if not t.checkpoint_compatible(checkpoint, name, request.model, request.provider_options) then
+      lowered_context.compaction = nil
+    end
     lowered_context.messages = {}
     for index, message in ipairs(context.messages) do lowered_context.messages[index] = t.context_message(message) end
     lowered_context.tail_messages = {}
@@ -293,45 +297,78 @@ local function translator(name, options)
     emit = function(body) t.publish(name, body) end,
   }
 
-  -- Interpret provider-owned checkpoints here, at the provider boundary.
-  t.compact_context = function(change)
-    local context = type(change) == "table" and change.context or nil
+  local compaction_format = "chatgpt.responses.compaction.v1"
+  t.compaction_capability = function(provider)
+    if provider ~= name then
+      return { kind = "unsupported", reason = "provider does not match adapter" }
+    end
+    return { kind = "supported" }
+  end
+  t.checkpoint_compatible = function(checkpoint, provider, model)
+    return type(checkpoint) == "table" and provider == name
+      and checkpoint.provider == provider and type(model) == "string" and model ~= ""
+      and checkpoint.model == model and checkpoint.format == compaction_format
+      and type(checkpoint.artifact) == "table" and type(checkpoint.artifact.items) == "table"
+      and #checkpoint.artifact.items > 0
+  end
+
+  t.compact_context = function(input)
+    local context, request = input.context, input.request
     if type(context) ~= "table" or type(context.messages) ~= "table" then
       return nil, "conversation context is missing complete messages"
     end
-    local request_id = change.compaction and change.compaction.request_id
-    if type(request_id) ~= "string" or request_id == "" then
-      return nil, "conversation compaction request_id is missing"
+    if type(request) ~= "table" or not nonempty(request.request_id)
+        or request.provider ~= name or not nonempty(request.model) then
+      return nil, "conversation compaction request identity is missing"
     end
-    local chat_id = "conversation-compact:" .. request_id
-    local provider_options = change.compaction and change.compaction.provider_options
+    local chat_id = "conversation-compact:" .. request.request_id
     local plan = {
       chat_id = chat_id,
       create = {
         kind = prefix .. "chat.create", chat_id = chat_id,
-        conversation_id = change.conversation_id,
-        model = change.model or (change.compaction and change.compaction.model),
-        provider_options = provider_options ~= nil and copy(provider_options) or nil,
+        conversation_id = request.conversation_id, model = request.model,
+        provider_options = request.provider_options ~= nil and copy(request.provider_options) or nil,
       },
-      messages = context.messages,
-      compact = { kind = prefix .. "chat.compact", chat_id = chat_id, trigger = "conversation-manager" },
+      messages = {},
+      compact = { kind = prefix .. "chat.compact", chat_id = chat_id, trigger = request.trigger },
       delete = { kind = prefix .. "chat.delete", chat_id = chat_id },
     }
     local selected = context.compaction
     local checkpoint = type(selected) == "table" and selected.checkpoint or nil
-    if type(checkpoint) == "table" and checkpoint.provider == name
-        and checkpoint.format == "chatgpt.responses.compaction.v1"
-        and type(checkpoint.artifact) == "table"
-        and type(checkpoint.artifact.items) == "table" then
+    local messages = context.messages
+    if t.checkpoint_compatible(checkpoint, request.provider, request.model, request.provider_options) then
       plan.restore = {
         kind = prefix .. "chat.compaction.restore", chat_id = chat_id,
-        model_context_artifact = checkpoint.artifact,
+        model_context_artifact = copy(checkpoint.artifact),
       }
-      plan.messages = type(context.tail_messages) == "table" and context.tail_messages or {}
+      messages = context.tail_messages or {}
     end
-    for index, message in ipairs(plan.messages) do plan.messages[index] = t.context_message(message) end
+    for index, message in ipairs(messages) do plan.messages[index] = t.context_message(message) end
     return plan
   end
+
+  t.compaction_outcome = function(body, request)
+    local outcome = { request_id = request.request_id, conversation_id = request.conversation_id }
+    local checkpoint = { provider = name, model = body.model, format = compaction_format,
+      artifact = copy(body.model_context_artifact) }
+    if body.kind == t.kinds.chat_compaction_commit
+        and t.checkpoint_compatible(checkpoint, request.provider, request.model, request.provider_options) then
+      outcome.kind = "completed"
+      outcome.checkpoint = checkpoint
+      outcome.compatibility = { provider = name, model = request.model, format = compaction_format }
+    else
+      outcome.kind = "failed"
+      outcome.error = body.kind == t.kinds.chat_compaction_commit
+        and { code = "compaction_checkpoint_invalid", message = "Native checkpoint is incompatible or empty" }
+        or require("core.error").normalize(body.error or body.message,
+          "provider_compaction_failed", "context compaction failed")
+    end
+    return outcome
+  end
+  t.cancel_compaction = function(plan)
+    return {{ kind = prefix .. "chat.cancel", chat_id = plan.chat_id }}
+  end
+  t.cleanup_compaction = function(plan) return { plan.delete } end
 
   t.inbound = function(env)
     local body = type(env) == "table" and env.body or nil

@@ -22,6 +22,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::time::timeout;
 
+#[path = "support/canonical_conversation.rs"]
+mod canonical_conversation;
 mod support;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
@@ -160,6 +162,26 @@ fn object(value: Value) -> Map<String, Value> {
     value.as_object().expect("object").clone()
 }
 
+async fn next_mag_kind(
+    reader: &mut BufReader<ChildStdout>,
+    stdin: &mut ChildStdin,
+    manager: &mut canonical_conversation::CanonicalConversation,
+    kind: &str,
+) -> Map<String, Value> {
+    loop {
+        if let Body::Event(body) = outgoing(reader, kind).await.body {
+            manager.service(&body, stdin).await;
+            if body["kind"] == kind {
+                return body;
+            }
+            assert!(
+                !matches!(body["kind"].as_str(), Some("mag.error" | "mag.run_failed")),
+                "MAG failure: {body:?}"
+            );
+        }
+    }
+}
+
 async fn next_kind(reader: &mut BufReader<ChildStdout>, kind: &str) -> Map<String, Value> {
     loop {
         if let Body::Event(body) = outgoing(reader, kind).await.body {
@@ -238,7 +260,7 @@ import nefor.graph.{}
 type InvestigationInput {prompt: String}
 
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(model)
-let resolved = nefor.actors.ResolvedModel {provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
+let resolved = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "read fixture"})
 let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Read fixture.txt, then answer.", tools: ["read_file", "unavailable_fixture_tool"], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
 let output = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
@@ -270,9 +292,16 @@ nefor.artifact.compile(topology)
         "artifact": artifact, "params_overlay": {"actor:10:answer.llm": {"provider": PROVIDER}}
     }))).await;
 
+    let mut manager = canonical_conversation::CanonicalConversation::new("openai-provider");
     let mut companion_conversation_id = None;
     for round in 0..2 {
-        let request = next_kind(&mut mag_out, "conversation.provider.invoke.request").await;
+        let request = next_mag_kind(
+            &mut mag_out,
+            &mut mag_in,
+            &mut manager,
+            "conversation.provider.invoke.request",
+        )
+        .await;
         assert_eq!(request["provider"], PROVIDER);
         let request_conversation_id = request["conversation_id"]
             .as_str()
@@ -292,8 +321,12 @@ nefor.artifact.compile(topology)
             "thin invoke has no system prompt"
         );
         assert!(
-            request.get("tool_specs").is_none(),
-            "tool schemas stay provider-owned"
+            request["tool_specs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|spec| spec["name"] == "self_compact" && spec["owner"] == "mag-runtime"),
+            "ordinary tool schemas stay provider-owned; only runtime self_compact is intrinsic"
         );
         let request_id = request["request_id"]
             .as_str()
@@ -356,7 +389,13 @@ nefor.artifact.compile(topology)
             .await;
         }
         if round == 0 {
-            let invoke = next_kind(&mut mag_out, "tool-gate.tool.invoke").await;
+            let invoke = next_mag_kind(
+                &mut mag_out,
+                &mut mag_in,
+                &mut manager,
+                "tool-gate.tool.invoke",
+            )
+            .await;
             assert_eq!(invoke["name"], "read_file");
             assert_eq!(invoke["args"]["path"], "fixture.txt");
             assert_eq!(invoke["invocation"]["run_id"], "tool-run");
@@ -450,7 +489,7 @@ nefor.artifact.compile(topology)
         }
     }
 
-    let result = next_kind(&mut mag_out, "mag.run_result").await;
+    let result = next_mag_kind(&mut mag_out, &mut mag_in, &mut manager, "mag.run_result").await;
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"]["value"]["value"], "done after read_file");
 
@@ -476,7 +515,7 @@ import nefor.graph.{}
 type InvestigationInput {prompt: String}
 
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(model)
-let resolved = nefor.actors.ResolvedModel {provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
+let resolved = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "provider", model: "test-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "research"})
 let answer = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("answer", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "Research, then answer.", tools: ["web_search"], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
 let output = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
@@ -514,7 +553,14 @@ nefor.artifact.compile(topology)
     )
     .await;
 
-    let request = next_kind(&mut mag_out, "conversation.provider.invoke.request").await;
+    let mut manager = canonical_conversation::CanonicalConversation::new("openai-provider");
+    let request = next_mag_kind(
+        &mut mag_out,
+        &mut mag_in,
+        &mut manager,
+        "conversation.provider.invoke.request",
+    )
+    .await;
     let request_id = request["request_id"]
         .as_str()
         .expect("provider request id")
@@ -564,6 +610,7 @@ nefor.artifact.compile(topology)
         {
             panic!("provider-executed observation activated run-tool: {body:?}");
         }
+        manager.service(&body, &mut mag_in).await;
         if kind == Some("conversation.fact.append") {
             facts.push(body["fact"].clone());
         }

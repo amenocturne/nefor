@@ -1,4 +1,5 @@
 local M = {}
+local policy = require("libs.compaction-policy")
 local json_data = require("core.json_data")
 
 local function copy_json_object(value, label)
@@ -23,7 +24,7 @@ local function copy_resolved_model(model, label)
   local copy = {}
   for key, value in pairs(model) do
     if key ~= "provider" and key ~= "model" and key ~= "reasoning_effort"
-        and key ~= "provider_options" then
+        and key ~= "provider_options" and key ~= "compaction_policy" then
       return nil, label .. " has unknown field " .. tostring(key)
     end
     copy[key] = value
@@ -44,6 +45,9 @@ local function copy_resolved_model(model, label)
     if options == nil then return nil, options_error end
     copy.provider_options = options
   end
+  local validated, policy_error = policy.validate(copy.compaction_policy)
+  if validated == nil then return nil, label .. " " .. policy_error end
+  copy.compaction_policy = policy.raw(validated)
   return copy
 end
 
@@ -54,7 +58,7 @@ function M.copy(snapshot)
   local current = {}
   for key, value in pairs(snapshot) do
     if key ~= "provider" and key ~= "model" and key ~= "reasoning_effort"
-        and key ~= "provider_options"
+        and key ~= "provider_options" and key ~= "compaction_policy"
         and key ~= "profiles" then
       return nil, "model snapshot has unknown field " .. tostring(key)
     end

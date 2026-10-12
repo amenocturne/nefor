@@ -283,10 +283,18 @@ compact_append("content_chunk_appended", { message_id = "compact-user",
 compact_append("message_completed", { message_id = "compact-user" })
 local before_compaction = expected_rows(canonical_projection.conversation(
   compact_store:peek("compact-conversation")))
+local compact_context = canonical_projection.context(compact_store:peek("compact-conversation"),
+  { provider = "test-provider", model = "test-model" })
 compact_append("context_compaction_requested", { request_id = "compact-request",
-  provider = "test-provider", history_cutoff = 1 })
+  provider = "test-provider", model = "test-model", history_cutoff = 1, trigger = "manual",
+  epoch_id = compact_context.policy_state.epoch_id, history_id = compact_context.history_id,
+  context_watermark = compact_context.watermark })
 compact_append("context_compaction_completed", { request_id = "compact-request",
-  checkpoint = { opaque = "artifact" } })
+  provider = "test-provider", model = "test-model",
+  epoch_id = compact_context.policy_state.epoch_id, history_id = compact_context.history_id,
+  checkpoint = { provider = "test-provider", model = "test-model", format = "test.opaque.v1",
+    artifact = { opaque = "artifact" } },
+  compatibility = { provider = "test-provider", model = "test-model", format = "test.opaque.v1" } })
 local after_compaction = canonical_projection.conversation(
   compact_store:peek("compact-conversation"))
 eq(expected_rows(after_compaction), before_compaction,

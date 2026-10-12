@@ -1,3 +1,5 @@
+#[path = "support/canonical_conversation.rs"]
+mod canonical_conversation;
 mod topology_lua;
 
 pub mod bridge {
@@ -25,11 +27,84 @@ pub mod kernel {
 
         fn shipped_host() -> LuaHost {
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            LuaHost::load_kernel(
+            let host = LuaHost::load_kernel(
                 &manifest.join("lua/mag-kernel/init.lua"),
                 Some(&manifest.join("../../lua")),
             )
-            .expect("load shipped kernel")
+            .expect("load shipped kernel");
+            crate::canonical_conversation::install(&host.lua);
+            host
+        }
+
+        fn drain_canonical(
+            host: &LuaHost,
+        ) -> Result<Vec<Map<String, JsonValue>>, crate::error::MagError> {
+            let mut out = Vec::new();
+            loop {
+                let batch = host.drain_emits()?;
+                if batch.is_empty() {
+                    break;
+                }
+                for body in batch {
+                    let output =
+                        crate::canonical_conversation::handle(&host.lua, &body, "openai-provider");
+                    for event in output["events"].as_array().unwrap() {
+                        host.canonical_event(
+                            event["from"].as_str().unwrap(),
+                            event["body"].as_object().unwrap(),
+                        )?;
+                    }
+                    out.push(body);
+                }
+            }
+            Ok(out)
+        }
+
+        #[test]
+        fn execution_snapshot_compaction_policy_is_strict() {
+            for policy in [
+                serde_json::json!(null),
+                serde_json::json!({"soft_percent":60.5,"step_percent":0.5,"hard_percent":90}),
+            ] {
+                let value = serde_json::json!({"provider":"p","model":"m","compaction_policy":policy,
+                    "profiles":{"current":{"provider":"p","model":"m","compaction_policy":policy}}});
+                serde_json::from_value::<ExecutionModelSnapshot>(value)
+                    .expect("snapshot shape")
+                    .validate()
+                    .expect("valid policy");
+            }
+            for policy in [
+                serde_json::json!({}),
+                serde_json::json!([]),
+                serde_json::json!(false),
+                serde_json::json!({"soft_percent":60,"step_percent":0,"hard_percent":90}),
+                serde_json::json!({"soft_percent":90,"step_percent":10,"hard_percent":90}),
+                serde_json::json!({"soft_percent":60,"step_percent":10,"hard_percent":101}),
+                serde_json::json!({"soft_percent":60,"step_percent":10,"hard_percent":90,"extra":true}),
+            ] {
+                for value in [
+                    serde_json::json!({"provider":"p","model":"m","compaction_policy":policy}),
+                    serde_json::json!({"provider":"p","model":"m","profiles":{"worker":{"provider":"p","model":"m","compaction_policy":policy}}}),
+                ] {
+                    assert!(serde_json::from_value::<ExecutionModelSnapshot>(value)
+                        .expect("snapshot shape")
+                        .validate()
+                        .is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn compaction_policy_pure_contract() {
+            let host = shipped_host();
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/lua/mag-kernel");
+            for file in ["compaction_policy_test.lua"] {
+                host.lua
+                    .load(std::fs::read_to_string(root.join(file)).expect("fixture"))
+                    .set_name(file)
+                    .exec()
+                    .expect("compaction contract");
+            }
         }
 
         fn compile_mag_source(host: &LuaHost, name: &str, source: &str) -> JsonValue {
@@ -322,7 +397,7 @@ import nefor.node.{{}}
 import nefor.result.{{}}
 type InvestigationInput {{prompt: String}}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(model)
-let configured_model = nefor.actors.ResolvedModel {{provider: "test-provider", model: "test-model", reasoning_effort: nefor.actors.no_reasoning_effort}}
+let configured_model = nefor.actors.ResolvedModel {{compaction_policy: nefor.actors.disabled_compaction, provider: "test-provider", model: "test-model", reasoning_effort: nefor.actors.no_reasoning_effort}}
 let start = nefor.graph.source("task", InvestigationInput {{prompt: "produce values"}})
 let planner = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.dynamic.DynamicList<{input_type}>>("planner", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {{model: configured_model, system: "Return values.", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}})
 let planned = nefor.node.`>>>`(start, planner)
@@ -377,12 +452,12 @@ nefor.artifact.compile_graph(contextual)
                 );
 
                 assert!(host.begin_run(name, name, None).unwrap().ok);
-                host.drain_emits().unwrap();
+                drain_canonical(&host).unwrap();
                 let started = host
                     .start_program(name, &decoded.initial, &decoded.operations)
                     .unwrap();
                 assert!(started.ok, "{name} start: {:?}", started.error);
-                let emitted = host.drain_emits().unwrap();
+                let emitted = drain_canonical(&host).unwrap();
                 let request = tool_invoke(&emitted, "test-provider");
                 host.bus_response(
                     request["id"].as_str().unwrap(),
@@ -395,7 +470,7 @@ nefor.artifact.compile_graph(contextual)
                 )
                 .unwrap();
                 assert!(host.take_run_complete(name).unwrap().is_none());
-                let emitted = host.drain_emits().unwrap();
+                let emitted = drain_canonical(&host).unwrap();
                 let request = tool_invoke(&emitted, "test-provider");
                 host.bus_response(
                     request["id"].as_str().unwrap(),
@@ -415,7 +490,7 @@ nefor.artifact.compile_graph(contextual)
                     "{name}: {result}"
                 );
                 host.end_run(name, TeardownReason::RunComplete).unwrap();
-                host.drain_emits().unwrap();
+                drain_canonical(&host).unwrap();
             }
 
             std::fs::remove_dir_all(source_dir).expect("remove traversal test workspace");
@@ -494,7 +569,7 @@ nefor.artifact.compile_graph(contextual)
                     );
                 }
                 assert!(host.begin_run(name, name, None).expect("begin run").ok);
-                host.drain_emits().expect("drain begin events");
+                drain_canonical(&host).expect("drain begin events");
                 let started = host
                     .start_program(name, &modification, &[])
                     .unwrap_or_else(|error| panic!("start {name}: {error:?}"));
@@ -509,7 +584,7 @@ nefor.artifact.compile_graph(contextual)
                 );
                 host.end_run(name, TeardownReason::RunComplete)
                     .expect("end run");
-                host.drain_emits().expect("drain end events");
+                drain_canonical(&host).expect("drain end events");
             }
         }
 
@@ -540,7 +615,7 @@ nefor.artifact.compile_graph(contextual)
                     .expect("begin shared source run")
                     .ok
             );
-            host.drain_emits().expect("drain begin events");
+            drain_canonical(&host).expect("drain begin events");
             let started = host
                 .start_program("shared-source-union", &modification, &[])
                 .expect("start shared source program");
@@ -568,7 +643,7 @@ nefor.artifact.compile_graph(contextual)
     import nefor.graph.{}
     type InvestigationInput {prompt: String}
     let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(model)
-    let resolved = nefor.actors.ResolvedModel {provider: "authored-provider", model: "authored-model", reasoning_effort: nefor.actors.reasoning_effort("authored-effort")}
+    let resolved = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "authored-provider", model: "authored-model", reasoning_effort: nefor.actors.reasoning_effort("authored-effort")}
     let start = nefor.graph.source("task", InvestigationInput {prompt: "answer"})
     let worker = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, nefor.contracts.TextAnswer>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved, system: "", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
     let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
@@ -601,6 +676,7 @@ nefor.artifact.compile_graph(contextual)
             ] {
                 let modification = compile_mag_source(&host, run_id, &source);
                 let mut snapshot = ExecutionModelSnapshot {
+                    compaction_policy: None,
                     provider: "snapshot-provider".to_owned(),
                     model: "snapshot-model".to_owned(),
                     reasoning_effort: None,
@@ -626,10 +702,10 @@ nefor.artifact.compile_graph(contextual)
                     .as_mut()
                     .unwrap()
                     .insert("service_tier".to_owned(), serde_json::json!("mutated"));
-                host.drain_emits().expect("drain begin");
+                drain_canonical(&host).expect("drain begin");
                 let outcome = host.start(run_id, &modification).expect("start run");
                 assert!(outcome.ok, "start failed: {:?}", outcome.error);
-                let emits = host.drain_emits().expect("drain start");
+                let emits = drain_canonical(&host).expect("drain start");
                 let spawned = emits
                     .iter()
                     .find(|event| {
@@ -653,6 +729,7 @@ nefor.artifact.compile_graph(contextual)
 
                 if run_id == "snapshot-direct" {
                     let later_snapshot = ExecutionModelSnapshot {
+                        compaction_policy: None,
                         provider: "later-provider".to_owned(),
                         model: "later-model".to_owned(),
                         reasoning_effort: Some("low".to_owned()),
@@ -670,12 +747,12 @@ nefor.artifact.compile_graph(contextual)
                         )
                         .expect("begin later run");
                     assert!(begun.ok);
-                    host.drain_emits().expect("drain later begin");
+                    drain_canonical(&host).expect("drain later begin");
                     let outcome = host
                         .start("snapshot-later", &modification)
                         .expect("start later run");
                     assert!(outcome.ok, "later start failed: {:?}", outcome.error);
-                    let later_emits = host.drain_emits().expect("drain later invoke");
+                    let later_emits = drain_canonical(&host).expect("drain later invoke");
                     let later_invoke = tool_invoke(&later_emits, "later-provider");
                     assert_eq!(later_invoke["args"]["model"], "later-model");
 
@@ -690,7 +767,7 @@ nefor.artifact.compile_graph(contextual)
                         .remove("result");
                     let outcome = host.apply(run_id, &patch).expect("apply snapshotted patch");
                     assert!(outcome.ok, "patch failed: {:?}", outcome.error);
-                    let patch_emits = host.drain_emits().expect("drain patch invoke");
+                    let patch_emits = drain_canonical(&host).expect("drain patch invoke");
                     let patch_invoke = tool_invoke(&patch_emits, "snapshot-provider");
                     assert_eq!(patch_invoke["args"]["model"], "snapshot-model");
                     assert!(patch_invoke["args"].get("reasoning_effort").is_none());
@@ -711,16 +788,17 @@ nefor.artifact.compile_graph(contextual)
 
                     host.end_run("snapshot-later", TeardownReason::Killed)
                         .expect("end later run");
-                    host.drain_emits().expect("drain later end");
+                    drain_canonical(&host).expect("drain later end");
                 }
 
                 host.end_run(run_id, TeardownReason::Killed)
                     .expect("end snapshot run");
-                host.drain_emits().expect("drain end");
+                drain_canonical(&host).expect("drain end");
             }
 
             let modification = compile_mag_source(&host, "snapshot-effort", direct);
             let snapshot = ExecutionModelSnapshot {
+                compaction_policy: None,
                 provider: "snapshot-provider".to_owned(),
                 model: "snapshot-model".to_owned(),
                 reasoning_effort: Some("high".to_owned()),
@@ -738,34 +816,34 @@ nefor.artifact.compile_graph(contextual)
                 )
                 .expect("begin effort run");
             assert!(begun.ok);
-            host.drain_emits().expect("drain begin");
+            drain_canonical(&host).expect("drain begin");
             let outcome = host
                 .start("snapshot-effort", &modification)
                 .expect("start effort run");
             assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let emits = host.drain_emits().expect("drain effort invoke");
+            let emits = drain_canonical(&host).expect("drain effort invoke");
             let invoke = tool_invoke(&emits, "snapshot-provider");
             assert_eq!(invoke["args"]["reasoning_effort"], "high");
             host.end_run("snapshot-effort", TeardownReason::Killed)
                 .expect("end effort run");
-            host.drain_emits().expect("drain effort end");
+            drain_canonical(&host).expect("drain effort end");
 
             let begun = host
                 .begin_run("snapshot-fallback", "snapshot-fallback", Some("session"))
                 .expect("begin fallback run");
             assert!(begun.ok);
-            host.drain_emits().expect("drain fallback begin");
+            drain_canonical(&host).expect("drain fallback begin");
             let outcome = host
                 .start("snapshot-fallback", &modification)
                 .expect("start fallback run");
             assert!(outcome.ok, "fallback start failed: {:?}", outcome.error);
-            let emits = host.drain_emits().expect("drain fallback invoke");
+            let emits = drain_canonical(&host).expect("drain fallback invoke");
             let invoke = tool_invoke(&emits, "authored-provider");
             assert_eq!(invoke["args"]["model"], "authored-model");
             assert_eq!(invoke["args"]["reasoning_effort"], "authored-effort");
             host.end_run("snapshot-fallback", TeardownReason::Killed)
                 .expect("end fallback run");
-            host.drain_emits().expect("drain fallback end");
+            drain_canonical(&host).expect("drain fallback end");
 
             let mut malformed = modification;
             let llm = malformed["actors"]
@@ -779,7 +857,7 @@ nefor.artifact.compile_graph(contextual)
                 .begin_run("malformed-effort", "malformed-effort", Some("session"))
                 .expect("begin malformed run");
             assert!(begun.ok);
-            host.drain_emits().expect("drain malformed begin");
+            drain_canonical(&host).expect("drain malformed begin");
             let outcome = host
                 .start("malformed-effort", &malformed)
                 .expect("start malformed run");
@@ -809,7 +887,7 @@ nefor.artifact.compile_graph(contextual)
     type Model = Current | Fast
     let fast = Model.Fast
     let resolve_model: fn(Model) -> nefor.actors.AuthoredModel = |model| => match model {
-      case Current => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "authored-provider", model: "authored-model", reasoning_effort: nefor.actors.no_reasoning_effort}),
+      case Current => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "authored-provider", model: "authored-model", reasoning_effort: nefor.actors.no_reasoning_effort}),
       case Fast => nefor.actors.AuthoredModel.ModelProfile(nefor.actors.model_profile("fast")),
     }
     let start = nefor.graph.source("task", InvestigationInput {prompt: "answer"})
@@ -852,6 +930,7 @@ nefor.artifact.compile_graph(contextual)
                 profiles.insert(
                     "fast".to_owned(),
                     ExecutionResolvedModel {
+                        compaction_policy: None,
                         provider: "fast-provider".to_owned(),
                         model: "fast-model".to_owned(),
                         reasoning_effort: Some("low".to_owned()),
@@ -862,6 +941,7 @@ nefor.artifact.compile_graph(contextual)
                     },
                 );
                 let snapshot = ExecutionModelSnapshot {
+                    compaction_policy: None,
                     provider: "current-provider".to_owned(),
                     model: "current-model".to_owned(),
                     reasoning_effort: Some("high".to_owned()),
@@ -879,12 +959,12 @@ nefor.artifact.compile_graph(contextual)
                     )
                     .expect("begin profiled run");
                 assert!(begun.ok, "begin failed: {:?}", begun.error);
-                host.drain_emits().expect("drain begin");
+                drain_canonical(&host).expect("drain begin");
                 let outcome = host
                     .start(run_id, &modification)
                     .expect("start profiled run");
                 assert!(outcome.ok, "start failed: {:?}", outcome.error);
-                let emits = host.drain_emits().expect("drain profiled invoke");
+                let emits = drain_canonical(&host).expect("drain profiled invoke");
                 let spawned = emits
                     .iter()
                     .find(|event| {
@@ -910,14 +990,14 @@ nefor.artifact.compile_graph(contextual)
                         .remove("result");
                     let outcome = host.apply(run_id, &patch).expect("apply profiled patch");
                     assert!(outcome.ok, "patch failed: {:?}", outcome.error);
-                    let patch_emits = host.drain_emits().expect("drain profiled patch");
+                    let patch_emits = drain_canonical(&host).expect("drain profiled patch");
                     let patch_invoke = tool_invoke(&patch_emits, "fast-provider");
                     assert_eq!(patch_invoke["args"]["model"], "fast-model");
                 }
 
                 host.end_run(run_id, TeardownReason::Killed)
                     .expect("end profiled run");
-                host.drain_emits().expect("drain profiled end");
+                drain_canonical(&host).expect("drain profiled end");
             }
 
             let standard_source =
@@ -928,6 +1008,7 @@ nefor.artifact.compile_graph(contextual)
             profiles.insert(
                 "standard".to_owned(),
                 ExecutionResolvedModel {
+                    compaction_policy: None,
                     provider: "standard-provider".to_owned(),
                     model: "standard-model".to_owned(),
                     reasoning_effort: Some("medium".to_owned()),
@@ -935,6 +1016,7 @@ nefor.artifact.compile_graph(contextual)
                 },
             );
             let snapshot = ExecutionModelSnapshot {
+                compaction_policy: None,
                 provider: "current-provider".to_owned(),
                 model: "current-model".to_owned(),
                 reasoning_effort: Some("high".to_owned()),
@@ -955,12 +1037,12 @@ nefor.artifact.compile_graph(contextual)
                 )
                 .expect("begin standard-profile run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin");
+            drain_canonical(&host).expect("drain begin");
             let outcome = host
                 .start("profile-clears-options", &modification)
                 .expect("start standard-profile run");
             assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let emits = host.drain_emits().expect("drain standard-profile invoke");
+            let emits = drain_canonical(&host).expect("drain standard-profile invoke");
             let invoke = tool_invoke(&emits, "standard-provider");
             assert_eq!(invoke["args"]["model"], "standard-model");
             assert!(
@@ -969,10 +1051,11 @@ nefor.artifact.compile_graph(contextual)
             );
             host.end_run("profile-clears-options", TeardownReason::Killed)
                 .expect("end standard-profile run");
-            host.drain_emits().expect("drain standard-profile end");
+            drain_canonical(&host).expect("drain standard-profile end");
 
             let modification = compile_mag_source(&host, "missing-profile", direct);
             let snapshot = ExecutionModelSnapshot {
+                compaction_policy: None,
                 provider: "current-provider".to_owned(),
                 model: "current-model".to_owned(),
                 reasoning_effort: None,
@@ -990,7 +1073,7 @@ nefor.artifact.compile_graph(contextual)
                 )
                 .expect("begin missing-profile run");
             assert!(begun.ok);
-            host.drain_emits().expect("drain missing-profile begin");
+            drain_canonical(&host).expect("drain missing-profile begin");
             let outcome = host
                 .start("missing-profile", &modification)
                 .expect("start missing-profile run");
@@ -1026,7 +1109,7 @@ nefor.artifact.compile_graph(contextual)
                 .begin_run("task-source-runtime", "task-source-runtime", None)
                 .expect("begin Task source run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host
                 .start("task-source-runtime", &modification)
                 .expect("start Task source run");
@@ -1087,7 +1170,7 @@ nefor.artifact.compile_graph(operation)
                 let modification = compile_mag_source(&host, run_id, source);
                 let begun = host.begin_run(run_id, run_id, None).expect("begin run");
                 assert!(begun.ok, "begin failed: {:?}", begun.error);
-                host.drain_emits().expect("drain begin event");
+                drain_canonical(&host).expect("drain begin event");
                 let outcome = host.start(run_id, &modification).expect("start run");
                 assert!(outcome.ok, "start failed: {:?}", outcome.error);
                 let completion = host
@@ -1122,7 +1205,7 @@ nefor.artifact.compile_graph(operation)
                 let modification = compile_mag_source(&host, run_id, &source);
                 let begun = host.begin_run(run_id, run_id, None).expect("begin run");
                 assert!(begun.ok, "begin failed: {:?}", begun.error);
-                host.drain_emits().expect("drain begin event");
+                drain_canonical(&host).expect("drain begin event");
                 let outcome = host.start(run_id, &modification).expect("start run");
                 assert!(outcome.ok, "start failed: {:?}", outcome.error);
                 let completion = host
@@ -1188,10 +1271,10 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
             let run_id = "guide-single-command";
             let modification = compile_mag_source(&host, run_id, source);
             assert!(host.begin_run(run_id, run_id, None).unwrap().ok);
-            host.drain_emits().unwrap();
+            drain_canonical(&host).unwrap();
             let started = host.start(run_id, &modification).unwrap();
             assert!(started.ok, "{:?}", started.error);
-            let emits = host.drain_emits().unwrap();
+            let emits = drain_canonical(&host).unwrap();
             assert_eq!(
                 emits
                     .iter()
@@ -1242,10 +1325,10 @@ let operation = nefor.node.then("ordered", nefor.shell.script("dependency", para
                 let host = shipped_host();
                 let modification = compile_mag_source(&host, name, &unit_root_program(definitions));
                 assert!(host.begin_run(name, name, None).unwrap().ok);
-                host.drain_emits().unwrap();
+                drain_canonical(&host).unwrap();
                 let started = host.start(name, &modification).unwrap();
                 assert!(started.ok, "{:?}", started.error);
-                let emits = host.drain_emits().unwrap();
+                let emits = drain_canonical(&host).unwrap();
                 let invocations: Vec<_> = emits
                     .iter()
                     .filter(|event| event["kind"] == "tool.invoke")
@@ -1258,7 +1341,7 @@ let operation = nefor.node.then("ordered", nefor.shell.script("dependency", para
                 );
                 assert!(host.take_run_complete(name).unwrap().is_none());
                 execute_unit_root_command(&host, invoke);
-                let emits = host.drain_emits().unwrap();
+                let emits = drain_canonical(&host).unwrap();
                 if dependent {
                     assert!(host.take_run_complete(name).unwrap().is_none());
                     assert_eq!(
@@ -1300,10 +1383,10 @@ let operation = nefor.node.then("ordered", nefor.shell.script("dependency", para
                 .begin_run(run_id, run_id, None)
                 .expect("begin shell run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host.start(run_id, &modification).expect("start shell run");
             assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            host.drain_emits().expect("drain shell start")
+            drain_canonical(&host).expect("drain shell start")
         }
 
         fn tool_invoke<'a>(
@@ -1431,10 +1514,10 @@ let operation = nefor.node.then("ordered", nefor.shell.script("dependency", para
                 )
                 .expect("begin provenance run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host.start(run_id, &modification).expect("start run");
             assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let emits = host.drain_emits().expect("drain start");
+            let emits = drain_canonical(&host).expect("drain start");
             let invoke = tool_invoke(&emits, "process.exec");
             assert_eq!(
                 invoke["args"]["args"]["argv"],
@@ -1581,7 +1664,7 @@ nefor.artifact.compile_graph(operation)"#
                 )
                 .expect("begin ordinary run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host
                 .start("ordinary-source-node-output", &modification)
                 .expect("start ordinary run");
@@ -1623,7 +1706,7 @@ nefor.artifact.compile_graph(operation)"#
             );
             let run_id = "malformed-typed-output";
             assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host.start(run_id, &modification).expect("start");
             assert!(outcome.ok, "modification remains structurally valid");
             let failure = host
@@ -1663,7 +1746,7 @@ nefor.artifact.compile_graph(operation)"#
                 .begin_run("whole-product-output", "whole-product-output", None)
                 .expect("begin product run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host
                 .start("whole-product-output", &modification)
                 .expect("start product run");
@@ -1715,12 +1798,12 @@ nefor.artifact.compile_graph(operation)"#
                 .begin_run("direct-sum-routing", "direct-sum-routing", None)
                 .expect("begin direct sum run");
             assert!(begun.ok, "begin failed: {:?}", begun.error);
-            host.drain_emits().expect("drain begin event");
+            drain_canonical(&host).expect("drain begin event");
             let outcome = host
                 .start("direct-sum-routing", &modification)
                 .expect("start direct sum run");
             assert!(outcome.ok, "start failed: {:?}", outcome.error);
-            let emits = host.drain_emits().expect("drain direct sum events");
+            let emits = drain_canonical(&host).expect("drain direct sum events");
             assert!(
                 emits.iter().any(|event| {
                     event.get("kind").and_then(JsonValue::as_str) == Some("mag.actor_ready")
@@ -1789,10 +1872,10 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
                 );
                 let modification = compile_mag_source(&host, run_id, &source);
                 assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
-                host.drain_emits().expect("drain begin");
+                drain_canonical(&host).expect("drain begin");
                 let outcome = host.start(run_id, &modification).expect("start");
                 assert!(outcome.ok, "{run_id}: {:?}", outcome.error);
-                host.drain_emits().expect("drain");
+                drain_canonical(&host).expect("drain");
                 let completion = host
                     .take_run_complete(run_id)
                     .expect("take")
@@ -1800,7 +1883,7 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
                 assert_eq!(completion.result.expect("result")["value"], expected);
                 host.end_run(run_id, TeardownReason::RunComplete)
                     .expect("end");
-                host.drain_emits().expect("drain end");
+                drain_canonical(&host).expect("drain end");
             }
         }
 
@@ -1841,10 +1924,10 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
                 );
                 let modification = compile_mag_source(&host, run_id, &source);
                 assert!(host.begin_run(run_id, run_id, None).expect("begin").ok);
-                host.drain_emits().expect("drain begin");
+                drain_canonical(&host).expect("drain begin");
                 let outcome = host.start(run_id, &modification).expect("start");
                 assert!(outcome.ok, "{run_id}: {:?}", outcome.error);
-                let emits = host.drain_emits().expect("drain");
+                let emits = drain_canonical(&host).expect("drain");
                 let completion = host
                     .take_run_complete(run_id)
                     .expect("take")
@@ -1856,7 +1939,7 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
                 assert_eq!(mapper_ran, constructor == "Error");
                 host.end_run(run_id, TeardownReason::RunComplete)
                     .expect("end");
-                host.drain_emits().expect("drain end");
+                drain_canonical(&host).expect("drain end");
             }
         }
 
@@ -1900,7 +1983,7 @@ import nefor.contracts.{}
 import nefor.graph.{}
 type InvestigationInput {prompt: String}
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |selected| => nefor.actors.AuthoredModel.ResolvedModel(selected)
-let configured_model = nefor.actors.ResolvedModel {provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
+let configured_model = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 let start = nefor.graph.source("task", InvestigationInput {prompt: "test"})
 let worker = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: configured_model, system: "Answer.", tools: ([]: List<String>), tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>> >("result")

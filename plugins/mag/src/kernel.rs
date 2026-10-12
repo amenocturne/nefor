@@ -55,6 +55,8 @@ pub struct ExecutionResolvedModel {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<Map<String, JsonValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_policy: Option<JsonValue>,
 }
 
 impl ExecutionResolvedModel {
@@ -70,6 +72,38 @@ impl ExecutionResolvedModel {
                 "{field}.reasoning_effort must be a non-empty string when present"
             ));
         }
+        if let Some(policy) = self
+            .compaction_policy
+            .as_ref()
+            .filter(|value| !value.is_null())
+        {
+            let Some(fields) = policy.as_object() else {
+                return Err(format!(
+                    "{field}.compaction_policy must be a threshold object"
+                ));
+            };
+            let soft = fields.get("soft_percent").and_then(JsonValue::as_f64);
+            let step = fields.get("step_percent").and_then(JsonValue::as_f64);
+            let hard = fields.get("hard_percent").and_then(JsonValue::as_f64);
+            let valid = match (soft, step, hard) {
+                (Some(soft), Some(step), Some(hard)) => {
+                    fields.len() == 3
+                        && soft.is_finite()
+                        && step.is_finite()
+                        && hard.is_finite()
+                        && soft > 0.0
+                        && soft < hard
+                        && hard <= 100.0
+                        && step > 0.0
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(format!(
+                    "{field}.compaction_policy requires finite 0 < soft_percent < hard_percent <= 100 and step_percent > 0"
+                ));
+            }
+        }
         Ok(self)
     }
 }
@@ -83,6 +117,8 @@ pub struct ExecutionModelSnapshot {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<Map<String, JsonValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_policy: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ExecutionResolvedModel>,
 }
@@ -94,6 +130,7 @@ impl ExecutionModelSnapshot {
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             provider_options: self.provider_options.clone(),
+            compaction_policy: self.compaction_policy.clone(),
         }
         .validate("model_snapshot")?;
         for (name, model) in &self.profiles {
@@ -187,7 +224,7 @@ impl LuaHost {
                 return Err(MagError::KernelNotTable {
                     path: path.display().to_string(),
                     got: other.type_name().to_string(),
-                })
+                });
             }
         };
 
@@ -495,7 +532,20 @@ impl LuaHost {
 
     /// Drain everything the kernel emitted since the last drain (bus + lifecycle
     /// events), converting each to an NCP event body. The queue is reset atomically.
+    pub fn canonical_event(
+        &self,
+        source: &str,
+        body: &Map<String, JsonValue>,
+    ) -> Result<Vec<String>, MagError> {
+        let f: Function = self.kernel.get("canonical_event")?;
+        Ok(f.call((source, self.lua.to_value(body)?))?)
+    }
+
     pub fn drain_emits(&self) -> Result<Vec<Map<String, JsonValue>>, MagError> {
+        let pump: Option<Function> = self.kernel.get("pump_commands")?;
+        if let Some(pump) = pump {
+            pump.call::<()>(())?;
+        }
         let queue: Table = self.lua.globals().get(EMIT_QUEUE)?;
         let mut out = Vec::new();
         for item in queue.clone().sequence_values::<Value>() {

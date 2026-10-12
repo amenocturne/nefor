@@ -910,8 +910,8 @@ local function compaction_failure(message, pending)
 end
 
 local function handle_chat_compaction_request(body)
-  if state.pending_compaction ~= nil then
-    compaction_failure("context compaction is already in progress")
+  if state.pending_compaction ~= nil or state.pending_context_request ~= nil then
+    compaction_failure("conversation context operation is already in progress")
     return
   end
   if state.current_run_id ~= nil then
@@ -948,6 +948,32 @@ local function handle_chat_compaction_request(body)
     request.model = run_model_snapshot.model
     request.provider_options = run_model_snapshot.provider_options
   end
+  pending.request = request
+  request_context("manual-compaction")
+end
+
+local function submit_manual_compaction(context)
+  local pending = state.pending_compaction
+  if not pending or not pending.request then return end
+  local request = pending.request
+  local calls, cutoff = {}, 0
+  for index, message in ipairs(context.messages or {}) do
+    for _, call in ipairs(message.tool_calls or {}) do calls[call.id] = true end
+    if message.role == "tool" then calls[message.tool_call_id] = nil end
+    if next(calls) == nil then cutoff = index end
+  end
+  if context.pending_compaction or cutoff == 0 or type(context.policy_state) ~= "table"
+      or context.policy_state.epoch_id == nil or context.watermark == nil or context.history_id == nil then
+    state.pending_compaction = nil
+    compaction_failure("canonical context is unavailable or has no safe compaction prefix", pending)
+    return
+  end
+  request.epoch_id = context.policy_state.epoch_id
+  request.history_id = context.history_id
+  request.context_watermark = context.watermark
+  request.history_cutoff = cutoff
+  request.trigger = "manual"
+  pending.request = nil
   emit("conversation-manager", request)
 end
 
@@ -1550,6 +1576,11 @@ local function handle_conversation_context_snapshot(body)
   if type(pending) ~= "table" or body.request_id ~= pending.id then return end
   state.pending_context_request = nil
   if body.found ~= true or not state.conversation:apply_snapshot(body) then
+    if pending.reason == "manual-compaction" then
+      local compaction = state.pending_compaction
+      state.pending_compaction = nil
+      compaction_failure("conversation context unavailable", compaction)
+    end
     state.context_error = "conversation context unavailable"
     fail_open_requests({ code = "context_unavailable", message = state.context_error })
     emit("nefor-tui", {
@@ -1561,6 +1592,7 @@ local function handle_conversation_context_snapshot(body)
     return
   end
   state.context_error = nil
+  if pending.reason == "manual-compaction" then submit_manual_compaction(body.context) end
   flush_pending_user_inputs()
   flush_deferred()
   request_lifecycle:recheck_all()
@@ -1609,6 +1641,11 @@ local function handle_conversation_query_rejection(body)
   local pending = state.pending_context_request
   if type(pending) ~= "table" or body.request_id ~= pending.id then return end
   state.pending_context_request = nil
+  if pending.reason == "manual-compaction" then
+    local compaction = state.pending_compaction
+    state.pending_compaction = nil
+    compaction_failure(tostring(body.code or "conversation context query rejected"), compaction)
+  end
   state.context_error = tostring(body.code or "conversation context query rejected")
   fail_open_requests({ code = "context_unavailable", message = state.context_error })
   emit("nefor-tui", {

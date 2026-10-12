@@ -16,6 +16,7 @@ local run_tool    = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
 local adapter     = require("factories.adapter")
 local llm         = require("factories.llm")
+local Async = dofile(package.searchpath("kinds", package.path):match("^(.*)/") .. "/../../../../tests/lua/mag-kernel/async_compaction_fixture.lua")
 local model_context = require("model-context")
 local policy = require("libs.model-context-policy")
 
@@ -535,14 +536,17 @@ end
 do
   -- Drive an llm to a tool-calls reply so it emits a real ToolCalls message.
   local lm, lemit = capture()
+  local transport = Async.disabled()
   local linst = llm.construct("dx.llm", {
     provider = "p",
     output_type = "nefor.contracts.TextAnswer",
     error_type = "nefor.contracts.AgentError",
     provider_error_type = "nefor.contracts.ProviderError",
   }, lemit, {
+    compaction = transport.facet,
     conversation = { id = "dx:conversation", turn_id = "dx:turn", emit = function(_) end },
   })
+  transport.wrap(linst)
   linst.deliver({
     shape = "single",
     messages = { { from = "up", tag = "generic-provider.ProviderOut", message = { messages = {} } } },

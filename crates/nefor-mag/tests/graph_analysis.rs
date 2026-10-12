@@ -1130,7 +1130,7 @@ let bound = nefor.result.and_then("bound", result_input, lifted)
 let operator_bound = nefor.result.`>=>`(result_input, lifted)
 let policy = nefor.contracts.ToolApprovalPolicy.Rules(nefor.contracts.ToolApprovalRules {rules: core.map.insert((core.map.empty<String, String>(): Map<String, String>), "bash", "deny")})
 let no_policy = nefor.contracts.ToolApprovalPolicy.Default
-let resolve_model: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
+let resolve_model: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
 let agent = nefor.actors.agent<String, Input, Output>("agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: policy})
 let dynamic_agent = nefor.actors.agent<String, Input, nefor.dynamic.DynamicList<Output>>("dynamic-agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: no_policy})
 let approval = nefor.human.approval_gate("approval", nefor.human.ApprovalConfig {prompt: "Approve?"})
@@ -1240,7 +1240,7 @@ type Record {nested: Nested}
 type RecordAlias = Record
 type DynamicList<T> {value: T}
 
-let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
+let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
 let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}
 let dynamic = nefor.actors.agent<String, Unit, nefor.dynamic.DynamicList<RecordAlias>>("dynamic", resolve, config)
 let lookalike = nefor.actors.agent<String, Unit, DynamicList<Record>>("lookalike", resolve, config)
@@ -1312,7 +1312,7 @@ import nefor.node.{}
 
 type Input {value: String}
 type Output {value: String}
-let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
+let resolve: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
 let config = nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}
 let identity = nefor.dynamic.traverse("identity-traverse", nefor.graph.identity<Input>("identity"))
 let composition = nefor.dynamic.traverse("composition-traverse", nefor.node.compose("composition", nefor.graph.identity<Input>("composition-left"), nefor.graph.identity<Input>("composition-right")))
@@ -1735,7 +1735,7 @@ fn authored_tool_policies_lower_without_changing_agent_configuration() {
     let result = run("policy-alternatives", r#"
 import nefor
 import core.map.{}
-let resolver: fn(String) -> AuthoredModel = |model| => AuthoredModel.ResolvedModel(ResolvedModel {provider: "test", model: model, reasoning_effort: no_reasoning_effort})
+let resolver: fn(String) -> AuthoredModel = |model| => AuthoredModel.ResolvedModel(ResolvedModel {compaction_policy: disabled_compaction, provider: "test", model: model, reasoning_effort: no_reasoning_effort})
 let policies = [ToolApprovalPolicy.Default, ToolApprovalPolicy.Rules(ToolApprovalRules {rules: core.map.insert(core.map.empty<String, String>(), "cargo build", "deny")})]
 let config: fn(ToolApprovalPolicy) -> AgentConfig<String> = |policy| => AgentConfig<String> {model: "test", system: "", tools: [], tool_approval_policy: policy}
 let configs = map(config, policies)
@@ -1812,7 +1812,7 @@ fn nefor_facade_exports_exact_authoring_allowlist() {
             Some(name.to_owned())
         })
         .collect();
-    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
+    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel CompactionPolicy CompactionThresholds disabled_compaction ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
     assert_eq!(actual, expected);
     for name in [
         "Task",
@@ -2122,4 +2122,103 @@ artifact([bounded, Timeout.Unlimited])
             {"constructor": "Unlimited", "value": null}
         ])
     );
+}
+
+#[test]
+fn compaction_policy_propagates_to_ordinary_structured_and_dynamic_agents() {
+    let value = run(
+        "compaction-authoring",
+        r#"
+import nefor
+import nefor.graph.{}
+import core.types.{}
+type Answer {answer: String}
+let thresholds = CompactionThresholds {soft_percent: 60.0, step_percent: 10.0, hard_percent: 90.0}
+let policy = CompactionPolicy.Thresholds(thresholds)
+let resolve: fn(String) -> AuthoredModel = |model| => AuthoredModel.ResolvedModel(ResolvedModel {provider: "p", model: model, reasoning_effort: no_reasoning_effort, compaction_policy: policy})
+let config = AgentConfig<String> {model: "m", system: "", tools: [], tool_approval_policy: ToolApprovalPolicy.Default}
+let ordinary = agent<String, String, TextAnswer>("ordinary", resolve, config)
+let structured = agent<String, String, Answer>("structured", resolve, config)
+let dynamic = agent<String, String, DynamicList<Answer>>("dynamic", resolve, config)
+let relocated = traverse("relocated", ordinary)
+artifact {ordinary: ordinary, structured: structured, dynamic: dynamic, relocated: relocated}
+"#,
+        json!({}),
+    );
+    let policy = json!({"constructor":"Thresholds","value":{"soft_percent":60.0,"step_percent":10.0,"hard_percent":90.0}});
+    for key in ["ordinary", "structured", "dynamic"] {
+        let actors = value[key]["actors"].as_array().unwrap();
+        let model = actors
+            .iter()
+            .find(|actor| actor["id"] == format!("{key}.llm"))
+            .unwrap();
+        assert_eq!(model["params"]["value"]["compaction_policy"], policy);
+        let tools = actors
+            .iter()
+            .find(|actor| actor["id"] == format!("{key}.run-tool"))
+            .unwrap();
+        assert!(tools["params"]["value"].get("compaction_policy").is_none());
+    }
+    fn policies(value: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(policy) = fields.get("compaction_policy") {
+                    found.push(policy.clone());
+                }
+                for value in fields.values() {
+                    policies(value, found);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    policies(value, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut relocated_policies = Vec::new();
+    policies(&value["relocated"], &mut relocated_policies);
+    assert!(!relocated_policies.is_empty());
+    assert!(relocated_policies.iter().all(|actual| actual == &policy));
+}
+
+#[test]
+fn profile_models_lower_disabled_placeholders_with_canonical_policy_identity() {
+    let value = run(
+        "compaction-profile-placeholders",
+        r#"
+import nefor
+import nefor.actors.{}
+import nefor.contracts.{}
+import core.types.{}
+type Answer {answer: String}
+let resolve: fn(String) -> AuthoredModel = |name| => AuthoredModel.ModelProfile(model_profile(name))
+let config = AgentConfig<String> {model: "current", system: "", tools: [], tool_approval_policy: ToolApprovalPolicy.Default}
+let ordinary = agent<String, Unit, TextAnswer>("ordinary", resolve, config)
+let structured = agent<String, Unit, Answer>("structured", resolve, config)
+let dynamic = agent<String, Unit, DynamicList<Answer>>("dynamic", resolve, config)
+let aliases: nefor.contracts.CompactionPolicy = CompactionPolicy.Thresholds(nefor.actors.CompactionThresholds {soft_percent: 60.0, step_percent: 10.0, hard_percent: 90.0})
+artifact {ordinary: ordinary, structured: structured, dynamic: dynamic, aliases: aliases}
+"#,
+        json!({}),
+    );
+    for key in ["ordinary", "structured", "dynamic"] {
+        let actors = value[key]["actors"].as_array().unwrap();
+        let actor = actors
+            .iter()
+            .find(|actor| actor["id"] == format!("{key}.llm"))
+            .unwrap();
+        let params = &actor["params"]["value"];
+        assert_eq!(
+            params["compaction_policy"],
+            json!({"constructor":"Disabled","value":null})
+        );
+        assert_eq!(
+            params["model_profile"],
+            json!({"present":true,"value":"current"})
+        );
+        assert_eq!(params["provider"], "");
+        assert_eq!(params["model"], "");
+    }
 }

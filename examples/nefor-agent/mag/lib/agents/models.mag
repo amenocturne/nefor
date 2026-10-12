@@ -6,4 +6,4 @@ import nefor.actors.{}
 
 type Model = Standard | Mock
 
-let resolve: fn(Model) -> nefor.actors.AuthoredModel = |model| => match model { case Standard => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "chatgpt", model: "gpt-5.6-sol", reasoning_effort: nefor.actors.reasoning_effort("medium")}), case Mock => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}) }
+let resolve: fn(Model) -> nefor.actors.AuthoredModel = |model| => match model { case Standard => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "chatgpt", model: "gpt-5.6-sol", reasoning_effort: nefor.actors.reasoning_effort("medium")}), case Mock => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}) }

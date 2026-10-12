@@ -310,6 +310,35 @@ function M.spawn_spec(name, command, opts)
       return true
     end
 
+    if body.notice_id ~= nil then
+      local notice = context.policy_state and context.policy_state.notices
+        and context.policy_state.notices[body.notice_id]
+      local text
+      for _, message in ipairs(context.messages or {}) do
+        if notice and message.id == notice.message_id then
+          local chunks = {}
+          for _, chunk in ipairs(message.chunks or {}) do
+            if chunk.kind == "text" then chunks[#chunks + 1] = chunk.data end
+          end
+          text = table.concat(chunks)
+        end
+      end
+      local function contains(value)
+        if type(value) == "string" then return text and text ~= "" and value:find(text, 1, true) ~= nil end
+        if type(value) == "table" then
+          for _, item in pairs(value) do if contains(item) then return true end end
+        end
+        return false
+      end
+      local submitted = native.conversation_context
+      local submitted_messages = submitted and (submitted.compaction and submitted.tail_messages or submitted.messages)
+        or native.messages
+      if not notice or notice.epoch_id ~= body.epoch_id or not contains(submitted_messages) then
+        fail_request(body, "notice_not_in_submitted_context", "Canonical notice is absent from submitted model context")
+        return true
+      end
+    end
+
     pending_requests[body.request_id] = {
       conversation_id = body.conversation_id,
       session_generation = session_generation,
@@ -318,6 +347,12 @@ function M.spawn_spec(name, command, opts)
     request_usage_versions[body.request_id] = {}
     for _, rule in ipairs((usage_config and usage_config.contributions) or {}) do
       request_usage_versions[body.request_id][rule.usage_id] = usage_value_versions[rule.usage_id] or 0
+    end
+    if body.notice_id ~= nil then
+      emit_synthetic(name, { kind = "conversation.provider.context_included", provider = name,
+        request_id = body.request_id, conversation_id = body.conversation_id, model = body.model,
+        context_watermark = context.watermark, history_id = clone_table(context.history_id),
+        notice_id = body.notice_id, epoch_id = body.epoch_id })
     end
     local delivered, delivery_error = pcall(translator.deliver, native)
     if not delivered then
@@ -558,90 +593,232 @@ function M.spawn_spec(name, command, opts)
     end
   end
 
-  local function publish_compaction_failed(change, failure)
+  local settled_compactions, cleanup_resources = {}, {}
+  local function adapter_capability(provider, model, options)
+    local ok, capability = pcall(translator.compaction_capability, provider, model, options)
+    if not ok then
+      return nil, error_value.normalize(capability, "compaction_capability_failed", "Adapter capability evaluation failed")
+    end
+    if type(capability) ~= "table" or (capability.kind ~= "supported"
+        and capability.kind ~= "unsupported" and capability.kind ~= "unknown") then
+      return nil, { code = "compaction_capability_invalid", message = "Adapter returned an invalid capability" }
+    end
+    return capability
+  end
+  local function cleanup_failed(pending, failure)
+    cleanup_resources[pending.plan.chat_id] = nil
+    emit_synthetic(name, { kind = "conversation.context.compact.cleanup_failed",
+      request_id = pending.request.request_id, conversation_id = pending.request.conversation_id,
+      resource_id = pending.plan.chat_id,
+      error = error_value.normalize(failure, "compaction_cleanup_failed",
+        "Temporary compaction resource could not be released") })
+  end
+  local function publish_compaction_failed(request, failure)
+    local normalized = error_value.normalize(failure, "provider_compaction_failed", "context compaction failed")
+    if type(failure) == "table" then normalized.outcome = failure.outcome end
     emit_synthetic(name, {
       kind = "conversation.context.compact.failed",
-      request_id = change.compaction and change.compaction.request_id,
-      conversation_id = change.conversation_id,
-      error = error_value.normalize(failure, "provider_compaction_failed",
-        "context compaction failed"),
+      request_id = request.request_id, conversation_id = request.conversation_id,
+      epoch_id = request.epoch_id, history_id = clone_table(request.history_id),
+      provider = request.provider, model = request.model,
+      error = normalized,
     })
   end
 
+  local function release_compaction(pending, cancel)
+    pending.cancelled = cancel
+    cleanup_resources[pending.plan.chat_id] = pending
+    local ok, failure = pcall(function()
+      if cancel then
+        for _, body in ipairs(translator.cancel_compaction(pending.plan, pending.request.request_id) or {}) do
+          translator.deliver(body)
+        end
+      end
+    end)
+    local cleaned, cleanup_error = pcall(function()
+      for _, body in ipairs(translator.cleanup_compaction(pending.plan, pending.request.request_id) or {}) do
+        translator.deliver(body)
+      end
+    end)
+    if not ok or not cleaned then
+      cleanup_failed(pending, not cleaned and cleanup_error or failure)
+    end
+  end
+
+  local function settle_failed(chat_id, failure, cancel)
+    local pending = pending_compactions[chat_id]
+    if not pending then return end
+    pending_compactions[chat_id] = nil
+    settled_compactions[pending.request.request_id] = true
+    publish_compaction_failed(pending.request, failure)
+    release_compaction(pending, cancel)
+  end
+
   local function begin_compaction(change)
-    local selected_provider = change.provider
-      or (type(change.compaction) == "table" and change.compaction.provider)
-    if selected_provider ~= name then return true end
-    local context = read_context(change.conversation_id)
-    if not context then
-      publish_compaction_failed(change, "conversation context is unavailable")
+    -- The manager supplies an accepted immutable prefix. Never read current
+    -- history here: sibling tool results may already have extended the tail.
+    local input = change.input or { request = change.request or change.compaction, context = change.context }
+    local request = clone_table(input.request or {})
+    request.conversation_id = request.conversation_id or change.conversation_id
+    request.provider = request.provider or change.provider
+    request.model = request.model or change.model
+    if request.provider ~= name then return true end
+    if settled_compactions[request.request_id] then return true end
+    for _, pending in pairs(pending_compactions) do
+      if pending.request.request_id == request.request_id then return true end
+    end
+    local capability, capability_error = adapter_capability(request.provider, request.model, request.provider_options)
+    if not capability then
+      settled_compactions[request.request_id] = true
+      publish_compaction_failed(request, capability_error)
       return true
     end
-    local lowered = clone_table(change)
-    lowered.context = context
-    local lowered_ok, plan, message = pcall(translator.compact_context, lowered)
+    if capability.kind ~= "supported" then
+      settled_compactions[request.request_id] = true
+      publish_compaction_failed(request, { code = capability.kind == "unsupported" and "compaction_unsupported" or "compaction_capability_unknown", message = capability.reason })
+      return true
+    end
+    if type(input.context) ~= "table" then
+      settled_compactions[request.request_id] = true
+      publish_compaction_failed(request, { code = "compaction_context_missing",
+        message = "Accepted compaction requires frozen canonical context" })
+      return true
+    end
+    local lowered_ok, plan, failure = pcall(translator.compact_context,
+      { request = request, context = clone_table(input.context) })
     if not lowered_ok or not plan then
-      publish_compaction_failed(change, lowered_ok
-        and (message or "context compaction is unsupported") or plan)
+      settled_compactions[request.request_id] = true
+      publish_compaction_failed(request, lowered_ok and failure or plan)
       return true
     end
-    pending_compactions[plan.chat_id] = {
-      request_id = change.compaction.request_id,
-      conversation_id = change.conversation_id,
-      delete = plan.delete,
-    }
+    if type(plan.chat_id) ~= "string" or plan.chat_id == "" or pending_compactions[plan.chat_id] then
+      settled_compactions[request.request_id] = true
+      publish_compaction_failed(request, { code = "compaction_plan_invalid", message = "Temporary chat identity is invalid" })
+      return true
+    end
+    pending_compactions[plan.chat_id] = { request = request, plan = plan,
+      request_id = request.request_id, conversation_id = request.conversation_id }
     local delivered, delivery_error = pcall(function()
       translator.deliver(plan.create)
       if plan.restore then translator.deliver(plan.restore) end
-      for _, message_body in ipairs(plan.messages or {}) do
-        translator.deliver({
-          kind = kinds.chat_append,
-          chat_id = plan.chat_id,
-          message = clone_table(message_body),
-        })
+      for _, message in ipairs(plan.messages or {}) do
+        translator.deliver({ kind = kinds.chat_append, chat_id = plan.chat_id, message = clone_table(message) })
       end
       translator.deliver(plan.compact)
     end)
-    if not delivered then
-      pending_compactions[plan.chat_id] = nil
-      publish_compaction_failed(change, delivery_error)
-    end
+    if not delivered then settle_failed(plan.chat_id, delivery_error, true) end
     return true
   end
 
   local function finish_compaction(body)
     local pending = type(body.chat_id) == "string" and pending_compactions[body.chat_id] or nil
     if not pending then return false end
-    pending_compactions[body.chat_id] = nil
-    if pending.delete then translator.deliver(pending.delete) end
-    if body.kind == kinds.chat_compaction_commit then
-      local checkpoint = {
-        provider = name,
-        format = "chatgpt.responses.compaction.v1",
-        model = body.model,
-        artifact = clone_table(body.model_context_artifact),
-      }
-      emit_synthetic(name, {
-        kind = "conversation.context.compact.complete",
-        request_id = pending.request_id,
-        conversation_id = pending.conversation_id,
-        checkpoint = checkpoint,
-        compatibility = {
-          provider = name,
-          format = checkpoint.format,
-          model = checkpoint.model,
-        },
-      })
-    else
-      emit_synthetic(name, {
-        kind = "conversation.context.compact.failed",
-        request_id = pending.request_id,
-        conversation_id = pending.conversation_id,
-        error = error_value.normalize(body.error or body.message,
-          "provider_compaction_failed", "context compaction failed"),
-      })
+    -- Native wire uses a unique temporary chat identity, not a request ID.
+    if body.request_id ~= nil and body.request_id ~= pending.request.request_id then return false end
+    local ok, outcome = pcall(translator.compaction_outcome, clone_table(body), pending.request)
+    if not ok then settle_failed(body.chat_id, outcome, false); return true end
+    if type(outcome) ~= "table" or outcome.request_id ~= pending.request.request_id
+        or outcome.conversation_id ~= pending.request.conversation_id then
+      settle_failed(body.chat_id, { code = "compaction_outcome_invalid", message = "Adapter outcome correlation mismatch" }, false)
+      return true
     end
+    if outcome.kind ~= "completed" then
+      settle_failed(body.chat_id, outcome.error, false)
+      return true
+    end
+    local checkpoint, compatibility = outcome.checkpoint, outcome.compatibility
+    local compatible_ok, compatible = pcall(function()
+      return type(compatibility) == "table" and type(checkpoint) == "table"
+        and compatibility.provider == pending.request.provider and compatibility.model == pending.request.model
+        and checkpoint.provider == pending.request.provider and checkpoint.model == pending.request.model
+        and type(checkpoint.format) == "string" and checkpoint.format ~= ""
+        and compatibility.format == checkpoint.format
+        and translator.checkpoint_compatible(checkpoint, pending.request.provider,
+          pending.request.model, pending.request.provider_options)
+    end)
+    if not compatible_ok or not compatible then
+      settle_failed(body.chat_id, { code = "compaction_checkpoint_invalid", message = "Adapter checkpoint is incompatible" }, false)
+      return true
+    end
+    pending_compactions[body.chat_id] = nil
+    settled_compactions[pending.request.request_id] = true
+    outcome.epoch_id = pending.request.epoch_id
+    outcome.history_id = clone_table(pending.request.history_id)
+    outcome.provider, outcome.model = pending.request.provider, pending.request.model
+    outcome.kind = "conversation.context.compact.complete"
+    emit_synthetic(name, outcome)
+    -- Canonical settlement is emitted first; resource cleanup cannot turn a
+    -- completed checkpoint into failure or hide it behind a delivery exception.
+    release_compaction(pending, false)
     return true
+  end
+
+  local catalog, catalog_known, preparation_waiters = {}, false, {}
+  local preparation_serial = 0
+  local function prepare_compaction(input)
+    if input.provider ~= name then
+      return { kind = "Error", error = { code = "compaction_provider_mismatch", message = "Provider does not match adapter" } }
+    end
+    local capability, failure = adapter_capability(name, input.model, input.provider_options)
+    if not capability then return { kind = "Error", error = failure } end
+    local enabled = input.policy ~= nil and input.policy ~= nefor.json.null
+      and not (type(input.policy) == "table" and input.policy.kind == "Disabled")
+    if enabled and capability.kind ~= "supported" then
+      return { kind = "Error", error = { code = capability.kind == "unsupported" and "compaction_unsupported" or "compaction_capability_unknown", message = capability.reason } }
+    end
+    local window = catalog[input.model]
+    if not enabled or window ~= nil then
+      return { kind = "Ready", regular_window = window, capability = capability }
+    end
+    if catalog_known then
+      return { kind = "Error", error = { code = "compaction_capacity_missing",
+        message = "Regular context window is unavailable for selected model" } }
+    end
+    local key = input.request_id or input.model
+    if not preparation_waiters[key] then
+      preparation_serial = preparation_serial + 1
+      preparation_waiters[key] = { request_id = input.request_id or (name .. ":compaction-prepare:" .. preparation_serial),
+        input = clone_table(input) }
+      local first = true
+      for waiter_key in pairs(preparation_waiters) do if waiter_key ~= key then first = false end end
+      local ok, failure = true, nil
+      if first then ok, failure = pcall(translator.deliver, { kind = kinds.models_list_requested }) end
+      if not ok then
+        preparation_waiters[key] = nil
+        return { kind = "Error", error = error_value.normalize(failure, "compaction_catalog_failed", "Catalog delivery failed") }
+      end
+    end
+    return { kind = "Waiting", request_id = preparation_waiters[key].request_id }
+  end
+
+  local function fail_preparation(failure)
+    local waiting = preparation_waiters
+    preparation_waiters = {}
+    for _, waiter in pairs(waiting) do
+      emit_synthetic(name, { kind = "conversation.compaction.prepared", provider = name,
+        request_id = waiter.request_id, outcome = { kind = "Error",
+          error = error_value.normalize(failure, "compaction_catalog_failed", "Catalog preparation failed") } })
+    end
+  end
+
+  local function observe_catalog(body)
+    catalog, catalog_known = {}, true
+    for model, window in pairs(body.context_windows or {}) do
+      if type(window) == "number" and window > 0 and window < math.huge then catalog[model] = window end
+    end
+    local capabilities = {}
+    for _, model in ipairs(body.models or {}) do
+      local capability, failure = adapter_capability(name, model)
+      capabilities[model] = capability or { kind = "Error", error = failure }
+    end
+    emit_synthetic(name, { kind = "conversation.compaction.catalog", provider = name,
+      context_windows = clone_table(catalog), capabilities = capabilities })
+    local waiting = preparation_waiters
+    preparation_waiters = {}
+    for _, waiter in pairs(waiting) do
+      emit_synthetic(name, { kind = "conversation.compaction.prepared", provider = name,
+        request_id = waiter.request_id, outcome = prepare_compaction(waiter.input) })
+    end
   end
 
   -- from_plugin (binary → bus) — provider lifecycle/usage handling followed
@@ -664,6 +841,23 @@ function M.spawn_spec(name, command, opts)
 
       if type(env.body) == "table" then
         local body = env.body
+        if body.kind == kinds.models_listed then observe_catalog(body) end
+        if body.kind == kinds.turn_error and body.chat_id == nil and pending_model_set == nil then
+          fail_preparation(body.error or body.message)
+        end
+        if cleanup_resources[body.chat_id] then
+          if body.kind == name .. ".chat.deleted" then
+            cleanup_resources[body.chat_id] = nil
+            goto continue
+          elseif body.kind == kinds.chat_error or body.kind == kinds.turn_error then
+            -- A cancelled compactor may still emit its interrupted terminal
+            -- while delete is in flight. That is not a cleanup rejection.
+            if not cleanup_resources[body.chat_id].cancelled then
+              cleanup_failed(cleanup_resources[body.chat_id], body.error or body.message)
+            end
+            goto continue
+          end
+        end
         if body.kind == kinds.chat_compaction_commit then
           finish_compaction(body)
           goto continue
@@ -791,7 +985,14 @@ function M.spawn_spec(name, command, opts)
         end
       else
         local body = env.body
-        if type(body) == "table" and ((kind == "ncp.delivery_failed" and body.peer == name)
+        if kind == "conversation.compaction.prepare.request" and body.provider == name then
+          local outcome = prepare_compaction(body)
+          if outcome.kind ~= "Waiting" then
+            emit_synthetic(name, { kind = "conversation.compaction.prepared", provider = name,
+              request_id = body.request_id, outcome = outcome })
+          end
+          goto continue
+        elseif type(body) == "table" and ((kind == "ncp.delivery_failed" and body.peer == name)
             or ((kind == "engine.plugin_transport_failed" or kind == "engine.plugin_delivery_lost")
               and body.plugin == name)) then
           local ids, compactions, model, identified, incomplete = {}, {}, false, false, false
@@ -800,6 +1001,10 @@ function M.spawn_spec(name, command, opts)
               if correlation.chat_id then
                 identified = true
                 if pending_compactions[correlation.chat_id] then compactions[correlation.chat_id] = true end
+              end
+              if correlation.kind == kinds.models_list_requested then
+                identified = true
+                fail_preparation({ code = "compaction_catalog_failed", message = "Catalog request delivery failed" })
               end
               if correlation.kind == kinds.model_set then
                 identified = true
@@ -812,20 +1017,26 @@ function M.spawn_spec(name, command, opts)
               end
             end
           end
+          for _, correlation in ipairs(body.correlations or {}) do
+            local resource = cleanup_resources[correlation.chat_id]
+            if resource then cleanup_failed(resource, { code = "compaction_cleanup_failed", message = "Cleanup delivery failed" }) end
+          end
           local unknown = not identified or incomplete
             or (type(body.count) == "number" and body.count > #(body.correlations or {}))
           if unknown then
+            fail_preparation({ code = "compaction_catalog_failed", message = "Provider transport lost during catalog preparation" })
+            local resources = cleanup_resources
+            cleanup_resources = {}
+            for _, resource in pairs(resources) do
+              cleanup_failed(resource, { code = "compaction_cleanup_failed", message = "Provider transport lost during cleanup" })
+            end
             for id in pairs(pending_requests) do ids[id] = true end
             for id in pairs(pending_compactions) do compactions[id] = true end
             model = true
           end
           for id in pairs(compactions) do
-            local pending = pending_compactions[id]
-            pending_compactions[id] = nil
-            emit_synthetic(name, { kind = "conversation.context.compact.failed",
-              request_id = pending.request_id, conversation_id = pending.conversation_id,
-              error = { code = "provider_delivery_failed", outcome = "unknown",
-                message = "Provider compaction delivery failed; prior effects are unknown" } })
+            settle_failed(id, { code = "provider_delivery_failed", outcome = "unknown",
+              message = "Provider compaction delivery failed; prior effects are unknown" }, true)
           end
           if model and pending_model_set then
             local pending = pending_model_set
@@ -850,6 +1061,12 @@ function M.spawn_spec(name, command, opts)
           provider_tools.advertise(tool_gate)
         end
         if type(env.body) == "table" and env.body.kind == "sessions.session_start" then
+          fail_preparation({ code = "compaction_session_changed", message = "Session changed during preparation" })
+          local chats = {}
+          for chat_id in pairs(pending_compactions) do chats[#chats + 1] = chat_id end
+          for _, chat_id in ipairs(chats) do
+            settle_failed(chat_id, { code = "compaction_session_changed", message = "Session changed during compaction" }, true)
+          end
           session_generation = session_generation + 1
           pending_requests = {}
           usage_contributions = {}
@@ -911,6 +1128,30 @@ function M.spawn_spec(name, command, opts)
           end
           publish_usage_values(env.body.subscription_id, values)
           request_native_usage()
+          goto continue
+        end
+        if type(body) == "table" and (body.kind == "conversation.context.compact.cancelled"
+            or (body.kind == "conversation.projection.delta" and type(body.change) == "table"
+              and body.change.kind == "context_compaction_failed")) then
+          local request_id = body.request_id or body.change.request_id
+          for chat_id, pending in pairs(pending_compactions) do
+            if pending.request.request_id == request_id and pending.request.conversation_id == body.conversation_id then
+              pending_compactions[chat_id] = nil
+              settled_compactions[request_id] = true
+              release_compaction(pending, true)
+              break
+            end
+          end
+          goto continue
+        end
+        if type(body) == "table" and body.kind == "conversation.context.compact.cancel" then
+          for chat_id, pending in pairs(pending_compactions) do
+            if pending.request.request_id == body.request_id
+                and pending.request.conversation_id == body.conversation_id then
+              settle_failed(chat_id, { code = "compaction_interrupted", message = body.reason or "Compaction interrupted" }, true)
+              break
+            end
+          end
           goto continue
         end
         if type(env.body) == "table" and env.body.kind == "conversation.provider.invoke" then
@@ -1012,6 +1253,11 @@ function M.spawn_spec(name, command, opts)
         to_plugin({ env })
       end
     end,
+    compaction = {
+      prepare = prepare_compaction,
+      capability = translator.compaction_capability,
+      checkpoint_compatible = translator.checkpoint_compatible,
+    },
     _internals = {
       pending_requests = function() return pending_requests end,
       usage_value = function(usage_id) return copy_usage(usage_values[usage_id]) end,

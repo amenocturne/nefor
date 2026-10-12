@@ -274,6 +274,56 @@ actors resolve only against the map owned by their run; missing profiles fail
 construction before provider invocation, and actors added later inherit the
 same snapshot. Ordinary actors continue to use the snapshot's current model.
 
+Compaction policy is orchestration metadata, not a provider request option.
+`nefor.contracts` owns `CompactionPolicy` and `CompactionThresholds`; the public
+facade and actor module expose aliases of those same nominal types. Fixed
+`ResolvedModel` and `ModelSettings` values require an explicit policy, including
+`disabled_compaction`. Profile selectors carry a Disabled placeholder until lazy
+construction resolves the run-owned profile. A Lua snapshot uses an absent/null
+`compaction_policy` for Disabled, or a closed object containing `soft_percent`,
+`step_percent`, and `hard_percent`. The parser validates and separately copies
+root and profile policies. A root conversation uses the snapshot's root policy,
+not its selected worker profile's policy.
+
+### Canonical compaction and asynchronous provider requests
+
+Every MAG provider request, including Disabled-policy actors, waits for canonical
+receipts for its preceding conversation writes. A run-scoped broker tracks each
+emitted write and its accepted/rejected receipt, prepares the provider capability,
+and reads manager-owned context at the required watermark. It is a transport
+ledger, not another transcript. Replies are accepted only from the canonical
+manager or the matching provider edge; reads and continuations are deferred.
+
+Enabled policy uses the latest applicable successful completed-response TOTAL
+measurement divided by the advertised **regular** window, with exact unrounded
+comparisons. Missing capacity fails preparation rather than inventing a limit.
+Soft milestones coalesce to the highest crossed milestone. A notice becomes
+eligible evidence only after its canonical append, inclusion in the actual
+submitted context, and successful native response have been acknowledged in the
+same epoch/history/provider/model binding. A successful nonterminal native round
+can establish delivery even without usage; a later error does not erase that
+evidence. A hard threshold has priority over soft notices.
+
+`self_compact` is always advertised with an empty argument object. Without
+accepted delivery evidence it returns a deterministic diagnostic. Multiple
+eligible self calls coalesce into one operation; ordinary siblings go through the
+normal gate and settle first. A batch containing both self-compaction and
+`submit_output` is rejected before any draft edit or ordinary tool effect.
+Compaction freezes a safe prefix before the assistant tool batch; matched calls
+and results remain together in the tail.
+
+Conversation-manager records admission and terminal facts. Admission is not
+completion: a continuation waits for the matching recorded completion/failure
+and a fresh canonical read. Only a completed commit replaces the opaque context
+checkpoint and advances the epoch; failure preserves measurement and eligibility.
+The compositor delegates to a replaceable capability/operation adapter and owns
+its temporary resource cleanup, not the artifact's contents. Manual `/compact`
+queries fresh canonical context and binds the same epoch, history, watermark and
+safe cutoff before admission. Cancellation, actor teardown and session changes
+detach pending callbacks, settle/cancel owned operations, and ignore late native
+results. Replay restores canonical facts without provider effects; a pending
+operation requires explicit recovery rather than an automatic restart.
+
 Route enforcement is deliberately out of scope: the composition targets a
 selection at a provider actor, and that actor decides what it will serve. Nefor
 does not template per-model endpoints or carry routing metadata that would let

@@ -46,8 +46,17 @@ use std::time::Duration;
 
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody, Timestamp};
 use serde_json::{json, Map, Value};
+use tokio::io::DuplexStream as ChildStdin;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::Child;
+
+#[path = "support/canonical_conversation.rs"]
+mod canonical_conversation;
+// Fact-round collection is used by lead_turn; acceptance observes raw events.
+#[allow(dead_code)]
+#[path = "support/regression_conversation_process.rs"]
+mod regression_conversation_process;
+use regression_conversation_process::ProcessReader;
 use tokio::time::timeout;
 
 fn binary_path() -> PathBuf {
@@ -84,10 +93,7 @@ async fn spawn_mag(data_dir: &std::path::Path) -> Child {
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn read_outgoing<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    expecting: &str,
-) -> PluginOutgoing {
+async fn read_outgoing(reader: &mut ProcessReader, expecting: &str) -> PluginOutgoing {
     let mut line = String::new();
     match timeout(READ_TIMEOUT, reader.read_line(&mut line)).await {
         Ok(Ok(0)) => panic!("mag stdout closed while expecting {expecting}"),
@@ -408,9 +414,8 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     };
 
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let (mut stdin, mut reader) =
+        regression_conversation_process::attach(&mut child, "chatgpt-provider", None);
 
     let stderr = child.stderr.take().expect("stderr");
     tokio::spawn(async move {
@@ -892,8 +897,8 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [
     )
 }
 
-async fn load_worktree_program<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn load_worktree_program(
+    reader: &mut ProcessReader,
     stdin: &mut ChildStdin,
     id: &str,
     source_dir: &std::path::Path,
@@ -932,8 +937,8 @@ async fn load_worktree_program<R: AsyncBufReadExt + Unpin>(
     }
 }
 
-async fn build_twice<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn build_twice(
+    reader: &mut ProcessReader,
     stdin: &mut ChildStdin,
     source: &std::path::Path,
     entry: &str,
@@ -975,8 +980,8 @@ async fn build_twice<R: AsyncBufReadExt + Unpin>(
     retained.unwrap().0
 }
 
-async fn execute_worktree_program<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn execute_worktree_program(
+    reader: &mut ProcessReader,
     stdin: &mut ChildStdin,
     id: &str,
     artifact: Value,
@@ -1064,8 +1069,8 @@ async fn canonical_chat_approval_delta_crosses_the_typed_plugin_boundary() {
         .expect("write approval program");
 
     let mut child = spawn_mag(root.path()).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let (mut stdin, mut reader) =
+        regression_conversation_process::attach(&mut child, "chatgpt-provider", None);
     let stderr = child.stderr.take().expect("stderr");
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
@@ -1356,8 +1361,8 @@ async fn worktree_create_persists_opens_and_rejects_implicit_reuse() {
     .expect("open program");
 
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let (mut stdin, mut reader) =
+        regression_conversation_process::attach(&mut child, "chatgpt-provider", None);
     let ready = read_outgoing(&mut reader, "system ready").await;
     assert!(matches!(ready.body, Body::System(SystemBody::Ready { .. })));
     write_env(
@@ -1482,8 +1487,8 @@ async fn project_build_process_restart_hit_and_cold_load_equivalence() {
     for status in ["miss", "hit"] {
         let data = tempfile::tempdir().unwrap();
         let mut child = spawn_mag(data.path()).await;
-        let mut stdin = child.stdin.take().unwrap();
-        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let (mut stdin, mut reader) =
+            regression_conversation_process::attach(&mut child, "chatgpt-provider", None);
         assert!(matches!(
             read_outgoing(&mut reader, "ready").await.body,
             Body::System(SystemBody::Ready { .. })

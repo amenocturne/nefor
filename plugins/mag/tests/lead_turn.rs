@@ -29,8 +29,15 @@ use std::time::Duration;
 use nefor_mag::json::concrete_type_from_json;
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody, Timestamp};
 use serde_json::{json, Map, Value};
+use tokio::io::DuplexStream as ChildStdin;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::Child;
+
+#[path = "support/canonical_conversation.rs"]
+mod canonical_conversation;
+#[path = "support/regression_conversation_process.rs"]
+mod regression_conversation_process;
+use regression_conversation_process::ProcessReader;
 use tokio::time::timeout;
 
 const PROVIDER: &str = "test-provider";
@@ -132,23 +139,25 @@ async fn spawn_mag(data_dir: &std::path::Path) -> Child {
     child
 }
 
-async fn read_outgoing<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    expecting: &str,
-) -> PluginOutgoing {
+async fn read_outgoing(reader: &mut ProcessReader, expecting: &str) -> PluginOutgoing {
     let mut line = String::new();
     match timeout(READ_TIMEOUT, reader.read_line(&mut line)).await {
         Ok(Ok(0)) => panic!("mag stdout closed while expecting {expecting}"),
-        Ok(Ok(_)) => PluginOutgoing::parse_line(line.trim_end()).expect("parse outgoing"),
+        Ok(Ok(_)) => {
+            let outgoing = PluginOutgoing::parse_line(line.trim_end()).expect("parse outgoing");
+            if let Body::Event(body) = &outgoing.body {
+                if body.get("kind").and_then(Value::as_str) == Some("conversation.fact.append") {
+                    reader.facts.push(body["fact"].clone());
+                }
+            }
+            outgoing
+        }
         Ok(Err(e)) => panic!("read mag stdout while expecting {expecting}: {e}"),
         Err(_) => panic!("timed out waiting for mag output while expecting {expecting}"),
     }
 }
 
-async fn next_event<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    expecting: &str,
-) -> Map<String, Value> {
+async fn next_event(reader: &mut ProcessReader, expecting: &str) -> Map<String, Value> {
     loop {
         let out = read_outgoing(reader, expecting).await;
         if let Body::Event(map) = out.body {
@@ -159,10 +168,7 @@ async fn next_event<R: AsyncBufReadExt + Unpin>(
 
 /// Read events until one of kind `kind` arrives; returns it. Other events
 /// (lifecycle noise) are skipped.
-async fn next_event_of_kind<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    kind: &str,
-) -> Map<String, Value> {
+async fn next_event_of_kind(reader: &mut ProcessReader, kind: &str) -> Map<String, Value> {
     loop {
         let body = next_event(reader, kind).await;
         if body.get("kind").and_then(Value::as_str) == Some(kind) {
@@ -198,7 +204,7 @@ async fn send_event(stdin: &mut ChildStdin, body: Map<String, Value>) {
     write_env(stdin, Envelope::event(source, Timestamp::now(), body)).await;
 }
 
-async fn handshake<R: AsyncBufReadExt + Unpin>(reader: &mut R, stdin: &mut ChildStdin) {
+async fn handshake(reader: &mut ProcessReader, stdin: &mut ChildStdin) {
     let ready = read_outgoing(reader, "system ready").await;
     assert!(matches!(ready.body, Body::System(SystemBody::Ready { .. })));
     write_env(
@@ -252,19 +258,19 @@ fn assert_thin_provider_request(request: &Map<String, Value>, provider: &str) {
     }
 }
 
-async fn next_provider_request_with_facts<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn next_provider_request_with_facts(
+    reader: &mut ProcessReader,
     provider: &str,
 ) -> (Map<String, Value>, Vec<Value>) {
-    let mut facts = Vec::new();
     loop {
         let body = next_event(reader, "conversation.provider.invoke.request").await;
         match body.get("kind").and_then(Value::as_str) {
             Some("conversation.fact.append") => {
-                facts.push(body.get("fact").cloned().expect("append carries fact"));
+                // read_outgoing retains facts across interleaved actor requests.
             }
             Some("conversation.provider.invoke.request") => {
                 assert_thin_provider_request(&body, provider);
+                let facts = reader.facts_for(&body);
                 return (body, facts);
             }
             Some("mag.error" | "mag.run_failed") => {
@@ -280,10 +286,7 @@ async fn next_provider_request_with_facts<R: AsyncBufReadExt + Unpin>(
     }
 }
 
-async fn next_provider_request<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    provider: &str,
-) -> Map<String, Value> {
+async fn next_provider_request(reader: &mut ProcessReader, provider: &str) -> Map<String, Value> {
     next_provider_request_with_facts(reader, provider).await.0
 }
 
@@ -292,10 +295,7 @@ fn facts_json(facts: &[Value]) -> String {
 }
 
 /// Load the shipped lead turn-program and return its compiled artifact.
-async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    stdin: &mut ChildStdin,
-) -> Value {
+async fn load_lead_program(reader: &mut ProcessReader, stdin: &mut ChildStdin) -> Value {
     send_event(
         stdin,
         obj(json!({
@@ -406,10 +406,7 @@ fn completed(provider: &str, request_id: &str, fields: Value) -> Map<String, Val
     body
 }
 
-async fn load_typed_task_program<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-    stdin: &mut ChildStdin,
-) -> Value {
+async fn load_typed_task_program(reader: &mut ProcessReader, stdin: &mut ChildStdin) -> Value {
     send_event(
         stdin,
         obj(json!({
@@ -435,8 +432,11 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     std::fs::remove_dir_all(&data_dir).ok();
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
 
     let artifact = load_typed_task_program(&mut reader, &mut stdin).await;
@@ -555,8 +555,11 @@ async fn whole_agent_error_union_can_drive_a_recovery_agent() {
     std::fs::remove_dir_all(&data_dir).ok();
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
 
     send_event(
@@ -631,11 +634,16 @@ fn assert_output_tools(request: &Map<String, Value>) {
 }
 
 fn output_write(text: &str, validate: bool) -> Value {
-    json!({"tool_calls": [{"id": "draft-write", "name": "write_output", "args": {"new_string": text, "validate": validate}}]})
+    static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = format!(
+        "draft-write-{}",
+        NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    json!({"tool_calls": [{"id": id, "name": "write_output", "args": {"new_string": text, "validate": validate}}]})
 }
 
-async fn complete_chat<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn complete_chat(
+    reader: &mut ProcessReader,
     stdin: &mut ChildStdin,
     request_id: &str,
     text: &str,
@@ -673,8 +681,8 @@ async fn complete_chat<R: AsyncBufReadExt + Unpin>(
     .await;
 }
 
-async fn complete_chat_recording<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn complete_chat_recording(
+    reader: &mut ProcessReader,
     stdin: &mut ChildStdin,
     request_id: &str,
     text: &str,
@@ -868,8 +876,8 @@ fn assert_dynamic_program_envelope(artifact: &Value) {
     assert!(operation.get("bytecode").is_none());
 }
 
-async fn load_dynamic_program<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn load_dynamic_program(
+    reader: &mut ProcessReader,
     stdin: &mut ChildStdin,
     load_id: &str,
 ) -> Map<String, Value> {
@@ -933,13 +941,12 @@ fn structured_input<'a>(facts: &'a [Value], actor_id: &str) -> &'a Value {
         .expect("actor receives one structured input record")
 }
 
-async fn next_provider_request_recording<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn next_provider_request_recording(
+    reader: &mut ProcessReader,
     provider: &str,
     trace: &mut Vec<String>,
     events: &mut Vec<Value>,
 ) -> (Map<String, Value>, Vec<Value>) {
-    let mut facts = Vec::new();
     loop {
         let body = next_event(reader, "conversation.provider.invoke.request").await;
         events.push(Value::Object(body.clone()));
@@ -951,10 +958,11 @@ async fn next_provider_request_recording<R: AsyncBufReadExt + Unpin>(
         trace.push(kind.clone());
         match kind.as_str() {
             "conversation.fact.append" => {
-                facts.push(body.get("fact").cloned().expect("append carries fact"));
+                // read_outgoing retains facts across interleaved actor requests.
             }
             "conversation.provider.invoke.request" => {
                 assert_thin_provider_request(&body, provider);
+                let facts = reader.facts_for(&body);
                 return (body, facts);
             }
             "mag.error" | "mag.run_failed" => {
@@ -968,8 +976,8 @@ async fn next_provider_request_recording<R: AsyncBufReadExt + Unpin>(
     }
 }
 
-async fn next_event_of_kind_recording<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
+async fn next_event_of_kind_recording(
+    reader: &mut ProcessReader,
     kind: &str,
     trace: &mut Vec<String>,
     events: &mut Vec<Value>,
@@ -1097,8 +1105,11 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     std::fs::remove_dir_all(&data_dir).ok();
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
     let assert_snapshot = |request: &Map<String, Value>| {
         assert_eq!(
@@ -1337,8 +1348,11 @@ async fn dynamic_tasks_zero_uses_empty_collection_identity_and_reaches_summarize
     std::fs::remove_dir_all(&data_dir).ok();
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
     let loaded = load_dynamic_program(&mut reader, &mut stdin, "zero-load").await;
     send_event(
@@ -1413,8 +1427,11 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
     std::fs::remove_dir_all(&data_dir).ok();
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
     let loaded = load_dynamic_program(&mut reader, &mut stdin, "one-load").await;
     let artifact = loaded["artifact"].clone();
@@ -1495,9 +1512,11 @@ async fn retained_dynamic_program_survives_source_disposal_and_process_restart()
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
     let mut compiler_process = spawn_mag(&data_dir).await;
-    let mut compiler_stdin = compiler_process.stdin.take().expect("compiler stdin");
-    let mut compiler_reader =
-        BufReader::new(compiler_process.stdout.take().expect("compiler stdout"));
+    let (mut compiler_stdin, mut compiler_reader) = regression_conversation_process::attach(
+        &mut compiler_process,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut compiler_reader, &mut compiler_stdin).await;
     std::fs::write(root.join("source/mag.toml"), "version = 1\n").unwrap();
     let mut retained = None;
@@ -1530,8 +1549,11 @@ async fn retained_dynamic_program_survives_source_disposal_and_process_restart()
     std::fs::remove_dir_all(root.join("cache")).expect("dispose build cache");
 
     let mut runtime_process = spawn_mag(&data_dir).await;
-    let mut stdin = runtime_process.stdin.take().expect("runtime stdin");
-    let mut reader = BufReader::new(runtime_process.stdout.take().expect("runtime stdout"));
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut runtime_process,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
     for run_id in ["retained-a", "retained-b"] {
         send_event(
@@ -1669,8 +1691,11 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
     std::fs::remove_dir_all(&data_dir).ok();
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
     handshake(&mut reader, &mut stdin).await;
     let loaded = load_dynamic_program(&mut reader, &mut stdin, "invalid-load").await;
     send_event(
@@ -1750,9 +1775,11 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
 
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
 
     handshake(&mut reader, &mut stdin).await;
     let program = load_lead_program(&mut reader, &mut stdin).await;
@@ -2037,9 +2064,11 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
 
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
 
     handshake(&mut reader, &mut stdin).await;
     let program = load_lead_program(&mut reader, &mut stdin).await;
@@ -2140,9 +2169,11 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
 
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
 
     handshake(&mut reader, &mut stdin).await;
     let program = load_lead_program(&mut reader, &mut stdin).await;
@@ -2292,9 +2323,11 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
 
     let mut child = spawn_mag(&data_dir).await;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
+    let (mut stdin, mut reader) = regression_conversation_process::attach(
+        &mut child,
+        "openai-provider",
+        Some(CONVERSATION_ID),
+    );
 
     handshake(&mut reader, &mut stdin).await;
     let program = load_lead_program(&mut reader, &mut stdin).await;

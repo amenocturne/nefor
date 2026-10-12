@@ -136,3 +136,87 @@ fn conversation_manager_runtime_contract() {
         "CLI manager must subscribe before the initial session lifecycle event"
     );
 }
+
+#[test]
+fn conversation_manager_compaction_contract() {
+    let lua = Lua::new();
+    let nefor = lua.create_table().expect("create nefor table");
+    nefor::lua::bindings::install_json(&lua, &nefor).expect("install json binding");
+    lua.globals().set("nefor", nefor).expect("set nefor global");
+
+    let root = repo_root();
+    let lua_root = root.join("lua").display().to_string();
+    lua.load(format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
+          package.path,
+        }}, ";")"#,
+    ))
+    .exec()
+    .expect("set package.path");
+
+    let test_path = root.join("tests/lua/conversation-manager/compaction_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", test_path.display()));
+    lua.load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+        .unwrap_or_else(|error| panic!("compaction_test.lua failed:\n{error}"));
+}
+
+#[test]
+fn conversation_manager_async_wire_contract() {
+    let lua = Lua::new();
+    let nefor = lua.create_table().expect("create nefor table");
+    nefor::lua::bindings::install_json(&lua, &nefor).expect("install json binding");
+    lua.globals().set("nefor", nefor).expect("set nefor global");
+
+    let root = repo_root();
+    let lua_root = root.join("lua").display().to_string();
+    lua.load(format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
+          package.path,
+        }}, ";")"#,
+    ))
+    .exec()
+    .expect("set package.path");
+
+    let test_path = root.join("tests/lua/conversation-manager/async_wire_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", test_path.display()));
+    lua.load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+        .unwrap_or_else(|error| panic!("async_wire_test.lua failed:\n{error}"));
+}
+
+#[test]
+fn conversation_manager_provider_operation_contract() {
+    let lua = Lua::new();
+    let nefor = lua.create_table().expect("create nefor table");
+    nefor::lua::bindings::install_json(&lua, &nefor).expect("install json binding");
+    lua.globals().set("nefor", nefor).expect("set nefor global");
+
+    let root = repo_root();
+    let lua_root = root.join("lua").display().to_string();
+    lua.load(format!(
+        r#"package.path = table.concat({{
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
+          package.path,
+        }}, ";")"#,
+    ))
+    .exec()
+    .expect("set package.path");
+
+    let test_path = root.join("tests/lua/conversation-manager/provider_operation_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", test_path.display()));
+    lua.load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+        .unwrap_or_else(|error| panic!("provider_operation_test.lua failed:\n{error}"));
+}

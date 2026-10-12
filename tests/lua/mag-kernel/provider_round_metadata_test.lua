@@ -1,4 +1,5 @@
 local llm = require("factories.llm")
+local transport = dofile(package.searchpath("kinds", package.path):match("^(.*)/") .. "/../../../../tests/lua/mag-kernel/async_compaction_fixture.lua").disabled()
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
@@ -32,6 +33,7 @@ local instance = assert(llm.construct("tool-footer.llm", {
   error_type = "nefor.contracts.AgentError",
   provider_error_type = "nefor.contracts.ProviderError",
 }, function(message) emitted[#emitted + 1] = message end, {
+  compaction = transport.facet,
   conversation = {
     id = "tool-footer:conversation",
     turn_id = "tool-footer:turn",
@@ -40,6 +42,7 @@ local instance = assert(llm.construct("tool-footer.llm", {
   },
 }))
 
+transport.wrap(instance)
 instance.deliver(turn({ messages = { { role = "user", content = "inspect" } } }))
 instance.handle_observation({ binding = "conversation", value = {
   kind = "usage", prompt_tokens = 12, completion_tokens = 7,

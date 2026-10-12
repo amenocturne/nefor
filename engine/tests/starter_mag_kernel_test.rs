@@ -298,3 +298,8 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     );
     lua.load(&script).exec()
 }
+
+#[test]
+fn starter_mag_kernel_compaction_boundary() {
+    run_lua_test("tests/lua/mag-kernel/compaction_boundary_test.lua");
+}

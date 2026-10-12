@@ -365,6 +365,10 @@ function M.translator(name)
     complete                   = complete,
     cancel_completion          = cancel_completion,
     cancel                     = cancel,
+    compaction_capability      = function()
+      return { kind = "unsupported", reason = "context compaction is not supported by " .. name }
+    end,
+    checkpoint_compatible      = function() return false end,
     compact_context            = compact_context,
     context_message            = context_message,
     maybe_inject_static_token  = maybe_inject_static_token,

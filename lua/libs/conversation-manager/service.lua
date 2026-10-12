@@ -1,4 +1,5 @@
 local manager = require("libs.conversation-manager")
+local domain = manager.domain
 local projection = require("libs.conversation-manager.projection")
 
 local M = {}
@@ -37,8 +38,19 @@ function M.new()
     return projection.conversation(store:peek(conversation_id))
   end
 
-  function reader:context(conversation_id)
-    return projection.context(store:peek(conversation_id))
+  function reader:context(conversation_id, options)
+    return projection.context(store:peek(conversation_id), options)
+  end
+
+  function reader:read(args)
+    local context = self:context(args.conversation_id, { provider = args.provider, model = args.model })
+    if not context then return nil, { code = "conversation_not_found" } end
+    if type(args.min_watermark) == "number" and context.watermark < args.min_watermark then
+      return nil, { code = "conversation_watermark_stale" }
+    end
+    return { context = context, history_id = domain.copy(context.history_id), watermark = context.watermark,
+      policy_state = domain.copy(context.policy_state), latest_response_usage = domain.copy(context.latest_response_usage),
+      pending_compaction = domain.copy(context.pending_compaction) }
   end
 
   function reader:watermark(conversation_id)

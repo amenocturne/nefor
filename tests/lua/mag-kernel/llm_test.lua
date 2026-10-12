@@ -15,6 +15,7 @@
 
 local Registry = require("registry")
 local llm = require("factories.llm")
+local Async = dofile(package.searchpath("kinds", package.path):match("^(.*)/") .. "/../../../../tests/lua/mag-kernel/async_compaction_fixture.lua")
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -161,7 +162,9 @@ end
 local function make(id, params, json_safe)
   local msgs, emit = capture(json_safe)
   local dependency, facts = conversation(id, nil, json_safe)
-  local instance = llm.construct(id, with_contracts(params), emit, { conversation = dependency })
+  local transport = Async.disabled()
+  local instance = llm.construct(id, with_contracts(params), emit, { conversation = dependency, compaction = transport.facet })
+  if instance then transport.wrap(instance) end
   return instance, msgs, facts
 end
 
@@ -1187,7 +1190,9 @@ end
 do
   local msgs, emit = capture()
   local facts = {}
+  local transport = Async.disabled()
   local instance = assert(llm.construct("lead.llm", with_contracts({ provider = "p" }), emit, {
+    compaction = transport.facet,
     conversation = {
       id = "root-conversation",
       root_id = "root-conversation",
@@ -1197,6 +1202,7 @@ do
       emit = function(fact) facts[#facts + 1] = fact end,
     },
   }))
+  transport.wrap(instance)
   instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
   instance.deliver({ kind = "reply", ref = find_kind(msgs, "capability.invoke").ref,
     result = { text = "done" } })

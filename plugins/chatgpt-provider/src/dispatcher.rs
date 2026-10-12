@@ -3454,6 +3454,24 @@ fn response_event_usage(event: &ResponseEvent) -> Option<Value> {
     }
 }
 
+fn response_completed_fields(
+    event: &ResponseEvent,
+    provider: &str,
+    model: &str,
+) -> Option<Vec<(&'static str, Value)>> {
+    let ResponseEvent::Completed { response } = event else {
+        return None;
+    };
+    let mut fields = vec![
+        ("provider", Value::String(provider.to_owned())),
+        ("model", Value::String(model.to_owned())),
+    ];
+    if let Some(id) = response.get("id").and_then(Value::as_str) {
+        fields.push(("response_id", Value::String(id.to_owned())));
+    }
+    Some(fields)
+}
+
 fn completed_response_usage(response: &Value) -> Option<Value> {
     let usage = response.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64);
@@ -4509,6 +4527,18 @@ async fn run_turn(
                                     body.insert("chat_id".into(), Value::String(chat_id.to_string()));
                                     checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                     latest_response_usage = Some(measurement);
+                                }
+                                if let Some(fields) = response_completed_fields(&event, &ctx.args.provider_name, &active_model) {
+                                    // Native round success is independent of usage parsing and
+                                    // of a later round's failure in the same request.
+                                    let mut body = completion_event_body(
+                                        &ctx.args,
+                                        direct_request.as_ref().map(|(id, _)| id.as_str()).unwrap_or(&turn_id),
+                                        "response_completed",
+                                        fields,
+                                    );
+                                    body.insert("chat_id".into(), Value::String(chat_id.to_string()));
+                                    checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                                 }
                                 match event {
                                 ResponseEvent::OutputTextDelta { delta, .. } => {
@@ -6084,6 +6114,39 @@ mod tests {
         fields
             .iter()
             .find_map(|(key, value)| (*key == name).then_some(value))
+    }
+
+    #[test]
+    fn native_success_without_usage_is_not_a_terminal_or_measurement() {
+        let event = ResponseEvent::Completed {
+            response: serde_json::json!({"id":"native-round"}),
+        };
+        assert_eq!(response_event_usage(&event), None);
+        let fields = response_completed_fields(&event, "gpt", "m").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("provider", serde_json::json!("gpt")),
+                ("model", serde_json::json!("m")),
+                ("response_id", serde_json::json!("native-round"))
+            ]
+        );
+        assert!(response_completed_fields(
+            &ResponseEvent::Failed {
+                response: serde_json::json!({})
+            },
+            "gpt",
+            "m"
+        )
+        .is_none());
+        assert!(response_completed_fields(
+            &ResponseEvent::Incomplete {
+                response: serde_json::json!({})
+            },
+            "gpt",
+            "m"
+        )
+        .is_none());
     }
 
     #[test]

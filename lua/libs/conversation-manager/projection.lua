@@ -110,22 +110,30 @@ local function public_compaction(compaction, include_checkpoint)
     provider = compaction.provider,
     model = compaction.model,
     provider_options = domain.copy(compaction.provider_options),
+    epoch_id = compaction.epoch_id, context_watermark = compaction.context_watermark,
+    trigger = compaction.trigger, tool_call_id = compaction.tool_call_id,
+    conversation_id = compaction.conversation_id,
     error = domain.copy(compaction.error),
   }
   if include_checkpoint then out.checkpoint = domain.copy(compaction.checkpoint) end
   return out
 end
 
-local function latest_response(conversation)
+local function latest_response(conversation, provider, model)
   local cutoff = 0
+  local latest
   for _, compaction in ipairs(conversation.compactions) do
     if compaction.status == "completed" and history_path.is_prefix(compaction.history_id, conversation.head) then
-      cutoff = math.max(cutoff, compaction.terminal_sequence or 0)
+      if (compaction.terminal_sequence or 0) > cutoff then
+        cutoff = compaction.terminal_sequence or 0
+        latest = compaction.optional_usage and { sequence = cutoff, history_id = compaction.history_id,
+          provider = compaction.provider, model = compaction.model, latest_response_usage = compaction.optional_usage } or nil
+      end
     end
   end
-  local latest
   local function consider(usage)
-    if usage.sequence > cutoff and history_path.is_prefix(usage.history_id, conversation.head)
+    if (provider == nil or (usage.provider == provider and usage.model == model))
+        and usage.sequence > cutoff and history_path.is_prefix(usage.history_id, conversation.head)
         and (not latest or usage.sequence > latest.sequence) then latest = usage end
   end
   for _, usage in ipairs(conversation.response_usages or {}) do consider(usage) end
@@ -139,6 +147,7 @@ local function latest_response(conversation)
         model = terminal.model, latest_response_usage = measured })
     end
   end
+  if latest and provider and (latest.provider ~= provider or latest.model ~= model) then return nil end
   return domain.copy(latest)
 end
 
@@ -177,7 +186,8 @@ function M.conversation(conversation)
     retries = domain.copy(conversation.retries),
     turns = turns,
     compactions = compactions,
-    response_usage = latest_response(conversation),
+    response_usage = latest_response(conversation, conversation.provenance.provider, conversation.provenance.model),
+    policy_state = domain.policy_state(conversation, conversation.provenance.provider, conversation.provenance.model),
     pending_edit = domain.copy(conversation.pending_edit),
     history_head = domain.copy(conversation.head),
     terminal = domain.copy(conversation.terminal),
@@ -186,14 +196,25 @@ function M.conversation(conversation)
   }
 end
 
-function M.context(conversation)
+function M.context(conversation, options)
   if not conversation then return nil end
+  options = domain.copy(options or {})
+  if options.provider == nil then
+    options.provider, options.model = conversation.provenance.provider, conversation.provenance.model
+  end
   local all = context_messages(conversation, true)
+  if options.history_cutoff ~= nil then
+    local prefix = {}
+    for index = 1, options.history_cutoff do prefix[index] = all[index] end
+    all = prefix
+  end
   local selected = nil
   for index = #conversation.compactions, 1, -1 do
     local candidate = conversation.compactions[index]
     if candidate.status == "completed"
-        and history_path.is_prefix(candidate.history_id, conversation.head) then
+        and history_path.is_prefix(candidate.history_id, conversation.head)
+        and candidate.history_cutoff <= #all
+        and (options.provider == nil or (candidate.provider == options.provider and candidate.model == options.model)) then
       selected = candidate
       break
     end
@@ -207,6 +228,17 @@ function M.context(conversation)
     history_length = #all,
     compaction = public_compaction(selected, true),
     watermark = conversation.last_sequence,
+    history_id = domain.copy(conversation.head),
+    policy_state = domain.policy_state(conversation, options.provider, options.model),
+    latest_response_usage = (function()
+      local usage = latest_response(conversation, options.provider, options.model)
+      return usage and usage.latest_response_usage or nil
+    end)(),
+    pending_compaction = (function()
+      for _, op in ipairs(conversation.compactions) do
+        if op.status == "pending" then return public_compaction(op, false) end
+      end
+    end)(),
   }
 end
 
@@ -266,9 +298,32 @@ function M.change(after, event)
     local compaction = after.compaction_by_id[event.request_id]
     change.kind = kind:gsub("_requested$", "_pending")
     change.compaction = public_compaction(compaction, false)
-    if kind == "context_compaction_requested" then change.context = M.context(after) end
+    if kind == "context_compaction_requested" then
+      local context = M.context(after, { history_cutoff = compaction.history_cutoff,
+        provider = compaction.provider, model = compaction.model })
+      context.watermark = compaction.context_watermark
+      context.pending_compaction = nil
+      local request = {}
+      for _, field in ipairs({ "request_id", "conversation_id", "epoch_id", "history_id", "context_watermark",
+          "history_cutoff", "provider", "model", "provider_options", "trigger", "tool_call_id" }) do
+        request[field] = domain.copy(compaction[field])
+      end
+      change.context = context
+      change.input = { request = request, context = domain.copy(context) }
+    else
+      change.context = M.context(after)
+    end
+    change.request_id = event.request_id
+  elseif kind:sub(1, #"context_notice_") == "context_notice_" then
+    change.notice = domain.copy(after.notice_by_id[event.notice_id])
+    change.request_id = event.request_id
+    change.policy_state = domain.policy_state(after, event.provider, event.model)
+    if kind == "context_notice_appended" then
+      change.message = projected_message(after, after.message_by_id[event.message_id], true)
+      change.context_messages = { domain.copy(change.message) }
+    end
   elseif kind == "response_usage_recorded" then
-    change.response_usage = latest_response(after)
+    change.response_usage = latest_response(after, after.provenance.provider, after.provenance.model)
   elseif kind == "provenance_updated" then
     change.provenance = domain.copy(after.provenance)
   elseif kind:sub(1, 13) == "conversation_" then

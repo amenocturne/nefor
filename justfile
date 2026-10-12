@@ -526,3 +526,11 @@ test-basic-tools target="basic_tools_default" *args:
     if [[ "$(uname -s)" == Darwin ]]; then
         while IFS= read -r path; do codesign --verify --strict "$path"; done < "$artifacts/executables.txt"
     fi
+
+# Separate-process canonical compaction acceptance, with deterministic native mock only.
+test-compaction: build-headless
+    just test-engine compaction_process
+
+# Pair a source configuration directory with the candidate snapshot parser and lazy MAG factories.
+test-source-config config:
+    NEFOR_SOURCE_CONFIG="{{config}}" just test-mag-plugin compaction_bridge source_config

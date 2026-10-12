@@ -1028,6 +1028,24 @@ do
     "promoted turn leaves context reconstruction to the provider")
 end
 
+local function answer_manual_compaction_context(messages)
+  local query = find_kind(decode_calls(), "conversation.context.request")
+  assert(query, "manual compaction first queries canonical context")
+  assert_eq(find_kind(decode_calls(), "conversation.context.compact.request"), nil,
+    "cached lead context is not a compaction binding")
+  send_to_loop("conversation-manager", {
+    kind = "conversation.context.snapshot", request_id = "unrelated", found = true,
+    conversation_id = manager_conversation_id, context = {},
+  })
+  assert_eq(find_kind(decode_calls(), "conversation.context.compact.request"), nil)
+  send_to_loop("conversation-manager", {
+    kind = "conversation.context.snapshot", request_id = query.body.request_id, found = true,
+    conversation_id = manager_conversation_id,
+    context = { messages = messages or agentic_loop.history(), history_length = 2,
+      watermark = 123, history_id = { "fresh" }, policy_state = { epoch_id = "fresh-epoch" } },
+  })
+end
+
 -- (/compact) the loop delegates universally and forwards the manager's opaque
 -- context projection without interpreting provider compatibility.
 do
@@ -1044,12 +1062,19 @@ do
     provider = "mock",
     trigger = "manual",
   })
+  answer_manual_compaction_context({ { role = "user", content = "safe" },
+    { role = "assistant", tool_calls = { { id = "unfinished", name = "ordinary" } } } })
   local calls = decode_calls()
   local compact = find_kind(calls, "conversation.context.compact.request")
   assert(compact ~= nil, "compaction delegates to conversation-manager")
   assert_eq(compact.target, "conversation-manager")
   assert_eq(compact.body.provider, "mock", "compaction carries provider routing")
   assert_eq(compact.body.model, "test-model", "compaction carries the active model")
+  assert_eq(compact.body.epoch_id, "fresh-epoch")
+  assert_eq(compact.body.context_watermark, 123)
+  assert_eq(compact.body.history_id[1], "fresh")
+  assert_eq(compact.body.history_cutoff, 1, "exclude the whole unfinished tool batch")
+  assert_eq(compact.body.trigger, "manual")
   assert_eq(find_kind(calls, "mock.chat.create"), nil,
     "agentic-loop does not orchestrate provider chats")
 
@@ -1103,6 +1128,7 @@ do
   })
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.compaction.request", trigger = "manual" })
+  answer_manual_compaction_context()
   local compact = find_kind(decode_calls(), "conversation.context.compact.request")
   assert(compact ~= nil)
   _test.calls_clear()

@@ -1,6 +1,7 @@
 -- The intrinsic editor owns one draft per firing; only standalone submission
 -- accepts a validated snapshot. All rejected calls remain ordinary receipts.
 local factory = require("factories.structured-output")
+local Async = dofile(package.searchpath("kinds", package.path):match("^(.*)/") .. "/../../../../tests/lua/mag-kernel/async_compaction_fixture.lua")
 local run_tool = require("factories.run-tool")
 local files, serial, validations = {}, 0, 0
 local real_schema = nefor.typed_json and nefor.typed_json.schema
@@ -40,11 +41,13 @@ end
 local function count(out, kind)
   local n = 0; for _, v in ipairs(out) do if v.kind == kind then n = n + 1 end end; return n
 end
-local function make(dynamic, bound_schema, synchronous)
+local function make(dynamic, bound_schema, synchronous, compaction_fixture)
   local current_schema = bound_schema or schema
   local out, facts = {}, {}
   local actor, err
+  local transport = compaction_fixture and compaction_fixture.transport or Async.disabled()
   actor, err = factory.construct("typed", {
+    compaction_policy = compaction_fixture and { soft_percent = 60, step_percent = 10, hard_percent = 90 },
     provider = "mock", tools = {}, schema = dynamic and { version = 2,
       root = { kind = "list", item = current_schema.root } } or current_schema,
     output_type = "output", error_type = "error", provider_error_type = "provider-error",
@@ -60,10 +63,14 @@ local function make(dynamic, bound_schema, synchronous)
       end
       actor.deliver({messages = {{message = {messages = messages}}}})
     end
-  end, { conversation = {
-    id = "conversation", turn_id = "turn", emit = function(v) facts[#facts + 1] = v end,
+  end, { compaction = transport.facet, conversation = {
+    id = "conversation", turn_id = "turn", emit = function(v)
+      facts[#facts + 1] = v
+      if compaction_fixture then compaction_fixture.record(v) end
+    end,
   } })
   assert(actor, err)
+  transport.wrap(actor)
   actor.deliver({ messages = {{ message = { messages = {{ role = "user", content = "assignment" }} } }} })
   return actor, out, facts
 end
@@ -80,7 +87,8 @@ local function continue(actor, calls)
 end
 local actor, out, facts = make()
 local request = last(out, "capability.invoke").request
-assert(request.output_schema == nil and #request.tools == 2 and #request.tool_specs == 2)
+assert(request.output_schema == nil and #request.tools == 3 and #request.tool_specs == 3)
+assert(request.tool_specs[3].name == "self_compact" and next(request.tool_specs[3].parameters.properties) == nil)
 assert(request.tool_specs[1].parameters.properties.validate.default == false)
 assert(request.tool_specs[1].parameters.properties.new_string.description:find("Whole draft", 1, true))
 assert(request.tool_specs[2].description:find("only tool call in a response", 1, true))
@@ -143,13 +151,13 @@ for _, mixed in ipairs({
   -- The actor names its request-local result tools beside the calls, and the
   -- executor hands them to the tool surface with its allowlist.
   local tool_calls = last(out, "generic-tool.ToolCalls")
-  assert(table.concat(tool_calls.request_local_tools, ",") == "write_output,submit_output")
+  assert(table.concat(tool_calls.request_local_tools, ",") == "write_output,submit_output,self_compact")
   executor.deliver({messages = {{message = tool_calls}}})
   if #calls == 3 then
     assert(count(emitted, "capability.invoke") == 1)
     local invoked = last(emitted, "capability.invoke")
     assert(table.concat(invoked.request.allowlist, ",") == "read_file")
-    assert(table.concat(invoked.request.request_local_tools, ",") == "write_output,submit_output")
+    assert(table.concat(invoked.request.request_local_tools, ",") == "write_output,submit_output,self_compact")
     executor.deliver({kind = "reply", ref = invoked.ref, result = "normal result"})
   else assert(count(emitted, "capability.invoke") == 0) end
   local handle = last(emitted, "generic-tool.ToolHandle")
@@ -251,4 +259,50 @@ do
   assert(result.draft == original_draft and result.write == "saved" and result.validation.status == "valid")
   reply(a, o, {call("submit_output")})
   assert(count(o, "capability.invoke") == 3 and last(o, "nefor.agent.Result").value.value.content == "synchronous")
+end
+
+-- Intrinsic self/submit conflicts reject the entire batch before draft edits,
+-- validation, ordinary dispatch or dynamic result production.
+for _, dynamic in ipairs({ false, true }) do
+  local a, o, f = make(dynamic)
+  local before, validation_before = nefor.json.encode(files), validations
+  reply(a, o, {call("self_compact"), call("submit_output"),
+    call("write_output", {new_string = '{"content":"must not save"}', validate = true}), call("shell.script")})
+  assert(nefor.json.encode(files) == before and validations == validation_before)
+  assert(count(o, "generic-tool.ToolCalls") == 0 and count(o, "nefor.agent.Result") == 0)
+  local errors = 0
+  for _, fact in ipairs(f) do
+    if fact.kind == "tool_error_recorded" then
+      assert(fact.error == "compaction_terminal_conflict"); errors = errors + 1
+    end
+  end
+  assert(errors == 4 and count(o, "capability.invoke") == 2)
+end
+
+-- Structured and dynamic final-output repair cannot bypass the common hard gate.
+for _, dynamic in ipairs({ false, true }) do
+  local view = { context = { history_length = 1 }, watermark = 0, history_id = {"h"},
+    policy_state = { epoch_id = "original", notices = {} } }
+  local requested
+  local fixture = { sync = {
+    barrier = function() return { watermark = view.watermark } end,
+    prepare = function() return { kind = "Ready", regular_window = 100, capability = { kind = "supported" } } end,
+    read = function() return view end,
+    request_compaction = function(request, handle) request.request_id = handle.id; requested = request; view.pending_compaction = request; return { kind = "Accepted" } end,
+  }, record = function(fact)
+    view.watermark = view.watermark + 1
+    if fact.kind == "response_usage_recorded" then view.latest_response_usage = fact.latest_response_usage end
+    if fact.kind == "message_completed" then view.context.history_length = view.context.history_length + 1 end
+  end }
+  fixture.transport = Async.new(fixture.sync)
+  local a, o = make(dynamic, nil, nil, fixture)
+  a.deliver({ kind = "reply", ref = last(o, "capability.invoke").ref,
+    result = { text = "not submitted", usage = { total_tokens = 95 } } })
+  assert(requested and requested.trigger == "hard" and count(o, "capability.invoke") == 1)
+  view.pending_compaction = nil; view.latest_response_usage = nil
+  view.policy_state = { epoch_id = requested.request_id, notices = {} }
+  fixture.transport.settle(fixture.transport.pending_compact, { kind = "Ok", value = {
+    status = "compacted", request_id = requested.request_id, epoch_id = requested.request_id } })
+  fixture.transport.pump("request_compaction")
+  assert(count(o, "capability.invoke") == 2)
 end

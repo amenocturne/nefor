@@ -340,13 +340,13 @@ async fn flush_emits(
             let id = body.get("id").and_then(Value::as_str).map(str::to_owned);
             let run_id = body.get("run_id").and_then(Value::as_str).map(str::to_owned);
             if let Some(run_id) = &run_id {
-                if host.output_failed(run_id)? && kind != "tool.cancel" && kind != "mag.actor_killed" {
+                if host.output_failed(run_id)? && kind != "tool.cancel" && kind != "conversation.context.compact.cancel" && kind != "mag.actor_killed" {
                     continue;
                 }
             }
             for envelope in bridge.translate_emit(body) {
                 if let Err(error) = send_event(out_tx, envelope).await {
-                    if !admission_rejection(&error) || kind == "tool.cancel" { return Err(error); }
+                    if !admission_rejection(&error) || kind == "tool.cancel" || kind == "conversation.context.compact.cancel" { return Err(error); }
                     if kind == "tool.invoke" {
                         if let Some(id) = &id {
                             bridge.forget(id);
@@ -462,6 +462,7 @@ fn is_provider_diagnostic_event(event: &str) -> bool {
             | "retry"
             | "retry_decision"
             | "usage"
+            | "response_completed"
             | "failed"
             | "error"
             | "interrupted"
@@ -527,6 +528,43 @@ async fn handle_event(
         Some(k) => k,
         None => return Ok(()),
     };
+    if matches!(
+        kind,
+        "conversation.fact.recorded"
+            | "conversation.fact.rejected"
+            | "conversation.context.snapshot"
+            | "conversation.query.rejected"
+            | "conversation.context.notice.accepted"
+            | "conversation.context.notice.rejected"
+            | "conversation.context.compact.accepted"
+            | "conversation.context.compact.rejected"
+            | "conversation.context.compact.cancelled"
+            | "conversation.compaction.prepared"
+    )
+    {
+        let runs = host.canonical_event(source, body)?;
+        flush_emits(out_tx, host, bridge).await?;
+        for run_id in runs {
+            settle_run(out_tx, host, active, bridge, &run_id).await?;
+        }
+        return Ok(());
+    }
+    if let Some(request_id) = bridge
+        .context_inclusion_request_id(source, kind, body)
+        .map(str::to_owned)
+    {
+        let mut inclusion = body.clone();
+        inclusion.insert("kind".into(), Value::String("context_included".into()));
+        // Keep the actual bus request ID in the value as well as the envelope;
+        // the boundary uses it for canonical inclusion/delivery attestations.
+        let _ = host.bus_observation(
+            &request_id,
+            "append",
+            "conversation",
+            &Value::Object(inclusion),
+        )?;
+        return flush_emits(out_tx, host, bridge).await;
+    }
     // Canonical provider events correlate themselves by request_id. Terminal
     // events settle the kernel capability; streaming and other telemetry remain
     // observational and keep the request open. Unknown and late ids are ignored.

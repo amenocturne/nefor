@@ -20,7 +20,7 @@ M.declaration = {
   params = {
     model = "string", system = "string?", tools = "table?",
     reasoning_effort = "string?",
-    provider_options = "table?",
+    provider_options = "table?", compaction_policy = "table?",
     provider = "string", history = "table?",
     output_type = "string", error_type = "string", provider_error_type = "string",
     conversation_id = "string?",
@@ -63,6 +63,7 @@ function M.construct(id, params, emit, deps)
   end
   return boundary.construct(id, params, emit, {
     conversation = deps.conversation,
+    compaction = deps.compaction,
     diagnostic = deps.diagnostic,
     name = "llm",
     steerable = true,

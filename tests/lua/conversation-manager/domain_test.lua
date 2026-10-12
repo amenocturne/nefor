@@ -25,6 +25,17 @@ local function create(store, id, purpose)
   } }))
 end
 
+local function compact_fields(store, id, request_id, cutoff, terminal)
+  local c = store:peek(id)
+  local op = terminal and c.compaction_by_id[request_id]
+  return { request_id = request_id, history_cutoff = cutoff, provider = "openai", model = "one",
+    epoch_id = op and op.epoch_id or domain.policy_state(c).epoch_id,
+    history_id = domain.copy(op and op.history_id or c.head), context_watermark = c.last_sequence, trigger = "manual",
+    checkpoint = terminal == "completed" and { provider = "openai", model = "one", format = "test", artifact = {} } or nil,
+    compatibility = terminal == "completed" and { provider = "openai", model = "one", format = "test" } or nil,
+    error = terminal == "failed" and { code = "failure", message = "failure" } or nil }
+end
+
 -- Every event variant participates in one canonical fold, preserving chunks as facts.
 do
   local store = manager.new(); create(store, "lead", "lead")
@@ -652,12 +663,8 @@ do
   message("system", "system", "rules")
   local old_prompt = message("old-user", "user", "old")
   message("old-answer", "assistant", "old answer")
-  append(store, fact("old-compact-request", "compact-branch", "context_compaction_requested", {
-    request_id = "old-compact", history_cutoff = 3, provider = "p",
-  }))
-  append(store, fact("old-compact-done", "compact-branch", "context_compaction_completed", {
-    request_id = "old-compact", checkpoint = { opaque = "old" },
-  }))
+  append(store, fact("old-compact-request", "compact-branch", "context_compaction_requested", compact_fields(store, "compact-branch", "old-compact", 3)))
+  append(store, fact("old-compact-done", "compact-branch", "context_compaction_completed", compact_fields(store, "compact-branch", "old-compact", nil, "completed")))
   local old_head = store:get("compact-branch").head
   append(store, fact("rewind-old", "compact-branch", "rewind_committed", {
     target_history_id = old_prompt, expected_head = old_head,
@@ -668,14 +675,10 @@ do
   eq(bypassed.compaction, nil, "branch-incompatible checkpoint is bypassed")
   eq(#bypassed.messages, 3, "inactive sibling history never reaches provider context")
 
-  append(store, fact("new-compact-request", "compact-branch", "context_compaction_requested", {
-    request_id = "new-compact", history_cutoff = 3, provider = "p",
-  }))
-  append(store, fact("new-compact-done", "compact-branch", "context_compaction_completed", {
-    request_id = "new-compact", checkpoint = { opaque = "new" },
-  }))
+  append(store, fact("new-compact-request", "compact-branch", "context_compaction_requested", compact_fields(store, "compact-branch", "new-compact", 3)))
+  append(store, fact("new-compact-done", "compact-branch", "context_compaction_completed", compact_fields(store, "compact-branch", "new-compact", nil, "completed")))
   local current = projection.context(store:peek("compact-branch"))
-  eq(current.compaction.checkpoint.opaque, "new")
+  eq(current.compaction.request_id, "new-compact")
   eq(#store:get("compact-branch").compactions, 2, "branch-local checkpoints coexist")
 end
 
@@ -707,12 +710,12 @@ do
   add("rewind-usage", "rewind_committed", { target_history_id = head, expected_head = head })
   eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 100,
     "rewind removes later branch measurements")
-  add("compact-fail", "context_compaction_requested", { request_id = "cf", provider = "openai", history_cutoff = 0 })
-  add("compact-failed", "context_compaction_failed", { request_id = "cf", error = "failure" })
+  add("compact-fail", "context_compaction_requested", compact_fields(store, "occupancy", "cf", 0))
+  add("compact-failed", "context_compaction_failed", compact_fields(store, "occupancy", "cf", nil, "failed"))
   eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 100,
     "failed compaction keeps prior snapshot")
-  add("compact-ok", "context_compaction_requested", { request_id = "co", provider = "openai", history_cutoff = 0 })
-  add("compact-completed", "context_compaction_completed", { request_id = "co", checkpoint = {} })
+  add("compact-ok", "context_compaction_requested", compact_fields(store, "occupancy", "co", 0))
+  add("compact-completed", "context_compaction_completed", compact_fields(store, "occupancy", "co", nil, "completed"))
   eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage, nil, "successful compaction invalidates measurement")
   measure("after-compact", 0)
   eq(require("libs.conversation-manager.projection").conversation(store:peek("occupancy")).response_usage.latest_response_usage.total_tokens, 0)

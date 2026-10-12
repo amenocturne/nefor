@@ -139,6 +139,14 @@ function M.new(options)
     return message_id
   end
 
+  -- Successful response occupancy also exists when a malformed call produces
+  -- no completed assistant message. Keep that measurement on the same authority.
+  function recorder:response_usage(request_id, provider, model, measurement)
+    if not require("libs.chat.context_usage").measurement(measurement) then return false end
+    return emit("response_usage_recorded", { request_id = request_id,
+      provider = provider, model = model, latest_response_usage = copy(measurement) })
+  end
+
   function recorder:start_message(role, fields)
     local message_id = next_message_id()
     local started = { message_id = message_id, role = role }

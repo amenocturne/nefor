@@ -1,3 +1,5 @@
+local compaction_broker = require("compaction-broker")
+local compaction_policy = require("libs.compaction-policy")
 -- plugins/mag/lua/mag-kernel/init.lua — MAG actor-kernel entry.
 --
 -- Loaded by the `mag` plugin's embedded Lua VM at startup. This module is
@@ -475,6 +477,7 @@ local function new_run_context(meta)
   -- boundary).
   inv.set_on_kill(function(id)
     router:dispatch_kill(id)
+    if ctx.compaction then ctx.compaction.detach_owner(id) end
     router:forget(id)
   end)
   inv.set_is_constructed(function(id)
@@ -487,6 +490,18 @@ local function new_run_context(meta)
   -- (actor-model.md): the per-node persistence writer (deps.writer), consumed
   -- by the sink and available to any factory that declares a use for it. A
   -- failure return escalates inside routing (mag.run_failed).
+  ctx.compaction = compaction_broker.new({
+    scope = ctx.scope,
+    emit = function(body)
+      body.run_id = ctx.run_id
+      nefor.emit(body)
+    end,
+    live = function(id)
+      local record = inv.get(id)
+      return record ~= nil and record.state ~= "dead"
+    end,
+    complete = function(id, completion) router:apply_completion(id, completion) end,
+  })
   router:set_construct(function(record)
     local emit = router:emitter(record.id)
     local actor_params = record.params or {}
@@ -518,6 +533,7 @@ local function new_run_context(meta)
         actor_params.model = selected.model
         actor_params.reasoning_effort = selected.reasoning_effort
         actor_params.provider_options = selected.provider_options
+        if profile ~= nil then actor_params.compaction_policy = selected.compaction_policy end
       end
     end
     local explicit_conversation_id = type(actor_params.conversation_id) == "string"
@@ -536,11 +552,21 @@ local function new_run_context(meta)
         .. "/actors/" .. tostring(record.id)
     ctx.actor_conversations[record.id] = actor_conversation_id
     local is_root_conversation = actor_conversation_id == ctx.conversation_id
+    if has_model_context(record.factory) then
+      local raw_policy = actor_params.compaction_policy
+      if is_root_conversation and ctx.model_snapshot ~= nil then
+        raw_policy = ctx.model_snapshot.compaction_policy
+      end
+      local policy, policy_error = compaction_policy.lower(raw_policy)
+      if policy == nil then return nil, policy_error end
+      actor_params.compaction_policy = compaction_policy.raw(policy)
+    end
     local explicit_turn_id = type(actor_params.turn_id) == "string"
         and actor_params.turn_id ~= "" and actor_params.turn_id or nil
     local actor_turn_id = explicit_turn_id
       or (is_root_conversation and ctx.run_id or (ctx.run_id .. "/" .. tostring(record.id)))
     local deps = {
+      compaction = ctx.compaction.facet(record.id),
       persistence_owned_by_kernel = true,
       writer = function(output)
         return persist_output(record.id, output)
@@ -558,7 +584,7 @@ local function new_run_context(meta)
           factory = record.factory,
         },
         emit = function(fact)
-          nefor.emit({ kind = "conversation.fact.append", fact = fact })
+          ctx.compaction.emit(fact)
         end,
       },
       diagnostic = function(diagnostic)
@@ -1026,6 +1052,7 @@ return {
     if not ctx then
       return { ok = false, error = err }
     end
+    ctx.compaction.interrupt(failure)
     local settled = ctx.router:interrupt(failure)
     ctx.drain_topology(); ctx.drain_operations(); ctx.drain_topology()
     -- Observable interrupt marker for the panel/transcript (run_id-stamped by
@@ -1104,6 +1131,21 @@ return {
     local rf = ctx.run_failed
     ctx.run_failed = nil
     return rf
+  end,
+
+  pump_commands = function()
+    for _, ctx in pairs(runs) do
+      ctx.compaction.pump()
+      ctx.drain_topology(); ctx.drain_operations(); ctx.drain_topology()
+    end
+  end,
+
+  canonical_event = function(source, body)
+    local claimed = {}
+    for run_id, ctx in pairs(runs) do
+      if ctx.compaction.event(source, body) then claimed[#claimed + 1] = run_id end
+    end
+    return claimed
   end,
 
   bus_observation = function(observation)

@@ -284,12 +284,16 @@ eq(internal_context.messages[4].input_cause, "internal_async_completion",
 eq(internal_context.messages[4].text, "[mag_run(run_id=sub) result] payload",
   "internal completion remains available for agent consumption")
 
+local frozen = reader:context("replayed")
 receive({
   kind = "conversation.context.compact.request", request_id = "compact-1",
+  epoch_id = frozen.policy_state.epoch_id, history_id = frozen.history_id,
+  history_cutoff = 4, context_watermark = frozen.watermark, trigger = "manual",
   conversation_id = "replayed", provider = "chatgpt", model = "gpt-5.6-sol",
   provider_options = { service_tier = "fast" },
 })
-delta = last_body()
+eq(last_body().kind, "conversation.context.compact.accepted")
+delta = body_at(#emitted - 1)
 eq(delta.change.kind, "context_compaction_pending")
 eq(delta.change.compaction.history_cutoff, 4)
 eq(delta.change.compaction.provider, "chatgpt", "pending compaction preserves routing provider")
@@ -300,7 +304,10 @@ receive({
   kind = "conversation.context.compact.complete",
   request_id = "compact-1",
   conversation_id = "replayed",
-  checkpoint = { opaque = "provider-owned" },
+  epoch_id = frozen.policy_state.epoch_id, history_id = frozen.history_id,
+  provider = "chatgpt", model = "gpt-5.6-sol",
+  checkpoint = { provider = "chatgpt", model = "gpt-5.6-sol", format = "test", artifact = "provider-owned" },
+  compatibility = { provider = "chatgpt", model = "gpt-5.6-sol", format = "test" },
 })
 delta = last_body()
 eq(delta.change.kind, "context_compaction_completed")
@@ -314,7 +321,7 @@ receive({
 context = last_body().context
 eq(#context.messages, 4, "full neutral history remains universally available")
 eq(#context.tail_messages, 0, "checkpoint tail begins after its cutoff")
-eq(context.compaction.checkpoint.opaque, "provider-owned")
+eq(context.compaction.checkpoint.artifact, "provider-owned")
 eq(context.compaction.provider, "chatgpt")
 
 receive({ kind = "conversation.active.set", request_id = "active-1", conversation_id = "replayed" })
@@ -359,6 +366,8 @@ receive({
   provider = "chatgpt",
   model = "gpt-test",
   reasoning_effort = "high",
+  notice_id = "notice-relay-test",
+  epoch_id = "epoch-relay-test",
   provider_options = { service_tier = "fast", nested = { retained = true } },
   tools = empty_tools,
   output_schema = schema_with_empty_arrays,
@@ -374,6 +383,8 @@ eq(invoke.provider, "chatgpt")
 eq(invoke.watermark, invoke_watermark, "invoke captures the folded manager watermark")
 eq(invoke.model, "gpt-test")
 eq(invoke.reasoning_effort, "high")
+eq(invoke.notice_id, "notice-relay-test", "relay preserves notice correlation for actual lowering")
+eq(invoke.epoch_id, "epoch-relay-test", "relay preserves canonical notice epoch")
 eq(invoke.provider_options.service_tier, "fast")
 eq(invoke.provider_options.nested.retained, true,
   "manager relay preserves opaque nested provider options")

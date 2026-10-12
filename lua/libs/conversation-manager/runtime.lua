@@ -40,6 +40,7 @@ function M.build(options)
       kind = "conversation.fact.rejected",
       event_id = type(fact) == "table" and fact.event_id or nil,
       conversation_id = type(fact) == "table" and fact.conversation_id or nil,
+      request_id = type(fact) == "table" and fact.request_id or nil,
       code = e.code,
       context = domain.copy(e.context),
     })
@@ -83,7 +84,7 @@ function M.build(options)
 
   local function append_fact(fact)
     local conversation, e, duplicate, event = store:append(fact)
-    if not conversation then reject(fact, e); return nil end
+    if not conversation then reject(fact, e); return nil, nil, nil, e end
     publish_recorded(event, duplicate, conversation)
     return conversation, duplicate, event
   end
@@ -97,7 +98,7 @@ function M.build(options)
     local event = body.event
     local conversation, e, duplicate = store:apply_recorded(event)
     if e then diagnose(body.event, e) end
-    if conversation and not duplicate and replay_active() then
+    if conversation and not duplicate and replay_active() and event.kind ~= "context_compaction_requested" then
       send({
         kind = "conversation.projection.delta",
         session_id = session_id,
@@ -167,7 +168,12 @@ function M.build(options)
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_context_request" })
       return
     end
-    local context = reader:context(body.conversation_id)
+    local context = reader:context(body.conversation_id, { provider = body.provider, model = body.model })
+    if context and type(body.min_watermark) == "number" and context.watermark < body.min_watermark then
+      send({ kind = "conversation.query.rejected", request_id = body.request_id,
+        code = "conversation_watermark_stale" })
+      return
+    end
     send({
       kind = "conversation.context.snapshot",
       request_id = body.request_id,
@@ -211,27 +217,39 @@ function M.build(options)
   end
 
   local function handle_compaction_request(body)
-    if replay_active() then return end
+    if replay_active() then return nil, { code = "replay_active" } end
     if not nonempty(body.request_id) or not nonempty(body.conversation_id) or not nonempty(body.provider) then
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_compaction_request" })
-      return
+      return nil, { code = "invalid_compaction_request" }
     end
     local conversation = store:owned(body.conversation_id)
     if not conversation then
       reject({ event_id = "compaction:" .. body.request_id .. ":requested", conversation_id = body.conversation_id },
         { code = "conversation_not_found", context = { request_id = body.request_id } })
-      return
+      send({ kind = "conversation.context.compact.rejected", request_id = body.request_id,
+        conversation_id = body.conversation_id, code = "conversation_not_found" })
+      return nil, { code = "conversation_not_found" }
     end
-    append_fact({
+    local accepted, duplicate, event, failure = append_fact({
       event_id = "compaction:" .. body.request_id .. ":requested",
       conversation_id = body.conversation_id,
       kind = "context_compaction_requested",
       request_id = body.request_id,
-      history_cutoff = projection.context(conversation).history_length,
+      history_cutoff = body.history_cutoff,
+      epoch_id = body.epoch_id, history_id = domain.copy(body.history_id),
+      context_watermark = body.context_watermark, trigger = body.trigger, tool_call_id = body.tool_call_id,
       provider = body.provider,
       model = body.model,
       provider_options = domain.copy(body.provider_options),
     })
+    if accepted then
+      send({ kind = "conversation.context.compact.accepted", request_id = body.request_id,
+        conversation_id = body.conversation_id, sequence = event.sequence, duplicate = duplicate })
+      return { kind = "Accepted", request_id = body.request_id }
+    end
+    send({ kind = "conversation.context.compact.rejected", request_id = body.request_id,
+      conversation_id = body.conversation_id, code = failure.code, context = domain.copy(failure.context) })
+    return nil, failure
   end
 
   local function handle_compaction_terminal(body, kind)
@@ -240,14 +258,107 @@ function M.build(options)
       send({ kind = "conversation.query.rejected", request_id = body.request_id, code = "invalid_compaction_terminal" })
       return
     end
-    append_fact({
+    local accepted, _, _, failure = append_fact({
       event_id = "compaction:" .. body.request_id .. ":" .. (kind == "context_compaction_completed" and "completed" or "failed"),
       conversation_id = body.conversation_id,
       kind = kind,
       request_id = body.request_id,
-      checkpoint = domain.copy(body.checkpoint),
+      epoch_id = body.epoch_id, history_id = domain.copy(body.history_id),
+      provider = body.provider, model = body.model,
+      checkpoint = domain.copy(body.checkpoint), compatibility = domain.copy(body.compatibility),
+      optional_usage = domain.copy(body.optional_usage),
       error = domain.copy(body.error),
     })
+    if not accepted then
+      -- A rejected completion is not a successful checkpoint. Settle only the
+      -- matching live operation; stale/unrelated terminals cannot cancel it.
+      local conversation = store:owned(body.conversation_id)
+      local op = conversation and conversation.compaction_by_id[body.request_id]
+      if op and op.status == "pending" and body.epoch_id == op.epoch_id
+          and domain.equal(body.history_id, op.history_id)
+          and body.provider == op.provider and body.model == op.model then
+        append_fact({ kind = "context_compaction_failed",
+          event_id = "compaction:" .. body.request_id .. ":failed",
+          conversation_id = body.conversation_id, request_id = body.request_id,
+          epoch_id = op.epoch_id, history_id = domain.copy(op.history_id),
+          provider = op.provider, model = op.model,
+          error = { code = "compaction_commit_rejected", message = failure.code,
+            context = domain.copy(failure.context) },
+        })
+      end
+    end
+  end
+
+  local function handle_notice(body, kind)
+    if replay_active() then return nil, { code = "replay_active" } end
+    local conversation_id = body.conversation_id
+    if not conversation_id and body.notice_id then
+      for _, candidate in ipairs(store:list_owned()) do
+        if candidate.notice_by_id[body.notice_id] then conversation_id = candidate.id; break end
+      end
+    end
+    local c = store:owned(conversation_id)
+    if not c then
+      send({ kind = "conversation.context.notice.rejected", command_id = body.command_id, request_id = body.request_id,
+        notice_id = body.notice_id, conversation_id = conversation_id, code = "conversation_not_found" })
+      return nil, { code = "conversation_not_found" }
+    end
+    local fact = domain.copy(body.notice_data or {})
+    for _, field in ipairs({ "notice_id", "epoch_id", "message_id", "request_id", "provider", "model",
+        "context_watermark", "expected_watermark", "text", "history_id", "response_id" }) do
+      if body[field] ~= nil then fact[field] = domain.copy(body[field]) end
+    end
+    fact.kind = kind; fact.conversation_id = conversation_id
+    fact.notice_id = fact.notice_id or ("notice:" .. c.id .. ":" .. tostring(body.expected_watermark))
+    fact.message_id = fact.message_id or (fact.notice_id .. ":message")
+    fact.provider = fact.provider or c.provenance.provider
+    fact.model = fact.model or c.provenance.model
+    fact.epoch_id = fact.epoch_id or domain.policy_state(c).epoch_id
+    local notice = c.notice_by_id[fact.notice_id]
+    local inclusion = notice and notice.inclusions and notice.inclusions[fact.request_id]
+    if kind == "context_notice_delivered" and inclusion then
+      fact.context_watermark = fact.context_watermark or inclusion.context_watermark
+    end
+    fact.history_id = fact.history_id or domain.copy(inclusion and inclusion.history_id or c.head)
+    fact.event_id = body.event_id or (fact.notice_id .. ":" .. kind .. ":" .. tostring(body.request_id or body.expected_watermark))
+    local after, e, duplicate, event = store:append(fact)
+    if not after then
+      reject(fact, e)
+      send({ kind = "conversation.context.notice.rejected", command_id = body.command_id, request_id = body.request_id,
+        notice_id = fact.notice_id, conversation_id = body.conversation_id, code = e.code })
+      return nil, e
+    end
+    publish_recorded(event, duplicate, after)
+    local receipt = { kind = "Accepted", notice_id = fact.notice_id, message_id = fact.message_id,
+      epoch_id = fact.epoch_id, watermark = event.sequence }
+    send({ kind = "conversation.context.notice.accepted", command_id = body.command_id, request_id = body.request_id,
+      conversation_id = conversation_id, expected_watermark = body.expected_watermark, operation = kind, receipt = receipt, duplicate = duplicate })
+    return receipt
+  end
+
+  local function handle_compaction_cancel(body)
+    if replay_active() then return nil, { code = "replay_active" } end
+    local c = store:owned(body.conversation_id)
+    local op = c and c.compaction_by_id[body.request_id]
+    if not op or op.status ~= "pending" then
+      send({ kind = "conversation.context.compact.rejected", request_id = body.request_id,
+        conversation_id = body.conversation_id, code = "compaction_request_not_pending" })
+      return nil, { code = "compaction_request_not_pending" }
+    end
+    local after, duplicate, event = append_fact({
+      kind = "context_compaction_failed", event_id = "compaction:" .. body.request_id .. ":failed",
+      conversation_id = body.conversation_id, request_id = body.request_id,
+      epoch_id = op.epoch_id, history_id = domain.copy(op.history_id), provider = op.provider, model = op.model,
+      error = { code = "compaction_interrupted", message = body.reason or "Compaction interrupted" },
+    })
+    if not after then
+      send({ kind = "conversation.context.compact.rejected", request_id = body.request_id,
+        conversation_id = body.conversation_id, code = "compaction_rejected" })
+      return nil, { code = "compaction_rejected" }
+    end
+    send({ kind = "conversation.context.compact.cancelled", conversation_id = body.conversation_id,
+      request_id = body.request_id, sequence = event.sequence, duplicate = duplicate })
+    return { kind = "Accepted", request_id = body.request_id }
   end
 
   local function handle_active_set(body)
@@ -295,7 +406,7 @@ function M.build(options)
 
   local invocation_fields = {
     "model", "tools", "reasoning_effort", "provider_options", "output_schema",
-    "tool_specs", "invocation",
+    "tool_specs", "invocation", "notice_id", "epoch_id",
   }
 
   local function handle_provider_invoke(body)
@@ -308,6 +419,16 @@ function M.build(options)
     if not conversation then
       provider_rejection("invoke", body, "conversation_not_found")
       return
+    end
+    if type(body.context_watermark) == "number" and conversation.last_sequence < body.context_watermark then
+      provider_rejection("invoke", body, "conversation_watermark_stale")
+      return
+    end
+    for _, op in ipairs(conversation.compactions) do
+      if op.status == "pending" then
+        provider_rejection("invoke", body, "compaction_pending", { request_id = op.request_id })
+        return
+      end
     end
     local prior = active_invocations[body.request_id]
     if prior then
@@ -704,6 +825,12 @@ function M.build(options)
     if body.kind == "conversation.context.request" then handle_context(body); return end
     if body.kind == "conversation.active.set" then handle_active_set(body); return end
     if body.kind == "conversation.rewind.request" then handle_rewind_request(body); return end
+    if body.kind == "conversation.context.notice.append" then handle_notice(body, "context_notice_appended"); return end
+    if body.kind == "conversation.context.notice.bind" then handle_notice(body, "context_notice_included"); return end
+    if body.kind == "conversation.context.notice.acknowledge" then handle_notice(body, "context_notice_delivered"); return end
+    if body.kind == "conversation.context.compact.cancel" or body.kind == "conversation.context.compact.recover" then
+      handle_compaction_cancel(body); return
+    end
     if body.kind == "conversation.context.compact.request" then handle_compaction_request(body); return end
     if body.kind == "conversation.context.compact.complete" then
       handle_compaction_terminal(body, "context_compaction_completed"); return
@@ -722,6 +849,14 @@ function M.build(options)
   end
 
   return {
+    compaction = {
+      read = function(args) return reader:read(args) end,
+      append_notice = function(args) return handle_notice(args, "context_notice_appended") end,
+      bind_notice = function(args) return handle_notice(args, "context_notice_included") end,
+      acknowledge_notice = function(args) return handle_notice(args, "context_notice_delivered") end,
+      request_compaction = handle_compaction_request,
+      cancel_compaction = handle_compaction_cancel,
+    },
     name = "conversation-manager",
     receive_msg = receive_msg,
     send_msg = function(_) end,

@@ -34,6 +34,26 @@ and watchdog output beneath `tmp/prepared-tests/`. These artifacts are the
 evidence boundary for inventory, phase timing, process kind, failures, and
 timeouts.
 
+## Compaction consumer and process coverage
+
+`compaction_bridge` is a default target. Its consumer regression parses the
+root/profile snapshot shape through both Lua and Rust, compiles configuration
+agents against the current public MAG modules, and constructs the real lazy LLM
+factories with the asynchronous broker. `NEFOR_SOURCE_CONFIG` selects a source
+configuration directory for paired acceptance; without it, the target uses canonical
+profile nodes and a deterministic policy snapshot. Paired acceptance reads
+only model-profile and MAG sources, not provider authentication, and neither
+installs nor modifies configuration.
+
+`compaction_process` is full-only. It runs separate engine, MAG, tool-gate and
+native-mock processes with the shipped canonical manager and provider compositor.
+Its retained traces cover delayed/out-of-order write receipts, notice delivery,
+coalesced selves and gated siblings, hard/Disabled/unsupported/missing-capacity
+outcomes, successful native evidence without later usage, structured and dynamic
+workers, cancellation with late native results, and effects-free replay. These
+process witnesses complement the focused boundary/manager tests; an isolated
+synchronous facet fixture is not evidence for that transport claim.
+
 ## Explicit local-package process fixtures
 
 The CLI mock process tests copy the starter configuration into retained project

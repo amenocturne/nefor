@@ -21,7 +21,7 @@ M.declaration = {
   params = {
     model = "string", provider = "string",
     reasoning_effort = "string?",
-    provider_options = "table?",
+    provider_options = "table?", compaction_policy = "table?",
     system = "string?", tools = "table?", history = "table?", schema = "table",
     output_type = "string", error_type = "string",
     provider_error_type = "string",
@@ -257,6 +257,7 @@ function M.construct(id, params, emit, deps)
   end
   return boundary.construct(id, provider_params, emit, {
     conversation = deps.conversation,
+    compaction = deps.compaction,
     diagnostic = deps.diagnostic,
     name = "structured-output",
     on_turn_start = function(state)

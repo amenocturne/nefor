@@ -74,3 +74,7 @@ required-features = ["full-tests"]
 name = "structured_provider_e2e"
 path = "tests/structured_provider_e2e.rs"
 required-features = ["full-tests"]
+
+[[test]]
+name = "compaction_bridge"
+path = "tests/compaction_bridge.rs"

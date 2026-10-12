@@ -81,7 +81,7 @@ handlers.created = function(conversation, event)
     retries = {}, retry_by_id = {},
     turns = {}, turn_by_id = {},
     compactions = {}, compaction_by_id = {},
-    response_usages = {},
+    response_usages = {}, notice_facts = {}, notice_by_id = {}, initial_epoch_id = event.event_id,
     open_messages = 0, open_exchanges = 0,
     last_sequence = 0,
   }
@@ -390,6 +390,9 @@ handlers.turn_interrupted = finish_turn("interrupted")
 
 handlers.rewind_committed = function(c, event)
   local ok, e = require_live(c, event); if not ok then return nil, e end
+  for _, op in ipairs(c.compactions) do
+    if op.status == "pending" then return err("compaction_pending", { request_id = op.request_id }) end
+  end
   local open_turns = 0
   for _, turn in ipairs(c.turns) do
     if turn.status == "open" then open_turns = open_turns + 1 end
@@ -424,47 +427,202 @@ handlers.rewind_committed = function(c, event)
   return c
 end
 
+-- Policy is rebuilt from applicable facts so rewinding never manufactures an epoch.
+function M.policy_state(c, provider, model)
+  local state = { epoch_id = c.initial_epoch_id }
+  local facts = {}
+  for _, f in ipairs(c.notice_facts) do facts[#facts + 1] = f end
+  for _, op in ipairs(c.compactions) do
+    if op.status == "completed" then
+      facts[#facts + 1] = { kind = "context_compaction_completed", request_id = op.request_id,
+        history_id = op.history_id, sequence = op.terminal_sequence }
+    end
+  end
+  table.sort(facts, function(a, b) return a.sequence < b.sequence end)
+  local policy = require("libs.compaction-policy")
+  for _, f in ipairs(facts) do
+    if history_path.is_prefix(f.history_id, c.head)
+        and (f.kind == "context_compaction_completed" or provider == nil
+          or (f.provider == provider and f.model == model)) then
+      local scoped = copy(f)
+      scoped.history_id = history_path.key(c.head)
+      state = policy.reduce(state, scoped)
+    end
+  end
+  for _, notice in pairs(state.notices or {}) do notice.history_id = copy(c.head) end
+  if state.outstanding_notice then state.outstanding_notice.history_id = copy(c.head) end
+  return state
+end
+
+local function current_epoch(c)
+  local epoch = c.initial_epoch_id
+  for _, op in ipairs(c.compactions) do
+    if op.status == "completed" and history_path.is_prefix(op.history_id, c.head) then epoch = op.request_id end
+  end
+  return epoch
+end
+
+local function pair_matches(c, provider, model)
+  return (c.provenance.provider == nil or c.provenance.provider == provider)
+    and (c.provenance.model == nil or c.provenance.model == model)
+end
+
+local function finite(value)
+  return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+handlers.context_notice_appended = function(c, event)
+  local ok, e = require_live(c, event); if not ok then return nil, e end
+  for _, key in ipairs({ "notice_id", "message_id", "epoch_id", "provider", "model" }) do
+    ok, e = require_id(event, key); if not ok then return nil, e end
+  end
+  if c.notice_by_id[event.notice_id] then return err("notice_id_conflict") end
+  if c.open_messages ~= 0 or c.open_exchanges ~= 0 then return err("notice_while_active_exchange") end
+  if event.epoch_id ~= current_epoch(c) or not pair_matches(c, event.provider, event.model)
+      or not equal(event.history_id, c.head) then return err("stale_notice_binding") end
+  if event.expected_watermark ~= c.last_sequence then return err("stale_context_watermark") end
+  if not finite(event.milestone_percent) or not finite(event.measured_percent)
+      or not finite(event.total_tokens) or not finite(event.regular_window)
+      or event.regular_window <= 0 or event.total_tokens < 0 then return err("invalid_notice_data") end
+  for _, notice in pairs(c.notice_by_id) do
+    if not notice.delivered and notice.epoch_id == event.epoch_id
+        and notice.provider == event.provider and notice.model == event.model
+        and history_path.is_prefix(notice.history_id, c.head) then return err("notice_pending") end
+  end
+  local message = c.message_by_id[event.message_id]
+  if message then
+    if message.role ~= "system" or message.status ~= "completed"
+        or not history_path.is_prefix(message.history_id, c.head) then return err("invalid_notice_message") end
+  else
+    if type(event.text) ~= "string" or event.text == "" then return err("invalid_notice_text") end
+    local allocated, allocation_error = history_path.allocate(c.head, c.history_child_max)
+    if not allocated then return err(allocation_error) end
+    c.history_child_max[history_path.key(c.head)] = allocated[#allocated]
+    message = { id = event.message_id, role = "system", status = "completed",
+      visibility = "diagnostic", history_id = copy(allocated), chunks = { { kind = "text", data = event.text } },
+      exchange_ids = {}, attempts = {}, completed_sequence = event.sequence }
+    c.messages[#c.messages + 1] = message; c.message_by_id[message.id] = message
+    c.history_by_key[history_path.key(allocated)] = message; c.head = copy(allocated)
+  end
+  local recorded = copy(event)
+  recorded.text = nil
+  recorded.history_id = copy(message.history_id)
+  recorded.request_ids = {}
+  c.notice_by_id[event.notice_id] = recorded
+  c.notice_facts[#c.notice_facts + 1] = copy(recorded)
+  return c
+end
+
+local function notice_evidence(c, event, delivered)
+  local notice = c.notice_by_id[event.notice_id]
+  if not notice or event.epoch_id ~= current_epoch(c) or notice.epoch_id ~= event.epoch_id
+      or notice.provider ~= event.provider or notice.model ~= event.model
+      or not pair_matches(c, event.provider, event.model)
+      or not history_path.is_prefix(notice.history_id, c.head)
+      or not history_path.is_prefix(event.history_id, c.head)
+      or (not delivered and not equal(event.history_id, c.head)) then return err("stale_notice_binding") end
+  if not nonempty(event.request_id) then return err("invalid_request_id") end
+  if not finite(event.context_watermark) or event.context_watermark % 1 ~= 0
+      or event.context_watermark < notice.sequence or event.context_watermark > c.last_sequence then
+    return err("invalid_context_watermark")
+  end
+  local inclusion = (notice.inclusions or {})[event.request_id]
+  if delivered then
+    if not inclusion or inclusion.context_watermark ~= event.context_watermark
+        or not equal(inclusion.history_id, event.history_id) then return err("notice_request_mismatch") end
+    if notice.delivered then return err("notice_already_delivered") end
+    notice.delivered = true
+  else
+    if inclusion then return err("notice_request_conflict") end
+    if event.context_watermark ~= c.last_sequence then return err("stale_context_watermark") end
+    notice.inclusions = notice.inclusions or {}
+    notice.inclusions[event.request_id] = copy(event)
+    notice.request_ids[#notice.request_ids + 1] = event.request_id
+  end
+  local recorded = copy(event)
+  recorded.milestone_percent = notice.milestone_percent
+  recorded.message_id = notice.message_id
+  recorded.request_ids = copy(notice.request_ids)
+  c.notice_facts[#c.notice_facts + 1] = recorded
+  return c
+end
+handlers.context_notice_included = function(c, e) return notice_evidence(c, e, false) end
+handlers.context_notice_delivered = function(c, e) return notice_evidence(c, e, true) end
+
+local function prefix_messages(c)
+  local out = {}
+  for _, m in ipairs(c.messages) do
+    if history_path.is_prefix(m.history_id, c.head) and m.status ~= "open" and m.visibility ~= "discarded" then
+      out[#out + 1] = m
+    end
+  end
+  return out
+end
+
 handlers.context_compaction_requested = function(c, event)
   local ok, e = require_live(c, event); if not ok then return nil, e end
-  ok, e = require_id(event, "request_id"); if not ok then return nil, e end
-  ok, e = require_id(event, "provider"); if not ok then return nil, e end
-  if c.compaction_by_id[event.request_id] then
-    return err("compaction_request_conflict", { request_id = event.request_id })
+  for _, field in ipairs({ "request_id", "provider", "model", "epoch_id" }) do
+    ok, e = require_id(event, field); if not ok then return nil, e end
   end
-  if type(event.history_cutoff) ~= "number" or event.history_cutoff % 1 ~= 0 or event.history_cutoff < 0 then
-    return err("invalid_history_cutoff", { request_id = event.request_id, history_cutoff = event.history_cutoff })
+  if c.compaction_by_id[event.request_id] then return err("compaction_request_conflict") end
+  for _, op in ipairs(c.compactions) do
+    if op.status == "pending" then return err("compaction_pending", { request_id = op.request_id }) end
   end
-  local compaction = {
-    request_id = event.request_id,
-    status = "pending",
-    history_cutoff = event.history_cutoff,
-    history_id = copy(c.head),
-    requested_sequence = event.sequence,
-    provider = event.provider,
-    model = event.model,
-    provider_options = copy(event.provider_options),
+  if event.epoch_id ~= current_epoch(c) or not equal(event.history_id, c.head)
+      or not pair_matches(c, event.provider, event.model) then return err("stale_compaction_binding") end
+  if event.context_watermark ~= c.last_sequence then return err("stale_context_watermark") end
+  if event.trigger ~= "manual" and event.trigger ~= "self" and event.trigger ~= "hard" then return err("invalid_compaction_trigger") end
+  if event.trigger == "self" and not nonempty(event.tool_call_id) then return err("invalid_tool_call_id") end
+  if event.provider_options ~= nil and (type(event.provider_options) ~= "table" or json_data.is_array(event.provider_options)) then
+    return err("invalid_provider_options")
+  end
+  local all = prefix_messages(c)
+  local cutoff = event.history_cutoff
+  if not finite(cutoff) or cutoff % 1 ~= 0 or cutoff < 0 or cutoff > #all then return err("invalid_history_cutoff") end
+  local calls = {}
+  for index = 1, cutoff do
+    local message = all[index]
+    for _, id in ipairs(message.exchange_ids) do calls[c.exchange_by_id[id].tool_call_id] = true end
+    if message.role == "tool" then calls[message.tool_call_id] = nil end
+  end
+  if next(calls) then return err("unsafe_history_cutoff") end
+  c.compactions[#c.compactions + 1] = {
+    request_id = event.request_id, conversation_id = c.id, status = "pending", history_cutoff = cutoff,
+    history_id = copy(c.head), epoch_id = event.epoch_id, context_watermark = event.context_watermark,
+    trigger = event.trigger, tool_call_id = event.tool_call_id, requested_sequence = event.sequence,
+    provider = event.provider, model = event.model, provider_options = copy(event.provider_options),
   }
-  c.compactions[#c.compactions + 1] = compaction
-  c.compaction_by_id[compaction.request_id] = compaction
+  c.compaction_by_id[event.request_id] = c.compactions[#c.compactions]
   return c
 end
 
 local function finish_compaction(status)
   return function(c, event)
-    local ok, e = require_live(c, event); if not ok then return nil, e end
-    local compaction = c.compaction_by_id[event.request_id]
-    if not compaction then return err("compaction_request_not_found", { request_id = event.request_id }) end
-    if compaction.status ~= "pending" then
-      return err("compaction_request_terminal", { request_id = event.request_id, status = compaction.status })
+    local op = c.compaction_by_id[event.request_id]
+    if not op then return err("compaction_request_not_found") end
+    if op.status ~= "pending" then return err("compaction_request_terminal") end
+    if event.epoch_id ~= op.epoch_id or not equal(event.history_id, op.history_id)
+        or event.provider ~= op.provider or event.model ~= op.model
+        or current_epoch(c) ~= op.epoch_id or not history_path.is_prefix(op.history_id, c.head) then
+      return err("stale_compaction_binding")
     end
     if status == "completed" then
-      if event.checkpoint == nil then return err("missing_checkpoint", { request_id = event.request_id }) end
-      compaction.checkpoint = copy(event.checkpoint)
+      local cp, compatible = event.checkpoint, event.compatibility
+      if type(cp) ~= "table" or cp.provider ~= op.provider or cp.model ~= op.model
+          or not nonempty(cp.format) or cp.artifact == nil or type(compatible) ~= "table"
+          or compatible.provider ~= cp.provider or compatible.model ~= cp.model or compatible.format ~= cp.format then
+        return err("invalid_checkpoint")
+      end
+      local usage = event.optional_usage
+      if usage ~= nil and not require("libs.chat.context_usage").measurement(usage) then return err("invalid_response_usage") end
+      op.checkpoint = copy(cp); op.compatibility = copy(compatible); op.optional_usage = copy(usage)
     else
-      compaction.error = copy(event.error)
+      if type(event.error) ~= "table" or not nonempty(event.error.code) or type(event.error.message) ~= "string" then
+        return err("invalid_compaction_error")
+      end
+      op.error = copy(event.error)
     end
-    compaction.status = status
-    compaction.terminal_sequence = event.sequence
+    op.status = status; op.terminal_sequence = event.sequence
     return c
   end
 end
@@ -522,7 +680,7 @@ function M.read_model(conversation)
   local out = copy(conversation)
   out.message_by_id = nil; out.history_by_key = nil; out.history_child_max = nil
   out.exchange_by_id = nil; out.exchange_by_tool_call_id = nil
-  out.retry_by_id = nil; out.turn_by_id = nil; out.compaction_by_id = nil
+  out.retry_by_id = nil; out.turn_by_id = nil; out.compaction_by_id = nil; out.notice_by_id = nil
   out.open_messages = nil; out.open_exchanges = nil
   for _, message in ipairs(out.messages) do message.exchange_ids = nil end
   for _, turn in ipairs(out.turns) do turn.open_messages = nil end

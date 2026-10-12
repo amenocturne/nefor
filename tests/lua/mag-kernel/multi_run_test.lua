@@ -47,14 +47,35 @@ end
 -- emitted-wire helpers (the harness stub queues nefor.emit into __emitted)
 -- ------------------------------------------------------------------
 
+-- Drive the canonical owner while retaining every wire event for run-isolation assertions.
+local service = require("libs.conversation-manager.service").new()
+local manager = require("libs.conversation-manager.runtime").build({
+  service=service, json=nefor.json, now=function() return "t" end,
+  replay_active=function()return false end,
+  emit=function(payload)
+    local body=nefor.json.decode(payload).body
+    __emitted[#__emitted+1]=body
+    kernel.canonical_event("conversation-manager",body)
+  end,
+})
+
 local function drain_emitted()
   local out = {}
-  for i, body in ipairs(__emitted) do
-    out[i] = body
+  local cursor = 1
+  while cursor <= #__emitted do
+    local body = __emitted[cursor]
+    out[#out+1] = body
+    cursor = cursor + 1
+    if body.kind == "conversation.compaction.prepare.request" then
+      kernel.canonical_event(body.provider,{kind="conversation.compaction.prepared",
+        provider=body.provider,request_id=body.request_id,
+        outcome={kind="Ready",capability={kind="supported"}}})
+    elseif body.kind and body.kind:match("^conversation%.") then
+      manager.receive_msg({origin="mag",payload=nefor.json.encode({type="event",from="mag",body=body})})
+    end
+    kernel.pump_commands()
   end
-  for i = #__emitted, 1, -1 do
-    __emitted[i] = nil
-  end
+  for i = #__emitted, 1, -1 do __emitted[i] = nil end
   return out
 end
 

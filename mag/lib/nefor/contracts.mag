@@ -52,3 +52,9 @@ type ProcessResult {stdout: String, stderr: String, termination: ProcessTerminat
 let no_identifier: fn() -> OptionalIdentifier = | | => OptionalIdentifier {present: false, value: ""}
 
 let identifier: fn(String) -> OptionalIdentifier = |value| => OptionalIdentifier {present: true, value: value}
+
+// Shared authoring policy; provider settings remain separate. Disabled carries
+// explicit Unit so its serialized payload remains null.
+type CompactionThresholds {soft_percent: Float, step_percent: Float, hard_percent: Float}
+type CompactionPolicy = Disabled(Unit) | Thresholds(CompactionThresholds)
+let disabled_compaction = CompactionPolicy.Disabled(nil)

@@ -17,8 +17,12 @@ let reasoning_effort: fn(String) -> OptionalReasoningEffort = |value| => Optiona
 
 let no_reasoning_effort = OptionalReasoningEffort {present: false, value: ""}
 
+type CompactionThresholds = nefor.contracts.CompactionThresholds
+type CompactionPolicy = nefor.contracts.CompactionPolicy
+let disabled_compaction = nefor.contracts.disabled_compaction
+
 // A fixed provider and model written into the program.
-type ResolvedModel {provider: String, model: String, reasoning_effort: OptionalReasoningEffort}
+type ResolvedModel {compaction_policy: CompactionPolicy, provider: String, model: String, reasoning_effort: OptionalReasoningEffort}
 
 // The name of a profile that the runtime resolves to a provider and model
 // when a run starts.
@@ -40,7 +44,7 @@ type AgentConfig<M> {model: M, system: String, tools: List<String>, tool_approva
 // one; with any other O it returns a value of that type.
 let agent<M, I, O>: fn(String, fn(M) -> AuthoredModel, AgentConfig<M>) -> nefor.graph.Node<I, core.types.Result<nefor.contracts.AgentError, O>> = |id, resolve_model, config| => {
   let authored = resolve_model(get(config, "model"))
-  let fixed = match authored { case ResolvedModel(value) => value, case ModelProfile(value) => ResolvedModel {provider: "", model: "", reasoning_effort: no_reasoning_effort} }
+  let fixed = match authored { case ResolvedModel(value) => value, case ModelProfile(value) => ResolvedModel {compaction_policy: disabled_compaction, provider: "", model: "", reasoning_effort: no_reasoning_effort} }
   let profile = match authored { case ResolvedModel(value) => nefor.llm.no_model_profile, case ModelProfile(value) => nefor.llm.model_profile(get(value, "name")) }
   let effort = get(fixed, "reasoning_effort")
   nefor.llm.agent<I, O>(id, nefor.llm.AgentSpec {
@@ -48,6 +52,7 @@ let agent<M, I, O>: fn(String, fn(M) -> AuthoredModel, AgentConfig<M>) -> nefor.
     model: get(fixed, "model"),
     reasoning_effort: nefor.llm.OptionalReasoningEffort {present: get(effort, "present"), value: get(effort, "value")},
     model_profile: profile,
+    compaction_policy: get(fixed, "compaction_policy"),
     system: get(config, "system"),
     tools: get(config, "tools"),
     tool_approval_policy: get(config, "tool_approval_policy")
