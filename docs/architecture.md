@@ -30,6 +30,29 @@ inputs and review vocabulary are local nominal types; no library `Task` or
 `Text` shape controls entry adaptation or display. Source previews preserve
 compiler evidence, and generic records render as structured values.
 
+A model that authors MAG sees only the modules its configuration declares
+public. `libs.mag-context` takes `public_modules`, an ordered list of MAG source
+paths: a plain path is embedded verbatim in the `# MAG references` part of the
+prompt, and `{ path = ..., embed = false }` is listed with its path only, to be
+read when a task needs it. Each path must be a `.mag` or `.magl` file inside
+exactly one of the configured `module_roots`, which gives it the import name
+the compiler resolves; anything else fails at startup. Modules that are not
+listed stay importable but are never named in the prompt, so "private" means
+"not shown", not a language visibility rule. Put what authors write against,
+with a description comment next to each type and function, in a public module,
+and keep resolution tables, wiring, and lowering in modules beside it. The
+`nefor` facade is Nefor's public module: every name is an alias, so the
+comment above it restates the declaration it points at, and
+`crates/nefor-mag/tests/facade_surface.rs` keeps those comments equal to the
+real declarations. A type's nominal identity includes its defining module, so
+declarations stay where the runtime already names them.
+
+Toolset contents are shown from the configuration's own manifest, the
+`nefor/toolsets.json` its MAG bindings and tool policy already read.
+`libs.mag-context` takes `toolsets = { manifest = <path>, names = { { key,
+name }, ... } }`: the configuration supplies only the MAG expression an author
+writes for each manifest key, and the tool names are rendered from the file.
+
 `nefor.contracts.ProviderInput` and `TextAnswer` are deliberately different:
 their exact nominal identities select provider-context input and terminal-text
 output codecs. Failure and process-result contracts describe runtime facts.

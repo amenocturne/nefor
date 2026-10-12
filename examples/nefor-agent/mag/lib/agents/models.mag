@@ -1,0 +1,9 @@
+// Internal to agents: this example configuration's finite model vocabulary
+// and the concrete provider model each choice stands for. Nefor only asks for
+// one typed resolver; a constructor may author a concrete model or a
+// configuration-resolved run profile.
+import nefor.actors.{}
+
+type Model = Standard | Mock
+
+let resolve: fn(Model) -> nefor.actors.AuthoredModel = |model| => match model { case Standard => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "chatgpt", model: "gpt-5.6-sol", reasoning_effort: nefor.actors.reasoning_effort("medium")}), case Mock => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {provider: "mock-provider", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}) }

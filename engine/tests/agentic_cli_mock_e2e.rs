@@ -446,6 +446,23 @@ fn headless_starter_request_resume_tools_and_failures() {
         session_file.is_file(),
         "initial CLI input must open persistence"
     );
+    let recorded = std::fs::read_to_string(&session_file).unwrap();
+    for shown in [
+        "### Module `agents`",
+        "type AgentConfig {",
+        "/lib/nefor.mag` (read when needed)",
+        "`nefor.general_tools`:",
+        "- `mag-write-file`",
+    ] {
+        assert!(
+            recorded.contains(shown),
+            "the lead prompt shows the starter's public MAG surface: {shown}"
+        );
+    }
+    assert!(
+        !recorded.contains("- `agents.models`") && !recorded.contains("- `nefor.graph`"),
+        "internal MAG modules are not advertised to the lead"
+    );
 
     let resumed = run(
         &dir,

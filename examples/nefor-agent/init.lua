@@ -195,6 +195,20 @@ local mag_context = require("libs.mag-context").new {
     { name = "nefor-mag", path = MAG_PACKAGE_ROOT .. "/lib" },
     { name = "config", path = STARTER_ROOT .. "/mag/lib" },
   },
+  -- The configuration's own agent module is embedded: every workflow uses
+  -- it. The Nefor facade is listed with its path and read when a task needs
+  -- more than the quick guide shows.
+  public_modules = {
+    STARTER_ROOT .. "/mag/lib/agents.mag",
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor.mag", embed = false },
+  },
+  toolsets = {
+    manifest = STARTER_ROOT .. "/mag/lib/nefor/toolsets.json",
+    names = {
+      { key = "read_only", name = "nefor.read_only_tools" },
+      { key = "general", name = "nefor.general_tools" },
+    },
+  },
   trailing_sections = { build_runtime_context() },
 }
 
