@@ -1,5 +1,7 @@
-// Deliberate authoring facade. Protocol and lowering internals remain in
-// their direct modules. node_named and result_map avoid builtin collisions.
+// The Nefor workflow authoring surface: import nefor.{...} selects names from
+// this module. A workflow is a value of type Node<I, O>; building one runs
+// nothing. Every other nefor.* module is an internal detail behind these
+// names. The commented let or type line above a name restates its declaration.
 import nefor.actors.{}
 import nefor.artifact.{}
 import nefor.contracts.{}
@@ -13,154 +15,287 @@ import nefor.result.{}
 import nefor.shell.{}
 import nefor.worktree.{}
 
-type OptionalReasoningEffort = nefor.actors.OptionalReasoningEffort
+// ---- Nodes and the program result ----
 
-let reasoning_effort = nefor.actors.reasoning_effort
-
-let no_reasoning_effort = nefor.actors.no_reasoning_effort
-
-type ModelProfile = nefor.actors.ModelProfile
-
-let model_profile = nefor.actors.model_profile
-
-type ResolvedModel = nefor.actors.ResolvedModel
-
-type AuthoredModel = nefor.actors.AuthoredModel
-
-type AgentConfig<M> = nefor.actors.AgentConfig<M>
-
-type ApprovalConfig = nefor.human.ApprovalConfig
-
-type RetryGateConfig = nefor.actors.RetryGateConfig
-
-let agent = nefor.actors.agent
-
-let read_only_tools = nefor.actors.read_only_tools
-
-let general_tools = nefor.actors.general_tools
-
-let retry_gate = nefor.actors.retry_gate
-
-let approval_gate = nefor.human.approval_gate
-
-let compile_graph = nefor.artifact.compile_graph
-
-type ProviderInput = nefor.contracts.ProviderInput
-
-type TextAnswer = nefor.contracts.TextAnswer
-
-
-type ProviderError = nefor.contracts.ProviderError
-
-
-type AgentErrorReason = nefor.contracts.AgentErrorReason
-
-type AgentError = nefor.contracts.AgentError
-
-type ToolApprovalRules = nefor.contracts.ToolApprovalRules
-
-type ToolApprovalPolicy = nefor.contracts.ToolApprovalPolicy
-
-type Timeout = nefor.contracts.Timeout
-
-type ProcessExited = nefor.contracts.ProcessExited
-
-type ProcessSignaled = nefor.contracts.ProcessSignaled
-
-type ProcessTermination = nefor.contracts.ProcessTermination
-
-type ProcessResult = nefor.contracts.ProcessResult
-
-type RetryDecision<T> = nefor.contracts.RetryDecision<T>
-
-type DynamicList<T> = nefor.dynamic.DynamicList<T>
-
-type Indexed<T> = nefor.dynamic.Indexed<T>
-
-let context = nefor.dynamic.context
-
-let traverse = nefor.dynamic.traverse
-
+// A step that consumes an I and produces an O. Opaque: build nodes with the
+// functions below and combine them; never read or construct its fields.
 type Node<I, O> = nefor.graph.Node<I, O>
 
+// Ends a program: turns the finished workflow into the artifact that is run.
+// The workflow must start from Unit, so feed it from source or a command.
+// let compile_graph<O>: fn(Node<Unit, O>) -> Artifact
+let compile_graph = nefor.artifact.compile_graph
+
+// A node that emits one fixed value: the workflow's literal input.
+// let source<T>: fn(String, T) -> Node<Unit, T>
 let source = nefor.graph.source
 
+// A node that passes its input through unchanged; names a point to branch from.
+// let identity<T>: fn(String) -> Node<T, T>
 let identity = nefor.graph.identity
 
-let node_named = nefor.node.named
-
-let rename = nefor.node.rename
-
-let compose = nefor.node.compose
-
-let `>>>` = nefor.node.`>>>`
-
+// A node that drops its input and emits Unit.
+// let discard<T>: fn(String) -> Node<T, Unit>
 let discard = nefor.node.discard
 
+// ---- Combining nodes ----
+// Operators take no id; the named forms take the id of the combined node.
+
+// left >>> right: feed the left output to the right input.
+// let `>>>`<A, B, C>: fn(Node<A, B>, Node<B, C>) -> Node<A, C>
+let `>>>` = nefor.node.`>>>`
+// let compose<A, B, C>: fn(String, Node<A, B>, Node<B, C>) -> Node<A, C>
+let compose = nefor.node.compose
+
+// left *> right: run the Unit-input right node after the left; keep the right result.
+// let `*>`<I, A, B>: fn(Node<I, A>, Node<Unit, B>) -> Node<I, B>
+let `*>` = nefor.node.`*>`
+// let then<I, A, B>: fn(String, Node<I, A>, Node<Unit, B>) -> Node<I, B>
 let then = nefor.node.then
 
-let `*>` = nefor.node.`*>`
-
-let keep_left = nefor.node.keep_left
-
+// left <* right: run the Unit-input right node after the left; keep the left result.
+// let `<*`<I, A, B>: fn(Node<I, A>, Node<Unit, B>) -> Node<I, A>
+let `<*` = nefor.node.`<*`
+// let before<I, A, B>: fn(String, Node<I, A>, Node<Unit, B>) -> Node<I, A>
 let before = nefor.node.before
 
+// left &&& right: send one input to both nodes and pair their outputs.
+// let `&&&`<I, A, B>: fn(Node<I, A>, Node<I, B>) -> Node<I, (A, B)>
+let `&&&` = nefor.node.`&&&`
+// let fanout<I, A, B>: fn(String, Node<I, A>, Node<I, B>) -> Node<I, (A, B)>
 let fanout = nefor.node.fanout
 
-let `&&&` = nefor.node.`&&&`
-
+// left *** right: map the two halves of a pair through two nodes.
+// let `***`<A, B, C, D>: fn(Node<A, B>, Node<C, D>) -> Node<(A, C), (B, D)>
+let `***` = nefor.node.`***`
+// let parallel<A, B, C, D>: fn(String, Node<A, B>, Node<C, D>) -> Node<(A, C), (B, D)>
 let parallel = nefor.node.parallel
 
-let `***` = nefor.node.`***`
+// The first half of a pair.
+// let keep_left<A, B>: fn(String) -> Node<(A, B), A>
+let keep_left = nefor.node.keep_left
 
+// left +++ right: route Either.Left to one node and Either.Right to the other.
+// let `+++`<A, B, C, D>: fn(Node<A, C>, Node<B, D>) -> Node<Either<A, B>, Either<C, D>>
+let `+++` = nefor.node.`+++`
+// let choose<A, B, C, D>: fn(String, Node<A, C>, Node<B, D>) -> Node<Either<A, B>, Either<C, D>>
 let choose = nefor.node.choose
 
-let `+++` = nefor.node.`+++`
-
+// Give one input to every node of a list fixed when the program is written;
+// the outputs come back as a list in the same order.
+// let sequence<I, O>: fn(List<Node<I, O>>) -> Node<I, List<O>>
 let sequence = nefor.node.sequence
 
-let join = nefor.path.join
+// Wrap a node as one named, expandable step of the run display.
+// let node_named<I, O>: fn(String, Node<I, O>) -> Node<I, O>
+let node_named = nefor.node.named
 
-let cwd = nefor.process.cwd
+// Change the displayed name of a node without adding a level.
+// let rename<I, O>: fn(String, Node<I, O>) -> Node<I, O>
+let rename = nefor.node.rename
 
-type ProcessExecParams = nefor.process.ProcessExecParams
+// ---- Result-carrying nodes ----
+// Agents produce Result<AgentError, O>. These continue the Ok value and pass
+// an Error through untouched. The _named forms take the id of the new step.
 
-let exec = nefor.process.exec
-
+// Put a node that cannot fail into the Result channel as Ok.
+// let lift<I, E, O>: fn(String, Node<I, O>) -> Node<I, Result<E, O>>
 let lift = nefor.result.lift
 
+// Continue an Ok value with a node that itself produces a Result.
+// let and_then<I, E, A, B>: fn(String, Node<I, Result<E, A>>, Node<A, Result<E, B>>) -> Node<I, Result<E, B>>
 let and_then = nefor.result.and_then
+// let `>=>`<I, E, A, B>: fn(Node<I, Result<E, A>>, Node<A, Result<E, B>>) -> Node<I, Result<E, B>>
+let `>=>` = nefor.result.`>=>`
 
+// Continue an Ok value with a node that cannot fail.
+// let result_map<I, E, A, B>: fn(Node<I, Result<E, A>>, Node<A, B>) -> Node<I, Result<E, B>>
+let result_map = nefor.result.map
+// let result_map_named<I, E, A, B>: fn(String, Node<I, Result<E, A>>, Node<A, B>) -> Node<I, Result<E, B>>
 let result_map_named = nefor.result.map_named
 
-let result_map = nefor.result.map
-
+// Transform only the Error value.
+// let map_error<I, E, F, A>: fn(Node<I, Result<E, A>>, Node<E, F>) -> Node<I, Result<F, A>>
+let map_error = nefor.result.map_error
+// let map_error_named<I, E, F, A>: fn(String, Node<I, Result<E, A>>, Node<E, F>) -> Node<I, Result<F, A>>
 let map_error_named = nefor.result.map_error_named
 
-let map_error = nefor.result.map_error
+// ---- Collections whose size is known only when the workflow runs ----
 
+// An ordered collection produced item by item at run time. An agent whose
+// output type is DynamicList<T> emits the items; it is never built by hand.
+type DynamicList<T> = nefor.dynamic.DynamicList<T>
+
+// One item of a DynamicList together with its position.
+// type Indexed<T> {collection: String, index: Int, value: T}
+type Indexed<T> = nefor.dynamic.Indexed<T>
+
+// Run one copy of the worker node for every item of a DynamicList.
+// let traverse<I, O>: fn(String, Node<I, O>) -> Node<DynamicList<I>, DynamicList<O>>
+let traverse = nefor.dynamic.traverse
+
+// Wait for a complete DynamicList and hand all items, in order, to one agent
+// as its input turn.
+// let context<T>: fn(String) -> Node<DynamicList<T>, ProviderInput>
+let context = nefor.dynamic.context
+
+// ---- Commands ----
+
+// How long a command may run; a bounded value must be positive.
+// type Timeout = Unlimited | Milliseconds(Int) | Seconds(Int) | Minutes(Int)
+type Timeout = nefor.contracts.Timeout
+
+// type ShellScriptParams {script: String, cwd: String, timeout: Timeout}
 type ShellScriptParams = nefor.shell.ShellScriptParams
 
+// Run a POSIX shell script in cwd.
+// let script: fn(String, ShellScriptParams) -> Node<Unit, ProcessResult>
 let script = nefor.shell.script
 
+// type ProcessExecParams {argv: List<String>, cwd: String, timeout: Timeout}
+type ProcessExecParams = nefor.process.ProcessExecParams
+
+// Run one program directly, without a shell: argv is the program and its arguments.
+// let exec: fn(String, ProcessExecParams) -> Node<Unit, ProcessResult>
+let exec = nefor.process.exec
+
+// The String naming the directory the runtime was started in, for a cwd field.
+let cwd = nefor.process.cwd
+
+// Join two path segments with "/"; purely textual.
+// let join: fn(String, String) -> String
+let join = nefor.path.join
+
+// What a command produced. A non-zero exit code is still a ProcessResult.
+// type ProcessResult {stdout: String, stderr: String, termination: ProcessTermination}
+type ProcessResult = nefor.contracts.ProcessResult
+
+// type ProcessTermination = ProcessExited(ProcessExited) | ProcessSignaled(ProcessSignaled)
+type ProcessTermination = nefor.contracts.ProcessTermination
+
+// type ProcessExited {code: Int}
+type ProcessExited = nefor.contracts.ProcessExited
+
+// type ProcessSignaled {signal: Int}
+type ProcessSignaled = nefor.contracts.ProcessSignaled
+
+// ---- Git worktrees ----
+
+// type CreateSpec {repository: String, path: String, branch: String, base: String}
 type CreateSpec = nefor.worktree.CreateSpec
 
-type OpenSpec = nefor.worktree.OpenSpec
-
-type Worktree = nefor.worktree.Worktree
-
-type WorktreeError = nefor.worktree.WorktreeError
-
+// Create a new worktree at path on a new branch starting from base.
+// let create: fn(String, CreateSpec) -> Node<Unit, Worktree>
 let create = nefor.worktree.create
 
+// type OpenSpec {repository: String, path: String, branch: String}
+type OpenSpec = nefor.worktree.OpenSpec
+
+// Reuse a worktree that already exists at path on branch.
+// let open: fn(String, OpenSpec) -> Node<Unit, Worktree>
 let open = nefor.worktree.open
 
-type HumanWorkflowApproval = nefor.human.HumanWorkflowApproval
+// type Worktree {repository: String, path: String, branch: String, head: String}
+type Worktree = nefor.worktree.Worktree
 
-type HumanWorkflowRejection = nefor.human.HumanWorkflowRejection
+// type WorktreeError {operation: String, kind: String, message: String}
+type WorktreeError = nefor.worktree.WorktreeError
 
+// ---- Agent inputs, outputs and errors ----
+// A configuration's own agent module builds agents from the definitions in
+// the last section. A workflow uses that module and these types.
+
+// The output type of an agent that answers in plain text. With any other
+// output type the agent returns a value of that type.
+// newtype TextAnswer = String
+type TextAnswer = nefor.contracts.TextAnswer
+
+// A ready-made input turn for an agent, as produced by context.
+// type ProviderInput {content: JsonValue}
+type ProviderInput = nefor.contracts.ProviderInput
+
+// Why an agent ended without a result.
+// type AgentError {last_output: JsonValue, reason: AgentErrorReason}
+type AgentError = nefor.contracts.AgentError
+
+// type AgentErrorReason = ProviderError(ProviderError)
+type AgentErrorReason = nefor.contracts.AgentErrorReason
+
+// type ProviderError {message: String, detail: OptionalIdentifier}
+type ProviderError = nefor.contracts.ProviderError
+
+// Default selects the runtime's configured approval behaviour for the
+// agent's tool calls.
+// type ToolApprovalPolicy = Default | Rules(ToolApprovalRules)
+type ToolApprovalPolicy = nefor.contracts.ToolApprovalPolicy
+
+// type ToolApprovalRules {rules: Map<String, String>}
+type ToolApprovalRules = nefor.contracts.ToolApprovalRules
+
+// The configuration's ready-made tool lists for an agent's tools field; each
+// is a List<String> of tool names.
+let general_tools = nefor.actors.general_tools
+let read_only_tools = nefor.actors.read_only_tools
+
+// ---- Retrying and human approval ----
+
+// type RetryGateConfig {max_retries: Int}
+type RetryGateConfig = nefor.actors.RetryGateConfig
+
+// type RetryDecision<T> = Continue(T) | Exhausted(T)
+type RetryDecision<T> = nefor.contracts.RetryDecision<T>
+
+// Bound a retry loop: the first max_retries values pass as Continue, the
+// next one comes out as Exhausted.
+// let retry_gate<T>: fn(String, RetryGateConfig) -> Node<T, RetryDecision<T>>
+let retry_gate = nefor.actors.retry_gate
+
+// type ApprovalConfig {prompt: String}
+type ApprovalConfig = nefor.human.ApprovalConfig
+
+// Show the incoming text to the person running the workflow, labelled with
+// prompt, and wait for their decision.
+// let approval_gate: fn(String, ApprovalConfig) -> Node<TextAnswer, HumanWorkflowDecision>
+let approval_gate = nefor.human.approval_gate
+
+// type HumanWorkflowDecision = Approved(HumanWorkflowApproval) | Rejected(HumanWorkflowRejection)
 type HumanWorkflowDecision = nefor.human.HumanWorkflowDecision
 
-let `<*` = nefor.node.`<*`
+// type HumanWorkflowApproval {content: String}
+type HumanWorkflowApproval = nefor.human.HumanWorkflowApproval
 
-let `>=>` = nefor.result.`>=>`
+// type HumanWorkflowRejection {reason: String}
+type HumanWorkflowRejection = nefor.human.HumanWorkflowRejection
+
+// ---- For a configuration's agent module ----
+// Workflows do not use these directly: a configuration wraps them in its own
+// module with its own model names.
+
+// M is the configuration's model vocabulary.
+// type AgentConfig<M> {model: M, system: String, tools: List<String>, tool_approval_policy: ToolApprovalPolicy}
+type AgentConfig<M> = nefor.actors.AgentConfig<M>
+
+// Build an agent node. The second argument turns the configuration's model
+// value into a concrete model or a named run profile.
+// let agent<M, I, O>: fn(String, fn(M) -> AuthoredModel, AgentConfig<M>) -> Node<I, Result<AgentError, O>>
+let agent = nefor.actors.agent
+
+// type AuthoredModel = ResolvedModel(ResolvedModel) | ModelProfile(ModelProfile)
+type AuthoredModel = nefor.actors.AuthoredModel
+
+// A fixed provider and model written into the program.
+// type ResolvedModel {provider: String, model: String, reasoning_effort: OptionalReasoningEffort}
+type ResolvedModel = nefor.actors.ResolvedModel
+
+// A profile name the runtime resolves to a provider and model for each run.
+// type ModelProfile {name: String}
+type ModelProfile = nefor.actors.ModelProfile
+// let model_profile: fn(String) -> ModelProfile
+let model_profile = nefor.actors.model_profile
+
+// type OptionalReasoningEffort {present: Bool, value: String}
+type OptionalReasoningEffort = nefor.actors.OptionalReasoningEffort
+// let reasoning_effort: fn(String) -> OptionalReasoningEffort
+let reasoning_effort = nefor.actors.reasoning_effort
+// The OptionalReasoningEffort that selects no effort.
+let no_reasoning_effort = nefor.actors.no_reasoning_effort
