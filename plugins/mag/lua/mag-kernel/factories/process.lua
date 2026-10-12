@@ -7,7 +7,7 @@ local FAILURE_WIRE = "nefor.process.CapabilityFailed"
 local INPUTS = { "nefor.process.Input" }
 
 local RESULT_TYPE = { kind="named", name="nefor.contracts.ProcessResult", arguments={} }
-local FAILURE_TYPE = { kind="named", name="nefor.contracts.ProcessFailure", arguments={} }
+local FAILURE_TYPE = { kind="named", name="nefor.wire.ProcessFailure", arguments={} }
 local INPUT_TYPE = {kind="primitive",name="Unit"}
 
 local function timeout_ms(timeout, actor)

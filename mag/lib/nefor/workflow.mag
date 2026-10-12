@@ -1,0 +1,104 @@
+// Building a workflow out of nodes. A node is a value that describes one
+// step; building or combining nodes runs nothing. The program ends by
+// handing the finished workflow to compile_graph.
+//
+// Every function that takes a String first uses it as the id of the node it
+// returns; ids must be unique within one program. The operators take no id.
+import core.types.{}
+
+import nefor.artifact.{}
+
+import nefor.graph.{}
+
+import nefor.node.{}
+
+import nefor.result.{}
+
+// A step that consumes an I and produces an O. Opaque: build nodes with the
+// functions of the nefor modules and combine them here; never read or
+// construct its fields.
+type Node<I, O> = nefor.graph.Node<I, O>
+
+// Ends a program: turns the finished workflow into the artifact that is run.
+// The workflow must start from Unit, so begin it with source or with a step
+// that takes no input, such as a command.
+let compile_graph<O>: fn(Node<Unit, O>) -> Artifact = |workflow| => nefor.artifact.compile_graph(workflow)
+
+// A node that emits one fixed value: the workflow's literal input.
+let source<T>: fn(String, T) -> Node<Unit, T> = |id, value| => nefor.graph.source(id, value)
+
+// A node that passes its input through unchanged; names a point to branch from.
+let identity<T>: fn(String) -> Node<T, T> = |id| => nefor.graph.identity<T>(id)
+
+// A node that drops its input and emits Unit.
+let discard<T>: fn(String) -> Node<T, Unit> = |id| => nefor.node.discard<T>(id)
+
+// ---- Combining nodes ----
+
+// left >>> right: feed the left output to the right input.
+let `>>>`<A, B, C>: fn(Node<A, B>, Node<B, C>) -> Node<A, C> = |left, right| => nefor.node.`>>>`(left, right)
+
+let compose<A, B, C>: fn(String, Node<A, B>, Node<B, C>) -> Node<A, C> = |id, left, right| => nefor.node.compose(id, left, right)
+
+// left *> right: run the Unit-input right node after the left; keep the right result.
+let `*>`<I, A, B>: fn(Node<I, A>, Node<Unit, B>) -> Node<I, B> = |left, right| => nefor.node.`*>`(left, right)
+
+let then<I, A, B>: fn(String, Node<I, A>, Node<Unit, B>) -> Node<I, B> = |id, left, right| => nefor.node.then(id, left, right)
+
+// left <* right: run the Unit-input right node after the left; keep the left result.
+let `<*`<I, A, B>: fn(Node<I, A>, Node<Unit, B>) -> Node<I, A> = |left, right| => nefor.node.`<*`(left, right)
+
+let before<I, A, B>: fn(String, Node<I, A>, Node<Unit, B>) -> Node<I, A> = |id, left, right| => nefor.node.before(id, left, right)
+
+// left &&& right: send one input to both nodes and pair their outputs. The
+// pair is emitted once both are done.
+let `&&&`<I, A, B>: fn(Node<I, A>, Node<I, B>) -> Node<I, (A, B)> = |left, right| => nefor.node.`&&&`(left, right)
+
+let fanout<I, A, B>: fn(String, Node<I, A>, Node<I, B>) -> Node<I, (A, B)> = |id, left, right| => nefor.node.fanout(id, left, right)
+
+// left *** right: map the two halves of a pair through two nodes.
+let `***`<A, B, C, D>: fn(Node<A, B>, Node<C, D>) -> Node<(A, C), (B, D)> = |left, right| => nefor.node.`***`(left, right)
+
+let parallel<A, B, C, D>: fn(String, Node<A, B>, Node<C, D>) -> Node<(A, C), (B, D)> = |id, left, right| => nefor.node.parallel(id, left, right)
+
+// The first half of a pair.
+let keep_left<A, B>: fn(String) -> Node<(A, B), A> = |id| => nefor.node.keep_left<A, B>(id)
+
+// left +++ right: route Either.Left to the left node and Either.Right to the
+// right node; only the selected one runs.
+let `+++`<A, B, C, D>: fn(Node<A, C>, Node<B, D>) -> Node<core.types.Either<A, B>, core.types.Either<C, D>> = |left, right| => nefor.node.`+++`(left, right)
+
+let choose<A, B, C, D>: fn(String, Node<A, C>, Node<B, D>) -> Node<core.types.Either<A, B>, core.types.Either<C, D>> = |id, left, right| => nefor.node.choose(id, left, right)
+
+// Give one input to every node of a list that is fixed when the program is
+// written; the outputs come back as a list in the same order.
+let sequence<I, O>: fn(List<Node<I, O>>) -> Node<I, List<O>> = |nodes| => nefor.node.sequence(nodes)
+
+// Wrap a node as one named, expandable step of the run display.
+let node_named<I, O>: fn(String, Node<I, O>) -> Node<I, O> = |id, node| => nefor.node.named(id, node)
+
+// Change the displayed name of a node without adding a level.
+let rename<I, O>: fn(String, Node<I, O>) -> Node<I, O> = |id, node| => nefor.node.rename(id, node)
+
+// ---- Nodes that carry a Result ----
+// An agent produces core.types.Result<AgentError, O>. These continue the Ok
+// value and pass an Error through untouched.
+
+// Put a node that cannot fail into the Result channel as Ok.
+let lift<I, E, O>: fn(String, Node<I, O>) -> Node<I, core.types.Result<E, O>> = |id, node| => nefor.result.lift<I, E, O>(id, node)
+
+// Continue an Ok value with a node that itself produces a Result.
+let and_then<I, E, A, B>: fn(String, Node<I, core.types.Result<E, A>>, Node<A, core.types.Result<E, B>>) -> Node<I, core.types.Result<E, B>> = |id, left, right| => nefor.result.and_then(id, left, right)
+
+// left >=> right: and_then without an id of its own.
+let `>=>`<I, E, A, B>: fn(Node<I, core.types.Result<E, A>>, Node<A, core.types.Result<E, B>>) -> Node<I, core.types.Result<E, B>> = |left, right| => nefor.result.`>=>`(left, right)
+
+// Continue an Ok value with a node that cannot fail.
+let result_map<I, E, A, B>: fn(Node<I, core.types.Result<E, A>>, Node<A, B>) -> Node<I, core.types.Result<E, B>> = |result, node| => nefor.result.map(result, node)
+
+let result_map_named<I, E, A, B>: fn(String, Node<I, core.types.Result<E, A>>, Node<A, B>) -> Node<I, core.types.Result<E, B>> = |id, result, node| => nefor.result.map_named(id, result, node)
+
+// Transform only the Error value.
+let map_error<I, E, F, A>: fn(Node<I, core.types.Result<E, A>>, Node<E, F>) -> Node<I, core.types.Result<F, A>> = |result, node| => nefor.result.map_error(result, node)
+
+let map_error_named<I, E, F, A>: fn(String, Node<I, core.types.Result<E, A>>, Node<E, F>) -> Node<I, core.types.Result<F, A>> = |id, result, node| => nefor.result.map_error_named(id, result, node)

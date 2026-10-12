@@ -80,7 +80,7 @@ local function program()
   local provider_input = named("nefor.contracts.ProviderInput")
   local text_answer = named("nefor.contracts.TextAnswer")
   local agent_error = named("nefor.contracts.AgentError")
-  local tool_calls = named("nefor.contracts.ToolCalls")
+  local tool_calls = named("nefor.wire.ToolCalls")
   local result_type = {kind="adt",name="core.types.Result",
     arguments=array({agent_error,text_answer}),constructors=array({
       {name="Error",payload=agent_error},{name="Ok",payload=text_answer},

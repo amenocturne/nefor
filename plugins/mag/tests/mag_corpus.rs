@@ -516,12 +516,12 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
         temp_root.join("retry-gate-graph.mag"),
         r#"import nefor.artifact.{}
 import core.types.{}
-import nefor.actors.{}
+import nefor.retry.{}
 import nefor.contracts.{}
 import nefor.graph.{}
 type InvestigationInput {prompt: String}
 let start = nefor.graph.source("start", InvestigationInput {prompt: "retry"})
-let gate = nefor.actors.retry_gate<InvestigationInput>("retry", nefor.actors.RetryGateConfig {max_retries: 3})
+let gate = nefor.retry.retry_gate<InvestigationInput>("retry", nefor.retry.RetryGateConfig {max_retries: 3})
 let result = nefor.graph.output_for("result", gate)
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, gate), nefor.graph.edge(gate, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)"#,
     )

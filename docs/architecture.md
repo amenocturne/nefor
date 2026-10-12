@@ -23,9 +23,10 @@ and post-compilation function application are not part of version 4.
 
 ## MAG authoring and runtime protocol ownership
 
-The `nefor` facade is an explicit authoring allowlist. Low-level graph editing,
-factory parameters, tool wires, template machinery, and normalization records
-remain available through their direct modules, not the facade. Application
+The `nefor` facade is an explicit authoring allowlist over the public modules.
+Low-level graph editing, factory parameters, tool wires, template machinery, and
+normalization records remain available through their private modules, not the
+facade. Application
 inputs and review vocabulary are local nominal types; no library `Task` or
 `Text` shape controls entry adaptation or display. Source previews preserve
 compiler evidence, and generic records render as structured values.
@@ -40,12 +41,26 @@ the compiler resolves; anything else fails at startup. Modules that are not
 listed stay importable but are never named in the prompt, so "private" means
 "not shown", not a language visibility rule. Put what authors write against,
 with a description comment next to each type and function, in a public module,
-and keep resolution tables, wiring, and lowering in modules beside it. The
-`nefor` facade is Nefor's public module: every name is an alias, so the
-comment above it restates the declaration it points at, and
-`crates/nefor-mag/tests/facade_surface.rs` keeps those comments equal to the
-real declarations. A type's nominal identity includes its defining module, so
-declarations stay where the runtime already names them.
+and keep resolution tables, wiring, and lowering in modules beside it.
+
+Nefor's own library follows the same cut. Its public modules hold the real
+declarations authors write against: `nefor.contracts` (the data agents and
+commands exchange), `nefor.workflow` (nodes, combinators, the Result channel),
+`nefor.shell`, `nefor.process`, `nefor.path`, `nefor.worktree`,
+`nefor.collections`, `nefor.retry`, `nefor.human`, and `nefor.actors` (agent
+construction for a configuration's agent module). The `nefor` facade only
+re-exports their names for `import nefor.{...}`. Graph construction, lowering,
+and actor wiring are private: `nefor.graph`, `nefor.node`, `nefor.result`,
+`nefor.dynamic`, `nefor.artifact`, `nefor.mag`, `nefor.llm` (the actors behind
+an agent), `nefor.capability` (single-actor nodes, factory identities and
+parameter records), `nefor.wire` (tool-call values and runtime records),
+`nefor.timeout`, and `nefor.toolsets`. Imports only point downwards: a private
+module may import a public module that declares types only
+(`nefor.contracts`), and never one that declares functions, so a private
+builder that carries an authored type takes it as a type argument. A type's
+nominal identity includes its defining module, so moving a declaration renames
+the type for the kernel as well; `Node` and `DynamicList` stay declared in
+their private modules and are opaque aliases in the public ones.
 
 Toolset contents are shown from the configuration's own manifest, the
 `nefor/toolsets.json` its MAG bindings and tool policy already read.

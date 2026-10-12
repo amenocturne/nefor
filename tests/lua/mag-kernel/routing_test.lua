@@ -791,7 +791,7 @@ do
   local retry_gate = require("factories.retry-gate")
   local prior_semantic_type = nefor.semantic_type
   local answer = { kind = "named", name = "test.Answer", arguments = {} }
-  local decision = { kind = "adt", name = "nefor.contracts.RetryDecision",
+  local decision = { kind = "adt", name = "nefor.retry.RetryDecision",
     arguments = { answer }, constructors = {
       { name = "Continue", payload = answer },
       { name = "Exhausted", payload = answer },
@@ -805,7 +805,7 @@ do
     end,
     input_covered_by = function() return true end,
     validate_value = function(expected, value)
-      local valid = expected.name == "nefor.contracts.RetryDecision"
+      local valid = expected.name == "nefor.retry.RetryDecision"
         and type(value) == "table" and value.value ~= nil
         and (value.constructor == "Continue" or value.constructor == "Exhausted")
       return valid and { ok = true } or {

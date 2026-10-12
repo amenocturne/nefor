@@ -1,0 +1,15 @@
+// Bounding a retry loop.
+import nefor.capability.{}
+
+import nefor.graph.{}
+
+type RetryGateConfig {max_retries: Int}
+
+// Continue carries a value that may be tried again; Exhausted carries the
+// value that arrived after the allowed retries were used up.
+type RetryDecision<T> = Continue(T) | Exhausted(T)
+
+// A node that counts the values passing through it: the first max_retries
+// come out as Continue, the next one as Exhausted, and later ones are dropped.
+let retry_gate<T>: fn(String, RetryGateConfig) -> nefor.graph.Node<T, RetryDecision<T>> = |id, config| =>
+  nefor.capability.retry_gate<T, RetryDecision<T>>(id, get(config, "max_retries"))

@@ -1,59 +1,54 @@
-// Runtime-facing protocol values and authored mechanism selections. Factory
-// identities and actor parameter records live with their constructors.
-import core.map.{}
+// The data that workflows exchange with agents and commands: what an agent
+// takes and returns, how its tool calls are approved, and what a command
+// produces. Types only; the nodes that use them are in the other nefor
+// modules.
 
-import core.types.{}
-
-type ProviderInput {content: JsonValue}
-
-// Direct-text codec: provider terminal text is the value. Unlike every other
-// named contract, this exact nominal type bypasses structured JSON.
+// The output type of an agent that answers in plain text. With any other
+// output type the agent returns a value of that type.
 newtype TextAnswer = String
 
-type ToolCall {name: String, arguments: JsonValue}
+// A ready-made input turn for an agent. An agent whose input type is
+// ProviderInput receives the content as it is; any other input type is
+// presented to the agent as its task.
+type ProviderInput {content: JsonValue}
 
-type ToolCalls {calls: List<ToolCall>}
-
-type ToolHandle {results: JsonValue}
-
-
+// A string that may be absent: value is meaningful only when present is true.
 type OptionalIdentifier {present: Bool, value: String}
 
+// What the model provider reported when a request failed.
 type ProviderError {message: String, detail: OptionalIdentifier}
 
-
+// Why an agent ended without a result.
 type AgentErrorReason = ProviderError(ProviderError)
 
+// The Error side of every agent's Result: the reason, and the last output
+// the agent drafted before it stopped (JSON null when there was none).
 type AgentError {last_output: JsonValue, reason: AgentErrorReason}
 
-// Default selects the configured approval behavior, never a bypass. Rules
-// carries mechanism-neutral per-agent approval-rule metadata.
+// Per-agent approval metadata: a map from a tool name to a rule name. The
+// runtime carries it with the agent's tool calls; it is not an execution
+// barrier by itself.
 type ToolApprovalRules {rules: Map<String, String>}
 
+// How an agent's tool calls are approved. Default selects the runtime's
+// configured approval behaviour, never a bypass.
 type ToolApprovalPolicy = Default | Rules(ToolApprovalRules)
 
-type ToolApprovalRuntimeRules {rules: Map<String, String>}
-
+// How long a command may run. A bounded value must be strictly positive.
 type Timeout = Unlimited | Milliseconds(Int) | Seconds(Int) | Minutes(Int)
 
+// A command that ended by itself, with its exit code.
 type ProcessExited {code: Int}
 
+// A command that was ended by a signal.
 type ProcessSignaled {signal: Int}
 
 type ProcessTermination = ProcessExited(ProcessExited) | ProcessSignaled(ProcessSignaled)
 
+// What a command produced. A non-zero exit code is still a ProcessResult, not
+// a failure of the workflow.
 type ProcessResult {stdout: String, stderr: String, termination: ProcessTermination}
-
-type ProcessFailure {operation: String, error: String}
-
-type RetryDecision<T> = Continue(T) | Exhausted(T)
 
 let no_identifier: fn() -> OptionalIdentifier = | | => OptionalIdentifier {present: false, value: ""}
 
 let identifier: fn(String) -> OptionalIdentifier = |value| => OptionalIdentifier {present: true, value: value}
-
-
-let normalize_tool_approval_policy: fn(ToolApprovalPolicy) -> ToolApprovalRuntimeRules = |policy| => match policy {
-  case Default => ToolApprovalRuntimeRules {rules: core.map.empty<String, String>()},
-  case Rules(policy_rules) => ToolApprovalRuntimeRules {rules: get(policy_rules, "rules")},
-}

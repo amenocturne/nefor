@@ -1,3 +1,5 @@
-// Lexical composition only: parent traversal and absolute-looking segments are
-// deliberately preserved rather than confined or canonicalized.
+// Building paths for cwd and worktree fields.
+
+// Joins two segments with "/". Purely textual: parent traversal and
+// absolute-looking segments are kept as written, not confined or resolved.
 let join: fn(String, String) -> String = |base, segment| => if (=)(base, "") then segment else if (=)(segment, "") then base else str(str(base, "/"), segment)

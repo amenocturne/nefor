@@ -68,10 +68,10 @@ local M = {}
 M.declaration = {
   name = "run-tool",
   semantic = {
-    input={kind="named",name="nefor.contracts.ToolCalls",arguments={}},
-    output={kind="named",name="nefor.contracts.ToolHandle",arguments={}},
-    inputs={{wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}}},
-    outputs={{wire="generic-tool.ToolHandle",type={kind="named",name="nefor.contracts.ToolHandle",arguments={}}}},
+    input={kind="named",name="nefor.wire.ToolCalls",arguments={}},
+    output={kind="named",name="nefor.wire.ToolHandle",arguments={}},
+    inputs={{wire="generic-tool.ToolCalls",type={kind="named",name="nefor.wire.ToolCalls",arguments={}}}},
+    outputs={{wire="generic-tool.ToolHandle",type={kind="named",name="nefor.wire.ToolHandle",arguments={}}}},
   },
 
   params = {

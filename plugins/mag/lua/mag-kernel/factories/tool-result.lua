@@ -49,9 +49,9 @@ end
 M.declaration = {
   name = "tool-result",
   semantic = {
-    input={kind="named",name="nefor.contracts.ToolHandle",arguments={}},
+    input={kind="named",name="nefor.wire.ToolHandle",arguments={}},
     output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
-    inputs={{wire="generic-tool.ToolHandle",type={kind="named",name="nefor.contracts.ToolHandle",arguments={}}}},
+    inputs={{wire="generic-tool.ToolHandle",type={kind="named",name="nefor.wire.ToolHandle",arguments={}}}},
     outputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
   },
 

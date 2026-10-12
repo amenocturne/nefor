@@ -1091,6 +1091,7 @@ import nefor.dynamic.{}
 import nefor.graph.{}
 import nefor.node.{}
 import nefor.result.{}
+import nefor.retry.{}
 
 type Input {value: Int}
 type Output {value: String}
@@ -1133,7 +1134,7 @@ let resolve_model: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.a
 let agent = nefor.actors.agent<String, Input, Output>("agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: policy})
 let dynamic_agent = nefor.actors.agent<String, Input, nefor.dynamic.DynamicList<Output>>("dynamic-agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: no_policy})
 let approval = nefor.human.approval_gate("approval", nefor.human.ApprovalConfig {prompt: "Approve?"})
-let retry = nefor.actors.retry_gate<Input>("retry", nefor.actors.RetryGateConfig {max_retries: 2})
+let retry = nefor.retry.retry_gate<Input>("retry", nefor.retry.RetryGateConfig {max_retries: 2})
 let agent_actors: List<nefor.graph.Actor> = get(agent, "actors")
 let run_tool_actor = first(filter(((|candidate| => (=)(get(candidate, "id"), "agent.run-tool")): fn(nefor.graph.Actor) -> Bool), agent_actors))
 
@@ -1467,7 +1468,8 @@ fn traverse_rejects_workers_outside_the_closed_ordinary_subset() {
 import nefor.actors.{}
 import nefor.human.{}
 import nefor.dynamic.{}
-artifact(nefor.dynamic.traverse("bad", nefor.actors.retry_gate<String>("worker", nefor.actors.RetryGateConfig {max_retries: 2})))
+import nefor.retry.{}
+artifact(nefor.dynamic.traverse("bad", nefor.retry.retry_gate<String>("worker", nefor.retry.RetryGateConfig {max_retries: 2})))
 "#,
             "retry gates retain cross-activation state",
         ),
@@ -1527,9 +1529,11 @@ import nefor.human.{}
 import nefor.contracts.{}
 import nefor.dynamic.{}
 import nefor.graph.{}
-let input = nefor.graph.port("worker", type_tag<nefor.contracts.ToolCalls>(), "generic-tool.ToolCalls")
-let output = nefor.graph.port("worker", type_tag<nefor.contracts.ToolHandle>(), "generic-tool.ToolHandle")
-let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.actors.RunToolParams {model: "", provider: "", model_profile: nefor.actors.no_model_profile, conversation_peer: "external", tools: [], tool_approval_policy: nefor.contracts.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}])
+import nefor.wire.{}
+import nefor.llm.{}
+let input = nefor.graph.port("worker", type_tag<nefor.wire.ToolCalls>(), "generic-tool.ToolCalls")
+let output = nefor.graph.port("worker", type_tag<nefor.wire.ToolHandle>(), "generic-tool.ToolHandle")
+let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.llm.RunToolParams {model: "", provider: "", model_profile: nefor.llm.no_model_profile, conversation_peer: "external", tools: [], tool_approval_policy: nefor.wire.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}])
 let worker = nefor.graph.node("worker", "ordinary", [actor], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1557,10 +1561,12 @@ import nefor.human.{}
 import nefor.contracts.{}
 import nefor.dynamic.{}
 import nefor.graph.{}
-let input = nefor.graph.port("worker", type_tag<nefor.contracts.ToolCalls>(), "generic-tool.ToolCalls")
-let output = nefor.graph.port("worker", type_tag<nefor.contracts.ToolHandle>(), "generic-tool.ToolHandle")
+import nefor.wire.{}
+import nefor.llm.{}
+let input = nefor.graph.port("worker", type_tag<nefor.wire.ToolCalls>(), "generic-tool.ToolCalls")
+let output = nefor.graph.port("worker", type_tag<nefor.wire.ToolHandle>(), "generic-tool.ToolHandle")
 let relocation = nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}
-let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.actors.RunToolParams {model: "", provider: "", model_profile: nefor.actors.no_model_profile, conversation_peer: "worker", tools: [], tool_approval_policy: nefor.contracts.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [relocation, relocation])
+let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.llm.RunToolParams {model: "", provider: "", model_profile: nefor.llm.no_model_profile, conversation_peer: "worker", tools: [], tool_approval_policy: nefor.wire.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [relocation, relocation])
 let worker = nefor.graph.node("worker", "ordinary", [actor], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1806,7 +1812,7 @@ fn nefor_facade_exports_exact_authoring_allowlist() {
             Some(name.to_owned())
         })
         .collect();
-    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList Indexed traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
+    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
     assert_eq!(actual, expected);
     for name in [
         "Task",
@@ -1842,7 +1848,8 @@ fn nefor_facade_exports_exact_authoring_allowlist() {
 fn nefor_facade_imports_specialize_and_construct() {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../mag/lib");
     let facade = fs::read_to_string(lib.join("nefor.mag")).unwrap();
-    let mut source = String::from("import nefor.graph.{}\nimport nefor.contracts.{}\n");
+    let mut source =
+        String::from("import nefor.graph.{}\nimport nefor.contracts.{}\nimport nefor.wire.{}\n");
     // Exercise every exported alias as an imported value or concrete type.
     // Calls below additionally check generic forwarding and constructor access.
     for (index, line) in facade.lines().enumerate() {
@@ -1882,7 +1889,7 @@ let composed = value >>> next
 let lifted = lift<Unit, String, Int>("lifted", composed)
 let mapped = result_map(lifted, identity<Int>("mapped"))
 let direct = nefor.graph.identity<Int>("direct")
-let runtime_policy = nefor.contracts.normalize_tool_approval_policy(policy)
+let runtime_policy = nefor.wire.normalize_tool_approval_policy(policy)
 artifact(get(runtime_policy, "rules"))
 "#);
     assert_eq!(run("facade-import-smoke", &source, json!({})), json!({}));

@@ -148,21 +148,21 @@ fn two_agent_program() -> Value {
             "nefor.contracts.ProviderInput" => {
                 record(name, vec![("content", primitive("JsonValue"))])
             }
-            "nefor.contracts.ToolCall" => record(
+            "nefor.wire.ToolCall" => record(
                 name,
                 vec![
                     ("arguments", primitive("JsonValue")),
                     ("name", primitive("String")),
                 ],
             ),
-            "nefor.contracts.ToolCalls" => record(
+            "nefor.wire.ToolCalls" => record(
                 name,
                 vec![(
                     "calls",
-                    json!({"kind":"list","item":named("nefor.contracts.ToolCall")}),
+                    json!({"kind":"list","item":named("nefor.wire.ToolCall")}),
                 )],
             ),
-            "nefor.contracts.ToolHandle" => record(name, vec![("results", primitive("JsonValue"))]),
+            "nefor.wire.ToolHandle" => record(name, vec![("results", primitive("JsonValue"))]),
             "nefor.contracts.TextAnswer" => {
                 json!({"kind":"named","name":name,"arguments":[],"body":primitive("String")})
             }
@@ -241,7 +241,7 @@ fn two_agent_program() -> Value {
     }
     fn agent(prefix: &str) -> (Vec<Value>, Vec<Value>) {
         let provider_input = named("nefor.contracts.ProviderInput");
-        let tool_calls = named("nefor.contracts.ToolCalls");
+        let tool_calls = named("nefor.wire.ToolCalls");
         let text_answer = named("nefor.contracts.TextAnswer");
         let agent_error = named("nefor.contracts.AgentError");
         let result = json!({
@@ -252,7 +252,7 @@ fn two_agent_program() -> Value {
                 {"name":"Ok","payload":text_answer}
             ]
         });
-        let tool_handle = named("nefor.contracts.ToolHandle");
+        let tool_handle = named("nefor.wire.ToolHandle");
         let llm = format!("{prefix}.llm");
         let run_tool = format!("{prefix}.run-tool");
         let tool_result = format!("{prefix}.tool-result");

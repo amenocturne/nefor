@@ -1,25 +1,26 @@
+// Git worktrees as workflow steps. A worktree made by a workflow is never
+// removed by it.
+import nefor.capability.{}
+
 import nefor.graph.{}
 
+// A new worktree: at path, on the new branch, starting from base, in the
+// repository at the given directory.
 type CreateSpec {repository: String, path: String, branch: String, base: String}
 
+// A worktree that already exists at path and has branch checked out.
 type OpenSpec {repository: String, path: String, branch: String}
 
+// A ready worktree; head is the commit it is on.
 type Worktree {repository: String, path: String, branch: String, head: String}
 
 type WorktreeError {operation: String, kind: String, message: String}
 
-let create_factory = "nefor.factory.worktree-create"
+// A node that creates the worktree. It fails when the path or the branch
+// already exists.
+let create: fn(String, CreateSpec) -> nefor.graph.Node<Unit, Worktree> = |id, spec| =>
+  nefor.capability.worktree_create<CreateSpec, Worktree>(id, spec)
 
-let open_factory = "nefor.factory.worktree-open"
-
-let create: fn(String, CreateSpec) -> nefor.graph.Node<Unit, Worktree> = |id, spec| => {
-  let input = nefor.graph.port(id, type_tag<Unit>(), "mag.Unit")
-  let output = nefor.graph.port(id, type_tag<Worktree>(), "nefor.worktree.Ready")
-  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.closed_actor(id, create_factory, [], spec, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], ([]: List<nefor.graph.StoredRoute>), [], [], [nefor.graph.logical_node([id], [id])], input, output)
-}
-
-let open: fn(String, OpenSpec) -> nefor.graph.Node<Unit, Worktree> = |id, spec| => {
-  let input = nefor.graph.port(id, type_tag<Unit>(), "mag.Unit")
-  let output = nefor.graph.port(id, type_tag<Worktree>(), "nefor.worktree.Ready")
-  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.closed_actor(id, open_factory, [], spec, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], ([]: List<nefor.graph.StoredRoute>), [], [], [nefor.graph.logical_node([id], [id])], input, output)
-}
+// A node that checks that the worktree exists as described and reuses it.
+let open: fn(String, OpenSpec) -> nefor.graph.Node<Unit, Worktree> = |id, spec| =>
+  nefor.capability.worktree_open<OpenSpec, Worktree>(id, spec)

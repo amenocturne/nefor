@@ -1,0 +1,19 @@
+// Collections whose size is known only when the workflow runs.
+import nefor.contracts.{}
+
+import nefor.dynamic.{}
+
+import nefor.graph.{}
+
+// An ordered collection produced item by item while the workflow runs.
+// Opaque: an agent whose output type is DynamicList<T> emits the items and
+// then declares the collection complete; it is never built by hand.
+type DynamicList<T> = nefor.dynamic.DynamicList<T>
+
+// Run one copy of the worker node for every item, as the items arrive. The
+// results keep the order of the items.
+let traverse<I, O>: fn(String, nefor.graph.Node<I, O>) -> nefor.graph.Node<DynamicList<I>, DynamicList<O>> = |id, worker| => nefor.dynamic.traverse(id, worker)
+
+// Wait for the collection to be complete, then hand all its items, in order,
+// to one agent as its input turn. It also fires for an empty collection.
+let context<T>: fn(String) -> nefor.graph.Node<DynamicList<T>, nefor.contracts.ProviderInput> = |id| => nefor.dynamic.context<T>(id)

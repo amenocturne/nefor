@@ -1,16 +1,14 @@
-import nefor.graph.{}
+// Running a POSIX shell script as a workflow step.
+import nefor.capability.{}
 
 import nefor.contracts.{}
-import nefor.timeout.{}
 
-let factory = "nefor.factory.shell-script"
+import nefor.graph.{}
 
+// The script text, the directory it runs in, and how long it may run.
 type ShellScriptParams {script: String, cwd: String, timeout: nefor.contracts.Timeout}
 
-type ShellScriptActorParams {script: String, cwd: String, timeout: nefor.timeout.RuntimeTimeout}
-
-let script: fn(String, ShellScriptParams) -> nefor.graph.Node<Unit, nefor.contracts.ProcessResult> = |name, params| => {
-  let input = nefor.graph.port(name, type_tag<Unit>(), "nefor.process.Input")
-  let output = nefor.graph.port(name, type_tag<nefor.contracts.ProcessResult>(), "nefor.process.Result")
-  nefor.graph.node_with_operations_and_nodes(name, "ordinary", [nefor.graph.closed_actor(name, factory, [], ShellScriptActorParams {script: get(params, "script"), cwd: get(params, "cwd"), timeout: nefor.timeout.normalize(get(params, "timeout"))}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], ([]: List<nefor.graph.StoredRoute>), [], [], [nefor.graph.logical_node([name], [name])], input, output)
-}
+// A node that runs the script when the workflow reaches it and produces what
+// the script printed and how it ended. id names the node in the run.
+let script: fn(String, ShellScriptParams) -> nefor.graph.Node<Unit, nefor.contracts.ProcessResult> = |id, params| =>
+  nefor.capability.shell_script<nefor.contracts.ProcessResult>(id, get(params, "script"), get(params, "cwd"), get(params, "timeout"))

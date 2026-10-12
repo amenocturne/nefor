@@ -1,21 +1,19 @@
-import nefor.graph.{}
+// Running one program directly, without a shell, as a workflow step.
+import nefor.capability.{}
 
 import nefor.contracts.{}
-import nefor.timeout.{}
 
-// Relative paths are resolved by the process actor against the MAG host's
-// inherited working directory. Keeping the captured base as data makes that
-// authority explicit in every process request.
+import nefor.graph.{}
+
+// The directory the runtime was started in, for a cwd field. A relative cwd
+// is resolved against that directory.
 let cwd = "."
 
-let factory = "nefor.factory.process-exec"
-
+// argv is the program followed by its arguments; nothing is expanded or
+// interpreted by a shell.
 type ProcessExecParams {argv: List<String>, cwd: String, timeout: nefor.contracts.Timeout}
 
-type ProcessExecActorParams {argv: List<String>, cwd: String, timeout: nefor.timeout.RuntimeTimeout}
-
-let exec: fn(String, ProcessExecParams) -> nefor.graph.Node<Unit, nefor.contracts.ProcessResult> = |name, params| => {
-  let input = nefor.graph.port(name, type_tag<Unit>(), "nefor.process.Input")
-  let output = nefor.graph.port(name, type_tag<nefor.contracts.ProcessResult>(), "nefor.process.Result")
-  nefor.graph.node_with_operations_and_nodes(name, "ordinary", [nefor.graph.closed_actor(name, factory, [], ProcessExecActorParams {argv: get(params, "argv"), cwd: get(params, "cwd"), timeout: nefor.timeout.normalize(get(params, "timeout"))}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], ([]: List<nefor.graph.StoredRoute>), [], [], [nefor.graph.logical_node([name], [name])], input, output)
-}
+// A node that runs the program when the workflow reaches it and produces what
+// it printed and how it ended. id names the node in the run.
+let exec: fn(String, ProcessExecParams) -> nefor.graph.Node<Unit, nefor.contracts.ProcessResult> = |id, params| =>
+  nefor.capability.process_exec<nefor.contracts.ProcessResult>(id, get(params, "argv"), get(params, "cwd"), get(params, "timeout"))

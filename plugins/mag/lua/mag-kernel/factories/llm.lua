@@ -13,7 +13,7 @@ M.declaration = {
     output={kind="variable",name="R"},
     inputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
     outputs={
-      {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}},
+      {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.wire.ToolCalls",arguments={}}},
       {wire=RESULT,type={kind="variable",name="R"}},
     },
   },

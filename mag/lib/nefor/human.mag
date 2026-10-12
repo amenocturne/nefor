@@ -1,18 +1,22 @@
-// Human workflow decisions are independent of tool invocation authorization.
-import nefor.graph.{}
+// Asking the person running the workflow to decide. This is a workflow step,
+// separate from the approval of an agent's tool calls.
+import nefor.capability.{}
+
 import nefor.contracts.{}
 
+import nefor.graph.{}
+
+// The text the person approved, as they left it.
 type HumanWorkflowApproval {content: String}
+
 type HumanWorkflowRejection {reason: String}
+
 type HumanWorkflowDecision = Approved(HumanWorkflowApproval) | Rejected(HumanWorkflowRejection)
 
+// prompt is the label shown with the request.
 type ApprovalConfig {prompt: String}
-type HumanParams {prompt: String}
-let factory = "nefor.factory.human"
 
-let approval_gate: fn(String, ApprovalConfig) -> nefor.graph.Node<nefor.contracts.TextAnswer, HumanWorkflowDecision> = |id, config| => {
-  let actor_id = str(id, ".human")
-  let input = nefor.graph.port(actor_id, type_tag<nefor.contracts.TextAnswer>(), "generic-provider.TextAnswer")
-  let result = nefor.graph.port(actor_id, type_tag<HumanWorkflowDecision>(), "human.Decision")
-  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.with_templateability(nefor.graph.actor(actor_id, factory, [type_evidence(type_tag<HumanWorkflowDecision>())], HumanParams {prompt: get(config, "prompt")}, nefor.graph.store_port(input), [nefor.graph.store_port(result)]), nefor.graph.Templateability.Unsupported("human approval requires interactive lifecycle"))], [], [], [], [nefor.graph.logical_node([id], [actor_id])], input, result)
-}
+// A node that shows the incoming text to the person and waits for their
+// decision.
+let approval_gate: fn(String, ApprovalConfig) -> nefor.graph.Node<nefor.contracts.TextAnswer, HumanWorkflowDecision> = |id, config| =>
+  nefor.capability.human_approval<HumanWorkflowDecision>(id, get(config, "prompt"))

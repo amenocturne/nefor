@@ -1,0 +1,65 @@
+// Internal: the single-actor nodes behind commands, worktrees, the retry gate
+// and human approval, with their factory identities and parameter records.
+// Each builder is generic in the authored types it carries, so the modules
+// that declare those types can call it.
+import nefor.contracts.{}
+
+import nefor.graph.{}
+
+import nefor.timeout.{}
+
+let shell_script_factory = "nefor.factory.shell-script"
+
+let process_exec_factory = "nefor.factory.process-exec"
+
+let worktree_create_factory = "nefor.factory.worktree-create"
+
+let worktree_open_factory = "nefor.factory.worktree-open"
+
+let retry_gate_factory = "nefor.factory.retry-gate"
+
+let human_factory = "nefor.factory.human"
+
+type ShellScriptActorParams {script: String, cwd: String, timeout: nefor.timeout.RuntimeTimeout}
+
+type ProcessExecActorParams {argv: List<String>, cwd: String, timeout: nefor.timeout.RuntimeTimeout}
+
+type RetryGateParams {max_retries: Int}
+
+type HumanParams {prompt: String}
+
+// One closed actor with a Unit trigger and one typed result.
+let command<P, R>: fn(String, String, P, String, String) -> nefor.graph.Node<Unit, R> = |name, factory, params, input_wire, output_wire| => {
+  let input = nefor.graph.port(name, type_tag<Unit>(), input_wire)
+  let output = nefor.graph.port(name, type_tag<R>(), output_wire)
+  nefor.graph.node_with_operations_and_nodes(name, "ordinary", [nefor.graph.closed_actor(name, factory, [], params, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [])], ([]: List<nefor.graph.StoredRoute>), [], [], [nefor.graph.logical_node([name], [name])], input, output)
+}
+
+let shell_script<R>: fn(String, String, String, nefor.contracts.Timeout) -> nefor.graph.Node<Unit, R> = |name, script, cwd, timeout| =>
+  command<ShellScriptActorParams, R>(name, shell_script_factory, ShellScriptActorParams {script: script, cwd: cwd, timeout: nefor.timeout.normalize(timeout)}, "nefor.process.Input", "nefor.process.Result")
+
+let process_exec<R>: fn(String, List<String>, String, nefor.contracts.Timeout) -> nefor.graph.Node<Unit, R> = |name, argv, cwd, timeout| =>
+  command<ProcessExecActorParams, R>(name, process_exec_factory, ProcessExecActorParams {argv: argv, cwd: cwd, timeout: nefor.timeout.normalize(timeout)}, "nefor.process.Input", "nefor.process.Result")
+
+let worktree_create<S, W>: fn(String, S) -> nefor.graph.Node<Unit, W> = |id, spec| =>
+  command<S, W>(id, worktree_create_factory, spec, "mag.Unit", "nefor.worktree.Ready")
+
+let worktree_open<S, W>: fn(String, S) -> nefor.graph.Node<Unit, W> = |id, spec| =>
+  command<S, W>(id, worktree_open_factory, spec, "mag.Unit", "nefor.worktree.Ready")
+
+// D is the authored RetryDecision<T>.
+let retry_gate<T, D>: fn(String, Int) -> nefor.graph.Node<T, D> = |id, max_retries| => {
+  let `type` = type_tag<T>()
+  let actor_id = str(id, ".retry-gate")
+  let input = nefor.graph.port(actor_id, `type`, "nefor.retry.Input")
+  let result = nefor.graph.port(actor_id, type_tag<D>(), "nefor.retry.Result")
+  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.with_templateability(nefor.graph.actor(actor_id, retry_gate_factory, [type_evidence(`type`), type_evidence(type_tag<D>())], RetryGateParams {max_retries: max_retries}, nefor.graph.store_port(input), [nefor.graph.store_port(result)]), nefor.graph.Templateability.Unsupported("retry gates retain cross-activation state"))], [], [], [], [nefor.graph.logical_node([id], [actor_id])], input, result)
+}
+
+// D is the authored human decision type.
+let human_approval<D>: fn(String, String) -> nefor.graph.Node<nefor.contracts.TextAnswer, D> = |id, prompt| => {
+  let actor_id = str(id, ".human")
+  let input = nefor.graph.port(actor_id, type_tag<nefor.contracts.TextAnswer>(), "generic-provider.TextAnswer")
+  let result = nefor.graph.port(actor_id, type_tag<D>(), "human.Decision")
+  nefor.graph.node_with_operations_and_nodes(id, "ordinary", [nefor.graph.with_templateability(nefor.graph.actor(actor_id, human_factory, [type_evidence(type_tag<D>())], HumanParams {prompt: prompt}, nefor.graph.store_port(input), [nefor.graph.store_port(result)]), nefor.graph.Templateability.Unsupported("human approval requires interactive lifecycle"))], [], [], [], [nefor.graph.logical_node([id], [actor_id])], input, result)
+}

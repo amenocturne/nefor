@@ -1,0 +1,22 @@
+// Internal: the tool-call values exchanged between an agent's actors and the
+// runtime records lowered from authored selections. Not part of the authoring
+// surface; factory identities and actor parameter records live with their
+// constructors.
+import core.map.{}
+
+import nefor.contracts.{}
+
+type ToolCall {name: String, arguments: JsonValue}
+
+type ToolCalls {calls: List<ToolCall>}
+
+type ToolHandle {results: JsonValue}
+
+type ToolApprovalRuntimeRules {rules: Map<String, String>}
+
+type ProcessFailure {operation: String, error: String}
+
+let normalize_tool_approval_policy: fn(nefor.contracts.ToolApprovalPolicy) -> ToolApprovalRuntimeRules = |policy| => match policy {
+  case Default => ToolApprovalRuntimeRules {rules: core.map.empty<String, String>()},
+  case Rules(policy_rules) => ToolApprovalRuntimeRules {rules: get(policy_rules, "rules")},
+}

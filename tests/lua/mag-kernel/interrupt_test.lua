@@ -119,8 +119,8 @@ local function harness()
     local arguments = nefor.json.mark_array and nefor.json.mark_array({}) or {}
     return {kind="named",name=name,arguments=arguments}
   end
-  local tool_calls = named("nefor.contracts.ToolCalls")
-  local tool_handle = named("nefor.contracts.ToolHandle")
+  local tool_calls = named("nefor.wire.ToolCalls")
+  local tool_handle = named("nefor.wire.ToolHandle")
   local provider_input = named("nefor.contracts.ProviderInput")
   local rt_in = port("rt","generic-tool.ToolCalls",tool_calls)
   local rt_out = port("rt","generic-tool.ToolHandle",tool_handle)
