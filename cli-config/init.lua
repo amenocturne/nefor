@@ -152,14 +152,15 @@ local mag_context = require("libs.mag-context").new {
     { name = "config", path = STARTER_ROOT .. "/mag/lib" },
   },
   -- Embedded: what every workflow is written against (this configuration's
-  -- agent module and the data types agents and commands exchange). Listed with
+  -- agent module, the data types agents and commands exchange, and the shell
+  -- script step). Listed with
   -- their path only: the modules a task may or may not need.
   public_modules = {
     STARTER_ROOT .. "/mag/lib/agents.mag",
     MAG_PACKAGE_ROOT .. "/lib/nefor/contracts.mag",
+    MAG_PACKAGE_ROOT .. "/lib/nefor/shell.mag",
     { path = MAG_PACKAGE_ROOT .. "/lib/nefor.mag", embed = false },
     { path = MAG_PACKAGE_ROOT .. "/lib/nefor/workflow.mag", embed = false },
-    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/shell.mag", embed = false },
     { path = MAG_PACKAGE_ROOT .. "/lib/nefor/process.mag", embed = false },
     { path = MAG_PACKAGE_ROOT .. "/lib/nefor/path.mag", embed = false },
     { path = MAG_PACKAGE_ROOT .. "/lib/nefor/worktree.mag", embed = false },

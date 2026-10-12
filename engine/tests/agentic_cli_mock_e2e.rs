@@ -450,6 +450,9 @@ fn headless_starter_request_resume_tools_and_failures() {
     for shown in [
         "### Module `agents`",
         "type AgentConfig {",
+        "### Module `nefor.contracts`",
+        "### Module `nefor.shell`",
+        "/lib/nefor/workflow.mag` (read when needed)",
         "/lib/nefor.mag` (read when needed)",
         "`nefor.general_tools`:",
         "- `mag-write-file`",
