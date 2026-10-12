@@ -11,17 +11,6 @@ local M = {}
 
 local DIAGNOSTIC_LIMIT = 160
 
--- A provider round that returns neither visible text nor a tool call is not an
--- answer: an upstream that cuts a response inside its reasoning still reports
--- a normal stop. The same request is attempted this many times in total before
--- the turn fails with a typed provider error.
-local MAX_EMPTY_RESPONSE_ATTEMPTS = 3
-local EMPTY_RESPONSE_RETRY_REASON = "empty_model_response"
-
-local function has_visible_text(value)
-  return type(value) == "string" and value:find("%S") ~= nil
-end
-
 local function bounded(value)
   value = tostring(value or "")
   local length = utf8.len(value)
@@ -172,11 +161,6 @@ function M.construct(id, params, emit, options)
   local draining = false
   local turn_active = false
   local awaiting_continuation = false
-  local empty_response_attempts = 0
-  -- Set once a tool in this firing acknowledged asynchronous delivery: its
-  -- result starts a later turn, so ending this one silently is a deliberate
-  -- wait rather than a missing answer.
-  local awaiting_async_completion = false
   local steered_messages = {}
   local streamed_message_id = nil
   local streamed_text = ""
@@ -227,8 +211,6 @@ function M.construct(id, params, emit, options)
     streamed_message_id = nil
     streamed_text = ""
     terminal_metadata = {}
-    empty_response_attempts = 0
-    awaiting_async_completion = false
   end
 
   local function merge_terminal(detail)
@@ -449,9 +431,6 @@ function M.construct(id, params, emit, options)
 
   local function record_input(input)
     local function append(message)
-      if message.role == "tool" and message.completion_delivery == "async" then
-        awaiting_async_completion = true
-      end
       if not submission_identity_recorded and message.role == "user" then
         message.submission_ids = submission_ids
         message.input_cause = input_cause
@@ -498,8 +477,8 @@ function M.construct(id, params, emit, options)
     })
     return true
   end
-  function state:retry(reason, provenance)
-    facts:retry(reason or "provider_retry", provenance)
+  function state:retry(reason)
+    facts:retry(reason or "provider_retry")
     return invoke_provider()
   end
 
@@ -518,52 +497,6 @@ function M.construct(id, params, emit, options)
     else
       state:fail(detail)
     end
-  end
-
-  -- True for a round that carries nothing a consumer could classify: no text,
-  -- no requested tool call (checked by the caller) and no provider-native tool
-  -- execution. Reasoning alone does not make a round an answer.
-  local function is_empty_response(result)
-    return not has_visible_text(M.answer_text(result))
-      and not has_visible_text(streamed_text)
-      and #native_exchange_order == 0
-  end
-
-  -- Retries the same request from the same canonical context. The attempt's
-  -- streamed reasoning is retained as discarded audit history, which the
-  -- conversation manager excludes from model context, so a truncated
-  -- reasoning-only message never becomes part of the conversation.
-  local function retry_empty_response(result)
-    local finish_reason = type(result) == "table" and result.finish_reason or nil
-    discard_stream({ reason = EMPTY_RESPONSE_RETRY_REASON, finish_reason = finish_reason })
-    if draining then
-      state:fail("actor drained after a model response with no answer and no tool call")
-      return
-    end
-    if options.steerable and #steered_messages > 0 then
-      -- New input changes the request; it is a continuation, not a retry.
-      append_steered_messages()
-      empty_response_attempts = 0
-      invoke_provider()
-      return
-    end
-    empty_response_attempts = empty_response_attempts + 1
-    if empty_response_attempts >= MAX_EMPTY_RESPONSE_ATTEMPTS then
-      emit_failure(string.format(
-        "model returned no answer and no tool call after %d attempts",
-        MAX_EMPTY_RESPONSE_ATTEMPTS))
-      return
-    end
-    local attempt = {
-      attempt = empty_response_attempts,
-      max_attempts = MAX_EMPTY_RESPONSE_ATTEMPTS,
-      finish_reason = finish_reason,
-    }
-    if options.diagnostic then
-      options.diagnostic({ kind = EMPTY_RESPONSE_RETRY_REASON, attempt = attempt.attempt,
-        max_attempts = attempt.max_attempts, finish_reason = finish_reason })
-    end
-    state:retry(EMPTY_RESPONSE_RETRY_REASON, attempt)
   end
 
   function state:record_calls(result, calls)
@@ -632,7 +565,6 @@ function M.construct(id, params, emit, options)
           state:retry("invalid_tool_call_arguments")
           return nil
         end
-        empty_response_attempts = 0
         if options.on_tool_calls and options.on_tool_calls(state, result, calls) then return nil end
         if draining then
           state:record_calls(result, calls)
@@ -647,11 +579,6 @@ function M.construct(id, params, emit, options)
         emit_tool_calls(result, calls)
         return nil
       end
-      if is_empty_response(result) and not awaiting_async_completion then
-        retry_empty_response(result)
-        return nil
-      end
-      empty_response_attempts = 0
       if options.steerable and #steered_messages > 0 then
         if options.on_steered_final then options.on_steered_final(state, result) end
         append_steered_messages()

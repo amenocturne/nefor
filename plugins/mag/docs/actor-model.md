@@ -399,23 +399,6 @@ path unless both the bridge and the provider schema add them; use
 `reasoning_effort` in MAG examples instead of provider-specific reasoning
 knobs.
 
-A provider round that returns neither visible text nor a tool call is not an
-answer, whatever finish reason it reports: an upstream that cuts a response
-inside its reasoning still reports `stop`. The shared provider boundary (both
-`llm` and `structured-output`) discards the attempt — streamed reasoning is
-kept as `discarded` audit history outside model context, and no empty assistant
-message is recorded — and makes the same request again, recording a
-`retry_started` fact with reason `empty_model_response` and a `mag.diagnostic`
-of that kind. A request is attempted `MAX_EMPTY_RESPONSE_ATTEMPTS` (3) times in
-total; when every attempt is empty the actor yields its typed
-`AgentError`/`ProviderError` result, "model returned no answer and no tool call
-after 3 attempts". Any round that makes progress resets the count. One silent
-ending is deliberate and is kept: after a tool result in the same firing
-acknowledged asynchronous delivery (`completion_delivery = "async"`), the
-result arrives later as a new turn, so the firing may end without text. A
-round in which the provider executed its own native tools is likewise left to
-the consumer.
-
 A fresh delegated execution may carry an immutable `model_snapshot` with a
 non-empty current provider/model, optional non-empty reasoning effort, optional
 opaque JSON-object provider options, and a
@@ -509,9 +492,7 @@ for that stop to finish the existing draft and submit. Invalid draft contents,
 malformed tool arguments and missing submission have unlimited correction
 rounds in the same activation. Cancellation and drain remain terminal lifecycle
 controls. Genuine provider failures retain `AgentError` with `ProviderError`
-and the last provider output; correction exhaustion is no longer a result. A
-response with no text and no tool call is not a stop to correct: it follows the
-bounded empty-response retry described for the provider boundary above.
+and the last provider output; correction exhaustion is no longer a result.
 
 The request-local tool definitions own this protocol: `write_output`'s
 description carries the activation's result schema, and the runtime adds no

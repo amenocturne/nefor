@@ -164,12 +164,6 @@ The provider boundary quarantines malformed native argument batches before any
 execution or recording of invalid assistant calls. Runtime feedback is a
 system message, never human-authored input. Model corrections have no retry
 budget; cancellation, drain and transport recovery retain their own semantics.
-A round with neither text nor a tool call is not a model stop to correct or
-accept: the same boundary discards it and repeats the request a small fixed
-number of times, then fails the turn with the typed provider error. Providers
-only report what the upstream returned; deciding that an empty round is not an
-answer belongs to the boundary that turns rounds into turn results, and a
-firing that received an asynchronous tool acknowledgment may still end silently.
 
 Request-local `tool_specs` travel with catalog `tools` names through the MAG
 bridge, conversation invocation and compositor into provider requests. Native
