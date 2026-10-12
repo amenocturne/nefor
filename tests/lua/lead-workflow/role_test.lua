@@ -96,7 +96,7 @@ assert_contains(lead, "Never poll `mag-status`", "lead forbids status polling")
 assert_excludes(lead, "## MAG programs", "ambient context owns MAG tutorials")
 assert_excludes(lead, "```lisp", "ambient context owns MAG syntax examples")
 assert_excludes(lead, "A minimal agent program is", "ambient context owns canonical examples")
-assert_excludes(lead, "Available MAG modules:", "ambient context owns the module inventory")
+assert_excludes(lead, "## Public modules", "ambient context owns the public module list")
 assert_excludes(lead, "Full MAG Book:", "ambient context owns the MAG Book reference")
 assert_excludes(lead, "Writable source directory:", "ambient context owns workspace guidance")
 

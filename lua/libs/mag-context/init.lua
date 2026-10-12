@@ -1,8 +1,22 @@
 -- Ordered model context for MAG-capable agents.
 --
--- Configuration owns every guide, package root, and trailing ambient section.
--- This module only reads that immutable selection and composes it after an
--- agent-authored system prompt. Tool schemas remain provider-native data.
+-- Configuration owns every guide, module root, public module, toolset
+-- manifest, and trailing ambient section. This module only reads that immutable
+-- selection once and composes it after an agent-authored system prompt. Tool
+-- schemas remain provider-native data.
+--
+--   guides            { { title, path }, ... } embedded whole, in order
+--   book_path         path named as the full reference
+--   module_roots      { { name, path }, ... } the roots the compiler searches;
+--                     they give each public module its import name
+--   public_modules    { path | { path, embed = false }, ... } the MAG sources
+--                     authors write against, in order: embedded verbatim by
+--                     default, or listed with their path only
+--   toolsets          { manifest = path, names = { { key, name }, ... } }
+--   trailing_sections { string, ... } appended last
+--
+-- Only public modules are named in the prompt. Every other module under the
+-- roots stays importable but is not advertised.
 
 local M = {}
 local Context = {}
@@ -54,52 +68,178 @@ local function read_file(path)
   return content
 end
 
-local function list_dir(path)
-  if nefor and nefor.fs and type(nefor.fs.list_dir) == "function" then
-    return nefor.fs.list_dir(path) or {}
-  end
-  return {}
+local function trim_slashes(path)
+  return (path:gsub("/+$", ""))
 end
 
-local function collect_modules(root, relative, out)
-  local path = relative == "" and root or (root .. "/" .. relative)
-  for _, entry in ipairs(list_dir(path)) do
-    local child = relative == "" and entry.name or (relative .. "/" .. entry.name)
-    if entry.is_dir then
-      collect_modules(root, child, out)
-    elseif entry.name:sub(-4) == ".mag" then
-      out[#out + 1] = child:sub(1, -5):gsub("/", ".")
-    elseif entry.name:sub(-5) == ".magl" then
-      out[#out + 1] = child:sub(1, -6):gsub("/", ".")
+-- A public module's import name is its path below a module root, exactly as
+-- the compiler resolves imports: `<root>/a/b.mag` is module `a.b`.
+local function module_name(path, roots)
+  local extension = path:match("%.magl?$")
+  if not extension then
+    error("mag-context: public module " .. path .. " is not a .mag or .magl source", 3)
+  end
+  local matches = {}
+  for _, root in ipairs(roots) do
+    local prefix = trim_slashes(root.path) .. "/"
+    if path:sub(1, #prefix) == prefix then
+      matches[#matches + 1] = path:sub(#prefix + 1, -(#extension + 1))
     end
   end
+  if #matches ~= 1 then
+    local listed = {}
+    for _, root in ipairs(roots) do listed[#listed + 1] = root.name .. " = " .. root.path end
+    error("mag-context: public module " .. path .. " must be inside exactly one module root ("
+      .. (#matches == 0 and "it is inside none" or "it is inside several")
+      .. "); module roots: " .. table.concat(listed, ", "), 3)
+  end
+  for part in (matches[1] .. "/"):gmatch("(.-)/") do
+    if part == "" or part:find("[^%w_%-]") then
+      error("mag-context: public module " .. path .. " has no valid module name below its root", 3)
+    end
+  end
+  return (matches[1]:gsub("/", "."))
 end
 
-local function inventory(packages)
-  local lines = { "Available MAG modules:" }
-  for _, package in ipairs(packages) do
-    local modules = {}
-    collect_modules(package.path, "", modules)
-    table.sort(modules)
-    if #modules > 0 then
+local function validated_roots(roots, label)
+  local out = {}
+  for index, root in ipairs(dense_list(roots or {}, label)) do
+    if type(root) ~= "table" then error(label .. " entries must be tables", 3) end
+    out[index] = {
+      name = nonempty(root.name, label .. "[" .. index .. "].name"),
+      path = nonempty(root.path, label .. "[" .. index .. "].path"),
+    }
+  end
+  return out
+end
+
+-- An entry is a path (embedded) or { path = ..., embed = false } (listed with
+-- its path only). Both forms are read at construction so a wrong path fails
+-- at startup instead of leaving a dangling reference in every prompt.
+local function public_modules(entries, roots)
+  local out, seen = {}, {}
+  local label = "mag-context public_modules"
+  for index, entry in ipairs(dense_list(entries or {}, label)) do
+    local here = label .. "[" .. index .. "]"
+    local path, embed = entry, true
+    if type(entry) == "table" then
+      path = entry.path
+      if entry.embed ~= nil and type(entry.embed) ~= "boolean" then
+        error(here .. ".embed must be a boolean", 3)
+      end
+      embed = entry.embed ~= false
+      for key in pairs(entry) do
+        if key ~= "path" and key ~= "embed" then
+          error(here .. " has unknown field " .. tostring(key), 3)
+        end
+      end
+    end
+    nonempty(path, type(entry) == "table" and here .. ".path" or here)
+    local name = module_name(path, roots)
+    if seen[name] then error(here .. " repeats module " .. name, 3) end
+    seen[name] = true
+    out[index] = { name = name, path = path, embed = embed, source = read_file(path) }
+  end
+  return out
+end
+
+local function fenced(source)
+  local longest = 2
+  for run in source:gmatch("`+") do
+    if #run > longest then longest = #run end
+  end
+  local fence = string.rep("`", longest + 1)
+  return fence .. "mag\n" .. source .. (source:sub(-1) == "\n" and "" or "\n") .. fence
+end
+
+local PUBLIC_MODULES_INTRO = [[These are the public MAG modules: the ones meant to be written against. Each is
+imported by the module name shown, and descriptions are comments next to its
+types and functions. The source of a module marked "source below" follows this
+list; a module marked "read when needed" is at the path shown. Modules that are
+not listed are internal details behind these.]]
+
+local function render_public_modules(modules)
+  if #modules == 0 then return nil end
+  local lines = { "## Public modules", "", PUBLIC_MODULES_INTRO, "" }
+  for _, module in ipairs(modules) do
+    lines[#lines + 1] = "- `" .. module.name .. "` — `" .. module.path .. "` ("
+      .. (module.embed and "source below" or "read when needed") .. ")"
+  end
+  for _, module in ipairs(modules) do
+    if module.embed then
       lines[#lines + 1] = ""
-      lines[#lines + 1] = package.name .. ":"
-      for _, name in ipairs(modules) do lines[#lines + 1] = "  " .. name end
+      lines[#lines + 1] = "### Module `" .. module.name .. "` — `" .. module.path .. "`"
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = fenced(module.source)
     end
   end
   return table.concat(lines, "\n")
 end
 
-local function validated_packages(packages, label)
-  local out = {}
-  for index, package in ipairs(dense_list(packages or {}, label)) do
-    if type(package) ~= "table" then error(label .. " entries must be tables", 3) end
-    out[index] = {
-      name = nonempty(package.name, label .. "[" .. index .. "].name"),
-      path = nonempty(package.path, label .. "[" .. index .. "].path"),
-    }
+local function decode_json(source)
+  if not (nefor and nefor.json and type(nefor.json.decode) == "function") then
+    error("mag-context: toolsets require the engine JSON binding", 4)
   end
+  return pcall(nefor.json.decode, source)
+end
+
+-- The manifest is the configuration's `{ "<key>": ["<tool>", ...] }` file that
+-- its MAG bindings and tool policy already read. `names` gives, in display
+-- order, the MAG expression an author writes for each key.
+local function toolsets(opts)
+  if opts == nil then return {} end
+  local label = "mag-context toolsets"
+  if type(opts) ~= "table" then error(label .. " must be a table", 3) end
+  local path = nonempty(opts.manifest, label .. ".manifest")
+  local ok, manifest = decode_json(read_file(path))
+  if not ok then
+    error("mag-context: toolsets manifest " .. path .. " is not valid JSON: " .. tostring(manifest), 3)
+  end
+  if type(manifest) ~= "table" then
+    error("mag-context: toolsets manifest " .. path .. " must be a JSON object", 3)
+  end
+  local out, seen = {}, {}
+  for index, entry in ipairs(dense_list(opts.names or {}, label .. ".names")) do
+    local here = label .. ".names[" .. index .. "]"
+    if type(entry) ~= "table" then error(here .. " must be a table", 3) end
+    local key = nonempty(entry.key, here .. ".key")
+    local name = nonempty(entry.name, here .. ".name")
+    if seen[key] then error(here .. " repeats key " .. key, 3) end
+    seen[key] = true
+    local tools = manifest[key]
+    local valid = type(tools) == "table"
+    if valid then
+      local count = 0
+      for _ in pairs(tools) do count = count + 1 end
+      for position = 1, count do
+        if type(tools[position]) ~= "string" or tools[position] == "" then valid = false end
+      end
+    end
+    if not valid then
+      error("mag-context: toolsets manifest " .. path .. " field `" .. key
+        .. "` must be an array of tool names", 3)
+    end
+    out[index] = { name = name, tools = tools }
+  end
+  if #out == 0 then error(label .. ".names must name at least one toolset", 3) end
   return out
+end
+
+local TOOLSETS_INTRO = [[An agent can call only the tools named in its `tools` list, plus the runtime's
+own result tools when its output is a typed value. Each toolset below is a
+ready-made `List<String>` of tool names.]]
+
+local function render_toolsets(sets)
+  if #sets == 0 then return nil end
+  local lines = { "## Toolsets", "", TOOLSETS_INTRO }
+  for _, set in ipairs(sets) do
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "`" .. set.name .. "`:"
+    lines[#lines + 1] = ""
+    if #set.tools == 0 then lines[#lines + 1] = "(no tools)" end
+    for _, tool in ipairs(set.tools) do lines[#lines + 1] = "- `" .. tool .. "`" end
+  end
+  return table.concat(lines, "\n")
 end
 
 local function append_nonempty(parts, value)
@@ -123,20 +263,13 @@ function Context:compose(base_system, opts)
     parts[#parts + 1] = headed_guide(guide)
   end
 
-  local packages = {}
-  for _, package in ipairs(self.module_roots) do packages[#packages + 1] = package end
-  if opts.workspace ~= nil then
-    nonempty(opts.workspace, "mag-context workspace")
-    packages[#packages + 1] = { name = "session", path = opts.workspace }
-  end
-  for _, package in ipairs(validated_packages(opts.module_roots or {},
-      "mag-context compose module_roots")) do
-    packages[#packages + 1] = package
-  end
+  if opts.workspace ~= nil then nonempty(opts.workspace, "mag-context workspace") end
 
-  parts[#parts + 1] = "# MAG references\n\nFull MAG Book: `" .. self.book_path ..
-    "`\n\nRead its index or the relevant chapter when the quick guides are insufficient.\n\n" ..
-    inventory(packages)
+  local references = { "# MAG references\n\nFull MAG Book: `" .. self.book_path ..
+    "`\n\nRead its index or the relevant chapter when the quick guides are insufficient." }
+  append_nonempty(references, self.public_modules)
+  append_nonempty(references, self.toolsets)
+  parts[#parts + 1] = table.concat(references, "\n\n")
 
   if opts.workspace ~= nil then
     parts[#parts + 1] = "# MAG workspace\n\nWritable source directory: `" .. opts.workspace ..
@@ -171,10 +304,12 @@ function M.new(opts)
     trailing[index] = nonempty(section, "mag-context trailing_sections[" .. index .. "]")
   end
 
+  local roots = validated_roots(opts.module_roots, "mag-context module_roots")
   return setmetatable({
     guides = guides,
     book_path = nonempty(opts.book_path, "mag-context book_path"),
-    module_roots = validated_packages(opts.module_roots or {}, "mag-context module_roots"),
+    public_modules = render_public_modules(public_modules(opts.public_modules, roots)),
+    toolsets = render_toolsets(toolsets(opts.toolsets)),
     trailing_sections = trailing,
   }, Context)
 end

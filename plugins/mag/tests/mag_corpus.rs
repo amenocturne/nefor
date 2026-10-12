@@ -187,7 +187,7 @@ fn starter_prompts_defer_mag_reference_material_to_ambient_context() {
         "nefor.process.ProcessExecParams",
         "## MAG programs",
         "A minimal agent program is",
-        "Available MAG modules:",
+        "## Public modules",
         "Full MAG Book:",
         "Writable source directory:",
     ];

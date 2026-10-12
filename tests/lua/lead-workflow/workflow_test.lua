@@ -585,6 +585,7 @@ do
       { name = "nefor-mag", path = mag_root .. "/lib" },
       { name = "config", path = _repo_root .. "/examples/nefor-agent/mag/lib" },
     },
+    public_modules = { _repo_root .. "/examples/nefor-agent/mag/lib/agents.mag" },
     trailing_sections = { "NESTED TRAILING CONTEXT" },
   }
   lw.configure({
@@ -621,7 +622,7 @@ do
   local core_at = assert(system:find("# MAG in Five Minutes", 1, true))
   local nefor_at = assert(system:find("# Nefor MAG in Five Minutes", 1, true))
   local book_at = assert(system:find("Full MAG Book:", 1, true))
-  local inventory_at = assert(system:find("Available MAG modules:", 1, true))
+  local inventory_at = assert(system:find("## Public modules", 1, true))
   local trailing_at = assert(system:find("NESTED TRAILING CONTEXT", 1, true))
   assert_true(base_at < position_at and position_at < reasoner_at
       and reasoner_at < core_at and core_at < nefor_at
@@ -631,8 +632,8 @@ do
   assert_eq(reasoner_titles, 1, "nested reasoner mental model is injected exactly once")
   assert_true(system:find(mag_root .. "/book/README.md", 1, true) ~= nil,
     "nested agents receive the resolved full-book path")
-  assert_true(system:find("nefor.graph", 1, true) ~= nil,
-    "nested agents receive the canonical module inventory")
+  assert_true(system:find("### Module `agents` — `", 1, true) ~= nil,
+    "nested agents receive the configured public modules")
   local run = lw._internals.state.active_runs[exec.body.run_id]
   assert_eq(run.nodes["worker.llm"].reasoner, "nefor.factory.structured-output",
     "run metadata uses the artifact factory identity")

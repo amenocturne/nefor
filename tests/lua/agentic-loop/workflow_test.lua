@@ -415,6 +415,14 @@ local function fresh_loop()
       { name = "nefor-mag", path = mag_root .. "/lib" },
       { name = "config", path = _starter_dir .. "/mag/lib" },
     },
+    public_modules = {
+      _starter_dir .. "/mag/lib/agents.mag",
+      { path = mag_root .. "/lib/nefor.mag", embed = false },
+    },
+    toolsets = {
+      manifest = _starter_dir .. "/mag/lib/nefor/toolsets.json",
+      names = { { key = "general", name = "nefor.general_tools" } },
+    },
     trailing_sections = { "TRAILING RUNTIME MARKER" },
   }
   agentic_loop.configure {
@@ -468,13 +476,22 @@ local function project_pending_conversation(calls)
   local core_at = assert(text:find("# MAG in Five Minutes", 1, true))
   local nefor_at = assert(text:find("# Nefor MAG in Five Minutes", 1, true))
   local book_at = assert(text:find("Full MAG Book:", 1, true))
-  local inventory_at = assert(text:find("Available MAG modules:", 1, true))
+  local inventory_at = assert(text:find("## Public modules", 1, true))
   local runtime_at = assert(text:find("TRAILING RUNTIME MARKER", 1, true))
   assert(base_at < reasoner_at and reasoner_at < core_at and core_at < nefor_at and nefor_at < book_at
       and book_at < inventory_at and inventory_at < runtime_at,
     "system, reasoner model, guides, references/inventory, and trailing ambient context keep exact order")
-  assert(text:find("nefor.graph", 1, true) and text:find("nefor-mag:", 1, true),
-    "ambient inventory exposes canonical package modules")
+  assert(text:find("### Module `agents` — `", 1, true)
+      and text:find("type AgentConfig {", 1, true),
+    "the configuration's public module is embedded as source")
+  assert(text:find("- `nefor` — `", 1, true) and text:find("/lib/nefor.mag` (read when needed)", 1, true)
+      and not text:find("### Module `nefor` ", 1, true),
+    "a listed-only public module is named with its path and not embedded")
+  assert(not text:find("nefor-mag:", 1, true) and not text:find("- `agents.models`", 1, true)
+      and not text:find("- `nefor.graph`", 1, true),
+    "internal modules and root names are not advertised")
+  assert(text:find("`nefor.general_tools`:\n\n- `read_file`", 1, true),
+    "toolset contents come from the configuration manifest")
   local _, core_titles = text:gsub("# MAG in Five Minutes", "")
   local _, nefor_titles = text:gsub("# Nefor MAG in Five Minutes", "")
   local _, reasoner_titles = text:gsub("# Reasoner mental model", "")
