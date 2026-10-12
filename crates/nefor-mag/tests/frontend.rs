@@ -1108,6 +1108,32 @@ artifact([size(annotated), size(first(listed)), size(empty())])
 }
 
 #[test]
+fn generic_let_requires_a_function_literal_value() {
+    // A generic binding cannot re-export another generic value by name: its
+    // type parameters are bound by the function literal on the right.
+    let root = constructor_workspace("generic-let-alias");
+    fs::write(
+        root.join("main.mag"),
+        "let id<T>: fn(T) -> T = |x| => x\nlet same<T>: fn(T) -> T = id\nartifact(same(1))\n",
+    )
+    .unwrap();
+    let error = compile_file_with_syntax(&root, "main.mag", SyntaxMode::New).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("generic let parameters require a function literal as the value"),
+        "{error}"
+    );
+    fs::write(
+        root.join("main.mag"),
+        "let id<T>: fn(T) -> T = |x| => x\nlet same<T>: fn(T) -> T = |x| => id(x)\nartifact(same<Int>(1))\n",
+    )
+    .unwrap();
+    let artifact = compile_file_with_syntax(&root, "main.mag", SyntaxMode::New).unwrap();
+    assert_eq!(artifact, serde_json::json!(1));
+}
+
+#[test]
 fn positional_arguments_fill_named_fields_in_declared_order() {
     let root = constructor_workspace("constructor-positional-fields");
     fs::write(

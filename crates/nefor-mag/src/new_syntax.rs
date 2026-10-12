@@ -666,6 +666,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_operator("=")?;
         let mut value = self.parse_expr(expected.as_ref())?;
+        let declares_generics = !type_params.is_empty();
         if let Some(target) = expected {
             let generic_function = if let authored::Expr::Function(function) = &mut value {
                 function.type_params = type_params;
@@ -673,6 +674,11 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
+            if !generic_function && declares_generics {
+                return Err(self.here(
+                    "generic let parameters require a function literal as the value; wrap the value in a lambda",
+                ));
+            }
             if !generic_function {
                 value = authored::Expr::Annotate {
                     target,
