@@ -195,12 +195,22 @@ local mag_context = require("libs.mag-context").new {
     { name = "nefor-mag", path = MAG_PACKAGE_ROOT .. "/lib" },
     { name = "config", path = STARTER_ROOT .. "/mag/lib" },
   },
-  -- The configuration's own agent module is embedded: every workflow uses
-  -- it. The Nefor facade is listed with its path and read when a task needs
-  -- more than the quick guide shows.
+  -- Embedded: what every workflow is written against (this configuration's
+  -- agent module and the data types agents and commands exchange). Listed with
+  -- their path only: the modules a task may or may not need.
   public_modules = {
     STARTER_ROOT .. "/mag/lib/agents.mag",
+    MAG_PACKAGE_ROOT .. "/lib/nefor/contracts.mag",
     { path = MAG_PACKAGE_ROOT .. "/lib/nefor.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/workflow.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/shell.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/process.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/path.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/worktree.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/collections.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/retry.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/human.mag", embed = false },
+    { path = MAG_PACKAGE_ROOT .. "/lib/nefor/actors.mag", embed = false },
   },
   toolsets = {
     manifest = STARTER_ROOT .. "/mag/lib/nefor/toolsets.json",
