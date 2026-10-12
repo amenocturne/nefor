@@ -826,44 +826,37 @@ async fn handle_tool_invoke(
         .get("args")
         .cloned()
         .unwrap_or(Value::Object(Map::new()));
-    let allowlist = match body.get("allowlist") {
-        Some(Value::Array(values)) if values.iter().all(Value::is_string) => Some(values),
-        Some(_) => {
-            send_event(
-                out_tx,
-                tool_result_error_body(
-                    &outer_id,
-                    "tool.invoke field `allowlist` must be an array containing only tool-name strings",
-                ),
-            )
-            .await?;
+    let allowed_names = match tool_name_list(body, "allowlist") {
+        Ok(names) => names,
+        Err(message) => {
+            send_event(out_tx, tool_result_error_body(&outer_id, &message)).await?;
             return Ok(());
         }
-        None => None,
     };
-    if let Some(allowlist) = allowlist {
-        let allowed = allowlist.iter().any(|tool| tool.as_str() == Some(&name));
-        if !allowed {
-            send_event(
-                out_tx,
-                tool_result_error_body(
-                    &outer_id,
-                    &format!("tool `{name}` is not in this invocation's allowlist"),
-                ),
-            )
-            .await?;
+    let allowlist = body.get("allowlist").and_then(Value::as_array);
+    let request_local_tools = match tool_name_list(body, "request_local_tools") {
+        Ok(names) => names.unwrap_or_default(),
+        Err(message) => {
+            send_event(out_tx, tool_result_error_body(&outer_id, &message)).await?;
             return Ok(());
         }
-    }
+    };
     let invoking_from = body.get("from").and_then(Value::as_str).map(str::to_owned);
     let invocation = body.get("invocation").cloned();
 
-    let source = match state.tool_owner.get(&name).cloned() {
+    // A name outside the invocation's allowlist and a name no source
+    // advertises get the same answer: the caller learns only which tools it
+    // can call, not which other tools exist.
+    let allowed = allowed_names
+        .as_ref()
+        .is_none_or(|names| names.contains(&name.as_str()));
+    let source = match state.tool_owner.get(&name).filter(|_| allowed).cloned() {
         Some(s) => s,
         None => {
+            let available = available_tools(state, allowed_names.as_deref(), &request_local_tools);
             send_event(
                 out_tx,
-                tool_result_error_body(&outer_id, &format!("unknown tool `{name}`")),
+                tool_result_error_body(&outer_id, &unknown_tool_message(&name, &available)),
             )
             .await?;
             return Ok(());
@@ -1149,6 +1142,73 @@ fn tool_register_body(state: &GateState) -> Map<String, Value> {
     m.insert("kind".into(), Value::String("tool.register".into()));
     m.insert("tools".into(), Value::Array(tools));
     m
+}
+
+/// Read an optional invocation field holding tool names. `Err` carries the
+/// caller-facing message for a malformed field.
+fn tool_name_list<'a>(
+    body: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<Vec<&'a str>>, String> {
+    match body.get(field) {
+        None => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or_else(|| malformed_tool_name_list(field)),
+        Some(_) => Err(malformed_tool_name_list(field)),
+    }
+}
+
+fn malformed_tool_name_list(field: &str) -> String {
+    format!("tool.invoke field `{field}` must be an array containing only tool-name strings")
+}
+
+/// The tools the caller of one invocation can call, in the order its model
+/// was offered them. An allowlist is offered in its own order, less the names
+/// no source advertises; without one the whole registry is offered in
+/// `tool.register` order. Request-local tools are the caller's own and follow.
+fn available_tools(
+    state: &GateState,
+    allowlist: Option<&[&str]>,
+    request_local_tools: &[&str],
+) -> Vec<String> {
+    let mut available: Vec<String> = Vec::new();
+    match allowlist {
+        Some(allowlist) => {
+            for name in allowlist {
+                if state.tool_owner.contains_key(*name) && !available.iter().any(|n| n == name) {
+                    available.push((*name).to_owned());
+                }
+            }
+        }
+        None => {
+            available.extend(state.tool_owner.keys().cloned());
+            available.sort_unstable();
+        }
+    }
+    for name in request_local_tools {
+        if !available.iter().any(|n| n == name) {
+            available.push((*name).to_owned());
+        }
+    }
+    available
+}
+
+/// The one answer to a call naming a tool its caller cannot use. `libs.tool`
+/// words the same message for a tool source (`unknown_tool_message` there);
+/// keep the two identical.
+fn unknown_tool_message(name: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        format!("unknown tool `{name}`; no tools are available")
+    } else {
+        format!(
+            "unknown tool `{name}`; available tools: {}",
+            available.join(", ")
+        )
+    }
 }
 
 struct ForwardMetadata<'a> {
@@ -2133,7 +2193,7 @@ mod tests {
         assert_eq!(result["body"]["id"], "cap-excluded");
         assert_eq!(
             result["body"]["error"],
-            "tool `write_file` is not in this invocation's allowlist"
+            "unknown tool `write_file`; available tools: read_file"
         );
         assert!(state.awaiting_approval.is_empty());
         assert!(state.pending.is_empty());
@@ -2150,7 +2210,7 @@ mod tests {
                 "empty",
                 json!([]),
                 GateMode::Safe,
-                "not in this invocation's allowlist",
+                "unknown tool `read_file`; no tools are available",
             ),
             (
                 "malformed-member",
@@ -2162,7 +2222,7 @@ mod tests {
                 "yolo-excluded",
                 json!(["write_file"]),
                 GateMode::Yolo,
-                "not in this invocation's allowlist",
+                "unknown tool `read_file`; no tools are available",
             ),
             (
                 "yolo-malformed",
@@ -2381,30 +2441,132 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn invoke_unknown_tool_replies_with_error() {
+    async fn unknown_tool_error(state: &mut GateState, invoke: Value) -> String {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let invoke = invoke.as_object().unwrap().clone();
+        handle_tool_invoke(&tx, &invoke, state).await.unwrap();
+        let result: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(result["body"]["kind"], "tool.result");
+        assert_eq!(result["body"]["id"], invoke["id"]);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unusable tool is never forwarded"
+        );
+        assert!(state.awaiting_approval.is_empty());
+        assert!(state.pending.is_empty());
+        result["body"]["error"].as_str().unwrap().to_owned()
+    }
+
+    async fn state_with_two_sources() -> GateState {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let mut state = make_state();
-        let invoke = json!({
-            "kind": "tool-gate.tool.invoke",
-            "id": "prov-3",
-            "name": "no_such_tool",
-            "args": {}
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
-        let msg = rx.recv().await.unwrap();
-        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
-        let body = v.get("body").unwrap();
+        for (source, tools) in [
+            (
+                "basic-tools",
+                json!([
+                    {"name": "write_file", "description": "", "parameters": {}},
+                    {"name": "read_file", "description": "", "parameters": {}}
+                ]),
+            ),
+            (
+                "lead-workflow",
+                json!([{"name": "mag-apply", "description": "", "parameters": {}}]),
+            ),
+        ] {
+            handle_tools_advertise(&tx, &advertise_body(source, tools), &mut state)
+                .await
+                .unwrap();
+            let _register = rx.recv().await.unwrap();
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_without_allowlist_lists_the_registry_in_register_order() {
+        let mut state = state_with_two_sources().await;
+        let registered: Vec<String> = tool_register_body(&state)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(registered, ["mag-apply", "read_file", "write_file"]);
+
+        let error = unknown_tool_error(
+            &mut state,
+            json!({"kind": "tool-gate.tool.invoke", "id": "prov-3", "name": "bash", "args": {}}),
+        )
+        .await;
         assert_eq!(
-            body.get("kind").and_then(Value::as_str),
-            Some("tool.result")
+            error,
+            "unknown tool `bash`; available tools: mag-apply, read_file, write_file"
         );
-        assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-3"));
-        let err = body.get("error").and_then(Value::as_str).unwrap();
-        assert!(err.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_with_nothing_registered_says_no_tools_are_available() {
+        let mut state = make_state();
+        let error = unknown_tool_error(
+            &mut state,
+            json!({"kind": "tool-gate.tool.invoke", "id": "prov-3", "name": "bash", "args": {}}),
+        )
+        .await;
+        assert_eq!(error, "unknown tool `bash`; no tools are available");
+    }
+
+    #[tokio::test]
+    async fn unusable_tool_lists_the_allowlist_as_offered_to_the_caller() {
+        let mut state = state_with_two_sources().await;
+        // `bash` is allowlisted but advertised by no source, so the model was
+        // never offered it; `mag-apply` exists but is outside the allowlist.
+        let allowlist = json!(["write_file", "bash", "read_file", "write_file"]);
+        let expected = "available tools: write_file, read_file";
+        for (id, name) in [
+            ("stale", "bash"),
+            ("nowhere", "shell"),
+            ("excluded", "mag-apply"),
+        ] {
+            let error = unknown_tool_error(
+                &mut state,
+                json!({
+                    "kind": "tool-gate.tool.invoke", "id": id, "name": name, "args": {},
+                    "allowlist": allowlist
+                }),
+            )
+            .await;
+            assert_eq!(error, format!("unknown tool `{name}`; {expected}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_tool_lists_request_local_tools_after_the_allowlist() {
+        let mut state = state_with_two_sources().await;
+        let error = unknown_tool_error(
+            &mut state,
+            json!({
+                "kind": "tool-gate.tool.invoke", "id": "typed", "name": "mag-apply", "args": {},
+                "allowlist": ["read_file"],
+                "request_local_tools": ["write_output", "submit_output"]
+            }),
+        )
+        .await;
+        assert_eq!(
+            error,
+            "unknown tool `mag-apply`; available tools: read_file, write_output, submit_output"
+        );
+
+        let malformed = unknown_tool_error(
+            &mut state,
+            json!({
+                "kind": "tool-gate.tool.invoke", "id": "malformed", "name": "read_file",
+                "args": {}, "allowlist": ["read_file"], "request_local_tools": "write_output"
+            }),
+        )
+        .await;
+        assert_eq!(
+            malformed,
+            "tool.invoke field `request_local_tools` must be an array containing only tool-name strings"
+        );
     }
 
     #[tokio::test]

@@ -299,7 +299,7 @@ reads exactly this — no alias fallbacks, no shape sniffing.
 
 | Kind                          | Emitter → consumer            | Payload (beyond `kind`, `from`)                                                                                                   |
 | ----------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `generic-tool.ToolCalls`      | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                                               |
+| `generic-tool.ToolCalls`      | llm → run-tool                | `calls = { { id, name, args }, … }`, plus `request_local_tools = { name, … }` when the request offered request-local tools        |
 | `generic-tool.ToolHandle`     | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                                                       |
 | `generic-provider.TextAnswer` | llm → result boundary / human | `result` (raw provider result); `text?`, `text_answer?` (lifted when result is a table)                                           |
 | `mag.ApprovalRequest`         | human → control plane         | intercepted emit, surfaced as `mag.approval_request`: `correlation = <id>`, `prompt?`, `subject`, `reply_type`, `reply_type_id`   |

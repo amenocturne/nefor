@@ -140,10 +140,16 @@ for _, mixed in ipairs({
   local emitted = {}
   local executor = assert(run_tool.construct("executor", {tools = {"read_file"},
     tool_approval_policy = {rules = {}}}, function(v) emitted[#emitted + 1] = v end))
-  executor.deliver({messages = {{message = {calls = calls}}}})
+  -- The actor names its request-local result tools beside the calls, and the
+  -- executor hands them to the tool surface with its allowlist.
+  local tool_calls = last(out, "generic-tool.ToolCalls")
+  assert(table.concat(tool_calls.request_local_tools, ",") == "write_output,submit_output")
+  executor.deliver({messages = {{message = tool_calls}}})
   if #calls == 3 then
     assert(count(emitted, "capability.invoke") == 1)
     local invoked = last(emitted, "capability.invoke")
+    assert(table.concat(invoked.request.allowlist, ",") == "read_file")
+    assert(table.concat(invoked.request.request_local_tools, ",") == "write_output,submit_output")
     executor.deliver({kind = "reply", ref = invoked.ref, result = "normal result"})
   else assert(count(emitted, "capability.invoke") == 0) end
   local handle = last(emitted, "generic-tool.ToolHandle")

@@ -34,6 +34,13 @@
 -- `call.err(message, fields)` (extra `fields` ride on the result envelope),
 -- may report process output with `call.stream(stream, text)`, and may keep
 -- `call.id` to settle later through `source.result`.
+--
+-- A call naming a tool its caller cannot use gets one answer everywhere,
+-- worded by `unknown_tool_message`: ``unknown tool `x`; available tools: a, b``.
+-- A source lists its own tools, narrowed to the invocation's `allowlist` (in
+-- that list's order) when the caller sent one; a tool the allowlist excludes
+-- is answered exactly like a tool that does not exist. The tool gate words the
+-- same message over the whole registry.
 
 local json_data = require("core.json_data")
 local envelope = require("core.envelope")
@@ -148,6 +155,15 @@ local function copy_fields(fields, into)
   return into
 end
 
+-- The one answer to a call naming a tool its caller cannot use. `available`
+-- lists the names that caller can call, in the order its model was offered
+-- them. The tool gate words the same message; keep the two identical.
+function M.unknown_tool_message(name, available)
+  local head = "unknown tool `" .. tostring(name) .. "`; "
+  if #available == 0 then return head .. "no tools are available" end
+  return head .. "available tools: " .. table.concat(available, ", ")
+end
+
 function M.source(opts)
   if type(opts) ~= "table" then error("tool.source: options must be a table", 2) end
   local name = opts.name
@@ -227,6 +243,23 @@ function M.source(opts)
     return call
   end
 
+  -- This source's tools the invocation may call. `allowlist` is the
+  -- invocation's own list of tool names; without one every tool is callable.
+  local function available_tools(allowlist)
+    local names, seen = {}, {}
+    if type(allowlist) ~= "table" then
+      for index, definition in ipairs(ordered) do names[index] = definition.name end
+      return names, by_name
+    end
+    for _, tool_name in ipairs(allowlist) do
+      if by_name[tool_name] and not seen[tool_name] then
+        seen[tool_name] = by_name[tool_name]
+        names[#names + 1] = tool_name
+      end
+    end
+    return names, seen
+  end
+
   -- Handle a `<name>.tool.invoke` body. Returns true when it was addressed to
   -- one of this source's tools or answered as an unknown tool.
   function source.invoke(body)
@@ -236,9 +269,10 @@ function M.source(opts)
       nefor.log.warn("tool.source: invoke without a string id dropped", { source = name })
       return false
     end
-    local definition = by_name[body.name]
+    local available, callable = available_tools(body.allowlist)
+    local definition = callable[body.name]
     if definition == nil then
-      source.result(id, { error = name .. ": unknown tool `" .. tostring(body.name) .. "`" })
+      source.result(id, { error = M.unknown_tool_message(body.name, available) })
       return true
     end
     local args = body.args

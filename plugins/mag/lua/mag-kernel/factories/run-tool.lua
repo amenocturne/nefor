@@ -51,6 +51,12 @@
 --   it (narrowing bash approvals to this agent) is tool-gate's side, beyond this
 --   factory — the factory's job is that the policy travels with the call.
 --
+--   The factory does not judge whether a called name is usable. Every call
+--   that the provider actor did not settle itself goes to the tool surface with
+--   the allowlist and the `request_local_tools` the ToolCalls message names;
+--   the surface answers a name outside them, or one that does not exist, with
+--   its one "unknown tool" message listing what this agent's model was offered.
+--
 -- ── kill with in-flight calls (signal choice, flagged) ───────────────────────
 --   run-tool holds live external work (in-flight tool invocations), so a signal
 --   handler is meaningful (actor-model.md, Signals). But the tool surface
@@ -214,6 +220,7 @@ function M.construct(id, params, emit, deps)
             name = call_name,
             args = call_args,
             allowlist = allowlist,
+            request_local_tools = message.request_local_tools,
             ["da-policy"] = tool_approval_policy,
           },
           -- Opaque correlation ref, echoed back on the reply: which batch + slot,

@@ -220,9 +220,10 @@ async fn chatgpt_projects_stale_allowlist_and_returns_tool_result_through_gate()
     .await;
     let denied = expect_denial_without_source_invocation(&mut gate_out, "blocked-probe").await;
     assert_eq!(denied["id"], "blocked-probe");
-    assert!(denied["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("not in this invocation's allowlist")));
+    assert_eq!(
+        denied["error"],
+        "unknown tool `write_file`; available tools: read_file"
+    );
 
     tokio::fs::write(temp.path().join("fixture.txt"), FIXTURE_CONTENT)
         .await

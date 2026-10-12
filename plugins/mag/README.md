@@ -17,6 +17,12 @@ the immutable allowlist enforced when a model invokes a tool. Names absent from
 the runtime advertisement are omitted from the model surface instead of
 failing the delegated run.
 
+A model that calls a name outside that surface is answered by the tool gate
+with ``unknown tool `x`; available tools: ...``. The run-tool actor sends every
+such call on with the agent's allowlist and `request_local_tools`, the names of
+the request-local tools (a typed agent's `write_output` and `submit_output`)
+its provider actor offered, so the list matches what the model was offered.
+
 Direct providers attach `model` and `duration_ms` to terminal observations and
 to usage observations when token usage exists. MAG projects those fields
 unchanged, so the chat surface can render per-turn model, elapsed time, and

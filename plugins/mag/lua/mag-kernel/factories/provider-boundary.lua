@@ -516,8 +516,17 @@ function M.construct(id, params, emit, options)
       semantic_calls[i] = { name = call.name, arguments = call.args }
     end
     awaiting_continuation = true
+    -- The request-local tools this actor offered its model are its own: the
+    -- tool surface never sees them, so name them beside the calls for it to
+    -- include when it tells the model which tools it can call.
+    local request_local_tools = nil
+    for _, spec in ipairs(params.tool_specs or {}) do
+      request_local_tools = request_local_tools or {}
+      request_local_tools[#request_local_tools + 1] = spec.name
+    end
     state:emit({ kind = "generic-tool.ToolCalls",
-      value = { calls = semantic_calls }, calls = calls })
+      value = { calls = semantic_calls }, calls = calls,
+      request_local_tools = request_local_tools })
     state:emit({ kind = kinds.complete })
   end
 

@@ -20,6 +20,27 @@ whitespace-only identifiers are rejected. Any invalid advertisement emits a
 deterministic `tool-gate.advertise_error` and leaves the prior valid registry
 unchanged.
 
+## Calls to a tool the caller cannot use
+
+A `tool-gate.tool.invoke` may carry `allowlist`, the tool names its caller may
+call. A name outside it and a name no source advertises get the same
+`tool.result` error, so a caller cannot tell an excluded tool from a
+nonexistent one:
+
+```text
+unknown tool `bash`; available tools: read_file, mag-apply
+```
+
+The list is what that caller's model was offered, in the same order: the
+allowlist in its own order, less the names no source advertises (providers
+project the same names out of a request). Without an allowlist it is the whole
+registry in `tool.register` order. A caller that offered its model tools the
+gate never routes names them in `request_local_tools`; they follow the
+allowlisted ones. With nothing to list the message ends `no tools are
+available`. The gate owns this wording because it alone holds the registry;
+`libs.tool` words the identical message for a single source, in the style of
+its uniform `unknown argument` message.
+
 Private advertisements may carry internal `context.folders` metadata. The Rust
 gate strips private context from the public registry and enforces the transport
 policy; it does not load instruction files or synthesize reminders.

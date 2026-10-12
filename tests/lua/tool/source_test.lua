@@ -119,7 +119,35 @@ counted.invoke({ id = "5", name = "echo" })
 eq(last_result("5").error, "echo: missing required argument `text`", "absent args validate as {}")
 eq(handled, 0, "invalid arguments never reach the handler")
 counted.invoke({ id = "6", name = "missing", args = {} })
-eq(last_result("6").error, "counted: unknown tool `missing`", "unknown tool")
+eq(last_result("6").error, "unknown tool `missing`; available tools: echo", "unknown tool")
+
+-- A call naming a tool the caller cannot use: one message, listing what it can.
+local ran
+local function named(tool_name)
+  return tool.define(spec({ name = tool_name, handler = function(_, call) ran = call.name; call.ok("ran") end }))
+end
+local several = tool.source { name = "several", tools = { named("write"), named("read"), named("list") } }
+several.invoke({ id = "u1", name = "bash", args = {} })
+eq(last_result("u1").error, "unknown tool `bash`; available tools: write, read, list",
+  "without an allowlist every tool is listed in advertised order")
+eq(tool.unknown_tool_message("bash", { "write", "read", "list" }), last_result("u1").error,
+  "the source words the message through the shared function")
+-- `shell` is allowlisted but not defined here; `write` is defined but excluded.
+local allowlist = { "list", "shell", "read", "list" }
+several.invoke({ id = "u2", name = "bash", args = {}, allowlist = allowlist })
+eq(last_result("u2").error, "unknown tool `bash`; available tools: list, read",
+  "an allowlist narrows and orders the list")
+ran = nil
+several.invoke({ id = "u3", name = "write", args = { text = "x" }, allowlist = allowlist })
+eq(last_result("u3").error, "unknown tool `write`; available tools: list, read",
+  "an excluded tool is answered like a nonexistent one")
+eq(ran, nil, "an excluded tool never reaches its handler")
+several.invoke({ id = "u4", name = "read", args = { text = "x" }, allowlist = allowlist })
+eq(last_result("u4").output, "ran", "an allowlisted tool runs")
+several.invoke({ id = "u5", name = "read", args = {}, allowlist = {} })
+eq(last_result("u5").error, "unknown tool `read`; no tools are available", "empty allowlist")
+eq(tool.unknown_tool_message("bash", {}), "unknown tool `bash`; no tools are available",
+  "nothing available")
 
 -- Handler failure settles exactly once.
 local raising = tool.source { name = "raising", tools = { tool.define(spec({

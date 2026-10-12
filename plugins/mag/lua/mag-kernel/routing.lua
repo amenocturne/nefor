@@ -500,7 +500,7 @@ function M:factory_arrival(id, wire, payload)
     -- Provider turns and tool-call handles carry correlation data which is not
     -- part of their semantic value but is required by the next runtime actor.
     -- Keep those explicit channels while dropping raw result metadata.
-    for _, field in ipairs({ "messages", "calls", "dynamic" }) do
+    for _, field in ipairs({ "messages", "calls", "request_local_tools", "dynamic" }) do
       if payload[field] ~= nil then routed_payload[field] = payload[field] end
     end
     if payload.semantic_value ~= nil then

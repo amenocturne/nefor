@@ -1055,6 +1055,73 @@ end }
     println!("retained oversized tool artifacts: {}", dir.display());
 }
 
+/// A model that calls a tool it cannot use is told which tools it can call.
+/// The lead and a delegated typed worker each try a name that exists nowhere
+/// for them and a real tool outside their allowlist; both get one message
+/// listing exactly what their own request offered, in that order.
+#[test]
+fn unusable_tool_call_answers_with_the_callers_available_tools() {
+    let dir = isolated_starter("unknown-tool-");
+    std::fs::copy(
+        root().join("engine/tests/agentic_cli_mock_e2e/unknown_tool_provider.lua"),
+        dir.join("fixture-config/mock-provider/acceptance.lua"),
+    )
+    .unwrap();
+    let output = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--mode",
+            "yolo",
+            "--format",
+            "json",
+            "--prompt",
+            "UNKNOWN_TOOL_PROBE",
+        ],
+    );
+    let result: serde_json::Value = serde_json::from_str(&success(&output)).unwrap();
+    assert!(
+        !dir.join("must-not-exist.txt").exists(),
+        "a tool outside the allowlist never runs"
+    );
+
+    // The lead's list is its turn program's `tools`, in authored order.
+    let lead_tools = "read_file, read_image, mag-status, mag-await, mag-terminate, \
+                      write-review, mag-write-file, mag-preview, mag-apply";
+    assert_eq!(
+        result["answer"].as_str().unwrap().trim_end(),
+        format!(
+            "LEAD <[tool error] unknown tool `bash`; available tools: {lead_tools}> \
+             <[tool error] unknown tool `write_file`; available tools: {lead_tools}>"
+        )
+    );
+
+    // The worker's allowlist is `read_image, bash, read_file`: the unadvertised
+    // `bash` drops out and the typed-result tools its request added follow.
+    let worker_tools = "read_image, read_file, write_output, submit_output";
+    let session = result["session_id"].as_str().unwrap();
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap();
+    let report = format!(
+        "WORKER <[tool error] unknown tool `bash`; available tools: {worker_tools}> \
+         <[tool error] unknown tool `write_file`; available tools: {worker_tools}>"
+    );
+    assert!(
+        persisted.contains(&report),
+        "worker report missing; retained artifacts: {}",
+        dir.display()
+    );
+    let trace = std::fs::read_to_string(dir.join("boundary-trace.jsonl")).unwrap();
+    assert!(
+        !trace.contains("basic-tools.tool.invoke"),
+        "no rejected call reaches a tool source"
+    );
+}
+
 #[test]
 fn routed_replay_reader_fault_closes_cli_and_reader_without_submission() {
     let dir = isolated_starter("routed-replay-fault-");

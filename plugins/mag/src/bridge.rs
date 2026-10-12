@@ -267,7 +267,7 @@ fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
         _ => Value::Object(request.clone()),
     };
     out.insert("args".into(), args);
-    for key in ["allowlist", "da-policy"] {
+    for key in ["allowlist", "request_local_tools", "da-policy"] {
         if let Some(value) = request.get(key).filter(|value| !value.is_null()) {
             out.insert(key.into(), value.clone());
         }

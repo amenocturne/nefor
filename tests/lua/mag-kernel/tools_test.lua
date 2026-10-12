@@ -121,6 +121,31 @@ do
 end
 
 -- ==================================================================
+-- run-tool: the request-local tools the ToolCalls message names travel with
+-- every invoke, so the tool surface can list them as callable by this agent
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local request_local = { "write_output", "submit_output" }
+  local inst = run_tool.construct("typed", {
+    tool_approval_policy = { rules = {} }, allowlist = { "grep" },
+  }, emit)
+  inst.deliver(single("llm", "generic-tool.ToolCalls", {
+    calls = {
+      { id = "call-1", name = "bash", args = {} },
+      { id = "call-2", name = "write_output", args = {}, runtime_result = { saved = true } },
+    },
+    request_local_tools = request_local,
+  }))
+  local invokes = collect_kind(msgs, "capability.invoke")
+  assert_eq(#invokes, 1, "a call the provider actor settled itself is not invoked")
+  assert_eq(invokes[1].capability, "bash", "an unlisted name still goes to the tool surface")
+  assert_eq(invokes[1].request.request_local_tools, request_local,
+    "invoke carries the request-local tools named beside the calls")
+end
+
+-- ==================================================================
 -- run-tool: two calls → two capability.invokes each carrying the da-policy
 -- (and allowlist) from params; pending; replies aggregate into one ToolHandle
 -- + mag.complete
@@ -151,6 +176,7 @@ do
     assert_true(inv.request ~= nil, "invoke carries a request payload")
     assert_eq(inv.request["da-policy"], policy, "invoke carries the node da-policy from params")
     assert_eq(inv.request.allowlist, allowlist, "invoke carries the node allowlist from params")
+    assert_true(inv.request.request_local_tools == nil, "no request-local tools unless the calls name them")
   end
   assert_eq(invokes[1].capability, "grep", "first invoke targets the first tool")
   assert_eq(invokes[1].request.args.pattern, "foo", "first invoke carries the tool args")

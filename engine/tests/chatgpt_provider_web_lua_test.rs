@@ -233,7 +233,8 @@ fn malformed_arguments_settle_uniformly_without_reaching_the_provider_process() 
         assert(t.inbound({ type = "event", from = "tool-gate", body = {
           kind = "chatgpt.tool.invoke", id = "unknown", name = "weather", args = {},
         }}) == nil)
-        assert(last_result("unknown").error == "chatgpt: unknown tool `weather`")
+        assert(last_result("unknown").error == "unknown tool `weather`; available tools: "
+          .. "web_search, web_open, web_click, web_find, web_image_search, web_screenshot")
         local wrong_provider = t.inbound({ type = "event", from = "tool-gate", body = {
           kind = "chatgpt.tool.invoke", id = "wrong-provider", name = "web_search", args = { query = "test" },
           invocation = { provider = "openrouter", model = "other-model",
