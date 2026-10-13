@@ -329,17 +329,12 @@ actor.spawn(actor.identity_spec("mag", {
 
 local tools = require("libs.compositors.tools")
 local model_context_policy = require("libs.model-context-policy")
+-- The gate decides every call from the caller's approval policy, the tool's
+-- own assessment and the permission mode. What a call means is defined by
+-- each tool, below where the tools are built; the gate has no per-tool
+-- settings except `--deny <tool>`, an explicit restriction this starter does
+-- not use.
 local tool_gate_argv = { require("config").bin("tool-gate") }
-for _, t in ipairs(cfg.tool_gate.auto_tools or {}) do
-  tool_gate_argv[#tool_gate_argv + 1] = "--auto"
-  tool_gate_argv[#tool_gate_argv + 1] = t
-end
-for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
-  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
-  tool_gate_argv[#tool_gate_argv + 1] = t
-end
-tool_gate_argv[#tool_gate_argv + 1] = "--default"
-tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 -- lead-workflow lives alongside agentic-loop, not inside it: separate
 -- bus subscriptions, separate state. Owns plan/approval state and the
@@ -364,27 +359,29 @@ actor.spawn(lead_workflow)
 actor.spawn(require("read-only-tools"))
 
 -- Tool-validator owns command classification: what running a command means
--- under each approval policy, answered by `da` with that policy's flags. The
--- command tools and `mag-apply` decide from it. Its actor forwards the gate's
+-- under each approval policy, answered by `da` with that policy's flags (this
+-- configuration's flags are in tool-validator/init.lua). The command tools and
+-- `mag-apply` decide from it. Its actor forwards the gate's
 -- chat.tool.permission_request to the chat surface as
 -- chat.tool.popup_request, so it must be spawned BEFORE tool-gate.
---
--- `model_flag` names the classifier's opt-in model flag; it is added to the
--- Default policy's flags only. The pinned da release has no such flag (it
--- always consults its model), so it stays unset here.
 local tool_validator = require("tool-validator").build {
   classifier = SHELL_CLASSIFIER,
-  model_flag = nil,
 }
 actor.spawn(tool_validator)
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
-local git_worktree_tools = tools.git_worktree_actor_spec()
+-- This starter's explicit choices for a Default agent. Creating or opening a
+-- worktree asks in safe mode; write_file needs a current approved
+-- write-review plan. (For a ReadOnly agent the tools themselves say:
+-- creating and writing are denied, opening is safe.)
+local git_worktree_tools = tools.git_worktree_actor_spec {
+  decide_create = { "unsure", "it creates a Git worktree and a branch" },
+  decide_open = { "unsure", "it opens a Git worktree outside the session" },
+}
 local basic_tools = tools.basic_actor_spec {
   max_read_bytes = model_context_policy.item_limit,
   classify_command = tool_validator.classify_command,
   classify_argv = tool_validator.classify_argv,
-  -- write_file needs a current approved write-review plan.
   decide_write = function()
     if lead_workflow.has_approved_plan() then return "safe" end
     return "denied", "write_file requires an approved plan"

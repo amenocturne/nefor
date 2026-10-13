@@ -27,7 +27,7 @@ local function turn(message)
   }
 end
 
-local instance = assert(llm.construct("tool-footer.llm", {
+local instance = assert(llm.construct("tool-footer.llm", { tool_approval_policy = { constructor = "Default" }, 
   provider = "p",
   output_type = "nefor.contracts.TextAnswer",
   error_type = "nefor.contracts.AgentError",

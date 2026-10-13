@@ -1,4 +1,5 @@
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 local RESULT = "nefor.retry.Result"
@@ -7,6 +8,8 @@ local decision = { kind = "variable", name = "R" }
 
 M.declaration = {
   name = "retry-gate",
+  -- Counts retries and routes a value; it changes nothing outside the run.
+  approval = node_approval.inert("retry gate"),
   type_variables = { "T", "R" },
   semantic = {
     input = value,

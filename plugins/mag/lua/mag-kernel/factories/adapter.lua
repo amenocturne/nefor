@@ -36,6 +36,7 @@
 -- Signals: explicit handlers only where meaningful — cf. factories/tool-result.lua).
 
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 local model_context = require("model-context")
 
 local M = {}
@@ -45,6 +46,8 @@ local PROVIDER_INPUT = "generic-provider.ProviderOut"
 
 M.declaration = {
   name = "adapter",
+  -- Turns a typed value into a provider turn; it changes nothing outside the run.
+  approval = node_approval.inert("adapter"),
   type_variables = { "T" },
   semantic = {
     input={kind="variable",name="T"},

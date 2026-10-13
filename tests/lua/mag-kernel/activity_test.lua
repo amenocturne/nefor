@@ -183,7 +183,7 @@ do
   local h
   h = harness({
     worker = {
-      declaration = { name = "worker", params = {}, inputs = { input = "seed.In" }, outputs = {} },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "worker", params = {}, inputs = { input = "seed.In" }, outputs = {} },
       make = function()
         return { deliver = function()
           h.clock.advance(40)
@@ -192,7 +192,7 @@ do
       end,
     },
     follower = {
-      declaration = { name = "follower", params = {}, inputs = { input = "mag.Unit" }, outputs = {} },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "follower", params = {}, inputs = { input = "mag.Unit" }, outputs = {} },
       make = function()
         return { deliver = function() return "ok" end }
       end,
@@ -246,7 +246,7 @@ end
 do
   local h = harness({
     caller = {
-      declaration = { name = "caller", params = {}, inputs = { input = "seed.In" }, outputs = {} },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "caller", params = {}, inputs = { input = "seed.In" }, outputs = {} },
       make = function(id, emit)
         return {
           deliver = function(activation)
@@ -287,7 +287,7 @@ end
 do
   local h = harness({
     deferred = {
-      declaration = { name = "deferred", params = {}, inputs = { input = "seed.In" }, outputs = {} },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "deferred", params = {}, inputs = { input = "seed.In" }, outputs = {} },
       make = function(id, emit)
         return {
           deliver = function() return { status = "pending" } end,
@@ -319,7 +319,7 @@ end
 do
   local h = harness({
     flaky = {
-      declaration = { name = "flaky", params = {}, inputs = { input = "seed.In" }, outputs = { "flaky.Err" } },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "flaky", params = {}, inputs = { input = "seed.In" }, outputs = { "flaky.Err" } },
       make = function()
         return { deliver = function()
           return { status = "failed", failure = "flaky.Err", value = { error = "boom" } }
@@ -327,7 +327,7 @@ do
       end,
     },
     catcher = {
-      declaration = { name = "catcher", params = {}, inputs = { input = "flaky.Err" }, outputs = {} },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "catcher", params = {}, inputs = { input = "flaky.Err" }, outputs = {} },
       make = function()
         return { deliver = function() return "ok" end }
       end,
@@ -349,7 +349,7 @@ do
   -- Unrouted failure: the escalation (mag.run_failed) rides with an idle too.
   local h2 = harness({
     flaky = {
-      declaration = { name = "flaky", params = {}, inputs = { input = "seed.In" }, outputs = { "flaky.Err" } },
+      declaration = { approval = require("node-approval").inert("test node"),  name = "flaky", params = {}, inputs = { input = "seed.In" }, outputs = { "flaky.Err" } },
       make = function()
         return { deliver = function()
           return { status = "failed", failure = "flaky.Err", value = { error = "boom" } }

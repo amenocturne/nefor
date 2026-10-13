@@ -304,6 +304,14 @@ function M.spawn_spec(name, command, opts)
       return true
     end
 
+    -- Every provider request is an agent's and names that agent's approval
+    -- policy; nothing is assumed for one that does not.
+    if not tool.approval.is_policy(body.approval_policy) then
+      fail_request(body, "invalid_provider_invocation",
+        "provider invocation names no approval policy (got `" .. tostring(body.approval_policy) .. "`)")
+      return true
+    end
+
     local request = {
       request_id = body.request_id,
       conversation_id = body.conversation_id,

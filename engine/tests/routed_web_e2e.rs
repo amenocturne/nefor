@@ -84,7 +84,7 @@ actor.spawn(provider.spawn_spec("chatgpt", {{
   conversations = conversations,
 }}))
 actor.spawn(actor.identity_spec("tool-gate", {{
-  "{gate_binary}", "--auto", "web_screenshot", "--default", "deny",
+  "{gate_binary}",
 }}))
 
 local OUTER_ID = "r1/capability-outer"
@@ -104,6 +104,7 @@ local function maybe_invoke()
       name = "web_screenshot",
       args = {{ url = "https://www.iana.org/about/informational-booklet.pdf", page = 0 }},
       allowlist = {{ "web_screenshot" }},
+      approval_policy = "ReadOnly",
       model = "gpt-test",
       invocation = {{
         provider = "chatgpt", model = "gpt-test", session_id = "session-1",

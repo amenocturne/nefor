@@ -47,6 +47,7 @@ local function make(dynamic, bound_schema, synchronous, compaction_fixture)
   local actor, err
   local transport = compaction_fixture and compaction_fixture.transport or Async.disabled()
   actor, err = factory.construct("typed", {
+    tool_approval_policy = { constructor = "Default" },
     compaction_policy = compaction_fixture and { soft_percent = 60, step_percent = 10, hard_percent = 90 },
     provider = "mock", tools = {}, schema = dynamic and { version = 2,
       root = { kind = "list", item = current_schema.root } } or current_schema,

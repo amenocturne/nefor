@@ -63,9 +63,10 @@ local function validate_script(params)
   }
 end
 
-local function declaration(name, identity, params_type)
+local function declaration(name, identity, params_type, approval)
   return {
     name = name,
+    approval = approval,
     semantic = {
       input = INPUT_TYPE,
       output = RESULT_TYPE,
@@ -88,7 +89,7 @@ end
 
 local function factory(config)
   local factory_module = {
-    declaration = declaration(config.name, config.identity, config.params),
+    declaration = declaration(config.name, config.identity, config.params, config.approval),
   }
 
   function factory_module.construct(id, params, emit, deps)
@@ -197,6 +198,17 @@ M.exec = factory({
   identity = "nefor.factory.process-exec",
   params = { argv = "string[]", cwd = "string", timeout = "record" },
   capability = "process.exec",
+  -- Means what the `process.exec` tool says its argument vector means. A
+  -- vector bound at run time cannot be classified before the run; the working
+  -- directory and the timeout are no part of what is classified.
+  approval = {
+    kind = "capability", noun = "process", tool = "process.exec",
+    arguments = { "argv" }, shown = "argv",
+    runtime_bound = {
+      argv = { "unsure", "its command is bound to a value known only at run time" },
+      cwd = "ignored", timeout = "ignored",
+    },
+  },
   validate = validate_exec,
 })
 
@@ -205,6 +217,17 @@ M.script = factory({
   identity = "nefor.factory.shell-script",
   params = { script = "string", cwd = "string", timeout = "record" },
   capability = "shell.script",
+  -- Means what the `shell.script` tool says its script means. A script bound
+  -- at run time cannot be classified before the run; the working directory
+  -- and the timeout are no part of what is classified.
+  approval = {
+    kind = "capability", noun = "shell script", tool = "shell.script",
+    arguments = { "script" }, shown = "script",
+    runtime_bound = {
+      script = { "unsure", "its command is bound to a value known only at run time" },
+      cwd = "ignored", timeout = "ignored",
+    },
+  },
   validate = validate_script,
 })
 

@@ -67,7 +67,7 @@ local function harness()
   reg:register({ declaration = run_tool.declaration, construct = run_tool.construct })
   reg:register({ declaration = tool_res.declaration, construct = tool_res.construct })
   reg:register({
-    declaration = {
+    declaration = { approval = require("node-approval").inert("test node"), 
       name = "capture-sink",
       inputs = { input = "generic-provider.ProviderOut" },
       outputs = {},

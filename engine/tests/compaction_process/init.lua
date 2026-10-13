@@ -16,8 +16,8 @@ actor.spawn(require("libs.conversation-manager.runtime").build{service=service,e
 end})
 actor.spawn(require("libs.compositors.provider").spawn_spec("gpt",{BIN.."/mock-plugin","--script",DIR.."/provider.lua","--lua-root",ROOT.."/lua"},{translator_lib=CASE=="unsupported" and "openai-provider" or "chatgpt-provider",tool_gate="tool-gate",agentic_loop={config=function() return {provider="gpt"} end},conversations=service:reader()}))
 local tool=require("libs.tool")
-actor.spawn(tool.actor{gate="tool-gate",source=tool.source{name="test-tools",tools={tool.define{name="echo",description="Deterministic sibling",parameters={type="object",properties={},additionalProperties=false},display={compact={label="echo"},expanded={label="echo",fields=nefor.json.mark_array({})},result={kind="content",fields=nefor.json.mark_array({})}},execute=function(args,call) call.ok("sibling done") end}}}})
-actor.spawn(actor.identity_spec("tool-gate",{BIN.."/tool-gate","--auto","echo","--default","deny"}))
+actor.spawn(tool.actor{gate="tool-gate",source=tool.source{name="test-tools",tools={tool.define{approval={ReadOnly={decide="safe",describe=tool.nothing},Default={decide="safe",describe=tool.nothing}},prepare=tool.nothing,name="echo",description="Deterministic sibling",parameters={type="object",properties={},additionalProperties=false},display={compact={label="echo"},expanded={label="echo",fields=nefor.json.mark_array({})},result={kind="content",fields=nefor.json.mark_array({})}},execute=function(args,call) call.ok("sibling done") end}}}})
+actor.spawn(actor.identity_spec("tool-gate",{BIN.."/tool-gate"}))
 actor.spawn(actor.identity_spec("mag",{BIN.."/mag-plugin","--lua-root",ROOT.."/lua","--tool-gate","tool-gate"}))
 local events={}
 local kill_sent=false

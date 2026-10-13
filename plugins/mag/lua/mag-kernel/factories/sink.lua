@@ -25,11 +25,14 @@
 -- pending work to drain or abort.
 
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 
 M.declaration = {
   name = "sink",
+  -- Records the run's result in the run's own output; nothing outside it.
+  approval = node_approval.inert("sink"),
   type_variables = { "T" },
   semantic = {
     input={kind="variable",name="T"},

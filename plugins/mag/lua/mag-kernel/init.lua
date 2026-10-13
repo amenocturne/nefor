@@ -1104,6 +1104,8 @@ return {
   registry_contracts = function(array_mt)
     return registry:contracts(array_mt)
   end,
+  -- What each factory's nodes mean for approval (node-approval.lua).
+  registry_approvals = function() return registry:approvals() end,
 
   -- Take a run's run-complete signal (one-shot; cleared on read). The host
   -- polls this after driving the fold to settle the execute reply with the

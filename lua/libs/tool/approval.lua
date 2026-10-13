@@ -80,31 +80,24 @@ function M.combine(left, right)
   return right
 end
 
--- Decision functions for the two commonest tools. Under `Default` both leave
--- the answer to the gate's configured setting for the tool.
-
--- A tool that only reads: safe for an agent that may only read.
-function M.reads()
-  return function(policy)
-    if policy == M.ReadOnly then return M.safe end
+-- nil when `result` (with `reason`) is a valid decision, otherwise what is
+-- wrong with it. `unsure` and `denied` must say why.
+function M.check_decision(result, reason)
+  if result == nil then return "it gives no result" end
+  if not M.is_result(result) then
+    return "`" .. tostring(result) .. "` is not one of " .. table.concat(M.RESULTS, ", ")
   end
+  if result ~= M.safe and (type(reason) ~= "string" or reason == "") then
+    return "`" .. result .. "` needs a reason"
+  end
+  if reason ~= nil and type(reason) ~= "string" then return "the reason must be a string" end
+  return nil
 end
 
--- A tool that writes or has other effects: denied for an agent that may only
--- read, with `reason` saying what it would change.
-function M.writes(reason)
-  if type(reason) ~= "string" or reason == "" then
-    error("approval.writes: a reason is required", 2)
-  end
-  return function(policy)
-    if policy == M.ReadOnly then return M.denied, reason end
-  end
-end
-
--- The text a writing tool adds to its description for a ReadOnly agent.
-function M.rejected_when_read_only(reason)
-  return { [M.ReadOnly] = "Your approval policy is ReadOnly, so every call to this tool is rejected: "
-    .. reason .. "." }
+-- The text a tool that is always denied for a ReadOnly agent adds to its
+-- description for such an agent.
+function M.read_only_rejection(reason)
+  return "Your approval policy is ReadOnly, so every call to this tool is rejected: " .. reason .. "."
 end
 
 return M

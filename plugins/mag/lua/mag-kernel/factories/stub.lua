@@ -7,6 +7,7 @@
 -- the declaration's `signals` list matches what the constructor implements.
 
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 
@@ -14,6 +15,8 @@ local M = {}
 -- no behavior is derived from it.
 M.declaration = {
   name = "stub",
+  -- Emits a canned value; it has no effect.
+  approval = node_approval.inert("stub"),
 
   -- params schema — documentation-grade shape of the setup table the
   -- constructor accepts. Opaque to the kernel (params belong to the factory).

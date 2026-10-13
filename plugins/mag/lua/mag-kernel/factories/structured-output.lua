@@ -2,11 +2,15 @@
 -- prose llm factory; this module owns only schema instruction, validation and
 -- editable drafts and explicit submission.
 local boundary = require("factories.provider-boundary")
+local node_approval = require("node-approval")
 local M = {}
 local RESULT = "nefor.agent.Result"
 
 M.declaration = {
   name = "structured-output",
+  -- Calls the model. What the agent may do is its tool calls, which its
+  -- run-tool actor makes under the agent's policy and the gate decides.
+  approval = node_approval.inert("model"),
   type_variables = { "T", "R" },
   semantic = {
     input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
@@ -22,7 +26,7 @@ M.declaration = {
     model = "string", provider = "string",
     reasoning_effort = "string?",
     provider_options = "table?", compaction_policy = "table?",
-    tool_approval_policy = "table?", -- the agent's policy; selects per-policy tool descriptions
+    tool_approval_policy = "table", -- the agent's policy; selects per-policy tool descriptions
     system = "string?", tools = "table?", history = "table?", schema = "table",
     output_type = "string", error_type = "string",
     provider_error_type = "string",

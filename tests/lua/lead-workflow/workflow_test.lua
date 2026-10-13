@@ -60,6 +60,26 @@ local function make_entry(origin, body)
   }
 end
 
+-- What each kind of node means for approval, taken from the kernel
+-- factories' own declarations, as the MAG runtime publishes them with every
+-- `mag.hello` and `mag.loaded`.
+package.path = _repo_root .. "/plugins/mag/lua/mag-kernel/?.lua;" .. package.path
+local FACTORY_APPROVALS = {}
+do
+  local process = require("factories.process")
+  local declarations = { process.script.declaration, process.exec.declaration }
+  for _, name in ipairs({ "adapter", "llm", "structured-output", "run-tool", "sink", "source", "stub",
+      "tool-result", "worktree-create", "worktree-open", "human", "retry-gate",
+      "dynamic-each", "dynamic-index", "dynamic-output", "dynamic-all" }) do
+    declarations[#declarations + 1] = require("factories." .. name).declaration
+  end
+  local validate = require("node-approval").validate
+  for _, declaration in ipairs(declarations) do
+    assert(validate(declaration) == nil, declaration.name .. " declares what its nodes mean")
+    FACTORY_APPROVALS["nefor.factory." .. declaration.name] = declaration.approval
+  end
+end
+
 -- A stand-in for the tool gate, for the tool that has a prepare step and a
 -- deferred decision. A `mag-apply` invoke is first sent as the gate's prepare
 -- request; once lead-workflow answers `tool.prepared`, the invoke follows
@@ -94,11 +114,17 @@ local function gate_settle()
 end
 
 local function feed(origin, body)
+  if type(body) == "table" and body.kind == "mag.loaded" and body.factory_approvals == nil then
+    body.factory_approvals = FACTORY_APPROVALS
+  end
   if type(body) == "table" and body.kind == "lead-workflow.tool.invoke"
       and body.name == "mag-apply" then
     local prepare = {}
     for key, value in pairs(body) do prepare[key] = value end
     prepare.kind = "lead-workflow.tool.prepare"
+    -- The gate only prepares a call that states its agent's policy; the
+    -- tests that do not care are a Default agent's calls.
+    if prepare.approval_policy == nil then prepare.approval_policy = "Default" end
     gate.prepared[body.id] = prepare
     lw.receive_msg(make_entry(origin, prepare))
   else
@@ -3334,8 +3360,13 @@ do
       invoke = function() end, cancel = function() end,
       classify_command = fake_classify,
       classify_argv = function(policy, argv) return fake_classify(policy, quote_argv(argv)) end,
+      decide_write = "safe",
     }
-    for _, definition in ipairs(require("libs.git-worktree").tools { invoke = function() end }) do
+    for _, definition in ipairs(require("libs.git-worktree").tools {
+      invoke = function() end,
+      decide_create = { "unsure", "it creates a Git worktree and a branch" },
+      decide_open = "safe",
+    }) do
       list[#list + 1] = definition
     end
     return list
@@ -3396,7 +3427,9 @@ do
     assert_true(executed_before_decision == nil, "nothing is executed before the decision")
     feed("mag", {
       kind = "mag.loaded", in_reply_to = load.body.id, hash = "sha256:approval-" .. sequence,
-      factories = APPROVAL_FACTORIES, factory_contracts = factory_contracts(APPROVAL_FACTORIES),
+      factories = options.factories or APPROVAL_FACTORIES,
+      factory_contracts = factory_contracts(options.factories or APPROVAL_FACTORIES),
+      factory_approvals = options.factory_approvals or FACTORY_APPROVALS,
       artifact = artifact,
     })
     gate.verdict = nil
@@ -3466,7 +3499,7 @@ do
       "- node `wipe` (shell script) `rm -rf build`: forbidden by the command classifier",
       "- node `build` (shell script) `make all`: not shown to be read-only",
       "- node `exec-wipe` (process) `'rm' '-rf' 'it'\\''s here'`: forbidden by the command classifier",
-      "- node `writer` (agent) with approval policy Default: wider than ReadOnly, the approval policy of the agent applying the workflow",
+      "- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)",
       "- node `per-item (template of each)` (shell script) `make item`: not shown to be read-only",
     }, "\n"), "the reason lists every offending node with its kind, its command or policy, and why")
     assert_true(outcome.execute == nil, "a refused workflow runs nothing")
@@ -3493,16 +3526,12 @@ do
     assert_eq(outcome.prepared.decision, "denied", "a wider agent is denied, not narrowed")
     assert_eq(outcome.prepared.reason,
       "the workflow declares 1 node not shown to be allowed under the ReadOnly approval policy:\n"
-      .. "- node `writer` (agent) with approval policy Default: wider than ReadOnly, the approval policy of the agent applying the workflow",
+      .. "- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)",
       "the message names the node and both policies")
     assert_true(outcome.execute == nil, "nothing runs")
     configured()
     assert_eq(apply(program({ agent("a", "ReadOnly"), agent("b", "Default") }), "Default").prepared.decision,
       "safe", "a Default caller may run ReadOnly and Default agents")
-    configured()
-    assert_eq(apply(program({ { id = "odd.run-tool", factory = "run-tool", params = {} } }), "Default",
-      { verdict = function() return false end }).prepared.decision,
-      "denied", "an agent without a valid policy is denied")
   end
 
   -- A nested apply from a ReadOnly agent inside another workflow reaches the
@@ -3579,25 +3608,77 @@ do
     assert_eq(read_only.prepared.decision, "denied", "creating a worktree is not read-only")
     assert_eq(read_only.prepared.reason,
       "the workflow declares 1 node not shown to be allowed under the ReadOnly approval policy:\n"
-      .. "- node `wt` (worktree creation) at `/r/.worktrees/x`: it creates a Git worktree and a branch",
+      .. "- node `wt` (worktree creation) `/r/.worktrees/x`: it creates a Git worktree and a branch",
       "the worktree node gives the tool's own reason; opening one and asking a human are read-only")
     configured()
     local default = apply(program({ create }), "Default", { verdict = function() return false end })
-    assert_eq(default.prepared.decision, "unsure", "under Default a tool that does not say is unsure")
-    configured()
-    local unknown = apply(program({ { id = "x", factory = "teleport", params = {} } }), "Default",
-      { verdict = function() return false end })
-    assert_eq(unknown.prepared.decision, "unsure", "an unknown kind of node is unsure")
-    assert_true(unknown.prepared.reason:find("nothing says what a `teleport` node does", 1, true) ~= nil,
-      "and says so")
+    assert_eq(default.prepared.decision, "unsure", "under Default the node means what the configuration chose for its tool")
+    assert_eq(default.prepared.reason,
+      "the workflow declares 1 node not shown to be allowed under the Default approval policy:\n"
+      .. "- node `wt` (worktree creation) `/r/.worktrees/x`: it creates a Git worktree and a branch",
+      "with the configured reason")
   end
 
-  -- Without a configured capability decision nothing vouches for a command.
+  -- Nothing about a node is assumed. A kind of node the runtime did not
+  -- describe, a capability no tool defines, an agent without a policy, a
+  -- classifier that fails, a call without a policy: each ends the call with
+  -- an error that names it, and nothing runs.
   do
-    fresh()
-    gate.prepared, gate.answers = {}, {}
-    local outcome = apply(program({ script("list", "ls") }), "ReadOnly", { verdict = function() return false end })
-    assert_eq(outcome.prepared.decision, "unsure", "an unconfigured runner approves no command")
+    local function undecidable(artifact, policy, options, expected)
+      configured()
+      if options.configure then options.configure() end
+      local outcome = apply(artifact, policy, options)
+      assert_true(outcome.prepared == nil, "no decision is answered: " .. expected)
+      assert_true(outcome.execute == nil, "nothing runs: " .. expected)
+      assert_eq(outcome.result.body.error, expected, "the error names what is undefined")
+    end
+    local teleport_factories = { "adapter", "llm", "teleport" }
+    undecidable(program({ { id = "x", factory = "teleport", params = {} } }), "Default",
+      { factories = teleport_factories },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `x`: the MAG runtime does not say what a `nefor.factory.teleport` node means for approval")
+    undecidable(program({ { id = "odd.run-tool", factory = "run-tool", params = {} } }), "Default", {},
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `odd.run-tool`: its approval policy is not one: expected a ToolApprovalPolicy (ReadOnly | Default)")
+    undecidable(program({ script("list", "ls") }), "ReadOnly",
+      { configure = function() fresh(); gate.prepared, gate.answers = {}, {} end },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `list`: this configuration did not say what capabilities mean (lead-workflow configure_approval)")
+    undecidable(program({ script("list", "ls"), script("other", "ls") }), "ReadOnly",
+      { configure = function()
+          lw.configure_approval { decide_capability = tool_lib.decision {
+            tool_lib.source { name = "empty", tools = {}, emit = function() end } } }
+        end },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `list`: no tool `shell.script` defines what this capability means\n"
+      .. "- node `other`: no tool `shell.script` defines what this capability means")
+    undecidable(program({ script("list", "ls") }), "Default",
+      { configure = function()
+          lw.configure_approval { decide_capability = function()
+            error("the command could not be classified: the classifier exited with the unknown status 70", 0)
+          end }
+        end },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `list`: the command could not be classified: the classifier exited with the unknown status 70")
+    local incomplete = {}
+    for identity, declared in pairs(FACTORY_APPROVALS) do incomplete[identity] = declared end
+    incomplete["nefor.factory.shell-script"] = { kind = "capability", noun = "shell script",
+      tool = "shell.script", arguments = { "script" }, shown = "script", runtime_bound = {} }
+    local bound = script("per-item", "placeholder")
+    bound.parameter_bindings = { { path = { "script" }, value = "item" } }
+    undecidable(program({}, { operation("each", { bound }) }), "Default", { factory_approvals = incomplete },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `per-item (template of each)`: its factory does not say what binding `script` at run time means")
+    configured()
+    _test.calls_clear()
+    lw.receive_msg(make_entry("tool-gate", { kind = "lead-workflow.tool.prepare", id = "no-policy",
+      name = "mag-apply", args = { file = "no-policy.mag", content = READ_ONLY_MAG } }))
+    local refused = find_call(decode_calls(), function(c) return c.body.kind == "tool.result" and c.body.id == "no-policy" end)
+    assert_eq(refused.body.error,
+      "mag-apply: this call could not be decided: no approval policy `nil`; the caller must state one of ReadOnly, Default",
+      "a call without a policy is an error before anything is compiled")
+    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end) == nil,
+      "and nothing is compiled for it")
   end
 
   -- A compile failure ends the call with the compiler's message: there is

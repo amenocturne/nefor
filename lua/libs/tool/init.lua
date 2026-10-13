@@ -6,7 +6,6 @@
 -- capability is an ordinary tool whose `execute` sends a capability request.
 --
 --   local tool = require("libs.tool")
---   local approval = require("libs.tool.approval")
 --   local write = tool.define {
 --     name = "write_note",
 --     description = "...",          -- string, or function(request) -> string
@@ -14,42 +13,59 @@
 --     display = { compact = ..., expanded = ..., result = ... },
 --     context = { folders = { ... } },  -- optional internal advertisement metadata
 --     execution = { kind = "routed" },  -- optional gate execution metadata
---     approval = {                      -- optional; see "Approval" below
---       decide = function(policy, args, call)
---         if policy == approval.ReadOnly then return approval.denied, "it writes a note" end
---       end,
---       describe = { ReadOnly = "Your approval policy is ReadOnly, so this tool is rejected." },
+--     approval = {                      -- one entry per approval policy; see below
+--       ReadOnly = {
+--         decide = { "denied", "it writes a note" },
+--         describe = "Your approval policy is ReadOnly, so every call to this tool is rejected.",
+--       },
+--       Default = {
+--         decide = function(args, call)
+--           if args.draft then return "safe" end
+--           return "unsure", "it publishes the note"
+--         end,
+--         describe = tool.nothing,
+--       },
 --     },
---     prepare = nil,                                        -- or function(args, call)
+--     prepare = tool.nothing,                               -- or function(args, call)
 --     execute = function(args, call) call.ok(output) end,
 --     cancel = function(call) end,      -- optional
 --   }
 --
+-- Nothing about a tool is implied. A definition that leaves out `prepare`, an
+-- approval policy, a `decide` or a `describe` fails when the tool is defined,
+-- naming the tool and what is missing. Lua cannot tell a field set to nil from
+-- an absent one, so "this tool has none" is written with one explicit value,
+-- `tool.nothing`.
+--
 -- ## prepare and execute
 --
--- Both functions belong to every tool's interface. `execute(args, call)` does
--- the tool's work and is required. `prepare(args, call)` is what the tool does
--- with a call before anyone has decided whether it may run, for example
--- storing the content the call carries so that it can be inspected; most
--- tools have none. Lua cannot tell a field set to nil from an absent field,
--- so "no prepare" is written either way, `prepare = nil` or nothing, and a
--- definition's `prepare` is then nil. What a caller does between the two
--- functions is the caller's concern. A source runs them in this order for one
--- call: `prepare` (if any), then the decision of whoever asked, then `execute`.
+-- Both belong to every tool's interface. `execute(args, call)` does the
+-- tool's work. `prepare(args, call)` is what the tool does with a call before
+-- anyone has decided whether it may run, for example storing the content the
+-- call carries so that it can be inspected; a tool without such a step
+-- declares `prepare = tool.nothing`. What a caller does between the two is the
+-- caller's concern. A source runs them in this order for one call: `prepare`,
+-- then the decision of whoever asked, then `execute`.
 --
 -- ## Approval
 --
--- `approval.decide(policy, args, call)` says what one call means under the
--- caller's approval policy (`libs.tool.approval`): it returns `safe`, `unsure`
--- or `denied`, with a reason for the last two. Returning nothing means the
--- tool does not say; the gate then uses its configured setting for the tool
--- under `Default` and denies under any narrower policy. A decision that needs
--- to wait returns `tool.deferred` and later calls `call.decided(result,
--- reason)`. `approval.describe[policy]` is text appended to the tool's
--- description for an agent with that policy; a policy with nothing to add has
--- no entry. The two live together so that what is enforced and what the model
--- is told cannot drift apart. The tool only states meaning: what happens to a
--- `safe`, `unsure` or `denied` call is the gate's decision.
+-- `approval` has exactly one entry for every approval policy in
+-- `libs.tool.approval`'s order. An entry says what a call means for a caller
+-- with that policy, and what the model is told about it:
+--
+--   * `decide` is the result for every call, `"safe"` or `{ "unsure", reason }`
+--     or `{ "denied", reason }`, or a function `(args, call) -> result, reason`
+--     for a tool whose calls differ. `unsure` and `denied` always carry a
+--     reason. A function that returns no result, or an unknown one, or
+--     raises, ends the call with an error: failing to decide is never a
+--     decision. A decision that needs to wait returns `tool.deferred` and
+--     later calls `call.decided(result, reason)`.
+--   * `describe` is text appended to the tool's description for an agent
+--     with that policy, or `tool.nothing`.
+--
+-- The two live together so that what is enforced and what the model is told
+-- cannot drift apart. The tool only states meaning: what happens to a `safe`,
+-- `unsure` or `denied` call is the gate's decision.
 --
 -- `define` checks the schema (only the keywords `libs.tool.schema` supports)
 -- and the display contract when the tool is defined. A source groups tools
@@ -96,6 +112,10 @@ local M = {}
 
 M.schema = schema
 M.approval = approval
+
+-- The explicit "this tool has none" for `prepare` and for a policy's
+-- `describe`.
+M.nothing = setmetatable({}, { __tostring = function() return "tool.nothing" end })
 
 -- Returned by a decision function that settles later through `call.decided`.
 M.deferred = setmetatable({}, { __tostring = function() return "tool.deferred" end })
@@ -151,42 +171,60 @@ function M.define(spec)
   if spec.execution ~= nil and type(spec.execution) ~= "table" then
     fail(name, "execution must be a table")
   end
-  if spec.prepare ~= nil and type(spec.prepare) ~= "function" then
-    fail(name, "prepare must be a function or nil")
+  if spec.prepare == nil then
+    fail(name, "prepare is not defined; give a function, or tool.nothing for a tool without a prepare step")
+  end
+  if spec.prepare ~= M.nothing and type(spec.prepare) ~= "function" then
+    fail(name, "prepare must be a function or tool.nothing")
   end
   if type(spec.execute) ~= "function" then fail(name, "execute must be a function") end
   if spec.cancel ~= nil and type(spec.cancel) ~= "function" then
     fail(name, "cancel must be a function")
   end
-  local decide, describe
-  if spec.approval ~= nil then
-    if type(spec.approval) ~= "table" then fail(name, "approval must be a table") end
-    for key in pairs(spec.approval) do
-      if key ~= "decide" and key ~= "describe" then
-        fail(name, "approval has unknown field `" .. tostring(key) .. "`")
-      end
-    end
-    decide = spec.approval.decide
-    if decide ~= nil and type(decide) ~= "function" then
-      fail(name, "approval.decide must be a function(policy, args, call)")
-    end
-    if spec.approval.describe ~= nil then
-      if type(spec.approval.describe) ~= "table" then
-        fail(name, "approval.describe must map an approval policy to text")
-      end
-      describe = {}
-      for policy, text in pairs(spec.approval.describe) do
-        if not approval.is_policy(policy) then
-          fail(name, "approval.describe names unknown approval policy `" .. tostring(policy) .. "`")
-        end
-        if type(text) ~= "string" or text == "" then
-          fail(name, "approval.describe." .. policy .. " must be a non-empty string")
-        end
-        describe[policy] = text
-      end
-      if next(describe) == nil then describe = nil end
+  if type(spec.approval) ~= "table" then
+    fail(name, "approval is not defined; it needs one entry for each approval policy ("
+      .. table.concat(approval.POLICIES, ", ") .. ")")
+  end
+  for key in pairs(spec.approval) do
+    if not approval.is_policy(key) then
+      fail(name, "approval names unknown approval policy `" .. tostring(key) .. "`")
     end
   end
+  local decisions, describe = {}, {}
+  for _, policy in ipairs(approval.POLICIES) do
+    local entry = spec.approval[policy]
+    if type(entry) ~= "table" then
+      fail(name, "approval does not define the " .. policy .. " policy")
+    end
+    for key in pairs(entry) do
+      if key ~= "decide" and key ~= "describe" then
+        fail(name, "approval." .. policy .. " has unknown field `" .. tostring(key) .. "`")
+      end
+    end
+    local decide = entry.decide
+    if decide == nil then
+      fail(name, "approval." .. policy .. ".decide is not defined")
+    elseif type(decide) == "function" then
+      decisions[policy] = decide
+    else
+      local result, reason = decide, nil
+      if type(decide) == "table" then result, reason = decide[1], decide[2] end
+      local problem = approval.check_decision(result, reason)
+      if problem then fail(name, "approval." .. policy .. ".decide: " .. problem) end
+      decisions[policy] = function() return result, reason end
+    end
+    local text = entry.describe
+    if text == nil then
+      fail(name, "approval." .. policy
+        .. ".describe is not defined; give text, or tool.nothing when there is nothing to add")
+    elseif text ~= M.nothing then
+      if type(text) ~= "string" or text == "" then
+        fail(name, "approval." .. policy .. ".describe must be a non-empty string or tool.nothing")
+      end
+      describe[policy] = text
+    end
+  end
+  if next(describe) == nil then describe = nil end
 
   local definition = {
     name = name,
@@ -198,9 +236,24 @@ function M.define(spec)
     prepare = spec.prepare,
     execute = spec.execute,
     cancel = spec.cancel,
-    decide = decide,
     policy_descriptions = describe,
   }
+
+  -- What one call means for a caller with `policy`: `safe`, `unsure` or
+  -- `denied` and a reason, or `tool.deferred`. Raises when the policy is not
+  -- one, or when the tool's function does not produce a valid decision.
+  function definition.decide(policy, args, call)
+    local decide = decisions[policy]
+    if decide == nil then
+      error("no approval policy `" .. tostring(policy) .. "`; the caller must state one of "
+        .. table.concat(approval.POLICIES, ", "), 0)
+    end
+    local result, reason = decide(args, call)
+    if result == M.deferred then return result end
+    local problem = approval.check_decision(result, reason)
+    if problem then error("its " .. policy .. " decision is invalid: " .. problem, 0) end
+    return result, reason
+  end
 
   -- Model-facing definition. `request` reaches a description function so a
   -- request-local tool can describe per-request data; advertised tools use a
@@ -341,17 +394,17 @@ function M.source(opts)
       emit(copy_fields(fields, { kind = "tool.stream", id = id, stream = stream, text = text }))
     end
     function call.settled() return pending[id] ~= call end
-    -- Answer the decision a deferred `approval.decide` promised.
+    -- Answer the decision a deferred `decide` promised.
     function call.decided(result, reason)
       if pending[id] ~= call or call.phase ~= "prepare" then return end
-      if result ~= nil and not approval.is_result(result) then
-        call.err(definition.name .. ": approval decision `" .. tostring(result)
-          .. "` is not one of " .. table.concat(approval.RESULTS, ", "))
+      local problem = approval.check_decision(result, reason)
+      if problem then
+        call.err(definition.name .. ": this call could not be decided: its "
+          .. tostring(call.policy) .. " decision is invalid: " .. problem)
         return
       end
       call.phase = "prepared"
-      emit({ kind = "tool.prepared", id = id, decision = result,
-        reason = type(reason) == "string" and reason ~= "" and reason or nil })
+      emit({ kind = "tool.prepared", id = id, decision = result, reason = reason })
     end
     return call
   end
@@ -424,17 +477,20 @@ function M.source(opts)
     local call = new_call(definition, body, args)
     call.phase = "prepare"
     pending[call.id] = call
-    if definition.prepare ~= nil then
+    if definition.prepare ~= M.nothing then
       if not run(definition, call, "prepare", definition.prepare, args, call) then return true end
       if pending[call.id] ~= call then return true end
     end
-    if definition.decide == nil then
-      call.decided(nil)
+    -- Failing to decide is never a decision: it ends the call with an error.
+    local ok, result, reason = pcall(definition.decide, call.policy, args, call)
+    if not ok then
+      if opts.propagate_errors and type(result) == "table" then error(result, 0) end
+      if pending[call.id] == call then
+        call.err(definition.name .. ": this call could not be decided: " .. tostring(result))
+      end
       return true
     end
-    local ok, result, reason = run(definition, call, "approval.decide",
-      definition.decide, call.policy, args, call)
-    if not ok or pending[call.id] ~= call or call.phase ~= "prepare" then return true end
+    if pending[call.id] ~= call or call.phase ~= "prepare" then return true end
     if result ~= M.deferred then call.decided(result, reason) end
     return true
   end
@@ -502,16 +558,20 @@ end
 -- text for `policy`, the result gains a request definition equal to the
 -- registered one with that text appended to its description; a provider
 -- prefers a request definition over its catalog entry of the same name and
--- owner. A tool with nothing to add, and a request without a known policy,
--- are left alone. This is the only place per-policy text is appended.
+-- owner. A tool with nothing to add is left alone. A request for an agent
+-- must name its policy: anything else raises. This is the only place
+-- per-policy text is appended.
 function M.request_tool_specs(names, registered, tool_specs, policy)
+  if not approval.is_policy(policy) then
+    error("tool.request_tool_specs: the request names no approval policy (got `"
+      .. tostring(policy) .. "`)", 2)
+  end
   local specs = {}
   local defined = {}
   for index, spec in ipairs(tool_specs or {}) do
     specs[index] = spec
     if type(spec) == "table" and type(spec.name) == "string" then defined[spec.name] = true end
   end
-  if not approval.is_policy(policy) then return specs end
   for _, tool_name in ipairs(names or {}) do
     local spec = registered[tool_name]
     local text = type(spec) == "table" and type(spec.policy_descriptions) == "table"
@@ -532,20 +592,17 @@ end
 
 -- What a call of a named tool means under an approval policy, read from the
 -- tools of `sources`: `decide(tool_name, policy, args) -> result, reason`.
--- It returns nothing for a tool none of the sources define, or one that does
--- not say. The workflow runner decides a workflow's capability nodes with it,
--- so a node and a tool call share one definition of each capability.
+-- It raises for a tool none of the sources define and for a call the tool
+-- cannot decide. The workflow runner decides a workflow's capability nodes
+-- with it, so a node and a tool call share one definition of each capability.
 function M.decision(sources)
   if type(sources) ~= "table" then error("tool.decision: sources must be a list", 2) end
   return function(tool_name, policy, args)
     for _, source in ipairs(sources) do
       local definition = source.get(tool_name)
-      if definition ~= nil then
-        if definition.decide == nil then return nil end
-        return definition.decide(policy, args)
-      end
+      if definition ~= nil then return definition.decide(policy, args) end
     end
-    return nil
+    error("no tool `" .. tostring(tool_name) .. "` defines what this capability means", 0)
   end
 end
 

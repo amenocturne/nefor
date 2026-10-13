@@ -6,7 +6,13 @@
 --
 --   require("libs.git-worktree").tools {
 --     invoke = function(call, capability, args) end,
+--     decide_create = "safe" | { result, reason } | function(args, call) end,
+--     decide_open   = the same,
 --   } -> { tool definitions }
+--
+-- `decide_create` and `decide_open` are the composition's explicit choice of
+-- what creating and opening a worktree mean for a `Default` caller. For a
+-- `ReadOnly` caller creating is always denied and opening is safe.
 
 local tool = require("libs.tool")
 local approval = require("libs.tool.approval")
@@ -39,7 +45,12 @@ function M.tools(opts)
   if type(opts) ~= "table" or type(opts.invoke) ~= "function" then
     error("git-worktree.tools: invoke must be a function", 2)
   end
+  if opts.decide_create == nil or opts.decide_open == nil then
+    error("git-worktree.tools: decide_create and decide_open are not defined; they are what "
+      .. "creating and opening a worktree mean for a Default caller", 2)
+  end
   local invoke = opts.invoke
+  local CREATES = "it creates a Git worktree and a branch"
   local function forward(capability)
     return function(args, call) invoke(call, capability, args) end
   end
@@ -56,9 +67,10 @@ function M.tools(opts)
       display = display("create worktree", "worktree created"),
       context = {},
       approval = {
-        decide = approval.writes("it creates a Git worktree and a branch"),
-        describe = approval.rejected_when_read_only("it creates a Git worktree and a branch"),
+        ReadOnly = { decide = { "denied", CREATES }, describe = approval.read_only_rejection(CREATES) },
+        Default = { decide = opts.decide_create, describe = tool.nothing },
       },
+      prepare = tool.nothing,
       execute = forward("git_worktree_create"),
     },
     tool.define {
@@ -72,7 +84,11 @@ function M.tools(opts)
       },
       display = display("open worktree", "worktree opened"),
       context = {},
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = opts.decide_open, describe = tool.nothing },
+      },
+      prepare = tool.nothing,
       execute = forward("git_worktree_open"),
     },
   }

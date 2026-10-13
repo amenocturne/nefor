@@ -134,17 +134,13 @@ function M.construct(id, params, emit, options)
   local policy, policy_error = policy_api.lower(params.compaction_policy)
   if not policy then return nil, policy_error end
   local compaction = options.compaction
-  -- The agent's approval policy, when its node carries one. Its name rides on
-  -- every provider request so the request's tool descriptions can say what
-  -- that policy means for each tool.
-  local approval_policy
-  if params.tool_approval_policy ~= nil then
-    local policy_error
-    approval_policy, policy_error = approval.from_mag(params.tool_approval_policy)
-    if not approval_policy then
-      return nil, string.format("%s '%s': params.tool_approval_policy: %s",
-        factory_name, tostring(id), policy_error)
-    end
+  -- The agent's approval policy. Its name rides on every provider request so
+  -- the request's tool descriptions can say what that policy means for each
+  -- tool. An agent without one cannot be constructed.
+  local approval_policy, policy_error = approval.from_mag(params.tool_approval_policy)
+  if not approval_policy then
+    return nil, string.format("%s '%s': params.tool_approval_policy: %s",
+      factory_name, tostring(id), policy_error)
   end
   params.tools = json_data.copy(params.tools or {})
   params.tool_specs = json_data.copy(params.tool_specs or {})

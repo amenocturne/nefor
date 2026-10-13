@@ -15,20 +15,21 @@
 -- The command goes through a classifier executable, normally `da`
 -- (https://github.com/amenocturne/da). The contract this module is written
 -- against: the classifier reads the command on stdin, takes policy flags as
--- arguments, and exits 0 to approve, 1 to defer, 2 to deny. Each approval
--- policy has its own flags:
+-- arguments, and exits 0 to approve, 1 to defer, 2 to deny. The flags for
+-- each approval policy are the composition's explicit configuration: this
+-- module has no default flags, and `build` fails for a policy without any.
 --
---   ReadOnly  --read-only --macos-only --help-bypass --git read
---   Default   --read-only --macos-only --help-bypass
---             --git read,add,commit,restore-staged,tag,fetch,pull,push
---             --cargo local  [+ model_flag]
+-- Failing to classify is not a decision. A classifier that cannot be run, or
+-- that exits with a status outside the contract, raises: the tool call that
+-- asked ends with an error saying that classification failed and why. It is
+-- never reported as `denied`, which is a policy answer, nor as `unsure`.
 --
 -- `classify_argv(policy, argv)` answers the same question for a program run
 -- from an argument vector without a shell. The vector is written as the
 -- equivalent POSIX command, every element single-quoted (`core.shell`), and
 -- classified as that text, so a program and a script are judged by one rule
--- set. A vector that cannot be written that way (empty, or not strings) is
--- denied.
+-- set. A vector that cannot be written that way (empty, or not strings)
+-- raises like any other failure to classify.
 --
 -- ## Asking the user
 --
@@ -42,25 +43,18 @@
 --
 -- ## Build options
 --
--- `build{ classifier, classifier_args, model_flag, command_fastpaths }`
--- returns the actor spec with `classify_command` and `classify_argv` on it:
+-- `build{ classifier, classifier_args, command_fastpaths }` returns the
+-- actor spec with `classify_command` and `classify_argv` on it. All three
+-- are required:
 --   * `classifier` — the classifier executable, normally resolved by
---     `nefor-pm.bin`. Required.
---   * `classifier_args` — `{ [policy] = { flags } }`, replacing that policy's
---     default flags above outright.
---   * `model_flag` — the name of the classifier's opt-in model flag. When set
---     it is appended to the default `Default` flags and to no other policy's.
---     Leave it unset for a classifier release that has no such flag.
+--     `nefor-pm.bin`.
+--   * `classifier_args` — `{ [policy] = { flags } }`, the classifier flags
+--     for every approval policy. A flag such as the classifier's opt-in
+--     model flag is simply listed for the policies that should use it.
 --   * `command_fastpaths` — list of `function(command, policy) -> bool`. If
 --     any returns true the command is safe before the classifier is asked.
 --     A downstream config passes its narrow approvals here instead of forking
---     this file.
---
--- ## Failure modes
---
--- A missing or unusable classifier, or one that exits with a status outside
--- the contract, makes the command `denied` with an actionable reason, so a
--- command nobody could classify never passes as merely unsure.
+--     this file; a configuration without any passes `{}`.
 
 local envelope     = require("core.envelope")
 local event        = require("core.event")
@@ -73,82 +67,50 @@ local emit = envelope.emit
 
 local SOURCE_NAME = "tool-validator"
 
--- Classifier flags per approval policy. `da` reads the command on stdin and
--- answers with its exit status: 0 approves, 1 defers, 2 denies.
---
--- Default is the wide stack: it mirrors da's README example, minus
--- --mkdir-cwd (which is `--path`-bound; the agent's cwd is the engine's cwd,
--- not per-call, so the path scope is ambiguous and we'd false-defer on
--- legitimate mkdirs). ReadOnly is the strict read-only stack.
-local DEFAULT_CLASSIFIER_ARGS = {
-  [approval.ReadOnly] = {
-    "--read-only",
-    "--macos-only",
-    "--help-bypass",
-    "--git", "read",
-  },
-  [approval.Default] = {
-    "--read-only",
-    "--macos-only",
-    "--help-bypass",
-    "--git",   "read,add,commit,restore-staged,tag,fetch,pull,push",
-    "--cargo", "local",
-  },
-}
-
 local function copy_list(list)
   local out = {}
   for index, value in ipairs(list) do out[index] = value end
   return out
 end
 
--- The classifier arguments for every policy. `opts.classifier_args[policy]`
--- replaces a policy's stack outright. `opts.model_flag` names the classifier's
--- opt-in model flag; when set it is added to the default Default stack only,
--- so the ReadOnly stack never consults the model.
+-- The classifier arguments for every policy, exactly as configured. Nothing
+-- is supplied for a policy the configuration left out.
 local function classifier_args(opts)
-  local configured = opts.classifier_args or {}
+  local configured = opts.classifier_args
   if type(configured) ~= "table" then
-    error("tool-validator: `classifier_args` must map an approval policy to a list of arguments", 0)
+    error("tool-validator: `classifier_args` is not defined; it maps every approval policy ("
+      .. table.concat(approval.POLICIES, ", ") .. ") to the classifier's flags", 0)
   end
   for policy in pairs(configured) do
     if not approval.is_policy(policy) then
       error("tool-validator: `classifier_args` names unknown approval policy `" .. tostring(policy) .. "`", 0)
     end
   end
-  if opts.model_flag ~= nil and (type(opts.model_flag) ~= "string" or opts.model_flag == "") then
-    error("tool-validator: `model_flag` must be a non-empty string", 0)
-  end
   local by_policy = {}
   for _, policy in ipairs(approval.POLICIES) do
     local args = configured[policy]
-    if args == nil then
-      args = copy_list(DEFAULT_CLASSIFIER_ARGS[policy])
-      if policy == approval.Default and opts.model_flag ~= nil then
-        args[#args + 1] = opts.model_flag
-      end
-    else
-      if type(args) ~= "table" then
+    if type(args) ~= "table" then
+      error("tool-validator: `classifier_args` does not define the " .. policy .. " policy", 0)
+    end
+    for key, argument in pairs(args) do
+      if math.type(key) ~= "integer" or type(argument) ~= "string" then
         error("tool-validator: `classifier_args." .. policy .. "` must be a list of strings", 0)
       end
-      for _, argument in ipairs(args) do
-        if type(argument) ~= "string" then
-          error("tool-validator: `classifier_args." .. policy .. "` must be a list of strings", 0)
-        end
-      end
-      args = copy_list(args)
     end
-    by_policy[policy] = args
+    by_policy[policy] = copy_list(args)
   end
   return by_policy
 end
 
--- build{ classifier, classifier_args, model_flag, command_fastpaths } -> actor spec.
+-- build{ classifier, classifier_args, command_fastpaths } -> actor spec.
 -- State (the probed classifier path) is per-build so instances don't share.
 local function build(opts)
   opts = opts or {}
 
-  local command_fastpaths = opts.command_fastpaths or {}
+  local command_fastpaths = opts.command_fastpaths
+  if type(command_fastpaths) ~= "table" then
+    error("tool-validator: `command_fastpaths` is not defined; pass a list of predicates, or {} for none", 0)
+  end
 
   if type(opts.classifier) ~= "string" or opts.classifier == "" then
     error("tool-validator: build requires a non-empty `classifier` executable path", 0)
@@ -190,46 +152,48 @@ local function build(opts)
     return result.code, result.stderr
   end
 
+  local function unavailable(detail)
+    error("the command could not be classified: " .. detail ..
+      ". Recovery: reinstall or repair the composition-managed command classifier, then retry.", 0)
+  end
+
   -- What running `command` means for a caller with approval policy `policy`:
   -- `safe`, `unsure` or `denied`, with a reason for the last two. The exit
-  -- contract is 0 = approve, 1 = defer, 2 = deny. A classifier that cannot be
-  -- run, or that exits with anything else, denies with an actionable reason:
-  -- a command nobody could classify must not pass as merely unsure.
+  -- contract is 0 = approve, 1 = defer, 2 = deny. It raises when there is
+  -- nothing to decide from: no command text, an unknown policy, a classifier
+  -- that cannot be run, or an exit status outside the contract.
   -- `command_fastpaths` predicates `function(command, policy) -> bool` get
   -- first refusal so a config can approve narrow, self-limited commands
   -- without widening a classifier stack.
   local function classify_command(policy, command)
     if not approval.is_policy(policy) then
-      error("tool-validator.classify_command: unknown approval policy `" .. tostring(policy) .. "`", 2)
+      error("tool-validator.classify_command: unknown approval policy `" .. tostring(policy) .. "`", 0)
     end
     if type(command) ~= "string" or command == "" then
-      return approval.unsure, "there is no command text to classify"
+      error("there is no command text to classify", 0)
     end
     for _, pred in ipairs(command_fastpaths) do
       if pred(command, policy) then return approval.safe end
     end
     local ran, code, stderr = pcall(run_classifier, policy, command)
-    if not ran then
-      return approval.denied, "tool_classifier_unavailable: " .. tostring(code) ..
-        ". Recovery: reinstall or repair the composition-managed command classifier, then retry."
-    end
+    if not ran then unavailable(tostring(code)) end
     if code == 0 then return approval.safe end
     if code == 1 then
       if policy == approval.ReadOnly then return approval.unsure, "not shown to be read-only" end
       return approval.unsure, "not shown to be safe"
     end
     if code == 2 then return approval.denied, "forbidden by the command classifier" end
-    return approval.denied, "tool_classifier_unavailable: the command classifier failed with exit code " ..
-      tostring(code) .. ((stderr or "") ~= "" and ": " .. stderr or "") ..
-      ". Recovery: reinstall or repair the composition-managed command classifier, then retry."
+    unavailable("the classifier exited with the unknown status " .. tostring(code) ..
+      ((stderr or "") ~= "" and ": " .. stderr or ""))
   end
 
   -- The same question for a program run from an argument vector without a
   -- shell: the vector is written as the equivalent shell command, every
-  -- element quoted, and classified as that command.
+  -- element quoted, and classified as that command. A vector that cannot be
+  -- written that way raises.
   local function classify_argv(policy, argv)
     local command, problem = shell.quote_argv(argv)
-    if not command then return approval.denied, problem end
+    if not command then error("the argument vector cannot be classified: " .. problem, 0) end
     return classify_command(policy, command)
   end
 

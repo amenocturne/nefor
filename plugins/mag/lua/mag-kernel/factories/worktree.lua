@@ -17,8 +17,21 @@ local function declaration(config)
   if config.operation == "create" then
     params.base = "string"
   end
+  -- Means what the worktree tool of the same operation says. A repository,
+  -- path, branch or base bound at run time is not the one that was assessed.
+  local arguments = { "repository", "path", "branch" }
+  local runtime_bound = {}
+  if config.operation == "create" then arguments[#arguments + 1] = "base" end
+  for _, name in ipairs(arguments) do
+    runtime_bound[name] = { "unsure", "its " .. name .. " is bound to a value known only at run time" }
+  end
   return {
     name = config.factory,
+    approval = {
+      kind = "capability",
+      noun = config.operation == "create" and "worktree creation" or "worktree",
+      tool = config.tool, arguments = arguments, shown = "path", runtime_bound = runtime_bound,
+    },
     semantic = {
       input={kind="primitive",name="Unit"},
       output=WORKTREE_TYPE,

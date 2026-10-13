@@ -45,7 +45,7 @@ end
 context={messages={{id="notice-message",role="system",chunks={{kind="text",data="usage notice"}}}},watermark=7,history_id={1},
   policy_state={notices={n={message_id="notice-message",epoch_id="e"}}}}
 local function invoke(id,notice)
-  spec.to_plugin({{from="conversation-manager",body={kind="conversation.provider.invoke",provider="p",model="m",request_id=id,
+  spec.to_plugin({{from="conversation-manager",body={kind="conversation.provider.invoke",approval_policy="Default",provider="p",model="m",request_id=id,
     conversation_id="c",notice_id=notice,epoch_id="e",watermark=7}}})
 end
 local before=#native

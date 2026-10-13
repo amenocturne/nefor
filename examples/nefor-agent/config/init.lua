@@ -133,31 +133,6 @@ M.active = {
   },
   providers = providers,
 
-  tool_gate = {
-    -- Default policy for unlisted tools. `prompt` = popup; user
-    -- approves before the call lands.
-    default_action = "prompt",
-    -- Tools that bypass the popup entirely. Context I/O
-    -- (read_file / read_image / instruction discovery) is safe to auto-allow —
-    -- nothing on disk changes. The MAG tools are control-plane
-    -- dispatch: the graphs they run deliver their capability invokes
-    -- (bash, …) back through this gate, where policy applies
-    -- unchanged, so gating the dispatch call itself is a redundant
-    -- click. write-review (alias submit-plan) is
-    -- the lead's plan-submission tool: it doesn't perform side
-    -- effects, it just parks a plan for the user's /approve, so
-    -- gating it behind an approval popup is a redundant click. The
-    -- plan still appears in chat as a chat.plan.append entry where
-    -- the user accepts/rejects with /approve / /reject.
-    auto_tools     = {
-      "read_file", "read_image", "discover_instruction_files",
-      "write-review", "submit-plan", "mag-status", "mag-await", "mag-terminate",
-      "mag-write-file", "mag-preview", "mag-apply",
-    },
-    -- Tools that always go through the popup, regardless of default.
-    prompt_tools   = {},
-  },
-
   log_level = "info",
 }
 

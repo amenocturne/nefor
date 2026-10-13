@@ -11,7 +11,6 @@
 -- advertisement and dispatch on every live gate hello.
 
 local tool = require("libs.tool")
-local approval = require("libs.tool.approval")
 local envelope = require("core.envelope")
 local instruction_files = require("libs.instruction-files")
 local tool_display = require("libs.chat.tool_display")
@@ -118,7 +117,11 @@ local function base_tools()
           },
         },
       },
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
+      prepare = tool.nothing,
       execute = discover_instruction_files,
     },
     tool.define {
@@ -142,7 +145,11 @@ local function base_tools()
         },
         required = { "name" },
       },
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
+      prepare = tool.nothing,
       execute = skill,
     },
   }

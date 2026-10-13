@@ -87,14 +87,13 @@ mod producer_admission {
 
     #[test]
     fn real_gate_rejected_forward_settles_outer_then_accepts_later_tool() {
-        let mut plugin = Plugin::start("tool-gate", &["--default", "auto"]);
+        let mut plugin = Plugin::start("tool-gate", &[]);
         plugin.send(json!({"kind": "tool-gate.tools.advertise", "source": "source-long-name-for-admission-testing-with-extra-routing-overhead-that-must-exceed-the-inbound-envelope-stamp", "tools": [{
             "name": "test", "description": "", "parameters": {},
             "display": {"compact": {"label": "Test"}, "expanded": {"label": "Test", "fields": []}, "result": {"kind": "content", "fields": []}}
         }]}));
         assert_eq!(plugin.recv()["body"]["kind"], "tool.register");
-        let mut invoke =
-            json!({"kind": "tool-gate.tool.invoke", "id": "outer", "name": "test", "args": ""});
+        let mut invoke = json!({"kind": "tool-gate.tool.invoke", "id": "outer", "name": "test", "args": "", "approval_policy": "Default"});
         let overhead = serde_json::to_string(&wire(invoke.clone())).unwrap().len() + 1;
         invoke["args"] = Value::String("x".repeat(16 * 1024 * 1024 - overhead - 4));
         plugin.send(invoke);
@@ -106,7 +105,15 @@ mod producer_admission {
             .unwrap()
             .contains("admission"));
         plugin.send(
-            json!({"kind": "tool-gate.tool.invoke", "id": "later", "name": "test", "args": {}}),
+            json!({"kind": "tool-gate.tool.invoke", "id": "later", "name": "test", "args": {}, "approval_policy": "Default"}),
+        );
+        let prepare = plugin.recv();
+        assert!(prepare["body"]["kind"]
+            .as_str()
+            .unwrap()
+            .ends_with(".tool.prepare"));
+        plugin.send(
+            json!({"kind": "tool.prepared", "id": prepare["body"]["id"], "decision": "safe"}),
         );
         let forward = plugin.recv();
         assert_eq!(forward["body"]["caller_id"], "later");

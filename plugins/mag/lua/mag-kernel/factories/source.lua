@@ -1,4 +1,5 @@
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 local VALUE = "nefor.graph.Value"
@@ -6,6 +7,8 @@ local variable = { kind = "variable", name = "T" }
 
 M.declaration = {
   name = "source",
+  -- Emits an authored constant.
+  approval = node_approval.inert("source"),
   type_variables = { "T" },
   semantic = {
     input = { kind = "primitive", name = "Unit" },

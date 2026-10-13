@@ -121,7 +121,7 @@ end
 do
   local fired = {}
   local h = harness({
-    upstream={declaration={name="upstream",params={},inputs={input="seed.In"},outputs={"l.Out","r.Out"}},
+    upstream={declaration={ approval = require("node-approval").inert("test node"), name="upstream",params={},inputs={input="seed.In"},outputs={"l.Out","r.Out"}},
       make=function(id, emit)
         return {deliver=function()
           local side = id == "u1" and "l.Out" or "r.Out"
@@ -130,7 +130,7 @@ do
           return "ok"
         end}
       end},
-    joiner={declaration={name="joiner",params={},inputs={joined="joined.In"},outputs={}},
+    joiner={declaration={ approval = require("node-approval").inert("test node"), name="joiner",params={},inputs={joined="joined.In"},outputs={}},
       make=function() return {deliver=function(activation)
         fired[#fired + 1] = activation
         return "ok"
@@ -173,11 +173,11 @@ end
 do
   local got = {}
   local h = harness({
-    solo={declaration={name="solo",params={},inputs={input="seed.In"},outputs={}},
+    solo={declaration={ approval = require("node-approval").inert("test node"), name="solo",params={},inputs={input="seed.In"},outputs={}},
       make=function(id) return {deliver=function(a)
         got[#got + 1] = {id=id,n=a.messages[1].message.value}; return "ok"
       end} end},
-    either={declaration={name="either",params={},inputs={boundary={"a.In","b.In"}},outputs={}},
+    either={declaration={ approval = require("node-approval").inert("test node"), name="either",params={},inputs={boundary={"a.In","b.In"}},outputs={}},
       make=function(id) return {deliver=function(a)
         got[#got + 1] = {id=id,tag=a.messages[1].tag}; return "ok"
       end} end},
@@ -210,7 +210,7 @@ end
 do
   local killed_handler_ran, delivered = false, 0
   local h = harness({idle={
-    declaration={name="idle",params={},inputs={input="seed.In"},outputs={},signals={"kill"}},
+    declaration={ approval = require("node-approval").inert("test node"), name="idle",params={},inputs={input="seed.In"},outputs={},signals={"kill"}},
     make=function() return {
       deliver=function() delivered=delivered+1; return "ok" end,
       handle_kill=function() killed_handler_ran=true end,
@@ -246,11 +246,11 @@ end
 do
   local received = {}
   local h = harness({
-    producer={declaration={name="producer",params={},inputs={input="seed.In"},outputs={"value.Out"}},
+    producer={declaration={ approval = require("node-approval").inert("test node"), name="producer",params={},inputs={input="seed.In"},outputs={"value.Out"}},
       make=function(id,emit) return {deliver=function()
         emit({kind="value.Out",from=id,value="delta",semantic_value="delta"}); return "ok"
       end} end},
-    consumer={declaration={name="consumer",params={},inputs={input="value.In"},outputs={}},
+    consumer={declaration={ approval = require("node-approval").inert("test node"), name="consumer",params={},inputs={input="value.In"},outputs={}},
       make=function() return {deliver=function(activation)
         received[#received + 1] = activation.messages[1].message.value; return "ok"
       end} end},
@@ -275,15 +275,15 @@ end
 -- A completed path does not construct a routed alternative which never emits.
 do
   local h = harness({
-    entry={declaration={name="entry",params={},inputs={input="seed.In"},outputs={"hop.Ping","alt.Out"}},
+    entry={declaration={ approval = require("node-approval").inert("test node"), name="entry",params={},inputs={input="seed.In"},outputs={"hop.Ping","alt.Out"}},
       make=function(id,emit) return {deliver=function()
         emit({kind="hop.Ping",from=id,value="done",semantic_value="done"}); return "ok"
       end} end},
-    terminal={declaration={name="terminal",params={},inputs={final="hop.Ping"},outputs={}},
+    terminal={declaration={ approval = require("node-approval").inert("test node"), name="terminal",params={},inputs={final="hop.Ping"},outputs={}},
       make=function(id,emit) return {deliver=function()
         emit({kind="mag.RunComplete",from=id,result={text="done"},persisted=false}); return "ok"
       end} end},
-    summarizer={declaration={name="summarizer",params={},inputs={input="alt.Out"},outputs={}},
+    summarizer={declaration={ approval = require("node-approval").inert("test node"), name="summarizer",params={},inputs={input="alt.Out"},outputs={}},
       make=function() return {deliver=function() return "ok" end} end},
   })
   local entry_in = port("entry","seed.In",string_type)

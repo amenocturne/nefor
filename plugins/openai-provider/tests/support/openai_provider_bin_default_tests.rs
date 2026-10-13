@@ -625,7 +625,7 @@
     #[test]
     fn tool_invoke_body_uses_plugin_prefix_routing() {
         let args = serde_json::json!({"path": "/tmp/x"});
-        let b = tool_invoke_body("basic-tools", "call_1", "read_file", args.clone());
+        let b = tool_invoke_body("basic-tools", "call_1", "read_file", args.clone(), "ReadOnly");
         assert_eq!(
             b.get("kind").and_then(Value::as_str),
             Some("basic-tools.tool.invoke")
@@ -633,6 +633,11 @@
         assert_eq!(b.get("id").and_then(Value::as_str), Some("call_1"));
         assert_eq!(b.get("name").and_then(Value::as_str), Some("read_file"));
         assert_eq!(b.get("args"), Some(&args));
+        assert_eq!(
+            b.get("approval_policy").and_then(Value::as_str),
+            Some("ReadOnly"),
+            "the prompt's stated policy travels with its tool calls"
+        );
     }
 
     // --- Catalog wiring through dispatch ----------------------------
@@ -1534,7 +1539,13 @@
         // dispatcher itself still returns Ok, which is what we assert.
         let client = reqwest::Client::builder().build().expect("client");
 
-        let body = make_event_body("ollama.prompt", &[("text", Value::String("hi".into()))]);
+        let body = make_event_body(
+            "ollama.prompt",
+            &[
+                ("text", Value::String("hi".into())),
+                ("approval_policy", Value::String("Default".into())),
+            ],
+        );
         dispatch_event(
             &chats,
             &auth,
@@ -2180,7 +2191,7 @@
         // chat.tool.start includes a 200-byte input preview; the invoke owns
         // the full arguments and must fail before the broker await.
         let result = publisher.run(&wire, input, &CancellationToken::new(), async {
-            run_one_tool_call_published(&catalog, &broker, &publisher, &CancellationToken::new(), call).await;
+            run_one_tool_call_published(&catalog, &broker, &publisher, &CancellationToken::new(), "Default", call).await;
         }).await;
         assert!(matches!(result, Err(publisher::OutputFailure::Transport(TransportError::FrameTooLarge { .. }))));
         broker.reap_abandoned().await;

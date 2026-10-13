@@ -41,6 +41,7 @@ fn text_answer_consumes_multiline_terminal_text_without_schema_or_correction() {
       local emitted = {}
       local actor = assert(factory.construct("direct", {
         provider = "mock-provider", tools = {}, output_type = "text-answer-tag",
+        tool_approval_policy = { constructor = "Default" },
         error_type = "agent-error-tag", provider_error_type = "provider-error-tag"
       }, function(message) emitted[#emitted + 1] = message end,
         { conversation = { id = "direct:conversation", turn_id = "direct:turn", emit = function(_) end } }))

@@ -93,11 +93,23 @@ local basic = tools.basic_actor_spec {
 }
 eq(pcall(tools.basic_actor_spec, { max_read_bytes = 1 }), false,
   "the command tools need the configured command classification")
+do
+  local classify = function() return "safe" end
+  local ok, err = pcall(tools.basic_actor_spec, { max_read_bytes = 1, classify_command = classify, classify_argv = classify })
+  eq(ok, false, "write_file's Default decision must be chosen by the composition")
+  assert(tostring(err):find("decide_write is not defined", 1, true), tostring(err))
+  ok, err = pcall(tools.git_worktree_actor_spec, {})
+  eq(ok, false, "the worktree tools' Default decisions must be chosen by the composition")
+  assert(tostring(err):find("decide_create and decide_open are not defined", 1, true), tostring(err))
+end
 eq(basic.name, "basic-tools", "actor keeps the basic-tools source name")
 eq(table.concat(basic.command, " "), "/bin/basic-tools --read-file-max-bytes 12345",
   "binary receives the read cap and no gate flag")
 same(hello(basic), read_fixture("basic-tools-advertisement.json"))
-local worktree = tools.git_worktree_actor_spec()
+local worktree = tools.git_worktree_actor_spec {
+  decide_create = { "unsure", "it creates a Git worktree and a branch" },
+  decide_open = "safe",
+}
 eq(table.concat(worktree.command, " "), "/bin/git-worktree", "git-worktree has no gate flag")
 same(hello(worktree), read_fixture("git-worktree-advertisement.json"))
 
@@ -198,20 +210,21 @@ do
     eq(got, decision, name .. " under " .. policy)
     eq(why, reason, name .. " under " .. policy .. " gives its reason")
   end
-  -- Reading tools: safe for a ReadOnly caller; Default is the gate's setting.
+  -- Reading tools: safe for every caller, by their own definition.
   for _, name in ipairs({ "read_file", "read_image" }) do
     check(basic, name, { path = "x" }, "ReadOnly", "safe", nil)
-    check(basic, name, { path = "x" }, "Default", nil, nil)
+    check(basic, name, { path = "x" }, "Default", "safe", nil)
   end
   check(worktree, "git_worktree_open", { repository = "/r", path = "/p", branch = "b" }, "ReadOnly", "safe", nil)
-  check(worktree, "git_worktree_open", { repository = "/r", path = "/p", branch = "b" }, "Default", nil, nil)
   -- Writing tools: denied for a ReadOnly caller, with the reason.
   check(basic, "write_file", { path = "x", new_string = "" }, "ReadOnly", "denied", "it writes a file")
   check(worktree, "git_worktree_create", { repository = "/r", path = "/p", branch = "b", base = "main" },
     "ReadOnly", "denied", "it creates a Git worktree and a branch")
+  -- For a Default caller the worktree tools mean what this composition chose.
   check(worktree, "git_worktree_create", { repository = "/r", path = "/p", branch = "b", base = "main" },
-    "Default", nil, nil)
-  -- write_file under Default follows the composition's write decision.
+    "Default", "unsure", "it creates a Git worktree and a branch")
+  check(worktree, "git_worktree_open", { repository = "/r", path = "/p", branch = "b" }, "Default", "safe", nil)
+  -- write_file under Default is the composition's write decision.
   check(basic, "write_file", { path = "x", new_string = "" }, "Default", "denied",
     "write_file requires an approved plan")
   plan_approved = true
@@ -246,6 +259,14 @@ do
   } } })
   -- Cancelling a prepared call that never ran sends no capability cancel.
   prepare(basic, "prepared-dropped", "shell.script", { script = "ls", cwd = ".", timeout = timeout }, "Default")
+  -- A prepare request that names no policy is an error, not a Default caller.
+  basic.to_plugin({ { type = "event", from = "tool-gate", replay = false, body = {
+    kind = "basic-tools.tool.prepare", id = "no-policy", name = "read_file", args = { path = "x" },
+  } } })
+  eq(last_sent("tool.prepared", "no-policy"), nil, "nothing is decided without a policy")
+  eq(last_sent("tool.result", "no-policy").error,
+    "read_file: this call could not be decided: no approval policy `nil`; the caller must state one of ReadOnly, Default",
+    "the caller is told what is missing")
   local before_cancel = #delivered
   basic.to_plugin({ { type = "event", from = "tool-gate", replay = false, body = {
     kind = "basic-tools.tool.cancel", id = "prepared-dropped",

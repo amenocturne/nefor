@@ -251,6 +251,16 @@ impl LuaHost {
         }
     }
 
+    /// What each factory's nodes mean for approval, by factory identity: the
+    /// factories' own declarations, passed through as plain data.
+    pub fn registry_approvals(&self) -> Result<JsonValue, MagError> {
+        let f: Function = self.kernel.get("registry_approvals")?;
+        let value: Value = f.call(())?;
+        let mut approvals: JsonValue = self.lua.from_value(value)?;
+        approvals.sort_all_objects();
+        Ok(approvals)
+    }
+
     /// Serializable factory declarations for MAG library validation. This is
     /// plain immutable data: no Lua constructor or other runtime capability
     /// crosses the evaluation boundary.

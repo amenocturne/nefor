@@ -35,7 +35,7 @@ local function program()
         id = "agent",
         factory = "llm",
         type_arguments = {result_type},
-        params = { model = "m", provider = "prov", system = "answer",
+        params = { tool_approval_policy = { constructor = "Default" },  model = "m", provider = "prov", system = "answer",
           output_type = "text-answer-id", error_type = "agent-error-id",
           provider_error_type = "provider-error-id" },
         evidence={version=2,identity="nefor.factory.llm",arguments={result_type},input=provider_input,output=result_type},

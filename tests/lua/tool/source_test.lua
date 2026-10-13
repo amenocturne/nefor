@@ -35,6 +35,8 @@ local function display(label)
   }
 end
 
+local REMOVE = {}
+
 local function spec(overrides)
   local value = {
     name = "echo",
@@ -45,10 +47,25 @@ local function spec(overrides)
       required = { "text" },
     },
     display = display("echo"),
+    approval = {
+      ReadOnly = { decide = "safe", describe = tool.nothing },
+      Default = { decide = "safe", describe = tool.nothing },
+    },
+    prepare = tool.nothing,
     execute = function(args, call) call.ok(args.text) end,
   }
-  for key, item in pairs(overrides or {}) do value[key] = item end
+  for key, item in pairs(overrides or {}) do
+    if item == REMOVE then value[key] = nil else value[key] = item end
+  end
   return value
+end
+
+-- An approval table with the same `decide` and `describe` under both policies.
+local function both(decide, describe)
+  return {
+    ReadOnly = { decide = decide, describe = describe or tool.nothing },
+    Default = { decide = decide, describe = describe or tool.nothing },
+  }
 end
 
 local function define_fails(overrides, fragment)
@@ -67,12 +84,36 @@ define_fails({ display = { compact = { label = "x" } } }, "invalid display")
 define_fails({ execute = "nope" }, "execute must be a function")
 define_fails({ execute = false }, "execute must be a function")
 define_fails({ handler = function() end }, "unknown field `handler`")
-define_fails({ prepare = "nope" }, "prepare must be a function or nil")
-define_fails({ approval = "safe" }, "approval must be a table")
-define_fails({ approval = { rules = {} } }, "approval has unknown field `rules`")
-define_fails({ approval = { decide = "safe" } }, "approval.decide must be a function")
-define_fails({ approval = { describe = { Rules = "x" } } }, "unknown approval policy `Rules`")
-define_fails({ approval = { describe = { ReadOnly = "" } } }, "approval.describe.ReadOnly must be a non-empty string")
+-- Nothing about a tool is implied: every part is defined or the definition fails.
+define_fails({ prepare = "nope" }, "prepare must be a function or tool.nothing")
+define_fails({ prepare = REMOVE }, "`echo`: prepare is not defined; give a function, or tool.nothing")
+define_fails({ approval = REMOVE }, "`echo`: approval is not defined; it needs one entry for each approval policy (ReadOnly, Default)")
+define_fails({ approval = "safe" }, "approval is not defined")
+define_fails({ approval = { ReadOnly = { decide = "safe", describe = tool.nothing } } },
+  "`echo`: approval does not define the Default policy")
+define_fails({ approval = { Default = { decide = "safe", describe = tool.nothing } } },
+  "`echo`: approval does not define the ReadOnly policy")
+do
+  local extra = both("safe")
+  extra.Rules = { decide = "safe", describe = tool.nothing }
+  define_fails({ approval = extra }, "approval names unknown approval policy `Rules`")
+  local missing_decide = both("safe")
+  missing_decide.Default.decide = nil
+  define_fails({ approval = missing_decide }, "`echo`: approval.Default.decide is not defined")
+  local missing_describe = both("safe")
+  missing_describe.ReadOnly.describe = nil
+  define_fails({ approval = missing_describe },
+    "`echo`: approval.ReadOnly.describe is not defined; give text, or tool.nothing")
+  local unknown_field = both("safe")
+  unknown_field.Default.rules = {}
+  define_fails({ approval = unknown_field }, "approval.Default has unknown field `rules`")
+end
+define_fails({ approval = both("approve") }, "approval.ReadOnly.decide: `approve` is not one of safe, unsure, denied")
+define_fails({ approval = both("unsure") }, "approval.ReadOnly.decide: `unsure` needs a reason")
+define_fails({ approval = both({ "denied" }) }, "approval.ReadOnly.decide: `denied` needs a reason")
+define_fails({ approval = both({}) }, "approval.ReadOnly.decide: it gives no result")
+define_fails({ approval = both("safe", "") }, "approval.ReadOnly.describe must be a non-empty string or tool.nothing")
+define_fails({ approval = both("safe", 3) }, "approval.ReadOnly.describe must be a non-empty string or tool.nothing")
 define_fails({ cancel = 1 }, "cancel must be a function")
 
 -- Advertisement.
@@ -187,12 +228,12 @@ assert(deferred.receive({ kind = "deferred.tool.cancel", id = "9" }), "cancel is
 eq(cancelled, "9", "tool cancel hook runs for the pending call")
 assert(not deferred.receive({ kind = "deferred.tool.cancel", id = "9" }), "a settled call is not cancelled twice")
 
--- The interface: every definition has execute, and prepare is nil unless given.
+-- The interface: every definition has execute and an explicit prepare.
 do
   local plain = tool.define(spec())
   eq(type(plain.execute), "function", "execute is part of every definition")
-  eq(plain.prepare, nil, "a tool without a prepare step has prepare = nil")
-  eq(tool.define(spec({ prepare = nil })).prepare, nil, "prepare = nil is the same as leaving it out")
+  eq(plain.prepare, tool.nothing, "a tool without a prepare step says so with tool.nothing")
+  eq(tostring(tool.nothing), "tool.nothing", "the explicit nothing names itself")
   local prepared = tool.define(spec({ prepare = function() end }))
   eq(type(prepared.prepare), "function", "a declared prepare is kept")
 end
@@ -200,19 +241,17 @@ end
 -- Per-policy descriptions are advertised beside the description, never merged
 -- into it here: appending is done once, where a request's tools are assembled.
 do
-  local described = tool.define(spec({ approval = {
-    describe = { ReadOnly = "Rejected for you." },
-  } }))
+  local approval = both("safe")
+  approval.ReadOnly.describe = "Rejected for you."
+  local described = tool.define(spec({ approval = approval }))
   eq(described.describe("ReadOnly"), "Rejected for you.", "the policy with text has it")
-  eq(described.describe("Default"), nil, "a policy with nothing to add has nil")
+  eq(described.describe("Default"), nil, "a policy that declared tool.nothing adds nothing")
   eq(described.spec().description, "Echo text.", "the description itself is unchanged")
   eq(described.spec().policy_descriptions.ReadOnly, "Rejected for you.", "advertised per policy")
   eq(described.spec().policy_descriptions.Default, nil, "nothing advertised for Default")
   local plain = tool.define(spec())
-  eq(plain.describe("ReadOnly"), nil, "a tool without descriptions adds nothing")
+  eq(plain.describe("ReadOnly"), nil, "a tool that declared nothing for a policy adds nothing")
   eq(plain.spec().policy_descriptions, nil, "and advertises none")
-  eq(tool.define(spec({ approval = { describe = {} } })).spec().policy_descriptions, nil,
-    "an empty table is the same as none")
 end
 
 -- Appending happens once, where one request's tools are assembled for an
@@ -234,8 +273,11 @@ do
   eq(specs[1].execution.kind, "routed", "and its execution")
   eq(registered.write.description, "Writes.", "the registered spec is not changed")
   eq(#tool.request_tool_specs(names, registered, nil, "Default"), 0, "nothing is appended for a policy without text")
-  eq(#tool.request_tool_specs(names, registered, nil, nil), 0, "nor for a request without a policy")
-  eq(#tool.request_tool_specs(names, registered, nil, "Rules"), 0, "nor for an unknown policy")
+  for _, policy in ipairs({ "Rules", false }) do
+    local ok, err = pcall(tool.request_tool_specs, names, registered, nil, policy or nil)
+    eq(ok, false, "a request that names no approval policy is an error")
+    assert(tostring(err):find("the request names no approval policy", 1, true), tostring(err))
+  end
   eq(#tool.request_tool_specs({ "read" }, registered, nil, "ReadOnly"), 0,
     "a tool outside the agent's names is never described")
   local own = { { name = "write_output", description = "Own." }, { name = "write", description = "Request-local." } }
@@ -261,13 +303,21 @@ do
       seen.prepare_phase = call.phase
       call.note = "kept:" .. args.text
     end,
-    approval = { decide = function(policy, args, call)
-      order[#order + 1] = "decide"
-      seen.policy, seen.decide_note, seen.call_policy = policy, call.note, call.policy
-      if args.text == "bad" then return "denied", "it is bad" end
-      if args.text == "odd" then return "unsure", "it is odd" end
-      return "safe"
-    end },
+    approval = (function()
+      local function decide_for(policy)
+        return function(args, call)
+          order[#order + 1] = "decide"
+          seen.policy, seen.decide_note, seen.call_policy = policy, call.note, call.policy
+          if args.text == "bad" then return "denied", "it is bad" end
+          if args.text == "odd" then return "unsure", "it is odd" end
+          return "safe"
+        end
+      end
+      return {
+        ReadOnly = { decide = decide_for("ReadOnly"), describe = tool.nothing },
+        Default = { decide = decide_for("Default"), describe = tool.nothing },
+      }
+    end)(),
     execute = function(args, call)
       order[#order + 1] = "execute"
       seen.execute_note = call.note
@@ -278,7 +328,7 @@ do
   assert(phased.receive({ kind = "phased.tool.prepare", id = "p1", name = "echo",
     args = { text = "fine" }, approval_policy = "ReadOnly" }), "prepare is routed")
   eq(table.concat(order, ","), "prepare,decide", "prepare runs before the decision, and execute does not run")
-  eq(seen.policy, "ReadOnly", "the decision function receives the caller's policy")
+  eq(seen.policy, "ReadOnly", "the caller's policy selects the decision")
   eq(seen.call_policy, "ReadOnly", "the call carries the caller's policy")
   eq(seen.prepare_phase, "prepare", "prepare runs in the prepare phase")
   eq(seen.decide_note, "kept:fine", "the decision function sees what prepare left on the call")
@@ -303,7 +353,7 @@ do
 
   -- Invalid arguments and unusable tools end the call before prepare.
   local before = #order
-  phased.receive({ kind = "phased.tool.prepare", id = "p4", name = "echo", args = { nope = 1 } })
+  phased.receive({ kind = "phased.tool.prepare", id = "p4", name = "echo", args = { nope = 1 }, approval_policy = "Default" })
   eq(last_result("p4").error, "echo: unknown argument `nope`; accepted arguments: text, times",
     "invalid arguments are rejected before prepare")
   phased.receive({ kind = "phased.tool.prepare", id = "p5", name = "echo", args = { text = "x" }, allowlist = {} })
@@ -312,68 +362,90 @@ do
   eq(last_prepared("p4"), nil, "a rejected call is not prepared")
 
   -- A cancelled prepared call is dropped; a later invoke starts a fresh call.
-  phased.receive({ kind = "phased.tool.prepare", id = "p6", name = "echo", args = { text = "fine" } })
+  phased.receive({ kind = "phased.tool.prepare", id = "p6", name = "echo", args = { text = "fine" }, approval_policy = "Default" })
   assert(phased.receive({ kind = "phased.tool.cancel", id = "p6" }), "a prepared call can be cancelled")
   eq(last_result("p6"), nil, "cancelling a prepared call emits nothing")
 end
 
--- A tool without a decision function answers without a decision, under every
--- policy; a tool whose function returns nothing does the same.
+-- Constant decisions, and a caller that states no policy.
 do
-  local silent = tool.source { name = "silent", tools = {
-    tool.define(spec()),
-    tool.define(spec({ name = "partial", approval = { decide = tool.approval.reads() } })),
+  local constant = tool.source { name = "constant", tools = {
+    tool.define(spec({ approval = {
+      ReadOnly = { decide = { "denied", "it writes" }, describe = "Rejected." },
+      Default = { decide = { "unsure", "it publishes" }, describe = tool.nothing },
+    } })),
   } }
-  for index, policy in ipairs({ "ReadOnly", "Default" }) do
-    local id = "s" .. index
-    silent.receive({ kind = "silent.tool.prepare", id = id, name = "echo",
-      args = { text = "x" }, approval_policy = policy })
-    assert(last_prepared(id) ~= nil, "a tool without a decision function still answers")
-    eq(last_prepared(id).decision, nil, "and says nothing under " .. policy)
+  constant.receive({ kind = "constant.tool.prepare", id = "c1", name = "echo", args = { text = "x" }, approval_policy = "ReadOnly" })
+  eq(last_prepared("c1").decision, "denied", "a constant decision is answered")
+  eq(last_prepared("c1").reason, "it writes", "with its reason")
+  constant.receive({ kind = "constant.tool.prepare", id = "c2", name = "echo", args = { text = "x" }, approval_policy = "Default" })
+  eq(last_prepared("c2").decision, "unsure", "each policy has its own")
+  eq(last_prepared("c2").reason, "it publishes", "and its own reason")
+  for index, policy in ipairs({ false, "Rules", 7 }) do
+    local id = "c-none-" .. index
+    constant.receive({ kind = "constant.tool.prepare", id = id, name = "echo", args = { text = "x" },
+      approval_policy = policy or nil })
+    eq(last_prepared(id), nil, "a call without a known policy is not decided")
+    eq(last_result(id).error, "echo: this call could not be decided: no approval policy `"
+      .. tostring(policy or nil) .. "`; the caller must state one of ReadOnly, Default",
+      "it is an error that says what is missing")
   end
-  silent.receive({ kind = "silent.tool.prepare", id = "s3", name = "partial",
-    args = { text = "x" }, approval_policy = "ReadOnly" })
-  eq(last_prepared("s3").decision, "safe", "a reading tool is safe under ReadOnly")
-  silent.receive({ kind = "silent.tool.prepare", id = "s4", name = "partial",
-    args = { text = "x" }, approval_policy = "Default" })
-  assert(last_prepared("s4") ~= nil, "it still answers under Default")
-  eq(last_prepared("s4").decision, nil, "and leaves Default to the gate's configured setting")
-  local writes = tool.approval.writes("it writes")
-  local result, reason = writes("ReadOnly")
-  eq(result, "denied", "a writing tool is denied under ReadOnly")
-  eq(reason, "it writes", "with the declared reason")
-  eq(writes("Default"), nil, "and says nothing under Default")
 end
 
--- Deferred decisions, failures before execute, and misuse.
+-- Deferred decisions, failures before execute, and decisions that are not ones.
 do
   local held
   local slow = tool.source { name = "slow", tools = {
-    tool.define(spec({ approval = { decide = function(_, _, call) held = call; return tool.deferred end } })),
+    tool.define(spec({ approval = both(function(_, call) held = call; return tool.deferred end) })),
     tool.define(spec({ name = "refuse", prepare = function(_, call) call.err("refuse: no such file") end,
-      approval = { decide = function() error("decide must not run after prepare failed") end } })),
-    tool.define(spec({ name = "raise", approval = { decide = function() error("boom", 0) end } })),
-    tool.define(spec({ name = "wrong", approval = { decide = function() return "approve" end } })),
+      approval = both(function() error("decide must not run after prepare failed") end) })),
+    tool.define(spec({ name = "raise", approval = both(function() error("the classifier is unavailable", 0) end) })),
+    tool.define(spec({ name = "wrong", approval = both(function() return "approve" end) })),
+    tool.define(spec({ name = "silent", approval = both(function() end) })),
+    tool.define(spec({ name = "unexplained", approval = both(function() return "denied" end) })),
     tool.define(spec({ name = "early", prepare = function(_, call) call.ok("done") end })),
   } }
-  slow.receive({ kind = "slow.tool.prepare", id = "d1", name = "echo", args = { text = "x" } })
+  local function prepare(id, name)
+    slow.receive({ kind = "slow.tool.prepare", id = id, name = name, args = { text = "x" }, approval_policy = "Default" })
+  end
+  prepare("d1", "echo")
   eq(last_prepared("d1"), nil, "a deferred decision answers nothing yet")
   held.decided("unsure", "still thinking")
   eq(last_prepared("d1").decision, "unsure", "the deferred decision is answered later")
   held.decided("safe")
   eq(last_prepared("d1").decision, "unsure", "a call is decided once")
 
-  slow.receive({ kind = "slow.tool.prepare", id = "d2", name = "refuse", args = { text = "x" } })
+  prepare("d2", "refuse")
   eq(last_result("d2").error, "refuse: no such file", "prepare may end the call with an error")
   eq(last_prepared("d2"), nil, "and then nothing is decided")
-  slow.receive({ kind = "slow.tool.prepare", id = "d3", name = "raise", args = { text = "x" } })
-  eq(last_result("d3").error, "raise: approval.decide raised: boom", "a raising decision ends the call")
-  slow.receive({ kind = "slow.tool.prepare", id = "d4", name = "wrong", args = { text = "x" } })
-  eq(last_result("d4").error, "wrong: approval decision `approve` is not one of safe, unsure, denied",
-    "an unknown result ends the call instead of being guessed")
-  slow.receive({ kind = "slow.tool.prepare", id = "d5", name = "early", args = { text = "x" } })
+  -- Failing to decide is an error for the call, never a decision.
+  prepare("d3", "raise")
+  eq(last_result("d3").error, "raise: this call could not be decided: the classifier is unavailable",
+    "a decision that fails ends the call with why")
+  prepare("d4", "wrong")
+  eq(last_result("d4").error,
+    "wrong: this call could not be decided: its Default decision is invalid: `approve` is not one of safe, unsure, denied",
+    "an unknown result is an error")
+  prepare("d6", "silent")
+  eq(last_result("d6").error,
+    "silent: this call could not be decided: its Default decision is invalid: it gives no result",
+    "a function that returns nothing is an error, not 'the tool does not say'")
+  prepare("d7", "unexplained")
+  eq(last_result("d7").error,
+    "unexplained: this call could not be decided: its Default decision is invalid: `denied` needs a reason",
+    "a denial without a reason is an error")
+  for _, id in ipairs({ "d3", "d4", "d6", "d7" }) do eq(last_prepared(id), nil, id .. " was never decided") end
+  prepare("d5", "early")
   assert(last_result("d5").error:find("a call can only succeed from execute", 1, true),
     "a tool cannot succeed before execute: " .. tostring(last_result("d5").error))
+
+  -- The same definitions answer the workflow runner, which raises instead.
+  local decide = tool.decision { slow }
+  eq(pcall(decide, "silent", "Default", {}), false, "an undecidable capability raises")
+  local ok, err = pcall(decide, "nowhere", "Default", {})
+  eq(ok, false, "a capability no tool defines raises")
+  eq(tostring(err), "no tool `nowhere` defines what this capability means", "and is named")
+  eq(pcall(decide, "echo", "Rules", {}), false, "an unknown policy raises")
 end
 
 -- An invoke that was never prepared (a workflow node's request) runs execute.
@@ -381,7 +453,7 @@ do
   local direct_prepared = 0
   local direct = tool.source { name = "direct", tools = { tool.define(spec({
     prepare = function() direct_prepared = direct_prepared + 1 end,
-    approval = { decide = function() error("not consulted") end },
+    approval = both(function() error("not consulted") end),
   })) } }
   direct.receive({ kind = "direct.tool.invoke", id = "n1", name = "echo", args = { text = "node" } })
   eq(last_result("n1").output, "node", "execute runs")

@@ -49,6 +49,7 @@
 -- chat surface can retract the prompt), drop the pending state, then die.
 
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 
@@ -71,6 +72,8 @@ M.approval_reply_type = approval_reply_type
 
 M.declaration = {
   name = "human",
+  -- Asks the user a question and waits; it changes nothing by itself.
+  approval = node_approval.inert("human approval"),
   type_variables = { "R" },
   semantic = {
     input={kind="named",name="nefor.contracts.TextAnswer",arguments={}},

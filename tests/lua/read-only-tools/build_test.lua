@@ -92,6 +92,7 @@ local function custom_display(label)
   }
 end
 local custom = tool.define {
+    approval = { ReadOnly = { decide = "safe", describe = tool.nothing }, Default = { decide = "safe", describe = tool.nothing } }, prepare = tool.nothing,
   name = "custom", description = "Custom lookup",
   parameters = { type = "object", properties = { value = { type = "string" } }, required = { "value" } },
   display = custom_display("Custom"),
@@ -112,6 +113,7 @@ assert_true(invoke(extras, "skill", { name = {} }).error == "skill: name must li
   "an empty skill list is a semantic error")
 assert_true(not pcall(rot.build, {
   include = { "skill" }, extra_tools = { tool.define {
+    approval = { ReadOnly = { decide = "safe", describe = tool.nothing }, Default = { decide = "safe", describe = tool.nothing } }, prepare = tool.nothing,
     name = "skill", description = "x", parameters = { type = "object" },
     display = custom_display("skill"), execute = function(_, call) call.ok("unexpected") end,
   } },
@@ -147,6 +149,7 @@ for _, already_settled in ipairs({ false, true }) do
     return send(payload)
   end
   local throwing = rot.build { extra_tools = { tool.define {
+    approval = { ReadOnly = { decide = "safe", describe = tool.nothing }, Default = { decide = "safe", describe = tool.nothing } }, prepare = tool.nothing,
     name = "custom", description = "Throwing custom tool",
     parameters = { type = "object" }, display = custom_display("custom"),
     execute = function(_, emit)
@@ -170,6 +173,7 @@ do
     return send(payload)
   end
   local guarded = rot.build { extra_tools = { tool.define {
+    approval = { ReadOnly = { decide = "safe", describe = tool.nothing }, Default = { decide = "safe", describe = tool.nothing } }, prepare = tool.nothing,
     name = "custom", description = "Callback settlement guard",
     parameters = { type = "object" }, display = custom_display("custom"),
     execute = function(_, call)
@@ -182,6 +186,7 @@ do
   assert_true(invoke(guarded, "custom", {}).output == "first", "first callback owns the result")
   assert_true(terminals == 1 and retained.settled(), "callbacks publish once")
   local delayed = rot.build { extra_tools = { tool.define {
+    approval = { ReadOnly = { decide = "safe", describe = tool.nothing }, Default = { decide = "safe", describe = tool.nothing } }, prepare = tool.nothing,
     name = "custom", description = "Deferred callback",
     parameters = { type = "object" }, display = custom_display("custom"),
     execute = function(_, call) retained = call end,

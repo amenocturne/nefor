@@ -1,4 +1,5 @@
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 local INPUT = "nefor.dynamic.Collect"
@@ -10,6 +11,8 @@ local count = { kind = "named", name = "nefor.dynamic.DynamicCount", arguments =
 
 M.declaration = {
   name = "dynamic-output",
+  -- Collects streamed items; plumbing.
+  approval = node_approval.inert("dynamic output"),
   type_variables = { "T", "R" },
   semantic = {
     input = { kind = "variable", name = "R" },

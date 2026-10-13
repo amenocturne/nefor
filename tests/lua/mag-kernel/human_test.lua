@@ -33,7 +33,7 @@ end
 
 local function producer_factory()
   return {
-    declaration={name="producer",params={},inputs={input="generic-provider.ProviderOut"},outputs={"generic-provider.TextAnswer"}},
+    declaration={ approval = require("node-approval").inert("test node"), name="producer",params={},inputs={input="generic-provider.ProviderOut"},outputs={"generic-provider.TextAnswer"}},
     construct=function(id, params, emit)
       local instance={id=id}
       function instance.deliver()
@@ -48,7 +48,7 @@ end
 
 local function collector_factory(decisions)
   return {
-    declaration={name="collector",params={},inputs={decision="human.Decision"},outputs={}},
+    declaration={ approval = require("node-approval").inert("test node"), name="collector",params={},inputs={decision="human.Decision"},outputs={}},
     construct=function(id, params, emit)
       local instance={id=id}
       function instance.deliver(activation)

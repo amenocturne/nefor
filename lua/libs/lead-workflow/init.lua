@@ -246,6 +246,11 @@ local state = {
   -- source of truth for valid factory types (see validate_factories).
   kernel_factories = {},
 
+  -- What each kernel factory's nodes mean for approval, by factory identity,
+  -- from the same `mag.hello` / `mag.loaded` bodies. mag-apply assesses a
+  -- workflow's nodes from it; a factory missing here cannot be assessed.
+  factory_approvals = {},
+
   -- `mag` tool invocations awaiting their `mag.load` reply, keyed by the load
   -- request id. Compile and apply go through this handshake:
   -- `mag.load` is sent, then the immutable envelope is previewed and either
@@ -466,16 +471,6 @@ end
 -- approval policy. Once the gate lets the call run, the workflow's own nodes
 -- are not asked about again when they fire.
 
-local FACTORY_PREFIX = "nefor.factory."
-
-local function factory_name(actor)
-  local factory = tostring(actor.factory or "")
-  if factory:sub(1, #FACTORY_PREFIX) == FACTORY_PREFIX then
-    return factory:sub(#FACTORY_PREFIX + 1)
-  end
-  return factory
-end
-
 local MAX_DETAIL = 200
 
 local function clip(text)
@@ -483,47 +478,6 @@ local function clip(text)
   if #text > MAX_DETAIL then return text:sub(1, MAX_DETAIL) .. "…" end
   return text
 end
-
--- Nodes that call a capability: the tool that owns the capability's meaning,
--- the node's params as that tool's arguments, the params that are the
--- command's text, and how the node is shown in an error.
-local CAPABILITY_NODES = {
-  ["shell-script"] = {
-    capability = "shell.script", kind = "shell script", text = { script = true },
-    args = function(params) return { script = params.script } end,
-    detail = function(params) return "`" .. clip(params.script) .. "`" end,
-  },
-  ["process-exec"] = {
-    capability = "process.exec", kind = "process", text = { argv = true },
-    args = function(params) return { argv = params.argv } end,
-    detail = function(params)
-      return "`" .. clip(shell.quote_argv(params.argv) or "(malformed argv)") .. "`"
-    end,
-  },
-  ["worktree-create"] = {
-    capability = "git_worktree_create", kind = "worktree creation", text = {},
-    args = function(params) return params end,
-    detail = function(params) return "at `" .. clip(params.path) .. "`" end,
-  },
-  ["worktree-open"] = {
-    capability = "git_worktree_open", kind = "worktree", text = {},
-    args = function(params) return params end,
-    detail = function(params) return "at `" .. clip(params.path) .. "`" end,
-  },
-}
-
--- Nodes that change nothing outside their run: routing, typing and waiting.
--- An agent's model and tool-result actors are here too; what the agent may do
--- is decided from its run-tool actor's approval policy, and each of its tool
--- calls goes through the gate under that policy. A human approval node asks
--- the user a question and changes nothing. A factory missing from both
--- tables is unsure, so a new kind of node is never approved by omission.
-local INERT_NODES = {
-  adapter = true, llm = true, ["structured-output"] = true, ["tool-result"] = true,
-  source = true, sink = true, stub = true, ["retry-gate"] = true, human = true,
-  ["dynamic-each"] = true, ["dynamic-index"] = true, ["dynamic-output"] = true,
-  ["dynamic-all"] = true,
-}
 
 local function node_name(node)
   local actor = node.actor
@@ -533,71 +487,108 @@ local function node_name(node)
   return tostring(actor.id)
 end
 
--- One node under `policy`: result, why, what kind of node, and its detail.
+-- What an error shows of a node's param: a string as it is, an argument
+-- vector as the command it stands for.
+local function shown(value)
+  if type(value) == "table" then
+    return "`" .. clip(shell.quote_argv(value) or "(malformed argument vector)") .. "`"
+  end
+  return "`" .. clip(value) .. "`"
+end
+
+-- One node under `policy`: result, why, what kind of node, its detail, and
+-- its name. What a kind of node means is not decided here: each kernel
+-- factory declares it (`state.factory_approvals`, from the MAG runtime), and
+-- a capability node means what the tool of that capability says. Anything
+-- that is not defined raises; nothing is assumed safe, unsure or denied.
 local function assess_node(policy, node)
   local actor = node.actor
   local params = type(actor.params) == "table" and actor.params or {}
-  local factory = factory_name(actor)
+  local declared = state.factory_approvals[actor.factory]
+  if type(declared) ~= "table" then
+    error("the MAG runtime does not say what a `" .. tostring(actor.factory) .. "` node means for approval", 0)
+  end
+  local noun = declared.noun
 
-  if factory == "run-tool" then
+  if declared.kind == "fixed" then
+    local decision = declared.decisions[policy]
+    if type(decision) ~= "table" then
+      error("its factory does not say what it means under the " .. policy .. " policy", 0)
+    end
+    return decision[1], decision[2], noun
+  end
+
+  if declared.kind == "agent" then
     local name = node_name(node):gsub("%.run%-tool", "", 1)
-    local node_policy = approval.from_mag(params.tool_approval_policy)
-    if node_policy == nil then
-      return approval.denied, "it has no valid approval policy", "agent", nil, name
-    end
+    local node_policy, problem = approval.from_mag(params[declared.policy])
+    if node_policy == nil then error("its approval policy is not one: " .. problem, 0) end
     if approval.wider(node_policy, policy) then
-      return approval.denied,
-        "wider than " .. policy .. ", the approval policy of the agent applying the workflow",
-        "agent", "with approval policy " .. node_policy, name
+      return declared.wider[1], declared.wider[2] .. " (" .. policy .. ")",
+        noun, "with approval policy " .. node_policy, name
     end
-    return approval.safe, nil, "agent", nil, name
+    return approval.safe, nil, noun, nil, name
   end
 
-  local capability = CAPABILITY_NODES[factory]
-  if capability ~= nil then
-    local detail = capability.detail(params)
+  if declared.kind == "capability" then
+    local detail = shown(params[declared.shown])
+    -- A param bound at run time means what the factory says it means.
+    local bound_result, bound_reason
     for _, binding in ipairs(type(actor.parameter_bindings) == "table" and actor.parameter_bindings or {}) do
-      local path = type(binding) == "table" and binding.path or nil
-      if type(path) == "table" and capability.text[path[1]] then
-        return approval.unsure, "its command is bound to a value known only at run time",
-          capability.kind, detail
+      local param = type(binding) == "table" and type(binding.path) == "table" and binding.path[1] or nil
+      local meaning = declared.runtime_bound[param]
+      if meaning == nil then
+        error("its factory does not say what binding `" .. tostring(param) .. "` at run time means", 0)
+      end
+      if meaning ~= "ignored" and (bound_result == nil
+          or approval.combine(bound_result, meaning[1]) ~= bound_result) then
+        bound_result, bound_reason = meaning[1], meaning[2]
       end
     end
+    if bound_result ~= nil then return bound_result, bound_reason, noun, detail end
     if type(decide_capability) ~= "function" then
-      return approval.unsure, "no capability decision is configured", capability.kind, detail
+      error("this configuration did not say what capabilities mean (lead-workflow configure_approval)", 0)
     end
-    local result, reason = decide_capability(capability.capability, policy, capability.args(params))
-    if result == nil then
-      -- The capability's tool does not say: denied under a narrower policy,
-      -- as at the gate, and unsure under Default.
-      if policy == approval.Default then
-        return approval.unsure, "its tool does not say what it does", capability.kind, detail
-      end
-      return approval.denied, "its tool does not say what it does under this policy",
-        capability.kind, detail
-    end
-    return result, reason, capability.kind, detail
+    local args = {}
+    for _, name in ipairs(declared.arguments) do args[name] = params[name] end
+    local result, reason = decide_capability(declared.tool, policy, args)
+    return result, reason, noun, detail
   end
 
-  if INERT_NODES[factory] then return approval.safe end
-  return approval.unsure, "nothing says what a `" .. factory .. "` node does", "node", nil
+  error("its factory declares the unknown approval kind `" .. tostring(declared.kind) .. "`", 0)
 end
 
 -- Fold a decoded workflow into one result for `policy`: denied dominates,
 -- then unsure, then safe. Every node that is not safe is listed in the
--- reason, not only the first.
+-- reason, not only the first. A node that cannot be assessed is an error,
+-- not a result: then the function returns nil and a message listing every
+-- such node.
 local function assess_workflow(policy, decoded)
-  local state_ = mag.fold_nodes(decoded, { result = approval.safe, offenders = {} },
+  if not approval.is_policy(policy) then
+    return nil, "the call names no approval policy (got `" .. tostring(policy) .. "`)"
+  end
+  local state_ = mag.fold_nodes(decoded, { result = approval.safe, offenders = {}, failures = {} },
     function(sofar, node)
-      local result, why, kind, detail, name = assess_node(policy, node)
+      local ok, result, why, kind, detail, name = pcall(assess_node, policy, node)
+      if not ok then
+        sofar.failures[#sofar.failures + 1] = "- node `" .. node_name(node) .. "`: " .. tostring(result)
+        return sofar
+      end
+      local problem = approval.check_decision(result, why)
+      if problem then
+        sofar.failures[#sofar.failures + 1] = "- node `" .. node_name(node)
+          .. "`: its decision is invalid: " .. problem
+        return sofar
+      end
       sofar.result = approval.combine(sofar.result, result)
       if result ~= approval.safe then
         sofar.offenders[#sofar.offenders + 1] = "- node `" .. (name or node_name(node)) .. "` ("
-          .. tostring(kind) .. ")" .. (detail and (" " .. detail) or "") .. ": "
-          .. tostring(why or (result == approval.denied and "not allowed" or "not shown to be allowed"))
+          .. tostring(kind) .. ")" .. (detail and (" " .. detail) or "") .. ": " .. why
       end
       return sofar
     end)
+  if #state_.failures > 0 then
+    return nil, "the workflow could not be assessed:\n" .. table.concat(state_.failures, "\n")
+  end
   if state_.result == approval.safe then return approval.safe end
   local count = #state_.offenders
   return state_.result, "the workflow declares " .. count .. (count == 1 and " node" or " nodes")
@@ -1024,6 +1015,10 @@ local function capture_kernel_factories(body)
     if type(identity) == "string" then set[identity] = true end
   end
   state.kernel_factories = set
+  -- What each factory's nodes mean for approval, as the factories declare.
+  if type(body.factory_approvals) == "table" then
+    state.factory_approvals = body.factory_approvals
+  end
 end
 
 -- The lead reads paths; the model needs content. Read the sink's output file so
@@ -1752,11 +1747,17 @@ end
 
 local advertised = false
 
+-- Replaced in tool_definitions by the fold over the compiled workflow.
+local MAG_APPLY_DECIDE = function() error("mag-apply's decision is not wired", 0) end
+
 local function lead_workflow_tool_specs()
   return {
     {
       name        = "mag-status",
-      approval    = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
       display = display_contract("graph status", run_label_field(false), {}, "content", nil, { display_field("state", "result", "$", "structured") }),
       description =
         "Returns the current state of MAG workflow runs: all active runs and recently completed ones, " ..
@@ -1775,7 +1776,10 @@ local function lead_workflow_tool_specs()
     },
     {
       name        = "mag-await",
-      approval    = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
       display = display_contract("await run", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
         "Waits until a run you started finishes and returns its result. A run finishes only when all " ..
@@ -1796,7 +1800,10 @@ local function lead_workflow_tool_specs()
     {
       name        = "mag-terminate",
       -- Stopping a run the caller itself started undoes nothing outside it.
-      approval    = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
       display = display_contract("terminate graph", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
         "Stops one active run, identified by run_id, and returns once the run confirms it has stopped. " ..
@@ -1816,9 +1823,13 @@ local function lead_workflow_tool_specs()
     },
     {
       name        = "write-review",
-      approval    = {
-        decide = approval.writes("it asks the user to approve a plan to write"),
-        describe = approval.rejected_when_read_only("it asks the user to approve a plan to write"),
+      approval = {
+        ReadOnly = {
+          decide = { "denied", "it asks the user to approve a plan to write" },
+          describe = approval.read_only_rejection("it asks the user to approve a plan to write"),
+        },
+        -- Submitting a plan changes nothing; the user's verdict is the approval.
+        Default = { decide = "safe", describe = tool.nothing },
       },
       display = display_contract("write review", nil, {}, "receipt", "AWAITING USER REVIEW", { display_field("status", "result", "$", "status", { sensitive = "omit" }) }),
       description =
@@ -1838,7 +1849,10 @@ local function lead_workflow_tool_specs()
     {
       name = "mag-write-file",
       -- Writes only the caller's own MAG workspace: nothing runs.
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
       display = display_contract("mag write file", display_field("file", "args", "file", "path"),
         {}, "receipt", "MAG source written", {}),
       description =
@@ -1856,7 +1870,10 @@ local function lead_workflow_tool_specs()
     },
     {
       name = "mag-preview",
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
       display = display_contract("mag preview", display_field("file", "args", "file", "path"),
         {}, "content", nil, { display_field("workflow", "result", "workflow_tree", "text",
           { max_lines = 120, max_bytes = 12000 }) }, "delayed"),
@@ -1872,9 +1889,14 @@ local function lead_workflow_tool_specs()
       name = "mag-apply",
       -- Decided by folding over the compiled workflow (assess_workflow); the
       -- decision function is attached in tool_definitions.
-      approval = { describe = { [approval.ReadOnly] =
-        "Your approval policy is ReadOnly: a workflow that declares nodes that are not read-only, "
-        .. "or agents with a wider approval policy than yours, is rejected." } },
+      approval = {
+        ReadOnly = {
+          decide = MAG_APPLY_DECIDE,
+          describe = "Your approval policy is ReadOnly: a workflow that declares nodes that are not "
+            .. "read-only, or agents with a wider approval policy than yours, is rejected.",
+        },
+        Default = { decide = MAG_APPLY_DECIDE, describe = tool.nothing },
+      },
       display = display_contract("mag apply", display_field("file", "args", "file", "path"),
         {}, "receipt", "MAG graph applied", {
           display_field("status", "result", "status", "status", { omit = "missing" }),
@@ -2250,6 +2272,11 @@ local function resume_pending_load(body)
     local call = pending.call
     pending.call = nil
     local result, reason = assess_workflow(pending.policy, decoded)
+    if result == nil then
+      -- Failing to assess is an error for the call, never a decision.
+      emit_tool_result_err(pending.firing_id, "mag-apply: " .. reason)
+      return
+    end
     call.assessed = { pending = pending, body = body }
     call.decided(result, reason)
     return
@@ -2347,8 +2374,7 @@ local function mag_apply_assess(firing_id, args, metadata, call)
   local pending = begin_mag_load(firing_id, "assess", args, ws, provenance)
   if not pending then return end
   pending.call = call
-  -- A caller that states no policy has the configured behaviour.
-  pending.policy = approval.is_policy(call.policy) and call.policy or approval.Default
+  pending.policy = call.policy
 end
 
 -- Runs only what the gate approved: the artifact assess_workflow saw. A call
@@ -2440,15 +2466,18 @@ local function tool_definitions()
   local definitions = {}
   for _, spec in ipairs(lead_workflow_tool_specs()) do
     spec.execute = owned(assert(TOOL_HANDLERS[spec.name], spec.name))
+    spec.prepare = tool.nothing
     if spec.name == "mag-apply" then
       spec.prepare = owned(mag_apply_prepare)
       local assess = owned(mag_apply_assess)
-      spec.approval.decide = function(_policy, args, call)
+      -- Answered when the compile reply arrives (resume_pending_load); a
+      -- failed compile ends the call with the compiler's message instead.
+      local function decide(args, call)
         assess(args, call)
-        -- Answered when the compile reply arrives (resume_pending_load); a
-        -- failed compile ends the call with the compiler's message instead.
         return tool.deferred
       end
+      spec.approval.ReadOnly.decide = decide
+      spec.approval.Default.decide = decide
     end
     definitions[#definitions + 1] = tool.define(spec)
   end
@@ -2864,6 +2893,7 @@ local M = {
       state.active_plan = nil
       state.gate_mode = "safe"
       state.kernel_factories = {}
+      state.factory_approvals = {}
       state.pending_mag_load = {}
       state.pending_mag_apply = {}
       for run_id in pairs(state.completion_grace_waiters) do

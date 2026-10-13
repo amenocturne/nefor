@@ -333,7 +333,7 @@ do
   local provider_messages, provider_emit = capture()
   local facts = {}
   local transport = Async.disabled()
-  local provider = assert(llm.construct("fan-in.llm", {
+  local provider = assert(llm.construct("fan-in.llm", { tool_approval_policy = { constructor = "Default" }, 
     provider = "fake-provider",
     output_type = "final-id",
     error_type = "error-id",

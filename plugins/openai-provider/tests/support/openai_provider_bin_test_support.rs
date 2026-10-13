@@ -63,7 +63,7 @@
         let (publisher, rx) = Publisher::new(256);
         let mut outcome = None;
         publisher.run(wire, rx, &CancellationToken::new(), async {
-            outcome = Some(run_one_tool_call_published(catalog, broker, &publisher, cancel, call).await);
+            outcome = Some(run_one_tool_call_published(catalog, broker, &publisher, cancel, "Default", call).await);
         }).await.expect("tool publication");
         outcome.expect("tool outcome")
     }

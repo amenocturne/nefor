@@ -719,6 +719,11 @@ mod tests {
             Some("mag-kernel"),
             &["sink".to_owned(), "llm".to_owned()],
             contracts,
+            serde_json::json!({"nefor.factory.llm": {"kind": "fixed", "noun": "model"}}),
+        );
+        assert_eq!(
+            b["factory_approvals"]["nefor.factory.llm"]["noun"], "model",
+            "hello carries each factory's own account of its nodes"
         );
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.hello"));
         assert_eq!(
@@ -736,7 +741,7 @@ mod tests {
 
     #[test]
     fn hello_body_omits_kernel_when_absent() {
-        let b = hello_body(None, &[], Value::Array(Vec::new()));
+        let b = hello_body(None, &[], Value::Array(Vec::new()), serde_json::json!({}));
         assert!(b.get("kernel").is_none());
         // Factories always present, even when empty.
         assert_eq!(

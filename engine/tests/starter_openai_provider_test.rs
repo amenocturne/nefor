@@ -390,7 +390,7 @@ fn provider_adapter_keeps_expanded_requests_private_and_reports_generic_events()
         spec.to_plugin({{
           type = "event", from = "conversation-manager",
           body = {
-            kind = "conversation.provider.invoke", provider = "ollama",
+            kind = "conversation.provider.invoke", approval_policy = "Default", provider = "ollama",
             request_id = "request-1", conversation_id = "conversation-1",
             watermark = 11, model = "qwen", tools = empty_tools,
             output_schema = schema,
@@ -525,7 +525,7 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         -- Exercise the actual generic completion-event shape emitted by the Rust
         -- provider: token facts and opaque extensions live under `usage`.
         spec.to_plugin({{ type = "event", from = "conversation-manager", body = {
-          kind = "conversation.provider.invoke", provider = "meter",
+          kind = "conversation.provider.invoke", approval_policy = "Default", provider = "meter",
           request_id = "r1", conversation_id = "c", watermark = 0 } }})
         _test.delivered()
         _test.sent()
@@ -566,7 +566,7 @@ fn provider_usage_compositor_preserves_generic_ledger_invariants() {
         occupancy_options.usage = nil
         local occupancy = provider.spawn_spec("meter", { "/bin/true" }, occupancy_options)
         occupancy.to_plugin({{ type = "event", from = "conversation-manager", body = {
-          kind = "conversation.provider.invoke", provider = "meter", model = "one",
+          kind = "conversation.provider.invoke", approval_policy = "Default", provider = "meter", model = "one",
           request_id = "failed-usage", conversation_id = "c", watermark = 0 } }})
         _test.delivered()
         _test.sent()
@@ -718,7 +718,7 @@ fn provider_adapter_cancels_private_request_without_publishing_native_control() 
         spec.to_plugin({{
           type = "event", from = "conversation-manager",
           body = {
-            kind = "conversation.provider.invoke", provider = "ollama",
+            kind = "conversation.provider.invoke", approval_policy = "Default", provider = "ollama",
             request_id = "request-2", conversation_id = "conversation-1", watermark = 1,
           },
         }})
@@ -963,7 +963,7 @@ fn provider_output_errors_and_capability_loss_release_exact_requests_once() {
       })
       local function invoke(id)
         spec.to_plugin({{type="event", from="conversation-manager", body={
-          kind="conversation.provider.invoke", provider="owner", request_id=id,
+          kind = "conversation.provider.invoke", approval_policy = "Default", provider="owner", request_id=id,
           conversation_id="conversation", watermark=1,
         }}})
       end
@@ -1038,7 +1038,7 @@ fn routed_provider_egress_failure_settles_completion_compaction_and_model_locall
         nefor.engine.send(nefor.json.encode({type="event", from="consumer", body=body}))
         drain()
       end
-      publish {kind="conversation.provider.invoke", provider="owner", request_id="completion",
+      publish {kind = "conversation.provider.invoke", approval_policy = "Default", provider="owner", request_id="completion",
         conversation_id="lead", watermark=1}
       publish {kind="conversation.projection.delta", conversation_id="lead", change={
         kind="context_compaction_pending", provider="owner", model="model", context={messages={{role="user",content="frozen context"}}}, compaction={request_id="compact"}}}
@@ -1090,7 +1090,7 @@ fn routed_provider_egress_failure_settles_completion_compaction_and_model_locall
         kind="context_compaction_pending",provider="owner",model="model",context={messages={{role="user",content="frozen context"}}}, compaction={request_id="scoped"}}}
       publish {kind="engine.plugin_delivery_lost",plugin="owner"}
       assert(count("conversation.context.compact.failed")==2,"surviving queue loss settles compaction")
-      publish {kind="conversation.provider.invoke",provider="owner",request_id="later",conversation_id="lead",watermark=1}
+      publish {kind = "conversation.provider.invoke", approval_policy = "Default",provider="owner",request_id="later",conversation_id="lead",watermark=1}
       assert(spec._internals.pending_requests().later~=nil,"surviving provider accepts later work")
     "#).exec().expect("routed provider local failure observation");
 }

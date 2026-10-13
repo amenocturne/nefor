@@ -18,12 +18,6 @@ M.active = {
     -- Resolved against STARTER_ROOT in init.lua at load time.
     mock_script = "mock-provider/init.lua",
   },
-  tool_gate = {
-    -- Deterministic fixture policy, not the starter's default permission mode.
-    -- The shared frontend never grants an interactive approval.
-    default_action = "auto",
-    prompt_tools   = {},
-  },
   log_level = "warn",
 }
 

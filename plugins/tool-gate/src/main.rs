@@ -28,8 +28,7 @@
 //!
 //! 1. `tool-gate.tool.invoke { id, name, args, approval_policy?, allowlist? }`
 //!    arrives. `approval_policy` is the calling agent's policy by name
-//!    (`ReadOnly` or `Default`); a caller that states none gets `Default`,
-//!    the configured behaviour.
+//!    (`ReadOnly` or `Default`) and is required.
 //! 2. The gate sends `<source>.tool.prepare` with the same fields. The source
 //!    checks the arguments, runs the tool's `prepare` step and the tool's
 //!    decision function, and answers `tool.prepared { id, decision?, reason? }`
@@ -43,20 +42,19 @@
 //!    (`<source>.tool.cancel`).
 //!
 //! The gate forwards the caller's policy to the source on both requests. It
-//! knows no tool's meaning: a tool that answers no decision is assessed from
-//! the per-tool setting below.
+//! knows no tool's meaning and never substitutes one: a call without an
+//! approval policy, a source that answers no decision or an unknown one, or
+//! `unsure` / `denied` without a reason, is an error for that call.
 //!
-//! A call marked `workflow_node` was made by a node of a running workflow,
-//! not by a model. The workflow was approved as a unit before it started, so
-//! the gate only transports such a call: it goes straight to
-//! `<source>.tool.invoke`, and neither the policy nor the mode is consulted.
+//! A call marked `workflow_node: true` was made by a node of a running
+//! workflow, not by a model. It has no agent and so no policy; the workflow
+//! was approved as a unit before it started, so the gate only transports such
+//! a call: it goes straight to `<source>.tool.invoke`, and neither the policy
+//! nor the mode is consulted. Every other call must state its policy.
 //!
-//! Per-tool setting from CLI flags, used when a tool does not assess a call:
+//! One configured restriction, from the command line:
 //!
-//! - `--auto <name>`   : such a call is safe.
-//! - `--prompt <name>` : such a call is unsure.
-//! - `--deny <name>`   : every call is denied, whatever the tool says.
-//! - `--default <auto|prompt|deny>` : fallback for unlisted tools (default: prompt).
+//! - `--deny <name>` : every call of the tool is denied, whatever the tool says.
 //!
 //! Runtime mode: `tool-gate.set_mode { mode: "safe" | "auto" | "yolo" }`
 //! selects the permission mode. Legacy `normal` maps to `safe`. The mode never
@@ -92,7 +90,7 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::policy::{
-    verdict, ApprovalPolicy, Assessment, Decision, GateMode, Policy, Verdict, DENIED_BY_SETTING,
+    verdict, ApprovalPolicy, Assessment, Denied, GateMode, Verdict, DENIED_BY_SETTING,
 };
 
 const CHANNEL_CAP: usize = 256;
@@ -121,54 +119,24 @@ async fn main() {
     std::process::exit(0);
 }
 
-fn parse_args() -> Policy {
+fn parse_args() -> Denied {
     use clap::{Arg, ArgAction, Command};
     let m = Command::new("tool-gate")
-        .arg(
-            Arg::new("auto")
-                .long("auto")
-                .action(ArgAction::Append)
-                .help("Mark <tool> as auto-allow (no prompt)."),
-        )
-        .arg(
-            Arg::new("prompt")
-                .long("prompt")
-                .action(ArgAction::Append)
-                .help("Mark <tool> as prompt-on-call."),
-        )
         .arg(
             Arg::new("deny")
                 .long("deny")
                 .action(ArgAction::Append)
-                .help("Mark <tool> as denied (immediate rejection)."),
-        )
-        .arg(
-            Arg::new("default")
-                .long("default")
-                .default_value("prompt")
-                .help("Fallback decision for unlisted tools (auto|prompt|deny)."),
+                .help("Deny every call of <tool>, whatever the tool says."),
         )
         .get_matches();
-
-    let default_decision = m
-        .get_one::<String>("default")
-        .expect("default has clap default")
-        .parse::<Decision>()
-        .expect("validated by clap value parse");
-    let mut policy = Policy::new(default_decision);
-    for v in m.get_many::<String>("auto").into_iter().flatten() {
-        policy.set(v.clone(), Decision::Auto);
+    let mut denied = Denied::default();
+    for tool in m.get_many::<String>("deny").into_iter().flatten() {
+        denied.deny(tool.clone());
     }
-    for v in m.get_many::<String>("prompt").into_iter().flatten() {
-        policy.set(v.clone(), Decision::Prompt);
-    }
-    for v in m.get_many::<String>("deny").into_iter().flatten() {
-        policy.set(v.clone(), Decision::Deny);
-    }
-    policy
+    denied
 }
 
-async fn run(policy: Policy) -> Result<(), TransportError> {
+async fn run(policy: Denied) -> Result<(), TransportError> {
     let (out_tx, writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader_handle = spawn_stdin_reader(in_tx);
@@ -334,13 +302,14 @@ struct GateState {
     awaiting_approval: HashMap<String, PendingApproval>,
     /// Monotonic counter for inner-id minting.
     inner_id_counter: u64,
-    policy: Policy,
+    /// Tools denied with `--deny`.
+    denied: Denied,
     /// Runtime permission mode, the second input of the decision table.
     mode: GateMode,
 }
 
 impl GateState {
-    fn new(policy: Policy) -> Self {
+    fn new(denied: Denied) -> Self {
         Self {
             advertised: HashMap::new(),
             tool_owner: HashMap::new(),
@@ -349,7 +318,7 @@ impl GateState {
             preparing: HashMap::new(),
             awaiting_approval: HashMap::new(),
             inner_id_counter: 0,
-            policy,
+            denied,
             mode: GateMode::Safe,
         }
     }
@@ -897,9 +866,37 @@ async fn handle_tool_invoke(
         return Ok(());
     }
 
-    if body.get("workflow_node").and_then(Value::as_bool) == Some(true) {
-        // A node of a running workflow, not a model's tool call: the workflow
-        // was the unit of approval, so this call is only transported.
+    let workflow_node = match body.get("workflow_node") {
+        None => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => {
+            send_event(
+                out_tx,
+                tool_result_error_body(
+                    &outer_id,
+                    "tool.invoke field `workflow_node` must be `true` when present",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let stated_policy = body.get("approval_policy");
+    if workflow_node {
+        if stated_policy.is_some() {
+            send_event(
+                out_tx,
+                tool_result_error_body(
+                    &outer_id,
+                    "tool.invoke cannot be both a workflow node's call and an agent's call with an `approval_policy`",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        // A node of a running workflow, not a model's tool call: it has no
+        // agent and no policy. The workflow was the unit of approval, so this
+        // call is only transported.
         let inner_id = state.next_inner_id();
         return execute(
             out_tx,
@@ -918,33 +915,32 @@ async fn handle_tool_invoke(
         )
         .await;
     }
-    let approval_policy = match body.get("approval_policy") {
-        // A caller that states no policy gets the configured behaviour.
-        None | Some(Value::Null) => ApprovalPolicy::Default,
-        Some(value) => match value.as_str().and_then(ApprovalPolicy::parse) {
-            Some(policy) => policy,
-            None => {
-                send_event(
-                    out_tx,
-                    tool_result_error_body(
-                        &outer_id,
-                        "tool.invoke field `approval_policy` must be `ReadOnly` or `Default`",
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        },
+    let approval_policy = match stated_policy
+        .and_then(Value::as_str)
+        .and_then(ApprovalPolicy::parse)
+    {
+        Some(policy) => policy,
+        None => {
+            send_event(
+                out_tx,
+                tool_result_error_body(
+                    &outer_id,
+                    "tool.invoke requires `approval_policy`, the calling agent's policy: `ReadOnly` or `Default`",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
     };
     // `--deny` rejects at once when the table has no way to run the call.
-    if state.policy.decide(&name) == Decision::Deny
+    if state.denied.contains(&name)
         && verdict(approval_policy, state.mode, Assessment::Denied) == Verdict::Deny
     {
         send_event(
             out_tx,
             tool_result_error_body(
                 &outer_id,
-                &denial_message(&name, approval_policy, Some(DENIED_BY_SETTING)),
+                &denial_message(&name, approval_policy, DENIED_BY_SETTING),
             ),
         )
         .await?;
@@ -1006,25 +1002,59 @@ async fn handle_tool_prepared(
     let Some(call) = state.preparing.remove(inner_id) else {
         return Ok(());
     };
-    // Only calls that carry a policy are prepared.
-    let approval_policy = call.approval_policy.unwrap_or(ApprovalPolicy::Default);
+    let Some(approval_policy) = call.approval_policy else {
+        // Only calls that carry a policy are prepared.
+        return fail(
+            out_tx,
+            state,
+            &call,
+            "it was prepared without an approval policy",
+        )
+        .await;
+    };
     let stated_reason = body
         .get("reason")
         .and_then(Value::as_str)
         .filter(|reason| !reason.is_empty());
-    let (assessment, reason) = if state.policy.decide(&call.name) == Decision::Deny {
-        (Assessment::Denied, Some(DENIED_BY_SETTING))
+    // The tool's own assessment. Nothing stands in for a missing one.
+    let assessment = match body.get("decision").and_then(Value::as_str) {
+        Some(decision) => match Assessment::parse(decision) {
+            Some(assessment) => assessment,
+            None => {
+                return fail(
+                    out_tx,
+                    state,
+                    &call,
+                    &format!("its source answered with the unknown decision `{decision}`"),
+                )
+                .await
+            }
+        },
+        None => {
+            return fail(
+                out_tx,
+                state,
+                &call,
+                "its source answered without a decision",
+            )
+            .await
+        }
+    };
+    let (assessment, reason) = if state.denied.contains(&call.name) {
+        (Assessment::Denied, DENIED_BY_SETTING)
     } else {
-        match body.get("decision") {
-            None | Some(Value::Null) => state.policy.unassessed(&call.name, approval_policy),
-            Some(value) => match value.as_str().and_then(Assessment::parse) {
-                Some(assessment) => (assessment, stated_reason),
-                // An answer the gate cannot read is not permission.
-                None => (
-                    Assessment::Denied,
-                    Some("its source answered with an unknown decision"),
-                ),
-            },
+        match (assessment, stated_reason) {
+            (Assessment::Safe, _) => (assessment, ""),
+            (_, Some(reason)) => (assessment, reason),
+            (_, None) => {
+                return fail(
+                    out_tx,
+                    state,
+                    &call,
+                    "its source gave no reason for a decision that is not `safe`",
+                )
+                .await
+            }
         }
     };
     match verdict(approval_policy, state.mode, assessment) {
@@ -1039,6 +1069,18 @@ async fn handle_tool_prepared(
             deny(out_tx, state, &call, &message).await
         }
     }
+}
+
+/// End a call that could not be decided. This is an error, not a denial: no
+/// policy was applied.
+async fn fail(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    state: &mut GateState,
+    call: &PendingApproval,
+    problem: &str,
+) -> Result<(), TransportError> {
+    let message = format!("tool `{}` could not be decided: {problem}", call.name);
+    deny(out_tx, state, call, &message).await
 }
 
 /// Run the call: `<source>.tool.invoke` under the id its source prepared it
@@ -1077,17 +1119,13 @@ async fn deny(
     send_event(out_tx, forward_cancel_body(&call.source, &call.inner_id)).await
 }
 
-/// The error a caller receives for a call the gate did not run.
-fn denial_message(name: &str, policy: ApprovalPolicy, reason: Option<&str>) -> String {
+/// The error a caller receives for a call the gate decided not to run.
+fn denial_message(name: &str, policy: ApprovalPolicy, reason: &str) -> String {
     match policy {
-        ApprovalPolicy::ReadOnly => format!(
-            "tool `{name}` was not run: your approval policy is ReadOnly and {}",
-            reason.unwrap_or("this call could not be shown to be read-only")
-        ),
-        ApprovalPolicy::Default => format!(
-            "tool `{name}` was not run: {}",
-            reason.unwrap_or("this call is not allowed")
-        ),
+        ApprovalPolicy::ReadOnly => {
+            format!("tool `{name}` was not run: your approval policy is ReadOnly and {reason}")
+        }
+        ApprovalPolicy::Default => format!("tool `{name}` was not run: {reason}"),
     }
 }
 
@@ -1403,7 +1441,7 @@ fn tool_canceled_body(outer_id: &str) -> Map<String, Value> {
 fn permission_request_body(
     call: &PendingApproval,
     policy: ApprovalPolicy,
-    reason: Option<&str>,
+    reason: &str,
 ) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
@@ -1417,9 +1455,7 @@ fn permission_request_body(
         "approval_policy".into(),
         Value::String(policy.as_str().into()),
     );
-    if let Some(reason) = reason {
-        m.insert("reason".into(), Value::String(reason.to_owned()));
-    }
+    m.insert("reason".into(), Value::String(reason.to_owned()));
     if let Some(allowlist) = &call.allowlist {
         m.insert("allowlist".into(), allowlist.clone());
     }
@@ -1547,14 +1583,19 @@ mod tests {
         }
     }
 
-    /// Invoke a tool whose source assesses nothing: answer the gate's prepare
-    /// request without a decision, so the configured per-tool setting decides.
-    async fn invoke_unassessed(
+    /// Invoke a tool as a Default caller and answer the gate's prepare request
+    /// as a source would: `write_file` is safe here, every other tool unsure.
+    async fn invoke_as_default(
         tx: &mpsc::Sender<PluginOutgoing>,
         rx: &mut mpsc::Receiver<PluginOutgoing>,
         invoke: &Map<String, Value>,
         state: &mut GateState,
     ) {
+        let mut invoke = invoke.clone();
+        invoke
+            .entry("approval_policy")
+            .or_insert_with(|| json!("Default"));
+        let invoke = &invoke;
         handle_tool_invoke(tx, invoke, state).await.unwrap();
         // Everything that is not this call's prepare request goes back to the
         // test in its original order.
@@ -1575,7 +1616,12 @@ mod tests {
             tx.send(message).await.unwrap();
         }
         if let Some(prepare) = prepare {
-            answer_prepared(tx, state, &prepare, json!({})).await;
+            let answer = if prepare["name"] == "write_file" {
+                json!({"decision": "safe"})
+            } else {
+                json!({"decision": "unsure", "reason": "it could not be shown to be safe"})
+            };
+            answer_prepared(tx, state, &prepare, answer).await;
         }
     }
 
@@ -1710,10 +1756,7 @@ mod tests {
     }
 
     fn make_state() -> GateState {
-        let mut policy = Policy::new(Decision::Prompt);
-        policy.set("read_file", Decision::Prompt);
-        policy.set("write_file", Decision::Auto);
-        GateState::new(policy)
+        GateState::new(Denied::default())
     }
 
     fn advertise_body(source: &str, mut tools: Value) -> Map<String, Value> {
@@ -2242,7 +2285,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-            invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+            invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
             let result: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
             assert_eq!(result["body"]["kind"], "tool.result");
             assert_eq!(
@@ -2340,7 +2383,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
 
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
@@ -2380,7 +2423,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
 
         let result: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(result["body"]["kind"], "tool.result");
@@ -2450,7 +2493,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-            invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+            invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
 
             let result: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
             assert_eq!(result["body"]["kind"], "tool.result", "case {id}");
@@ -2489,7 +2532,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
 
         let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
@@ -2521,7 +2564,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
 
         let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
@@ -2564,7 +2607,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
 
@@ -2614,7 +2657,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
 
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
@@ -2786,7 +2829,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let _request = rx.recv().await.unwrap();
 
         let response = json!({
@@ -2835,7 +2878,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let _request = rx.recv().await.unwrap();
 
         let response = json!({
@@ -2886,7 +2929,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let _ = rx.recv().await;
 
         let response = json!({
@@ -2942,7 +2985,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let _ = rx.recv().await;
 
         let response = json!({
@@ -3042,7 +3085,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let forwarded: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(forwarded["body"]["id"], "gate-1");
         assert_eq!(forwarded["body"]["caller_id"], "r7/cap-3");
@@ -3092,7 +3135,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-            invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+            invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         }
         let first: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         let second: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
@@ -3137,7 +3180,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let forwarded: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         let inner_id = forwarded["body"]["id"].as_str().unwrap().to_owned();
 
@@ -3193,7 +3236,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
 
@@ -3301,9 +3344,9 @@ mod tests {
     async fn yolo_runs_a_default_callers_unsure_and_denied_calls() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         // Default `prompt` policy + a per-tool `deny` to prove yolo wins.
-        let mut policy = Policy::new(Decision::Prompt);
-        policy.set("shell.script", Decision::Deny);
-        let mut state = GateState::new(policy);
+        let mut denied = Denied::default();
+        denied.deny("shell.script");
+        let mut state = GateState::new(denied);
         state.mode = GateMode::Yolo;
         let advertise = advertise_body(
             "basic-tools",
@@ -3327,7 +3370,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-            invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+            invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
             let msg = rx.recv().await.unwrap();
             let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
             let body = v.get("body").unwrap();
@@ -3420,7 +3463,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
@@ -3459,7 +3502,7 @@ mod tests {
     async fn two_sequential_bash_invokes_with_different_args_both_prompt() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         // Default `prompt` policy with bash unlisted — falls through to default.
-        let mut state = GateState::new(Policy::new(Decision::Prompt));
+        let mut state = GateState::new(Denied::default());
         let advertise = advertise_body(
             "basic-tools",
             json!([{"name": "shell.script", "description": "", "parameters": {}}]),
@@ -3479,7 +3522,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &first, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &first, &mut state).await;
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
@@ -3514,7 +3557,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &second, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &second, &mut state).await;
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
@@ -3531,9 +3574,9 @@ mod tests {
     #[tokio::test]
     async fn deny_policy_replies_immediately_without_prompt() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
-        let mut policy = Policy::new(Decision::Prompt);
-        policy.set("shell.script", Decision::Deny);
-        let mut state = GateState::new(policy);
+        let mut denied = Denied::default();
+        denied.deny("shell.script");
+        let mut state = GateState::new(denied);
         let advertise = advertise_body(
             "basic-tools",
             json!([{"name": "shell.script", "description": "", "parameters": {}}]),
@@ -3552,7 +3595,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        invoke_unassessed(&tx, &mut rx, &invoke, &mut state).await;
+        invoke_as_default(&tx, &mut rx, &invoke, &mut state).await;
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
@@ -3576,16 +3619,18 @@ mod tests {
     /// A gate with one source advertising `tool`, in `mode`.
     async fn gate_with_tool(
         mode: GateMode,
-        setting: Decision,
+        deny_tool: bool,
     ) -> (
         GateState,
         mpsc::Sender<PluginOutgoing>,
         mpsc::Receiver<PluginOutgoing>,
     ) {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(16);
-        let mut policy = Policy::new(Decision::Prompt);
-        policy.set("tool", setting);
-        let mut state = GateState::new(policy);
+        let mut denied = Denied::default();
+        if deny_tool {
+            denied.deny("tool");
+        }
+        let mut state = GateState::new(denied);
         state.mode = mode;
         let advertise = advertise_body(
             TOOLS,
@@ -3638,13 +3683,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_callers_policy_is_forwarded_on_prepare_and_on_invoke() {
-        for (stated, forwarded) in [
-            (Some("ReadOnly"), "ReadOnly"),
-            (Some("Default"), "Default"),
-            // A caller that states no policy gets the configured behaviour.
-            (None, "Default"),
-        ] {
-            let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, Decision::Prompt).await;
+        for (stated, forwarded) in [(Some("ReadOnly"), "ReadOnly"), (Some("Default"), "Default")] {
+            let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, false).await;
             let prepare = invoke_assessed(
                 &mut state,
                 &tx,
@@ -3674,7 +3714,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_policy_is_rejected_before_the_source_hears_of_the_call() {
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, Decision::Auto).await;
+        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, false).await;
         for policy in [
             json!("Rules"),
             json!("readonly"),
@@ -3688,7 +3728,7 @@ mod tests {
             assert_eq!(result["kind"], "tool.result");
             assert_eq!(
                 result["error"],
-                "tool.invoke field `approval_policy` must be `ReadOnly` or `Default`"
+                "tool.invoke requires `approval_policy`, the calling agent's policy: `ReadOnly` or `Default`"
             );
             assert!(rx.try_recv().is_err());
             assert!(state.pending.is_empty() && state.preparing.is_empty());
@@ -3729,7 +3769,7 @@ mod tests {
         for (policy, mode, assessment, expected) in table {
             let case = format!("{policy} / {mode:?} / {assessment}");
             // The configured setting says `auto`: a tool's own assessment wins.
-            let (mut state, tx, mut rx) = gate_with_tool(mode, Decision::Auto).await;
+            let (mut state, tx, mut rx) = gate_with_tool(mode, false).await;
             let prepare = invoke_assessed(
                 &mut state,
                 &tx,
@@ -3794,57 +3834,63 @@ mod tests {
                 "tool `tool` was not run: your approval policy is ReadOnly and not shown to be read-only",
             ),
             (
-                "ReadOnly",
-                json!({"decision": "unsure"}),
-                "tool `tool` was not run: your approval policy is ReadOnly and this call could not be shown to be read-only",
-            ),
-            (
                 "Default",
                 json!({"decision": "denied", "reason": "write_file requires an approved plan"}),
                 "tool `tool` was not run: write_file requires an approved plan",
             ),
-            (
-                "Default",
-                json!({"decision": "denied"}),
-                "tool `tool` was not run: this call is not allowed",
-            ),
-            (
-                "Default",
-                json!({"decision": "approve"}),
-                "tool `tool` was not run: its source answered with an unknown decision",
-            ),
         ];
         for (policy, answer, expected) in cases {
-            let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, Decision::Auto).await;
+            let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, false).await;
             invoke_assessed(&mut state, &tx, &mut rx, Some(policy), answer).await;
             assert_eq!(next(&mut rx)["error"], expected);
         }
     }
 
+    /// The gate never stands in for a tool that did not decide: a missing
+    /// decision, an unknown one, or a non-safe one without a reason ends the
+    /// call with an error in every mode and under every policy.
     #[tokio::test]
-    async fn a_tool_that_assesses_nothing_follows_the_configured_setting_under_default_only() {
+    async fn an_undecided_call_is_an_error_not_a_decision() {
         let cases = [
-            ("Default", Decision::Auto, "tools.tool.invoke"),
-            ("Default", Decision::Prompt, "chat.tool.permission_request"),
-            ("ReadOnly", Decision::Auto, "tool.result"),
-            ("ReadOnly", Decision::Prompt, "tool.result"),
+            (json!({}), "its source answered without a decision"),
+            (
+                json!({"decision": null}),
+                "its source answered without a decision",
+            ),
+            (
+                json!({"decision": "approve"}),
+                "its source answered with the unknown decision `approve`",
+            ),
+            (
+                json!({"decision": "unsure"}),
+                "its source gave no reason for a decision that is not `safe`",
+            ),
+            (
+                json!({"decision": "denied", "reason": ""}),
+                "its source gave no reason for a decision that is not `safe`",
+            ),
         ];
-        for (policy, setting, expected) in cases {
-            let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, setting).await;
-            invoke_assessed(&mut state, &tx, &mut rx, Some(policy), json!({})).await;
-            let first = next(&mut rx);
-            assert_eq!(first["kind"], expected, "{policy} / {setting:?}");
-            if policy == "ReadOnly" {
-                assert_eq!(
-                    first["error"],
-                    "tool `tool` was not run: your approval policy is ReadOnly and the tool does not say what it does under this policy"
-                );
+        for policy in ["ReadOnly", "Default"] {
+            for mode in [GateMode::Safe, GateMode::Auto, GateMode::Yolo] {
+                for (answer, problem) in &cases {
+                    let (mut state, tx, mut rx) = gate_with_tool(mode, false).await;
+                    let prepare =
+                        invoke_assessed(&mut state, &tx, &mut rx, Some(policy), answer.clone())
+                            .await;
+                    let result = next(&mut rx);
+                    assert_eq!(result["kind"], "tool.result", "{policy} {mode:?} {answer}");
+                    assert_eq!(
+                        result["error"],
+                        format!("tool `tool` could not be decided: {problem}")
+                    );
+                    let dropped = next(&mut rx);
+                    assert_eq!(dropped["kind"], "tools.tool.cancel");
+                    assert_eq!(dropped["id"], prepare["id"]);
+                    assert!(rx.try_recv().is_err(), "an undecided call never runs");
+                    assert!(state.pending.is_empty() && state.awaiting_approval.is_empty());
+                }
             }
         }
-        // Yolo does not widen a ReadOnly caller of a tool that says nothing.
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, Decision::Auto).await;
-        invoke_assessed(&mut state, &tx, &mut rx, Some("ReadOnly"), json!({})).await;
-        assert_eq!(next(&mut rx)["kind"], "tool.result");
     }
 
     #[tokio::test]
@@ -3855,7 +3901,7 @@ mod tests {
             ("Default", GateMode::Auto),
             ("ReadOnly", GateMode::Yolo),
         ] {
-            let (mut state, tx, mut rx) = gate_with_tool(mode, Decision::Deny).await;
+            let (mut state, tx, mut rx) = gate_with_tool(mode, true).await;
             handle_tool_invoke(&tx, &call("outer-1", Some(policy)), &mut state)
                 .await
                 .unwrap();
@@ -3868,7 +3914,7 @@ mod tests {
             assert!(rx.try_recv().is_err());
         }
         // Default in yolo runs denied calls, so the call is prepared and run.
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, Decision::Deny).await;
+        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, true).await;
         invoke_assessed(
             &mut state,
             &tx,
@@ -3882,13 +3928,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_approved_call_executes_the_prepared_call_and_a_refused_one_is_dropped() {
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, Decision::Auto).await;
+        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, false).await;
         let prepare = invoke_assessed(
             &mut state,
             &tx,
             &mut rx,
             Some("Default"),
-            json!({"decision": "unsure"}),
+            json!({"decision": "unsure", "reason": "it publishes"}),
         )
         .await;
         assert_eq!(next(&mut rx)["kind"], "chat.tool.permission_request");
@@ -3902,13 +3948,13 @@ mod tests {
         assert_eq!(invoke["id"], prepare["id"]);
         assert_eq!(invoke["approval_policy"], "Default");
 
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, Decision::Auto).await;
+        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, false).await;
         let prepare = invoke_assessed(
             &mut state,
             &tx,
             &mut rx,
             Some("Default"),
-            json!({"decision": "unsure"}),
+            json!({"decision": "unsure", "reason": "it publishes"}),
         )
         .await;
         let _request = next(&mut rx);
@@ -3930,7 +3976,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_may_end_a_call_while_preparing_it() {
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, Decision::Auto).await;
+        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, false).await;
         handle_tool_invoke(&tx, &call("outer-1", Some("Default")), &mut state)
             .await
             .unwrap();
@@ -3950,7 +3996,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_call_that_is_being_prepared_drops_it_at_its_source() {
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, Decision::Auto).await;
+        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, false).await;
         handle_tool_invoke(&tx, &call("outer-1", Some("Default")), &mut state)
             .await
             .unwrap();
@@ -3971,7 +4017,7 @@ mod tests {
     async fn a_workflow_nodes_call_is_transported_without_a_decision() {
         // Safe mode and a setting that would ask: neither is consulted.
         for mode in [GateMode::Safe, GateMode::Auto, GateMode::Yolo] {
-            let (mut state, tx, mut rx) = gate_with_tool(mode, Decision::Prompt).await;
+            let (mut state, tx, mut rx) = gate_with_tool(mode, false).await;
             let mut invoke = call("node-1", None);
             invoke.insert("workflow_node".into(), json!(true));
             handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
@@ -3983,12 +4029,32 @@ mod tests {
             assert!(rx.try_recv().is_err(), "no prepare request and no question");
             assert!(state.preparing.is_empty() && state.awaiting_approval.is_empty());
         }
-        // The marker is exactly `true`; anything else is an ordinary call.
-        let (mut state, tx, mut rx) = gate_with_tool(GateMode::Safe, Decision::Prompt).await;
-        let mut invoke = call("node-2", None);
-        invoke.insert("workflow_node".into(), json!("true"));
-        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
-        assert_eq!(next(&mut rx)["kind"], "tools.tool.prepare");
+        // The marker is exactly `true`, and a call is a node's or an agent's,
+        // never both: anything else is an error, not a guess.
+        for (marker, policy, expected) in [
+            (
+                json!("true"),
+                None,
+                "tool.invoke field `workflow_node` must be `true` when present",
+            ),
+            (
+                json!(false),
+                Some("Default"),
+                "tool.invoke field `workflow_node` must be `true` when present",
+            ),
+            (
+                json!(true),
+                Some("ReadOnly"),
+                "tool.invoke cannot be both a workflow node's call and an agent's call with an `approval_policy`",
+            ),
+        ] {
+            let (mut state, tx, mut rx) = gate_with_tool(GateMode::Yolo, false).await;
+            let mut invoke = call("node-2", policy);
+            invoke.insert("workflow_node".into(), marker);
+            handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+            assert_eq!(next(&mut rx)["error"], expected);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

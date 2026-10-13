@@ -106,7 +106,7 @@ fn registry_exposes_qualified_serializable_contracts() {
             return function()
               local reg = Registry.new()
               local decl, err = reg:register({
-                declaration = {
+                declaration = { approval = require("node-approval").inert("test node"), 
                   name = "example",
                   params = { count = "int", owner = "string" },
                   template = { relocations = {
@@ -222,7 +222,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
       local function list(item) return {kind="list",item=item} end
       local function map(key,value) return {kind="map",key=key,value=value} end
       local function record(fields) return {kind="record",fields=fields} end
-      assert(reg:register({ declaration = {
+      assert(reg:register({ declaration = { approval = require("node-approval").inert("test node"), 
         name="generic", type_variables={"T"}, semantic={input=v("T"),output=list(v("T")),inputs={{wire="In",type=v("T")}},outputs={{wire="Out",type=list(v("T"))}}},
         params={}, inputs={input="In"}, outputs={"Out"}
       }, construct=function() return {} end }))
@@ -243,7 +243,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
       assert(not valid(task,p("Int"),list(task)).ok)
       assert(not valid(task,task,list(p("Int"))).ok)
       assert(not valid({kind="named",name="Task",arguments={}},task,list(task)).ok)
-      assert(reg:register({ declaration = {
+      assert(reg:register({ declaration = { approval = require("node-approval").inert("test node"), 
         name="plain", params={}, inputs={input="In"}, outputs={"Out"}
       }, construct=function() return {} end }))
       local plain=reg:validate_modification({actors={{id="p",factory="plain",type_arguments={},routes={}}}})
@@ -253,7 +253,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
       assert(not reg:validate_modification({actors={{id="sparse",factory="plain",
         type_arguments={[2]=p("String")},routes={}}}}).ok)
 
-      assert(reg:register({declaration={name="fixed",semantic={
+      assert(reg:register({declaration={ approval = require("node-approval").inert("test node"), name="fixed",semantic={
         input=p("String"),output=p("Int"),
         inputs={{wire="FixedIn",type=p("String")}},outputs={{wire="FixedOut",type=p("Int")}}},
         params={},inputs={value="FixedIn"},outputs={"FixedOut"}},construct=function() return {} end}))
@@ -287,7 +287,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
       assert(not fixed_tamper.ok)
 
       local function contradictory(name,inputs,outputs,semantic_inputs,semantic_outputs)
-        local _,err=reg:register({declaration={name=name,params={},inputs=inputs,outputs=outputs,
+        local _,err=reg:register({declaration={ approval = require("node-approval").inert("test node"), name=name,params={},inputs=inputs,outputs=outputs,
           semantic={input=p("String"),output=p("String"),inputs=semantic_inputs,outputs=semantic_outputs}},
           construct=function() return {} end})
         return err
@@ -301,7 +301,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
       -- Route transforms and input coverage are validated by compiled topology.
       -- The registry owns only capability factory specialization and endpoints.
 
-      assert(reg:register({declaration={name="choice",type_variables={"A","B"},
+      assert(reg:register({declaration={ approval = require("node-approval").inert("test node"), name="choice",type_variables={"A","B"},
         semantic={input=p("Unit"),output=p("JsonValue"),inputs={{wire="Start",type=p("Unit")}},outputs={{wire="Left",type=v("A")},{wire="Right",type=v("B")}}},params={},inputs={start="Start"},outputs={"Left","Right"}},
         construct=function() return {} end}))
       local missing_arm=reg:validate_modification({actors={{id="choice",factory="choice",
@@ -314,7 +314,7 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
         outputs={{type=p("Int"),wire="Left"},{type=p("String"),wire="Right"}},routes={}}}})
       assert(not swapped.ok)
 
-      assert(reg:register({declaration={name="answer",semantic={
+      assert(reg:register({declaration={ approval = require("node-approval").inert("test node"), name="answer",semantic={
         input=p("String"),output=n("nefor.contracts.TextAnswer"),
         inputs={{wire="In",type=p("String")}},
         outputs={{wire="Final",type=n("nefor.contracts.TextAnswer")}}},

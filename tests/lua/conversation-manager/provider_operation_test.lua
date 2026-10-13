@@ -104,7 +104,7 @@ for _, body in ipairs(sent) do if body.kind == "conversation.compaction.prepared
 assert(seen.a.kind == "Ready" and seen.b.kind == "Ready" and seen.a.regular_window == 100 and seen.b.regular_window == 100)
 -- Successful response evidence is nonterminal and independent of occupancy/billing.
 sent = {}
-spec.to_plugin({{from = "conversation-manager", body = {kind = "conversation.provider.invoke", request_id = "native", provider = "p",
+spec.to_plugin({{from = "conversation-manager", body = {kind = "conversation.provider.invoke", request_id = "native", provider = "p", approval_policy = "Default",
   conversation_id = "c", model = "m", watermark = 7}}})
 spec.from_plugin({{from = "p", body = {kind = "p.completion.event", request_id = "native", event = "response_completed", provider = "p", model = "m"}}})
 assert(sent[#sent].kind == "conversation.provider.event.reported" and sent[#sent].event == "response_completed")

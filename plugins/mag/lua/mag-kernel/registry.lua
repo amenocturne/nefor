@@ -26,6 +26,7 @@
 -- validated before applying").
 
 local shape = require("shape")
+local node_approval = require("node-approval")
 local type_node = require("type-node")
 local plain_data = require("plain-data")
 
@@ -70,6 +71,8 @@ local function validate_declaration(decl)
   if decl.params ~= nil and type(decl.params) ~= "table" then
     return nil, "declaration.params must be a table (params schema)"
   end
+  local approval_problem = node_approval.validate(decl)
+  if approval_problem then return nil, approval_problem end
   if decl.template ~= nil then
     if type(decl.template) ~= "table" or not is_dense_list(decl.template.relocations) then
       return nil, "declaration.template must contain a dense relocations list"
@@ -339,6 +342,18 @@ function registry:contracts(array_mt)
       },
       signals = array_copy(decl.signals),
     }
+  end
+  return out
+end
+
+-- What each factory's nodes mean for approval, by factory identity: the
+-- factories' own `approval` declarations, as plain data for whoever approves
+-- a workflow before it runs.
+function registry:approvals()
+  local out = {}
+  for _, name in ipairs(self:names()) do
+    local decl = self.factories[name].declaration
+    out[decl.identity] = decl.approval
   end
   return out
 end

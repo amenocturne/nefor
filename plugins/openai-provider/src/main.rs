@@ -685,7 +685,7 @@ async fn dispatch_event(
                 client,
                 out_tx,
                 chat_id,
-                false,
+                None,
                 extra_tools,
                 response_format,
             )
@@ -773,6 +773,25 @@ async fn dispatch_event(
                 .await?;
                 return Ok(());
             }
+            // This path runs the model's tool calls itself. Each of them goes
+            // through the tool gate, which needs the caller's approval
+            // policy; whoever sends the prompt states it.
+            let Some(approval_policy) = body
+                .get("approval_policy")
+                .and_then(Value::as_str)
+                .filter(|policy| !policy.is_empty())
+                .map(str::to_owned)
+            else {
+                send_event(
+                    out_tx,
+                    turn_error_body(
+                        config,
+                        "openai-provider: prompt needs `approval_policy`, the approval policy its tool calls are made under",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            };
             let chat_id = ChatId::default_for_prefix(&prefix);
             if let Err(e) = chats.ensure(chat_id.clone()).await {
                 send_event(
@@ -792,7 +811,7 @@ async fn dispatch_event(
                 client,
                 out_tx,
                 chat_id,
-                true,
+                Some(approval_policy),
                 Vec::new(),
                 None,
             )
@@ -1549,10 +1568,13 @@ async fn start_completion_turn(
     client: &reqwest::Client,
     out_tx: &mpsc::Sender<PluginOutgoing>,
     chat_id: ChatId,
-    legacy_default_chat: bool,
+    legacy_tool_policy: Option<String>,
     extra_tools: Vec<Value>,
     response_format: Option<Value>,
 ) -> Result<(), LlmError> {
+    // The legacy `<prefix>.prompt` path is the one that states a policy for
+    // the tool calls this provider then makes itself.
+    let legacy_default_chat = legacy_tool_policy.is_some();
     let history = match chats.request_history_snapshot(&chat_id).await {
         Ok(h) => h,
         Err(e) => {
@@ -1593,7 +1615,7 @@ async fn start_completion_turn(
         out_tx.clone(),
         chat_id,
         cancel,
-        legacy_default_chat,
+        legacy_tool_policy,
         extra_tools,
         response_format,
     );
@@ -1611,10 +1633,11 @@ fn spawn_turn(
     out_tx: mpsc::Sender<PluginOutgoing>,
     chat_id: ChatId,
     cancel: TurnToken,
-    legacy_default_chat: bool,
+    legacy_tool_policy: Option<String>,
     extra_tools: Vec<Value>,
     response_format: Option<Value>,
 ) {
+    let legacy_default_chat = legacy_tool_policy.is_some();
     let stop = publisher::shutdown_token();
     publisher::spawn(async move {
         let wire = out_tx;
@@ -1919,6 +1942,7 @@ fn spawn_turn(
                                     &broker,
                                     &out_tx,
                                     &cancel_token,
+                                    legacy_tool_policy.as_deref().unwrap_or_default(),
                                     tc,
                                 )
                                 .await;
@@ -2220,6 +2244,7 @@ async fn run_one_tool_call_published(
     broker: &Arc<ToolBroker>,
     out_tx: &Publisher,
     cancel: &tokio_util::sync::CancellationToken,
+    approval_policy: &str,
     tc: ToolCall,
 ) -> ToolStepOutcome {
     let id = tc.id.clone();
@@ -2305,7 +2330,11 @@ async fn run_one_tool_call_published(
     let rx = broker.register(id.clone()).await;
     let _ = out_tx
         .send(PluginOutgoing::event(tool_invoke_body(
-            &owner, &id, &name, args_value,
+            &owner,
+            &id,
+            &name,
+            args_value,
+            approval_policy,
         )))
         .await;
 
@@ -3175,7 +3204,13 @@ fn chat_tool_end_body(id: &str, output: &str, error: bool) -> Map<String, Value>
 /// Build a `<plugin>.tool.invoke` body. The kind is prefix-routed by
 /// the engine to deliver only to the named plugin (see
 /// `examples/nefor-agent/ncp.lua` `handle_event`).
-fn tool_invoke_body(plugin: &str, id: &str, name: &str, args: Value) -> Map<String, Value> {
+fn tool_invoke_body(
+    plugin: &str,
+    id: &str,
+    name: &str,
+    args: Value,
+    approval_policy: &str,
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
@@ -3184,6 +3219,11 @@ fn tool_invoke_body(plugin: &str, id: &str, name: &str, args: Value) -> Map<Stri
     m.insert("id".into(), Value::String(id.to_owned()));
     m.insert("name".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args);
+    // The policy the prompt's sender stated; the gate decides the call from it.
+    m.insert(
+        "approval_policy".into(),
+        Value::String(approval_policy.to_owned()),
+    );
     m
 }
 

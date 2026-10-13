@@ -19,7 +19,24 @@ local function classify(validator, policy, command)
   return result, reason
 end
 
-local validator = tv.build { classifier = FAKE_CLASSIFIER }
+-- The flags of the configuration under test: one stack per policy.
+local ARGS = {
+  ReadOnly = { "--read-only", "--git", "read" },
+  Default = { "--read-only", "--git", "read,add,commit", "--model" },
+}
+local function build(overrides)
+  local opts = { classifier = FAKE_CLASSIFIER, classifier_args = ARGS, command_fastpaths = {} }
+  for key, value in pairs(overrides or {}) do opts[key] = value end
+  return tv.build(opts)
+end
+local validator = build()
+
+-- A failed classification raises with this message.
+local function fails(v, policy, command)
+  local ok, err = pcall(v.classify_command, policy, command)
+  eq(ok, false, "classifying must fail: " .. tostring(command))
+  return tostring(err)
+end
 
 -- The exit contract: 0 approve, 1 defer, 2 deny.
 eq(classify(validator, "ReadOnly", "ls -la"), "safe", "exit 0 is safe")
@@ -36,67 +53,60 @@ do
   eq(classify(validator, "ReadOnly", "rm -rf build"), "denied", "exit 2 is denied under ReadOnly")
 end
 
--- Each policy has its own flags: the wide Default stack approves a commit,
--- the strict ReadOnly stack does not.
-eq(classify(validator, "Default", "git commit -m x"), "safe", "Default uses the wide stack")
-eq(classify(validator, "ReadOnly", "git commit -m x"), "unsure", "ReadOnly uses the strict stack")
+-- Each policy gets exactly its configured flags: Default's stack approves a
+-- commit and carries the model flag, ReadOnly's does neither.
+eq(classify(validator, "Default", "git commit -m x"), "safe", "Default uses its stack")
+eq(classify(validator, "ReadOnly", "git commit -m x"), "unsure", "ReadOnly uses its stack")
+eq(classify(validator, "Default", "MODEL decides"), "safe", "Default's flags include the model flag")
+eq(classify(validator, "ReadOnly", "MODEL decides"), "unsure", "ReadOnly's do not")
 
--- The model flag is a configuration value and is added to Default only.
-do
-  eq(classify(validator, "Default", "MODEL decides"), "unsure", "without a configured model flag nothing asks the model")
-  local with_model = tv.build { classifier = FAKE_CLASSIFIER, model_flag = "--model" }
-  eq(classify(with_model, "Default", "MODEL decides"), "safe", "Default gets the configured model flag")
-  eq(classify(with_model, "ReadOnly", "MODEL decides"), "unsure", "ReadOnly never gets the model flag")
-  eq(classify(with_model, "Default", "git commit -m x"), "safe", "the flag is added to the wide stack, not instead of it")
+-- Nothing is supplied for what the configuration left out.
+for _, case in ipairs({
+  { { classifier_args = false }, "`classifier_args` is not defined; it maps every approval policy (ReadOnly, Default)" },
+  { { classifier_args = { ReadOnly = {} } }, "`classifier_args` does not define the Default policy" },
+  { { classifier_args = { Default = {} } }, "`classifier_args` does not define the ReadOnly policy" },
+  { { classifier_args = { ReadOnly = {}, Default = {}, Rules = {} } }, "names unknown approval policy `Rules`" },
+  { { classifier_args = { ReadOnly = { 1 }, Default = {} } }, "`classifier_args.ReadOnly` must be a list of strings" },
+  { { command_fastpaths = false }, "`command_fastpaths` is not defined; pass a list of predicates, or {} for none" },
+  { { classifier = false }, "requires a non-empty `classifier` executable path" },
+}) do
+  local overrides = {}
+  for key, value in pairs(case[1]) do overrides[key] = value end
+  local opts = { classifier = FAKE_CLASSIFIER, classifier_args = ARGS, command_fastpaths = {} }
+  for key, value in pairs(overrides) do opts[key] = value or nil end
+  local ok, err = pcall(tv.build, opts)
+  eq(ok, false, "an incomplete configuration fails at build: " .. case[2])
+  assert(tostring(err):find(case[2], 1, true), tostring(err))
 end
 
--- A configuration may replace a policy's flags outright.
-do
-  local custom = tv.build {
-    classifier = FAKE_CLASSIFIER,
-    classifier_args = { ReadOnly = { "--git", "read,commit" } },
-    model_flag = "--model",
-  }
-  eq(classify(custom, "ReadOnly", "git commit -m x"), "safe", "configured flags replace the default stack")
-  eq(classify(custom, "Default", "MODEL decides"), "safe", "an untouched policy keeps its default stack")
-  eq(pcall(tv.build, { classifier = FAKE_CLASSIFIER, classifier_args = { Rules = {} } }), false,
-    "flags for an unknown policy are a configuration error")
-  eq(pcall(tv.build, { classifier = FAKE_CLASSIFIER, model_flag = "" }), false,
-    "an empty model flag is a configuration error")
-end
-
--- A classifier that fails denies with an actionable reason, under every policy.
+-- Failing to classify is an error, never a decision.
 for _, policy in ipairs({ "ReadOnly", "Default" }) do
-  local result, reason = classify(validator, policy, "CRASH now")
-  eq(result, "denied", "an unexpected exit status is a denial under " .. policy)
-  assert(reason:find("tool_classifier_unavailable", 1, true), "the reason is recognisable: " .. reason)
-  assert(reason:find("exit code 70", 1, true), "it carries the exit status: " .. reason)
-  assert(reason:find("classifier exploded", 1, true), "and the classifier's own message: " .. reason)
-  assert(reason:find("Recovery:", 1, true), "and what to do: " .. reason)
+  local message = fails(validator, policy, "CRASH now")
+  assert(message:find("the command could not be classified", 1, true), message)
+  assert(message:find("unknown status 70", 1, true), "it carries the exit status: " .. message)
+  assert(message:find("classifier exploded", 1, true), "and the classifier's own message: " .. message)
+  assert(message:find("Recovery:", 1, true), "and what to do: " .. message)
 end
 do
-  local missing = tv.build { classifier = "/nonexistent/classifier" }
-  local result, reason = classify(missing, "Default", "ls")
-  eq(result, "denied", "an unusable classifier is a denial")
-  assert(reason:find("tool_classifier_unavailable", 1, true), "the reason is recognisable: " .. reason)
-  assert(reason:find("/nonexistent/classifier", 1, true), "it names the configured executable: " .. reason)
-  eq(pcall(tv.build, {}), false, "a classifier executable is required")
+  local message = fails(build({ classifier = "/nonexistent/classifier" }), "Default", "ls")
+  assert(message:find("the command could not be classified", 1, true), message)
+  assert(message:find("/nonexistent/classifier", 1, true), "it names the configured executable: " .. message)
+  eq(fails(validator, "Default", ""), "there is no command text to classify", "an empty command is an error")
+  eq(fails(validator, "ReadOnly", nil), "there is no command text to classify", "a missing command is an error")
+  assert(fails(validator, "Rules", "ls"):find("unknown approval policy `Rules`", 1, true), "an unknown policy is an error")
 end
 
--- No text, an unknown policy, and fast paths.
-eq(classify(validator, "Default", ""), "unsure", "an empty command is unsure")
-eq(classify(validator, "ReadOnly", nil), "unsure", "a missing command is unsure")
-eq(pcall(validator.classify_command, "Rules", "ls"), false, "an unknown policy raises")
+-- Fast paths.
 do
   local seen = {}
-  local fast = tv.build { classifier = "/nonexistent/classifier", command_fastpaths = {
+  local fast = build { classifier = "/nonexistent/classifier", command_fastpaths = {
     function(command, policy)
       seen[#seen + 1] = policy .. ":" .. command
       return policy == "Default" and command == "make lint"
     end,
   } }
   eq(classify(fast, "Default", "make lint"), "safe", "a fast path approves before the classifier is consulted")
-  eq(classify(fast, "ReadOnly", "make lint"), "denied", "a fast path decides per policy")
+  eq(pcall(fast.classify_command, "ReadOnly", "make lint"), false, "a fast path decides per policy")
   eq(seen[1], "Default:make lint", "the predicate sees the command and the policy")
 end
 
@@ -139,9 +149,9 @@ eq(validator.classify_argv("ReadOnly", { "ls", "-la" }), "safe", "a read-only pr
 eq(validator.classify_argv("ReadOnly", { "rm", "-rf", "build" }), "denied", "a forbidden program is denied")
 eq(validator.classify_argv("Default", { "frobnicate", "; ls" }), "unsure", "quoted separators do not make a second command")
 do
-  local result, reason = validator.classify_argv("Default", {})
-  eq(result, "denied", "an empty vector cannot run")
-  eq(reason, "argv is empty", "and says so")
+  local ok, err = pcall(validator.classify_argv, "Default", {})
+  eq(ok, false, "an empty vector cannot be classified")
+  eq(tostring(err), "the argument vector cannot be classified: argv is empty", "and says so")
 end
 
 return true

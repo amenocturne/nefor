@@ -183,7 +183,7 @@ do
   local inv = inventory.new({ log = silent_log() })
   local reg = Registry.new()
   reg:register({
-    declaration = {
+    declaration = { approval = require("node-approval").inert("test node"), 
       name = "worker",
       params = {},
       inputs = { input = "stub.In" },
@@ -264,7 +264,7 @@ do
   local inv = inventory.new({ log = silent_log() })
   local reg = Registry.new()
   reg:register({
-    declaration = { name = "worker", params = {}, inputs = { input = "stub.In" }, outputs = { "stub.Out" } },
+    declaration = { approval = require("node-approval").inert("test node"),  name = "worker", params = {}, inputs = { input = "stub.In" }, outputs = { "stub.Out" } },
     construct = function(id) return { id = id } end,
   })
   local topo
@@ -325,7 +325,7 @@ do
   local reg = Registry.new()
   local delivered = {}
   reg:register({
-    declaration = { name = "entry", params = {}, inputs = { input = "seed.In" }, outputs = {} },
+    declaration = { approval = require("node-approval").inert("test node"),  name = "entry", params = {}, inputs = { input = "seed.In" }, outputs = {} },
     construct = function(id, params, emit)
       local i = { id = id }
       i.deliver = function(activation)
@@ -399,7 +399,7 @@ do
   local events = {}
   local inv = inventory.new({ log = silent_log() })
   local reg = Registry.new()
-  local declaration = {
+  local declaration = { approval = require("node-approval").inert("test node"), 
     name = "endpoint-observed", params = {}, inputs = { named = "stub.In" }, outputs = { "stub.Out" },
   }
   reg:register({ declaration = declaration, construct = function(id, _, emit)
@@ -412,7 +412,7 @@ do
     return instance
   end })
   reg:register({
-    declaration = { name = "observed-sink", params = {},
+    declaration = { approval = require("node-approval").inert("test node"),  name = "observed-sink", params = {},
       inputs = { input = "stub.Out" }, outputs = {} },
     construct = function(id, _, emit)
       emit({ kind = "mag.ready", from = id })

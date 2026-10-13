@@ -101,7 +101,7 @@ fn jsonl_excludes_session_control_events() {
         -- history-shaped payload on one of these generic protocol events must
         -- never inflate the durable session or become resume input.
         sessions_test._persist_envelope(entry("conversation-manager", {
-            kind = "conversation.provider.invoke",
+            kind = "conversation.provider.invoke", approval_policy = "Default",
             request_id = "req-1",
             messages = { { role = "user", content = string.rep("x", 65536) } },
         }))

@@ -1,4 +1,5 @@
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 local INPUT = "nefor.dynamic.Input"
@@ -11,6 +12,9 @@ local count = { kind = "named", name = "nefor.dynamic.DynamicCount", arguments =
 
 M.declaration = {
   name = "dynamic-each",
+  -- Starts one instance of a template per item; what those instances do is
+  -- declared by the template's own nodes, which are assessed with the workflow.
+  approval = node_approval.inert("dynamic fan-out"),
   type_variables = { "T" },
   semantic = {
     input = dynamic,

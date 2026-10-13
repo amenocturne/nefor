@@ -271,6 +271,7 @@ fn two_agent_program() -> Value {
                 "outputs":[port(&llm, "generic-tool.ToolCalls", &tool_calls), port(&llm, "nefor.agent.Result", &result)],
                 "params": {"$mag": "packed-value", "value": {
                     "model": "opus", "provider": PROVIDER, "system": "work",
+                    "tool_approval_policy": {"constructor": "Default"},
                     "output_type": "text-answer", "error_type": "agent-error",
                     "provider_error_type": "provider-error"
                 }}

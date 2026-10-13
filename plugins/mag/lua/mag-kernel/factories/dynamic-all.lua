@@ -1,4 +1,5 @@
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 local INPUT = "nefor.dynamic.Input"
@@ -11,6 +12,8 @@ local provider_input = {
 
 M.declaration = {
   name = "dynamic-all",
+  -- Collects the results of a dynamic workflow; plumbing.
+  approval = node_approval.inert("dynamic collector"),
   type_variables = { "T" },
   semantic = {
     input = dynamic,

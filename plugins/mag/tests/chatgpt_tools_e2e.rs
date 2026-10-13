@@ -67,12 +67,8 @@ async fn spawn_mag(data_dir: &Path) -> Child {
 
 async fn spawn_tool_gate() -> Child {
     tokio::process::Command::new(prepared_binary("tool-gate"))
-        .arg("--prompt")
-        .arg("read_file")
         .arg("--deny")
         .arg("write_file")
-        .arg("--default")
-        .arg("deny")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -413,15 +409,18 @@ nefor.artifact.compile(topology)
             send(&mut gate_in, "mag", invoke).await;
 
             // The gate asks the source what the call means before deciding.
-            // This source assesses nothing, so the gate's `--prompt` setting
-            // for read_file applies to the Default caller and the user is asked.
+            // The source says it is unsure, so the Default caller's user is
+            // asked in safe mode.
             let prepare = next_kind(&mut gate_out, "basic-tools.tool.prepare").await;
             assert_eq!(prepare["name"], "read_file");
             assert_eq!(prepare["approval_policy"], "Default");
             send(
                 &mut gate_in,
                 "basic-tools",
-                object(json!({"kind": "tool.prepared", "id": prepare["id"]})),
+                object(json!({
+                    "kind": "tool.prepared", "id": prepare["id"],
+                    "decision": "unsure", "reason": "this stand-in source asks about every read"
+                })),
             )
             .await;
 

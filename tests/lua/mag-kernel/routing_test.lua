@@ -57,6 +57,10 @@ local function harness(factories)
       declaration = factory,
       construct = function(id) return { id = id } end,
     }
+    -- These declarations describe routing only; as nodes they are inert.
+    if entry.declaration.approval == nil then
+      entry.declaration.approval = require("node-approval").inert("test node")
+    end
     local _, err = reg:register(entry)
     assert_true(err == nil, "factory registers: " .. tostring(err))
   end

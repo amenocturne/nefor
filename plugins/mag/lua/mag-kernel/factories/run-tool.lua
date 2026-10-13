@@ -67,12 +67,20 @@
 --   local batch state and documents the void. Written inline — no wrapper.
 
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 local approval = require("libs.tool.approval")
 
 local M = {}
 
 M.declaration = {
   name = "run-tool",
+  -- Makes the agent's tool calls with the agent's approval policy; each call
+  -- is decided by the gate when it is made. As a node of a workflow someone
+  -- applies, an agent may not have a wider policy than the agent applying it.
+  approval = {
+    kind = "agent", noun = "agent", policy = "tool_approval_policy",
+    wider = { "denied", "its approval policy is wider than that of the agent applying the workflow" },
+  },
   semantic = {
     input={kind="named",name="nefor.wire.ToolCalls",arguments={}},
     output={kind="named",name="nefor.wire.ToolHandle",arguments={}},

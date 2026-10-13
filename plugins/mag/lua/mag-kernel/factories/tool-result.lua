@@ -33,6 +33,7 @@
 -- Signals: "explicit signal handlers only where meaningful").
 
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 local model_context = require("model-context")
 
 local M = {}
@@ -48,6 +49,8 @@ end
 
 M.declaration = {
   name = "tool-result",
+  -- Passes tool results back to the model.
+  approval = node_approval.inert("tool result"),
   semantic = {
     input={kind="named",name="nefor.wire.ToolHandle",arguments={}},
     output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},

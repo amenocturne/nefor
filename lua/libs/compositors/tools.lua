@@ -13,13 +13,13 @@
 --     through `<name>.capability.invoke` / `<name>.capability.cancel`.
 --
 --   tools.basic_actor_spec { max_read_bytes = N, gate = "tool-gate",
---                            classify_command = f, classify_argv = f, decide_write = f? }
+--                            classify_command = f, classify_argv = f, decide_write = d }
 --     The basic-tools capability binary with the `libs.basic-tools` tools.
 --     The composition must supply the read_file maximum explicitly, and the
 --     command classification its command tools decide from
 --     (`libs.tool-validator`'s `classify_command` / `classify_argv`).
 --
---   tools.git_worktree_actor_spec { gate = "tool-gate" }
+--   tools.git_worktree_actor_spec { gate = "tool-gate", decide_create = d, decide_open = d }
 --     The git-worktree capability binary with the `libs.git-worktree` tools,
 --     used by MAG's worktree factories.
 
@@ -302,7 +302,11 @@ function M.git_worktree_actor_spec(options)
     command = { config.bin("git-worktree") },
     gate = options.gate or "tool-gate",
     tools = function(capability)
-      return require("libs.git-worktree").tools { invoke = capability.invoke }
+      return require("libs.git-worktree").tools {
+        invoke = capability.invoke,
+        decide_create = options.decide_create,
+        decide_open = options.decide_open,
+      }
     end,
   }
 end

@@ -221,12 +221,6 @@ actor.spawn(actor.identity_spec("mag", {
 local tools = require("libs.compositors.tools")
 local model_context_policy = require("libs.model-context-policy")
 local tool_gate_argv = { require("config").bin("tool-gate") }
-for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
-  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
-  tool_gate_argv[#tool_gate_argv + 1] = t
-end
-tool_gate_argv[#tool_gate_argv + 1] = "--default"
-tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 -- lead-workflow owns the lead's kernel-dispatch tool surface (mag /
 -- MAG lifecycle/source tools and write-review) and relays
@@ -251,12 +245,14 @@ actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 local approval = require("libs.tool.approval")
 local function fixture_classification(policy)
   if policy == approval.Default then return approval.safe end
-  return approval.unsure, "this configuration has no command classifier"
+  return approval.unsure, "this fixture configuration has no command classifier"
 end
 local basic_tools = tools.basic_actor_spec {
   max_read_bytes = model_context_policy.item_limit,
   classify_command = fixture_classification,
   classify_argv = fixture_classification,
+  -- Nobody reviews plans in this fixture: a Default caller's writes run.
+  decide_write = "safe",
 }
 actor.spawn(basic_tools)
 lead_workflow.configure_approval {

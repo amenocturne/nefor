@@ -9,7 +9,15 @@ fn harness() -> Lua {
     package
         .set(
             "path",
-            format!("{0}/?.lua;{0}/?/init.lua;{current}", root.display()),
+            format!(
+                "{0}/?.lua;{0}/?/init.lua;{1}/?.lua;{1}/?/init.lua;{current}",
+                root.display(),
+                // The shared Lua tree: factories declare their approval meaning
+                // with `libs.tool.approval`.
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../lua")
+                    .display()
+            ),
         )
         .unwrap();
     lua

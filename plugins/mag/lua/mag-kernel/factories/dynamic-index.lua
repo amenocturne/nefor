@@ -1,4 +1,5 @@
 local kinds = require("kinds")
+local node_approval = require("node-approval")
 
 local M = {}
 local INPUT = "nefor.dynamic.IndexInput"
@@ -8,6 +9,8 @@ local indexed = { kind = "named", name = "nefor.dynamic.Indexed", arguments = { 
 
 M.declaration = {
   name = "dynamic-index",
+  -- Tags one instance's result with its position; plumbing.
+  approval = node_approval.inert("dynamic index"),
   type_variables = { "T", "R" },
   semantic = {
     input = item,

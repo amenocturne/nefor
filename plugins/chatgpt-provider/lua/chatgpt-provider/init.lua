@@ -1,7 +1,6 @@
 local oa = require("openai-provider")
 local json_data = require("core.json_data")
 local tool = require("libs.tool")
-local approval = require("libs.tool.approval")
 
 local function copy(value)
   return json_data.copy(value or {})
@@ -88,7 +87,12 @@ local function definitions(handle)
   local function define(spec)
     spec.execution = { kind = "routed" }
     local name = spec.name
-    spec.approval = { decide = approval.reads() }
+    -- Web reads change nothing: safe for every caller.
+    spec.approval = {
+      ReadOnly = { decide = "safe", describe = tool.nothing },
+      Default = { decide = "safe", describe = tool.nothing },
+    }
+    spec.prepare = tool.nothing
     spec.execute = function(args, call) return handle(name, args, call) end
     return tool.define(spec)
   end

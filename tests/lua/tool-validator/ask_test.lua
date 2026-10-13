@@ -6,6 +6,7 @@
 local CLASSIFIER = "/managed/plugins/da/bin/da"
 local tv_lib = require("libs.tool-validator")
 local tv = require("tool-validator").build { classifier = CLASSIFIER }
+local ARGS = { ReadOnly = { "--read-only" }, Default = { "--read-only" } }
 local json = nefor.json
 
 local function assert_eq(actual, expected, msg)
@@ -68,15 +69,16 @@ do
   end
 end
 
--- A classifier that cannot be probed denies and names the configured path.
+-- A classifier that cannot be probed is an error that names the configured path.
 do
   local original_run = nefor.process.run
   nefor.process.run = function(_) return { code = -1, stderr = "spawn failed: no such file" } end
-  local validator = tv_lib.build { classifier = "/missing/plugins/da/bin/da" }
-  local result, reason = validator.classify_command("Default", "git status")
+  local validator = tv_lib.build { classifier = "/missing/plugins/da/bin/da", classifier_args = ARGS, command_fastpaths = {} }
+  local ok, reason = pcall(validator.classify_command, "Default", "git status")
   nefor.process.run = original_run
-  assert_eq(result, "denied", "an unusable classifier denies")
-  assert_eq(reason:find("tool_classifier_unavailable", 1, true) ~= nil, true, "the failure is actionable")
+  assert_eq(ok, false, "an unusable classifier is an error, not a denial")
+  reason = tostring(reason)
+  assert_eq(reason:find("the command could not be classified", 1, true) ~= nil, true, "the failure says what failed")
   assert_eq(reason:find("/missing/plugins/da/bin/da", 1, true) ~= nil, true, "it names the configured path")
 end
 
@@ -93,12 +95,12 @@ do
     end
     return { code = -1, stderr = "classifier process crashed" }
   end
-  local validator = tv_lib.build { classifier = CLASSIFIER }
-  local result, reason = validator.classify_command("ReadOnly", "git status")
-  validator.classify_command("Default", "git log")
+  local validator = tv_lib.build { classifier = CLASSIFIER, classifier_args = ARGS, command_fastpaths = {} }
+  local ok, reason = pcall(validator.classify_command, "ReadOnly", "git status")
+  pcall(validator.classify_command, "Default", "git log")
   nefor.process.run = original_run
-  assert_eq(result, "denied", "a failure after the probe denies")
-  assert_eq(reason:find("classifier process crashed", 1, true) ~= nil, true, "the diagnostic is preserved")
+  assert_eq(ok, false, "a failure after the probe is an error")
+  assert_eq(tostring(reason):find("classifier process crashed", 1, true) ~= nil, true, "the diagnostic is preserved")
   assert_eq(probes, 1, "the probe is cached")
   assert_eq(#commands, 3, "one probe and one run per classification")
   for _, command in ipairs(commands) do assert_eq(command, CLASSIFIER, "only the injected path is run") end

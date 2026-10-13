@@ -12,16 +12,17 @@
 --     cancel = function(call) end,           -- process capabilities only
 --     classify_command = function(policy, command) end,  -- -> result, reason
 --     classify_argv = function(policy, argv) end,        -- -> result, reason
---     decide_write = function(policy, args, call) end,   -- optional
+--     decide_write = "safe" | { result, reason } | function(args, call) end,
 --   } -> { tool definitions }
 --
 -- `libs.compositors.tools.basic_actor_spec` supplies invoke/cancel for the
--- wrapped process. The two classifiers are the configured command
--- classification (`libs.tool-validator`): `shell.script` and `process.exec`
--- answer their decision from it, under every approval policy. `write_file` is
--- denied for a `ReadOnly` caller; under a wider policy `decide_write` decides
--- when the composition supplies one (the starter requires an approved
--- write-review plan), and otherwise the gate's configured setting does.
+-- wrapped process. Everything else is the composition's explicit choice:
+-- the two classifiers are the configured command classification
+-- (`libs.tool-validator`), from which `shell.script` and `process.exec`
+-- answer under every approval policy, and `decide_write` is what a
+-- `write_file` call means for a `Default` caller (the starter requires an
+-- approved write-review plan). `write_file` is always denied for a `ReadOnly`
+-- caller, and the reading tools are safe for every caller.
 
 local tool = require("libs.tool")
 local approval = require("libs.tool.approval")
@@ -77,8 +78,8 @@ function M.tools(opts)
     error("basic-tools.tools: classify_command and classify_argv must be functions", 2)
   end
   local decide_write = opts.decide_write
-  if decide_write ~= nil and type(decide_write) ~= "function" then
-    error("basic-tools.tools: decide_write must be a function", 2)
+  if decide_write == nil then
+    error("basic-tools.tools: decide_write is not defined; it is write_file's decision for a Default caller", 2)
   end
 
   local function forward(capability)
@@ -112,7 +113,11 @@ function M.tools(opts)
         field("content", "result", "$", "text", { max_lines = 20, max_bytes = 1600 }),
       }) }),
       context = file_path_context("cwd"),
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
+      prepare = tool.nothing,
       execute = forward("read_file"),
     },
     tool.define {
@@ -133,7 +138,11 @@ function M.tools(opts)
           field("encoded bytes", "result", "data", "bytes", { omit = "missing" }),
         }) }),
       context = file_path_context("cwd"),
-      approval = { decide = approval.reads() },
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
+      prepare = tool.nothing,
       execute = forward("read_image"),
     },
     tool.define {
@@ -159,12 +168,10 @@ function M.tools(opts)
         { kind = "receipt", text = "file written", fields = tool_display.fields({}) }),
       context = file_path_context(nil),
       approval = {
-        decide = function(policy, args, call)
-          if policy == approval.ReadOnly then return approval.denied, WRITES_A_FILE end
-          if decide_write then return decide_write(policy, args, call) end
-        end,
-        describe = approval.rejected_when_read_only(WRITES_A_FILE),
+        ReadOnly = { decide = { "denied", WRITES_A_FILE }, describe = approval.read_only_rejection(WRITES_A_FILE) },
+        Default = { decide = decide_write, describe = tool.nothing },
       },
+      prepare = tool.nothing,
       execute = forward("write_file"),
     },
     tool.define {
@@ -189,9 +196,16 @@ function M.tools(opts)
         { kind = "content", fields = tool_display.fields({}) }),
       context = CWD_CONTEXT,
       approval = {
-        decide = function(policy, args) return classify_argv(policy, args.argv) end,
-        describe = { [approval.ReadOnly] = "Your approval policy is ReadOnly: a program that is not shown to be read-only is rejected." },
+        ReadOnly = {
+          decide = function(args) return classify_argv(approval.ReadOnly, args.argv) end,
+          describe = "Your approval policy is ReadOnly: a program that is not shown to be read-only is rejected.",
+        },
+        Default = {
+          decide = function(args) return classify_argv(approval.Default, args.argv) end,
+          describe = tool.nothing,
+        },
       },
+      prepare = tool.nothing,
       execute = forward("process.exec"),
       cancel = cancel,
     },
@@ -212,9 +226,16 @@ function M.tools(opts)
         { kind = "content", fields = tool_display.fields({}) }),
       context = CWD_CONTEXT,
       approval = {
-        decide = function(policy, args) return classify_command(policy, args.script) end,
-        describe = { [approval.ReadOnly] = "Your approval policy is ReadOnly: a script that is not shown to be read-only is rejected." },
+        ReadOnly = {
+          decide = function(args) return classify_command(approval.ReadOnly, args.script) end,
+          describe = "Your approval policy is ReadOnly: a script that is not shown to be read-only is rejected.",
+        },
+        Default = {
+          decide = function(args) return classify_command(approval.Default, args.script) end,
+          describe = tool.nothing,
+        },
       },
+      prepare = tool.nothing,
       execute = forward("shell.script"),
       cancel = cancel,
     },

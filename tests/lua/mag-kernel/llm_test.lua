@@ -148,13 +148,18 @@ local function conversation_messages(facts)
   return completed
 end
 
+local NO_POLICY = {}
+
 local function with_contracts(params)
   local resolved = {
     output_type = "text-answer-id",
     error_type = "agent-error-id",
     provider_error_type = "provider-error-id",
+    tool_approval_policy = { constructor = "Default" },
   }
-  for key, value in pairs(params or {}) do resolved[key] = value end
+  for key, value in pairs(params or {}) do
+    if value == NO_POLICY then resolved[key] = nil else resolved[key] = value end
+  end
   return resolved
 end
 
@@ -235,10 +240,13 @@ do
   instance.deliver(turn({ messages = { { role = "user", content = "look" } } }))
   assert_eq(find_last_kind(msgs, "capability.invoke").request.approval_policy, "ReadOnly",
     "the provider request names the agent's approval policy")
-  local plain, plain_msgs = make("plain.llm", { provider = "p" })
-  plain.deliver(turn({ messages = { { role = "user", content = "look" } } }))
-  assert_eq(find_last_kind(plain_msgs, "capability.invoke").request.approval_policy, nil,
-    "an actor without a policy states none")
+  for _, bad in ipairs({ NO_POLICY, { rules = {} }, { constructor = "Rules" } }) do
+    local invalid, err = llm.construct("bad.llm",
+      with_contracts({ provider = "p", tool_approval_policy = bad }), function() end, {})
+    assert_eq(invalid, nil, "an agent without a valid approval policy cannot be constructed")
+    assert_true(tostring(err):find("params.tool_approval_policy: expected a ToolApprovalPolicy (ReadOnly | Default)", 1, true) ~= nil,
+      "and the error names what is missing: " .. tostring(err))
+  end
 end
 
 -- ==================================================================

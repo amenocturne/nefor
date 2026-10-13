@@ -188,9 +188,15 @@ async fn run() -> Result<(), MagError> {
     // Refuse to advertise readiness if their immutable snapshot cannot cross
     // the wire; otherwise actors could spawn before observers know their type.
     let contracts = host.registry_contracts()?;
+    let approvals = host.registry_approvals()?;
     send_event(
         &out_tx,
-        hello_body(host.kernel_name().as_deref(), &factories, contracts),
+        hello_body(
+            host.kernel_name().as_deref(),
+            &factories,
+            contracts,
+            approvals,
+        ),
     )
     .await?;
 
@@ -732,6 +738,12 @@ async fn finish_compile(
     let factories = host.registry_names().unwrap_or_default();
     let contracts = host.registry_contracts().unwrap_or_else(|_| Value::Array(Vec::new()));
     let mut reply = loaded_body(in_reply_to, &hash, artifact, &factories, contracts);
+    // Whoever approves this artifact needs each factory's own account of its
+    // nodes. When the registry cannot say, the field is absent and the
+    // approver reports that; nothing is invented here.
+    if let Ok(approvals) = host.registry_approvals() {
+        reply.insert("factory_approvals".into(), approvals);
+    }
     if let Some(build) = build {
         reply.insert("build".into(), build);
     }
@@ -1626,7 +1638,12 @@ fn default_run_id() -> String {
 
 // ---- static body constructors ----------------------------------------------
 
-fn hello_body(kernel: Option<&str>, factories: &[String], contracts: Value) -> Map<String, Value> {
+fn hello_body(
+    kernel: Option<&str>,
+    factories: &[String],
+    contracts: Value,
+    approvals: Value,
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(format!("{PLUGIN_NAME}.hello")));
     m.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
@@ -1640,6 +1657,8 @@ fn hello_body(kernel: Option<&str>, factories: &[String], contracts: Value) -> M
         Value::Array(factories.iter().cloned().map(Value::String).collect()),
     );
     m.insert("factory_contracts".into(), contracts);
+    // What each factory's nodes mean for approval, as the factories declare.
+    m.insert("factory_approvals".into(), approvals);
     m
 }
 
