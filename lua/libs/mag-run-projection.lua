@@ -94,24 +94,14 @@ function M.actor_path(run, actor_id)
   return nil
 end
 
--- The path of the deepest logical node whose subtree holds every listed
--- actor: the row that folds them together. Empty when they share no node, nil
--- when an actor is unknown.
-function M.common_path(run, actor_ids)
-  local common
-  for _, actor_id in ipairs(actor_ids) do
-    local path = M.actor_path(run, actor_id)
-    if not path then return nil end
-    if not common then
-      common = {}
-      for index, name in ipairs(path) do common[index] = name end
-    else
-      local length = 0
-      while length < #common and common[length + 1] == path[length + 1] do length = length + 1 end
-      for index = #common, length + 1, -1 do common[index] = nil end
-    end
-  end
-  return common
+-- The path of the logical node that directly contains `actor_id`'s own row:
+-- the parent of the node listing it as a member. An actor whose node is
+-- top-level has no parent, so its own node is the answer. Nil when the run
+-- does not know the actor.
+function M.enclosing_path(run, actor_id)
+  local path = M.actor_path(run, actor_id)
+  if not path then return nil end
+  return #path > 1 and parent_path(path) or path
 end
 
 function M.active_groups(run, nodes)

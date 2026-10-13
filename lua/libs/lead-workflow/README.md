@@ -120,51 +120,69 @@ out), or unauthorized (a delegated agent addressing a run it did not start).
   seconds, bounds that wait). The caller does not also receive that run's
   completion notification.
 
-## Agent workspaces
+## Workspaces
 
-Every agent has its own writable MAG workspace under the session's MAG folder.
-The source tools operate on the caller's workspace only, so one agent cannot
-read, overwrite, or run another agent's source through them.
+Every calling node has its own writable MAG workspace inside its run's folder.
+The source tools operate on the caller's workspace only, so one caller cannot
+read, overwrite, or run another's source through them.
 
 ```text
 <sessions root>/<session id>/mag/
-  lead/                               the lead's workspace
-  agents/<run id>/<node>/.../<node>/  one workspace per delegated agent
   runs/<run id>/<actor>.output        node outputs, written by the runtime
+  runs/<run id>/<node>/.../<node>/    one workspace per calling node
+  lead/                               the lead's workspace (interim, see below)
 ```
 
-- The lead keeps `lead/` for the whole session. Its run id changes every
-  turn, so a folder per run would hide the files it wrote in earlier turns.
-- A delegated agent's workspace is its run, then its logical node path: the
-  same nesting the TUI sidebar shows for that run (a stage, then the agent
-  inside it). The path comes from `libs.mag-run-projection`, which the sidebar
-  also uses, applied to the logical nodes the compiled program declares. An
-  agent that applies a workflow starts a new run; that run's agents get folders
-  under the new run id, and the applying agent stays under its own. An agent
-  expanded from a template gets its folder from its materialized node path,
-  for example `agents/<run id>/fan-out/items%3A0/worker/`.
-- `runs/` belongs to the runtime. Source folders live under `lead/` and
-  `agents/`, so a run id or node name can never collide with it.
+A workspace is identified by the run and the caller's logical node path, the
+same nesting the TUI sidebar shows for that run. Nothing in the layout or in
+the resolution depends on what kind of node the caller is.
 
 The caller is identified by the invocation provenance the kernel stamps on the
-tool call (`session_id`, `run_id`, `actor_id`, `principal`), never by anything
-the model supplies. A `lead` principal resolves to `lead/`. For a delegated
-agent, the calling actor is its run-tool actor; the workspace belongs to the
-logical node that holds both that actor and the model actor it names in
-`conversation_peer`. A call whose run this library does not track, or whose
-actor has no node in that run, is rejected rather than given a guessed folder.
+tool call (`session_id`, `run_id`, `actor_id`), never by anything the model
+supplies:
 
-A run id or node name becomes one directory name. Lowercase letters, digits,
-`_`, `-`, and a non-leading `.` are kept; every other byte, including
-uppercase letters and `%` itself, is written as `%XX`. Two different names
-therefore never share a directory, also on a filesystem that ignores case or
-normalizes Unicode. A name longer than 255 bytes after encoding is rejected.
+- The top-level key of the path comes from one function of the invocation,
+  `workspace_key` in `init.lua`. Today it is the invocation's `run_id`.
+- The node path comes from `libs.mag-run-projection`, which the sidebar also
+  uses, applied to the logical nodes the run declared (the compiled program's,
+  then each materialized template's through `mag.nodes_declared`). The
+  workspace belongs to the node that directly contains the calling actor's own
+  row: `enclosing_path` takes the path of the node listing the actor as a
+  member and drops its last segment. A calling actor whose node is top-level
+  has no containing node, so its own node is its workspace.
+- A call whose run this library does not track, or whose actor has no node in
+  that run, is rejected rather than given a guessed folder.
 
-A workspace is created by its agent's first write, together with a minimal
-`mag.toml` that makes it a MAG project. Reading from a workspace that was never
-written reports an ordinary missing file and creates nothing. Each agent's
-prompt names its own directory in its `# MAG workspace` section. A template
-agent's prompt is composed before its node path exists, so it names the run's
+A node that applies a workflow starts a new run; that run's nodes get folders
+under the new run id, and the applying node stays under its own. A node
+expanded from a template gets its folder from its materialized path, for
+example `runs/<run id>/fan-out/items%3A0/worker/`.
+
+The lead does not go through this rule yet. Its run id changes every turn and
+its turn run is started by `libs.agentic-loop`, not tracked here, so a
+workspace keyed by its run would hide the files it wrote in earlier turns.
+Until its key is decided it keeps `lead/` for the session.
+
+A run's folder holds both what the runtime wrote and what the run's nodes
+authored, so names are chosen to keep them apart:
+
+- A node name becomes one directory name. Lowercase letters, digits, `_`,
+  `-`, and a non-leading `.` are kept; every other byte, including uppercase
+  letters and `%` itself, is written as `%XX`. Two different names therefore
+  never share a directory, also on a filesystem that ignores case or
+  normalizes Unicode. A name longer than 255 bytes after encoding is rejected.
+- The runtime's files in a run folder are all named `<actor>.output`. The dot
+  of a node name ending in `.output` is written `%2E` (`task.output` becomes
+  `task%2Eoutput`), so no directory can take an output file's name.
+- The run id is used as given, because the runtime writes into the same
+  folder under that id. A run id that is not already a plain folder name by
+  the rule above, or that starts or ends with `-`, is rejected.
+
+A workspace is created by its first write, together with a minimal `mag.toml`
+that makes it a MAG project. Reading from a workspace that was never written
+reports an ordinary missing file and creates nothing. Each model actor's
+prompt names its node's directory in its `# MAG workspace` section. A template
+actor's prompt is composed before its node path exists, so it names the run's
 folder and says its own folder is at its node path beneath it.
 
 Paths given to the source tools are normalized and relative to the caller's
@@ -172,21 +190,20 @@ workspace; absolute paths, `..` traversal, and symlinks are rejected, including
 a symlinked run or node folder above the workspace.
 
 Imports resolve through the configured module roots plus the caller's own
-workspace, which is also the project root of the compilation. Modules an agent
-writes into its workspace are importable by programs in that workspace only: a
-program cannot import a module that exists only in another agent's workspace
-or in the lead's. Code several agents need belongs in a configured package
-root. Canonical and configuration-owned libraries stay in their package roots;
-the composition passes those roots to every compilation and nothing is copied
-into the session. Files loaded with `read(...)` or `read_json(...)` are
-snapshotted on first access within one compilation, so compile again after
-changing them.
+workspace, which is also the project root of the compilation. Modules written
+into a workspace are importable by programs in that workspace only: a program
+cannot import a module that exists only in another workspace. Code several
+callers need belongs in a configured package root. Canonical and
+configuration-owned libraries stay in their package roots; the composition
+passes those roots to every compilation and nothing is copied into the
+session. Files loaded with `read(...)` or `read_json(...)` are snapshotted on
+first access within one compilation, so compile again after changing them.
 
-An agent's workspace follows the node that folds its model and run-tool actors
-together. Nefor's agent constructor makes that node a leaf of the workflow
-tree, so no workspace contains another. A custom library that nested one
-agent's node inside another's would place the inner workspace inside the outer
-one.
+Workspaces nest as their nodes do. If two calling actors' containing nodes are
+an ancestor and a descendant of each other, the descendant's workspace lies
+inside the ancestor's, and the ancestor can reach it by relative path. Nefor's
+own node constructors give calling actors sibling containing nodes, so this
+does not occur with them.
 
 ## Plan review
 

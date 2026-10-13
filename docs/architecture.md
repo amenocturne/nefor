@@ -518,10 +518,11 @@ to every MAG source compilation. Policy is `{ cache_dir = "/absolute/writable/pa
 `libs.mag-workspace.compile_request(id, project_root, entry, module_roots, policy)`
 constructs either request without selecting global paths or altering correlations.
 
-Config roots supply `mag.toml`. Each agent authors into its own workspace under
-the session's MAG folder (`lead/` for the lead, `agents/<run id>/<logical node
-path>/` for a delegated agent; see `lua/libs/lead-workflow/README.md`), and that
-workspace is the project root of its compilations. An agent's first write
+Config roots supply `mag.toml`. Each calling node authors into its own workspace
+inside its run's folder under the session's MAG folder (`runs/<run id>/<logical
+node path>/`, beside the runtime's output files; the lead keeps `lead/` for
+now; see `lua/libs/lead-workflow/README.md`), and that workspace is the project
+root of its compilations. A workspace's first write
 creates the workspace and only a missing minimal `version = 1` manifest, never
 replacing authored content (even an invalid manifest). Files and deltas need no
 per-entry manifest edits; generated

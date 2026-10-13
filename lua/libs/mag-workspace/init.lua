@@ -1,8 +1,8 @@
 -- lua/libs/mag-workspace/init.lua — MAG workspace management and preview formatting.
 --
 -- Provides two things:
---   1. Workspace layout: one writable MAG source directory per agent, under
---      the session's MAG folder, created when its agent first writes.
+--   1. Workspace layout: one writable MAG source directory per calling node,
+--      under the session's MAG folder, created by its first write.
 --   2. Preview formatting: render a graph modification (the shape the
 --      mag plugin replies with on `mag.loaded`) into a human-readable
 --      string the lead can inspect before executing.
@@ -95,7 +95,7 @@ local function workspace_symlink(workspace)
   return false
 end
 
--- Resolve a model-authored source name inside one agent's workspace. Rejecting
+-- Resolve a model-authored source name inside one workspace. Rejecting
 -- symlink components is what makes lexical containment meaningful even when a
 -- prior process has written into the workspace.
 function M.resolve_file(workspace, file)
@@ -219,13 +219,12 @@ function M.workflow_tree(descriptors)
   return #lines > 0 and table.concat(lines, "\n") or "(empty workflow)"
 end
 
--- The session's MAG folder. Agents never write here directly: it holds the
--- lead's workspace, the agents' workspaces, and the runtime's run outputs.
+-- The session's MAG folder. Nothing is authored here directly.
 --
 --   <sessions root>/<session id>/mag/
---     lead/                               the lead's workspace
---     agents/<run id>/<node>/.../<node>/  one workspace per agent node
---     runs/<run id>/<actor>.output        written by the runtime
+--     lead/                             the lead (interim, see lead_workspace)
+--     runs/<key>/<node>/.../<node>/     one workspace per calling node
+--     runs/<run id>/<actor>.output      written by the runtime
 function M.session_dir(session_id)
   local root = sessions_root()
   if not root then return nil end
@@ -233,14 +232,18 @@ function M.session_dir(session_id)
 end
 
 local LEAD_DIR = "lead"
-local AGENTS_DIR = "agents"
+local RUNS_DIR = "runs"
+local OUTPUT_SUFFIX = ".output"
 local MAX_SEGMENT_BYTES = 255
 
--- One run id or node name as one directory name. Lowercase letters, digits,
--- `_`, `-` and a non-leading `.` stay as written; every other byte becomes
--- `%XX`. `%` is itself encoded, so two different names never share a
--- directory, including on a filesystem that folds case or normalizes Unicode.
--- A name too long for one directory entry is rejected, not truncated.
+-- One node name as one directory name. Lowercase letters, digits, `_`, `-`
+-- and a non-leading `.` stay as written; every other byte becomes `%XX`. `%`
+-- is itself encoded, so two different names never share a directory,
+-- including on a filesystem that folds case or normalizes Unicode. The dot of
+-- a trailing `.output` is encoded too: the runtime names its output files
+-- `<actor>.output` in the run folder, and a directory must never take one of
+-- those names. A name too long for one directory entry is rejected, not
+-- truncated.
 function M.encode_segment(name)
   if type(name) ~= "string" or name == "" then
     return nil, "workspace path segment must be a non-empty string"
@@ -249,35 +252,44 @@ function M.encode_segment(name)
     return string.format("%%%02X", char:byte())
   end)
   if encoded:sub(1, 1) == "." then encoded = "%2E" .. encoded:sub(2) end
+  if encoded:sub(-#OUTPUT_SUFFIX) == OUTPUT_SUFFIX then
+    encoded = encoded:sub(1, -#OUTPUT_SUFFIX - 1) .. "%2E" .. OUTPUT_SUFFIX:sub(2)
+  end
   if #encoded > MAX_SEGMENT_BYTES then
     return nil, "workspace path segment is too long: " .. name
   end
   return encoded
 end
 
--- The lead is one agent for the whole session: its run id changes every turn,
--- so its workspace is keyed by the session alone and keeps its files.
+-- Interim: the lead's run id changes every turn, so a workspace keyed by its
+-- run would hide the files it wrote in earlier turns. Until its key is
+-- decided it keeps one folder for the session.
 function M.lead_workspace(session_id)
   local dir = M.session_dir(session_id)
   return dir and dir .. "/" .. LEAD_DIR or nil
 end
 
--- The folder holding every agent workspace of one run.
-function M.run_workspaces_dir(session_id, run_id)
+-- The folder a workspace key names. Today the key is a run id, and this is
+-- that run's folder, shared with the runtime, which writes the run's outputs
+-- into it under the run id as given. A key is therefore used unencoded and
+-- must already be a plain folder name; any other key is rejected.
+function M.run_dir(session_id, run_id)
   local dir = M.session_dir(session_id)
   if not dir then return nil, "no data root available" end
-  local run_segment, run_error = M.encode_segment(run_id)
-  if not run_segment then return nil, run_error end
-  return dir .. "/" .. AGENTS_DIR .. "/" .. run_segment
+  if type(run_id) ~= "string" or run_id == "" or M.encode_segment(run_id) ~= run_id
+      or run_id:sub(1, 1) == "-" or run_id:sub(-1) == "-" then
+    return nil, "run id is not usable as a folder name: " .. tostring(run_id)
+  end
+  return dir .. "/" .. RUNS_DIR .. "/" .. run_id
 end
 
--- An agent's workspace: its run, then its logical node path as the sidebar
--- nests it (libs.mag-run-projection owns that path).
-function M.agent_workspace(session_id, run_id, node_path)
-  local dir, run_error = M.run_workspaces_dir(session_id, run_id)
+-- A calling node's workspace: its key's folder, then its logical node path as
+-- the sidebar nests it (libs.mag-run-projection owns that path).
+function M.node_workspace(session_id, run_id, node_path)
+  local dir, run_error = M.run_dir(session_id, run_id)
   if not dir then return nil, run_error end
   if type(node_path) ~= "table" or #node_path == 0 then
-    return nil, "agent workspace requires a logical node path"
+    return nil, "a workspace requires a logical node path"
   end
   for _, name in ipairs(node_path) do
     local segment, segment_error = M.encode_segment(name)

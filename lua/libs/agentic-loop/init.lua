@@ -286,8 +286,8 @@ end
 
 -- ── ambient MAG context ───────────────────────────────────────────────
 
--- The lead's prompt names the lead's own workspace. The path is derived, not
--- created: the directory appears with the lead's first source write.
+-- The lead's prompt names its workspace. The path is derived, not created: the
+-- directory appears with the first source write.
 local function system_with_mag_context(base)
   local context = state.config.ambient_context
   if type(context) ~= "table" or type(context.compose) ~= "function" then return base end

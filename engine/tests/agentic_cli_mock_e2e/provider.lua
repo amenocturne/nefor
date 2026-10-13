@@ -79,7 +79,7 @@ local function typed_result(last, value)
   return mock.tool_call("write_output", { new_string = nefor.json.encode(value), validate = true })
 end
 
--- The combining agent writes a program into its own workspace, compiles it
+-- The combining node writes a program into its own workspace, compiles it
 -- there, and then asks for the lead's file by name. That name does not exist
 -- in its workspace, so it answers only once the lead's file proved unreachable.
 local function combine(last)

@@ -562,24 +562,24 @@ fn headless_starter_request_resume_tools_and_failures() {
         !session_mag.join("octo-lighthouse.mag").exists() && !session_mag.join("mag.toml").exists(),
         "nothing is authored into the shared session folder"
     );
-    // The provider script answers only after the combining agent wrote and
-    // compiled its own source and was refused the lead's file by name.
-    let agent_runs: Vec<_> = std::fs::read_dir(session_mag.join("agents"))
-        .expect("a delegated agent wrote MAG source")
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+    // The provider script answers only after the combining node wrote and
+    // compiled its own source and was refused the lead's file by name. Its
+    // workspace sits in its run's folder, beside the runtime's output files.
+    let authoring_runs: Vec<_> = std::fs::read_dir(session_mag.join("runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|run| run.join("combine").is_dir())
         .collect();
-    assert_eq!(agent_runs.len(), 1, "one run had an authoring agent");
-    let combine = session_mag
-        .join("agents")
-        .join(&agent_runs[0])
-        .join("combine");
+    assert_eq!(authoring_runs.len(), 1, "one run had an authoring node");
+    let run_dir = &authoring_runs[0];
     assert!(
-        combine.join("combine-notes.mag").is_file() && combine.join("mag.toml").is_file(),
-        "the agent's workspace is its run and node path, and is its own project"
+        run_dir.join("combine/combine-notes.mag").is_file()
+            && run_dir.join("combine/mag.toml").is_file(),
+        "a workspace is its run and node path, and is its own project"
     );
     assert!(
-        session_mag.join("runs").join(&agent_runs[0]).is_dir(),
-        "the runtime's outputs for the same run stay under runs/"
+        run_dir.join("combine.llm.output").is_file() && !session_mag.join("agents").exists(),
+        "the run's folder holds both its outputs and its nodes' source"
     );
 
     let error = run(

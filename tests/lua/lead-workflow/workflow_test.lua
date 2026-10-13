@@ -3719,12 +3719,12 @@ do
 end
 
 -- ------------------------------------------------------------------
--- per-agent MAG workspaces
+-- per-node MAG workspaces
 -- ------------------------------------------------------------------
 --
--- Every agent writes MAG source into its own folder under the session's MAG
--- folder: `lead/` for the lead, `agents/<run id>/<logical node path>/` for a
--- delegated agent. The node path is the one the sidebar projection nests.
+-- Every calling node writes MAG source into its own folder inside its run's
+-- folder: `runs/<run id>/<logical node path>/`, the path the sidebar
+-- projection nests. The lead keeps `lead/` until its key is decided.
 
 local mag_workspace_lib = require("libs.mag-workspace")
 
@@ -3752,14 +3752,14 @@ local function agent_nodes(prefix, id)
   }
 end
 
-local function register_agent_run(run_id, inventory, nodes, dispatcher)
+local function register_node_run(run_id, inventory, nodes, dispatcher)
   local run = lw._internals.register_active_run(run_id, inventory, "terminal",
     "dispatch-" .. run_id, run_id, sessions.current_id(), dispatcher)
   run.logical_nodes = nodes
   return run
 end
 
-local function agent_call(run_id, actor_id)
+local function node_call(run_id, actor_id)
   return { invocation = invocation(sessions.current_id(), "subagent",
     "scope-" .. run_id .. "/cap-" .. actor_id:gsub("[^%w]", "-"), actor_id, run_id) }
 end
@@ -3772,7 +3772,7 @@ local function read_all(path)
 end
 
 -- The lead keeps one workspace for the session although every turn is a new
--- run; a delegated agent's workspace follows its run and node path.
+-- run; any other caller's workspace follows its run and node path.
 do
   fresh()
   local session_id = sessions.current_id()
@@ -3801,67 +3801,69 @@ do
   local inventory = agent_actors("reviewer")
   local nodes = { { path = { "review-stage" }, members = {} } }
   for _, node in ipairs(agent_nodes({ "review-stage" }, "reviewer")) do nodes[#nodes + 1] = node end
-  register_agent_run("mag-run-alpha", inventory, nodes)
-  local expected = session_dir .. "/agents/mag-run-alpha/review-stage/reviewer"
-  assert_true(not nefor.fs.exists(session_dir .. "/agents"),
-    "registering a run creates no agent folder")
+  register_node_run("mag-run-alpha", inventory, nodes)
+  local expected = session_dir .. "/runs/mag-run-alpha/review-stage/reviewer"
+  assert_true(not nefor.fs.exists(session_dir .. "/runs/mag-run-alpha"),
+    "registering a run creates no workspace folder")
 
   invoke_tool_with_metadata("agent-missing", "mag-preview", { file = "plan.mag" },
-    agent_call("mag-run-alpha", "reviewer.run-tool"))
+    node_call("mag-run-alpha", "reviewer.run-tool"))
   assert_eq(tool_result("agent-missing").body.error, "mag-preview: file does not exist: plan.mag",
     "a workspace that was never written is an ordinary missing file")
-  assert_true(not nefor.fs.exists(session_dir .. "/agents"), "reading does not create the folder")
+  assert_true(not nefor.fs.exists(session_dir .. "/runs/mag-run-alpha"),
+    "reading does not create the folder")
 
   invoke_tool_with_metadata("agent-write", "mag-write-file",
     { file = "plan.mag", new_string = "reviewer plan" },
-    agent_call("mag-run-alpha", "reviewer.run-tool"))
+    node_call("mag-run-alpha", "reviewer.run-tool"))
   local written = tool_result("agent-write").body.output
   assert_eq(written.operation, "created",
     "an agent's file does not collide with the lead's file of the same name")
   assert_eq(written.source_path, expected .. "/plan.mag",
-    "the workspace is the agent node, not its run-tool member node")
+    "the workspace is the node containing the calling actor's row, not that row")
   assert_eq(read_all(lead_dir .. "/plan.mag"), "turn three", "the lead's file is untouched")
 
   -- The same agent id in another run is another agent.
-  register_agent_run("mag-run-beta", agent_actors("reviewer"), nodes)
+  register_node_run("mag-run-beta", agent_actors("reviewer"), nodes)
   invoke_tool_with_metadata("other-run-write", "mag-write-file",
     { file = "plan.mag", new_string = "beta plan" },
-    agent_call("mag-run-beta", "reviewer.run-tool"))
+    node_call("mag-run-beta", "reviewer.run-tool"))
   assert_eq(tool_result("other-run-write").body.output.source_path,
-    session_dir .. "/agents/mag-run-beta/review-stage/reviewer/plan.mag",
+    session_dir .. "/runs/mag-run-beta/review-stage/reviewer/plan.mag",
     "runs key the top level, so equal node paths in two runs stay apart")
   assert_eq(read_all(expected .. "/plan.mag"), "reviewer plan", "the first run's file is untouched")
 
-  -- Members declared on one node resolve to that node.
-  register_agent_run("mag-run-flat", agent_actors("worker"),
+  -- A calling actor whose node is top-level has no containing node: its own
+  -- node is its workspace.
+  register_node_run("mag-run-flat", agent_actors("worker"),
     { { path = { "worker" }, members = { "worker.llm", "worker.run-tool" } } })
   invoke_tool_with_metadata("flat-write", "mag-write-file",
-    { file = "a.mag", new_string = "flat" }, agent_call("mag-run-flat", "worker.run-tool"))
+    { file = "a.mag", new_string = "flat" }, node_call("mag-run-flat", "worker.run-tool"))
   assert_eq(tool_result("flat-write").body.output.source_path,
-    session_dir .. "/agents/mag-run-flat/worker/a.mag",
-    "an agent whose members share one node owns that node's folder")
+    session_dir .. "/runs/mag-run-flat/worker/a.mag",
+    "a top-level node is its own workspace")
 
-  -- A run without declared nodes projects each actor as its own row; both
-  -- members still resolve to the model actor's row.
-  register_agent_run("mag-run-rows", agent_actors("solo"), {})
+  -- A run without declared nodes projects each actor as its own top-level
+  -- row, so the same rule applies.
+  register_node_run("mag-run-rows", agent_actors("solo"), {})
   invoke_tool_with_metadata("rows-write", "mag-write-file",
-    { file = "a.mag", new_string = "rows" }, agent_call("mag-run-rows", "solo.run-tool"))
+    { file = "a.mag", new_string = "rows" }, node_call("mag-run-rows", "solo.run-tool"))
   assert_eq(tool_result("rows-write").body.output.source_path,
-    session_dir .. "/agents/mag-run-rows/solo.llm/a.mag",
-    "members that share no node resolve to the model actor's row")
+    session_dir .. "/runs/mag-run-rows/solo.run-tool/a.mag",
+    "an undeclared actor row is a top-level node like any other")
 
   invoke_tool_with_metadata("unknown-run", "mag-write-file",
-    { file = "a.mag", new_string = "x" }, agent_call("mag-run-missing", "reviewer.run-tool"))
+    { file = "a.mag", new_string = "x" }, node_call("mag-run-missing", "reviewer.run-tool"))
   assert_true(tool_result("unknown-run").body.error:find(
-      "workspace unavailable: the calling agent's run is not known: mag-run-missing", 1, true) ~= nil,
-    "an agent in an untracked run gets no guessed workspace")
+      "workspace unavailable: the calling node's run is not known: mag-run-missing", 1, true) ~= nil,
+    "a caller in an untracked run gets no guessed workspace")
   invoke_tool_with_metadata("unknown-actor", "mag-write-file",
-    { file = "a.mag", new_string = "x" }, agent_call("mag-run-alpha", "stranger.run-tool"))
+    { file = "a.mag", new_string = "x" }, node_call("mag-run-alpha", "stranger.run-tool"))
   assert_true(tool_result("unknown-actor").body.error:find("has no workflow node", 1, true) ~= nil,
     "an actor outside the run's tree gets no guessed workspace")
 end
 
--- Isolation: no path reaches another agent's workspace.
+-- Isolation: no path reaches another caller's workspace.
 do
   fresh()
   local session_dir = mag_workspace_lib.session_dir(sessions.current_id())
@@ -3871,11 +3873,11 @@ do
   end
   local inventory = agent_actors("alice")
   for _, entry in ipairs(agent_actors("bob")) do inventory[#inventory + 1] = entry end
-  register_agent_run("mag-run-pair", inventory, nodes)
-  local alice = agent_call("mag-run-pair", "alice.run-tool")
-  local bob = agent_call("mag-run-pair", "bob.run-tool")
-  local alice_dir = session_dir .. "/agents/mag-run-pair/alice"
-  local bob_dir = session_dir .. "/agents/mag-run-pair/bob"
+  register_node_run("mag-run-pair", inventory, nodes)
+  local alice = node_call("mag-run-pair", "alice.run-tool")
+  local bob = node_call("mag-run-pair", "bob.run-tool")
+  local alice_dir = session_dir .. "/runs/mag-run-pair/alice"
+  local bob_dir = session_dir .. "/runs/mag-run-pair/bob"
 
   invoke_tool_with_metadata("alice-write", "mag-write-file",
     { file = "secret.mag", new_string = "alice only" }, alice)
@@ -3922,14 +3924,14 @@ do
 
   -- A node folder that is itself a link would move the whole workspace.
   local carol_nodes = agent_nodes({}, "carol")
-  register_agent_run("mag-run-linked", agent_actors("carol"), carol_nodes)
-  assert_true(nefor.fs.mkdir_p(session_dir .. "/agents/mag-run-linked").ok)
-  assert_true(nefor.fs.symlink(alice_dir, session_dir .. "/agents/mag-run-linked/carol").ok)
+  register_node_run("mag-run-linked", agent_actors("carol"), carol_nodes)
+  assert_true(nefor.fs.mkdir_p(session_dir .. "/runs/mag-run-linked").ok)
+  assert_true(nefor.fs.symlink(alice_dir, session_dir .. "/runs/mag-run-linked/carol").ok)
   for _, tool_name in ipairs({ "mag-write-file", "mag-preview", "mag-apply" }) do
     local id = "carol-" .. tool_name
     local args = { file = "secret.mag" }
     if tool_name == "mag-write-file" then args.new_string = "carol" end
-    invoke_tool_with_metadata(id, tool_name, args, agent_call("mag-run-linked", "carol.run-tool"))
+    invoke_tool_with_metadata(id, tool_name, args, node_call("mag-run-linked", "carol.run-tool"))
     assert_true(tool_result(id).body.error:find("workspace is a symlink", 1, true) ~= nil,
       tool_name .. " rejects a workspace reached through a symlinked node folder")
   end
@@ -3943,16 +3945,16 @@ do
   lw.configure { project_build = { cache_dir = "/persistent/cache" },
     dependency_module_roots = { "/immutable/modules" } }
   local session_dir = mag_workspace_lib.session_dir(sessions.current_id())
-  register_agent_run("mag-run-compile", agent_actors("builder"), agent_nodes({ "stage" }, "builder"))
-  local builder_dir = session_dir .. "/agents/mag-run-compile/stage/builder"
-  local caller = agent_call("mag-run-compile", "builder.run-tool")
+  register_node_run("mag-run-compile", agent_actors("builder"), agent_nodes({ "stage" }, "builder"))
+  local builder_dir = session_dir .. "/runs/mag-run-compile/stage/builder"
+  local caller = node_call("mag-run-compile", "builder.run-tool")
   write_mag_file("lead-module", "shared.mag", "let lead_only = 1")
   _test.calls_clear()
   invoke_tool_with_metadata("builder-apply", "mag-apply",
     { file = "flow.mag", content = READ_ONLY_MAG }, caller)
   local build = find_call(decode_calls(), function(c) return c.body.kind == "mag.build" end)
   assert_true(build ~= nil, "an agent's source compiles through the configured build")
-  assert_eq(build.body.project_root, builder_dir, "the agent's workspace is the project root")
+  assert_eq(build.body.project_root, builder_dir, "the caller's workspace is the project root")
   assert_eq(build.body.entry, "flow.mag", "the entry stays relative to that workspace")
   assert_eq(#build.body.module_roots, 2, "module roots are the configured roots plus one workspace")
   assert_eq(build.body.module_roots[1], "/immutable/modules", "configured roots come first")
@@ -3976,13 +3978,13 @@ do
     end,
   } })
   local session_dir = mag_workspace_lib.session_dir(sessions.current_id())
-  register_agent_run("mag-run-outer", agent_actors("planner"), agent_nodes({}, "planner"))
-  local planner = agent_call("mag-run-outer", "planner.run-tool")
+  register_node_run("mag-run-outer", agent_actors("planner"), agent_nodes({}, "planner"))
+  local planner = node_call("mag-run-outer", "planner.run-tool")
   _test.calls_clear()
   invoke_tool_with_metadata("planner-apply", "mag-apply",
     { file = "inner.mag", content = READ_ONLY_MAG }, planner)
   local load = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end)
-  assert_eq(load.body.source_dir, session_dir .. "/agents/mag-run-outer/planner",
+  assert_eq(load.body.source_dir, session_dir .. "/runs/mag-run-outer/planner",
     "the applying agent compiles in its own workspace")
 
   local worker_nodes = { { path = { "fan-out" }, members = { "source" } } }
@@ -4021,7 +4023,7 @@ do
   assert_true(exec ~= nil, "the nested workflow is dispatched")
   local inner_id = exec.body.run_id
   assert_true(inner_id ~= "mag-run-outer", "the nested workflow is a new run")
-  local inner_dir = session_dir .. "/agents/" .. inner_id
+  local inner_dir = session_dir .. "/runs/" .. inner_id
 
   assert_eq(exec.body.params_overlay["actor:10:worker.llm"].system,
     "agent base\n\n---\n\nworker system|workspace=" .. inner_dir .. "/fan-out/worker|parent=nil",
@@ -4031,13 +4033,13 @@ do
     "a template agent's prompt names the run folder its workspace will sit under")
 
   invoke_tool_with_metadata("inner-write", "mag-write-file",
-    { file = "notes.mag", new_string = "worker" }, agent_call(inner_id, "worker.run-tool"))
+    { file = "notes.mag", new_string = "worker" }, node_call(inner_id, "worker.run-tool"))
   assert_eq(tool_result("inner-write").body.output.source_path,
     inner_dir .. "/fan-out/worker/notes.mag", "the nested run's agent writes under the nested run")
   invoke_tool_with_metadata("outer-write", "mag-write-file",
     { file = "notes.mag", new_string = "planner" }, planner)
   assert_eq(tool_result("outer-write").body.output.source_path,
-    session_dir .. "/agents/mag-run-outer/planner/notes.mag",
+    session_dir .. "/runs/mag-run-outer/planner/notes.mag",
     "the applying agent stays under its own run")
 
   -- Materialization declares the instance's nodes and spawns its actors.
@@ -4054,10 +4056,10 @@ do
     factory = "nefor.factory.run-tool", spec = { factory = "nefor.factory.run-tool",
       params = { conversation_peer = "expand.item.0.llm" } } })
   invoke_tool_with_metadata("item-write", "mag-write-file",
-    { file = "notes.mag", new_string = "item" }, agent_call(inner_id, "expand.item.0.run-tool"))
+    { file = "notes.mag", new_string = "item" }, node_call(inner_id, "expand.item.0.run-tool"))
   assert_eq(tool_result("item-write").body.output.source_path,
     inner_dir .. "/fan-out/items%3A0/item/notes.mag",
-    "a materialized agent's workspace follows its declared node path")
+    "a materialized node's workspace follows its declared node path")
   assert_eq(read_all(inner_dir .. "/fan-out/worker/notes.mag"), "worker",
     "the sibling agent's file is untouched")
 end
@@ -4088,15 +4090,36 @@ do
   assert_eq(select(1, encode(string.rep("A", 100))), nil,
     "the limit applies to the encoded directory name")
 
-  local nested = assert(mag_workspace_lib.agent_workspace("s", "mag-run-x", { "a", "b" }))
-  local slashed = assert(mag_workspace_lib.agent_workspace("s", "mag-run-x", { "a/b" }))
+  -- A workspace shares its run's folder with the runtime's `<actor>.output`
+  -- files, so no directory name may end in that suffix.
+  for _, case in ipairs({
+    { "worker.output", "worker%2Eoutput" }, { "task.output", "task%2Eoutput" },
+    { ".output", "%2Eoutput" }, { "a.output.b", "a.output.b" }, { "output", "output" },
+    { "x.OUTPUT", "x.%4F%55%54%50%55%54" },
+  }) do
+    assert_eq(encode(case[1]), case[2], "segment encoding of " .. case[2])
+    assert_true(case[2]:lower():sub(-7) ~= ".output", "a folder never takes an output file's name")
+    assert_eq(seen[case[2]:lower()], nil, "the suffix rule shares no folder either")
+    seen[case[2]:lower()] = case[1]
+  end
+  assert_true(assert(mag_workspace_lib.node_workspace("s", "mag-run-x", { "worker.output" }))
+    :match("/s/mag/runs/mag%-run%-x/worker%%2Eoutput$") ~= nil)
+
+  -- The run folder is the runtime's too, so a run id is used as given or not
+  -- at all.
+  for _, run_id in ipairs({ "Mag-run", "mag/run", "mag run", ".mag-run", "-mag-run", "mag-run-",
+      "mag-run.output", "" }) do
+    local dir, run_error = mag_workspace_lib.node_workspace("s", run_id, { "a" })
+    assert_eq(dir, nil, "run id " .. run_id .. " is rejected rather than rewritten")
+    assert_true(run_error:find("not usable as a folder name", 1, true) ~= nil)
+  end
+
+  local nested = assert(mag_workspace_lib.node_workspace("s", "mag-run-x", { "a", "b" }))
+  local slashed = assert(mag_workspace_lib.node_workspace("s", "mag-run-x", { "a/b" }))
   assert_true(nested ~= slashed, "a nested path and a name containing a slash stay apart")
-  assert_true(nested:match("/s/mag/agents/mag%-run%-x/a/b$") ~= nil)
-  assert_eq(select(1, mag_workspace_lib.agent_workspace("s", "mag-run-x", {})), nil,
+  assert_true(nested:match("/s/mag/runs/mag%-run%-x/a/b$") ~= nil)
+  assert_eq(select(1, mag_workspace_lib.node_workspace("s", "mag-run-x", {})), nil,
     "a workspace needs a node path")
-  assert_eq(select(1, mag_workspace_lib.agent_workspace("s", "mag-run-x", { "a", "" })), nil,
+  assert_eq(select(1, mag_workspace_lib.node_workspace("s", "mag-run-x", { "a", "" })), nil,
     "an empty node name is rejected")
-  assert_true(assert(mag_workspace_lib.agent_workspace("s", "lead", { "a" }))
-    ~= mag_workspace_lib.lead_workspace("s") .. "/a",
-    "a run named like the lead folder cannot land in the lead's workspace")
 end

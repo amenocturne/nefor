@@ -429,44 +429,22 @@ local function result_boundary(modification)
   return "result", nil
 end
 
--- An agent is a model actor and the run-tool actor that calls tools for it.
--- The run-tool names its model actor in `conversation_peer`; either member
--- resolves to the same ordered pair.
-local function conversation_pair(run, actor_id)
-  local function peer_of(id)
-    local node = run.nodes and run.nodes[id]
-    local params = node and type(node.spec) == "table" and node.spec.params or nil
-    local peer = type(params) == "table" and params.conversation_peer or nil
-    return type(peer) == "string" and peer ~= "" and peer or nil
-  end
-  local model_actor = peer_of(actor_id)
-  if model_actor then return model_actor, actor_id end
-  for _, id in ipairs(run.nodes_order or {}) do
-    if peer_of(id) == actor_id then return actor_id, id end
-  end
-  return actor_id, nil
+-- The top-level key of a caller's workspace path, from its invocation. This
+-- is the one place that decides it; today it is the caller's run.
+local function workspace_key(invocation)
+  return invocation.run_id
 end
 
--- The logical node an agent's workspace belongs to: the node that folds its
--- model and run-tool actors together in the run tree, never one member's own
--- row. Members that share no node fall back to the model actor's row, so both
--- still resolve to one place.
-local function agent_node_path(run, actor_id)
-  local model_actor, tool_actor = conversation_pair(run, actor_id)
-  if tool_actor ~= nil then
-    local shared = run_projection.common_path(run, { model_actor, tool_actor })
-    if shared and #shared > 0 then return shared end
-  end
-  return run_projection.actor_path(run, model_actor)
-end
-
-local function agent_workspace(session_id, run, actor_id)
-  local path = agent_node_path(run, actor_id)
+-- A calling node's workspace belongs to the logical node that directly
+-- contains the calling actor's row in the run tree. The rule knows nothing
+-- about what kind of node that is; the path is the sidebar projection's.
+local function node_workspace(session_id, run, invocation)
+  local path = run_projection.enclosing_path(run, invocation.actor_id)
   if not path or #path == 0 then
-    return nil, "actor " .. tostring(actor_id) .. " has no workflow node in run "
+    return nil, "actor " .. tostring(invocation.actor_id) .. " has no workflow node in run "
       .. tostring(run.run_id)
   end
-  return mag.agent_workspace(session_id, run.run_id, path)
+  return mag.node_workspace(session_id, workspace_key(invocation), path)
 end
 
 local function compose_agent_system(base, positional_overlay, workspace)
@@ -504,24 +482,28 @@ local function initial_nodes(inventory)
   return nodes_order, nodes
 end
 
--- Each agent's prompt names its own workspace. An initial agent's node path is
--- known now. A template agent's path exists only once it materializes, and one
--- overlay serves every instance, so it is told where its folder will be.
+-- Each model actor's prompt names its node's workspace. An initial actor's node
+-- path is known now. A template actor's path exists only once it materializes,
+-- and one overlay serves every instance, so it is told where its folder will be.
 local function compose_agent_params(inventory, session_id, run_id, logical_nodes)
   local overlay = {}
   if agent_system == nil then return overlay end
   local nodes_order, nodes = initial_nodes(inventory)
   local run = { run_id = run_id, logical_nodes = logical_nodes or {},
     nodes_order = nodes_order, nodes = nodes }
+  -- The provenance fields this run's kernel will stamp on that actor's calls.
+  local function invocation_of(actor_id)
+    return { session_id = session_id, run_id = run_id, actor_id = actor_id }
+  end
   for _, entry in ipairs(inventory or {}) do
     local actor = entry.actor
     local params = type(actor.params) == "table" and actor.params or {}
     if is_llm_actor(actor) then
       local workspace = {}
       if entry.kind == "initial" then
-        workspace.workspace = agent_workspace(session_id, run, actor.id)
+        workspace.workspace = node_workspace(session_id, run, invocation_of(actor.id))
       else
-        workspace.workspace_parent = mag.run_workspaces_dir(session_id, run_id)
+        workspace.workspace_parent = mag.run_dir(session_id, workspace_key(invocation_of(nil)))
       end
       overlay[entry.address] = {
         system = compose_agent_system(agent_system, params.system, workspace),
@@ -1919,7 +1901,7 @@ local function lead_workflow_tool_specs()
         "- new_string only: becomes the file's complete contents, creating or replacing the file.\n" ..
         "- old_string and new_string: replaces the single exact occurrence of old_string. If it occurs " ..
         "zero or several times, the file is unchanged and an error is returned.\n\n" ..
-        "new_string may be empty. Paths are relative to your workspace, which other agents cannot " ..
+        "new_string may be empty. Paths are relative to your workspace, which no other caller can " ..
         "reach through these tools; absolute paths, .. segments and symlinks are rejected.",
       parameters = { type = "object", additionalProperties = false, properties = {
         file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
@@ -1992,8 +1974,8 @@ end
 -- MAG tool handlers.
 --
 -- The file tools write, compile, and apply .mag programs through the plugin,
--- each inside the calling agent's own workspace. That workspace's path and the
--- library shapes are ambient in every agent's system prompt, so there is no
+-- each inside the calling node's own workspace. That workspace's path and the
+-- library shapes are ambient in every model actor's system prompt, so there is no
 -- discovery tool.
 
 -- Compile and apply both run a synchronous load handshake against the mag
@@ -2365,10 +2347,12 @@ local function fail_pending_load(body)
     "compilation failed:\n" .. tostring(body.message))
 end
 
--- The workspace of the agent that made this call. The root lead has one for
--- the whole session. A delegated agent's comes from the provenance the kernel
--- stamped on the call: its run, and the logical node that actor belongs to.
+-- The workspace of the calling node, from the provenance the kernel stamped on
+-- the call: its key's folder, then the logical node that contains the calling
+-- actor.
 local function caller_workspace(provenance)
+  -- Interim: the lead's run id changes every turn and its turn run is not in
+  -- this registry, so it keeps one session folder until its key is decided.
   if provenance.principal == "lead" then
     local ws = mag.lead_workspace(provenance.session_id)
     if not ws then return nil, "no data root available" end
@@ -2376,13 +2360,13 @@ local function caller_workspace(provenance)
   end
   local invocation = provenance.invocation
   if type(invocation) ~= "table" then
-    return nil, "a delegated agent's workspace requires invocation provenance"
+    return nil, "a delegated caller's workspace requires invocation provenance"
   end
   local run = run_registry:get(invocation.run_id)
   if not run or run.session_id ~= provenance.session_id then
-    return nil, "the calling agent's run is not known: " .. tostring(invocation.run_id)
+    return nil, "the calling node's run is not known: " .. tostring(invocation.run_id)
   end
-  return agent_workspace(provenance.session_id, run, invocation.actor_id)
+  return node_workspace(provenance.session_id, run, invocation)
 end
 
 local function mag_workspace(firing_id, args, metadata, tool_name)
@@ -2840,7 +2824,7 @@ local function receive_msg(entry)
     return
   end
   -- The same declarations the sidebar folds: a run's logical nodes grow as
-  -- templates materialize, and an agent's workspace follows its node path.
+  -- templates materialize, and a workspace follows its node's path.
   if kind == "mag.nodes_declared" then
     local run = mag_event_run(body)
     if run and type(body.nodes) == "table" then

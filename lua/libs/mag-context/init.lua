@@ -15,7 +15,7 @@
 --   toolsets          { manifest = path, names = { { key, name }, ... } }  (each toolset is rendered with its approval policy)
 --   trailing_sections { string, ... } appended last
 --
--- `compose(base, opts)` names the composing agent's own writable source
+-- `compose(base, opts)` names the composing caller's own writable source
 -- directory: `opts.workspace` when its path is known, or `opts.workspace_parent`
 -- (the folder its workspace will sit under) when only that is.
 --
@@ -36,7 +36,7 @@ Nefor, nodes can represent reasoners; MAG itself only manipulates values defined
 by libraries and knows neither concept.]]
 
 local WORKSPACE_RULES = [[This workspace is yours alone. The MAG source tools take paths relative to
-it and reach no other agent's files, and it is created by your first write.
+it and reach no other workspace, and it is created by your first write.
 Source modules you write here are importable by programs in this workspace
 only; configured package roots remain immutable.]]
 

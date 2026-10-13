@@ -17,19 +17,18 @@ A persisted session can include:
 <session-root>/<id>/metadata.json
 ```
 
-`<id>/mag/` holds the MAG source agents write during the session and the
-outputs of the runs they start:
+`<id>/mag/` holds one folder per workflow run, with the run's node outputs and
+the MAG source its nodes wrote:
 
 ```text
-<id>/mag/lead/                               the lead's MAG source
-<id>/mag/agents/<run id>/<node>/.../<node>/  each delegated agent's MAG source
-<id>/mag/runs/<run id>/<actor>.output        node outputs of each run
+<id>/mag/runs/<run id>/<actor>.output       node outputs of the run
+<id>/mag/runs/<run id>/<node>/.../<node>/   MAG source written by that node
+<id>/mag/lead/                              the lead's MAG source
 ```
 
-Every agent writes only into its own folder. A delegated agent's folder is its
-run, then its place in the workflow tree as the sidebar shows it. Folder names
-are the run id and node names with uppercase letters and other unusual
-characters written as `%XX`.
+A node writes only into its own folder: its run, then its place in the
+workflow tree as the sidebar shows it. Folder names are the node names with
+uppercase letters and other unusual characters written as `%XX`.
 
 The JSONL is an append-only bus-event record used to rebuild runtime projections. It is not documented as a stable export format. Do not treat it as a transcript API or promise that every internal event will remain readable by future minor versions.
 

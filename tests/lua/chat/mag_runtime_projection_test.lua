@@ -541,7 +541,7 @@ eq(killed_tree:find("worker", 1, true) ~= nil, true,
   "terminated receipt includes the branch active at termination")
 
 -- Actor-to-node paths come from the same declarations the tree is built from;
--- per-agent workspaces follow them.
+-- per-node workspaces follow them.
 local declared = run_projection.merge_declared({
   { path = { "stage" }, members = {} },
   { path = { "stage", "agent" }, members = {} },
@@ -558,20 +558,18 @@ local pathed = { logical_nodes = declared, nodes = {} }
 eq(table.concat(run_projection.actor_path(pathed, "agent.run-tool"), "/"), "stage/agent/run-tool",
   "an actor's path is the node that lists it as a member")
 eq(run_projection.actor_path(pathed, "late.duplicate"), nil, "an undeclared actor has no path")
-eq(table.concat(run_projection.common_path(pathed, { "agent.llm", "agent.run-tool" }), "/"),
-  "stage/agent", "members of one agent share the agent's node")
-eq(table.concat(run_projection.common_path(pathed, { "agent.llm", "agent.retry" }), "/"),
-  "stage", "actors in sibling nodes share their stage")
-eq(#run_projection.common_path(pathed, { "agent.llm", "workflow.result" }), 0,
-  "actors under different roots share no node")
-eq(run_projection.common_path(pathed, { "agent.llm", "missing" }), nil,
-  "an unknown actor has no common path")
-eq(run_projection.path_key(run_projection.common_path(pathed, { "agent.llm", "agent.run-tool" })),
+eq(table.concat(run_projection.enclosing_path(pathed, "agent.run-tool"), "/"), "stage/agent",
+  "an actor's enclosing node is the parent of its own row")
+eq(table.concat(run_projection.enclosing_path(pathed, "agent.retry"), "/"), "stage",
+  "the rule is the same for every kind of node")
+eq(table.concat(run_projection.enclosing_path(pathed, "workflow.result"), "/"), "result",
+  "a top-level row has no parent and encloses itself")
+eq(run_projection.enclosing_path(pathed, "missing"), nil, "an unknown actor has no enclosing node")
+eq(run_projection.path_key(run_projection.enclosing_path(pathed, "agent.llm")),
   run_panel.build_nodes({ logical_nodes = declared, nodes = {} })[1].children[1].key,
-  "the shared path is the row the sidebar builds for the agent")
+  "the enclosing path is a row the sidebar builds")
 local rows = { logical_nodes = {}, nodes = { ["a.llm"] = { seq = 1 }, ["a.run-tool"] = { seq = 2 } } }
-eq(table.concat(run_projection.actor_path(rows, "a.llm"), "/"), "a.llm",
-  "without declarations each actor is its own row")
-eq(#run_projection.common_path(rows, { "a.llm", "a.run-tool" }), 0, "separate rows share no node")
+eq(table.concat(run_projection.enclosing_path(rows, "a.run-tool"), "/"), "a.run-tool",
+  "without declarations each actor is its own top-level row")
 
 print("mag_runtime_projection_test: all assertions passed")
