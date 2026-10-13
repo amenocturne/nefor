@@ -756,12 +756,15 @@ fn chatgpt_compaction_plan_restores_only_its_opaque_checkpoint() {
             local chatgpt = require("chatgpt-provider")
             local t = chatgpt.translator("chatgpt")
             local plan = assert(t.compact_context({
-                compaction = { request_id = "compact-1" },
+                -- The compaction request names the provider and model it is for;
+                -- a checkpoint is restored only for that same pair.
+                request = { request_id = "compact-1", provider = "chatgpt", model = "gpt-test" },
                 context = {
                     messages = {{ role = "user", content = "old" }},
                     tail_messages = {{ role = "user", content = "new" }},
                     compaction = { checkpoint = {
                         provider = "chatgpt",
+                        model = "gpt-test",
                         format = "chatgpt.responses.compaction.v1",
                         artifact = { items = {{ type = "compaction", encrypted_content = "sealed" }} },
                     }},
@@ -780,28 +783,48 @@ fn chatgpt_compaction_plan_restores_only_its_opaque_checkpoint() {
 #[test]
 fn chatgpt_compaction_plan_falls_back_to_full_context_for_foreign_checkpoint() {
     let lua = lua_with_lib();
-    let (restored, content): (bool, String) = lua
+    let (restored, content, other_model, unidentified): (bool, String, bool, String) = lua
         .load(
             r#"
             local chatgpt = require("chatgpt-provider")
             local t = chatgpt.translator("chatgpt")
-            local plan = assert(t.compact_context({
-                compaction = { request_id = "compact-1" },
-                context = {
+            local request = { request_id = "compact-1", provider = "chatgpt", model = "gpt-test" }
+            local function context(checkpoint)
+                return {
                     messages = {{ role = "user", content = "full" }},
                     tail_messages = {{ role = "user", content = "tail" }},
-                    compaction = { checkpoint = {
-                        provider = "another-provider",
-                        format = "private.v1",
-                        artifact = { items = {} },
-                    }},
-                },
-            }))
-            return plan.restore ~= nil, plan.messages[1].content
+                    compaction = { checkpoint = checkpoint },
+                }
+            end
+            local plan = assert(t.compact_context({ request = request, context = context({
+                provider = "another-provider",
+                model = "gpt-test",
+                format = "private.v1",
+                artifact = { items = {} },
+            }) }))
+            -- This adapter's own checkpoint made for another model is foreign too.
+            local other = assert(t.compact_context({ request = request, context = context({
+                provider = "chatgpt",
+                model = "gpt-other",
+                format = "chatgpt.responses.compaction.v1",
+                artifact = { items = {{ type = "compaction", encrypted_content = "sealed" }} },
+            }) }))
+            -- A request that does not say which provider and model it is for
+            -- has no plan.
+            local missing, why = t.compact_context({
+                request = { request_id = "compact-1" }, context = context(nil),
+            })
+            assert(missing == nil)
+            return plan.restore ~= nil, plan.messages[1].content, other.restore ~= nil, why
             "#,
         )
         .eval()
         .expect("fallback compaction plan");
     assert!(!restored);
     assert_eq!(content, "full");
+    assert!(!other_model);
+    assert_eq!(
+        unidentified,
+        "conversation compaction request identity is missing"
+    );
 }

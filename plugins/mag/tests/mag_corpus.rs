@@ -298,6 +298,11 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
     let config_libraries = mag_files(&config_lib_root);
     let fixtures = mag_files(&fixture_root);
     let book_examples = mag_files(&book_root);
+    // Programs that integration tests run as they are, such as the compaction
+    // process acceptance program. They are shipped test inputs, so they must
+    // keep compiling against the library like any entrypoint.
+    let test_program_root = root.join("engine/tests");
+    let test_programs = mag_files(&test_program_root);
     let entrypoints = all_mag
         .iter()
         .filter(|path| {
@@ -316,12 +321,13 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
                 && !config_libraries.contains(path)
                 && !fixtures.contains(path)
                 && !book_examples.contains(path)
+                && !test_programs.contains(path)
                 && !entrypoints.contains(path)
         })
         .collect::<Vec<_>>();
     assert!(
         unclassified.is_empty(),
-        "shipped MAG files are outside the known library, entrypoint, or failure-fixture categories: {unclassified:#?}"
+        "shipped MAG files are outside the known library, entrypoint, test-program, or failure-fixture categories: {unclassified:#?}"
     );
 
     assert!(
@@ -1212,6 +1218,26 @@ nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edg
             result.get("kind").and_then(Value::as_str),
             Some("mag.loaded"),
             "shipped MAG entrypoint {} failed to compile: {result:#?}",
+            path.display()
+        );
+    }
+
+    for (index, path) in test_programs.iter().enumerate() {
+        let directory = path.parent().expect("test program directory");
+        let entry = path.strip_prefix(directory).expect("test program name");
+        let result = load(
+            &mut reader,
+            &mut stdin,
+            &format!("corpus-test-program-{index}"),
+            directory,
+            entry,
+            &module_roots,
+        )
+        .await;
+        assert_eq!(
+            result.get("kind").and_then(Value::as_str),
+            Some("mag.loaded"),
+            "integration test program {} failed to compile: {result:#?}",
             path.display()
         );
     }

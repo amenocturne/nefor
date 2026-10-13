@@ -549,7 +549,7 @@ do
   -- Drive an llm to a tool-calls reply so it emits a real ToolCalls message.
   local lm, lemit = capture()
   local transport = Async.disabled()
-  local linst = llm.construct("dx.llm", { tool_approval_policy = { constructor = "Default" }, 
+  local linst = llm.construct("dx.llm", { tool_approval_policy = { constructor = "Default" }, compaction_policy = { constructor = "Disabled" }, 
     provider = "p",
     output_type = "nefor.contracts.TextAnswer",
     error_type = "nefor.contracts.AgentError",

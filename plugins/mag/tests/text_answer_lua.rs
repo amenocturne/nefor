@@ -38,13 +38,21 @@ fn harness() -> Lua {
 fn text_answer_consumes_multiline_terminal_text_without_schema_or_correction() {
     harness().load(r#"
       local factory = require("factories.llm")
+      -- This test is not about compaction: the actor's policy is explicitly
+      -- Disabled, and the provider boundary gets the kernel tests' inert
+      -- transport for the canonical receipts every request waits for.
+      local transport = dofile(package.searchpath("kinds", package.path):match("^(.*)/")
+        .. "/../../../../tests/lua/mag-kernel/async_compaction_fixture.lua").disabled()
       local emitted = {}
       local actor = assert(factory.construct("direct", {
         provider = "mock-provider", tools = {}, output_type = "text-answer-tag",
         tool_approval_policy = { constructor = "Default" },
+        compaction_policy = { constructor = "Disabled" },
         error_type = "agent-error-tag", provider_error_type = "provider-error-tag"
       }, function(message) emitted[#emitted + 1] = message end,
-        { conversation = { id = "direct:conversation", turn_id = "direct:turn", emit = function(_) end } }))
+        { compaction = transport.facet,
+          conversation = { id = "direct:conversation", turn_id = "direct:turn", emit = function(_) end } }))
+      transport.wrap(actor)
       actor.deliver({ messages = {{ tag = "generic-provider.ProviderOut", message = {
         messages = {{ role = "user", content = "answer normally" }}
       }}}})

@@ -156,6 +156,8 @@ local function with_contracts(params)
     error_type = "agent-error-id",
     provider_error_type = "provider-error-id",
     tool_approval_policy = { constructor = "Default" },
+    -- Not a compaction test unless a case passes its own policy.
+    compaction_policy = { constructor = "Disabled" },
   }
   for key, value in pairs(params or {}) do
     if value == NO_POLICY then resolved[key] = nil else resolved[key] = value end

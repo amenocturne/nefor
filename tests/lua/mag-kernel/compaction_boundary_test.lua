@@ -122,12 +122,12 @@ do
   eq(t.op().trigger, "hard"); t.commit(); eq(count(t.out, "capability.invoke"), 1)
   local request = last(t.out, "capability.invoke").request
   eq(request.tools[1], "self_compact"); eq(request.tool_specs[1].parameters.additionalProperties, false)
-  local actor, err = boundary.construct("bad", { tool_approval_policy = { constructor = "Default" },  provider = "p", tools = { "self_compact" } }, function() end, {})
+  local actor, err = boundary.construct("bad", { tool_approval_policy = { constructor = "Default" }, compaction_policy = { constructor = "Disabled" },  provider = "p", tools = { "self_compact" } }, function() end, {})
   assert(not actor and err:find("conflicts"))
 end
 -- Reusing authored params never installs an intrinsic into the source graph.
 do
-  local params = { tool_approval_policy = { constructor = "Default" }, provider = "p", tools = {}, tool_specs = {} }
+  local params = { tool_approval_policy = { constructor = "Default" }, compaction_policy = { constructor = "Disabled" }, provider = "p", tools = {}, tool_specs = {} }
   for _, id in ipairs({ "lead", "opaque-worker" }) do
     local transport = Async.disabled()
     local actor = assert(boundary.construct(id, params, function() end, {
@@ -138,7 +138,7 @@ do
     transport.wrap(actor)
     eq(#params.tools, 0); eq(#params.tool_specs, 0)
   end
-  local actor, err = boundary.construct("reserved-spec", { tool_approval_policy = { constructor = "Default" },  provider = "p",
+  local actor, err = boundary.construct("reserved-spec", { tool_approval_policy = { constructor = "Default" }, compaction_policy = { constructor = "Disabled" },  provider = "p",
     tool_specs = {{ name = "self_compact" }} }, function() end, {})
   assert(not actor and err:find("conflicts"))
 end
