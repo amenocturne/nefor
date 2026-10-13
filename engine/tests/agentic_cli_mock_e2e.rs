@@ -468,7 +468,8 @@ fn headless_starter_request_resume_tools_and_failures() {
         "### Module `nefor.shell`",
         "/lib/nefor/workflow.mag` (read when needed)",
         "/lib/nefor.mag` (read when needed)",
-        "`nefor.general_tools`:",
+        "`nefor.general_tools` — policy `ToolApprovalPolicy.Default`:",
+        "`nefor.read_only_tools` — policy `ToolApprovalPolicy.ReadOnly`:",
         "- `mag-write-file`",
     ] {
         assert!(
@@ -1132,9 +1133,10 @@ fn unusable_tool_call_answers_with_the_callers_available_tools() {
         "a tool outside the allowlist never runs"
     );
 
-    // The lead's list is its turn program's `tools`, in authored order.
+    // The lead's list is its toolset's tools, in authored order, followed by
+    // the runtime's own `self_compact`, which every model request is offered.
     let lead_tools = "read_file, read_image, mag-status, mag-await, mag-terminate, \
-                      write-review, mag-write-file, mag-preview, mag-apply";
+                      write-review, mag-write-file, mag-preview, mag-apply, self_compact";
     assert_eq!(
         result["answer"].as_str().unwrap().trim_end(),
         format!(
@@ -1145,7 +1147,7 @@ fn unusable_tool_call_answers_with_the_callers_available_tools() {
 
     // The worker's allowlist is `read_image, bash, read_file`: the unadvertised
     // `bash` drops out and the typed-result tools its request added follow.
-    let worker_tools = "read_image, read_file, write_output, submit_output";
+    let worker_tools = "read_image, read_file, write_output, submit_output, self_compact";
     let session = result["session_id"].as_str().unwrap();
     let persisted = std::fs::read_to_string(
         dir.join("data/nefor/sessions")
@@ -1582,13 +1584,26 @@ fn a_read_only_agents_workflows_are_decided_by_its_policy_in_every_mode() {
             "{mode}: {worker_description}"
         );
 
-        // The writing workflow's file was written by prepare and stays.
+        // The writing workflow's file was written by prepare into the worker's
+        // own node workspace, inside the run that holds the worker, and it
+        // stays there for the author to fix. The lead's workspace holds only
+        // the lead's file.
+        let mag_dir = dir.join("data/nefor/sessions").join(session).join("mag");
+        let outer_run = bodies
+            .iter()
+            .find(|body| body["kind"] == "mag.execute" && body["invocation_label"] == "outer.mag")
+            .and_then(|body| body["run_id"].as_str())
+            .unwrap_or_else(|| panic!("{mode}: the outer run was executed"));
+        let worker_dir = mag_dir.join("runs").join(outer_run).join("worker");
         assert!(
-            dir.join("data/nefor/sessions")
-                .join(session)
-                .join("mag/writes.mag")
-                .is_file(),
-            "{mode}: the refused workflow's source stays for the author to fix"
+            worker_dir.join("writes.mag").is_file(),
+            "{mode}: the refused workflow's source stays in the worker's workspace"
+        );
+        assert!(worker_dir.join("reads.mag").is_file(), "{mode}");
+        assert!(mag_dir.join("lead/outer.mag").is_file(), "{mode}");
+        assert!(
+            !mag_dir.join("lead/writes.mag").exists() && !mag_dir.join("writes.mag").exists(),
+            "{mode}: a node's source is not written into the lead's or the session's folder"
         );
     }
 }

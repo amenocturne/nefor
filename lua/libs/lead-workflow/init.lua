@@ -2435,8 +2435,12 @@ end
 --   execute  runs the artifact the decision was made on.
 -- A file written by prepare stays when the gate then refuses the call, so
 -- the author can fix it and apply again.
-local function mag_apply_prepare(firing_id, args, metadata)
-  local ws = mag_workspace(firing_id, args, metadata, "mag-apply")
+--
+-- The three steps of one call use one workspace, the calling node's own:
+-- prepare resolves it once and keeps it on the call, the decision compiles
+-- the file there, and execute runs the artifact that compile produced.
+local function mag_apply_prepare(firing_id, args, metadata, call)
+  local ws, provenance = mag_workspace(firing_id, args, metadata, "mag-apply")
   if not ws then return end
   local _, source_error
   if args.content ~= nil then
@@ -2444,13 +2448,20 @@ local function mag_apply_prepare(firing_id, args, metadata)
   else
     _, source_error = existing_source(ws, args.file)
   end
-  if source_error then emit_tool_result_err(firing_id, "mag-apply: " .. source_error) end
+  if source_error then
+    emit_tool_result_err(firing_id, "mag-apply: " .. source_error)
+    return
+  end
+  call.workspace = { path = ws, provenance = provenance }
 end
 
-local function mag_apply_assess(firing_id, args, metadata, call)
-  local ws, provenance = mag_workspace(firing_id, args, metadata, "mag-apply")
-  if not ws then return end
-  local pending = begin_mag_load(firing_id, "assess", args, ws, provenance)
+local function mag_apply_assess(firing_id, args, _metadata, call)
+  local workspace = call.workspace
+  if workspace == nil then
+    emit_tool_result_err(firing_id, "mag-apply: this call was not prepared")
+    return
+  end
+  local pending = begin_mag_load(firing_id, "assess", args, workspace.path, workspace.provenance)
   if not pending then return end
   pending.call = call
   pending.policy = call.policy

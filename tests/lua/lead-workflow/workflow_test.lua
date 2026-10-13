@@ -3339,386 +3339,6 @@ do
 end
 
 -- ------------------------------------------------------------------
--- Workflow approval: mag-apply decides a workflow as a unit
--- ------------------------------------------------------------------
-
-do
-  local workspace = require("libs.mag-workspace")
-  local tool_lib = require("libs.tool")
-  local approval = require("libs.tool.approval")
-
-  -- The capability meanings the starter wires in, with a stand-in classifier.
-  local function fake_classify(policy, command)
-    if command:find("rm ", 1, true) or command:find("'rm'", 1, true) then
-      return "denied", "forbidden by the command classifier"
-    end
-    if command:find("ls", 1, true) or command:find("cat", 1, true) then return "safe" end
-    if policy == "ReadOnly" then return "unsure", "not shown to be read-only" end
-    return "unsure", "not shown to be safe"
-  end
-  local quote_argv = require("core.shell").quote_argv
-  local capability_tools = tool_lib.source { name = "capabilities", emit = function() end, tools = (function()
-    local list = require("libs.basic-tools").tools {
-      max_read_bytes = 10,
-      invoke = function() end, cancel = function() end,
-      classify_command = fake_classify,
-      classify_argv = function(policy, argv) return fake_classify(policy, quote_argv(argv)) end,
-      decide_write = "safe",
-    }
-    for _, definition in ipairs(require("libs.git-worktree").tools {
-      invoke = function() end,
-      decide_create = { "unsure", "it creates a Git worktree and a branch" },
-      decide_open = "safe",
-    }) do
-      list[#list + 1] = definition
-    end
-    return list
-  end)() }
-  local decide_capability = tool_lib.decision { capability_tools }
-
-  local TIMEOUT = { present = false, milliseconds = 0 }
-  local function script(id, text)
-    return { id = id, factory = "shell-script", params = { script = text, cwd = ".", timeout = TIMEOUT } }
-  end
-  local function exec(id, argv)
-    return { id = id, factory = "process-exec", params = { argv = argv, cwd = ".", timeout = TIMEOUT } }
-  end
-  local function agent(id, policy)
-    return { id = id .. ".run-tool", factory = "run-tool",
-      params = { tools = { "read_file" }, tool_approval_policy = { constructor = policy } } }
-  end
-  local function program(actors, operations)
-    local modification = read_only_modification()
-    for _, actor in ipairs(actors) do modification.actors[#modification.actors + 1] = actor end
-    local envelope = envelope_from_modification(modification)
-    envelope.program.operations = operations or {}
-    return envelope
-  end
-  -- One dynamic-workflow operation whose template holds `actors`.
-  local function operation(id, actors)
-    local template_actors = {}
-    for index, actor in ipairs(actors) do
-      template_actors[index] = {
-        slot = actor.id, id = "ref:" .. actor.id, factory = "nefor.factory." .. actor.factory,
-        type_arguments = {}, params = { ["$mag"] = "packed-value", value = actor.params },
-        input = {}, outputs = {}, parameter_bindings = actor.parameter_bindings or {},
-      }
-    end
-    return { id = id, on = {}, captures = {}, expressions = {},
-      template = { actors = template_actors, routes = {}, messages = {} } }
-  end
-
-  local APPROVAL_FACTORIES = { "adapter", "llm", "run-tool", "sink", "stub", "tool-result",
-    "shell-script", "process-exec", "worktree-create", "worktree-open", "human" }
-  local sequence = 0
-  -- Apply `artifact` as a caller with `policy`; returns the gate's view.
-  local function apply(artifact, policy, options)
-    options = options or {}
-    sequence = sequence + 1
-    local id = "approval-" .. sequence
-    local file = "approval-" .. sequence .. ".mag"
-    gate.verdict = options.verdict
-    _test.calls_clear()
-    feed("tool-gate", {
-      kind = "lead-workflow.tool.invoke", id = id, name = "mag-apply",
-      args = { file = file, content = options.content or READ_ONLY_MAG },
-      approval_policy = policy, caller_id = options.caller_id, invocation = options.invocation,
-    })
-    local load = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" and c.target == "mag" end)
-    assert_true(load ~= nil, "the decision compiles the workflow")
-    local executed_before_decision = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
-    assert_true(executed_before_decision == nil, "nothing is executed before the decision")
-    feed("mag", {
-      kind = "mag.loaded", in_reply_to = load.body.id, hash = "sha256:approval-" .. sequence,
-      factories = options.factories or APPROVAL_FACTORIES,
-      factory_contracts = factory_contracts(options.factories or APPROVAL_FACTORIES),
-      factory_approvals = options.factory_approvals or FACTORY_APPROVALS,
-      artifact = artifact,
-    })
-    gate.verdict = nil
-    local calls = decode_calls()
-    return {
-      id = id, file = file,
-      prepared = gate.answers[id],
-      loads = find_calls(calls, function(c) return c.body.kind == "mag.load" end),
-      execute = find_call(calls, function(c) return c.body.kind == "mag.execute" end),
-      result = find_call(calls, function(c) return c.body.kind == "tool.result" and c.body.id == id end),
-    }
-  end
-
-  local function configured()
-    fresh()
-    gate.prepared, gate.answers = {}, {}
-    lw.configure_approval { decide_capability = decide_capability }
-  end
-
-  -- The fold visits every node the kernel would spawn: initial actors in
-  -- order, then the actors of every operation template.
-  do
-    local artifact = program({ script("list", "ls") },
-      { operation("each", { script("per-item", "ls"), exec("per-exec", { "ls" }) }), operation("other", { script("again", "ls") }) })
-    local decoded = assert(workspace.decode_artifact(artifact))
-    local visited = workspace.fold_nodes(decoded, {}, function(seen, node)
-      seen[#seen + 1] = node.kind .. ":" .. tostring(node.actor.slot or node.actor.id)
-      return seen
-    end)
-    assert_eq(table.concat(visited, " "),
-      "initial:worker.entry initial:worker.llm initial:list template:per-item template:per-exec template:again",
-      "fold_nodes visits initial and template nodes in order")
-    assert_eq(workspace.fold_nodes(decoded, 0, function(count) return count + 1 end), 6,
-      "fold_nodes returns the final accumulator")
-    assert_eq(#workspace.actor_inventory(decoded), 6, "the actor inventory is the same walk")
-    assert_eq(workspace.actor_inventory(decoded)[4].operation.id, "each",
-      "a template node carries its operation")
-  end
-
-  -- A ReadOnly caller whose workflow only reads: approved, and the artifact
-  -- the decision saw is the one that runs.
-  do
-    configured()
-    local artifact = program({ script("list", "ls -la"), exec("show", { "cat", "README.md" }), agent("reader", "ReadOnly") },
-      { operation("each", { script("per-item", "ls src") }) })
-    local outcome = apply(artifact, "ReadOnly")
-    assert_eq(outcome.prepared.decision, "safe", "a read-only workflow is safe for a ReadOnly caller")
-    assert_eq(outcome.prepared.reason, nil, "a safe workflow needs no reason")
-    assert_true(outcome.execute ~= nil, "the approved workflow runs: " .. json.encode(outcome.result and outcome.result.body or {}))
-    assert_eq(#outcome.loads, 1, "execute runs the assessed artifact without compiling again")
-    assert_eq(json.encode(outcome.execute.body.artifact.program.initial.actors[3].params.value.script),
-      '"ls -la"', "what runs is what was assessed")
-    assert_eq(outcome.execute.body.invocation_kind, "apply", "the run is an apply")
-  end
-
-  -- One denied script: rejected, nothing runs, and every offender is listed.
-  do
-    configured()
-    local artifact = program({
-      script("list", "ls"), script("wipe", "rm -rf build"), script("build", "make all"),
-      exec("exec-wipe", { "rm", "-rf", "it's here" }), agent("writer", "Default"),
-    }, { operation("each", { script("per-item", "make item") }) })
-    local outcome = apply(artifact, "ReadOnly", { verdict = function() return false end })
-    assert_eq(outcome.prepared.decision, "denied", "a denied node denies the workflow")
-    assert_eq(outcome.prepared.reason, table.concat({
-      "the workflow declares 5 nodes not shown to be allowed under the ReadOnly approval policy:",
-      "- node `wipe` (shell script) `rm -rf build`: forbidden by the command classifier",
-      "- node `build` (shell script) `make all`: not shown to be read-only",
-      "- node `exec-wipe` (process) `'rm' '-rf' 'it'\\''s here'`: forbidden by the command classifier",
-      "- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)",
-      "- node `per-item (template of each)` (shell script) `make item`: not shown to be read-only",
-    }, "\n"), "the reason lists every offending node with its kind, its command or policy, and why")
-    assert_true(outcome.execute == nil, "a refused workflow runs nothing")
-    assert_true(outcome.result == nil, "the tool itself does not answer a refused call; the gate does")
-    -- prepare wrote the file before the decision, and it stays.
-    local path = workspace.workspace_dir(sessions.current_id()) .. "/" .. outcome.file
-    assert_true(nefor.fs.exists(path), "the file written by prepare stays after the denial")
-    -- The refused call is gone: a later invoke under its id runs nothing.
-    _test.calls_clear()
-    lw.receive_msg(make_entry("tool-gate", { kind = "lead-workflow.tool.invoke", id = outcome.id,
-      name = "mag-apply", args = { file = outcome.file } }))
-    local late = find_call(decode_calls(), function(c) return c.body.kind == "tool.result" and c.body.id == outcome.id end)
-    assert_eq(late.body.error, "mag-apply: this call was not approved by the tool gate",
-      "mag-apply executes only a call the gate decided")
-    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end) == nil,
-      "and still runs nothing")
-  end
-
-  -- An agent node with a wider policy is a denial on its own; a narrower or
-  -- equal one is fine, and a Default caller may run Default agents.
-  do
-    configured()
-    local outcome = apply(program({ agent("writer", "Default") }), "ReadOnly", { verdict = function() return false end })
-    assert_eq(outcome.prepared.decision, "denied", "a wider agent is denied, not narrowed")
-    assert_eq(outcome.prepared.reason,
-      "the workflow declares 1 node not shown to be allowed under the ReadOnly approval policy:\n"
-      .. "- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)",
-      "the message names the node and both policies")
-    assert_true(outcome.execute == nil, "nothing runs")
-    configured()
-    assert_eq(apply(program({ agent("a", "ReadOnly"), agent("b", "Default") }), "Default").prepared.decision,
-      "safe", "a Default caller may run ReadOnly and Default agents")
-  end
-
-  -- A nested apply from a ReadOnly agent inside another workflow reaches the
-  -- same decision with that agent's policy.
-  do
-    configured()
-    local nested = invocation(sessions.current_id(), "subagent", "r-nested/cap-1", "reader.run-tool", "run-outer")
-    local refused = apply(program({ script("wipe", "rm -rf build") }), "ReadOnly",
-      { invocation = nested, caller_id = "r-nested/cap-1", verdict = function() return false end })
-    assert_eq(refused.prepared.decision, "denied", "a nested ReadOnly apply is decided under ReadOnly")
-    assert_true(refused.execute == nil, "the nested workflow does not run")
-    nested = invocation(sessions.current_id(), "subagent", "r-nested/cap-2", "reader.run-tool", "run-outer")
-    local allowed = apply(program({ script("list", "ls") }), "ReadOnly",
-      { invocation = nested, caller_id = "r-nested/cap-2" })
-    assert_eq(allowed.prepared.decision, "safe", "a nested read-only workflow is safe")
-    assert_true(allowed.execute ~= nil, "and runs")
-    assert_eq(allowed.execute.body.principal, "subagent", "as a run the agent dispatched")
-  end
-
-  -- A command bound to a run-time value cannot be classified: unsure, which
-  -- the gate denies for ReadOnly and asks about or runs for Default.
-  do
-    configured()
-    local bound = script("per-item", "placeholder")
-    bound.parameter_bindings = { { path = { "script" }, value = "item" } }
-    local bound_cwd = script("in-dir", "ls")
-    bound_cwd.parameter_bindings = { { path = { "cwd" }, value = "item" } }
-    local artifact = program({ script("list", "ls") }, { operation("each", { bound, bound_cwd }) })
-    for _, policy in ipairs({ "ReadOnly", "Default" }) do
-      local outcome = apply(artifact, policy, { verdict = function() return false end })
-      assert_eq(outcome.prepared.decision, "unsure", "a run-time command is unsure under " .. policy)
-      assert_eq(outcome.prepared.reason,
-        "the workflow declares 1 node not shown to be allowed under the " .. policy .. " approval policy:\n"
-        .. "- node `per-item (template of each)` (shell script) `placeholder`: its command is bound to a value known only at run time",
-        "only the bound command is listed; a bound working directory is not command text")
-      assert_true(outcome.execute == nil, "nothing runs while the gate has not let it")
-    end
-  end
-
-  -- A Default caller: unsure and denied nodes give the workflow's result; the
-  -- gate's table turns it into ask / run / deny per mode. A call the gate
-  -- lets run after asking runs the assessed artifact.
-  do
-    configured()
-    local unsure = apply(program({ script("build", "make all"), script("list", "ls") }), "Default")
-    assert_eq(unsure.prepared.decision, "unsure", "an unclassified command makes the workflow unsure")
-    assert_eq(unsure.prepared.reason,
-      "the workflow declares 1 node not shown to be allowed under the Default approval policy:\n"
-      .. "- node `build` (shell script) `make all`: not shown to be safe", "the reason the user is shown")
-    assert_true(unsure.execute ~= nil, "when the gate lets it run (asked and approved, auto, or yolo) it runs")
-    configured()
-    local denied = apply(program({ script("build", "make all"), script("wipe", "rm -rf /") }), "Default",
-      { verdict = function() return false end })
-    assert_eq(denied.prepared.decision, "denied", "denied dominates unsure")
-    assert_true(denied.prepared.reason:find("`make all`: not shown to be safe", 1, true) ~= nil
-      and denied.prepared.reason:find("`rm -rf /`: forbidden by the command classifier", 1, true) ~= nil,
-      "both nodes are listed")
-    assert_true(denied.execute == nil, "refused in safe and auto mode: nothing runs")
-    configured()
-    assert_true(apply(program({ script("wipe", "rm -rf /") }), "Default").execute ~= nil,
-      "in yolo the gate runs a Default caller's denied workflow")
-  end
-
-  -- Other capability nodes share their tool's meaning; an unknown kind of
-  -- node is never approved by omission.
-  do
-    configured()
-    local create = { id = "wt", factory = "worktree-create",
-      params = { repository = "/r", path = "/r/.worktrees/x", branch = "b", base = "main" } }
-    local open = { id = "wt-open", factory = "worktree-open",
-      params = { repository = "/r", path = "/r/.worktrees/x", branch = "b" } }
-    local human = { id = "ask.human", factory = "human", params = { prompt = "ok?" } }
-    local read_only = apply(program({ create, open, human }), "ReadOnly", { verdict = function() return false end })
-    assert_eq(read_only.prepared.decision, "denied", "creating a worktree is not read-only")
-    assert_eq(read_only.prepared.reason,
-      "the workflow declares 1 node not shown to be allowed under the ReadOnly approval policy:\n"
-      .. "- node `wt` (worktree creation) `/r/.worktrees/x`: it creates a Git worktree and a branch",
-      "the worktree node gives the tool's own reason; opening one and asking a human are read-only")
-    configured()
-    local default = apply(program({ create }), "Default", { verdict = function() return false end })
-    assert_eq(default.prepared.decision, "unsure", "under Default the node means what the configuration chose for its tool")
-    assert_eq(default.prepared.reason,
-      "the workflow declares 1 node not shown to be allowed under the Default approval policy:\n"
-      .. "- node `wt` (worktree creation) `/r/.worktrees/x`: it creates a Git worktree and a branch",
-      "with the configured reason")
-  end
-
-  -- Nothing about a node is assumed. A kind of node the runtime did not
-  -- describe, a capability no tool defines, an agent without a policy, a
-  -- classifier that fails, a call without a policy: each ends the call with
-  -- an error that names it, and nothing runs.
-  do
-    local function undecidable(artifact, policy, options, expected)
-      configured()
-      if options.configure then options.configure() end
-      local outcome = apply(artifact, policy, options)
-      assert_true(outcome.prepared == nil, "no decision is answered: " .. expected)
-      assert_true(outcome.execute == nil, "nothing runs: " .. expected)
-      assert_eq(outcome.result.body.error, expected, "the error names what is undefined")
-    end
-    local teleport_factories = { "adapter", "llm", "teleport" }
-    undecidable(program({ { id = "x", factory = "teleport", params = {} } }), "Default",
-      { factories = teleport_factories },
-      "mag-apply: the workflow could not be assessed:\n"
-      .. "- node `x`: the MAG runtime does not say what a `nefor.factory.teleport` node means for approval")
-    undecidable(program({ { id = "odd.run-tool", factory = "run-tool", params = {} } }), "Default", {},
-      "mag-apply: the workflow could not be assessed:\n"
-      .. "- node `odd.run-tool`: its approval policy is not one: expected a ToolApprovalPolicy (ReadOnly | Default)")
-    undecidable(program({ script("list", "ls") }), "ReadOnly",
-      { configure = function() fresh(); gate.prepared, gate.answers = {}, {} end },
-      "mag-apply: the workflow could not be assessed:\n"
-      .. "- node `list`: this configuration did not say what capabilities mean (lead-workflow configure_approval)")
-    undecidable(program({ script("list", "ls"), script("other", "ls") }), "ReadOnly",
-      { configure = function()
-          lw.configure_approval { decide_capability = tool_lib.decision {
-            tool_lib.source { name = "empty", tools = {}, emit = function() end } } }
-        end },
-      "mag-apply: the workflow could not be assessed:\n"
-      .. "- node `list`: no tool `shell.script` defines what this capability means\n"
-      .. "- node `other`: no tool `shell.script` defines what this capability means")
-    undecidable(program({ script("list", "ls") }), "Default",
-      { configure = function()
-          lw.configure_approval { decide_capability = function()
-            error("the command could not be classified: the classifier exited with the unknown status 70", 0)
-          end }
-        end },
-      "mag-apply: the workflow could not be assessed:\n"
-      .. "- node `list`: the command could not be classified: the classifier exited with the unknown status 70")
-    local incomplete = {}
-    for identity, declared in pairs(FACTORY_APPROVALS) do incomplete[identity] = declared end
-    incomplete["nefor.factory.shell-script"] = { kind = "capability", noun = "shell script",
-      tool = "shell.script", arguments = { "script" }, shown = "script", runtime_bound = {} }
-    local bound = script("per-item", "placeholder")
-    bound.parameter_bindings = { { path = { "script" }, value = "item" } }
-    undecidable(program({}, { operation("each", { bound }) }), "Default", { factory_approvals = incomplete },
-      "mag-apply: the workflow could not be assessed:\n"
-      .. "- node `per-item (template of each)`: its factory does not say what binding `script` at run time means")
-    configured()
-    _test.calls_clear()
-    lw.receive_msg(make_entry("tool-gate", { kind = "lead-workflow.tool.prepare", id = "no-policy",
-      name = "mag-apply", args = { file = "no-policy.mag", content = READ_ONLY_MAG } }))
-    local refused = find_call(decode_calls(), function(c) return c.body.kind == "tool.result" and c.body.id == "no-policy" end)
-    assert_eq(refused.body.error,
-      "mag-apply: this call could not be decided: no approval policy `nil`; the caller must state one of ReadOnly, Default",
-      "a call without a policy is an error before anything is compiled")
-    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end) == nil,
-      "and nothing is compiled for it")
-  end
-
-  -- A compile failure ends the call with the compiler's message: there is
-  -- nothing to decide and nothing runs.
-  do
-    configured()
-    _test.calls_clear()
-    feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "approval-compile-error", name = "mag-apply",
-      args = { file = "broken.mag", content = "nonsense" }, approval_policy = "ReadOnly" })
-    local load = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end)
-    feed("mag", { kind = "mag.error", in_reply_to = load.body.id, message = "parse error at 1:1" })
-    local result = find_call(decode_calls(), function(c)
-      return c.body.kind == "tool.result" and c.body.id == "approval-compile-error" end)
-    assert_eq(result.body.error, "compilation failed:\nparse error at 1:1", "the model gets the compiler's message")
-    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "tool.prepared" end) == nil,
-      "no decision is answered for a workflow that does not compile")
-    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end) == nil, "nothing runs")
-  end
-
-  -- The per-policy description is one generic sentence.
-  do
-    local advertised
-    for _, spec in ipairs(lw._internals.tool_source.advertisement("tool-gate").tools) do
-      if spec.name == "mag-apply" then advertised = spec end
-    end
-    assert_eq(advertised.policy_descriptions.ReadOnly,
-      "Your approval policy is ReadOnly: a workflow that declares nodes that are not read-only, "
-      .. "or agents with a wider approval policy than yours, is rejected.",
-      "mag-apply tells a ReadOnly agent what is rejected, without naming mechanisms")
-    assert_eq(advertised.policy_descriptions.Default, nil, "and adds nothing for a Default agent")
-    assert_true(approval.is_policy("ReadOnly"), "vocabulary loaded")
-  end
-  fresh()
-  gate.prepared, gate.answers = {}, {}
-end
-
--- ------------------------------------------------------------------
 -- per-node MAG workspaces
 -- ------------------------------------------------------------------
 --
@@ -4003,7 +3623,8 @@ do
           { id = "worker.llm", factory = "nefor.factory.llm", type_arguments = {},
             params = packed({ system = "worker system" }) },
           { id = "worker.run-tool", factory = "nefor.factory.run-tool", type_arguments = {},
-            params = packed({ conversation_peer = "worker.llm" }) },
+            params = packed({ conversation_peer = "worker.llm",
+              tool_approval_policy = { constructor = "Default" } }) },
         },
         routes = {}, messages = {}, kills = {}, nodes = worker_nodes,
         result = { from = { type = {}, type_id = "test-type",
@@ -4122,4 +3743,435 @@ do
     "a workspace needs a node path")
   assert_eq(select(1, mag_workspace_lib.node_workspace("s", "mag-run-x", { "a", "" })), nil,
     "an empty node name is rejected")
+end
+
+-- ------------------------------------------------------------------
+-- Workflow approval: mag-apply decides a workflow as a unit
+-- ------------------------------------------------------------------
+
+do
+  local workspace = require("libs.mag-workspace")
+  local tool_lib = require("libs.tool")
+  local approval = require("libs.tool.approval")
+
+  -- The capability meanings the starter wires in, with a stand-in classifier.
+  local function fake_classify(policy, command)
+    if command:find("rm ", 1, true) or command:find("'rm'", 1, true) then
+      return "denied", "forbidden by the command classifier"
+    end
+    if command:find("ls", 1, true) or command:find("cat", 1, true) then return "safe" end
+    if policy == "ReadOnly" then return "unsure", "not shown to be read-only" end
+    return "unsure", "not shown to be safe"
+  end
+  local quote_argv = require("core.shell").quote_argv
+  local capability_tools = tool_lib.source { name = "capabilities", emit = function() end, tools = (function()
+    local list = require("libs.basic-tools").tools {
+      max_read_bytes = 10,
+      invoke = function() end, cancel = function() end,
+      classify_command = fake_classify,
+      classify_argv = function(policy, argv) return fake_classify(policy, quote_argv(argv)) end,
+      decide_write = "safe",
+    }
+    for _, definition in ipairs(require("libs.git-worktree").tools {
+      invoke = function() end,
+      decide_create = { "unsure", "it creates a Git worktree and a branch" },
+      decide_open = "safe",
+    }) do
+      list[#list + 1] = definition
+    end
+    return list
+  end)() }
+  local decide_capability = tool_lib.decision { capability_tools }
+
+  local TIMEOUT = { present = false, milliseconds = 0 }
+  local function script(id, text)
+    return { id = id, factory = "shell-script", params = { script = text, cwd = ".", timeout = TIMEOUT } }
+  end
+  local function exec(id, argv)
+    return { id = id, factory = "process-exec", params = { argv = argv, cwd = ".", timeout = TIMEOUT } }
+  end
+  local function agent(id, policy)
+    return { id = id .. ".run-tool", factory = "run-tool",
+      params = { tools = { "read_file" }, tool_approval_policy = { constructor = policy } } }
+  end
+  local function program(actors, operations)
+    local modification = read_only_modification()
+    for _, actor in ipairs(actors) do modification.actors[#modification.actors + 1] = actor end
+    local envelope = envelope_from_modification(modification)
+    envelope.program.operations = operations or {}
+    return envelope
+  end
+  -- One dynamic-workflow operation whose template holds `actors`.
+  local function operation(id, actors)
+    local template_actors = {}
+    for index, actor in ipairs(actors) do
+      template_actors[index] = {
+        slot = actor.id, id = "ref:" .. actor.id, factory = "nefor.factory." .. actor.factory,
+        type_arguments = {}, params = { ["$mag"] = "packed-value", value = actor.params },
+        input = {}, outputs = {}, parameter_bindings = actor.parameter_bindings or {},
+      }
+    end
+    return { id = id, on = {}, captures = {}, expressions = {},
+      template = { actors = template_actors, routes = {}, messages = {} } }
+  end
+
+  local APPROVAL_FACTORIES = { "adapter", "llm", "run-tool", "sink", "stub", "tool-result",
+    "shell-script", "process-exec", "worktree-create", "worktree-open", "human" }
+  local sequence = 0
+  -- Apply `artifact` as a caller with `policy`; returns the gate's view.
+  local function apply(artifact, policy, options)
+    options = options or {}
+    sequence = sequence + 1
+    local id = "approval-" .. sequence
+    local file = "approval-" .. sequence .. ".mag"
+    gate.verdict = options.verdict
+    _test.calls_clear()
+    feed("tool-gate", {
+      kind = "lead-workflow.tool.invoke", id = id, name = "mag-apply",
+      args = { file = file, content = options.content or READ_ONLY_MAG },
+      approval_policy = policy, caller_id = options.caller_id, invocation = options.invocation,
+    })
+    local load = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" and c.target == "mag" end)
+    assert_true(load ~= nil, "the decision compiles the workflow: " .. json.encode(decode_calls()))
+    local executed_before_decision = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
+    assert_true(executed_before_decision == nil, "nothing is executed before the decision")
+    feed("mag", {
+      kind = "mag.loaded", in_reply_to = load.body.id, hash = "sha256:approval-" .. sequence,
+      factories = options.factories or APPROVAL_FACTORIES,
+      factory_contracts = factory_contracts(options.factories or APPROVAL_FACTORIES),
+      factory_approvals = options.factory_approvals or FACTORY_APPROVALS,
+      artifact = artifact,
+    })
+    gate.verdict = nil
+    local calls = decode_calls()
+    return {
+      id = id, file = file,
+      prepared = gate.answers[id],
+      loads = find_calls(calls, function(c) return c.body.kind == "mag.load" end),
+      execute = find_call(calls, function(c) return c.body.kind == "mag.execute" end),
+      result = find_call(calls, function(c) return c.body.kind == "tool.result" and c.body.id == id end),
+    }
+  end
+
+  local function configured()
+    fresh()
+    gate.prepared, gate.answers = {}, {}
+    lw.configure_approval { decide_capability = decide_capability }
+  end
+
+  -- The fold visits every node the kernel would spawn: initial actors in
+  -- order, then the actors of every operation template.
+  do
+    local artifact = program({ script("list", "ls") },
+      { operation("each", { script("per-item", "ls"), exec("per-exec", { "ls" }) }), operation("other", { script("again", "ls") }) })
+    local decoded = assert(workspace.decode_artifact(artifact))
+    local visited = workspace.fold_nodes(decoded, {}, function(seen, node)
+      seen[#seen + 1] = node.kind .. ":" .. tostring(node.actor.slot or node.actor.id)
+      return seen
+    end)
+    assert_eq(table.concat(visited, " "),
+      "initial:worker.entry initial:worker.llm initial:list template:per-item template:per-exec template:again",
+      "fold_nodes visits initial and template nodes in order")
+    assert_eq(workspace.fold_nodes(decoded, 0, function(count) return count + 1 end), 6,
+      "fold_nodes returns the final accumulator")
+    assert_eq(#workspace.actor_inventory(decoded), 6, "the actor inventory is the same walk")
+    assert_eq(workspace.actor_inventory(decoded)[4].operation.id, "each",
+      "a template node carries its operation")
+  end
+
+  -- A ReadOnly caller whose workflow only reads: approved, and the artifact
+  -- the decision saw is the one that runs.
+  do
+    configured()
+    local artifact = program({ script("list", "ls -la"), exec("show", { "cat", "README.md" }), agent("reader", "ReadOnly") },
+      { operation("each", { script("per-item", "ls src") }) })
+    local outcome = apply(artifact, "ReadOnly")
+    assert_eq(outcome.prepared.decision, "safe", "a read-only workflow is safe for a ReadOnly caller")
+    assert_eq(outcome.prepared.reason, nil, "a safe workflow needs no reason")
+    assert_true(outcome.execute ~= nil, "the approved workflow runs: " .. json.encode(outcome.result and outcome.result.body or {}))
+    assert_eq(#outcome.loads, 1, "execute runs the assessed artifact without compiling again")
+    assert_eq(json.encode(outcome.execute.body.artifact.program.initial.actors[3].params.value.script),
+      '"ls -la"', "what runs is what was assessed")
+    assert_eq(outcome.execute.body.invocation_kind, "apply", "the run is an apply")
+  end
+
+  -- One denied script: rejected, nothing runs, and every offender is listed.
+  do
+    configured()
+    local artifact = program({
+      script("list", "ls"), script("wipe", "rm -rf build"), script("build", "make all"),
+      exec("exec-wipe", { "rm", "-rf", "it's here" }), agent("writer", "Default"),
+    }, { operation("each", { script("per-item", "make item") }) })
+    local outcome = apply(artifact, "ReadOnly", { verdict = function() return false end })
+    assert_eq(outcome.prepared.decision, "denied", "a denied node denies the workflow")
+    assert_eq(outcome.prepared.reason, table.concat({
+      "the workflow declares 5 nodes not shown to be allowed under the ReadOnly approval policy:",
+      "- node `wipe` (shell script) `rm -rf build`: forbidden by the command classifier",
+      "- node `build` (shell script) `make all`: not shown to be read-only",
+      "- node `exec-wipe` (process) `'rm' '-rf' 'it'\\''s here'`: forbidden by the command classifier",
+      "- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)",
+      "- node `per-item (template of each)` (shell script) `make item`: not shown to be read-only",
+    }, "\n"), "the reason lists every offending node with its kind, its command or policy, and why")
+    assert_true(outcome.execute == nil, "a refused workflow runs nothing")
+    assert_true(outcome.result == nil, "the tool itself does not answer a refused call; the gate does")
+    -- prepare wrote the file before the decision, and it stays.
+    local path = workspace.lead_workspace(sessions.current_id()) .. "/" .. outcome.file
+    assert_true(nefor.fs.exists(path), "the file written by prepare stays after the denial")
+    -- The refused call is gone: a later invoke under its id runs nothing.
+    _test.calls_clear()
+    lw.receive_msg(make_entry("tool-gate", { kind = "lead-workflow.tool.invoke", id = outcome.id,
+      name = "mag-apply", args = { file = outcome.file } }))
+    local late = find_call(decode_calls(), function(c) return c.body.kind == "tool.result" and c.body.id == outcome.id end)
+    assert_eq(late.body.error, "mag-apply: this call was not approved by the tool gate",
+      "mag-apply executes only a call the gate decided")
+    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end) == nil,
+      "and still runs nothing")
+  end
+
+  -- An agent node with a wider policy is a denial on its own; a narrower or
+  -- equal one is fine, and a Default caller may run Default agents.
+  do
+    configured()
+    local outcome = apply(program({ agent("writer", "Default") }), "ReadOnly", { verdict = function() return false end })
+    assert_eq(outcome.prepared.decision, "denied", "a wider agent is denied, not narrowed")
+    assert_eq(outcome.prepared.reason,
+      "the workflow declares 1 node not shown to be allowed under the ReadOnly approval policy:\n"
+      .. "- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)",
+      "the message names the node and both policies")
+    assert_true(outcome.execute == nil, "nothing runs")
+    configured()
+    assert_eq(apply(program({ agent("a", "ReadOnly"), agent("b", "Default") }), "Default").prepared.decision,
+      "safe", "a Default caller may run ReadOnly and Default agents")
+  end
+
+  -- A nested apply from a ReadOnly agent inside another workflow reaches the
+  -- same decision with that agent's policy, and every step of the call uses
+  -- that node's own workspace: prepare writes the file there, the decision
+  -- compiles that file, a refused workflow leaves it there, and no other
+  -- node can see it.
+  do
+    configured()
+    local session_dir = workspace.session_dir(sessions.current_id())
+    local inventory = agent_actors("reader")
+    for _, actor in ipairs(agent_actors("other")) do inventory[#inventory + 1] = actor end
+    local nodes = agent_nodes({}, "reader")
+    for _, node in ipairs(agent_nodes({}, "other")) do nodes[#nodes + 1] = node end
+    register_node_run("mag-run-outer", inventory, nodes)
+    local reader = node_call("mag-run-outer", "reader.run-tool").invocation
+    local reader_dir = session_dir .. "/runs/mag-run-outer/reader"
+
+    local refused = apply(program({ script("wipe", "rm -rf build") }), "ReadOnly",
+      { invocation = reader, caller_id = reader.capability_id, content = "REFUSED SOURCE",
+        verdict = function() return false end })
+    assert_eq(refused.prepared.decision, "denied", "a nested ReadOnly apply is decided under ReadOnly")
+    assert_true(refused.execute == nil, "the nested workflow does not run")
+    assert_eq(#refused.loads, 1, "the decision compiled once")
+    assert_eq(refused.loads[1].body.source_dir, reader_dir,
+      "the decision compiles in the calling node's own workspace")
+    assert_eq(refused.loads[1].body.entry, refused.file, "and compiles the file prepare wrote")
+    assert_eq(read_all(reader_dir .. "/" .. refused.file), "REFUSED SOURCE",
+      "prepare wrote into the calling node's own workspace, and the refused file stays there")
+    assert_true(not nefor.fs.exists(workspace.lead_workspace(sessions.current_id()) .. "/" .. refused.file),
+      "nothing was written into the lead's workspace")
+
+    -- Another node of the same run does not see that file.
+    _test.calls_clear()
+    local other = node_call("mag-run-outer", "other.run-tool").invocation
+    feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "other-apply", name = "mag-apply",
+      args = { file = refused.file }, approval_policy = "ReadOnly",
+      caller_id = other.capability_id, invocation = other })
+    local missing = find_call(decode_calls(), function(c)
+      return c.body.kind == "tool.result" and c.body.id == "other-apply" end)
+    assert_eq(missing.body.error, "mag-apply: file does not exist: " .. refused.file,
+      "another node cannot apply a file from this node's workspace")
+    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end) == nil,
+      "and nothing is compiled for it")
+
+    -- An allowed nested workflow runs from the same workspace, as a run the
+    -- agent dispatched.
+    local reader_again = node_call("mag-run-outer", "reader.run-tool").invocation
+    local allowed = apply(program({ script("list", "ls") }), "ReadOnly",
+      { invocation = reader_again, caller_id = reader_again.capability_id })
+    assert_eq(allowed.prepared.decision, "safe", "a nested read-only workflow is safe")
+    assert_eq(allowed.loads[1].body.source_dir, reader_dir, "it compiles in the same node workspace")
+    assert_true(allowed.execute ~= nil, "and runs")
+    assert_eq(allowed.execute.body.principal, "subagent", "as a run the agent dispatched")
+
+    -- A node of the nested run has its own workspace under the nested run.
+    local nested_run_id = allowed.execute.body.run_id
+    local nested_run = lw._internals.state.active_runs[nested_run_id]
+    assert_true(nested_run ~= nil, "the nested run is registered")
+    nested_run.logical_nodes = agent_nodes({}, "inner")
+    nested_run.nodes = nested_run.nodes or {}
+    local inner = invocation(sessions.current_id(), "subagent", "r-inner/cap-1", "inner.run-tool", nested_run_id)
+    local deeper = apply(program({ script("list", "ls") }), "ReadOnly",
+      { invocation = inner, caller_id = "r-inner/cap-1", verdict = function() return false end })
+    assert_eq(deeper.loads[1].body.source_dir, session_dir .. "/runs/" .. nested_run_id .. "/inner",
+      "a node inside the nested run uses the nested node's own workspace")
+    assert_true(nefor.fs.exists(session_dir .. "/runs/" .. nested_run_id .. "/inner/" .. deeper.file),
+      "and its file is written there")
+  end
+
+  -- A command bound to a run-time value cannot be classified: unsure, which
+  -- the gate denies for ReadOnly and asks about or runs for Default.
+  do
+    configured()
+    local bound = script("per-item", "placeholder")
+    bound.parameter_bindings = { { path = { "script" }, value = "item" } }
+    local bound_cwd = script("in-dir", "ls")
+    bound_cwd.parameter_bindings = { { path = { "cwd" }, value = "item" } }
+    local artifact = program({ script("list", "ls") }, { operation("each", { bound, bound_cwd }) })
+    for _, policy in ipairs({ "ReadOnly", "Default" }) do
+      local outcome = apply(artifact, policy, { verdict = function() return false end })
+      assert_eq(outcome.prepared.decision, "unsure", "a run-time command is unsure under " .. policy)
+      assert_eq(outcome.prepared.reason,
+        "the workflow declares 1 node not shown to be allowed under the " .. policy .. " approval policy:\n"
+        .. "- node `per-item (template of each)` (shell script) `placeholder`: its command is bound to a value known only at run time",
+        "only the bound command is listed; a bound working directory is not command text")
+      assert_true(outcome.execute == nil, "nothing runs while the gate has not let it")
+    end
+  end
+
+  -- A Default caller: unsure and denied nodes give the workflow's result; the
+  -- gate's table turns it into ask / run / deny per mode. A call the gate
+  -- lets run after asking runs the assessed artifact.
+  do
+    configured()
+    local unsure = apply(program({ script("build", "make all"), script("list", "ls") }), "Default")
+    assert_eq(unsure.prepared.decision, "unsure", "an unclassified command makes the workflow unsure")
+    assert_eq(unsure.prepared.reason,
+      "the workflow declares 1 node not shown to be allowed under the Default approval policy:\n"
+      .. "- node `build` (shell script) `make all`: not shown to be safe", "the reason the user is shown")
+    assert_true(unsure.execute ~= nil, "when the gate lets it run (asked and approved, auto, or yolo) it runs")
+    configured()
+    local denied = apply(program({ script("build", "make all"), script("wipe", "rm -rf /") }), "Default",
+      { verdict = function() return false end })
+    assert_eq(denied.prepared.decision, "denied", "denied dominates unsure")
+    assert_true(denied.prepared.reason:find("`make all`: not shown to be safe", 1, true) ~= nil
+      and denied.prepared.reason:find("`rm -rf /`: forbidden by the command classifier", 1, true) ~= nil,
+      "both nodes are listed")
+    assert_true(denied.execute == nil, "refused in safe and auto mode: nothing runs")
+    configured()
+    assert_true(apply(program({ script("wipe", "rm -rf /") }), "Default").execute ~= nil,
+      "in yolo the gate runs a Default caller's denied workflow")
+  end
+
+  -- Other capability nodes share their tool's meaning; an unknown kind of
+  -- node is never approved by omission.
+  do
+    configured()
+    local create = { id = "wt", factory = "worktree-create",
+      params = { repository = "/r", path = "/r/.worktrees/x", branch = "b", base = "main" } }
+    local open = { id = "wt-open", factory = "worktree-open",
+      params = { repository = "/r", path = "/r/.worktrees/x", branch = "b" } }
+    local human = { id = "ask.human", factory = "human", params = { prompt = "ok?" } }
+    local read_only = apply(program({ create, open, human }), "ReadOnly", { verdict = function() return false end })
+    assert_eq(read_only.prepared.decision, "denied", "creating a worktree is not read-only")
+    assert_eq(read_only.prepared.reason,
+      "the workflow declares 1 node not shown to be allowed under the ReadOnly approval policy:\n"
+      .. "- node `wt` (worktree creation) `/r/.worktrees/x`: it creates a Git worktree and a branch",
+      "the worktree node gives the tool's own reason; opening one and asking a human are read-only")
+    configured()
+    local default = apply(program({ create }), "Default", { verdict = function() return false end })
+    assert_eq(default.prepared.decision, "unsure", "under Default the node means what the configuration chose for its tool")
+    assert_eq(default.prepared.reason,
+      "the workflow declares 1 node not shown to be allowed under the Default approval policy:\n"
+      .. "- node `wt` (worktree creation) `/r/.worktrees/x`: it creates a Git worktree and a branch",
+      "with the configured reason")
+  end
+
+  -- Nothing about a node is assumed. A kind of node the runtime did not
+  -- describe, a capability no tool defines, an agent without a policy, a
+  -- classifier that fails, a call without a policy: each ends the call with
+  -- an error that names it, and nothing runs.
+  do
+    local function undecidable(artifact, policy, options, expected)
+      configured()
+      if options.configure then options.configure() end
+      local outcome = apply(artifact, policy, options)
+      assert_true(outcome.prepared == nil, "no decision is answered: " .. expected)
+      assert_true(outcome.execute == nil, "nothing runs: " .. expected)
+      assert_eq(outcome.result.body.error, expected, "the error names what is undefined")
+    end
+    local teleport_factories = { "adapter", "llm", "teleport" }
+    undecidable(program({ { id = "x", factory = "teleport", params = {} } }), "Default",
+      { factories = teleport_factories },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `x`: the MAG runtime does not say what a `nefor.factory.teleport` node means for approval")
+    undecidable(program({ { id = "odd.run-tool", factory = "run-tool", params = {} } }), "Default", {},
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `odd.run-tool`: its approval policy is not one: expected a ToolApprovalPolicy (ReadOnly | Default)")
+    undecidable(program({ script("list", "ls") }), "ReadOnly",
+      { configure = function() fresh(); gate.prepared, gate.answers = {}, {} end },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `list`: this configuration did not say what capabilities mean (lead-workflow configure_approval)")
+    undecidable(program({ script("list", "ls"), script("other", "ls") }), "ReadOnly",
+      { configure = function()
+          lw.configure_approval { decide_capability = tool_lib.decision {
+            tool_lib.source { name = "empty", tools = {}, emit = function() end } } }
+        end },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `list`: no tool `shell.script` defines what this capability means\n"
+      .. "- node `other`: no tool `shell.script` defines what this capability means")
+    undecidable(program({ script("list", "ls") }), "Default",
+      { configure = function()
+          lw.configure_approval { decide_capability = function()
+            error("the command could not be classified: the classifier exited with the unknown status 70", 0)
+          end }
+        end },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `list`: the command could not be classified: the classifier exited with the unknown status 70")
+    local incomplete = {}
+    for identity, declared in pairs(FACTORY_APPROVALS) do incomplete[identity] = declared end
+    incomplete["nefor.factory.shell-script"] = { kind = "capability", noun = "shell script",
+      tool = "shell.script", arguments = { "script" }, shown = "script", runtime_bound = {} }
+    local bound = script("per-item", "placeholder")
+    bound.parameter_bindings = { { path = { "script" }, value = "item" } }
+    undecidable(program({}, { operation("each", { bound }) }), "Default", { factory_approvals = incomplete },
+      "mag-apply: the workflow could not be assessed:\n"
+      .. "- node `per-item (template of each)`: its factory does not say what binding `script` at run time means")
+    configured()
+    _test.calls_clear()
+    lw.receive_msg(make_entry("tool-gate", { kind = "lead-workflow.tool.prepare", id = "no-policy",
+      name = "mag-apply", args = { file = "no-policy.mag", content = READ_ONLY_MAG } }))
+    local refused = find_call(decode_calls(), function(c) return c.body.kind == "tool.result" and c.body.id == "no-policy" end)
+    assert_eq(refused.body.error,
+      "mag-apply: this call could not be decided: no approval policy `nil`; the caller must state one of ReadOnly, Default",
+      "a call without a policy is an error before anything is compiled")
+    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end) == nil,
+      "and nothing is compiled for it")
+  end
+
+  -- A compile failure ends the call with the compiler's message: there is
+  -- nothing to decide and nothing runs.
+  do
+    configured()
+    _test.calls_clear()
+    feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "approval-compile-error", name = "mag-apply",
+      args = { file = "broken.mag", content = "nonsense" }, approval_policy = "ReadOnly" })
+    local load = find_call(decode_calls(), function(c) return c.body.kind == "mag.load" end)
+    feed("mag", { kind = "mag.error", in_reply_to = load.body.id, message = "parse error at 1:1" })
+    local result = find_call(decode_calls(), function(c)
+      return c.body.kind == "tool.result" and c.body.id == "approval-compile-error" end)
+    assert_eq(result.body.error, "compilation failed:\nparse error at 1:1", "the model gets the compiler's message")
+    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "tool.prepared" end) == nil,
+      "no decision is answered for a workflow that does not compile")
+    assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end) == nil, "nothing runs")
+  end
+
+  -- The per-policy description is one generic sentence.
+  do
+    local advertised
+    for _, spec in ipairs(lw._internals.tool_source.advertisement("tool-gate").tools) do
+      if spec.name == "mag-apply" then advertised = spec end
+    end
+    assert_eq(advertised.policy_descriptions.ReadOnly,
+      "Your approval policy is ReadOnly: a workflow that declares nodes that are not read-only, "
+      .. "or agents with a wider approval policy than yours, is rejected.",
+      "mag-apply tells a ReadOnly agent what is rejected, without naming mechanisms")
+    assert_eq(advertised.policy_descriptions.Default, nil, "and adds nothing for a Default agent")
+    assert_true(approval.is_policy("ReadOnly"), "vocabulary loaded")
+  end
+  fresh()
+  gate.prepared, gate.answers = {}, {}
 end
