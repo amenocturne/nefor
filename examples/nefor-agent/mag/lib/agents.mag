@@ -27,20 +27,17 @@ type AgentConfig {
   // The agent's own instructions. The runtime places them after this
   // configuration's common agent prompt and before the MAG context.
   system: String,
-  // Exactly the tools the agent may call, by name.
-  tools: List<String>,
-  // What the agent may do with its tools; the only statement of it.
-  // ToolApprovalPolicy.ReadOnly: the agent may only read. A tool call that
-  // writes or has other effects is rejected in every permission mode, and so
-  // is a workflow it applies that declares nodes that are not read-only or
-  // agents with a wider policy. Pair it with nefor.read_only_tools to give an
-  // agent that searches with commands and cannot change anything.
-  // ToolApprovalPolicy.Default: the runtime's configured approval behaviour
-  // for the current permission mode.
-  tool_approval_policy: nefor.contracts.ToolApprovalPolicy
+  // The tools the agent may call together with what it may do with them:
+  // nefor.read_only_tools (the agent may only read; it can search with
+  // commands by running read-only workflows, and anything that writes is
+  // rejected in every permission mode), nefor.general_tools (the configured
+  // approval behaviour for the current permission mode), or
+  // nefor.contracts.Toolset {policy: ..., tools: [...]} for another selection.
+  // The policy is ToolApprovalPolicy.ReadOnly or ToolApprovalPolicy.Default.
+  toolset: nefor.contracts.Toolset
 }
 
 // An agent node: it receives an I as its task and produces Ok(O), or
 // Error(AgentError) when it ends without a result. id names the node in the
 // run.
-let agent<I, O>: fn(String, AgentConfig) -> nefor.graph.Node<I, core.types.Result<nefor.contracts.AgentError, O>> = |id, config| => nefor.actors.agent<agents.models.Model, I, O>(id, agents.models.resolve, nefor.actors.AgentConfig<agents.models.Model> {model: get(config, "model"), system: get(config, "system"), tools: get(config, "tools"), tool_approval_policy: get(config, "tool_approval_policy")})
+let agent<I, O>: fn(String, AgentConfig) -> nefor.graph.Node<I, core.types.Result<nefor.contracts.AgentError, O>> = |id, config| => nefor.actors.agent<agents.models.Model, I, O>(id, agents.models.resolve, nefor.actors.AgentConfig<agents.models.Model> {model: get(config, "model"), system: get(config, "system"), toolset: get(config, "toolset")})

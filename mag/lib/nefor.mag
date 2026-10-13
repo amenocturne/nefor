@@ -50,6 +50,7 @@ type ProviderError = nefor.contracts.ProviderError
 type AgentErrorReason = nefor.contracts.AgentErrorReason
 type AgentError = nefor.contracts.AgentError
 type ToolApprovalPolicy = nefor.contracts.ToolApprovalPolicy
+type Toolset = nefor.contracts.Toolset
 type Timeout = nefor.contracts.Timeout
 type ProcessExited = nefor.contracts.ProcessExited
 type ProcessSignaled = nefor.contracts.ProcessSignaled
@@ -87,7 +88,8 @@ type HumanWorkflowRejection = nefor.human.HumanWorkflowRejection
 type HumanWorkflowDecision = nefor.human.HumanWorkflowDecision
 let approval_gate = nefor.human.approval_gate
 
-// nefor.toolsets: the configuration's ready-made tool lists.
+// nefor.toolsets: the configuration's ready-made toolsets, each a Toolset
+// (its tools together with its approval policy).
 let read_only_tools = nefor.toolsets.read_only
 let general_tools = nefor.toolsets.general
 

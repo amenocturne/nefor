@@ -1857,7 +1857,9 @@ fn infer_builtin(
         "keys" => {
             exact(1)?;
             let actual = infer(env, locals, &args[0])?;
-            if named_field_types(env, &actual).is_some() {
+            // A JSON value may be an object; its keys are checked when the
+            // program runs, like every other use of JSON data.
+            if named_field_types(env, &actual).is_some() || actual == MagType::JsonValue {
                 Ok(MagType::List(Box::new(MagType::String)))
             } else {
                 Err(MagError::Type(format!(

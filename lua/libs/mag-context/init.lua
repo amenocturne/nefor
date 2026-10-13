@@ -12,7 +12,7 @@
 --   public_modules    { path | { path, embed = false }, ... } the MAG sources
 --                     authors write against, in order: embedded verbatim by
 --                     default, or listed with their path only
---   toolsets          { manifest = path, names = { { key, name }, ... } }
+--   toolsets          { manifest = path, names = { { key, name }, ... } }  (each toolset is rendered with its approval policy)
 --   trailing_sections { string, ... } appended last
 --
 -- Only public modules are named in the prompt. Every other module under the
@@ -45,6 +45,8 @@ local function dense_list(value, label)
   end
   return value
 end
+
+local approval = require("libs.tool.approval")
 
 local function nonempty(value, label)
   if type(value) ~= "string" or value == "" then
@@ -183,9 +185,13 @@ local function decode_json(source)
   return pcall(nefor.json.decode, source)
 end
 
--- The manifest is the configuration's `{ "<key>": ["<tool>", ...] }` file that
--- its MAG bindings and tool policy already read. `names` gives, in display
--- order, the MAG expression an author writes for each key.
+-- The manifest is the configuration's toolsets file that its MAG bindings
+-- already read: `{ "<key>": { "policy": "<approval policy>", "tools":
+-- ["<tool>", ...] }, ... }`. A toolset is its tools together with its
+-- approval policy; one without a policy, with an unknown policy, or with any
+-- other key is an error here, as it is when MAG loads the same file.
+-- `names` gives, in display order, the MAG expression an author writes for
+-- each key.
 local function toolsets(opts)
   if opts == nil then return {} end
   local label = "mag-context toolsets"
@@ -206,7 +212,25 @@ local function toolsets(opts)
     local name = nonempty(entry.name, here .. ".name")
     if seen[key] then error(here .. " repeats key " .. key, 3) end
     seen[key] = true
-    local tools = manifest[key]
+    local where = "mag-context: toolsets manifest " .. path .. " toolset `" .. key .. "`"
+    local set = manifest[key]
+    if type(set) ~= "table" or #set > 0 then
+      error(where .. " must be an object with `policy` and `tools`", 3)
+    end
+    for field in pairs(set) do
+      if field ~= "policy" and field ~= "tools" then
+        error(where .. " has unknown key `" .. tostring(field) .. "`; a toolset has exactly `policy` and `tools`", 3)
+      end
+    end
+    if set.policy == nil then
+      error(where .. " does not state its approval policy (`policy`: "
+        .. table.concat(approval.POLICIES, " or ") .. ")", 3)
+    end
+    if not approval.is_policy(set.policy) then
+      error(where .. " names unknown approval policy `" .. tostring(set.policy) .. "`; expected "
+        .. table.concat(approval.POLICIES, " or "), 3)
+    end
+    local tools = set.tools
     local valid = type(tools) == "table"
     if valid then
       local count = 0
@@ -215,26 +239,28 @@ local function toolsets(opts)
         if type(tools[position]) ~= "string" or tools[position] == "" then valid = false end
       end
     end
-    if not valid then
-      error("mag-context: toolsets manifest " .. path .. " field `" .. key
-        .. "` must be an array of tool names", 3)
-    end
-    out[index] = { name = name, tools = tools }
+    if not valid then error(where .. " field `tools` must be an array of tool names", 3) end
+    out[index] = { name = name, policy = set.policy, tools = tools }
   end
   if #out == 0 then error(label .. ".names must name at least one toolset", 3) end
   return out
 end
 
-local TOOLSETS_INTRO = [[An agent can call only the tools named in its `tools` list, plus the runtime's
-own result tools when its output is a typed value. Each toolset below is a
-ready-made `List<String>` of tool names.]]
+local TOOLSETS_INTRO = [[An agent is given one toolset: the tools it can call together with the
+approval policy its calls are decided under. It can call only those tools, plus
+the runtime's own result tools when its output is a typed value. Each toolset
+below is a ready-made `Toolset`; `Toolset {policy: ..., tools: [...]}` builds
+another. `ToolApprovalPolicy.ReadOnly` means the agent may only read: a call
+that writes or has other effects is rejected in every permission mode.
+`ToolApprovalPolicy.Default` is the configured approval behavior for the
+current permission mode.]]
 
 local function render_toolsets(sets)
   if #sets == 0 then return nil end
   local lines = { "## Toolsets", "", TOOLSETS_INTRO }
   for _, set in ipairs(sets) do
     lines[#lines + 1] = ""
-    lines[#lines + 1] = "`" .. set.name .. "`:"
+    lines[#lines + 1] = "`" .. set.name .. "` — policy `ToolApprovalPolicy." .. set.policy .. "`:"
     lines[#lines + 1] = ""
     if #set.tools == 0 then lines[#lines + 1] = "(no tools)" end
     for _, tool in ipairs(set.tools) do lines[#lines + 1] = "- `" .. tool .. "`" end

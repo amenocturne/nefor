@@ -31,8 +31,14 @@ local facade = write("core/lib/nefor.mag", FACADE)
 local nested = write("core/lib/nefor/extra/kit.magl", "(kit)\n")
 write("core/lib/nefor/graph.mag", INTERNAL)
 local manifest = write("config/mag/lib/nefor/toolsets.json",
-  '{"general": ["read_file", "write_file", "mag-apply"], "read_only": ["read_file"], "none": [],'
-  .. ' "broken": {"read_file": true}, "mixed": ["read_file", 7]}')
+  '{"general": {"policy": "Default", "tools": ["read_file", "write_file", "mag-apply"]},'
+  .. ' "read_only": {"policy": "ReadOnly", "tools": ["read_file"]},'
+  .. ' "none": {"policy": "ReadOnly", "tools": []},'
+  .. ' "bare": ["read_file"], "no_policy": {"tools": ["read_file"]},'
+  .. ' "odd_policy": {"policy": "Yolo", "tools": []},'
+  .. ' "extra": {"policy": "Default", "tools": [], "gate": "auto"},'
+  .. ' "broken": {"policy": "Default", "tools": {"read_file": true}},'
+  .. ' "mixed": {"policy": "Default", "tools": ["read_file", 7]}}')
 
 local function context(overrides)
   local opts = {
@@ -96,9 +102,12 @@ do
   assert(not text:find("nefor.graph", 1, true), "an unlisted module is not advertised")
   assert(not text:find("config:", 1, true), "root names are not rendered as headings")
 
-  at("`nefor.read_only_tools`:\n\n- `read_file`\n\n`tools.general_tools`:\n\n"
-    .. "- `read_file`\n- `write_file`\n- `mag-apply`\n\n`tools.no_tools`:\n\n(no tools)")
-  at("only the tools named in its `tools` list")
+  -- Each toolset is shown with its approval policy next to its tools.
+  at("`nefor.read_only_tools` — policy `ToolApprovalPolicy.ReadOnly`:\n\n- `read_file`\n\n"
+    .. "`tools.general_tools` — policy `ToolApprovalPolicy.Default`:\n\n"
+    .. "- `read_file`\n- `write_file`\n- `mag-apply`\n\n"
+    .. "`tools.no_tools` — policy `ToolApprovalPolicy.ReadOnly`:\n\n(no tools)")
+  at("An agent is given one toolset: the tools it can call together with the\napproval policy")
 end
 
 -- A source containing a fence is wrapped in a longer one and stays verbatim.
@@ -140,8 +149,18 @@ expect_error("cannot read", function()
   context({ toolsets = { manifest = _scratch .. "/absent.json",
     names = { { key = "general", name = "g" } } } })
 end)
-for _, key in ipairs({ "absent", "broken", "mixed" }) do
-  expect_error("field `" .. key .. "` must be an array of tool names", function()
+-- A toolset states its policy and its tools and nothing else; anything short
+-- of that is an error when the prompt context is built.
+for key, message in pairs({
+  absent = "toolset `absent` must be an object with `policy` and `tools`",
+  bare = "toolset `bare` must be an object with `policy` and `tools`",
+  no_policy = "toolset `no_policy` does not state its approval policy (`policy`: ReadOnly or Default)",
+  odd_policy = "toolset `odd_policy` names unknown approval policy `Yolo`; expected ReadOnly or Default",
+  extra = "toolset `extra` has unknown key `gate`; a toolset has exactly `policy` and `tools`",
+  broken = "toolset `broken` field `tools` must be an array of tool names",
+  mixed = "toolset `mixed` field `tools` must be an array of tool names",
+}) do
+  expect_error(message, function()
     context({ toolsets = { manifest = manifest, names = { { key = key, name = "g" } } } })
   end)
 end

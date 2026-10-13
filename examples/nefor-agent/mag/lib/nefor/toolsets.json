@@ -1,25 +1,31 @@
 {
-  "read_only": [
-    "read_file",
-    "read_image",
-    "discover_instruction_files",
-    "mag-write-file",
-    "mag-preview",
-    "mag-apply",
-    "mag-status",
-    "mag-await",
-    "mag-terminate"
-  ],
-  "general": [
-    "read_file",
-    "read_image",
-    "discover_instruction_files",
-    "write_file",
-    "mag-write-file",
-    "mag-preview",
-    "mag-apply",
-    "mag-status",
-    "mag-await",
-    "mag-terminate"
-  ]
+  "read_only": {
+    "policy": "ReadOnly",
+    "tools": [
+      "read_file",
+      "read_image",
+      "discover_instruction_files",
+      "mag-write-file",
+      "mag-preview",
+      "mag-apply",
+      "mag-status",
+      "mag-await",
+      "mag-terminate"
+    ]
+  },
+  "general": {
+    "policy": "Default",
+    "tools": [
+      "read_file",
+      "read_image",
+      "discover_instruction_files",
+      "write_file",
+      "mag-write-file",
+      "mag-preview",
+      "mag-apply",
+      "mag-status",
+      "mag-await",
+      "mag-terminate"
+    ]
+  }
 }

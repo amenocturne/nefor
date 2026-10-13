@@ -490,8 +490,8 @@ local function project_pending_conversation(calls)
   assert(not text:find("nefor-mag:", 1, true) and not text:find("- `agents.models`", 1, true)
       and not text:find("- `nefor.graph`", 1, true),
     "internal modules and root names are not advertised")
-  assert(text:find("`nefor.general_tools`:\n\n- `read_file`", 1, true),
-    "toolset contents come from the configuration manifest")
+  assert(text:find("`nefor.general_tools` — policy `ToolApprovalPolicy.Default`:\n\n- `read_file`", 1, true),
+    "toolset contents and policies come from the configuration manifest")
   local _, core_titles = text:gsub("# MAG in Five Minutes", "")
   local _, nefor_titles = text:gsub("# Nefor MAG in Five Minutes", "")
   local _, reasoner_titles = text:gsub("# Reasoner mental model", "")

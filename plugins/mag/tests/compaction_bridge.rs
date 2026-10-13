@@ -65,15 +65,15 @@ mod kernel {
             .map(|c| c.join("mag/lib"))
             .unwrap_or_else(|| root.join("../../examples/nefor-agent/mag/lib"));
         let source = r#"import agents.{}
-import nefor.{>>>, TextAnswer, ToolApprovalPolicy, compile_graph, sequence, source}
-let workers = indexed_map(((|index, model| => agents.agent<String, TextAnswer>(str(index), agents.AgentConfig {model:model,system:"paired config",tools:[],tool_approval_policy:ToolApprovalPolicy.Default})): fn(Int, agents.Model) -> nefor.Node<String, core.types.Result<nefor.AgentError, TextAnswer>>), [agents.current,agents.fast,agents.efficient,agents.standard,agents.deep])
+import nefor.{>>>, TextAnswer, ToolApprovalPolicy, Toolset, compile_graph, sequence, source}
+let workers = indexed_map(((|index, model| => agents.agent<String, TextAnswer>(str(index), agents.AgentConfig {model:model,system:"paired config",toolset: Toolset {policy: ToolApprovalPolicy.Default, tools: []}})): fn(Int, agents.Model) -> nefor.Node<String, core.types.Result<nefor.AgentError, TextAnswer>>), [agents.current,agents.fast,agents.efficient,agents.standard,agents.deep])
 compile_graph(source("task", "begin") >>> sequence(workers))"#;
         let source = if config.is_some() {
             source
         } else {
-            r#"import nefor.{>>>, AgentConfig, AuthoredModel, Node, TextAnswer, ToolApprovalPolicy, agent, compile_graph, model_profile, sequence, source}
+            r#"import nefor.{>>>, AgentConfig, AuthoredModel, Node, TextAnswer, ToolApprovalPolicy, Toolset, agent, compile_graph, model_profile, sequence, source}
 let resolve: fn(String) -> AuthoredModel = |profile| => AuthoredModel.ModelProfile(model_profile(profile))
-let workers = map(((|profile| => agent<String, String, TextAnswer>(profile, resolve, AgentConfig<String> {model:profile,system:"consumer regression",tools:[],tool_approval_policy:ToolApprovalPolicy.Default})): fn(String) -> Node<String, core.types.Result<nefor.AgentError, TextAnswer>>), ["current","fast","efficient","standard","deep"])
+let workers = map(((|profile| => agent<String, String, TextAnswer>(profile, resolve, AgentConfig<String> {model:profile,system:"consumer regression",toolset: Toolset {policy: ToolApprovalPolicy.Default, tools: []}})): fn(String) -> Node<String, core.types.Result<nefor.AgentError, TextAnswer>>), ["current","fast","efficient","standard","deep"])
 compile_graph(source("task", "begin") >>> sequence(workers))"#
         };
         let source = format!("import core.types.{{}}\n{source}");

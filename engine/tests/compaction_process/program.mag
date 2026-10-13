@@ -1,4 +1,4 @@
-import nefor.{>>>, AuthoredModel, AgentConfig, ModelProfile, ToolApprovalPolicy, TextAnswer, agent, compile_graph, model_profile, source}
+import nefor.{>>>, AuthoredModel, AgentConfig, ModelProfile, ToolApprovalPolicy, Toolset, TextAnswer, agent, compile_graph, model_profile, source}
 let resolve: fn(Unit) -> AuthoredModel = |value| => AuthoredModel.ModelProfile(model_profile("worker"))
-let worker = agent<Unit, String, TextAnswer>("worker", resolve, AgentConfig<Unit>{model:nil,system:"process compaction acceptance",tools:["echo"],tool_approval_policy:ToolApprovalPolicy.Default})
+let worker = agent<Unit, String, TextAnswer>("worker", resolve, AgentConfig<Unit>{model:nil,system:"process compaction acceptance",toolset: Toolset {policy: ToolApprovalPolicy.Default, tools: ["echo"]}})
 compile_graph(source("task", "begin") >>> worker)

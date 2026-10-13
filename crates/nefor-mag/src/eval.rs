@@ -1195,6 +1195,12 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 Value::Fields(m) => Ok(Value::List(std::sync::Arc::new(
                     m.keys().cloned().map(Value::Str).collect(),
                 ))),
+                Value::JsonValue(serde_json::Value::Object(fields)) => Ok(Value::List(
+                    std::sync::Arc::new(fields.keys().cloned().map(Value::Str).collect()),
+                )),
+                Value::JsonValue(_) => Err(MagError::Eval(
+                    "keys expects a JSON object, got another JSON value".into(),
+                )),
                 _ => Err(MagError::Eval("keys expects a map".into())),
             }
         }

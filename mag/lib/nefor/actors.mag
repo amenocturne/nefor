@@ -34,10 +34,9 @@ let model_profile: fn(String) -> ModelProfile = |name| => ModelProfile {name: na
 type AuthoredModel = ResolvedModel(ResolvedModel) | ModelProfile(ModelProfile)
 
 // What one agent is. M is the configuration's own model vocabulary; system is
-// the agent's instructions; tools names exactly the tools it may call;
-// tool_approval_policy says what it may do with them (ReadOnly or Default,
-// see nefor.contracts.ToolApprovalPolicy).
-type AgentConfig<M> {model: M, system: String, tools: List<String>, tool_approval_policy: nefor.contracts.ToolApprovalPolicy}
+// the agent's instructions; toolset is the tools it may call together with
+// the approval policy its calls are decided under (nefor.contracts.Toolset).
+type AgentConfig<M> {model: M, system: String, toolset: nefor.contracts.Toolset}
 
 // An agent node: it receives an I as its task and produces Ok(O), or
 // Error(AgentError) when it ends without a result. resolve_model turns the
@@ -56,7 +55,7 @@ let agent<M, I, O>: fn(String, fn(M) -> AuthoredModel, AgentConfig<M>) -> nefor.
     model_profile: profile,
     compaction_policy: get(fixed, "compaction_policy"),
     system: get(config, "system"),
-    tools: get(config, "tools"),
-    tool_approval_policy: get(config, "tool_approval_policy")
+    tools: get(get(config, "toolset"), "tools"),
+    tool_approval_policy: get(get(config, "toolset"), "policy")
   })
 }

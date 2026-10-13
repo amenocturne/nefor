@@ -37,6 +37,13 @@ type AgentError {last_output: JsonValue, reason: AgentErrorReason}
 // permission mode, never a bypass.
 type ToolApprovalPolicy = ReadOnly | Default
 
+// The tools an agent may call, together with what it may do with them. An
+// agent is given a toolset, never a bare list of tool names, so a list of
+// tools cannot be paired with the wrong policy. tools names exactly the tools
+// the agent may call; policy is the approval policy its calls are decided
+// under. A configuration's ready-made toolsets are values of this type.
+type Toolset {policy: ToolApprovalPolicy, tools: List<String>}
+
 // How long a command may run. A bounded value must be strictly positive.
 type Timeout = Unlimited | Milliseconds(Int) | Seconds(Int) | Minutes(Int)
 

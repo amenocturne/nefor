@@ -20,7 +20,7 @@ let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = 
 let resolved_model_value = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "mock-plugin", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 
 let start = nefor.graph.source("task", ProbeInput {prompt: "<initial task text>"})
-let worker = nefor.actors.agent<nefor.actors.ResolvedModel, ProbeInput, nefor.contracts.TextAnswer>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "READ_ONLY_WORKER", tools: ["mag-apply"], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.ReadOnly})
+let worker = nefor.actors.agent<nefor.actors.ResolvedModel, ProbeInput, nefor.contracts.TextAnswer>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "READ_ONLY_WORKER", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.ReadOnly, tools: ["mag-apply"]}})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])
 nefor.artifact.compile(topology)

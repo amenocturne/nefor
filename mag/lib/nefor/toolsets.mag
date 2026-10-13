@@ -1,7 +1,29 @@
-// MAG bindings for the config-owned neutral toolset manifest. The compiler's
-// read-json parser validates JSON and converts its values into MAG data.
+// MAG bindings for the config-owned toolset manifest, nefor/toolsets.json:
+//   {"<name>": {"policy": "ReadOnly" | "Default", "tools": ["<tool>", ...]}, ...}
+// Each toolset states its approval policy together with its tools. A toolset
+// without a policy, with an unknown policy name, or with any other key does
+// not load.
+import nefor.contracts.{}
+
 let manifest = read_json("nefor/toolsets.json")
 
-let read_only = get(manifest, "read_only")
+let policy_named: fn(String, String) -> nefor.contracts.ToolApprovalPolicy = |toolset, name| => if (=)(name, "ReadOnly") then nefor.contracts.ToolApprovalPolicy.ReadOnly else if (=)(name, "Default") then nefor.contracts.ToolApprovalPolicy.Default else fail([str("toolset '", toolset, "' names unknown approval policy '", name, "'; expected ReadOnly or Default")])
 
-let general = get(manifest, "general")
+let is_policy_key: fn(String) -> Bool = |key| => (=)(key, "policy")
+
+let is_tools_key: fn(String) -> Bool = |key| => (=)(key, "tools")
+
+let is_unknown_key: fn(String) -> Bool = |key| => if is_policy_key(key) then false else if is_tools_key(key) then false else true
+
+// A manifest entry has exactly the two keys policy and tools; nothing is
+// supplied for a missing one and nothing else is tolerated.
+let toolset: fn(String) -> nefor.contracts.Toolset = |name| => {
+  let entry = get(manifest, name)
+  let present = keys(entry)
+  let unknown = filter(is_unknown_key, present)
+  if (=)(count(filter(is_policy_key, present)), 0) then fail([str("toolset '", name, "' does not state its approval policy ('policy': ReadOnly or Default)")]) else if (=)(count(filter(is_tools_key, present)), 0) then fail([str("toolset '", name, "' does not list its 'tools'")]) else if (=)(count(unknown), 0) then nefor.contracts.Toolset {policy: policy_named(name, (get(entry, "policy"): String)), tools: (get(entry, "tools"): List<String>)} else fail([str("toolset '", name, "' has unknown key '", first(unknown), "'; a toolset has exactly 'policy' and 'tools'")])
+}
+
+let read_only = toolset("read_only")
+
+let general = toolset("general")

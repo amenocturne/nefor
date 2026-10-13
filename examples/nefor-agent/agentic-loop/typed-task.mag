@@ -11,6 +11,6 @@ import nefor.graph.{}
 type TaskDescription {task: String, description: String, dependent_tasks: List<String>}
 
 let start = nefor.graph.source("typed-task-input", RequestInput {prompt: "Describe the build task"})
-let worker = agents.agent<RequestInput, TaskDescription>("typed-task", agents.AgentConfig {model: agents.mock, system: "Describe the requested task.", tools: ([]: List<String>), tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
+let worker = agents.agent<RequestInput, TaskDescription>("typed-task", agents.AgentConfig {model: agents.mock, system: "Describe the requested task.", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.Default, tools: ([]: List<String>)}})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, TaskDescription>>("typed-task-output")
 nefor.artifact.compile((|graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, worker), nefor.graph.edge(worker, result)])): fn(nefor.graph.Graph) -> nefor.graph.Graph)
