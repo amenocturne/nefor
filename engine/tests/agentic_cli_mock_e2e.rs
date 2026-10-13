@@ -1170,6 +1170,111 @@ fn unusable_tool_call_answers_with_the_callers_available_tools() {
     );
 }
 
+/// The file name a model gives `mag-apply` is the name every stage sees: the
+/// recorded tool call, the gate's invocation, the compiler's entry and the
+/// file in the lead's workspace. The source is the one a model sent in a
+/// recorded session, which itself mentions a `.mag` suffix.
+#[test]
+fn mag_apply_keeps_the_file_name_the_model_gave() {
+    let dir = isolated_starter("mag-file-name-");
+    let content =
+        include_str!("../../plugins/openai-provider/tests/fixtures/mag_apply_locate_content.mag");
+    let provider = std::fs::read_to_string(
+        root().join("engine/tests/agentic_cli_mock_e2e/mag_file_name_provider.lua"),
+    )
+    .unwrap();
+    assert_eq!(provider.matches("__MAG_PROGRAM__").count(), 1);
+    std::fs::write(
+        dir.join("fixture-config/mock-provider/acceptance.lua"),
+        provider.replace("__MAG_PROGRAM__", content),
+    )
+    .unwrap();
+    let output = run(
+        &dir,
+        &[
+            "--frontend",
+            "cli",
+            "--mode",
+            "yolo",
+            "--format",
+            "json",
+            "--prompt",
+            "MAG_FILE_NAME_PROBE",
+        ],
+    );
+    let result: serde_json::Value = serde_json::from_str(&success(&output)).unwrap();
+    let answer = result["answer"].as_str().unwrap();
+    assert!(
+        answer.starts_with("APPLIED ") && !answer.contains("[tool error]"),
+        "the workflow ran: {answer}"
+    );
+
+    let session = result["session_id"].as_str().unwrap();
+    let sessions = dir.join("data/nefor/sessions");
+    let workspace = sessions.join(session).join("mag/lead");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("locate.mag")).unwrap(),
+        content
+    );
+    assert!(
+        !workspace.join(".mag").exists(),
+        "no file without a name before the extension"
+    );
+
+    // Every recorded stage of the call names the same file.
+    let persisted = std::fs::read_to_string(sessions.join(format!("{session}.jsonl"))).unwrap();
+    let mut stages = Vec::new();
+    for line in persisted.lines() {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        let Some(payload) = entry["payload"].as_str() else {
+            continue;
+        };
+        let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let body = &envelope["body"];
+        let kind = body["kind"].as_str().unwrap_or_default();
+        let file = match kind {
+            "conversation.fact.recorded" => match body["event"]["kind"].as_str() {
+                Some("tool_call_fragment_appended") => {
+                    &body["event"]["fragment"]["arguments"]["file"]
+                }
+                Some("tool_call_completed") => &body["event"]["call"]["arguments"]["file"],
+                _ => continue,
+            },
+            "tool-gate.tool.invoke"
+            | "lead-workflow.tool.prepare"
+            | "lead-workflow.tool.invoke"
+                if body["name"] == "mag-apply" =>
+            {
+                &body["args"]["file"]
+            }
+            // The starter compiles through the project build; a configuration
+            // without one sends `mag.load` with the same entry.
+            "mag.build" | "mag.load" if envelope["from"] == "lead-workflow" => &body["entry"],
+            _ => continue,
+        };
+        let stage = match kind {
+            "conversation.fact.recorded" => body["event"]["kind"].as_str().unwrap(),
+            "mag.build" | "mag.load" => "compile",
+            kind => kind,
+        };
+        assert_eq!(file, "locate.mag", "{stage} names the file: {body}");
+        stages.push(stage.to_owned());
+    }
+    for stage in [
+        "tool_call_fragment_appended",
+        "tool_call_completed",
+        "tool-gate.tool.invoke",
+        "lead-workflow.tool.prepare",
+        "compile",
+        "lead-workflow.tool.invoke",
+    ] {
+        assert!(
+            stages.iter().any(|seen| seen == stage),
+            "{stage} was recorded; saw {stages:?}"
+        );
+    }
+}
+
 #[test]
 fn routed_replay_reader_fault_closes_cli_and_reader_without_submission() {
     let dir = isolated_starter("routed-replay-fault-");

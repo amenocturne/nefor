@@ -1,0 +1,7 @@
+import nefor.{ShellScriptParams, Timeout, compile_graph, script}
+
+compile_graph(script("locate", ShellScriptParams {
+  script: "printf '%s\\n' \"$(pwd)\"; find . -type f \\( -name '*.lua' -o -name '*.rs' -o -name '*.mag' \\) | grep -v target | head -200",
+  cwd: ".",
+  timeout: Timeout.Seconds(30),
+}))

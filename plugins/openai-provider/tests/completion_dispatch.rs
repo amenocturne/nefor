@@ -383,6 +383,120 @@ async fn native_reasoning_round_trips_beside_assistant_tool_calls_and_tool_resul
     child.kill().await.expect("kill provider");
 }
 
+/// A tool call's arguments reach the completion's `tool_call` event exactly
+/// as the upstream streamed them, however the stream cut them: here in the
+/// shape OpenRouter uses (name first, then argument fragments beside empty
+/// content and reasoning), with the fragments cut inside the `file` value and
+/// the HTTP body written in small pieces.
+#[tokio::test]
+async fn streamed_tool_call_arguments_reach_the_completion_unchanged() {
+    let content = include_str!("fixtures/mag_apply_locate_content.mag");
+    let arguments = format!(
+        r#"{{"file": "locate.mag", "content": {}}}"#,
+        serde_json::to_string(content).expect("content")
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let streamed = arguments.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let request = read_request_json(&mut stream).await;
+        assert_eq!(request["stream"], true);
+        let chunk = |delta: Value, finish: Value| {
+            format!(
+                "data: {}\n\n",
+                json!({"id":"gen-1","provider":"Upstream","model":"fixture-model",
+                    "choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
+            )
+        };
+        let mut events = String::from(": OPENROUTER PROCESSING\n\n");
+        events += &chunk(
+            json!({"role":"assistant","content":"","reasoning":"Let me use locate.mag.",
+                "reasoning_details":[{"type":"reasoning.text","text":"Let me use locate.mag.","index":0}]}),
+            Value::Null,
+        );
+        events += &chunk(
+            json!({"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call_1",
+                "type":"function","function":{"name":"mag-apply","arguments":""}}]}),
+            Value::Null,
+        );
+        // Cut after `{"file": "`, after `locate`, after `.mag`, then every 9 bytes.
+        let cuts = [
+            streamed.find("locate").expect("name"),
+            streamed.find("locate").expect("name") + "locate".len(),
+            streamed.find(".mag").expect("suffix") + ".mag".len(),
+        ];
+        let mut start = 0;
+        let mut fragments = Vec::new();
+        for cut in cuts {
+            fragments.push(&streamed[start..cut]);
+            start = cut;
+        }
+        let rest = &streamed[start..];
+        let mut at = 0;
+        while at < rest.len() {
+            let mut end = (at + 9).min(rest.len());
+            while !rest.is_char_boundary(end) {
+                end += 1;
+            }
+            fragments.push(&rest[at..end]);
+            at = end;
+        }
+        assert_eq!(fragments.concat(), streamed);
+        for fragment in fragments {
+            events += &chunk(
+                json!({"role":"assistant","content":"","tool_calls":[{"index":0,
+                    "function":{"arguments":fragment}}]}),
+                Value::Null,
+            );
+        }
+        events += &chunk(
+            json!({"role":"assistant","content":""}),
+            json!("tool_calls"),
+        );
+        events += "data: {\"id\":\"gen-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n";
+        events += "data: [DONE]\n\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            events.len()
+        );
+        stream.write_all(head.as_bytes()).await.expect("head");
+        for piece in events.as_bytes().chunks(37) {
+            stream.write_all(piece).await.expect("piece");
+            stream.flush().await.expect("flush");
+        }
+    });
+
+    let (mut child, mut stdin, mut stdout) = spawn_provider(&format!("http://{addr}")).await;
+    send_completion_messages(
+        &mut stdin,
+        "tool-call",
+        json!([{"role":"user","content":"locate the sources"}]),
+    )
+    .await;
+    let mut calls = Vec::new();
+    loop {
+        let event = next_completion_event(&mut stdout, "tool-call").await;
+        match event["event"].as_str() {
+            Some("tool_call") => calls.push(event),
+            Some("completed") => break,
+            Some("failed") | Some("error") => panic!("completion failed: {event:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(calls.len(), 1, "one tool call: {calls:?}");
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["name"], "mag-apply");
+    assert_eq!(
+        calls[0]["arguments"],
+        serde_json::from_str::<Value>(&arguments).expect("arguments")
+    );
+    assert_eq!(calls[0]["arguments"]["file"], "locate.mag");
+    server.await.expect("server");
+    child.kill().await.expect("kill provider");
+}
+
 #[tokio::test]
 async fn streamed_reasoning_blocks_survive_the_next_completion_request() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

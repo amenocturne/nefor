@@ -1678,4 +1678,206 @@ mod tests {
         assert_eq!(outcome.reasoning_text, "thinking only");
         assert_eq!(reasoning_ends, vec!["thinking only"]);
     }
+
+    // The source a model sent with a `mag-apply` call in a recorded session.
+    // It names a `.mag` suffix inside a shell quote, next to the call's own
+    // `file` argument.
+    const MAG_APPLY_CONTENT: &str = include_str!("../tests/fixtures/mag_apply_locate_content.mag");
+
+    fn mag_apply_arguments(file_first: bool) -> String {
+        let file = serde_json::to_string("locate.mag").unwrap();
+        let content = serde_json::to_string(MAG_APPLY_CONTENT).unwrap();
+        if file_first {
+            format!(r#"{{"file": {file}, "content": {content}}}"#)
+        } else {
+            format!(r#"{{"content": {content}, "file": {file}}}"#)
+        }
+    }
+
+    fn frame(chunk: serde_json::Value) -> String {
+        format!("data: {chunk}\n\n")
+    }
+
+    fn argument_frame(index: usize, arguments: &str) -> String {
+        frame(
+            serde_json::json!({"id": "gen-1", "provider": "Upstream", "choices": [{"index": 0,
+            "delta": {"role": "assistant", "content": "", "tool_calls": [
+                {"index": index, "function": {"arguments": arguments}}]},
+            "finish_reason": null}]}),
+        )
+    }
+
+    fn start_frame(index: usize, id: &str, arguments: &str) -> String {
+        frame(serde_json::json!({"id": "gen-1", "choices": [{"index": 0,
+            "delta": {"role": "assistant", "content": null, "tool_calls": [
+                {"index": index, "id": id, "type": "function",
+                 "function": {"name": "mag-apply", "arguments": arguments}}]},
+            "finish_reason": null}]}))
+    }
+
+    fn finish_frame() -> String {
+        frame(serde_json::json!({"id": "gen-1",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}))
+    }
+
+    /// Feed a whole SSE body to the parser in transport pieces of `piece`
+    /// bytes and return the assembled calls.
+    fn assemble(sse: &str, piece: usize) -> Vec<ToolCall> {
+        let mut buffer = SseBuffer::new();
+        let mut outcome = StreamOutcome::default();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        for part in sse.as_bytes().chunks(piece.max(1)) {
+            buffer.push_slice(part);
+            drain_complete_frames(
+                &mut buffer,
+                &mut outcome,
+                &mut tc,
+                &mut ended,
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .expect("drain ok");
+        }
+        assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
+        tc.finalize().expect("complete calls")
+    }
+
+    fn assert_locate(call: &ToolCall, expected: &str) {
+        assert_eq!(call.function.name, "mag-apply");
+        assert_eq!(call.function.arguments, expected);
+        let parsed: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+        assert_eq!(parsed["file"], "locate.mag");
+        assert_eq!(parsed["content"], MAG_APPLY_CONTENT);
+    }
+
+    #[test]
+    fn tool_call_arguments_equal_their_fragments_in_one_chunk() {
+        for file_first in [true, false] {
+            let arguments = mag_apply_arguments(file_first);
+            let sse = start_frame(0, "call_1", &arguments) + &finish_frame() + "data: [DONE]\n\n";
+            for piece in [usize::MAX, 1, 7, 64] {
+                assert_locate(&assemble(&sse, piece)[0], &arguments);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_call_arguments_equal_their_fragments_split_at_every_position() {
+        for file_first in [true, false] {
+            let arguments = mag_apply_arguments(file_first);
+            for at in (0..=arguments.len()).filter(|at| arguments.is_char_boundary(*at)) {
+                let (head, tail) = arguments.split_at(at);
+                // The name and id arrive first with empty arguments, as
+                // OpenRouter sends them, then two argument fragments.
+                let sse = start_frame(0, "call_1", "")
+                    + &argument_frame(0, head)
+                    + &argument_frame(0, tail)
+                    + &finish_frame();
+                assert_locate(&assemble(&sse, usize::MAX)[0], &arguments);
+                // The whole arguments in the first chunk's own delta, then the rest.
+                let sse =
+                    start_frame(0, "call_1", head) + &argument_frame(0, tail) + &finish_frame();
+                assert_locate(&assemble(&sse, 13)[0], &arguments);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_call_arguments_keep_fragments_that_repeat_earlier_text() {
+        // One character per fragment makes many fragments equal to an earlier
+        // one, and `.mag` itself arrives twice as a fragment of its own.
+        let arguments = mag_apply_arguments(false);
+        let mut sse = start_frame(0, "call_1", "");
+        for character in arguments.chars() {
+            sse += &argument_frame(0, &character.to_string());
+        }
+        sse += &finish_frame();
+        assert_locate(&assemble(&sse, usize::MAX)[0], &arguments);
+
+        let mut sse = start_frame(0, "call_1", "");
+        let mut rest = arguments.as_str();
+        while let Some(at) = rest.find(".mag") {
+            sse += &argument_frame(0, &rest[..at]);
+            sse += &argument_frame(0, ".mag");
+            rest = &rest[at + ".mag".len()..];
+        }
+        sse += &argument_frame(0, rest);
+        sse += &finish_frame();
+        assert_locate(&assemble(&sse, usize::MAX)[0], &arguments);
+    }
+
+    #[test]
+    fn tool_call_arguments_survive_interleaved_reasoning_usage_and_empty_deltas() {
+        let arguments = mag_apply_arguments(true);
+        let (head, tail) = arguments.split_at(arguments.find("locate").unwrap());
+        let (name, tail) = tail.split_at("locate".len());
+        let reasoning = frame(serde_json::json!({"id": "gen-1", "choices": [{"index": 0,
+            "delta": {"reasoning": "Let me use locate.mag.", "reasoning_details": [
+                {"type": "reasoning.text", "text": "Let me use locate.mag.", "index": 0}]}}]}));
+        let null_usage = frame(serde_json::json!({"id": "gen-1", "choices": [], "usage": null}));
+        // A fragment that carries reasoning and an empty-name tool-call delta
+        // beside the argument text.
+        let mixed = frame(serde_json::json!({"id": "gen-1", "choices": [{"index": 0,
+            "delta": {"content": "", "reasoning": "", "reasoning_details": [], "tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "mag-apply", "arguments": name}}]}}]}));
+        let sse = reasoning.clone()
+            + &start_frame(0, "call_1", "")
+            + ": OPENROUTER PROCESSING\n\n"
+            + &argument_frame(0, head)
+            + &null_usage
+            + &mixed
+            + &argument_frame(0, "")
+            + &argument_frame(0, tail)
+            + &finish_frame()
+            + &frame(serde_json::json!({"id": "gen-1", "choices": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}))
+            + "data: [DONE]\n\n";
+        for piece in [usize::MAX, 1, 5] {
+            assert_locate(&assemble(&sse, piece)[0], &arguments);
+        }
+    }
+
+    #[test]
+    fn two_tool_calls_keep_their_own_interleaved_fragments() {
+        let first = mag_apply_arguments(true);
+        let second = mag_apply_arguments(false);
+        let mut sse = start_frame(0, "call_1", "") + &start_frame(1, "call_2", "");
+        let (mut left, mut right) = (first.as_str(), second.as_str());
+        while !left.is_empty() || !right.is_empty() {
+            let take = |text: &mut &str, count: usize| {
+                let at = (count..=text.len())
+                    .find(|at| text.is_char_boundary(*at))
+                    .unwrap_or(text.len())
+                    .min(text.len());
+                let (head, tail) = text.split_at(at);
+                *text = tail;
+                head.to_owned()
+            };
+            sse += &argument_frame(0, &take(&mut left, 3));
+            sse += &argument_frame(1, &take(&mut right, 5));
+        }
+        sse += &finish_frame();
+        let calls = assemble(&sse, usize::MAX);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            (calls[0].id.as_str(), calls[1].id.as_str()),
+            ("call_1", "call_2")
+        );
+        assert_locate(&calls[0], &first);
+        assert_locate(&calls[1], &second);
+    }
+
+    #[test]
+    fn the_finish_chunk_may_carry_the_last_argument_fragment() {
+        let arguments = mag_apply_arguments(true);
+        let (head, tail) = arguments.split_at(arguments.find(".mag").unwrap());
+        let last = frame(serde_json::json!({"id": "gen-1", "choices": [{"index": 0,
+            "delta": {"tool_calls": [{"index": 0, "function": {"arguments": tail}}]},
+            "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}));
+        let sse = start_frame(0, "call_1", head) + &last + "data: [DONE]\n\n";
+        assert_locate(&assemble(&sse, usize::MAX)[0], &arguments);
+    }
 }
