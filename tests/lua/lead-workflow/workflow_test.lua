@@ -212,8 +212,8 @@ do
   assert_true(preview_schema ~= nil, "mag-preview is advertised")
   assert_true(apply_schema ~= nil, "mag-apply is advertised")
   for _, schema in ipairs({ write_schema, preview_schema, apply_schema }) do
-    assert_eq(schema.parameters.properties.file.pattern, "\\.(mag|magl)$",
-      schema.name .. " advertises the compiler's supported source suffixes")
+    assert_eq(schema.parameters.properties.file.pattern, "^(.*/)?[^/]+\\.(mag|magl)$",
+      schema.name .. " advertises a named file with one of the compiler's source suffixes")
   end
   assert_eq(write_schema.parameters.required[1], "file", "write requires file")
   assert_eq(write_schema.parameters.required[2], "new_string", "write requires new_string")
@@ -1233,6 +1233,57 @@ do
   assert_true(err ~= nil, "invalid MAG path returns a tool.result error")
   assert_true(err.body.error:find("path traversal", 1, true) ~= nil,
     "invalid MAG path error explains path traversal")
+end
+
+-- A MAG source file has a name before its extension. Every source tool says
+-- so itself, with the value it received, before it writes or compiles anything.
+do
+  fresh()
+  local workspace = require("libs.mag-workspace").lead_workspace(sessions.current_id())
+  local unnamed = "which has no name before the extension"
+  local cases = {
+    { file = ".mag", problem = "must name a file, like `inspect.mag`; got `.mag`, " .. unnamed },
+    { file = ".magl", problem = "must name a file, like `inspect.mag`; got `.magl`, " .. unnamed },
+    { file = "dir/.mag", problem = "must name a file, like `inspect.mag`; got `dir/.mag`, " .. unnamed },
+    { file = "notes.txt", problem = "must name a MAG source file ending in `.mag` or `.magl`, "
+        .. "like `inspect.mag`; got `notes.txt`" },
+    { file = "mag", problem = "must name a MAG source file ending in `.mag` or `.magl`, "
+        .. "like `inspect.mag`; got `mag`" },
+  }
+  local arguments = {
+    ["mag-write-file"] = function(file) return { file = file, new_string = READ_ONLY_MAG } end,
+    ["mag-preview"] = function(file) return { file = file } end,
+    ["mag-apply"] = function(file) return { file = file, content = READ_ONLY_MAG } end,
+  }
+  for _, tool_name in ipairs({ "mag-write-file", "mag-preview", "mag-apply" }) do
+    for index, case in ipairs(cases) do
+      _test.calls_clear()
+      local id = "unnamed-" .. tool_name .. "-" .. index
+      invoke_tool(id, tool_name, arguments[tool_name](case.file))
+      local result = tool_result(id)
+      assert_true(result ~= nil, tool_name .. " answers a call for `" .. case.file .. "`")
+      assert_eq(result.body.error, tool_name .. ": argument `file` " .. case.problem,
+        tool_name .. " states the file-name rule for `" .. case.file .. "`")
+      assert_true(find_call(decode_calls(), function(call)
+        return call.body.kind == "mag.load" or call.body.kind == "mag.build"
+          or call.body.kind == "tool.prepared"
+      end) == nil, tool_name .. " neither prepares nor compiles `" .. case.file .. "`")
+      local written = io.open(workspace .. "/" .. case.file, "r")
+      if written then written:close() end
+      assert_true(written == nil, tool_name .. " writes nothing for `" .. case.file .. "`")
+    end
+  end
+  -- The advertised pattern and the worded rule accept the same names.
+  local mag_workspace = require("libs.mag-workspace")
+  local matches = assert(require("libs.tool.pattern").compile(mag_workspace.SOURCE_PATH_PATTERN))
+  for _, file in ipairs({ ".mag", ".magl", "dir/.mag", "notes.txt", "mag", "a.mag/", "inspect.mag",
+      "checks/inspect.magl", "a.b.mag", "x.mag.txt", "" }) do
+    assert_eq(matches(file), mag_workspace.source_name_problem(file) == nil,
+      "pattern and rule agree on `" .. file .. "`")
+  end
+  -- A name with dots before the extension is still a name.
+  invoke_tool("named-write", "mag-write-file", { file = "checks/a.b.mag", new_string = READ_ONLY_MAG })
+  assert_eq(tool_result("named-write").body.error, nil, "a dotted file name is accepted")
 end
 
 -- Workspace-relative paths cannot escape through a symlink component.

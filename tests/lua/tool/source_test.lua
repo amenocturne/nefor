@@ -84,6 +84,7 @@ define_fails({ display = { compact = { label = "x" } } }, "invalid display")
 define_fails({ execute = "nope" }, "execute must be a function")
 define_fails({ execute = false }, "execute must be a function")
 define_fails({ handler = function() end }, "unknown field `handler`")
+define_fails({ validate = "nope" }, "validate must be a function")
 -- Nothing about a tool is implied: every part is defined or the definition fails.
 define_fails({ prepare = "nope" }, "prepare must be a function or tool.nothing")
 define_fails({ prepare = REMOVE }, "`echo`: prepare is not defined; give a function, or tool.nothing")
@@ -291,6 +292,35 @@ local function last_prepared(id)
     local body = sent[index].body
     if body.kind == "tool.prepared" and body.id == id then return body end
   end
+end
+
+-- A tool's own argument rule: checked with the schema on a prepare and on an
+-- invoke, before either function, and worded in the tool's words.
+do
+  local reached = {}
+  local ruled = tool.source { name = "ruled", tools = { tool.define(spec({
+    validate = function(args)
+      if type(args.text) == "string" and args.text:sub(1, 1) == "." then
+        return "argument `text` must not start with a dot; got `" .. args.text .. "`"
+      end
+    end,
+    prepare = function() reached[#reached + 1] = "prepare" end,
+    approval = both(function() reached[#reached + 1] = "decide"; return "safe" end),
+    execute = function(_, call) reached[#reached + 1] = "execute"; call.ok("ran") end,
+  })) } }
+  ruled.receive({ kind = "ruled.tool.prepare", id = "v1", name = "echo", approval_policy = "Default",
+    args = { text = ".hidden" } })
+  eq(last_result("v1").error, "echo: argument `text` must not start with a dot; got `.hidden`",
+    "the rule ends a prepare with the tool's wording")
+  ruled.receive({ kind = "ruled.tool.invoke", id = "v2", name = "echo", args = { text = ".hidden" } })
+  eq(last_result("v2").error, "echo: argument `text` must not start with a dot; got `.hidden`",
+    "and an invoke")
+  eq(#reached, 0, "a call the rule rejects reaches no tool function")
+  ruled.receive({ kind = "ruled.tool.invoke", id = "v3", name = "echo", args = { text = 7 } })
+  eq(last_result("v3").error, "echo: argument `text` must be a string, got integer",
+    "what the rule does not judge is the schema's")
+  ruled.receive({ kind = "ruled.tool.invoke", id = "v4", name = "echo", args = { text = "shown" } })
+  eq(last_result("v4").output, "ran", "arguments the rule accepts run")
 end
 
 -- prepare, then the decision function, then execute — on one call.

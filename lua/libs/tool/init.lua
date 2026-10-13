@@ -26,6 +26,7 @@
 --         describe = tool.nothing,
 --       },
 --     },
+--     validate = function(args) end,    -- optional; see "Argument rules"
 --     prepare = tool.nothing,                               -- or function(args, call)
 --     execute = function(args, call) call.ok(output) end,
 --     cancel = function(call) end,      -- optional
@@ -36,6 +37,17 @@
 -- naming the tool and what is missing. Lua cannot tell a field set to nil from
 -- an absent one, so "this tool has none" is written with one explicit value,
 -- `tool.nothing`.
+--
+-- ## Argument rules
+--
+-- The schema is what a provider is sent, and its own messages name the
+-- keyword that failed. A tool with a rule that deserves plain words (a file
+-- name, say) adds `validate(args) -> nil | problem`. It runs with the schema
+-- on every call, before `prepare`, on arguments that are an object, and
+-- before the schema's keywords so that its wording is the one the caller
+-- reads; it therefore tolerates arguments the schema would reject. The
+-- problem is worded like the schema's, ``argument `file` must ...``, and the
+-- caller receives it with the tool's name in front.
 --
 -- ## prepare and execute
 --
@@ -122,7 +134,7 @@ M.deferred = setmetatable({}, { __tostring = function() return "tool.deferred" e
 
 local DEFINITION_FIELDS = {
   name = true, description = true, parameters = true, display = true,
-  context = true, execution = true, approval = true,
+  context = true, execution = true, approval = true, validate = true,
   prepare = true, execute = true, cancel = true,
 }
 
@@ -178,6 +190,10 @@ function M.define(spec)
     fail(name, "prepare must be a function or tool.nothing")
   end
   if type(spec.execute) ~= "function" then fail(name, "execute must be a function") end
+  local validate = spec.validate
+  if validate ~= nil and type(validate) ~= "function" then
+    fail(name, "validate must be a function")
+  end
   if spec.cancel ~= nil and type(spec.cancel) ~= "function" then
     fail(name, "cancel must be a function")
   end
@@ -284,7 +300,14 @@ function M.define(spec)
   -- nil when `args` satisfy the schema, otherwise the caller-facing message.
   function definition.check(args)
     if args == nil then args = {} end
-    local problem = schema.validate(parameters, args)
+    local problem = nil
+    if validate and type(args) == "table" and not json_data.is_array(args) then
+      problem = validate(args)
+      if problem ~= nil and (type(problem) ~= "string" or problem == "") then
+        error("tool `" .. name .. "`: validate must return nil or a problem string", 0)
+      end
+    end
+    if problem == nil then problem = schema.validate(parameters, args) end
     if problem == nil then return nil end
     return name .. ": " .. problem
   end

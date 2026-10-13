@@ -29,6 +29,20 @@ The tools are built with [`libs.tool`](../tool/init.lua), so their schemas are
 closed: an undeclared argument such as `run_id` on `mag-apply` is rejected
 with the same message format every tool uses, before the tool runs.
 
+`file` is a path inside the caller's workspace whose last component is a file
+name followed by `.mag` or `.magl`: `inspect.mag`, `checks/inspect.mag`. A
+value with nothing before the extension (`.mag`, `dir/.magl`) or with another
+extension is rejected by all three source tools when the arguments are
+checked, before anything is written or compiled, in one sentence that states
+the rule and repeats the value: ``mag-apply: argument `file` must name a
+file, like `inspect.mag`; got `.mag`, which has no name before the
+extension``. The rule lives in `libs.mag-workspace` (`source_name_problem`),
+and the schema carries it as `SOURCE_PATH_PATTERN`, anchored at both ends so
+that a model host which reads a schema `pattern` as a whole-value match
+(grammar-constrained tool calls) and one which searches for a match admit the
+same names. The compiler states the same two cases for a path that reaches it
+another way.
+
 ## Approval: the workflow is the unit
 
 Every `mag-apply` goes through the tool gate like any tool call, in three

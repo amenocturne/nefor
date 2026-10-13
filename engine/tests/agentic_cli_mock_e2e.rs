@@ -1173,7 +1173,9 @@ fn unusable_tool_call_answers_with_the_callers_available_tools() {
 /// The file name a model gives `mag-apply` is the name every stage sees: the
 /// recorded tool call, the gate's invocation, the compiler's entry and the
 /// file in the lead's workspace. The source is the one a model sent in a
-/// recorded session, which itself mentions a `.mag` suffix.
+/// recorded session, which itself mentions a `.mag` suffix. A file with no
+/// name before its extension is then refused by each MAG source tool in one
+/// sentence, and nothing is written or compiled for it.
 #[test]
 fn mag_apply_keeps_the_file_name_the_model_gave() {
     let dir = isolated_starter("mag-file-name-");
@@ -1204,9 +1206,25 @@ fn mag_apply_keeps_the_file_name_the_model_gave() {
     );
     let result: serde_json::Value = serde_json::from_str(&success(&output)).unwrap();
     let answer = result["answer"].as_str().unwrap();
+    let (applied, refused) = answer.split_once("\n<").unwrap();
     assert!(
-        answer.starts_with("APPLIED ") && !answer.contains("[tool error]"),
-        "the workflow ran: {answer}"
+        applied.starts_with("APPLIED ") && !applied.contains("[tool error]"),
+        "the workflow ran: {applied}"
+    );
+    let unnamed = |tool: &str, file: &str| {
+        format!(
+            "[tool error] {tool}: argument `file` must name a file, like `inspect.mag`; \
+             got `{file}`, which has no name before the extension"
+        )
+    };
+    assert_eq!(
+        format!("<{}", refused.trim_end()),
+        format!(
+            "<{}>\n<{}>\n<{}>",
+            unnamed("mag-write-file", ".mag"),
+            unnamed("mag-preview", "dir/.mag"),
+            unnamed("mag-apply", ".magl")
+        )
     );
 
     let session = result["session_id"].as_str().unwrap();
@@ -1216,10 +1234,12 @@ fn mag_apply_keeps_the_file_name_the_model_gave() {
         std::fs::read_to_string(workspace.join("locate.mag")).unwrap(),
         content
     );
-    assert!(
-        !workspace.join(".mag").exists(),
-        "no file without a name before the extension"
-    );
+    for unnamed in [".mag", "dir", ".magl"] {
+        assert!(
+            !workspace.join(unnamed).exists(),
+            "nothing is written for a file without a name: {unnamed}"
+        );
+    }
 
     // Every recorded stage of the call names the same file.
     let persisted = std::fs::read_to_string(sessions.join(format!("{session}.jsonl"))).unwrap();
@@ -1257,7 +1277,21 @@ fn mag_apply_keeps_the_file_name_the_model_gave() {
             "mag.build" | "mag.load" => "compile",
             kind => kind,
         };
-        assert_eq!(file, "locate.mag", "{stage} names the file: {body}");
+        // The refused calls are recorded as the model made them and reach
+        // the tool's argument check, and no further.
+        if file != "locate.mag" {
+            assert!(
+                matches!(
+                    stage,
+                    "tool_call_fragment_appended"
+                        | "tool_call_completed"
+                        | "tool-gate.tool.invoke"
+                        | "lead-workflow.tool.prepare"
+                ),
+                "{stage} never sees a file without a name: {body}"
+            );
+            continue;
+        }
         stages.push(stage.to_owned());
     }
     for stage in [

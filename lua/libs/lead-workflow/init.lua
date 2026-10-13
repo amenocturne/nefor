@@ -1788,6 +1788,16 @@ end
 
 local advertised = false
 
+local MAG_FILE_DESCRIPTION = "MAG source path relative to your MAG workspace: a file name "
+  .. "followed by .mag or .magl, like inspect.mag or checks/inspect.mag."
+
+-- The `file` rule of the MAG source tools, in words; the schema carries the
+-- same rule as a pattern.
+local function mag_file_problem(args)
+  local problem = mag.source_name_problem(args.file)
+  return problem and ("argument `file` " .. problem) or nil
+end
+
 -- Replaced in tool_definitions by the fold over the compiled workflow.
 local MAG_APPLY_DECIDE = function() error("mag-apply's decision is not wired", 0) end
 
@@ -1889,6 +1899,7 @@ local function lead_workflow_tool_specs()
     },
     {
       name = "mag-write-file",
+      validate = mag_file_problem,
       -- Writes only the caller's own MAG workspace: nothing runs.
       approval = {
         ReadOnly = { decide = "safe", describe = tool.nothing },
@@ -1904,13 +1915,14 @@ local function lead_workflow_tool_specs()
         "new_string may be empty. Paths are relative to your workspace, which no other caller can " ..
         "reach through these tools; absolute paths, .. segments and symlinks are rejected.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
+        file = { type = "string", pattern = mag.SOURCE_PATH_PATTERN, description = MAG_FILE_DESCRIPTION },
         new_string = { type = "string", description = "Complete contents or replacement text; may be empty." },
         old_string = { type = "string", description = "Optional non-empty exact text that must occur once." },
       }, required = { "file", "new_string" } },
     },
     {
       name = "mag-preview",
+      validate = mag_file_problem,
       approval = {
         ReadOnly = { decide = "safe", describe = tool.nothing },
         Default = { decide = "safe", describe = tool.nothing },
@@ -1923,11 +1935,12 @@ local function lead_workflow_tool_specs()
         "and returns the complete node tree the workflow would run. Compilation errors are returned " ..
         "as errors.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", pattern = "\\.(mag|magl)$", description = "Existing MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
+        file = { type = "string", pattern = mag.SOURCE_PATH_PATTERN, description = "Existing " .. MAG_FILE_DESCRIPTION },
       }, required = { "file" } },
     },
     {
       name = "mag-apply",
+      validate = mag_file_problem,
       -- Decided by folding over the compiled workflow (assess_workflow); the
       -- decision function is attached in tool_definitions.
       approval = {
@@ -1958,7 +1971,7 @@ local function lead_workflow_tool_specs()
         "failure together with the workflow tree. A longer run returns a run_id, the workflow tree, " ..
         "and how its result will reach you.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
+        file = { type = "string", pattern = mag.SOURCE_PATH_PATTERN, description = MAG_FILE_DESCRIPTION },
         content = { type = "string", description = "Optional complete source written to file before running, replacing any existing contents." },
       }, required = { "file" } },
     },

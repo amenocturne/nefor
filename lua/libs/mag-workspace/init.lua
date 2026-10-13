@@ -95,6 +95,31 @@ local function workspace_symlink(workspace)
   return false
 end
 
+-- The JSON Schema pattern of a MAG source path: any folders, then a file name
+-- with at least one character before `.mag` or `.magl`. It is anchored at
+-- both ends, so it means the same to a reader that searches for a match and
+-- to one that requires the whole value to match (as the grammar-constrained
+-- decoders of some model hosts do).
+M.SOURCE_PATH_PATTERN = "^(.*/)?[^/]+\\.(mag|magl)$"
+
+-- nil when `file` names a MAG source file, otherwise what is wrong with it,
+-- worded to follow ``argument `file` ``. The same rule as SOURCE_PATH_PATTERN,
+-- in words and with the value received.
+function M.source_name_problem(file)
+  if type(file) ~= "string" then return nil end
+  local name = file:match("[^/]*$")
+  local stem, extension = name:match("^(.*)%.([^.]*)$")
+  if extension ~= "mag" and extension ~= "magl" then
+    return "must name a MAG source file ending in `.mag` or `.magl`, like `inspect.mag`; got `"
+      .. file .. "`"
+  end
+  if stem == "" then
+    return "must name a file, like `inspect.mag`; got `" .. file
+      .. "`, which has no name before the extension"
+  end
+  return nil
+end
+
 -- Resolve a model-authored source name inside one workspace. Rejecting
 -- symlink components is what makes lexical containment meaningful even when a
 -- prior process has written into the workspace.
