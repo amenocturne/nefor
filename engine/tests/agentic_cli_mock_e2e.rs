@@ -1526,6 +1526,28 @@ fn a_read_only_agents_workflows_are_decided_by_its_policy_in_every_mode() {
             }),
             "{mode}: a ReadOnly agent is never asked about"
         );
+        // Each agent's request describes mag-apply for that agent's policy:
+        // the ReadOnly worker is told what is rejected, the Default lead gets
+        // the registered description with nothing appended.
+        let descriptions = std::fs::read_to_string(dir.join("approval-descriptions.txt")).unwrap();
+        let described = |who: &str| {
+            descriptions
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{who}=")))
+                .unwrap_or_else(|| panic!("{mode}: no description noted for {who}: {descriptions}"))
+                .to_owned()
+        };
+        assert_eq!(described("lead"), "REGISTERED", "{mode}");
+        let worker_description = described("worker");
+        assert!(
+            worker_description.starts_with("Runs MAG code.")
+                && worker_description.ends_with(
+                    "Your approval policy is ReadOnly: a workflow that declares nodes that are \
+                     not read-only, or agents with a wider approval policy than yours, is rejected."
+                ),
+            "{mode}: {worker_description}"
+        );
+
         // The writing workflow's file was written by prepare and stays.
         assert!(
             dir.join("data/nefor/sessions")

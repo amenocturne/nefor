@@ -88,6 +88,7 @@ impl CapabilityBridge {
             "tools",
             "output_schema",
             "tool_specs",
+            "approval_policy",
             "context_watermark",
             "notice_id",
             "epoch_id",

@@ -215,6 +215,35 @@ do
     "an empty table is the same as none")
 end
 
+-- Appending happens once, where one request's tools are assembled for an
+-- agent: the registered specs, the names the agent may call, and its policy.
+do
+  local registered = {
+    write = { name = "write", owner = "files", description = "Writes.", parameters = { type = "object" },
+      execution = { kind = "routed" }, policy_descriptions = { ReadOnly = "Rejected for you." } },
+    read = { name = "read", owner = "files", description = "Reads.", parameters = { type = "object" } },
+    hidden = { name = "hidden", owner = "files", description = "Not allowed.",
+      policy_descriptions = { ReadOnly = "Never shown." } },
+  }
+  local names = { "read", "write", "missing" }
+  local specs = tool.request_tool_specs(names, registered, nil, "ReadOnly")
+  eq(#specs, 1, "only a tool with text for the policy gets a request definition")
+  eq(specs[1].name, "write", "the tool with text")
+  eq(specs[1].description, "Writes.\n\nRejected for you.", "the text is appended to the description")
+  eq(specs[1].owner, "files", "the definition keeps the registered owner")
+  eq(specs[1].execution.kind, "routed", "and its execution")
+  eq(registered.write.description, "Writes.", "the registered spec is not changed")
+  eq(#tool.request_tool_specs(names, registered, nil, "Default"), 0, "nothing is appended for a policy without text")
+  eq(#tool.request_tool_specs(names, registered, nil, nil), 0, "nor for a request without a policy")
+  eq(#tool.request_tool_specs(names, registered, nil, "Rules"), 0, "nor for an unknown policy")
+  eq(#tool.request_tool_specs({ "read" }, registered, nil, "ReadOnly"), 0,
+    "a tool outside the agent's names is never described")
+  local own = { { name = "write_output", description = "Own." }, { name = "write", description = "Request-local." } }
+  local merged = tool.request_tool_specs(names, registered, own, "ReadOnly")
+  eq(#merged, 2, "the request's own definitions are kept")
+  eq(merged[2].description, "Request-local.", "and one of them is never replaced")
+end
+
 local function last_prepared(id)
   for index = #sent, 1, -1 do
     local body = sent[index].body

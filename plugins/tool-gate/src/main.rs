@@ -280,6 +280,10 @@ struct ToolSpec {
     parameters: Value,
     display: Value,
     execution: ToolExecution,
+    /// Text the tool adds to its description for an agent with a given
+    /// approval policy, keyed by policy name. Carried to the public registry
+    /// unchanged; whoever assembles an agent's request appends it.
+    policy_descriptions: Option<Value>,
 }
 
 /// Pending forwarded invocation: maps the gate-minted inner id (used to
@@ -771,12 +775,15 @@ async fn handle_tools_advertise(
                 .map_err(|e| "invalid display for ".to_owned() + &name + ": " + &e)?;
             let execution = ToolExecution::parse(t.get("execution"), &source)
                 .map_err(|e| "invalid execution for ".to_owned() + &name + ": " + &e)?;
+            let policy_descriptions = parse_policy_descriptions(t.get("policy_descriptions"))
+                .map_err(|e| "invalid policy_descriptions for ".to_owned() + &name + ": " + &e)?;
             Ok(ToolSpec {
                 name,
                 description,
                 parameters,
                 display,
                 execution,
+                policy_descriptions,
             })
         })
         .collect::<Result<_, _>>();
@@ -1245,12 +1252,36 @@ fn tool_register_body(state: &GateState) -> Map<String, Value> {
         m.insert("parameters".into(), ts.parameters.clone());
         m.insert("display".into(), ts.display.clone());
         m.insert("execution".into(), ts.execution.wire_value());
+        if let Some(descriptions) = &ts.policy_descriptions {
+            m.insert("policy_descriptions".into(), descriptions.clone());
+        }
         tools.push(Value::Object(m));
     }
     let mut m = Map::new();
     m.insert("kind".into(), Value::String("tool.register".into()));
     m.insert("tools".into(), Value::Array(tools));
     m
+}
+
+/// An advertised tool's per-policy description text: an object from an
+/// approval policy's name to non-empty text. An empty object is the same as
+/// none.
+fn parse_policy_descriptions(value: Option<&Value>) -> Result<Option<Value>, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "must be an object".to_owned())?;
+    for (policy, text) in object {
+        if ApprovalPolicy::parse(policy).is_none() {
+            return Err(format!("unknown approval policy `{policy}`"));
+        }
+        if !text.as_str().is_some_and(|text| !text.is_empty()) {
+            return Err(format!("text for `{policy}` must be a non-empty string"));
+        }
+    }
+    Ok((!object.is_empty()).then(|| value.clone()))
 }
 
 /// Read an optional invocation field holding tool names. `Err` carries the
@@ -3958,5 +3989,62 @@ mod tests {
         invoke.insert("workflow_node".into(), json!("true"));
         handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
         assert_eq!(next(&mut rx)["kind"], "tools.tool.prepare");
+    }
+
+    #[tokio::test]
+    async fn per_policy_descriptions_reach_the_public_registry_unchanged() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let advertise = advertise_body(
+            TOOLS,
+            json!([
+                {"name": "write", "description": "Writes.", "parameters": {},
+                 "policy_descriptions": {"ReadOnly": "Rejected for you."}},
+                {"name": "read", "description": "Reads.", "parameters": {}},
+                {"name": "empty", "description": "Says nothing.", "parameters": {},
+                 "policy_descriptions": {}}
+            ]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let register = next(&mut rx);
+        let tools = register["tools"].as_array().unwrap();
+        let by_name = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(
+            by_name("write")["policy_descriptions"],
+            json!({"ReadOnly": "Rejected for you."})
+        );
+        assert_eq!(
+            by_name("write")["description"],
+            "Writes.",
+            "the gate appends nothing"
+        );
+        assert!(by_name("read").get("policy_descriptions").is_none());
+        assert!(by_name("empty").get("policy_descriptions").is_none());
+
+        for (bad, expected) in [
+            (json!({"Rules": "x"}), "unknown approval policy `Rules`"),
+            (
+                json!({"ReadOnly": ""}),
+                "text for `ReadOnly` must be a non-empty string",
+            ),
+            (json!("text"), "must be an object"),
+        ] {
+            let advertise = advertise_body(
+                "other",
+                json!([{"name": "odd", "description": "", "parameters": {},
+                        "policy_descriptions": bad}]),
+            );
+            handle_tools_advertise(&tx, &advertise, &mut state)
+                .await
+                .unwrap();
+            let error = next(&mut rx);
+            assert_eq!(error["kind"], "tool-gate.advertise_error");
+            assert!(
+                error["message"].as_str().unwrap().contains(expected),
+                "{error}"
+            );
+        }
     }
 }

@@ -226,6 +226,22 @@ do
 end
 
 -- ==================================================================
+-- the agent's approval policy rides on every provider request by name
+-- ==================================================================
+
+do
+  local instance, msgs = make("reader.llm", { provider = "p",
+    tool_approval_policy = { constructor = "ReadOnly" } })
+  instance.deliver(turn({ messages = { { role = "user", content = "look" } } }))
+  assert_eq(find_last_kind(msgs, "capability.invoke").request.approval_policy, "ReadOnly",
+    "the provider request names the agent's approval policy")
+  local plain, plain_msgs = make("plain.llm", { provider = "p" })
+  plain.deliver(turn({ messages = { { role = "user", content = "look" } } }))
+  assert_eq(find_last_kind(plain_msgs, "capability.invoke").request.approval_policy, nil,
+    "an actor without a policy states none")
+end
+
+-- ==================================================================
 -- steering lands after the current exchange and before the next round
 -- ==================================================================
 

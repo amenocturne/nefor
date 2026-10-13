@@ -494,6 +494,42 @@ function M.source(opts)
   return source
 end
 
+-- The tool definitions of one provider request, for an agent with approval
+-- policy `policy`. `names` are the registered tools the agent may call,
+-- `registered` maps a tool name to its registered spec (as the gate's
+-- `tool.register` lists it, `policy_descriptions` included), and `tool_specs`
+-- are the request's own definitions. For every named tool whose spec has
+-- text for `policy`, the result gains a request definition equal to the
+-- registered one with that text appended to its description; a provider
+-- prefers a request definition over its catalog entry of the same name and
+-- owner. A tool with nothing to add, and a request without a known policy,
+-- are left alone. This is the only place per-policy text is appended.
+function M.request_tool_specs(names, registered, tool_specs, policy)
+  local specs = {}
+  local defined = {}
+  for index, spec in ipairs(tool_specs or {}) do
+    specs[index] = spec
+    if type(spec) == "table" and type(spec.name) == "string" then defined[spec.name] = true end
+  end
+  if not approval.is_policy(policy) then return specs end
+  for _, tool_name in ipairs(names or {}) do
+    local spec = registered[tool_name]
+    local text = type(spec) == "table" and type(spec.policy_descriptions) == "table"
+      and spec.policy_descriptions[policy] or nil
+    if type(text) == "string" and text ~= "" and not defined[tool_name] then
+      defined[tool_name] = true
+      specs[#specs + 1] = {
+        name = tool_name,
+        owner = spec.owner,
+        description = tostring(spec.description or "") .. "\n\n" .. text,
+        parameters = json_data.copy(spec.parameters),
+        execution = spec.execution and json_data.copy(spec.execution) or nil,
+      }
+    end
+  end
+  return specs
+end
+
 -- What a call of a named tool means under an approval policy, read from the
 -- tools of `sources`: `decide(tool_name, policy, args) -> result, reason`.
 -- It returns nothing for a tool none of the sources define, or one that does

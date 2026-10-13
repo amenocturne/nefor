@@ -406,7 +406,7 @@ function M.build(options)
 
   local invocation_fields = {
     "model", "tools", "reasoning_effort", "provider_options", "output_schema",
-    "tool_specs", "invocation", "notice_id", "epoch_id",
+    "tool_specs", "approval_policy", "invocation", "notice_id", "epoch_id",
   }
 
   local function handle_provider_invoke(body)

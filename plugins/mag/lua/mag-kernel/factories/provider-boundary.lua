@@ -8,6 +8,7 @@ local kinds = require("kinds")
 local conversation_facts = require("conversation-facts")
 local json_data = require("core.json_data")
 local policy_api = require("libs.compaction-policy")
+local approval = require("libs.tool.approval")
 local M = {}
 
 local DIAGNOSTIC_LIMIT = 160
@@ -133,6 +134,18 @@ function M.construct(id, params, emit, options)
   local policy, policy_error = policy_api.lower(params.compaction_policy)
   if not policy then return nil, policy_error end
   local compaction = options.compaction
+  -- The agent's approval policy, when its node carries one. Its name rides on
+  -- every provider request so the request's tool descriptions can say what
+  -- that policy means for each tool.
+  local approval_policy
+  if params.tool_approval_policy ~= nil then
+    local policy_error
+    approval_policy, policy_error = approval.from_mag(params.tool_approval_policy)
+    if not approval_policy then
+      return nil, string.format("%s '%s': params.tool_approval_policy: %s",
+        factory_name, tostring(id), policy_error)
+    end
+  end
   params.tools = json_data.copy(params.tools or {})
   params.tool_specs = json_data.copy(params.tool_specs or {})
   for _, name in ipairs(params.tools) do
@@ -497,6 +510,7 @@ function M.construct(id, params, emit, options)
       provider_options = params.provider_options,
       output_schema = params.schema,
       tool_specs = params.tool_specs,
+      approval_policy = approval_policy,
     }
   end
 

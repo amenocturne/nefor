@@ -56,11 +56,34 @@ local function apply_results(request)
   return seen
 end
 
+-- The description of mag-apply this request carries for its agent, wherever
+-- the request holds its own tool definitions; nil when it carries none and
+-- the provider would use the registered description.
+local function own_mag_apply_description(value, depth)
+  if type(value) ~= "table" or (depth or 0) > 8 then return nil end
+  if value.name == "mag-apply" and type(value.description) == "string" then return value.description end
+  for _, child in pairs(value) do
+    local found = own_mag_apply_description(child, (depth or 0) + 1)
+    if found then return found end
+  end
+  return nil
+end
+
+local noted = {}
+local function note_description(who, request)
+  if noted[who] then return end
+  noted[who] = true
+  local file = assert(io.open("approval-descriptions.txt", "a"))
+  file:write(who, "=", (own_mag_apply_description(request.body) or "REGISTERED"):gsub("\n", " "), "\n")
+  file:close()
+end
+
 local function respond(request)
   local last = request.messages[#request.messages]
   local worker = type(request.system) == "string"
     and string.find(request.system, WORKER_SYSTEM, 1, true) ~= nil
   local results = apply_results(request)
+  note_description(worker and "worker" or "lead", request)
 
   if worker then
     if #results == 0 then return mock.tool_call("mag-apply", { file = "reads.mag", content = READS }) end

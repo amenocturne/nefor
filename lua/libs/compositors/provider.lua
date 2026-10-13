@@ -45,6 +45,7 @@
 local M = {}
 local json_data = require("core.json_data")
 local error_value = require("core.error")
+local tool = require("libs.tool")
 
 -- opts.hooks lets downstream callers splice per-envelope logic into the
 -- two translation seams without forking this file. Both hooks are
@@ -96,6 +97,17 @@ function M.spawn_spec(name, command, opts)
   local conversations = opts.conversations
   if type(conversations) ~= "table" or type(conversations.context) ~= "function" then
     error("provider.spawn_spec: opts.conversations read facet is required")
+  end
+
+  -- The gate's public tool registry by tool name, kept for the per-policy
+  -- text a tool adds to its description (`policy_descriptions`).
+  local registered_tools = {}
+  local function request_tool_specs(body)
+    local specs = tool.request_tool_specs(body.tools, registered_tools,
+      json_data.copy(body.tool_specs), body.approval_policy)
+    if body.tool_specs == nil and #specs == 0 then return nil end
+    if type(nefor.json.mark_array) == "function" then nefor.json.mark_array(specs) end
+    return specs
   end
 
   local provider_lib = require(opts.translator_lib or "openai-provider")
@@ -301,7 +313,9 @@ function M.spawn_spec(name, command, opts)
       provider_options = clone_table(body.provider_options),
       tools = clone_table(body.tools),
       output_schema = clone_table(body.output_schema),
-      tool_specs = clone_table(body.tool_specs),
+      -- The one place a request's tool definitions meet the agent's
+      -- approval policy: tools with text for that policy get it appended.
+      tool_specs = request_tool_specs(body),
       invocation = clone_table(body.invocation),
     }
     local ok, native = pcall(translator.complete, request, context)
@@ -970,6 +984,16 @@ function M.spawn_spec(name, command, opts)
   --   3. translator.deliver to the peer's stdin.
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
+      -- The gate's public registry: kept for the per-policy tool descriptions.
+      if not env.replay and type(env.body) == "table" and env.body.kind == "tool.register"
+          and type(env.body.tools) == "table" then
+        registered_tools = {}
+        for _, spec in ipairs(env.body.tools) do
+          if type(spec) == "table" and type(spec.name) == "string" then
+            registered_tools[spec.name] = spec
+          end
+        end
+      end
       local kind = type(env.body) == "table" and env.body.kind or nil
       if env.replay then
         -- Provider calls remain inert during replay. Only this actor's durable
