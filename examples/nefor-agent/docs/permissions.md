@@ -13,16 +13,19 @@ mode verdict.
 
 ## Approval policy and mode
 
-What an agent may do with its tools is its **approval policy**, written on the
-agent in MAG as `tool_approval_policy`. There are two, in order:
+What an agent may do with its tools is its **approval policy**. An agent is
+given a toolset, and a toolset is its tools together with its policy, so the
+two cannot be paired wrongly. There are two policies, in order:
 
 - `ToolApprovalPolicy.ReadOnly` — the agent may only read. Anything else is
   rejected, in every mode, and the agent is never asked about.
 - `ToolApprovalPolicy.Default` — the configured behaviour for the current mode.
 
-The policy is the only source of truth. It is not derived from the agent's
-tool list: an agent built with `nefor.read_only_tools` and `Default` is a
-`Default` agent with few tools.
+The starter's toolsets are `nefor.read_only_tools` (policy `ReadOnly`: the
+read tools plus the tools to write, preview, apply, await and stop a
+workflow) and `nefor.general_tools` (policy `Default`), both defined in
+`mag/lib/nefor/toolsets.json`. Another selection is written
+`Toolset {policy: ..., tools: [...]}`.
 
 The **mode** is the user's choice for the session: `/safe`, `/auto`, or
 `/yolo`. At process start, `nefor run --mode safe|auto|yolo` selects the
@@ -54,22 +57,29 @@ otherwise the call is answered as an unknown tool in every mode.
 
 ### What the starter's tools say
 
+Every tool defines what a call means under both policies; nothing is filled
+in by a setting.
+
 | Tool | ReadOnly | Default |
 | ---- | -------- | ------- |
-| `read_file`, `read_image`, `discover_instruction_files` | safe | configured: automatic |
-| `mag-status`, `mag-await`, `mag-terminate`, `mag-write-file`, `mag-preview` | safe | configured: automatic |
-| `git_worktree_open` | safe | configured: asks |
-| `write_file` | denied: it writes a file | safe with a current approved write-review plan, otherwise denied |
-| `write-review` | denied: it asks you to approve a plan to write | configured: automatic |
-| `git_worktree_create` | denied: it creates a worktree and a branch | configured: asks |
-| `shell.script`, `process.exec` | what the command classifier says about the command, with the strict read-only flags | what the classifier says, with the wide flags |
+| `read_file`, `read_image`, `discover_instruction_files` | safe | safe |
+| `mag-status`, `mag-await`, `mag-terminate`, `mag-write-file`, `mag-preview` | safe | safe |
+| `write-review` | denied: it asks you to approve a plan to write | safe |
+| `write_file` | denied: it writes a file | safe with a current approved write-review plan, otherwise denied (this starter's choice) |
+| `git_worktree_create` | denied: it creates a worktree and a branch | unsure (this starter's choice) |
+| `git_worktree_open` | safe | unsure (this starter's choice) |
+| `shell.script`, `process.exec` | what the classifier says, with the strict read-only rules | what the classifier says, with the wide rules and its model |
 | `mag-apply` | the workflow as a whole, see below | the workflow as a whole |
 
-"Configured" is `config.active.tool_gate`: a tool in `auto_tools` is safe, any
-other tool is unsure. Commands are classified by `da`: it approves (safe),
-defers (unsure), or denies. A missing or unusable `da` denies with an
-actionable reason. `process.exec` arguments are written as the equivalent
-quoted shell command and classified the same way.
+Commands are classified by `da` 0.3: it approves (safe), defers (unsure), or
+denies. For a `ReadOnly` agent only its read-only rules apply, so a command
+they do not recognise is unsure and the call is rejected. For a `Default`
+agent the wide rules apply and, for a command no rule recognises, the
+classifier's model: it approves what it is confident is safe and denies what
+it classifies as dangerous. `process.exec` arguments are written as the
+equivalent quoted shell command and classified the same way. If the
+classifier cannot be run or answers with anything else, the call fails with
+an error that says classification failed; that is not a decision.
 
 ### Workflows are approved as a unit
 

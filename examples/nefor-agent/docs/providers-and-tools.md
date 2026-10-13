@@ -22,7 +22,7 @@ A provider subprocess speaks NCP, but provider request/history/stream types are 
 
 The ChatGPT provider owns the `web_search` descriptor and advertises it when
 the composition-selected tool gate announces liveness. Configuration selects
-the ordinary catalog name in an agent's `tools` list; it does not reproduce the
+the ordinary catalog name in an agent's toolset; it does not reproduce the
 descriptor or pass a process-wide switch. Selected + advertised + matching
 provider lowers to ChatGPT's native Responses tool with
 `external_web_access: false`. Unselected, stale, and wrong-provider descriptors
@@ -60,7 +60,14 @@ return require("libs.read-only-tools").build {
         expanded = { label = "My read tool", fields = {} },
         result = { kind = "content", fields = {} },
       },
-      approval = { decide = require("libs.tool.approval").reads() },
+      -- What a call means for a caller with each approval policy, and what
+      -- the tool adds to its description for such an agent. Every policy
+      -- needs an entry.
+      approval = {
+        ReadOnly = { decide = "safe", describe = tool.nothing },
+        Default = { decide = "safe", describe = tool.nothing },
+      },
+      prepare = tool.nothing,
       execute = function(args, call)
         call.ok("result for " .. args.query)
         -- On expected failure, call call.err("message") instead.
@@ -70,46 +77,72 @@ return require("libs.read-only-tools").build {
 }
 ```
 
-Base tools are opt-in: `build {}` advertises none. The available base tools are repository instruction discovery and ordinary workflow skill loading; shell/process capabilities handle directory listings, searches, and Python analysis. `tool.define` checks the schema and Nefor's `display` metadata when the tool is defined, and rejects schema keywords its validator does not support. Every schema is closed: arguments not declared in `properties` are rejected, and invalid arguments never reach the tool; the caller receives an error such as ``my_read_tool: unknown argument `q`; accepted arguments: query``. `execute` settles exactly once through `call.ok` or `call.err`. `approval.decide` says what a call means under the calling agent's approval policy: `approval.reads()` declares a tool that only reads, so a `ReadOnly` agent may call it; a tool that declares nothing is rejected for a `ReadOnly` agent and follows the gate's configured setting otherwise. All tools built here share source identity `read-only-tools`.
+Base tools are opt-in: `build {}` advertises none. The available base tools are repository instruction discovery and ordinary workflow skill loading; shell/process capabilities handle directory listings, searches, and Python analysis. `tool.define` checks the schema and Nefor's `display` metadata when the tool is defined, and rejects schema keywords its validator does not support. Every schema is closed: arguments not declared in `properties` are rejected, and invalid arguments never reach the tool; the caller receives an error such as ``my_read_tool: unknown argument `q`; accepted arguments: query``. `execute` settles exactly once through `call.ok` or `call.err`. `approval` says what a call means for a caller with each approval policy; nothing is assumed, so a definition without `approval` for every policy, or without `prepare`, fails when the tool is defined. All tools built here share source identity `read-only-tools`.
 
 Spawn the actor before `tool-gate`; it advertises on the gate's hello. A tool intended for delegated agents may also need entries in the MAG toolset/allowlist, gate policy, and startup readiness.
 
 ## Permission policy
 
 Registration makes a tool available; it does not authorize every call. What an
-agent may do is its `tool_approval_policy` (`ReadOnly` or `Default`), and each
-tool says what a call means under a policy. The gate decides from the two and
-the permission mode; see the [permissions guide](permissions.md).
+agent may do is the approval policy of its toolset (`ReadOnly` or `Default`),
+and each tool says what a call means under each policy. The gate decides from
+the two and the permission mode; see the [permissions guide](permissions.md).
 
-A tool declares its meaning in its definition:
+Nothing is implied. A tool defines, in its definition, an entry for every
+approval policy and its `prepare` step, or the definition fails:
 
 ```lua
-local approval = require("libs.tool.approval")
+local tool = require("libs.tool")
 
 tool.define {
   name = "publish_note",
   -- description, parameters, display ...
   approval = {
-    -- (policy, args, call) -> "safe" | "unsure" | "denied", reason
-    decide = function(policy, args)
-      if policy == approval.ReadOnly then return approval.denied, "it publishes a note" end
-      if args.draft then return approval.safe end
-      return approval.unsure, "it publishes to everyone"
-    end,
-    -- Appended to the description for an agent with that policy.
-    describe = { ReadOnly = "Your approval policy is ReadOnly, so every call to this tool is rejected." },
+    ReadOnly = {
+      -- "safe", { "unsure", reason }, { "denied", reason }, or a function
+      decide = { "denied", "it publishes a note" },
+      -- Appended to the description for an agent with this policy.
+      describe = "Your approval policy is ReadOnly, so every call to this tool is rejected.",
+    },
+    Default = {
+      decide = function(args, call)
+        if args.draft then return "safe" end
+        return "unsure", "it publishes to everyone"
+      end,
+      describe = tool.nothing,
+    },
   },
+  prepare = tool.nothing,
   execute = function(args, call) call.ok("published") end,
 }
 ```
 
-`approval.reads()` and `approval.writes(reason)` cover the two common cases. A
-tool that declares nothing follows the gate's configured setting
-(`tool_gate.auto_tools` / `prompt_tools` / `default_action`) for a `Default`
-agent and is rejected for a `ReadOnly` agent.
+`tool.nothing` is the explicit "this tool has none". A decision function that
+returns no valid decision, or raises, ends the call with an error; failing to
+decide is never a decision. The gate has no per-tool settings that stand in
+for a definition; its one setting is `--deny <tool>`.
+
+Where a configuration chooses what one of Nefor's tools means for a `Default`
+agent, it says so where it builds the tool:
+
+```lua
+tools.git_worktree_actor_spec {
+  decide_create = { "unsure", "it creates a Git worktree and a branch" },
+  decide_open = { "unsure", "it opens a Git worktree outside the session" },
+}
+tools.basic_actor_spec {
+  max_read_bytes = N,
+  classify_command = validator.classify_command,
+  classify_argv = validator.classify_argv,
+  decide_write = function()            -- write_file for a Default agent
+    if lead_workflow.has_approved_plan() then return "safe" end
+    return "denied", "write_file requires an approved plan"
+  end,
+}
+```
 
 Commands are classified by `libs.tool-validator`, which the command tools and
-`mag-apply` decide from:
+`mag-apply` decide from. All three options are required:
 
 ```lua
 local pm = require("nefor-pm")
@@ -118,11 +151,13 @@ pm.install { da.package { commit = "<trusted-da-commit>" } }
 
 local validator = require("libs.tool-validator").build {
   classifier = pm.bin("da", "da"),
-  -- Optional. Replace a policy's classifier flags outright:
-  classifier_args = { ReadOnly = { "--read-only", "--git", "read" } },
-  -- Optional. The classifier's opt-in model flag, added to Default only:
-  model_flag = nil,
-  -- Optional. Approve narrow commands before the classifier is asked:
+  -- The classifier's flags for every approval policy. A flag such as da's
+  -- `--ml` model is listed for the policies that should use it.
+  classifier_args = {
+    ReadOnly = { "--read-only", "--git", "read" },
+    Default = { "--read-only", "--git", "read,add,commit", "--ml" },
+  },
+  -- Approve narrow commands before the classifier is asked; {} for none.
   command_fastpaths = {
     function(command, policy)
       return policy == "Default" and command:match("^my%-cli%s+read%s") ~= nil
@@ -135,16 +170,12 @@ actor.spawn(validator)
 ```
 
 The classifier reads the command on stdin and exits 0 to approve, 1 to defer
-or 2 to deny. A missing or unusable classifier makes the command denied with
-an actionable reason; it never becomes approval or an unresolved wait.
+or 2 to deny; pass it no mode flag. A classifier that cannot be run, or that
+exits with any other status, raises: the tool call ends with an error that
+says classification failed and why, never with a policy answer.
 `classify_argv` writes the vector as the equivalent POSIX command, every
 element single-quoted, and classifies that text, so a program and a script are
 judged by the same rules. Fast paths are trusted policy predicates.
-
-The starter wires the classification into `basic_actor_spec` and gives
-`write_file` its plan rule there (`decide_write`): under `Default` it needs a
-current approved write-review plan, and it is always rejected for a `ReadOnly`
-agent.
 
 ## Tool plugins
 

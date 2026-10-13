@@ -9,7 +9,7 @@ running workflows.
 
 ## Tool projection
 
-Agent `tools` lists are requested capability profiles, not schema registries.
+An agent's toolset names requested capabilities; its `tools` list is not a schema registry.
 MAG snapshots the configured tool gate's owner-qualified `tool.register`
 advertisement and attaches the matching descriptors to each provider request.
 Providers consume that request-local snapshot, while the original names remain

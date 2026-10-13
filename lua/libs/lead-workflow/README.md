@@ -41,18 +41,30 @@ call with the compiler's message; there is nothing to decide.
 
 The assessment is a fold over every node the kernel would spawn
 (`libs.mag-workspace`'s `fold_nodes(decoded, initial, f)`), templates of
-dynamic workflows included:
+dynamic workflows included. What a kind of node means is not decided here:
+each kernel factory declares it, and the MAG runtime publishes the
+declarations as `factory_approvals`.
 
 - a script or process node means what the `shell.script` or `process.exec`
   tool says its command means under the caller's policy (the configured
   command classification; a process's argument vector is classified as the
   equivalent quoted shell command);
 - a worktree node means what its tool says;
-- a command whose text is bound to a run-time value is unsure;
+- a param bound to a run-time value means what the node's factory says: for a
+  command's text, unsure;
 - an agent node whose approval policy is wider than the caller's is a denial;
   the agent is not silently narrowed;
-- routing, typing, waiting and human-approval nodes change nothing; a kind of
-  node nobody has described is unsure.
+- routing, typing, model, waiting and human-approval nodes are declared safe
+  by their factories.
+
+A kind of node the runtime did not describe, a capability no tool defines, a
+classifier that fails, or an agent node without a policy cannot be assessed.
+That is an error for the call, naming every such node, never a result:
+
+```text
+mag-apply: the workflow could not be assessed:
+- node `x`: the MAG runtime does not say what a `nefor.factory.teleport` node means for approval
+```
 
 Denied dominates unsure, which dominates safe. The gate's decision table turns
 the result into run, ask or deny, so a `ReadOnly` agent's workflow that is not
@@ -62,13 +74,13 @@ listed:
 ```text
 tool `mag-apply` was not run: your approval policy is ReadOnly and the workflow declares 2 nodes not shown to be allowed under the ReadOnly approval policy:
 - node `build` (shell script) `make all`: not shown to be read-only
-- node `writer` (agent) with approval policy Default: wider than ReadOnly, the approval policy of the agent applying the workflow
+- node `writer` (agent) with approval policy Default: its approval policy is wider than that of the agent applying the workflow (ReadOnly)
 ```
 
 Once a workflow runs, its own nodes are not asked about again. The
 composition supplies the capability meanings with
 `configure_approval { decide_capability = require("libs.tool").decision { sources } }`;
-without it no command is vouched for and every command node is unsure.
+without it a workflow with a capability node cannot be assessed.
 
 The plan-review rule below is separate and unchanged: in `safe` mode a
 workflow with write-capable agents also needs an approved plan.

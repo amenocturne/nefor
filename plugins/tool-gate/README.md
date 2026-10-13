@@ -58,16 +58,16 @@ The chain is always: a caller invokes a tool, the gate decides, and the tool
 executes or the caller receives an error saying why it did not. Nothing
 executes before the decision.
 
-1. `tool-gate.tool.invoke { id, name, args, approval_policy?, allowlist? }`.
+1. `tool-gate.tool.invoke { id, name, args, approval_policy, allowlist? }`.
    `approval_policy` is the calling agent's policy by name, `ReadOnly` or
-   `Default`. A caller that states none gets `Default`; any other value is an
-   error.
+   `Default`, and is required: a call that states none, or another value, is
+   answered with an error. Nothing is assumed for a caller that does not say.
 2. The gate sends `<source>.tool.prepare` with the same fields. The source
    checks the arguments, runs the tool's `prepare` step and its decision
-   function, and answers `tool.prepared { id, decision?, reason? }` with
-   `decision` one of `safe`, `unsure`, `denied`. A source may instead end the
-   call with `tool.result { error }`. Every source must answer one way or the
-   other; `libs.tool` sources do.
+   function, and answers `tool.prepared { id, decision, reason? }` with
+   `decision` one of `safe`, `unsure`, `denied`; `unsure` and `denied` carry a
+   reason. A source may instead end the call with `tool.result { error }`.
+   Every source must answer one way or the other; `libs.tool` sources do.
 3. The gate applies the decision table to the caller's policy, the permission
    mode and the assessment, policy first:
 
@@ -95,21 +95,27 @@ tool `write_file` was not run: your approval policy is ReadOnly and it writes a 
 tool `write_file` was not run: write_file requires an approved plan
 ```
 
+The gate never stands in for a tool that did not decide. An answer without a
+decision, with an unknown decision, or with `unsure` / `denied` and no reason
+ends the call with an error, in every mode and under every policy:
+
+```text
+tool `read_file` could not be decided: its source answered without a decision
+```
+
 A call marked `workflow_node: true` was made by a node of a running workflow
-(a script, a process, a worktree), not by a model. The workflow was approved
-as a unit before it started, so the gate only transports such a call: it goes
-straight to `<source>.tool.invoke`, and neither the policy nor the mode is
-consulted.
+(a script, a process, a worktree), not by a model. It has no agent and no
+policy; the workflow was approved as a unit before it started, so the gate
+only transports such a call: it goes straight to `<source>.tool.invoke`, and
+neither the policy nor the mode is consulted. A call that carries both the
+marker and a policy is an error, as is a marker that is not `true`.
 
-Per-tool setting via CLI flags, used when a tool answers no decision:
+One setting, on the command line:
 
-- `--auto <name>` -- such a call is safe
-- `--prompt <name>` -- such a call is unsure
-- `--deny <name>` -- every call is denied, whatever the tool says
-- `--default <auto|prompt|deny>` -- fallback for unlisted tools (default: `prompt`)
+- `--deny <name>` -- every call of the tool is denied, whatever the tool says
 
-The setting speaks for a `Default` caller only. Under `ReadOnly` a call its
-tool did not assess is denied, because nothing showed that it fits the policy.
+There is no `--auto`, `--prompt` or `--default`: what a call means is defined
+by its tool, for every policy.
 
 An advertised tool may carry `policy_descriptions`, an object from a policy
 name to text the tool adds to its description for an agent with that policy.

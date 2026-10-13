@@ -77,31 +77,47 @@ review belongs to lead-workflow. These are three independent boundaries.
 
 ## Tool approval
 
-An agent's `ToolApprovalPolicy` is the only statement of what that agent may
-do with its tools. It is one ordered sum type, `ReadOnly < Default`, declared
-in `nefor.contracts`; `lua/libs/tool/approval.lua` repeats the order once for
-Lua (a test keeps the two in step) and is the only place Lua compares
-policies. Nothing normalizes the value and nothing derives it from the agent's
-tool list: the agent's `run-tool` actor receives it as authored and sends its
-name as `approval_policy` with every tool call. The wire names a policy, never
-the mechanism that classifies commands.
+An agent is given one `Toolset {policy, tools}` (`nefor.contracts`): the tools
+it may call and its `ToolApprovalPolicy` are one value, so the two cannot be
+paired wrongly, and that policy is the only statement of what the agent may
+do. The policy is one ordered sum type, `ReadOnly < Default`;
+`lua/libs/tool/approval.lua` repeats the order once for Lua (a test keeps the
+two in step) and is the only place Lua compares policies. A configuration's
+toolsets manifest (`nefor/toolsets.json`) states each toolset's policy with
+its tools, `{"read_only": {"policy": "ReadOnly", "tools": [...]}}`; a toolset
+without a policy, with an unknown policy, or with another key does not load,
+in MAG (`nefor.toolsets`) or in the prompt context (`libs.mag-context`, which
+renders each toolset with its policy). Agent lowering puts the toolset's
+tools and policy on the agent's model and `run-tool` actors; `run-tool` sends
+the policy's name as `approval_policy` with every tool call. The wire names a
+policy, never the mechanism that classifies commands.
+
+Nothing here is implied. Every owner below either defines its part or the
+missing part is an error that names it: there is no default policy, no
+default decision, and no configured setting that stands in for a tool.
 
 The chain for a tool call is always the same: the model calls a tool, the gate
 decides, and the tool executes or the model receives an error saying why it did
 not. Nothing executes before the decision. Three owners take part:
 
-- **The tool says what a call means.** Every tool has two functions, `prepare`
-  (nil for most) and `execute`, and may declare `approval.decide(policy, args,
-  call)`, which answers `safe`, `unsure` or `denied` with a reason, and
-  `approval.describe[policy]`, text for an agent with that policy. They live
-  together in the tool's definition (`libs.tool`), so what is enforced and
-  what the model is told cannot drift. There is no central list of read-only
-  tools.
-- **The gate decides** (`plugins/tool-gate/src/policy.rs`). It asks the tool's
-  source with `<source>.tool.prepare`; the source validates the arguments, runs
-  `prepare`, then the decision function, and answers `tool.prepared`. The gate
-  applies one table to the caller's policy, the permission mode and that
-  assessment, policy first:
+- **The tool says what a call means.** Every tool defines `prepare` and
+  `execute`, and an `approval` entry for every policy: `decide`, which is
+  `safe`, `{ "unsure", reason }`, `{ "denied", reason }` or a function of the
+  call's arguments returning one of them, and `describe`, text for an agent
+  with that policy. A tool with no prepare step or nothing to add writes the
+  one explicit value `tool.nothing`. A definition that leaves any of this out
+  fails when the tool is defined (`libs.tool`), and a decision function that
+  returns no valid decision, or raises, ends the call with an error. Where a
+  configuration chooses what one of Nefor's tools means for a `Default`
+  caller, it passes that choice where it builds the tool: `decide_write` to
+  `basic_actor_spec`, `decide_create` and `decide_open` to
+  `git_worktree_actor_spec`.
+- **The gate decides** (`plugins/tool-gate/src/policy.rs`). A call must state
+  its `approval_policy`. The gate asks the tool's source with
+  `<source>.tool.prepare`; the source validates the arguments, runs `prepare`,
+  then the decision, and answers `tool.prepared`. The gate applies one table
+  to the caller's policy, the permission mode and that assessment, policy
+  first:
 
   | assessment | ReadOnly (every mode) | Default, safe | Default, auto | Default, yolo |
   | ---------- | --------------------- | ------------- | ------------- | ------------- |
@@ -111,51 +127,65 @@ not. Nothing executes before the decision. Three owners take part:
 
   The table is in the Rust gate because deciding whether a call may execute is
   what the gate is for, and it alone holds the mode, the registry and every
-  call in flight; it stays ignorant of what any tool does. A tool that answers
-  no decision is assessed from the gate's configured per-tool setting under
-  `Default` (`--auto` safe, `--prompt` unsure) and denied under a narrower
-  policy; `--deny` denies whatever the tool says. Then the gate sends
-  `<source>.tool.invoke` under the same id, or asks with
+  call in flight; it stays ignorant of what any tool does. A call without a
+  policy, an answer without a decision, an unknown decision, or `unsure` /
+  `denied` without a reason is an error for the call. The gate's only
+  configured setting is `--deny <tool>`, an explicit restriction. After the
+  decision it sends `<source>.tool.invoke` under the same id, or asks with
   `chat.tool.permission_request`, or answers the caller with an error and
   tells the source to drop the prepared call. It forwards the caller's policy
   on both requests.
 - **Command classification** is `libs.tool-validator`'s
-  `classify_command(policy, command)`: one classifier executable, flags per
-  policy, exit status 0 approve, 1 defer, 2 deny. `shell.script` decides from
-  it; `process.exec` writes its argument vector as the equivalent POSIX command
-  with every element single-quoted (`core.shell`) and decides from the same
-  function. The validator's actor only forwards the gate's question to the
-  chat surface.
+  `classify_command(policy, command)`: one classifier executable, exit status
+  0 approve, 1 defer, 2 deny, with the flags for every policy given
+  explicitly by the configuration (the starter's are in
+  `examples/nefor-agent/tool-validator/init.lua`). `shell.script` decides
+  from it; `process.exec` writes its argument vector as the equivalent POSIX
+  command with every element single-quoted (`core.shell`) and decides from
+  the same function. A classifier that cannot be run, or that exits with any
+  other status, raises: the call ends with an error saying classification
+  failed, never with a policy answer. The validator's actor only forwards the
+  gate's question to the chat surface.
 
 A workflow is the unit of approval. `mag-apply`'s `prepare` writes the file,
 its decision function compiles it and folds over every node the kernel would
 spawn (`libs.mag-workspace`'s `fold_nodes(decoded, initial, f)`, which also
 visits the templates of dynamic workflows), and `execute` runs exactly the
-artifact that was assessed. A command node means what the tool with the same
-capability says it means; an agent node with a policy wider than the applying
-agent's is a denial; a command bound to a run-time value is unsure; denied
-dominates unsure, which dominates safe, and every node that is not safe is
-listed in the error. The result goes through the table like any other tool's.
-This holds for every `mag-apply`, including one made by an agent inside
-another workflow.
+artifact that was assessed. What a kind of node means is declared by the
+kernel factory that defines it (`declaration.approval`, checked when the
+factory is registered and published as `factory_approvals` on `mag.hello` and
+`mag.loaded`; see `plugins/mag/lua/mag-kernel/node-approval.lua`): a fixed
+decision per policy for routing, model, waiting and human-approval nodes; for
+a command or worktree node, the tool that owns its capability, the params
+that are its arguments, and what each param means when a dynamic workflow
+binds it at run time; for an agent's `run-tool` node, that a policy wider
+than the applying agent's is a denial. A capability node therefore means what
+the tool with the same capability says. Denied dominates unsure, which
+dominates safe, and every node that is not safe is listed in the error. A
+kind of node the runtime did not describe, a capability no tool defines, or a
+node that cannot be assessed is an error naming the node, not a result. The
+result goes through the table like any other tool's. This holds for every
+`mag-apply`, including one made by an agent inside another workflow.
 
 Once a workflow runs, the requests its own nodes make (scripts, processes,
 worktrees) are marked `workflow_node` by the kernel and the gate only
-transports them: they are not prepared, decided or asked about again. A model
-cannot produce that marker; it is set by the kernel's node factories, and an
-agent's tool calls come from `run-tool`, which always states the agent's
-policy. Runs start in two places only: `mag-apply`'s `execute`, after the
-gate's decision, and the agentic loop, which starts the lead's turn program.
-That program is authored by the configuration, not applied by a model, so it
-does not go through the gate and its nodes are treated like those of an
-approved run; the lead's own tool calls carry the lead's policy like any
-agent's.
+transports them: such a call has no agent and no policy, and is not prepared,
+decided or asked about again. A model cannot produce that marker; it is set
+by the kernel's node factories, and an agent's tool calls come from
+`run-tool`, which always states the agent's policy. A call that carries both,
+or neither, is an error. Runs start in two places only: `mag-apply`'s
+`execute`, after the gate's decision, and the agentic loop, which starts the
+lead's turn program. That program is authored by the configuration, not
+applied by a model, so it does not go through the gate and its nodes are
+treated like those of an approved run; the lead's own tool calls carry the
+lead's policy like any agent's.
 
 Per-policy description text is appended in one place: the provider compositor
 (`lua/libs/compositors/provider.lua`), where one request's tools meet the
-agent's policy (`libs.tool`'s `request_tool_specs`). The text travels in the
-gate's registry beside the description, and the compositor hands the provider
-a request definition with it appended.
+agent's policy (`libs.tool`'s `request_tool_specs`). Every provider request
+names its agent's policy; the text travels in the gate's registry beside the
+description, and the compositor hands the provider a request definition with
+it appended.
 
 Authored `Timeout` units normalize once in `nefor.timeout`, shared by process
 and shell constructors. The library owns positivity and unit factors; MAG's
@@ -226,7 +256,7 @@ Lua owns behavior that is composition-specific or bus-aware:
 - Actor spawning and dispatch wiring (`examples/nefor-agent/init.lua`, `lua/core/actor.lua`).
 - Session root selection, persistence, replacement, resume, and replay (`examples/nefor-agent/init.lua`, `lua/libs/sessions`). Rust remains session-blind; the starter defaults the root to `$NEFOR_DATA_DIR/sessions` and permits `NEFOR_SESSIONS_DIR` to replace it.
 - Command classification and plan review (`lua/libs/tool-validator`, `lua/libs/lead-workflow`); see [Tool approval](#tool-approval) for who decides what.
-- Tool construction (`lua/libs/tool`). Plugins provide capabilities; tools — name, description, closed parameter schema, display contract, argument validation, `prepare` and `execute`, and what a call means under each approval policy — are built only in Lua with `libs.tool`. A Rust-backed tool is a Lua tool whose `execute` sends a capability request (`libs.compositors.tools.capability_tools_spec` wraps `basic-tools` and `git-worktree`); a pure-Lua tool's `execute` does the work. Every schema is closed and validated by the tool's source before either function runs, so arguments a gate approval replaces are validated too. Validation is not tool-gate's job: the gate only decides whether an invocation may execute. A call naming a tool its caller cannot use — one that does not exist, or one outside the invocation's `allowlist` — gets one answer in the same style, ``unknown tool `x`; available tools: a, b``, listing what that caller's model was offered in the order it was offered. The gate words it, because it alone holds both the registry and the invocation's allowlist; a MAG agent's run-tool actor forwards the call with its allowlist and the request-local tool names its provider actor added, and never judges the name itself.
+- Tool construction (`lua/libs/tool`). Plugins provide capabilities; tools — name, description, closed parameter schema, display contract, argument validation, `prepare` and `execute`, and what a call means under every approval policy — are built only in Lua with `libs.tool`. A Rust-backed tool is a Lua tool whose `execute` sends a capability request (`libs.compositors.tools.capability_tools_spec` wraps `basic-tools` and `git-worktree`); a pure-Lua tool's `execute` does the work. Every schema is closed and validated by the tool's source before either function runs, so arguments a gate approval replaces are validated too. Validation is not tool-gate's job: the gate only decides whether an invocation may execute. A call naming a tool its caller cannot use — one that does not exist, or one outside the invocation's `allowlist` — gets one answer in the same style, ``unknown tool `x`; available tools: a, b``, listing what that caller's model was offered in the order it was offered. The gate words it, because it alone holds both the registry and the invocation's allowlist; a MAG agent's run-tool actor forwards the call with its allowlist and the request-local tool names its provider actor added, and never judges the name itself.
 - Provider/tool adapters and interface reducers. The ChatGPT adapter defines its six web reads with `libs.tool` as ordinary routed tools; the provider process executes them through a standalone `/alpha/search` client sharing its Responses HTTP/auth boundary, while Lua and the tool gate retain routing and permission policy. The adapter accepts private web traffic only from the selected gate, Rust revalidates invocation provenance before HTTP, each run-tool shares its companion LLM's conversation identity, and oversized results use the gate's generic retrievable output dump rather than a web-specific persistence path.
 - Markdown destination metadata and pointer gesture recognition belong to the TUI plugin; activation policy belongs to optional Lua `on_link`, never to a built-in opener. Generic `tui.open_external` and clipboard effects report outcomes independently. The canonical chat entry adapts activation into its configured extension event hook; extension popup state is separate from correlated canonical popup state, which always has precedence.
 - Chat event/key sequencing through `libs.chat.controller`, assembled from named handler groups with `libs.chat.dispatch`. The starter supplies its command handler as one visible group; consumers can use the defaults, wrap or replace a handler with an explicit duplicate policy, or bypass the controller and use `nefor-tui` primitives directly.

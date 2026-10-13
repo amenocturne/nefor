@@ -52,12 +52,6 @@ M.active = {
     },
   },
 
-  tool_gate = {
-    default_action = "prompt",
-    auto_tools = { "read_file", "read_image", "mag-write-file", "mag-preview", "mag-apply" },
-    prompt_tools = {},
-  },
-
   chat_extension = "my-chat-extension",
 }
 
