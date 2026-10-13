@@ -111,7 +111,8 @@ function M.build(config)
       emit(sign({
         kind = "capability.invoke",
         capability = config.tool,
-        request = { name = config.tool, args = params },
+        -- A node's own work: approved with its workflow, transported by the gate.
+        request = { name = config.tool, args = params, workflow_node = true },
         ref = { operation = config.operation },
       }))
       return { status = "pending" }

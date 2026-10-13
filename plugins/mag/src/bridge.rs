@@ -288,7 +288,14 @@ fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
         _ => Value::Object(request.clone()),
     };
     out.insert("args".into(), args);
-    for key in ["allowlist", "request_local_tools", "approval_policy"] {
+    // `approval_policy` is the calling agent's policy; `workflow_node` marks a
+    // request a workflow node makes for itself, which the gate only transports.
+    for key in [
+        "allowlist",
+        "request_local_tools",
+        "approval_policy",
+        "workflow_node",
+    ] {
         if let Some(value) = request.get(key).filter(|value| !value.is_null()) {
             out.insert(key.into(), value.clone());
         }

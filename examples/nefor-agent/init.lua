@@ -377,14 +377,10 @@ local tool_validator = require("tool-validator").build {
   model_flag = nil,
 }
 actor.spawn(tool_validator)
-lead_workflow.configure_approval {
-  classify_command = tool_validator.classify_command,
-  classify_argv = tool_validator.classify_argv,
-}
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
-actor.spawn(tools.git_worktree_actor_spec())
-actor.spawn(tools.basic_actor_spec {
+local git_worktree_tools = tools.git_worktree_actor_spec()
+local basic_tools = tools.basic_actor_spec {
   max_read_bytes = model_context_policy.item_limit,
   classify_command = tool_validator.classify_command,
   classify_argv = tool_validator.classify_argv,
@@ -393,7 +389,14 @@ actor.spawn(tools.basic_actor_spec {
     if lead_workflow.has_approved_plan() then return "safe" end
     return "denied", "write_file requires an approved plan"
   end,
-})
+}
+actor.spawn(git_worktree_tools)
+actor.spawn(basic_tools)
+-- mag-apply approves a workflow as a unit: each command or worktree node
+-- means what the tool with the same capability says it means.
+lead_workflow.configure_approval {
+  decide_capability = require("libs.tool").decision { basic_tools.source, git_worktree_tools.source },
+}
 if startup.frontend == "tui" then
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),

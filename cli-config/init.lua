@@ -253,15 +253,15 @@ local function fixture_classification(policy)
   if policy == approval.Default then return approval.safe end
   return approval.unsure, "this configuration has no command classifier"
 end
-lead_workflow.configure_approval {
-  classify_command = fixture_classification,
-  classify_argv = fixture_classification,
-}
-actor.spawn(tools.basic_actor_spec {
+local basic_tools = tools.basic_actor_spec {
   max_read_bytes = model_context_policy.item_limit,
   classify_command = fixture_classification,
   classify_argv = fixture_classification,
-})
+}
+actor.spawn(basic_tools)
+lead_workflow.configure_approval {
+  decide_capability = require("libs.tool").decision { basic_tools.source },
+}
 
 -- ------------------------------------------------------------------
 -- Virtual agentic-cli plugin — calls nefor.plugins.spawn directly to

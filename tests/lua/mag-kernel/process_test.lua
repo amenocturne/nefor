@@ -59,6 +59,8 @@ for _, case in ipairs({
   local invocation = find(messages, "capability.invoke")
   assert_eq(invocation.capability, case.capability, "capability name")
   assert_eq(invocation.request.name, case.capability, "request name")
+  assert_eq(invocation.request.workflow_node, true, "a node's own request is marked as such")
+  assert_eq(invocation.request.approval_policy, nil, "a node has no approval policy of its own")
   assert_eq(invocation.request.args.cwd, "/repo", "cwd retained")
   assert_eq(invocation.request.args.timeout.present, false, "explicit unbounded timeout retained")
   assert_eq(invocation.request.args.timeout.milliseconds, 0, "unbounded timeout sentinel retained")

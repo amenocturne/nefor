@@ -371,6 +371,19 @@ pub mod bridge {
                     "approval_policy": "ReadOnly"
                 }))]
             );
+            // A node's own request carries its marker and no policy.
+            let node = bridge.translate_emit(obj(json!({
+                "kind": "tool.invoke", "id": "cap-2", "from": "build",
+                "name": "shell.script",
+                "args": {"name": "shell.script", "args": {"script": "ls"}, "workflow_node": true}
+            })));
+            assert_eq!(
+                node,
+                vec![obj(json!({
+                    "kind": "custom-gate.tool.invoke", "id": "cap-2", "from": "build",
+                    "name": "shell.script", "args": {"script": "ls"}, "workflow_node": true
+                }))]
+            );
             let cancel = bridge.translate_emit(obj(json!({"kind": "tool.cancel", "id": "cap-1"})));
             assert_eq!(cancel[0]["kind"], "custom-gate.tool.cancel");
         }

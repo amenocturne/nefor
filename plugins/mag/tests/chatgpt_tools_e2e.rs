@@ -112,7 +112,9 @@ async fn expect_denial_without_source_invocation(
             continue;
         };
         let kind = body.get("kind").and_then(Value::as_str);
-        if kind.is_some_and(|kind| kind.ends_with(".tool.invoke")) {
+        if kind
+            .is_some_and(|kind| kind.ends_with(".tool.invoke") || kind.ends_with(".tool.prepare"))
+        {
             panic!("blocked invocation reached a source: {body:?}");
         }
         if kind == Some("tool.result") && body.get("id").and_then(Value::as_str) == Some(blocked_id)
@@ -409,6 +411,19 @@ nefor.artifact.compile(topology)
                 .expect("tool-gate.tool.invoke.id must be a string")
                 .to_owned();
             send(&mut gate_in, "mag", invoke).await;
+
+            // The gate asks the source what the call means before deciding.
+            // This source assesses nothing, so the gate's `--prompt` setting
+            // for read_file applies to the Default caller and the user is asked.
+            let prepare = next_kind(&mut gate_out, "basic-tools.tool.prepare").await;
+            assert_eq!(prepare["name"], "read_file");
+            assert_eq!(prepare["approval_policy"], "Default");
+            send(
+                &mut gate_in,
+                "basic-tools",
+                object(json!({"kind": "tool.prepared", "id": prepare["id"]})),
+            )
+            .await;
 
             let permission = next_kind(&mut gate_out, "chat.tool.permission_request").await;
             assert_eq!(permission["tool"], "read_file");

@@ -494,6 +494,25 @@ function M.source(opts)
   return source
 end
 
+-- What a call of a named tool means under an approval policy, read from the
+-- tools of `sources`: `decide(tool_name, policy, args) -> result, reason`.
+-- It returns nothing for a tool none of the sources define, or one that does
+-- not say. The workflow runner decides a workflow's capability nodes with it,
+-- so a node and a tool call share one definition of each capability.
+function M.decision(sources)
+  if type(sources) ~= "table" then error("tool.decision: sources must be a list", 2) end
+  return function(tool_name, policy, args)
+    for _, source in ipairs(sources) do
+      local definition = source.get(tool_name)
+      if definition ~= nil then
+        if definition.decide == nil then return nil end
+        return definition.decide(policy, args)
+      end
+    end
+    return nil
+  end
+end
+
 -- Pure-Lua actor for a source whose tool functions run in this VM. It advertises on
 -- every live `<gate>.hello` and serves prepares, invocations and cancellations; replayed
 -- traffic is ignored.

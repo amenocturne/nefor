@@ -67,6 +67,7 @@ do
   local invoke = find(messages, "capability.invoke")
   assert_eq(invoke.capability, "git_worktree_create", "create capability")
   assert_eq(invoke.request.args.path, "/wt", "create forwards path")
+  assert_eq(invoke.request.workflow_node, true, "a node's own request is marked as such")
   assert_eq(invoke.request.args.base, "main", "create forwards base")
 
   local completion = instance.deliver(reply(invoke.ref, {

@@ -166,7 +166,10 @@ local function factory(config)
       emit(sign({
         kind = "capability.invoke",
         capability = config.capability,
-        request = { name = config.capability, args = request_args },
+        -- A node's own work, not a model's tool call: the workflow that
+        -- declares this node was approved as a unit before it ran, so the
+        -- tool gate transports this request without deciding it again.
+        request = { name = config.capability, args = request_args, workflow_node = true },
         ref = { call = seq },
       }))
       return { status = "pending" }

@@ -80,6 +80,7 @@ local results_lib    = require("libs.agentic-loop.results")
 local tool_display   = require("libs.chat.tool_display")
 local tool           = require("libs.tool")
 local approval       = require("libs.tool.approval")
+local shell          = require("core.shell")
 local model_snapshot = require("libs.model-snapshot")
 
 local function display_field(label, source, path, kind, extra)
@@ -149,11 +150,12 @@ local project_build = nil
 local agent_system = nil
 local ambient_context = nil
 local resolve_model_snapshot = nil
--- The configured command classification (libs.tool-validator): what a
--- command, or a program run from an argument vector, means under an approval
--- policy. mag-apply decides a workflow's command nodes from it.
-local classify_command = nil
-local classify_argv = nil
+-- What a capability call means under an approval policy, as its tool says:
+-- `decide_capability(tool_name, policy, args) -> result, reason`, or nothing
+-- when no tool by that name says. mag-apply decides a workflow's capability
+-- nodes (commands, worktrees) from it, so a node and the tool with the same
+-- capability are judged by one definition.
+local decide_capability = nil
 
 local SYNC_COMPLETION_GRACE_MS = 3000
 local TERMINATION_CONFIRM_TIMEOUT_MS = 30000
@@ -454,6 +456,153 @@ end
 local function has_approved_plan()
   return type(state.active_plan) == "table"
          and state.active_plan.status == "approved"
+end
+
+-- ## Workflow approval
+--
+-- A workflow is approved as a unit, when an agent applies it. mag-apply's
+-- decision function folds over every node the kernel would spawn for the
+-- compiled workflow and asks what each means under the applying agent's
+-- approval policy. Once the gate lets the call run, the workflow's own nodes
+-- are not asked about again when they fire.
+
+local FACTORY_PREFIX = "nefor.factory."
+
+local function factory_name(actor)
+  local factory = tostring(actor.factory or "")
+  if factory:sub(1, #FACTORY_PREFIX) == FACTORY_PREFIX then
+    return factory:sub(#FACTORY_PREFIX + 1)
+  end
+  return factory
+end
+
+local MAX_DETAIL = 200
+
+local function clip(text)
+  text = tostring(text)
+  if #text > MAX_DETAIL then return text:sub(1, MAX_DETAIL) .. "…" end
+  return text
+end
+
+-- Nodes that call a capability: the tool that owns the capability's meaning,
+-- the node's params as that tool's arguments, the params that are the
+-- command's text, and how the node is shown in an error.
+local CAPABILITY_NODES = {
+  ["shell-script"] = {
+    capability = "shell.script", kind = "shell script", text = { script = true },
+    args = function(params) return { script = params.script } end,
+    detail = function(params) return "`" .. clip(params.script) .. "`" end,
+  },
+  ["process-exec"] = {
+    capability = "process.exec", kind = "process", text = { argv = true },
+    args = function(params) return { argv = params.argv } end,
+    detail = function(params)
+      return "`" .. clip(shell.quote_argv(params.argv) or "(malformed argv)") .. "`"
+    end,
+  },
+  ["worktree-create"] = {
+    capability = "git_worktree_create", kind = "worktree creation", text = {},
+    args = function(params) return params end,
+    detail = function(params) return "at `" .. clip(params.path) .. "`" end,
+  },
+  ["worktree-open"] = {
+    capability = "git_worktree_open", kind = "worktree", text = {},
+    args = function(params) return params end,
+    detail = function(params) return "at `" .. clip(params.path) .. "`" end,
+  },
+}
+
+-- Nodes that change nothing outside their run: routing, typing and waiting.
+-- An agent's model and tool-result actors are here too; what the agent may do
+-- is decided from its run-tool actor's approval policy, and each of its tool
+-- calls goes through the gate under that policy. A human approval node asks
+-- the user a question and changes nothing. A factory missing from both
+-- tables is unsure, so a new kind of node is never approved by omission.
+local INERT_NODES = {
+  adapter = true, llm = true, ["structured-output"] = true, ["tool-result"] = true,
+  source = true, sink = true, stub = true, ["retry-gate"] = true, human = true,
+  ["dynamic-each"] = true, ["dynamic-index"] = true, ["dynamic-output"] = true,
+  ["dynamic-all"] = true,
+}
+
+local function node_name(node)
+  local actor = node.actor
+  if node.kind == "template" then
+    return tostring(actor.slot or actor.id) .. " (template of " .. tostring(node.operation.id) .. ")"
+  end
+  return tostring(actor.id)
+end
+
+-- One node under `policy`: result, why, what kind of node, and its detail.
+local function assess_node(policy, node)
+  local actor = node.actor
+  local params = type(actor.params) == "table" and actor.params or {}
+  local factory = factory_name(actor)
+
+  if factory == "run-tool" then
+    local name = node_name(node):gsub("%.run%-tool", "", 1)
+    local node_policy = approval.from_mag(params.tool_approval_policy)
+    if node_policy == nil then
+      return approval.denied, "it has no valid approval policy", "agent", nil, name
+    end
+    if approval.wider(node_policy, policy) then
+      return approval.denied,
+        "wider than " .. policy .. ", the approval policy of the agent applying the workflow",
+        "agent", "with approval policy " .. node_policy, name
+    end
+    return approval.safe, nil, "agent", nil, name
+  end
+
+  local capability = CAPABILITY_NODES[factory]
+  if capability ~= nil then
+    local detail = capability.detail(params)
+    for _, binding in ipairs(type(actor.parameter_bindings) == "table" and actor.parameter_bindings or {}) do
+      local path = type(binding) == "table" and binding.path or nil
+      if type(path) == "table" and capability.text[path[1]] then
+        return approval.unsure, "its command is bound to a value known only at run time",
+          capability.kind, detail
+      end
+    end
+    if type(decide_capability) ~= "function" then
+      return approval.unsure, "no capability decision is configured", capability.kind, detail
+    end
+    local result, reason = decide_capability(capability.capability, policy, capability.args(params))
+    if result == nil then
+      -- The capability's tool does not say: denied under a narrower policy,
+      -- as at the gate, and unsure under Default.
+      if policy == approval.Default then
+        return approval.unsure, "its tool does not say what it does", capability.kind, detail
+      end
+      return approval.denied, "its tool does not say what it does under this policy",
+        capability.kind, detail
+    end
+    return result, reason, capability.kind, detail
+  end
+
+  if INERT_NODES[factory] then return approval.safe end
+  return approval.unsure, "nothing says what a `" .. factory .. "` node does", "node", nil
+end
+
+-- Fold a decoded workflow into one result for `policy`: denied dominates,
+-- then unsure, then safe. Every node that is not safe is listed in the
+-- reason, not only the first.
+local function assess_workflow(policy, decoded)
+  local state_ = mag.fold_nodes(decoded, { result = approval.safe, offenders = {} },
+    function(sofar, node)
+      local result, why, kind, detail, name = assess_node(policy, node)
+      sofar.result = approval.combine(sofar.result, result)
+      if result ~= approval.safe then
+        sofar.offenders[#sofar.offenders + 1] = "- node `" .. (name or node_name(node)) .. "` ("
+          .. tostring(kind) .. ")" .. (detail and (" " .. detail) or "") .. ": "
+          .. tostring(why or (result == approval.denied and "not allowed" or "not shown to be allowed"))
+      end
+      return sofar
+    end)
+  if state_.result == approval.safe then return approval.safe end
+  local count = #state_.offenders
+  return state_.result, "the workflow declares " .. count .. (count == 1 and " node" or " nodes")
+    .. " not shown to be allowed under the " .. policy .. " approval policy:\n"
+    .. table.concat(state_.offenders, "\n")
 end
 
 -- Tool: write-review.
@@ -1721,6 +1870,11 @@ local function lead_workflow_tool_specs()
     },
     {
       name = "mag-apply",
+      -- Decided by folding over the compiled workflow (assess_workflow); the
+      -- decision function is attached in tool_definitions.
+      approval = { describe = { [approval.ReadOnly] =
+        "Your approval policy is ReadOnly: a workflow that declares nodes that are not read-only, "
+        .. "or agents with a wider approval policy than yours, is rejected." } },
       display = display_contract("mag apply", display_field("file", "args", "file", "path"),
         {}, "receipt", "MAG graph applied", {
           display_field("status", "result", "status", "status", { omit = "missing" }),
@@ -1776,6 +1930,12 @@ local function begin_mag_load(firing_id, action, args, ws, provenance)
   local run_id
   if action == "apply" then run_id = args.run_id or run_registry:mint_run_id()
   else run_id = "mag-load-" .. envelope.uuid_lite() end
+  -- An assessed apply runs the artifact it was assessed on, as a fresh run.
+  local invocation_kind = action
+  if action == "assess" then
+    run_id = run_registry:mint_run_id()
+    invocation_kind = "apply"
+  end
   local load_id = "mag-load-" .. envelope.uuid_lite()
 
   state.pending_mag_load[load_id] = {
@@ -1785,7 +1945,7 @@ local function begin_mag_load(firing_id, action, args, ws, provenance)
     run_id     = run_id,
     target_run_id = args.run_id,
     run_name   = graph_name,
-    invocation_kind = action,
+    invocation_kind = invocation_kind,
     invocation_label = args.file,
     session_id = provenance.session_id,
     dispatcher_id = provenance.dispatcher_id,
@@ -1799,7 +1959,9 @@ local function begin_mag_load(firing_id, action, args, ws, provenance)
   if not admitted then
     state.pending_mag_load[load_id] = nil
     emit_tool_result_err(firing_id, "MAG compile request could not be published")
+    return nil
   end
+  return state.pending_mag_load[load_id]
 end
 
 
@@ -2081,6 +2243,18 @@ local function resume_pending_load(body)
     return
   end
 
+  -- The decision for a mag-apply call: fold over the compiled workflow under
+  -- the caller's policy, keep the compiled artifact on the call, and answer.
+  -- If the gate lets the call run, execute submits exactly this artifact.
+  if pending.action == "assess" then
+    local call = pending.call
+    pending.call = nil
+    local result, reason = assess_workflow(pending.policy, decoded)
+    call.assessed = { pending = pending, body = body }
+    call.decided(result, reason)
+    return
+  end
+
   if pending.action == "apply" and pending.target_run_id ~= nil then
     submit_loaded_apply(pending, body)
     return
@@ -2147,8 +2321,16 @@ end
 -- TODO: Reconsider live workflow modification in favor of resuming workflows
 -- with completed-node outputs. Live modification is not sufficiently supported
 -- and may be removed; this tool deliberately exposes only fresh dispatches.
-local function mag_apply(firing_id, args, metadata)
-  local ws, provenance = mag_workspace(firing_id, args, metadata, "mag-apply")
+--
+-- mag-apply runs in three steps, in the order every tool call takes:
+--   prepare  writes `content` to the file (or checks that the file exists);
+--   decide   compiles the file and folds over the compiled workflow's nodes
+--            under the caller's approval policy (assess_workflow);
+--   execute  runs the artifact the decision was made on.
+-- A file written by prepare stays when the gate then refuses the call, so
+-- the author can fix it and apply again.
+local function mag_apply_prepare(firing_id, args, metadata)
+  local ws = mag_workspace(firing_id, args, metadata, "mag-apply")
   if not ws then return end
   local _, source_error
   if args.content ~= nil then
@@ -2156,8 +2338,33 @@ local function mag_apply(firing_id, args, metadata)
   else
     _, source_error = mag.require_file(ws, args.file)
   end
-  if source_error then emit_tool_result_err(firing_id, "mag-apply: " .. source_error); return end
-  begin_mag_load(firing_id, "apply", args, ws, provenance)
+  if source_error then emit_tool_result_err(firing_id, "mag-apply: " .. source_error) end
+end
+
+local function mag_apply_assess(firing_id, args, metadata, call)
+  local ws, provenance = mag_workspace(firing_id, args, metadata, "mag-apply")
+  if not ws then return end
+  local pending = begin_mag_load(firing_id, "assess", args, ws, provenance)
+  if not pending then return end
+  pending.call = call
+  -- A caller that states no policy has the configured behaviour.
+  pending.policy = approval.is_policy(call.policy) and call.policy or approval.Default
+end
+
+-- Runs only what the gate approved: the artifact assess_workflow saw. A call
+-- that was never assessed has nothing to run.
+local function mag_apply(firing_id, _args, _metadata, call)
+  local assessed = call and call.assessed or nil
+  if assessed == nil then
+    emit_tool_result_err(firing_id, "mag-apply: this call was not approved by the tool gate")
+    return
+  end
+  call.assessed = nil
+  if sessions.current_id() ~= assessed.pending.session_id then
+    emit_tool_result_err(firing_id, "mag-apply: the session that approved this workflow has ended")
+    return
+  end
+  submit_loaded_run(assessed.pending, assessed.body, "mag apply")
 end
 
 local TOOL_HANDLERS = {
@@ -2170,7 +2377,7 @@ local TOOL_HANDLERS = {
   ["mag-apply"]      = mag_apply,
 }
 
-local function invoke_owned_handler(handler, firing_id, args, body)
+local function invoke_owned_handler(handler, firing_id, args, body, call)
   local previous_invocation = current_invocation
   local invocation = { id = firing_id }
   current_invocation = invocation
@@ -2178,7 +2385,7 @@ local function invoke_owned_handler(handler, firing_id, args, body)
     caller_id = body.caller_id,
     from = body.from,
     invocation = body.invocation,
-  })
+  }, call)
   current_invocation = previous_invocation
   if ok then return end
   -- Only the local encoding boundary and typed engine admission errors are
@@ -2221,15 +2428,27 @@ end
 -- Handlers keep firing-id addressing so deferred settlement (plan verdicts,
 -- run completion, termination confirmation) can resolve later by id.
 local function tool_definitions()
-  local definitions = {}
-  for _, spec in ipairs(lead_workflow_tool_specs()) do
-    local handler = assert(TOOL_HANDLERS[spec.name], spec.name)
-    spec.execute = function(args, call)
+  local function owned(handler)
+    return function(args, call)
       invoke_owned_handler(handler, call.id, args, {
         caller_id = call.request.caller_id,
         from = call.request.from,
         invocation = call.request.invocation,
-      })
+      }, call)
+    end
+  end
+  local definitions = {}
+  for _, spec in ipairs(lead_workflow_tool_specs()) do
+    spec.execute = owned(assert(TOOL_HANDLERS[spec.name], spec.name))
+    if spec.name == "mag-apply" then
+      spec.prepare = owned(mag_apply_prepare)
+      local assess = owned(mag_apply_assess)
+      spec.approval.decide = function(_policy, args, call)
+        assess(args, call)
+        -- Answered when the compile reply arrives (resume_pending_load); a
+        -- failed compile ends the call with the compiler's message instead.
+        return tool.deferred
+      end
     end
     definitions[#definitions + 1] = tool.define(spec)
   end
@@ -2594,7 +2813,10 @@ local M = {
   cancel_request = cancel_request,
   reconcile_mag_authority_loss = reconcile_mag_authority_loss,
 
+  assess_workflow = assess_workflow,
+
   _internals = {
+    tool_source = tool_source,
     state = state,
     SOURCE_NAME = SOURCE_NAME,
     -- Direct handler hooks for the test driver. Tests fire envelopes
@@ -2664,23 +2886,21 @@ local M = {
       agent_system = nil
       ambient_context = nil
       resolve_model_snapshot = nil
-      classify_command = nil
-      classify_argv = nil
+      decide_capability = nil
       advertised = false
     end,
   },
 }
 
--- configure_approval{ classify_command, classify_argv }: the command
--- classification mag-apply decides from. Separate from `configure` because a
--- composition builds its classifier after this actor is configured.
+-- configure_approval{ decide_capability }: what each capability means under
+-- an approval policy (see `libs.tool`'s `decision`).
+-- Separate from `configure` because a composition builds its tool sources
+-- after this actor is configured.
 function M.configure_approval(opts)
-  if type(opts) ~= "table" or type(opts.classify_command) ~= "function"
-      or type(opts.classify_argv) ~= "function" then
-    error("lead-workflow: configure_approval needs classify_command and classify_argv functions", 2)
+  if type(opts) ~= "table" or type(opts.decide_capability) ~= "function" then
+    error("lead-workflow: configure_approval needs a decide_capability function", 2)
   end
-  classify_command = opts.classify_command
-  classify_argv = opts.classify_argv
+  decide_capability = opts.decide_capability
 end
 
 function M.configure(opts)

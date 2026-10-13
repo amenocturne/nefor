@@ -111,7 +111,13 @@ fn run_inner(
     let da = dir.join("da-fixture/bin");
     std::fs::create_dir_all(&da).unwrap();
     let classifier = da.join("da");
-    std::fs::write(&classifier, "#!/bin/sh\nprintf 'allow\\n'\n").unwrap();
+    // Exit contract: 0 approve, 1 defer. The fixture defers a command that
+    // creates a file and approves everything else.
+    std::fs::write(
+        &classifier,
+        "#!/bin/sh\ncase \"$(cat)\" in *touch*) exit 1 ;; esac\nprintf 'allow\\n'\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(classifier, std::fs::Permissions::from_mode(0o755)).unwrap();
     let init = dir.join("fixture-config/init.lua");
@@ -1382,4 +1388,151 @@ end }}
         "success"
     );
     println!("retained accepted MAG output artifacts: {}", dir.display());
+}
+
+/// An agent's approval policy is enforced end to end. The lead (Default)
+/// applies a workflow holding a ReadOnly worker. The worker applies a workflow
+/// whose command only reads: it is approved as a unit and its command runs
+/// without anyone being asked. The worker then applies a workflow whose
+/// command writes: the gate refuses it with an explanation and the command
+/// never runs. No permission mode widens the worker.
+#[test]
+fn a_read_only_agents_workflows_are_decided_by_its_policy_in_every_mode() {
+    for mode in ["safe", "auto", "yolo"] {
+        let dir = isolated_starter("approval-policy-");
+        std::fs::copy(
+            root().join("engine/tests/agentic_cli_mock_e2e/approval_policy_provider.lua"),
+            dir.join("fixture-config/mock-provider/acceptance.lua"),
+        )
+        .unwrap();
+        let output = run(
+            &dir,
+            &[
+                "--frontend",
+                "cli",
+                "--mode",
+                mode,
+                "--format",
+                "json",
+                "--prompt",
+                "APPROVAL_POLICY_PROBE",
+            ],
+        );
+        let result: serde_json::Value = serde_json::from_str(&success(&output)).unwrap();
+        assert_eq!(result["status"], "success", "{mode}: {result}");
+        assert!(
+            !dir.join("approval-marker.txt").exists(),
+            "{mode}: the writing command never ran"
+        );
+
+        let session = result["session_id"].as_str().unwrap();
+        let persisted = std::fs::read_to_string(
+            dir.join("data/nefor/sessions")
+                .join(format!("{session}.jsonl")),
+        )
+        .unwrap();
+        let events = persisted
+            .lines()
+            .filter_map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).ok()?;
+                serde_json::from_str::<serde_json::Value>(row["payload"].as_str()?).ok()
+            })
+            .collect::<Vec<_>>();
+        let bodies = events
+            .iter()
+            .map(|event| &event["body"])
+            .collect::<Vec<_>>();
+        let applies = bodies
+            .iter()
+            .filter(|body| body["kind"] == "tool-gate.tool.invoke" && body["name"] == "mag-apply")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            applies.len(),
+            3,
+            "{mode}: the lead applies once, the worker twice"
+        );
+
+        // The lead is a Default agent and is unaffected: its workflow, which
+        // only holds a narrower agent, runs.
+        assert_eq!(applies[0]["approval_policy"], "Default", "{mode}");
+        assert_eq!(applies[0]["args"]["file"], "outer.mag", "{mode}");
+        // The worker's calls carry the worker's own policy.
+        assert_eq!(applies[1]["approval_policy"], "ReadOnly", "{mode}");
+        assert_eq!(applies[2]["approval_policy"], "ReadOnly", "{mode}");
+
+        let result_of = |call: &serde_json::Value| {
+            bodies
+                .iter()
+                .find(|body| body["kind"] == "tool.result" && body["id"] == call["id"])
+                .unwrap_or_else(|| panic!("{mode}: no result for {}", call["id"]))
+        };
+        assert!(
+            result_of(applies[0])["error"].is_null(),
+            "{mode}: {}",
+            result_of(applies[0])
+        );
+        assert!(
+            result_of(applies[1])["error"].is_null(),
+            "{mode}: the read-only workflow is approved: {}",
+            result_of(applies[1])
+        );
+        assert_eq!(
+            result_of(applies[2])["error"],
+            concat!(
+                "tool `mag-apply` was not run: your approval policy is ReadOnly and the workflow ",
+                "declares 1 node not shown to be allowed under the ReadOnly approval policy:\n",
+                "- node `leave-a-mark` (shell script) `touch approval-marker.txt`: ",
+                "not shown to be read-only"
+            ),
+            "{mode}: the model is told why its workflow was not run"
+        );
+
+        // The approved workflow's command ran as a node of that workflow: it
+        // reached the tool source marked as such, with no policy of its own,
+        // and nobody was asked about it.
+        let commands = bodies
+            .iter()
+            .filter(|body| body["kind"] == "basic-tools.tool.invoke")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands.len(),
+            1,
+            "{mode}: exactly one command ran: {commands:?}"
+        );
+        assert_eq!(commands[0]["name"], "shell.script", "{mode}");
+        assert_eq!(
+            commands[0]["args"]["script"], "printf 'read-only-ran'",
+            "{mode}"
+        );
+        assert_eq!(commands[0]["workflow_node"], true, "{mode}");
+        assert!(commands[0]["approval_policy"].is_null(), "{mode}");
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body["kind"] == "tool.result"
+                    && body["output"]["stdout"] == "read-only-ran"),
+            "{mode}: the read-only command produced its output"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body["kind"] == "basic-tools.tool.prepare"),
+            "{mode}: a node of an approved workflow is not decided again"
+        );
+        assert!(
+            !bodies.iter().any(|body| {
+                body["kind"] == "chat.tool.permission_request"
+                    || body["kind"] == "chat.tool.popup_request"
+            }),
+            "{mode}: a ReadOnly agent is never asked about"
+        );
+        // The writing workflow's file was written by prepare and stays.
+        assert!(
+            dir.join("data/nefor/sessions")
+                .join(session)
+                .join("mag/writes.mag")
+                .is_file(),
+            "{mode}: the refused workflow's source stays for the author to fix"
+        );
+    }
 }

@@ -429,24 +429,41 @@ function M.decode_artifact(artifact)
   return nil, "artifact envelope has an unsupported or malformed variant"
 end
 
-function M.actor_inventory(decoded)
-  local entries = {}
+-- Fold over every node the kernel would spawn for a decoded program or
+-- delta: the actors of its initial modification, then the actors of every
+-- operation template (the nodes a dynamic workflow instantiates at run time).
+-- `f(accumulator, node)` returns the next accumulator; the final one is
+-- returned. A node is
+--   { address, actor, kind = "initial" }
+--   { address, actor, kind = "template", operation, operation_index, actor_index }
+-- where `actor` is the lowered actor (`id` or `slot`, `factory`, `params`,
+-- and for a template actor its `parameter_bindings`). This is the one walker
+-- over the compiled form; inventories and approval decisions are folds.
+function M.fold_nodes(decoded, initial, f)
+  local accumulator = initial
   for _, actor in ipairs(decoded.modification.actors or {}) do
-    entries[#entries + 1] = {
+    accumulator = f(accumulator, {
       address = initial_actor_address(actor.id), actor = actor, kind = "initial",
-    }
+    })
   end
   for operation_index, operation in ipairs(decoded.operations or {}) do
     local template = type(operation) == "table" and operation.template or nil
     for actor_index, actor in ipairs(type(template) == "table" and template.actors or {}) do
-      entries[#entries + 1] = {
+      accumulator = f(accumulator, {
         address = template_actor_address(operation.id, actor.slot), actor = actor,
         kind = "template", operation = operation, operation_index = operation_index,
         actor_index = actor_index,
-      }
+      })
     end
   end
-  return entries
+  return accumulator
+end
+
+function M.actor_inventory(decoded)
+  return M.fold_nodes(decoded, {}, function(entries, node)
+    entries[#entries + 1] = node
+    return entries
+  end)
 end
 
 M.initial_actor_address = initial_actor_address
