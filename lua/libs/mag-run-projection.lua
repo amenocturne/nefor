@@ -68,6 +68,52 @@ local function actor_ancestor_keys(run, nodes)
   return out
 end
 
+-- Logical nodes accumulate over a run's lifetime (the initial program, then
+-- each materialized template); the first declaration of a path wins.
+function M.merge_declared(existing, declared)
+  local nodes, seen = {}, {}
+  for _, descriptor in ipairs(existing or {}) do
+    nodes[#nodes + 1] = descriptor
+    seen[path_key(descriptor.path)] = true
+  end
+  for _, descriptor in ipairs(declared or {}) do
+    local key = path_key(descriptor.path)
+    if not seen[key] then nodes[#nodes + 1], seen[key] = descriptor, true end
+  end
+  return nodes
+end
+
+-- The path of the logical node that lists `actor_id` as its own member, or
+-- nil when the run does not know the actor.
+function M.actor_path(run, actor_id)
+  for _, descriptor in ipairs(descriptors_for(run)) do
+    for _, member in ipairs(descriptor.members or {}) do
+      if member == actor_id then return descriptor.path or {} end
+    end
+  end
+  return nil
+end
+
+-- The path of the deepest logical node whose subtree holds every listed
+-- actor: the row that folds them together. Empty when they share no node, nil
+-- when an actor is unknown.
+function M.common_path(run, actor_ids)
+  local common
+  for _, actor_id in ipairs(actor_ids) do
+    local path = M.actor_path(run, actor_id)
+    if not path then return nil end
+    if not common then
+      common = {}
+      for index, name in ipairs(path) do common[index] = name end
+    else
+      local length = 0
+      while length < #common and common[length + 1] == path[length + 1] do length = length + 1 end
+      for index = #common, length + 1, -1 do common[index] = nil end
+    end
+  end
+  return common
+end
+
 function M.active_groups(run, nodes)
   local out, ancestors = {}, actor_ancestor_keys(run, nodes)
   for id, node in pairs(nodes or run.nodes or {}) do

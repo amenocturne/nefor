@@ -429,14 +429,53 @@ local function result_boundary(modification)
   return "result", nil
 end
 
-local function compose_agent_system(base, positional_overlay, session_id)
+-- An agent is a model actor and the run-tool actor that calls tools for it.
+-- The run-tool names its model actor in `conversation_peer`; either member
+-- resolves to the same ordered pair.
+local function conversation_pair(run, actor_id)
+  local function peer_of(id)
+    local node = run.nodes and run.nodes[id]
+    local params = node and type(node.spec) == "table" and node.spec.params or nil
+    local peer = type(params) == "table" and params.conversation_peer or nil
+    return type(peer) == "string" and peer ~= "" and peer or nil
+  end
+  local model_actor = peer_of(actor_id)
+  if model_actor then return model_actor, actor_id end
+  for _, id in ipairs(run.nodes_order or {}) do
+    if peer_of(id) == actor_id then return actor_id, id end
+  end
+  return actor_id, nil
+end
+
+-- The logical node an agent's workspace belongs to: the node that folds its
+-- model and run-tool actors together in the run tree, never one member's own
+-- row. Members that share no node fall back to the model actor's row, so both
+-- still resolve to one place.
+local function agent_node_path(run, actor_id)
+  local model_actor, tool_actor = conversation_pair(run, actor_id)
+  if tool_actor ~= nil then
+    local shared = run_projection.common_path(run, { model_actor, tool_actor })
+    if shared and #shared > 0 then return shared end
+  end
+  return run_projection.actor_path(run, model_actor)
+end
+
+local function agent_workspace(session_id, run, actor_id)
+  local path = agent_node_path(run, actor_id)
+  if not path or #path == 0 then
+    return nil, "actor " .. tostring(actor_id) .. " has no workflow node in run "
+      .. tostring(run.run_id)
+  end
+  return mag.agent_workspace(session_id, run.run_id, path)
+end
+
+local function compose_agent_system(base, positional_overlay, workspace)
   local authored = base
   if type(positional_overlay) == "string" and positional_overlay:match("%S") then
     authored = base .. "\n\n---\n\n" .. positional_overlay
   end
   if ambient_context == nil then return authored end
-  local ws = mag.workspace_dir(session_id)
-  return ambient_context:compose(authored, { workspace = ws })
+  return ambient_context:compose(authored, workspace)
 end
 
 local function is_llm_actor(actor)
@@ -444,15 +483,49 @@ local function is_llm_actor(actor)
       or actor.factory == "nefor.factory.structured-output"
 end
 
-local function compose_agent_params(inventory, session_id)
+-- Initial actors as run nodes, keyed by actor id. Operation templates have no
+-- actor id until they materialize and appear through actor lifecycle events.
+local function initial_nodes(inventory)
+  local nodes_order, nodes = {}, {}
+  for _, entry in ipairs(inventory or {}) do
+    local actor = entry.actor
+    local id = entry.kind == "initial" and tostring(actor.id or "") or ""
+    if id ~= "" then
+      nodes_order[#nodes_order + 1] = id
+      nodes[id] = {
+        id = id,
+        role = actor.factory,
+        reasoner = actor.factory,
+        spec = actor,
+        status = "pending",
+      }
+    end
+  end
+  return nodes_order, nodes
+end
+
+-- Each agent's prompt names its own workspace. An initial agent's node path is
+-- known now. A template agent's path exists only once it materializes, and one
+-- overlay serves every instance, so it is told where its folder will be.
+local function compose_agent_params(inventory, session_id, run_id, logical_nodes)
   local overlay = {}
+  if agent_system == nil then return overlay end
+  local nodes_order, nodes = initial_nodes(inventory)
+  local run = { run_id = run_id, logical_nodes = logical_nodes or {},
+    nodes_order = nodes_order, nodes = nodes }
   for _, entry in ipairs(inventory or {}) do
     local actor = entry.actor
     local params = type(actor.params) == "table" and actor.params or {}
-    if is_llm_actor(actor) and agent_system ~= nil then
-      overlay[entry.address] = {}
-      overlay[entry.address].system = compose_agent_system(
-        agent_system, params.system, session_id)
+    if is_llm_actor(actor) then
+      local workspace = {}
+      if entry.kind == "initial" then
+        workspace.workspace = agent_workspace(session_id, run, actor.id)
+      else
+        workspace.workspace_parent = mag.run_workspaces_dir(session_id, run_id)
+      end
+      overlay[entry.address] = {
+        system = compose_agent_system(agent_system, params.system, workspace),
+      }
     end
   end
   return overlay
@@ -820,21 +893,7 @@ end
 -- matching what the chat surface renders (chat/run_panel.lua).
 register_active_run = function(run_id, inventory, terminal, firing_id, run_name, session_id,
     dispatcher_id, owner_resume, request_ids)
-  local nodes_order, nodes = {}, {}
-  for _, entry in ipairs(inventory or {}) do
-    local actor = entry.actor
-    local id = entry.kind == "initial" and tostring(actor.id or "") or ""
-    if id ~= "" then
-      nodes_order[#nodes_order + 1] = id
-      nodes[id] = {
-        id = id,
-        role = actor.factory,
-        reasoner = actor.factory,
-        spec = actor,
-        status = "pending",
-      }
-    end
-  end
+  local nodes_order, nodes = initial_nodes(inventory)
   local run = run_registry:register({
     run_id = run_id,
     run_name = run_name,
@@ -1856,14 +1915,14 @@ local function lead_workflow_tool_specs()
       display = display_contract("mag write file", display_field("file", "args", "file", "path"),
         {}, "receipt", "MAG source written", {}),
       description =
-        "Writes or edits a MAG source file in this session's MAG workspace without running it.\n\n" ..
+        "Writes or edits a MAG source file in your own MAG workspace without running it.\n\n" ..
         "- new_string only: becomes the file's complete contents, creating or replacing the file.\n" ..
         "- old_string and new_string: replaces the single exact occurrence of old_string. If it occurs " ..
         "zero or several times, the file is unchanged and an error is returned.\n\n" ..
-        "new_string may be empty. Paths are relative to the workspace; absolute paths, .. segments " ..
-        "and symlinks are rejected.",
+        "new_string may be empty. Paths are relative to your workspace, which other agents cannot " ..
+        "reach through these tools; absolute paths, .. segments and symlinks are rejected.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
+        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
         new_string = { type = "string", description = "Complete contents or replacement text; may be empty." },
         old_string = { type = "string", description = "Optional non-empty exact text that must occur once." },
       }, required = { "file", "new_string" } },
@@ -1878,11 +1937,11 @@ local function lead_workflow_tool_specs()
         {}, "content", nil, { display_field("workflow", "result", "workflow_tree", "text",
           { max_lines = 120, max_bytes = 12000 }) }, "delayed"),
       description =
-        "Validates and compiles a MAG source file in this session's workspace without running it, " ..
+        "Validates and compiles a MAG source file in your own MAG workspace without running it, " ..
         "and returns the complete node tree the workflow would run. Compilation errors are returned " ..
         "as errors.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", pattern = "\\.(mag|magl)$", description = "Existing MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
+        file = { type = "string", pattern = "\\.(mag|magl)$", description = "Existing MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
       }, required = { "file" } },
     },
     {
@@ -1917,7 +1976,7 @@ local function lead_workflow_tool_specs()
         "failure together with the workflow tree. A longer run returns a run_id, the workflow tree, " ..
         "and how its result will reach you.",
       parameters = { type = "object", additionalProperties = false, properties = {
-        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to the session MAG workspace." },
+        file = { type = "string", pattern = "\\.(mag|magl)$", description = "MAG source path ending in .mag or .magl, normalized and relative to your MAG workspace." },
         content = { type = "string", description = "Optional complete source written to file before running, replacing any existing contents." },
       }, required = { "file" } },
     },
@@ -1932,9 +1991,10 @@ end
 
 -- MAG tool handlers.
 --
--- The file tools write, compile, and apply .mag programs through the plugin. The
--- workspace path and library shapes are ambient (agentic-loop injects them
--- into the lead's system prompt each turn), so there is no discovery tool.
+-- The file tools write, compile, and apply .mag programs through the plugin,
+-- each inside the calling agent's own workspace. That workspace's path and the
+-- library shapes are ambient in every agent's system prompt, so there is no
+-- discovery tool.
 
 -- Compile and apply both run a synchronous load handshake against the mag
 -- plugin: `mag.load` is sent, the `mag.loaded` reply carries the lowered
@@ -2099,7 +2159,8 @@ submit_loaded_run = function(pending, body, error_prefix)
   local snapshot_error
   snapshot, snapshot_error = model_snapshot.copy(snapshot)
   if snapshot == nil then return reject(error_prefix .. ": invalid model snapshot: " .. tostring(snapshot_error)) end
-  local overlay = compose_agent_params(inventory, pending.session_id)
+  local overlay = compose_agent_params(inventory, pending.session_id, pending.run_id,
+    modification.nodes)
   local exec = {
     kind = "mag.execute", id = pending.run_id, run_id = pending.run_id,
     run_name = pending.run_name, session_id = pending.session_id,
@@ -2146,7 +2207,9 @@ local function submit_loaded_apply(pending, body)
       "This modification contains write-capable agents and needs an approved plan first.")
     return false
   end
-  local overlay = compose_agent_params(inventory, pending.session_id)
+  local target = state.active_runs[pending.run_id]
+  local overlay = compose_agent_params(inventory, pending.session_id, pending.run_id,
+    run_projection.merge_declared(target and target.logical_nodes, decoded.modification.nodes))
   local request_id = "mag-apply-" .. envelope.uuid_lite()
   state.pending_mag_apply[request_id] = {
     firing_id = pending.firing_id,
@@ -2155,7 +2218,6 @@ local function submit_loaded_apply(pending, body)
     workflow_tree = pending.workflow_tree,
     request_ids = pending.request_ids,
   }
-  local target = state.active_runs[pending.run_id]
   state.pending_mag_apply[request_id].attached_request_ids = {}
   if target then
     local seen = {}
@@ -2303,16 +2365,35 @@ local function fail_pending_load(body)
     "compilation failed:\n" .. tostring(body.message))
 end
 
+-- The workspace of the agent that made this call. The root lead has one for
+-- the whole session. A delegated agent's comes from the provenance the kernel
+-- stamped on the call: its run, and the logical node that actor belongs to.
+local function caller_workspace(provenance)
+  if provenance.principal == "lead" then
+    local ws = mag.lead_workspace(provenance.session_id)
+    if not ws then return nil, "no data root available" end
+    return ws
+  end
+  local invocation = provenance.invocation
+  if type(invocation) ~= "table" then
+    return nil, "a delegated agent's workspace requires invocation provenance"
+  end
+  local run = run_registry:get(invocation.run_id)
+  if not run or run.session_id ~= provenance.session_id then
+    return nil, "the calling agent's run is not known: " .. tostring(invocation.run_id)
+  end
+  return agent_workspace(provenance.session_id, run, invocation.actor_id)
+end
+
 local function mag_workspace(firing_id, args, metadata, tool_name)
   local provenance, provenance_error = resolve_invocation(metadata, "lead")
   if not provenance then
     emit_tool_result_err(firing_id, tool_name .. ": " .. provenance_error)
     return nil
   end
-  local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
-  local ws, ws_err = mag.init_workspace(provenance.session_id, config_dir)
+  local ws, ws_err = caller_workspace(provenance)
   if not ws then
-    emit_tool_result_err(firing_id, tool_name .. ": workspace init failed: " .. tostring(ws_err))
+    emit_tool_result_err(firing_id, tool_name .. ": workspace unavailable: " .. tostring(ws_err))
     return nil
   end
   local _, path_error = mag.resolve_file(ws, args.file)
@@ -2337,10 +2418,18 @@ local function mag_write_file(firing_id, args, metadata)
   end
 end
 
+-- An existing source file compiles as its workspace's project. A workspace is
+-- created by its first write, so a missing one is only a missing file.
+local function existing_source(ws, file)
+  local _, missing = mag.require_file(ws, file)
+  if missing then return nil, missing end
+  return mag.ensure_project(ws)
+end
+
 local function mag_preview(firing_id, args, metadata)
   local ws, provenance = mag_workspace(firing_id, args, metadata, "mag-preview")
   if not ws then return end
-  local _, error = mag.require_file(ws, args.file)
+  local _, error = existing_source(ws, args.file)
   if error then emit_tool_result_err(firing_id, "mag-preview: " .. error); return end
   begin_mag_load(firing_id, "preview", args, ws, provenance)
 end
@@ -2363,7 +2452,7 @@ local function mag_apply_prepare(firing_id, args, metadata)
   if args.content ~= nil then
     _, source_error = mag.write_file(ws, args.file, args.content)
   else
-    _, source_error = mag.require_file(ws, args.file)
+    _, source_error = existing_source(ws, args.file)
   end
   if source_error then emit_tool_result_err(firing_id, "mag-apply: " .. source_error) end
 end
@@ -2748,6 +2837,15 @@ local function receive_msg(entry)
   -- run-result block report done/killed rather than dispatch-time pending.
   if kind == "mag.run_started" then
     mark_mag_run_started(body)
+    return
+  end
+  -- The same declarations the sidebar folds: a run's logical nodes grow as
+  -- templates materialize, and an agent's workspace follows its node path.
+  if kind == "mag.nodes_declared" then
+    local run = mag_event_run(body)
+    if run and type(body.nodes) == "table" then
+      run.logical_nodes = run_projection.merge_declared(run.logical_nodes, body.nodes)
+    end
     return
   end
   if kind == "mag.actor_spawned" then

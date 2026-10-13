@@ -160,7 +160,6 @@ end
 M.group_of = run_projection.group_of
 M.path_key = run_projection.path_key
 M.member_label = run_projection.member_label
-local path_key = run_projection.path_key
 local advance_group_activity = run_projection.advance_group_activity
 local build_nodes = run_projection.build_nodes
 local group_elapsed_ms = run_projection.group_elapsed_ms
@@ -441,16 +440,9 @@ end
 function M.nodes_declared(state, run_id, declared)
   if not (state.runs and state.runs[run_id]) or type(declared) ~= "table" then return state end
   return apply(state, run_id, function(prev)
-    local nodes, seen = {}, {}
-    for _, descriptor in ipairs(prev.logical_nodes or {}) do
-      nodes[#nodes + 1] = descriptor
-      seen[path_key(descriptor.path)] = true
-    end
-    for _, descriptor in ipairs(declared) do
-      local key = path_key(descriptor.path)
-      if not seen[key] then nodes[#nodes + 1], seen[key] = descriptor, true end
-    end
-    return shallow_merge(prev, { logical_nodes = nodes })
+    return shallow_merge(prev, {
+      logical_nodes = run_projection.merge_declared(prev.logical_nodes, declared),
+    })
   end)
 end
 

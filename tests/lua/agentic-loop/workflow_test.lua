@@ -470,6 +470,12 @@ local function project_pending_conversation(calls)
     "canonical system message carries the configured prompt")
   assert(system_chunk.chunk.data:find("# MAG workspace", 1, true),
     "canonical system message carries ambient MAG context")
+  local lead_workspace = require("libs.mag-workspace").lead_workspace(
+    require("libs.sessions").current_id())
+  assert(system_chunk.chunk.data:find("Writable source directory: `" .. lead_workspace .. "`", 1, true),
+    "the lead's prompt names the lead's own workspace")
+  assert(lead_workspace:match("/mag/lead$"), "the lead's workspace is its stable session folder")
+  assert(not nefor.fs.exists(lead_workspace), "naming the workspace does not create it")
   local text = system_chunk.chunk.data
   local base_at = assert(text:find("lead system prompt", 1, true))
   local reasoner_at = assert(text:find("# Reasoner mental model", 1, true))

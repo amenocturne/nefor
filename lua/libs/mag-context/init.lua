@@ -15,6 +15,10 @@
 --   toolsets          { manifest = path, names = { { key, name }, ... } }  (each toolset is rendered with its approval policy)
 --   trailing_sections { string, ... } appended last
 --
+-- `compose(base, opts)` names the composing agent's own writable source
+-- directory: `opts.workspace` when its path is known, or `opts.workspace_parent`
+-- (the folder its workspace will sit under) when only that is.
+--
 -- Only public modules are named in the prompt. Every other module under the
 -- roots stays importable but is not advertised.
 
@@ -30,6 +34,11 @@ of reasoners is itself a reasoner: package a complicated subgraph behind typed
 inputs and outputs, bind it once, and compose it as a node in a larger graph. In
 Nefor, nodes can represent reasoners; MAG itself only manipulates values defined
 by libraries and knows neither concept.]]
+
+local WORKSPACE_RULES = [[This workspace is yours alone. The MAG source tools take paths relative to
+it and reach no other agent's files, and it is created by your first write.
+Source modules you write here are importable by programs in this workspace
+only; configured package roots remain immutable.]]
 
 local function dense_list(value, label)
   if type(value) ~= "table" then error(label .. " must be a list", 3) end
@@ -290,6 +299,12 @@ function Context:compose(base_system, opts)
   end
 
   if opts.workspace ~= nil then nonempty(opts.workspace, "mag-context workspace") end
+  if opts.workspace_parent ~= nil then
+    nonempty(opts.workspace_parent, "mag-context workspace_parent")
+    if opts.workspace ~= nil then
+      error("mag-context compose takes workspace or workspace_parent, not both", 2)
+    end
+  end
 
   local references = { "# MAG references\n\nFull MAG Book: `" .. self.book_path ..
     "`\n\nRead its index or the relevant chapter when the quick guides are insufficient." }
@@ -299,7 +314,10 @@ function Context:compose(base_system, opts)
 
   if opts.workspace ~= nil then
     parts[#parts + 1] = "# MAG workspace\n\nWritable source directory: `" .. opts.workspace ..
-      "`\n\nAdditional source modules may live in this workspace; configured package roots remain immutable."
+      "`\n\n" .. WORKSPACE_RULES
+  elseif opts.workspace_parent ~= nil then
+    parts[#parts + 1] = "# MAG workspace\n\nWritable source directory: your own folder under `" ..
+      opts.workspace_parent .. "`, at your node's path in the workflow tree.\n\n" .. WORKSPACE_RULES
   end
 
   for _, section in ipairs(self.trailing_sections) do append_nonempty(parts, section) end

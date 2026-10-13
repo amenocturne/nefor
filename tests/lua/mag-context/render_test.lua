@@ -167,3 +167,28 @@ end
 expect_error("must name at least one toolset", function()
   context({ toolsets = { manifest = manifest, names = {} } })
 end)
+
+-- The workspace section names the composing agent's own directory: exactly
+-- when its path is known, or the folder it will sit under when it is not.
+do
+  local own = context():compose("BASE", { workspace = "/session/mag/agents/mag-run-1/stage/worker" })
+  assert(own:find("# MAG workspace\n\nWritable source directory: "
+    .. "`/session/mag/agents/mag-run-1/stage/worker`\n\n", 1, true))
+  assert(own:find("This workspace is yours alone", 1, true))
+  assert(own:find("importable by programs in this workspace\nonly", 1, true),
+    "session-local modules are described as private to the workspace")
+
+  local pending = context():compose("BASE", { workspace_parent = "/session/mag/agents/mag-run-1" })
+  assert(pending:find("Writable source directory: your own folder under "
+    .. "`/session/mag/agents/mag-run-1`, at your node's path in the workflow tree.", 1, true))
+  assert(pending:find("This workspace is yours alone", 1, true))
+
+  assert(not context():compose("BASE"):find("# MAG workspace", 1, true),
+    "no workspace section without a workspace")
+  expect_error("workspace or workspace_parent, not both", function()
+    context():compose("BASE", { workspace = "/a", workspace_parent = "/b" })
+  end)
+  expect_error("mag-context workspace_parent must be a non-empty string", function()
+    context():compose("BASE", { workspace_parent = "" })
+  end)
+end

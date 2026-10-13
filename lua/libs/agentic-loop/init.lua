@@ -122,13 +122,6 @@ local state = {
   tool_start_observers   = {},  ---@type table
   tool_end_observers     = {},  ---@type table
   complete_observers     = {},  ---@type table
-
-  -- The context description is composition-owned and immutable; only the
-  -- writable workspace path is session-specific.
-  mag_context = {
-    workspace         = nil,  ---@type string|nil
-    workspace_session = nil,  ---@type string|nil
-  },
 }
 
 local emit           = envelope.emit
@@ -293,44 +286,15 @@ end
 
 -- ── ambient MAG context ───────────────────────────────────────────────
 
-local function mag_config_dir()
-  local sd = state.lead_program.source_dir
-  if type(sd) == "string" and #sd > 0 then return sd end
-  return rawget(_G, "NEFOR_CONFIG_DIR") or os.getenv("NEFOR_CONFIG_DIR") or "."
-end
-
--- The session workspace dir, resolved the way the mag tool does (seed +
--- return); falls back to the pure path when seeding can't run (no writable
--- data root, e.g. under test). Cached per session.
-local function mag_workspace_dir(session_id, config_dir)
-  local mc = state.mag_context
-  if mc.workspace_session == session_id and type(mc.workspace) == "string" then
-    return mc.workspace
-  end
-  local mag = require("libs.mag-workspace")
-  local ws
-  local ok, res = pcall(mag.init_workspace, session_id, config_dir)
-  if ok and type(res) == "string" and #res > 0 then
-    ws = res
-  else
-    ws = mag.workspace_dir(session_id)
-  end
-  mc.workspace = ws
-  mc.workspace_session = session_id
-  return ws
-end
-
--- The full `## MAG workspace` block, or nil when there is no active session
--- to anchor the workspace dir.
+-- The lead's prompt names the lead's own workspace. The path is derived, not
+-- created: the directory appears with the lead's first source write.
 local function system_with_mag_context(base)
   local context = state.config.ambient_context
   if type(context) ~= "table" or type(context.compose) ~= "function" then return base end
   local sessions = require("libs.sessions")
   local session_id = sessions.current_id()
   if type(session_id) ~= "string" or session_id == "" then return base end
-  local config_dir = mag_config_dir()
-  local ws = mag_workspace_dir(session_id, config_dir)
-  return context:compose(base, { workspace = ws })
+  return context:compose(base, { workspace = mag_workspace.lead_workspace(session_id) })
 end
 
 -- Seed system content once into the append-only conversation. Provider actors
@@ -2197,10 +2161,6 @@ M._internals  = {
     state.tool_end_observers = {}
     state.complete_observers = {}
     request_lifecycle:reset()
-    state.mag_context = {
-      workspace = nil,
-      workspace_session = nil,
-    }
     envelope._reset()
   end,
 }

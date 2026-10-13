@@ -1,7 +1,8 @@
 -- lua/libs/mag-workspace/init.lua — MAG workspace management and preview formatting.
 --
 -- Provides two things:
---   1. Workspace lifecycle: init an empty per-session MAG source directory.
+--   1. Workspace layout: one writable MAG source directory per agent, under
+--      the session's MAG folder, created when its agent first writes.
 --   2. Preview formatting: render a graph modification (the shape the
 --      mag plugin replies with on `mag.loaded`) into a human-readable
 --      string the lead can inspect before executing.
@@ -69,11 +70,31 @@ local function exists(path)
 end
 
 local function is_symlink(path)
+  if nefor and nefor.fs and type(nefor.fs.is_symlink) == "function" then
+    return nefor.fs.is_symlink(path) == true
+  end
   local result = os.execute("test -L " .. sh_quote(path) .. " >/dev/null 2>&1")
   return result == true or result == 0
 end
 
--- Resolve a model-authored source name inside one session workspace. Rejecting
+-- The directories between the sessions root and a workspace are created by
+-- this library from run and node names. One of them being a symlink would
+-- move the whole workspace, so they are checked like the workspace itself.
+local function workspace_symlink(workspace)
+  local root = sessions_root()
+  local current, rest = workspace, ""
+  if type(root) == "string" and workspace:sub(1, #root + 1) == root .. "/" then
+    current, rest = root, workspace:sub(#root + 2)
+  end
+  if rest == "" then return is_symlink(current) end
+  for part in rest:gmatch("[^/]+") do
+    current = current .. "/" .. part
+    if is_symlink(current) then return true end
+  end
+  return false
+end
+
+-- Resolve a model-authored source name inside one agent's workspace. Rejecting
 -- symlink components is what makes lexical containment meaningful even when a
 -- prior process has written into the workspace.
 function M.resolve_file(workspace, file)
@@ -93,8 +114,8 @@ function M.resolve_file(workspace, file)
   if #parts == 0 or table.concat(parts, "/") ~= file then
     return nil, "file must be a normalized relative path: " .. file
   end
+  if workspace_symlink(workspace) then return nil, "workspace is a symlink" end
   local current = workspace
-  if is_symlink(current) then return nil, "workspace is a symlink" end
   for _, part in ipairs(parts) do
     current = current .. "/" .. part
     if is_symlink(current) then return nil, "symlink paths are not allowed: " .. file end
@@ -137,6 +158,8 @@ function M.write_file(workspace, file, new_string, old_string)
   if type(new_string) ~= "string" then return nil, "new_string must be a string" end
   if old_string == nil then
     local existed = exists(path)
+    local project, project_error = M.ensure_project(workspace)
+    if not project then return nil, project_error end
     local ok, error = write_text(path, new_string)
     if not ok then return nil, error end
     return { operation = existed and "overwritten" or "created", source_path = path }
@@ -195,21 +218,83 @@ function M.workflow_tree(descriptors)
   return #lines > 0 and table.concat(lines, "\n") or "(empty workflow)"
 end
 
--- Get the MAG workspace directory for a session.
-function M.workspace_dir(session_id)
+-- The session's MAG folder. Agents never write here directly: it holds the
+-- lead's workspace, the agents' workspaces, and the runtime's run outputs.
+--
+--   <sessions root>/<session id>/mag/
+--     lead/                               the lead's workspace
+--     agents/<run id>/<node>/.../<node>/  one workspace per agent node
+--     runs/<run id>/<actor>.output        written by the runtime
+function M.session_dir(session_id)
   local root = sessions_root()
   if not root then return nil end
   return root .. "/" .. session_id .. "/mag"
 end
 
--- Initialize an empty writable workspace. Canonical and config-owned module
--- roots stay where the package/config materialized them and are supplied to
--- the compiler explicitly; copying them here would create stale session state.
--- Returns the workspace path on success, nil + error on failure.
-function M.init_workspace(session_id, _config_dir)
-  local ws = M.workspace_dir(session_id)
-  if not ws then return nil, "no data root available" end
+local LEAD_DIR = "lead"
+local AGENTS_DIR = "agents"
+local MAX_SEGMENT_BYTES = 255
 
+-- One run id or node name as one directory name. Lowercase letters, digits,
+-- `_`, `-` and a non-leading `.` stay as written; every other byte becomes
+-- `%XX`. `%` is itself encoded, so two different names never share a
+-- directory, including on a filesystem that folds case or normalizes Unicode.
+-- A name too long for one directory entry is rejected, not truncated.
+function M.encode_segment(name)
+  if type(name) ~= "string" or name == "" then
+    return nil, "workspace path segment must be a non-empty string"
+  end
+  local encoded = name:gsub("[^a-z0-9_%.%-]", function(char)
+    return string.format("%%%02X", char:byte())
+  end)
+  if encoded:sub(1, 1) == "." then encoded = "%2E" .. encoded:sub(2) end
+  if #encoded > MAX_SEGMENT_BYTES then
+    return nil, "workspace path segment is too long: " .. name
+  end
+  return encoded
+end
+
+-- The lead is one agent for the whole session: its run id changes every turn,
+-- so its workspace is keyed by the session alone and keeps its files.
+function M.lead_workspace(session_id)
+  local dir = M.session_dir(session_id)
+  return dir and dir .. "/" .. LEAD_DIR or nil
+end
+
+-- The folder holding every agent workspace of one run.
+function M.run_workspaces_dir(session_id, run_id)
+  local dir = M.session_dir(session_id)
+  if not dir then return nil, "no data root available" end
+  local run_segment, run_error = M.encode_segment(run_id)
+  if not run_segment then return nil, run_error end
+  return dir .. "/" .. AGENTS_DIR .. "/" .. run_segment
+end
+
+-- An agent's workspace: its run, then its logical node path as the sidebar
+-- nests it (libs.mag-run-projection owns that path).
+function M.agent_workspace(session_id, run_id, node_path)
+  local dir, run_error = M.run_workspaces_dir(session_id, run_id)
+  if not dir then return nil, run_error end
+  if type(node_path) ~= "table" or #node_path == 0 then
+    return nil, "agent workspace requires a logical node path"
+  end
+  for _, name in ipairs(node_path) do
+    local segment, segment_error = M.encode_segment(name)
+    if not segment then return nil, segment_error end
+    dir = dir .. "/" .. segment
+  end
+  return dir
+end
+
+-- Make a workspace a compilable MAG project: the directory and a minimal
+-- manifest. Canonical and config-owned module roots stay where the
+-- package/config materialized them and are supplied to the compiler
+-- explicitly; copying them here would create stale session state.
+function M.ensure_project(ws)
+  if type(ws) ~= "string" or ws:sub(1, 1) ~= "/" then
+    return nil, "workspace must be an absolute path"
+  end
+  if workspace_symlink(ws) then return nil, "workspace is a symlink" end
   if not mkdir_p(ws) then
     return nil, "failed to create workspace: " .. ws
   end
