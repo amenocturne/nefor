@@ -1277,7 +1277,7 @@ fn parse_policy_descriptions(value: Option<&Value>) -> Result<Option<Value>, Str
         if ApprovalPolicy::parse(policy).is_none() {
             return Err(format!("unknown approval policy `{policy}`"));
         }
-        if !text.as_str().is_some_and(|text| !text.is_empty()) {
+        if text.as_str().is_none_or(str::is_empty) {
             return Err(format!("text for `{policy}` must be a non-empty string"));
         }
     }
