@@ -1128,7 +1128,7 @@ let error_mapper = nefor.node.discard<String>("error-mapper")
 let mapped_error = nefor.result.map_error(result_input, error_mapper)
 let bound = nefor.result.and_then("bound", result_input, lifted)
 let operator_bound = nefor.result.`>=>`(result_input, lifted)
-let policy = nefor.contracts.ToolApprovalPolicy.Rules(nefor.contracts.ToolApprovalRules {rules: core.map.insert((core.map.empty<String, String>(): Map<String, String>), "bash", "deny")})
+let policy = nefor.contracts.ToolApprovalPolicy.ReadOnly
 let no_policy = nefor.contracts.ToolApprovalPolicy.Default
 let resolve_model: fn(String) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "test", model: model, reasoning_effort: nefor.actors.no_reasoning_effort})
 let agent = nefor.actors.agent<String, Input, Output>("agent", resolve_model, nefor.actors.AgentConfig<String> {model: "mock", system: "test", tools: [], tool_approval_policy: policy})
@@ -1183,11 +1183,11 @@ artifact {
     );
     assert_eq!(
         artifact["tool_approval_policy"],
-        json!({"constructor": "Rules", "value": {"rules": {"bash": "deny"}}})
+        json!({"constructor": "ReadOnly", "value": null})
     );
     assert_eq!(
         artifact["run_tool_params"]["value"]["tool_approval_policy"],
-        json!({"rules": {"bash": "deny"}})
+        json!({"constructor": "ReadOnly", "value": null})
     );
 }
 
@@ -1533,7 +1533,7 @@ import nefor.wire.{}
 import nefor.llm.{}
 let input = nefor.graph.port("worker", type_tag<nefor.wire.ToolCalls>(), "generic-tool.ToolCalls")
 let output = nefor.graph.port("worker", type_tag<nefor.wire.ToolHandle>(), "generic-tool.ToolHandle")
-let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.llm.RunToolParams {model: "", provider: "", model_profile: nefor.llm.no_model_profile, conversation_peer: "external", tools: [], tool_approval_policy: nefor.wire.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}])
+let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.llm.RunToolParams {model: "", provider: "", model_profile: nefor.llm.no_model_profile, conversation_peer: "external", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}])
 let worker = nefor.graph.node("worker", "ordinary", [actor], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1566,7 +1566,7 @@ import nefor.llm.{}
 let input = nefor.graph.port("worker", type_tag<nefor.wire.ToolCalls>(), "generic-tool.ToolCalls")
 let output = nefor.graph.port("worker", type_tag<nefor.wire.ToolHandle>(), "generic-tool.ToolHandle")
 let relocation = nefor.graph.Relocation {path: ["conversation_peer"], shape: "actor_id"}
-let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.llm.RunToolParams {model: "", provider: "", model_profile: nefor.llm.no_model_profile, conversation_peer: "worker", tools: [], tool_approval_policy: nefor.wire.normalize_tool_approval_policy(nefor.contracts.ToolApprovalPolicy.Default)}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [relocation, relocation])
+let actor = nefor.graph.closed_actor("worker", "nefor.factory.run-tool", [], nefor.llm.RunToolParams {model: "", provider: "", model_profile: nefor.llm.no_model_profile, conversation_peer: "worker", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default}, nefor.graph.store_port(input), [nefor.graph.store_port(output)], [relocation, relocation])
 let worker = nefor.graph.node("worker", "ordinary", [actor], [], [], input, output)
 artifact(nefor.dynamic.traverse("bad", worker))
 "#,
@@ -1736,34 +1736,24 @@ fn authored_tool_policies_lower_without_changing_agent_configuration() {
 import nefor
 import core.map.{}
 let resolver: fn(String) -> AuthoredModel = |model| => AuthoredModel.ResolvedModel(ResolvedModel {compaction_policy: disabled_compaction, provider: "test", model: model, reasoning_effort: no_reasoning_effort})
-let policies = [ToolApprovalPolicy.Default, ToolApprovalPolicy.Rules(ToolApprovalRules {rules: core.map.insert(core.map.empty<String, String>(), "cargo build", "deny")})]
+let policies = [ToolApprovalPolicy.ReadOnly, ToolApprovalPolicy.Default]
 let config: fn(ToolApprovalPolicy) -> AgentConfig<String> = |policy| => AgentConfig<String> {model: "test", system: "", tools: [], tool_approval_policy: policy}
 let configs = map(config, policies)
 let nodes = map(((|settings| => agent<String, String, TextAnswer>("worker", resolver, settings)): fn(AgentConfig<String>) -> Node<String, core.types.Result<AgentError, TextAnswer>>), configs)
 artifact {configs: configs, actors: map(((|node| => get(node, "actors")): fn(Node<String, core.types.Result<AgentError, TextAnswer>>) -> List<nefor.graph.Actor>), nodes)}
 "#.replace("import core.map.{}", "import core.map.{}\nimport core.types.{}\nimport nefor.graph.{}").as_str(), json!({}));
-    assert_eq!(
-        result["configs"][0]["tool_approval_policy"],
-        json!({"constructor": "Default", "value": null})
-    );
-    assert_eq!(
-        result["configs"][1]["tool_approval_policy"],
-        json!({"constructor": "Rules", "value": {"rules": {"cargo build": "deny"}}})
-    );
-    for (index, rules) in [json!({}), json!({"cargo build": "deny"})]
-        .into_iter()
-        .enumerate()
-    {
+    // The policy is one value from authoring to the actor that makes the
+    // agent's tool calls: nothing normalizes or reinterprets it on the way.
+    for (index, name) in ["ReadOnly", "Default"].into_iter().enumerate() {
+        let policy = json!({"constructor": name, "value": null});
+        assert_eq!(result["configs"][index]["tool_approval_policy"], policy);
         let run_tool = result["actors"][index]
             .as_array()
             .unwrap()
             .iter()
             .find(|actor| actor["factory"] == "nefor.factory.run-tool")
             .unwrap();
-        assert_eq!(
-            run_tool["params"]["value"]["tool_approval_policy"],
-            json!({"rules": rules})
-        );
+        assert_eq!(run_tool["params"]["value"]["tool_approval_policy"], policy);
     }
 }
 
@@ -1812,7 +1802,7 @@ fn nefor_facade_exports_exact_authoring_allowlist() {
             Some(name.to_owned())
         })
         .collect();
-    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel CompactionPolicy CompactionThresholds disabled_compaction ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalRules ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
+    let expected: std::collections::BTreeSet<_> = "Node source identity compile_graph AgentConfig agent AuthoredModel ResolvedModel CompactionPolicy CompactionThresholds disabled_compaction ModelProfile model_profile OptionalReasoningEffort reasoning_effort no_reasoning_effort read_only_tools general_tools ToolApprovalPolicy ProviderInput TextAnswer ProviderError AgentErrorReason AgentError ApprovalConfig approval_gate HumanWorkflowApproval HumanWorkflowRejection HumanWorkflowDecision RetryGateConfig retry_gate RetryDecision node_named rename compose >>> discard then *> keep_left before <* fanout &&& parallel *** choose +++ sequence lift and_then >=> result_map_named result_map map_error_named map_error DynamicList traverse context Timeout ProcessExecParams exec ShellScriptParams script ProcessExited ProcessSignaled ProcessTermination ProcessResult cwd CreateSpec OpenSpec Worktree WorktreeError create open join".split_whitespace().map(str::to_owned).collect();
     assert_eq!(actual, expected);
     for name in [
         "Task",
@@ -1889,10 +1879,12 @@ let composed = value >>> next
 let lifted = lift<Unit, String, Int>("lifted", composed)
 let mapped = result_map(lifted, identity<Int>("mapped"))
 let direct = nefor.graph.identity<Int>("direct")
-let runtime_policy = nefor.wire.normalize_tool_approval_policy(policy)
-artifact(get(runtime_policy, "rules"))
+artifact(policy)
 "#);
-    assert_eq!(run("facade-import-smoke", &source, json!({})), json!({}));
+    assert_eq!(
+        run("facade-import-smoke", &source, json!({})),
+        json!({"constructor": "Default", "value": null})
+    );
 }
 
 #[test]

@@ -99,7 +99,7 @@ end
 local function continue_batch(t)
   local emitted = last(t.out, "generic-tool.ToolCalls")
   local tools = {}
-  local runner = assert(run_tool.construct("tools", { tool_approval_policy = { rules = {} } },
+  local runner = assert(run_tool.construct("tools", { tool_approval_policy = { constructor = "Default" } },
     function(m) tools[#tools + 1] = m end))
   runner.deliver({ messages = { { message = emitted } } })
   for _, m in ipairs(tools) do
@@ -150,7 +150,7 @@ do
   eq(table.concat(emitted.request_local_tools, ","), "ordinary,self_compact")
   local tools = {}
   local runner = assert(run_tool.construct("local-tools", { tools = {},
-    tool_approval_policy = { rules = {} } }, function(m) tools[#tools + 1] = m end))
+    tool_approval_policy = { constructor = "Default" } }, function(m) tools[#tools + 1] = m end))
   runner.deliver({ messages = {{ message = emitted }} })
   local request = last(tools, "capability.invoke").request
   eq(table.concat(request.request_local_tools, ","), "ordinary,self_compact")

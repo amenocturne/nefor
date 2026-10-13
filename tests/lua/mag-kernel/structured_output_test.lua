@@ -147,7 +147,7 @@ for _, mixed in ipairs({
   assert(count(out, "nefor.agent.Result") == 0)
   local emitted = {}
   local executor = assert(run_tool.construct("executor", {tools = {"read_file"},
-    tool_approval_policy = {rules = {}}}, function(v) emitted[#emitted + 1] = v end))
+    tool_approval_policy = { constructor = "Default" }}, function(v) emitted[#emitted + 1] = v end))
   -- The actor names its request-local result tools beside the calls, and the
   -- executor hands them to the tool surface with its allowlist.
   local tool_calls = last(out, "generic-tool.ToolCalls")

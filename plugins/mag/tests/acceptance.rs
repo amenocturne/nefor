@@ -283,7 +283,7 @@ fn two_agent_program() -> Value {
                 "outputs":[port(&run_tool, "generic-tool.ToolHandle", &tool_handle)],
                 "params": {"$mag": "packed-value", "value": {
                     "model":"opus", "provider":PROVIDER, "model_profile":{"present":false,"value":""},
-                    "conversation_peer":llm, "tools":[], "tool_approval_policy":{"rules":{}}
+                    "conversation_peer":llm, "tools":[], "tool_approval_policy":{"constructor":"Default"}
                 }}
             }),
             json!({
@@ -532,7 +532,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     "direct execute capabilities cannot mint lead/subagent notices"
                 );
                 // The double-wrapped kernel payload was unwrapped: `args` is the
-                // tool's own args, not `{ name, args, allowlist, da-policy }`.
+                // tool's own args, not `{ name, args, allowlist, approval_policy }`.
                 let args = body.get("args").and_then(Value::as_object).expect("args");
                 assert_eq!(
                     args.get("text").and_then(Value::as_str),

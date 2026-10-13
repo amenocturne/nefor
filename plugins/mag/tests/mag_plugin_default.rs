@@ -359,7 +359,7 @@ pub mod bridge {
                 "args": {"name": "read_file", "args": {"path": "src/lib.rs"},
                          "allowlist": ["read_file"],
                          "request_local_tools": ["write_output", "submit_output"],
-                         "da-policy": {"git": "read"}}
+                         "approval_policy": "ReadOnly"}
             })));
             assert_eq!(
                 out,
@@ -368,7 +368,7 @@ pub mod bridge {
                     "name": "read_file", "invocation": invocation,
                     "args": {"path": "src/lib.rs"}, "allowlist": ["read_file"],
                     "request_local_tools": ["write_output", "submit_output"],
-                    "da-policy": {"git": "read"}
+                    "approval_policy": "ReadOnly"
                 }))]
             );
             let cancel = bridge.translate_emit(obj(json!({"kind": "tool.cancel", "id": "cap-1"})));

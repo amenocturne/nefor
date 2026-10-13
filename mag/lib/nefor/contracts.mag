@@ -25,14 +25,17 @@ type AgentErrorReason = ProviderError(ProviderError)
 // the agent drafted before it stopped (JSON null when there was none).
 type AgentError {last_output: JsonValue, reason: AgentErrorReason}
 
-// Per-agent approval metadata: a map from a tool name to a rule name. The
-// runtime carries it with the agent's tool calls; it is not an execution
-// barrier by itself.
-type ToolApprovalRules {rules: Map<String, String>}
-
-// How an agent's tool calls are approved. Default selects the runtime's
-// configured approval behaviour, never a bypass.
-type ToolApprovalPolicy = Default | Rules(ToolApprovalRules)
+// What an agent may do with its tools, from the narrowest policy to the widest.
+// The constructors are declared in that order: ReadOnly < Default. The runtime
+// compares policies by this order (lua/libs/tool/approval.lua repeats it once
+// for the gate and the workflow runner).
+//
+// ReadOnly: the agent may only read. A tool call that writes or has other
+// effects is rejected, in every permission mode, and so is a workflow that
+// declares such nodes or an agent with a wider policy.
+// Default: the runtime's configured approval behaviour for the current
+// permission mode, never a bypass.
+type ToolApprovalPolicy = ReadOnly | Default
 
 // How long a command may run. A bounded value must be strictly positive.
 type Timeout = Unlimited | Milliseconds(Int) | Seconds(Int) | Minutes(Int)

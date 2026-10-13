@@ -19,7 +19,9 @@ fn run(script: &str) {
     install_stub_nefor(&lua).expect("install nefor stub");
     let lua_root = repo_root().join("lua").display().to_string();
     lua.load(format!(
-        r#"package.path = "{lua_root}/?.lua;{lua_root}/?/init.lua;" .. package.path"#
+        r#"REPO_ROOT = "{repo}"
+        package.path = "{lua_root}/?.lua;{lua_root}/?/init.lua;" .. package.path"#,
+        repo = repo_root().display(),
     ))
     .exec()
     .expect("set package.path");
@@ -42,6 +44,11 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     nefor.set("log", log)?;
     lua.globals().set("nefor", nefor)?;
     Ok(())
+}
+
+#[test]
+fn approval_policy_order_and_decision_results() {
+    run("approval_test.lua");
 }
 
 #[test]

@@ -49,7 +49,6 @@ type ProviderInput = nefor.contracts.ProviderInput
 type ProviderError = nefor.contracts.ProviderError
 type AgentErrorReason = nefor.contracts.AgentErrorReason
 type AgentError = nefor.contracts.AgentError
-type ToolApprovalRules = nefor.contracts.ToolApprovalRules
 type ToolApprovalPolicy = nefor.contracts.ToolApprovalPolicy
 type Timeout = nefor.contracts.Timeout
 type ProcessExited = nefor.contracts.ProcessExited

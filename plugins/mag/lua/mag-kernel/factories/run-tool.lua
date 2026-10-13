@@ -44,12 +44,11 @@
 --   mirroring a provider turn that consumes all tool outputs together.
 --
 -- ── tool approval policy threading ───────────────────────────────────────────
---   The MAG node authors `tool_approval_policy` and a tool allowlist; lowering places
---   them in THIS actor's `params`. Per call the factory carries both in the
---   invocation `request` (which routing forwards as the `tool.invoke` args), so
---   the policy authored on the node reaches the exact tool invocation. Enforcing
---   it (narrowing bash approvals to this agent) is tool-gate's side, beyond this
---   factory — the factory's job is that the policy travels with the call.
+--   The MAG node authors `tool_approval_policy` and a tool allowlist; lowering
+--   places them in THIS actor's `params`. Per call the factory carries both in
+--   the invocation `request` (which routing forwards as the `tool.invoke`
+--   args): the allowlist, and the policy's name as `approval_policy`. The
+--   factory does not decide anything from the policy; the tool gate does.
 --
 --   The factory does not judge whether a called name is usable. Every call
 --   that the provider actor did not settle itself goes to the tool surface with
@@ -68,6 +67,7 @@
 --   local batch state and documents the void. Written inline — no wrapper.
 
 local kinds = require("kinds")
+local approval = require("libs.tool.approval")
 
 local M = {}
 
@@ -83,7 +83,7 @@ M.declaration = {
   params = {
     model = "string?", provider = "string?", conversation_peer = "string?",
     allowlist = "table?",  -- tool-name allowlist for this node (lowered from :tools)
-    tool_approval_policy = "table", -- per-node rules; forwarded on the established external key
+    tool_approval_policy = "table", -- the agent's ToolApprovalPolicy; its name travels as `approval_policy`
   },
   template = { relocations = {
     { path = { "conversation_peer" }, shape = "actor_id" },
@@ -107,19 +107,10 @@ function M.construct(id, params, emit, deps)
   params = params or {}
   deps = deps or {}
 
-  -- MAG supplies one normalized runtime record. The external tool API keeps
-  -- its established `da-policy` key and receives only the contained rules as
-  -- metadata; this factory does not interpret or enforce them.
-  local normalized_policy = params.tool_approval_policy
-  if type(normalized_policy) ~= "table" or type(normalized_policy.rules) ~= "table" then
-    return nil, "run-tool actor params.tool_approval_policy must be normalized ToolApprovalRuntimeRules"
+  local approval_policy, policy_error = approval.from_mag(params.tool_approval_policy)
+  if not approval_policy then
+    return nil, "run-tool actor params.tool_approval_policy: " .. policy_error
   end
-  for key, value in pairs(normalized_policy.rules) do
-    if type(key) ~= "string" or type(value) ~= "string" then
-      return nil, "run-tool actor normalized tool approval rules must map strings to strings"
-    end
-  end
-  local tool_approval_policy = normalized_policy.rules
   local allowlist = params.allowlist
   if allowlist == nil then
     allowlist = params.tools
@@ -221,7 +212,7 @@ function M.construct(id, params, emit, deps)
             args = call_args,
             allowlist = allowlist,
             request_local_tools = message.request_local_tools,
-            ["da-policy"] = tool_approval_policy,
+            approval_policy = approval_policy,
           },
           -- Opaque correlation ref, echoed back on the reply: which batch + slot,
           -- plus the model's call id / name for the assembled result entry.

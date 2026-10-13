@@ -129,7 +129,7 @@ local function harness()
   local cap_in = port("cap","generic-provider.ProviderOut",provider_input)
   local modification = {
     actors = {
-      {id="rt",factory="run-tool",type_arguments={},params={tool_approval_policy={rules={}}},input=rt_in,outputs={rt_out}},
+      {id="rt",factory="run-tool",type_arguments={},params={tool_approval_policy = { constructor = "Default" }},input=rt_in,outputs={rt_out}},
       {id="tr",factory="tool-result",type_arguments={},params={},input=tr_in,outputs={tr_out}},
       {id="cap",factory="capture-sink",type_arguments={},params={},input=cap_in,outputs={}},
     },

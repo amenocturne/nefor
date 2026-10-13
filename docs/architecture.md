@@ -75,12 +75,14 @@ output codecs. Failure and process-result contracts describe runtime facts.
 authorization belongs to tool-gate/tool-validator and prelaunch write-plan
 review belongs to lead-workflow. These are three independent boundaries.
 
-An authored `ToolApprovalPolicy` selects `Default` (no per-agent override, not
-an approval bypass) or `Rules(ToolApprovalRules)`. Agent lowering normalizes
-that selection into the private `ToolApprovalRuntimeRules` transport record.
-The current rule map is metadata: tool-gate does not consume or enforce it.
-Authorization still follows its gate policy and configured validator; a deny
-entry alone does not prevent execution.
+An agent's `ToolApprovalPolicy` is the only statement of what that agent may
+do with its tools. It is one ordered sum type, `ReadOnly < Default`, declared
+in `nefor.contracts`; `lua/libs/tool/approval.lua` repeats the order once for
+Lua (a test keeps the two in step) and is the only place Lua compares
+policies. Nothing normalizes the value: the agent's `run-tool` actor receives
+it as authored and sends its name as `approval_policy` with every tool call,
+and the tool gate forwards it to the tool's source. The wire names a policy,
+never the mechanism that classifies commands.
 
 Authored `Timeout` units normalize once in `nefor.timeout`, shared by process
 and shell constructors. The library owns positivity and unit factors; MAG's
