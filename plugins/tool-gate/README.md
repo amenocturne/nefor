@@ -52,31 +52,87 @@ and emits path-only, one-shot reminders for nearby `AGENTS.md` / `CLAUDE.md`
 files. Reminders are de-duped per chat/scope. File contents are not loaded
 automatically; agents must read the referenced files explicitly when relevant.
 
-Per-tool policy via CLI flags:
+## What happens to a call
 
-- `--auto <name>` -- forward without prompting
-- `--prompt <name>` -- emit permission request, wait for user approval
-- `--deny <name>` -- reject immediately
+The chain is always: a caller invokes a tool, the gate decides, and the tool
+executes or the caller receives an error saying why it did not. Nothing
+executes before the decision.
+
+1. `tool-gate.tool.invoke { id, name, args, approval_policy?, allowlist? }`.
+   `approval_policy` is the calling agent's policy by name, `ReadOnly` or
+   `Default`. A caller that states none gets `Default`; any other value is an
+   error.
+2. The gate sends `<source>.tool.prepare` with the same fields. The source
+   checks the arguments, runs the tool's `prepare` step and its decision
+   function, and answers `tool.prepared { id, decision?, reason? }` with
+   `decision` one of `safe`, `unsure`, `denied`. A source may instead end the
+   call with `tool.result { error }`. Every source must answer one way or the
+   other; `libs.tool` sources do.
+3. The gate applies the decision table to the caller's policy, the permission
+   mode and the assessment, policy first:
+
+   | assessment | ReadOnly (every mode) | Default, safe | Default, auto | Default, yolo |
+   | ---------- | --------------------- | ------------- | ------------- | ------------- |
+   | safe       | run                   | run           | run           | run           |
+   | unsure     | deny                  | ask the user  | run           | run           |
+   | denied     | deny                  | deny          | deny          | run           |
+
+   Run: `<source>.tool.invoke` under the id the source prepared, with
+   `approval_policy`. Ask: `chat.tool.permission_request { id, tool, args,
+   approval_policy, reason? }`, answered by `tool.permission_response`. Deny:
+   a `tool.result` error to the caller and `<source>.tool.cancel` so the
+   source drops what it prepared.
+
+A `ReadOnly` caller is never asked about and no mode widens it. The table is
+`verdict` in [`src/policy.rs`](src/policy.rs) and exists nowhere else. The
+gate does not know what any tool does: meaning comes from the tool's decision
+function.
+
+A caller whose call was not run is told why:
+
+```text
+tool `write_file` was not run: your approval policy is ReadOnly and it writes a file
+tool `write_file` was not run: write_file requires an approved plan
+```
+
+A call marked `workflow_node: true` was made by a node of a running workflow
+(a script, a process, a worktree), not by a model. The workflow was approved
+as a unit before it started, so the gate only transports such a call: it goes
+straight to `<source>.tool.invoke`, and neither the policy nor the mode is
+consulted.
+
+Per-tool setting via CLI flags, used when a tool answers no decision:
+
+- `--auto <name>` -- such a call is safe
+- `--prompt <name>` -- such a call is unsure
+- `--deny <name>` -- every call is denied, whatever the tool says
 - `--default <auto|prompt|deny>` -- fallback for unlisted tools (default: `prompt`)
+
+The setting speaks for a `Default` caller only. Under `ReadOnly` a call its
+tool did not assess is denied, because nothing showed that it fits the policy.
+
+An advertised tool may carry `policy_descriptions`, an object from a policy
+name to text the tool adds to its description for an agent with that policy.
+The gate passes it to the public registry unchanged; whoever assembles an
+agent's request appends it.
 
 Runtime modes are `safe`, `auto`, and `yolo`. The starter's user-facing mode
 behavior is documented in [the agent example permission guide](../../examples/nefor-agent/docs/permissions.md).
-At the transport layer, `yolo` overrides all policies to auto-approve.
 
 ## Runtime events
 
 - `tool-gate.set_mode` `{ mode }` switches the transport mode (`safe`, `auto`,
   or `yolo`).
 - `tool-gate.mode_changed` announces the active mode after a change.
+- `tool.prepared` is a source's answer to a prepare request.
 - `tool.permission_response` answers a pending prompt with approval/rejection.
 - `tool-gate.tool.cancel` terminally settles a call by its outer caller ID. A
   pending permission request is removed before stale approval can forward it;
   an active source correlation is removed before cancellation is forwarded, so
   late source results and duplicate cancellation are ignored.
 
-The starter starts `tool-validator` before the gate and routes prompt requests
-through it. The validator may auto-approve, deny, or defer to the chat popup
-before a request reaches the user.
+The starter starts `tool-validator` before the gate; its actor forwards the
+gate's question to the chat popup. It decides nothing.
 
 ## Tool display contract
 

@@ -76,39 +76,75 @@ Spawn the actor before `tool-gate`; it advertises on the gate's hello. A tool in
 
 ## Permission policy
 
-Registration makes a tool available; it does not authorize every invocation. `libs.tool-validator` classifies requests after validating the invoking agent's capability allowlist.
+Registration makes a tool available; it does not authorize every call. What an
+agent may do is its `tool_approval_policy` (`ReadOnly` or `Default`), and each
+tool says what a call means under a policy. The gate decides from the two and
+the permission mode; see the [permissions guide](permissions.md).
+
+A tool declares its meaning in its definition:
+
+```lua
+local approval = require("libs.tool.approval")
+
+tool.define {
+  name = "publish_note",
+  -- description, parameters, display ...
+  approval = {
+    -- (policy, args, call) -> "safe" | "unsure" | "denied", reason
+    decide = function(policy, args)
+      if policy == approval.ReadOnly then return approval.denied, "it publishes a note" end
+      if args.draft then return approval.safe end
+      return approval.unsure, "it publishes to everyone"
+    end,
+    -- Appended to the description for an agent with that policy.
+    describe = { ReadOnly = "Your approval policy is ReadOnly, so every call to this tool is rejected." },
+  },
+  execute = function(args, call) call.ok("published") end,
+}
+```
+
+`approval.reads()` and `approval.writes(reason)` cover the two common cases. A
+tool that declares nothing follows the gate's configured setting
+(`tool_gate.auto_tools` / `prompt_tools` / `default_action`) for a `Default`
+agent and is rejected for a `ReadOnly` agent.
+
+Commands are classified by `libs.tool-validator`, which the command tools and
+`mag-apply` decide from:
 
 ```lua
 local pm = require("nefor-pm")
 local da = require("libs.tool-validator.da")
 pm.install { da.package { commit = "<trusted-da-commit>" } }
 
-return require("libs.tool-validator").build {
-  shell_classifier = pm.bin("da", "da"),
-  read_only_tools = { "read_file", "my_read_tool" },
-  auto_approve_tools = { "my_schema_limited_safe_tool" },
-  shell_fastpaths = {
-    function(command, read_only)
-      return not read_only and command:match("^my%-cli%s+read%s") ~= nil
+local validator = require("libs.tool-validator").build {
+  classifier = pm.bin("da", "da"),
+  -- Optional. Replace a policy's classifier flags outright:
+  classifier_args = { ReadOnly = { "--read-only", "--git", "read" } },
+  -- Optional. The classifier's opt-in model flag, added to Default only:
+  model_flag = nil,
+  -- Optional. Approve narrow commands before the classifier is asked:
+  command_fastpaths = {
+    function(command, policy)
+      return policy == "Default" and command:match("^my%-cli%s+read%s") ~= nil
     end,
   },
 }
+actor.spawn(validator)
+-- validator.classify_command(policy, command) -> "safe" | "unsure" | "denied", reason
+-- validator.classify_argv(policy, argv)       -> the same, for an argument vector
 ```
 
-Policy precedence is:
+The classifier reads the command on stdin and exits 0 to approve, 1 to defer
+or 2 to deny. A missing or unusable classifier makes the command denied with
+an actionable reason; it never becomes approval or an unresolved wait.
+`classify_argv` writes the vector as the equivalent POSIX command, every
+element single-quoted, and classifies that text, so a program and a script are
+judged by the same rules. Fast paths are trusted policy predicates.
 
-1. validate that capability data is well-formed and includes the requested tool;
-2. apply `yolo` mode;
-3. apply `auto_approve_tools`;
-4. apply special `write_file`, `shell.script`, and `process.exec` rules;
-5. approve other tools when the entire capability allowlist is read-only;
-6. prompt in `safe` or deny in `auto`.
-
-Malformed or excluding capability data fails closed even in `yolo`. A missing allowlist retains legacy unrestricted behavior. `auto_approve_tools` is unconditional after capability validation, so use it only for schemas whose complete input space is safe. `shell_fastpaths` are trusted policy predicates and run before `da`.
-
-Both forms of `write_file` require an active approved lead-workflow plan except in `yolo` and are unavailable to read-only agents. Non-read-only `shell.script` uses the explicitly supplied classifier. Missing or unusable classifier execution produces one actionable denial for the pending request; it never becomes approval or an unresolved wait. See the user-facing [permissions guide](permissions.md).
-
-The starter currently derives `read_only_tools` from `mag/lib/nefor/toolsets.json`. Custom `auto_approve_tools`, shell fast paths, and structural process fast paths are source-exposed composition seams, but have less focused regression coverage than the base mode behavior.
+The starter wires the classification into `basic_actor_spec` and gives
+`write_file` its plan rule there (`decide_write`): under `Default` it needs a
+current approved write-review plan, and it is always rejected for a `ReadOnly`
+agent.
 
 ## Tool plugins
 

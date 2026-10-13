@@ -34,7 +34,9 @@ let model_profile: fn(String) -> ModelProfile = |name| => ModelProfile {name: na
 type AuthoredModel = ResolvedModel(ResolvedModel) | ModelProfile(ModelProfile)
 
 // What one agent is. M is the configuration's own model vocabulary; system is
-// the agent's instructions; tools names exactly the tools it may call.
+// the agent's instructions; tools names exactly the tools it may call;
+// tool_approval_policy says what it may do with them (ReadOnly or Default,
+// see nefor.contracts.ToolApprovalPolicy).
 type AgentConfig<M> {model: M, system: String, tools: List<String>, tool_approval_policy: nefor.contracts.ToolApprovalPolicy}
 
 // An agent node: it receives an I as its task and produces Ok(O), or

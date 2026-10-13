@@ -27,7 +27,51 @@ different future run; it never changes a running one.
 
 The tools are built with [`libs.tool`](../tool/init.lua), so their schemas are
 closed: an undeclared argument such as `run_id` on `mag-apply` is rejected
-with the same message format every tool uses, before the handler runs.
+with the same message format every tool uses, before the tool runs.
+
+## Approval: the workflow is the unit
+
+Every `mag-apply` goes through the tool gate like any tool call, in three
+steps: `prepare` writes `content` to the file (or checks that the file
+exists), the decision function compiles it and assesses the compiled workflow
+under the calling agent's approval policy, and `execute` runs exactly the
+artifact that was assessed. A file written by `prepare` stays when the call is
+then refused, so it can be fixed and applied again. A compile error ends the
+call with the compiler's message; there is nothing to decide.
+
+The assessment is a fold over every node the kernel would spawn
+(`libs.mag-workspace`'s `fold_nodes(decoded, initial, f)`), templates of
+dynamic workflows included:
+
+- a script or process node means what the `shell.script` or `process.exec`
+  tool says its command means under the caller's policy (the configured
+  command classification; a process's argument vector is classified as the
+  equivalent quoted shell command);
+- a worktree node means what its tool says;
+- a command whose text is bound to a run-time value is unsure;
+- an agent node whose approval policy is wider than the caller's is a denial;
+  the agent is not silently narrowed;
+- routing, typing, waiting and human-approval nodes change nothing; a kind of
+  node nobody has described is unsure.
+
+Denied dominates unsure, which dominates safe. The gate's decision table turns
+the result into run, ask or deny, so a `ReadOnly` agent's workflow that is not
+entirely safe is refused in every permission mode, with every offending node
+listed:
+
+```text
+tool `mag-apply` was not run: your approval policy is ReadOnly and the workflow declares 2 nodes not shown to be allowed under the ReadOnly approval policy:
+- node `build` (shell script) `make all`: not shown to be read-only
+- node `writer` (agent) with approval policy Default: wider than ReadOnly, the approval policy of the agent applying the workflow
+```
+
+Once a workflow runs, its own nodes are not asked about again. The
+composition supplies the capability meanings with
+`configure_approval { decide_capability = require("libs.tool").decision { sources } }`;
+without it no command is vouched for and every command node is unsure.
+
+The plan-review rule below is separate and unchanged: in `safe` mode a
+workflow with write-capable agents also needs an approved plan.
 
 ## Runs
 
@@ -98,7 +142,7 @@ whose human decision is part of the workflow's meaning.
 
 ## Files
 
-- `init.lua` — tool definitions and handlers, MAG load/apply coordination,
+- `init.lua` — tool definitions and their functions, workflow approval, MAG load/apply coordination,
   run control and result delivery.
 - `run-registry.lua` — ownership and waiter registry for detached runs.
 - `role.lua` — loads the config-owned lead and worker system prompts.

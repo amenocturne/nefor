@@ -3,8 +3,12 @@
     "read_file",
     "read_image",
     "discover_instruction_files",
+    "mag-write-file",
+    "mag-preview",
+    "mag-apply",
     "mag-status",
-    "mag-await"
+    "mag-await",
+    "mag-terminate"
   ],
   "general": [
     "read_file",

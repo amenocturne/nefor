@@ -29,8 +29,14 @@ type AgentConfig {
   system: String,
   // Exactly the tools the agent may call, by name.
   tools: List<String>,
-  // How the agent's tool calls are approved. ToolApprovalPolicy.Default
-  // selects the runtime's configured behaviour.
+  // What the agent may do with its tools; the only statement of it.
+  // ToolApprovalPolicy.ReadOnly: the agent may only read. A tool call that
+  // writes or has other effects is rejected in every permission mode, and so
+  // is a workflow it applies that declares nodes that are not read-only or
+  // agents with a wider policy. Pair it with nefor.read_only_tools to give an
+  // agent that searches with commands and cannot change anything.
+  // ToolApprovalPolicy.Default: the runtime's configured approval behaviour
+  // for the current permission mode.
   tool_approval_policy: nefor.contracts.ToolApprovalPolicy
 }
 
