@@ -10,7 +10,8 @@ local COMBINE_SYSTEM = "Combine the two summaries above into one paragraph."
 local DISPATCH_PROMPT = "summarise octopuses and lighthouses in parallel and combine into one paragraph"
 
 -- A chain rather than a join keeps the run deterministic while still giving
--- the lead one dispatched run with three child agents.
+-- the lead one dispatched run with three child agents. The last one authors
+-- MAG source of its own, which lands in its workspace, not the lead's.
 local MAG_PROGRAM = [=[
 import core.types.{}
 import nefor.actors.{}
@@ -28,9 +29,29 @@ let resolved_model_value = nefor.actors.ResolvedModel {compaction_policy: nefor.
 let start = nefor.graph.source("task", InvestigationInput {prompt: "<initial task text>"})
 let sx = nefor.actors.agent<nefor.actors.ResolvedModel, InvestigationInput, OctopusSummary>("sx", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Summarise octopuses in one sentence.", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.Default, tools: []}})
 let sy = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, OctopusSummary>, LighthouseSummary>("sy", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Summarise lighthouses in one sentence.", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.Default, tools: []}})
-let combine = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, LighthouseSummary>, nefor.contracts.TextAnswer>("combine", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Combine the two summaries above into one paragraph.", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.Default, tools: []}})
+let combine = nefor.actors.agent<nefor.actors.ResolvedModel, core.types.Result<nefor.contracts.AgentError, LighthouseSummary>, nefor.contracts.TextAnswer>("combine", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Combine the two summaries above into one paragraph.", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.ReadOnly, tools: ["mag-write-file", "mag-preview"]}})
 let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
 let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, sx), nefor.graph.edge(sx, sy), nefor.graph.edge(sy, combine), nefor.graph.edge(combine, result)])
+nefor.artifact.compile(topology)
+]=]
+
+local NOTES_FILE = "combine-notes.mag"
+local NOTES_PROGRAM = [=[
+import core.types.{}
+import nefor.actors.{}
+import nefor.artifact.{}
+import nefor.contracts.{}
+import nefor.graph.{}
+
+type NoteInput {prompt: String}
+
+let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(model)
+let resolved_model_value = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "mock-plugin", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
+
+let start = nefor.graph.source("note-task", NoteInput {prompt: "<note>"})
+let note = nefor.actors.agent<nefor.actors.ResolvedModel, NoteInput, nefor.contracts.TextAnswer>("note-taker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "Take a note.", tools: [], tool_approval_policy: nefor.contracts.ToolApprovalPolicy.Default})
+let result = nefor.graph.output<core.types.Result<nefor.contracts.AgentError, nefor.contracts.TextAnswer>>("result")
+let topology: fn(nefor.graph.Graph) -> nefor.graph.Graph = |graph| => nefor.graph.add_edges(graph, [nefor.graph.edge(start, note), nefor.graph.edge(note, result)])
 nefor.artifact.compile(topology)
 ]=]
 
@@ -58,6 +79,27 @@ local function typed_result(last, value)
   return mock.tool_call("write_output", { new_string = nefor.json.encode(value), validate = true })
 end
 
+-- The combining agent writes a program into its own workspace, compiles it
+-- there, and then asks for the lead's file by name. That name does not exist
+-- in its workspace, so it answers only once the lead's file proved unreachable.
+local function combine(last)
+  if last.role ~= "tool" then
+    return mock.tool_call("mag-write-file", { file = NOTES_FILE, new_string = NOTES_PROGRAM })
+  end
+  local content = text_of(last.content)
+  if last.name == "mag-write-file" then
+    if not contains(content, "/combine/" .. NOTES_FILE) then
+      return mock.error("combine wrote outside its own workspace: " .. content)
+    end
+    return mock.tool_call("mag-preview", { file = NOTES_FILE })
+  end
+  if last.name == "mag-preview" then
+    if contains(content, "note-taker") then return mock.tool_call("mag-preview", { file = MAG_FILE }) end
+    if contains(content, "file does not exist: " .. MAG_FILE) then return mock.text(COMBINED_TEXT) end
+  end
+  return mock.error("unexpected tool result for combine from " .. tostring(last.name) .. ": " .. content)
+end
+
 local function lead_after_tool(tool)
   if tool.name == "read_file" then return mock.text("README: " .. text_of(tool.content)) end
   if tool.name == "mag-write-file" then return mock.tool_call("mag-apply", { file = MAG_FILE }) end
@@ -74,7 +116,7 @@ local function respond(request)
   local last = request.messages[#request.messages]
   if contains(request.system, OCTOPUS_SYSTEM) then return typed_result(last, { content = OCTOPUS_TEXT }) end
   if contains(request.system, LIGHTHOUSE_SYSTEM) then return typed_result(last, { content = LIGHTHOUSE_TEXT }) end
-  if contains(request.system, COMBINE_SYSTEM) then return mock.text(COMBINED_TEXT) end
+  if contains(request.system, COMBINE_SYSTEM) then return combine(last) end
 
   if last.role == "tool" then return lead_after_tool(last) end
   local prompt = text_of(last.content)

@@ -550,11 +550,37 @@ fn headless_starter_request_resume_tools_and_failures() {
         "{answer}"
     );
     let dispatched_session = answer["session_id"].as_str().unwrap();
-    assert!(dir
+    let session_mag = dir
         .join("data/nefor/sessions")
         .join(dispatched_session)
-        .join("mag")
-        .is_dir());
+        .join("mag");
+    assert!(
+        session_mag.join("lead/octo-lighthouse.mag").is_file(),
+        "the lead authors into its own workspace"
+    );
+    assert!(
+        !session_mag.join("octo-lighthouse.mag").exists() && !session_mag.join("mag.toml").exists(),
+        "nothing is authored into the shared session folder"
+    );
+    // The provider script answers only after the combining agent wrote and
+    // compiled its own source and was refused the lead's file by name.
+    let agent_runs: Vec<_> = std::fs::read_dir(session_mag.join("agents"))
+        .expect("a delegated agent wrote MAG source")
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(agent_runs.len(), 1, "one run had an authoring agent");
+    let combine = session_mag
+        .join("agents")
+        .join(&agent_runs[0])
+        .join("combine");
+    assert!(
+        combine.join("combine-notes.mag").is_file() && combine.join("mag.toml").is_file(),
+        "the agent's workspace is its run and node path, and is its own project"
+    );
+    assert!(
+        session_mag.join("runs").join(&agent_runs[0]).is_dir(),
+        "the runtime's outputs for the same run stay under runs/"
+    );
 
     let error = run(
         &dir,

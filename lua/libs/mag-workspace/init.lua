@@ -77,16 +77,17 @@ local function is_symlink(path)
   return result == true or result == 0
 end
 
--- The directories between the sessions root and a workspace are created by
--- this library from run and node names. One of them being a symlink would
+-- The directories between a session's MAG folder and a workspace are created
+-- by this library from run and node names. One of them being a symlink would
 -- move the whole workspace, so they are checked like the workspace itself.
 local function workspace_symlink(workspace)
   local root = sessions_root()
-  local current, rest = workspace, ""
+  local session, rest
   if type(root) == "string" and workspace:sub(1, #root + 1) == root .. "/" then
-    current, rest = root, workspace:sub(#root + 2)
+    session, rest = workspace:sub(#root + 2):match("^([^/]+)/(.+)$")
   end
-  if rest == "" then return is_symlink(current) end
+  if not session then return is_symlink(workspace) end
+  local current = root .. "/" .. session
   for part in rest:gmatch("[^/]+") do
     current = current .. "/" .. part
     if is_symlink(current) then return true end
