@@ -31,6 +31,76 @@ fn starter_tool_validator_modes() {
     }
 }
 
+/// `classify_command` and argument-vector quoting against the fake classifier
+/// executable beside the Lua test; `nefor.process.run` runs real processes.
+#[test]
+fn command_classification_per_policy_and_argv_quoting() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    install_real_process_run(&lua).expect("install process runner");
+    set_package_path(&lua).expect("set package.path");
+    let dir = repo_root().join("tests/lua/tool-validator");
+    lua.globals()
+        .set(
+            "FAKE_CLASSIFIER",
+            dir.join("fake-classifier.sh").display().to_string(),
+        )
+        .expect("set classifier path");
+    let test_path = dir.join("classify_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
+    if let Err(e) = lua
+        .load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+    {
+        panic!("classify_test.lua failed:\n{e}");
+    }
+}
+
+fn install_real_process_run(lua: &Lua) -> mlua::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let run = lua.create_function(|lua, opts: Table| {
+        let cmd: String = opts.get("cmd")?;
+        let args: Vec<String> = match opts.get::<Value>("args")? {
+            Value::Table(list) => list.sequence_values::<String>().collect::<Result<_, _>>()?,
+            _ => Vec::new(),
+        };
+        let stdin: Option<mlua::String> = opts.get("stdin")?;
+        let result = lua.create_table()?;
+        let spawned = Command::new(&cmd)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                result.set("code", -1)?;
+                result.set("stdout", "")?;
+                result.set("stderr", format!("cannot run {cmd}: {error}"))?;
+                return Ok(result);
+            }
+        };
+        if let Some(mut pipe) = child.stdin.take() {
+            if let Some(text) = &stdin {
+                pipe.write_all(&text.as_bytes())
+                    .map_err(mlua::Error::external)?;
+            }
+        }
+        let output = child.wait_with_output().map_err(mlua::Error::external)?;
+        result.set("code", output.status.code().unwrap_or(-1))?;
+        result.set("stdout", lua.create_string(&output.stdout)?)?;
+        result.set("stderr", lua.create_string(&output.stderr)?)?;
+        Ok(result)
+    })?;
+    let nefor: Table = lua.globals().get("nefor")?;
+    let process: Table = nefor.get("process")?;
+    process.set("run", run)
+}
+
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor::lua::bindings::install_json(lua, &nefor)?;

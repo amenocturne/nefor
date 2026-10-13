@@ -44,9 +44,7 @@ function M.compile_request(id, project_root, entry, module_roots, project_build)
   return request
 end
 
-local function sh_quote(value)
-  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
-end
+local sh_quote = require("core.shell").quote
 
 local function sessions_root()
   return configured_sessions_root

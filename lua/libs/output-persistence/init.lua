@@ -11,9 +11,7 @@ local json = nefor.json
 
 local M = {}
 
-local function sh_quote(value)
-  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
-end
+local sh_quote = require("core.shell").quote
 
 local function safe_segment(value, fallback)
   local s = tostring(value or "")

@@ -1,5 +1,5 @@
 local CLASSIFIER = "/managed/plugins/da/bin/da"
-local tv = require("tool-validator").build { shell_classifier = CLASSIFIER }
+local tv = require("tool-validator").build { classifier = CLASSIFIER }
 local tv_lib = require("libs.tool-validator")
 local json = nefor.json
 
@@ -120,7 +120,7 @@ end
 
 -- Read-only status is derived from the complete allowlist, not a wire flag.
 do
-  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file", "read_image" } }
+  local validator = tv_lib.build { classifier = CLASSIFIER, read_only_tools = { "read_file", "read_image" } }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -139,7 +139,7 @@ end
 -- A mixed allowlist is write-capable even when the requested tool is itself
 -- read-only; it follows ordinary safe-mode policy and opens a popup.
 do
-  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file", "read_image" } }
+  local validator = tv_lib.build { classifier = CLASSIFIER, read_only_tools = { "read_file", "read_image" } }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -159,7 +159,7 @@ end
 do
   local seen
   local validator = tv_lib.build {
-    shell_classifier = CLASSIFIER,
+    classifier = CLASSIFIER,
     process_fastpaths = {
       function(argv, args, read_only)
         seen = { argv = argv, args = args, read_only = read_only }
@@ -213,7 +213,7 @@ end
 -- Capability validation is fail-closed before every mode-specific policy,
 -- including yolo. Missing allowlist is the legacy unrestricted shape.
 do
-  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file" } }
+  local validator = tv_lib.build { classifier = CLASSIFIER, read_only_tools = { "read_file" } }
   local cases = {
     { id = "empty", mode = "safe", allowlist = {} },
     { id = "malformed", mode = "safe", allowlist = { "read_file", 7 } },
@@ -242,7 +242,7 @@ end
 -- Legacy read_only is ignored; absence of an authoritative allowlist remains
 -- unrestricted and follows normal policy rather than becoming read-only.
 do
-  local validator = tv_lib.build { shell_classifier = CLASSIFIER, read_only_tools = { "read_file" } }
+  local validator = tv_lib.build { classifier = CLASSIFIER, read_only_tools = { "read_file" } }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -264,7 +264,7 @@ do
   nefor.process.run = function(_)
     return { code = -1, stderr = "spawn failed: no such file" }
   end
-  local validator = tv_lib.build { shell_classifier = "/missing/plugins/da/bin/da" }
+  local validator = tv_lib.build { classifier = "/missing/plugins/da/bin/da" }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -278,7 +278,7 @@ do
   assert_eq(#calls, 1, "classifier failure settles exactly once")
   assert_eq(calls[1].kind, "tool.permission_response", "classifier failure responds to gate")
   assert_eq(calls[1].decision, "deny", "classifier failure denies")
-  assert_true(calls[1].reason:find("tool_classifier_unavailable[da]", 1, true) ~= nil,
+  assert_true(calls[1].reason:find("tool_classifier_unavailable", 1, true) ~= nil,
     "classifier failure is actionable")
   assert_true(calls[1].reason:find("/missing/plugins/da/bin/da", 1, true) ~= nil,
     "classifier failure identifies configured path")
@@ -297,7 +297,7 @@ do
     end
     return { code = -1, stderr = "classifier process crashed" }
   end
-  local validator = tv_lib.build { shell_classifier = CLASSIFIER }
+  local validator = tv_lib.build { classifier = CLASSIFIER }
   validator._internals.set_mode("safe")
   _test.calls_clear()
   validator.receive_msg(make_entry({
@@ -321,7 +321,7 @@ end
 do
   local ok, err = pcall(tv_lib.build, {})
   assert_eq(ok, false, "classifier dependency is required")
-  assert_true(tostring(err):find("shell_classifier", 1, true) ~= nil,
+  assert_true(tostring(err):find("classifier", 1, true) ~= nil,
     "missing dependency names the composition seam")
 end
 

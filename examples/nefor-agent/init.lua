@@ -371,7 +371,7 @@ actor.spawn(require("read-only-tools"))
 -- popup_request, not permission_request — without the validator
 -- running, gated invocations never reach the popup.
 actor.spawn(require("tool-validator").build {
-  shell_classifier = SHELL_CLASSIFIER,
+  classifier = SHELL_CLASSIFIER,
 })
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))

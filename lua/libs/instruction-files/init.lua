@@ -59,9 +59,7 @@ local function basename(p)
   return tostring(p or ""):match("([^/]+)$") or ""
 end
 
-local function shell_quote(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
+local shell_quote = require("core.shell").quote
 
 local function is_directory(p)
   if type(p) ~= "string" or p == "" then return false end
