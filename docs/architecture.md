@@ -520,8 +520,7 @@ constructs either request without selecting global paths or altering correlation
 
 Config roots supply `mag.toml`. Each calling node authors into its own workspace
 inside its run's folder under the session's MAG folder (`runs/<run id>/<logical
-node path>/`, beside the runtime's output files; the lead keeps `lead/` for
-now; see `lua/libs/lead-workflow/README.md`), and that workspace is the project
+node path>/`, beside the runtime's output files; the lead is the one exception and keeps `lead/`; see `lua/libs/lead-workflow/README.md`), and that workspace is the project
 root of its compilations. A workspace's first write
 creates the workspace and only a missing minimal `version = 1` manifest, never
 replacing authored content (even an invalid manifest). Files and deltas need no

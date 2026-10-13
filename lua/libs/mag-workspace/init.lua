@@ -222,7 +222,7 @@ end
 -- The session's MAG folder. Nothing is authored here directly.
 --
 --   <sessions root>/<session id>/mag/
---     lead/                             the lead (interim, see lead_workspace)
+--     lead/                             the lead (exception, see lead_workspace)
 --     runs/<key>/<node>/.../<node>/     one workspace per calling node
 --     runs/<run id>/<actor>.output      written by the runtime
 function M.session_dir(session_id)
@@ -261,9 +261,10 @@ function M.encode_segment(name)
   return encoded
 end
 
--- Interim: the lead's run id changes every turn, so a workspace keyed by its
--- run would hide the files it wrote in earlier turns. Until its key is
--- decided it keeps one folder for the session.
+-- The lead is the one exception to the run-and-node layout: its run id changes
+-- every turn, so a workspace keyed by its run would hide the files it wrote in
+-- earlier turns. It keeps one folder for the session (see the TODO at
+-- `caller_workspace` in libs.lead-workflow).
 function M.lead_workspace(session_id)
   local dir = M.session_dir(session_id)
   return dir and dir .. "/" .. LEAD_DIR or nil

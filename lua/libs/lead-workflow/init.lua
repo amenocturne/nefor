@@ -2351,8 +2351,14 @@ end
 -- the call: its key's folder, then the logical node that contains the calling
 -- actor.
 local function caller_workspace(provenance)
-  -- Interim: the lead's run id changes every turn and its turn run is not in
-  -- this registry, so it keeps one session folder until its key is decided.
+  -- TODO: Remove this exception, the only caller-specific branch in workspace
+  -- resolution. The agentic loop starts the lead's turn as a new short-lived
+  -- run per user message, so its run id changes every turn and the general
+  -- "run folder + calling node path" rule would lose its files between turns.
+  -- Make the lead an ordinary long-lived looping workflow (or otherwise give
+  -- it a stable run identity, recording its turn run as the parent of the runs
+  -- it dispatches) so it resolves like every other calling node and the
+  -- hardcoded folder name disappears.
   if provenance.principal == "lead" then
     local ws = mag.lead_workspace(provenance.session_id)
     if not ws then return nil, "no data root available" end

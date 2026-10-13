@@ -130,7 +130,7 @@ read, overwrite, or run another's source through them.
 <sessions root>/<session id>/mag/
   runs/<run id>/<actor>.output        node outputs, written by the runtime
   runs/<run id>/<node>/.../<node>/    one workspace per calling node
-  lead/                               the lead's workspace (interim, see below)
+  lead/                               the lead's workspace (exception, see below)
 ```
 
 A workspace is identified by the run and the caller's logical node path, the
@@ -158,10 +158,12 @@ under the new run id, and the applying node stays under its own. A node
 expanded from a template gets its folder from its materialized path, for
 example `runs/<run id>/fan-out/items%3A0/worker/`.
 
-The lead does not go through this rule yet. Its run id changes every turn and
-its turn run is started by `libs.agentic-loop`, not tracked here, so a
-workspace keyed by its run would hide the files it wrote in earlier turns.
-Until its key is decided it keeps `lead/` for the session.
+The lead is the one exception, and the only caller-specific branch
+(`caller_workspace` in `init.lua`, marked `TODO`). The agentic loop starts the
+lead's turn as a new short-lived run per user message, so the general rule
+would lose its files between turns; it keeps `lead/` for the session. The
+intended redesign makes the lead an ordinary long-lived workflow with a stable
+run identity, which removes the exception and the hardcoded folder name.
 
 A run's folder holds both what the runtime wrote and what the run's nodes
 authored, so names are chosen to keep them apart:
