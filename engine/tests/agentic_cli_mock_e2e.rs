@@ -111,15 +111,23 @@ fn run_inner(
     let da = dir.join("da-fixture/bin");
     std::fs::create_dir_all(&da).unwrap();
     let classifier = da.join("da");
-    // Exit contract: 0 approve, 1 defer. The fixture defers a command that
-    // creates a file and approves everything else.
-    std::fs::write(
-        &classifier,
-        "#!/bin/sh\ncase \"$(cat)\" in *touch*) exit 1 ;; esac\nprintf 'allow\\n'\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(classifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Exit contract: 0 approve, 1 defer, 2 deny. The fixture defers a command
+    // that creates a file and approves everything else. With
+    // NEFOR_TEST_REAL_DA set to a released `da` binary the same tests run
+    // against it instead, with the starter's own flags.
+    let _ = std::fs::remove_file(&classifier);
+    match std::env::var_os("NEFOR_TEST_REAL_DA") {
+        Some(real) => std::os::unix::fs::symlink(real, &classifier).unwrap(),
+        None => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &classifier,
+                "#!/bin/sh\ncase \"$(cat)\" in *touch*) exit 1 ;; esac\nprintf 'allow\\n'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&classifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
     let init = dir.join("fixture-config/init.lua");
     let source = std::fs::read_to_string(&init).unwrap();
     let marker = "local da_package = require(\"libs.tool-validator.da\")";

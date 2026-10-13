@@ -46,11 +46,11 @@ pm.register({
 local da_package = require("libs.tool-validator.da")
 pm.install({
   da_package.release_package {
-    version = "0.2.1",
+    version = "0.3.0",
     checksums = {
-      ["aarch64-apple-darwin"] = "2ab4714780f7e6509e30137b7e1434c8d534d035ddfddbc5a68278a023b281cf",
-      ["aarch64-unknown-linux-gnu"] = "14469f64a8aafbddd7f8d1c76fb85771123188657368e5f01f17031c147fa0ea",
-      ["x86_64-unknown-linux-gnu"] = "f2ab7637c0129291419683d686eeb9bd9154d7d06f5bba65abd574cf1786cfbb",
+      ["aarch64-apple-darwin"] = "04fd66aba05497c954e729b8e48c5eaf87d6319292bbf75cc3b4f7967078e053",
+      ["aarch64-unknown-linux-gnu"] = "0cdac8e2a4bc7488a7c4bb37ac1e475a7adabbb6b1b49156f76b2d11751b4503",
+      ["x86_64-unknown-linux-gnu"] = "06c71d7e18e9e7a9cc6027a641b400ff97e99f5900f4972eef214b77a07b2a1b",
     },
   },
 }, { on_progress = pm.stderr_progress })

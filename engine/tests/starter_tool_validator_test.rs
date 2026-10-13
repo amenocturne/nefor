@@ -58,6 +58,34 @@ fn command_classification_per_policy_and_argv_quoting() {
     }
 }
 
+/// The starter's own classifier flags against a released `da` binary. Opt-in:
+/// it runs only when NEFOR_TEST_REAL_DA names that binary, because the
+/// repository's tests never download anything.
+#[test]
+fn the_starters_flags_classify_with_a_released_classifier() {
+    let Some(real) = std::env::var_os("NEFOR_TEST_REAL_DA") else {
+        eprintln!("skipped: NEFOR_TEST_REAL_DA is not set");
+        return;
+    };
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    install_real_process_run(&lua).expect("install process runner");
+    set_package_path(&lua).expect("set package.path");
+    lua.globals()
+        .set("REAL_CLASSIFIER", real.to_string_lossy().to_string())
+        .expect("set classifier path");
+    let test_path = repo_root().join("tests/lua/tool-validator/released_classifier_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
+    if let Err(e) = lua
+        .load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+    {
+        panic!("released_classifier_test.lua failed:\n{e}");
+    }
+}
+
 fn install_real_process_run(lua: &Lua) -> mlua::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};

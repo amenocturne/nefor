@@ -2407,12 +2407,12 @@ fn archive_specs_and_da_release_platforms_are_explicit() {
         nefor.process.run = function(args)
           return { code = 0, stdout = args.args[1] == "-s" and "Darwin" or "arm64" }
         end
-        assert(not pcall(da.release_package, { version = "0.2.1", checksums = {} }))
+        assert(not pcall(da.release_package, { version = "0.3.0", checksums = {} }))
         local spec = da.release_package {
-          version = "0.2.1", checksums = { ["aarch64-apple-darwin"] = string.rep("a", 64) },
+          version = "0.3.0", checksums = { ["aarch64-apple-darwin"] = string.rep("a", 64) },
         }
         assert(spec.build == nil and spec.commit == nil)
-        assert(spec.archive.url == "https://github.com/amenocturne/da/releases/download/v0.2.1/da-aarch64-apple-darwin.tar.gz")
+        assert(spec.archive.url == "https://github.com/amenocturne/da/releases/download/v0.3.0/da-aarch64-apple-darwin.tar.gz")
         assert(spec.archive.strip_components == 1)
     "#).exec().expect("archive contract");
 }
