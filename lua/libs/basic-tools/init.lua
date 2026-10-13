@@ -2,8 +2,9 @@
 --
 -- The `basic-tools` process executes capabilities; these definitions own what
 -- a model sees and calls: names, descriptions, closed parameter schemas,
--- display contracts, and `context` folder metadata. Each handler forwards its
--- validated arguments to the capability of the same name.
+-- display contracts, `context` folder metadata, and what a call means under
+-- each approval policy. Each `execute` forwards its validated arguments to the
+-- capability of the same name.
 --
 --   require("libs.basic-tools").tools {
 --     max_read_bytes = N,                    -- read_file cap, same as the process flag
@@ -15,6 +16,7 @@
 -- wrapped process.
 
 local tool = require("libs.tool")
+local approval = require("libs.tool.approval")
 local tool_display = require("libs.chat.tool_display")
 
 local M = {}
@@ -91,7 +93,8 @@ function M.tools(opts)
         field("content", "result", "$", "text", { max_lines = 20, max_bytes = 1600 }),
       }) }),
       context = file_path_context("cwd"),
-      handler = forward("read_file"),
+      approval = { decide = approval.reads() },
+      execute = forward("read_file"),
     },
     tool.define {
       name = "read_image",
@@ -111,7 +114,8 @@ function M.tools(opts)
           field("encoded bytes", "result", "data", "bytes", { omit = "missing" }),
         }) }),
       context = file_path_context("cwd"),
-      handler = forward("read_image"),
+      approval = { decide = approval.reads() },
+      execute = forward("read_image"),
     },
     tool.define {
       name = "write_file",
@@ -135,7 +139,7 @@ function M.tools(opts)
       display = display("write file", field("path", "args", "path", "path"), {},
         { kind = "receipt", text = "file written", fields = tool_display.fields({}) }),
       context = file_path_context(nil),
-      handler = forward("write_file"),
+      execute = forward("write_file"),
     },
     tool.define {
       name = "process.exec",
@@ -158,7 +162,7 @@ function M.tools(opts)
       display = display("execute process", field("argv", "args", "argv", "scalar"), {},
         { kind = "content", fields = tool_display.fields({}) }),
       context = CWD_CONTEXT,
-      handler = forward("process.exec"),
+      execute = forward("process.exec"),
       cancel = cancel,
     },
     tool.define {
@@ -177,7 +181,7 @@ function M.tools(opts)
       display = display("execute shell script", field("script", "args", "script", "scalar"), {},
         { kind = "content", fields = tool_display.fields({}) }),
       context = CWD_CONTEXT,
-      handler = forward("shell.script"),
+      execute = forward("shell.script"),
       cancel = cancel,
     },
   }

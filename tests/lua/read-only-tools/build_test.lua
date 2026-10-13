@@ -95,7 +95,7 @@ local custom = tool.define {
   name = "custom", description = "Custom lookup",
   parameters = { type = "object", properties = { value = { type = "string" } }, required = { "value" } },
   display = custom_display("Custom"),
-  handler = function(args, call) call.ok(args.value) end,
+  execute = function(args, call) call.ok(args.value) end,
 }
 local extras = rot.build { include = { "skill" }, extra_tools = { custom } }
 local extra_names = advertise(extras)
@@ -113,7 +113,7 @@ assert_true(invoke(extras, "skill", { name = {} }).error == "skill: name must li
 assert_true(not pcall(rot.build, {
   include = { "skill" }, extra_tools = { tool.define {
     name = "skill", description = "x", parameters = { type = "object" },
-    display = custom_display("skill"), handler = function(_, call) call.ok("unexpected") end,
+    display = custom_display("skill"), execute = function(_, call) call.ok("unexpected") end,
   } },
 }), "extra tool cannot collide with an included base name")
 
@@ -149,7 +149,7 @@ for _, already_settled in ipairs({ false, true }) do
   local throwing = rot.build { extra_tools = { tool.define {
     name = "custom", description = "Throwing custom tool",
     parameters = { type = "object" }, display = custom_display("custom"),
-    handler = function(_, emit)
+    execute = function(_, emit)
       if already_settled then emit.ok("completed") end
       error("expected external invocation failure")
     end,
@@ -172,7 +172,7 @@ do
   local guarded = rot.build { extra_tools = { tool.define {
     name = "custom", description = "Callback settlement guard",
     parameters = { type = "object" }, display = custom_display("custom"),
-    handler = function(_, call)
+    execute = function(_, call)
       retained = call
       call.ok("first")
       call.err("second")
@@ -184,7 +184,7 @@ do
   local delayed = rot.build { extra_tools = { tool.define {
     name = "custom", description = "Deferred callback",
     parameters = { type = "object" }, display = custom_display("custom"),
-    handler = function(_, call) retained = call end,
+    execute = function(_, call) retained = call end,
   } } }
   delayed.receive_msg({ payload = nefor.json.encode({ body = {
     kind = "read-only-tools.tool.invoke", id = "late-callback", name = "custom", args = {},

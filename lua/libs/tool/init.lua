@@ -1,39 +1,82 @@
 -- Uniform tool constructor.
 --
 -- A tool is what a model sees and calls: a name, a description, a closed
--- parameter schema, a display contract, and a handler. Every tool in Nefor is
--- built here; a tool backed by a process capability is an ordinary tool whose
--- handler sends a capability request.
+-- parameter schema, a display contract, and two functions, `prepare` and
+-- `execute`. Every tool in Nefor is built here; a tool backed by a process
+-- capability is an ordinary tool whose `execute` sends a capability request.
 --
 --   local tool = require("libs.tool")
---   local read = tool.define {
---     name = "read_file",
+--   local approval = require("libs.tool.approval")
+--   local write = tool.define {
+--     name = "write_note",
 --     description = "...",          -- string, or function(request) -> string
 --     parameters = { type = "object", properties = { ... }, required = { ... } },
 --     display = { compact = ..., expanded = ..., result = ... },
 --     context = { folders = { ... } },  -- optional internal advertisement metadata
 --     execution = { kind = "routed" },  -- optional gate execution metadata
---     handler = function(args, call) call.ok(output) end,
+--     approval = {                      -- optional; see "Approval" below
+--       decide = function(policy, args, call)
+--         if policy == approval.ReadOnly then return approval.denied, "it writes a note" end
+--       end,
+--       describe = { ReadOnly = "Your approval policy is ReadOnly, so this tool is rejected." },
+--     },
+--     prepare = nil,                                        -- or function(args, call)
+--     execute = function(args, call) call.ok(output) end,
 --     cancel = function(call) end,      -- optional
 --   }
 --
+-- ## prepare and execute
+--
+-- Both functions belong to every tool's interface. `execute(args, call)` does
+-- the tool's work and is required. `prepare(args, call)` is what the tool does
+-- with a call before anyone has decided whether it may run, for example
+-- storing the content the call carries so that it can be inspected; most
+-- tools have none. Lua cannot tell a field set to nil from an absent field,
+-- so "no prepare" is written either way, `prepare = nil` or nothing, and a
+-- definition's `prepare` is then nil. What a caller does between the two
+-- functions is the caller's concern. A source runs them in this order for one
+-- call: `prepare` (if any), then the decision of whoever asked, then `execute`.
+--
+-- ## Approval
+--
+-- `approval.decide(policy, args, call)` says what one call means under the
+-- caller's approval policy (`libs.tool.approval`): it returns `safe`, `unsure`
+-- or `denied`, with a reason for the last two. Returning nothing means the
+-- tool does not say; the gate then uses its configured setting for the tool
+-- under `Default` and denies under any narrower policy. A decision that needs
+-- to wait returns `tool.deferred` and later calls `call.decided(result,
+-- reason)`. `approval.describe[policy]` is text appended to the tool's
+-- description for an agent with that policy; a policy with nothing to add has
+-- no entry. The two live together so that what is enforced and what the model
+-- is told cannot drift apart. The tool only states meaning: what happens to a
+-- `safe`, `unsure` or `denied` call is the gate's decision.
+--
 -- `define` checks the schema (only the keywords `libs.tool.schema` supports)
 -- and the display contract when the tool is defined. A source groups tools
--- under one bus name, advertises them to a gate, validates every invocation
--- against the tool's schema before its handler runs, and emits results:
+-- under one bus name, advertises them to a gate, validates every call's
+-- arguments against the tool's schema before either function runs, and emits
+-- results:
 --
 --   local source = tool.source { name = "read-only-tools", tools = { read } }
 --   source.advertise("tool-gate")      -- <gate>.tools.advertise
---   source.invoke(body)                -- <name>.tool.invoke body
+--   source.prepare(body)               -- <name>.tool.prepare body -> tool.prepared
+--   source.invoke(body)                -- <name>.tool.invoke body  -> tool.result
 --   source.cancel(body)                -- <name>.tool.cancel body
 --   source.result(id, { output = x })  -- deferred settlement by invocation id
 --
--- Invalid arguments never reach a handler; the caller receives
+-- `<name>.tool.prepare { id, name, args, approval_policy, ... }` runs the
+-- tool's `prepare` and its decision function and answers `tool.prepared { id,
+-- decision?, reason? }`; a later `<name>.tool.invoke` with the same id runs
+-- `execute` on the same call. An invoke that was never prepared (a workflow
+-- node's capability request) runs `execute` directly.
+--
+-- Invalid arguments never reach a tool function; the caller receives
 -- `tool.result { error = "<tool>: <problem>" }` with the problem worded by
--- `libs.tool.schema`. A handler settles through `call.ok(output, fields)` or
+-- `libs.tool.schema`. `execute` settles through `call.ok(output, fields)` or
 -- `call.err(message, fields)` (extra `fields` ride on the result envelope),
 -- may report process output with `call.stream(stream, text)`, and may keep
--- `call.id` to settle later through `source.result`.
+-- `call.id` to settle later through `source.result`. `prepare` and `decide`
+-- may end the call with `call.err`; they cannot call `call.ok`.
 --
 -- A call naming a tool its caller cannot use gets one answer everywhere,
 -- worded by `unknown_tool_message`: ``unknown tool `x`; available tools: a, b``.
@@ -47,14 +90,20 @@ local envelope = require("core.envelope")
 local replay_window = require("core.replay_window")
 local tool_display = require("libs.chat.tool_display")
 local schema = require("libs.tool.schema")
+local approval = require("libs.tool.approval")
 
 local M = {}
 
 M.schema = schema
+M.approval = approval
+
+-- Returned by a decision function that settles later through `call.decided`.
+M.deferred = setmetatable({}, { __tostring = function() return "tool.deferred" end })
 
 local DEFINITION_FIELDS = {
   name = true, description = true, parameters = true, display = true,
-  context = true, execution = true, handler = true, cancel = true,
+  context = true, execution = true, approval = true,
+  prepare = true, execute = true, cancel = true,
 }
 
 local function mark_array(value)
@@ -102,9 +151,41 @@ function M.define(spec)
   if spec.execution ~= nil and type(spec.execution) ~= "table" then
     fail(name, "execution must be a table")
   end
-  if type(spec.handler) ~= "function" then fail(name, "handler must be a function") end
+  if spec.prepare ~= nil and type(spec.prepare) ~= "function" then
+    fail(name, "prepare must be a function or nil")
+  end
+  if type(spec.execute) ~= "function" then fail(name, "execute must be a function") end
   if spec.cancel ~= nil and type(spec.cancel) ~= "function" then
     fail(name, "cancel must be a function")
+  end
+  local decide, describe
+  if spec.approval ~= nil then
+    if type(spec.approval) ~= "table" then fail(name, "approval must be a table") end
+    for key in pairs(spec.approval) do
+      if key ~= "decide" and key ~= "describe" then
+        fail(name, "approval has unknown field `" .. tostring(key) .. "`")
+      end
+    end
+    decide = spec.approval.decide
+    if decide ~= nil and type(decide) ~= "function" then
+      fail(name, "approval.decide must be a function(policy, args, call)")
+    end
+    if spec.approval.describe ~= nil then
+      if type(spec.approval.describe) ~= "table" then
+        fail(name, "approval.describe must map an approval policy to text")
+      end
+      describe = {}
+      for policy, text in pairs(spec.approval.describe) do
+        if not approval.is_policy(policy) then
+          fail(name, "approval.describe names unknown approval policy `" .. tostring(policy) .. "`")
+        end
+        if type(text) ~= "string" or text == "" then
+          fail(name, "approval.describe." .. policy .. " must be a non-empty string")
+        end
+        describe[policy] = text
+      end
+      if next(describe) == nil then describe = nil end
+    end
   end
 
   local definition = {
@@ -114,8 +195,11 @@ function M.define(spec)
     display = json_data.copy(spec.display),
     context = spec.context and json_data.copy(spec.context) or nil,
     execution = spec.execution and json_data.copy(spec.execution) or nil,
-    handler = spec.handler,
+    prepare = spec.prepare,
+    execute = spec.execute,
     cancel = spec.cancel,
+    decide = decide,
+    policy_descriptions = describe,
   }
 
   -- Model-facing definition. `request` reaches a description function so a
@@ -134,7 +218,14 @@ function M.define(spec)
       display = json_data.copy(definition.display),
       context = definition.context and json_data.copy(definition.context) or nil,
       execution = definition.execution and json_data.copy(definition.execution) or nil,
+      policy_descriptions = describe and json_data.copy(describe) or nil,
     }
+  end
+
+  -- The text this tool adds to its description for an agent with `policy`,
+  -- or nil when it adds nothing.
+  function definition.describe(policy)
+    return describe and describe[policy] or nil
   end
 
   -- nil when `args` satisfy the schema, otherwise the caller-facing message.
@@ -219,11 +310,21 @@ function M.source(opts)
     emit(copy_fields(fields, { kind = "tool.result", id = id }))
   end
 
+  -- One call of one tool. `call.phase` is "prepare" until the tool has
+  -- answered `tool.prepared`, "prepared" while its caller decides, and
+  -- "execute" once `execute` runs. `call.policy` is the caller's approval
+  -- policy when the call carries one.
   local function new_call(definition, body, args)
     local id = body.id
-    local call = { id = id, name = definition.name, args = args, request = body }
+    local call = {
+      id = id, name = definition.name, args = args, request = body,
+      policy = body.approval_policy,
+    }
     function call.ok(output, fields)
       if pending[id] ~= call then return end
+      if call.phase ~= "execute" then
+        error("tool `" .. definition.name .. "`: a call can only succeed from execute", 2)
+      end
       local result = copy_fields(fields, {})
       result.output = output
       result.error = nil
@@ -240,6 +341,18 @@ function M.source(opts)
       emit(copy_fields(fields, { kind = "tool.stream", id = id, stream = stream, text = text }))
     end
     function call.settled() return pending[id] ~= call end
+    -- Answer the decision a deferred `approval.decide` promised.
+    function call.decided(result, reason)
+      if pending[id] ~= call or call.phase ~= "prepare" then return end
+      if result ~= nil and not approval.is_result(result) then
+        call.err(definition.name .. ": approval decision `" .. tostring(result)
+          .. "` is not one of " .. table.concat(approval.RESULTS, ", "))
+        return
+      end
+      call.phase = "prepared"
+      emit({ kind = "tool.prepared", id = id, decision = result,
+        reason = type(reason) == "string" and reason ~= "" and reason or nil })
+    end
     return call
   end
 
@@ -260,42 +373,92 @@ function M.source(opts)
     return names, seen
   end
 
-  -- Handle a `<name>.tool.invoke` body. Returns true when it was addressed to
-  -- one of this source's tools or answered as an unknown tool.
-  function source.invoke(body)
-    if type(body) ~= "table" then return false end
+  -- Resolve the tool a body names and check its arguments. Answers the call
+  -- itself and returns nil when the tool is unusable or the arguments invalid.
+  local function admit(body, label)
+    if type(body) ~= "table" then return nil, false end
     local id = body.id
     if type(id) ~= "string" or id == "" then
-      nefor.log.warn("tool.source: invoke without a string id dropped", { source = name })
-      return false
+      nefor.log.warn("tool.source: " .. label .. " without a string id dropped", { source = name })
+      return nil, false
     end
     local available, callable = available_tools(body.allowlist)
     local definition = callable[body.name]
     if definition == nil then
       source.result(id, { error = M.unknown_tool_message(body.name, available) })
-      return true
+      return nil, true
     end
     local args = body.args
     if args == nil then args = {} end
     local problem = definition.check(args)
     if problem then
       source.result(id, { error = problem })
+      return nil, true
+    end
+    return definition, true, args
+  end
+
+  -- Run one tool function for `call`. A raised error ends the call.
+  local function run(definition, call, label, fn, ...)
+    local ok, first, second = pcall(fn, ...)
+    if ok then return true, first, second end
+    if opts.propagate_errors then error(first, 0) end
+    if type(first) == "table" and first.kind == "tool_output_unavailable" then error(first, 0) end
+    if pending[call.id] == call then
+      call.err(definition.name .. ": " .. label .. " raised: " .. tostring(first))
+    else
+      nefor.log.error("tool.source: " .. label .. " raised after settling", {
+        source = name, tool = definition.name, error = tostring(first),
+      })
+    end
+    return false
+  end
+
+  -- Handle a `<name>.tool.prepare` body: run the tool's `prepare`, then its
+  -- decision function under the caller's approval policy, and answer
+  -- `tool.prepared { id, decision?, reason? }`. Nothing here executes the
+  -- tool. Returns true when the body was addressed to this source.
+  function source.prepare(body)
+    local definition, addressed, args = admit(body, "prepare")
+    if definition == nil then return addressed end
+    local call = new_call(definition, body, args)
+    call.phase = "prepare"
+    pending[call.id] = call
+    if definition.prepare ~= nil then
+      if not run(definition, call, "prepare", definition.prepare, args, call) then return true end
+      if pending[call.id] ~= call then return true end
+    end
+    if definition.decide == nil then
+      call.decided(nil)
       return true
     end
-    local call = new_call(definition, body, args)
-    pending[id] = call
-    local ok, raised = pcall(definition.handler, args, call)
-    if not ok then
-      if opts.propagate_handler_errors then error(raised, 0) end
-      if type(raised) == "table" and raised.kind == "tool_output_unavailable" then error(raised, 0) end
-      if pending[id] == call then
-        call.err(definition.name .. ": handler raised: " .. tostring(raised))
-      else
-        nefor.log.error("tool.source: handler raised after settling", {
-          source = name, tool = definition.name, error = tostring(raised),
-        })
-      end
+    local ok, result, reason = run(definition, call, "approval.decide",
+      definition.decide, call.policy, args, call)
+    if not ok or pending[call.id] ~= call or call.phase ~= "prepare" then return true end
+    if result ~= M.deferred then call.decided(result, reason) end
+    return true
+  end
+
+  -- Handle a `<name>.tool.invoke` body: run the tool's `execute`, on the call
+  -- a `tool.prepare` with the same id opened when there is one. Returns true
+  -- when it was addressed to one of this source's tools or answered as an
+  -- unknown tool.
+  function source.invoke(body)
+    local definition, addressed, args = admit(body, "invoke")
+    if definition == nil then
+      if addressed and type(body.id) == "string" then pending[body.id] = nil end
+      return addressed
     end
+    local call = pending[body.id]
+    if call ~= nil and call.name == definition.name and call.phase == "prepared" then
+      -- An approval may have replaced the arguments; execute sees those.
+      call.args, call.request = args, body
+    else
+      call = new_call(definition, body, args)
+      pending[call.id] = call
+    end
+    call.phase = "execute"
+    run(definition, call, "execute", definition.execute, args, call)
     return true
   end
 
@@ -307,7 +470,8 @@ function M.source(opts)
     if call == nil then return nil end
     pending[id] = nil
     local definition = by_name[call.name]
-    if definition and definition.cancel then
+    -- `cancel` stops running work; a call that never reached execute has none.
+    if definition and definition.cancel and call.phase == "execute" then
       local ok, raised = pcall(definition.cancel, call)
       if not ok then
         nefor.log.error("tool.source: cancel raised", {
@@ -321,6 +485,7 @@ function M.source(opts)
   -- Dispatch a decoded bus body addressed to this source.
   function source.receive(body)
     local kind = type(body) == "table" and body.kind or nil
+    if kind == name .. ".tool.prepare" then return source.prepare(body) end
     if kind == name .. ".tool.invoke" then return source.invoke(body) end
     if kind == name .. ".tool.cancel" then return source.cancel(body) ~= nil end
     return false
@@ -329,8 +494,8 @@ function M.source(opts)
   return source
 end
 
--- Pure-Lua actor for a source whose handlers run in this VM. It advertises on
--- every live `<gate>.hello` and serves invocations and cancellations; replayed
+-- Pure-Lua actor for a source whose tool functions run in this VM. It advertises on
+-- every live `<gate>.hello` and serves prepares, invocations and cancellations; replayed
 -- traffic is ignored.
 function M.actor(opts)
   if type(opts) ~= "table" then error("tool.actor: options must be a table", 2) end

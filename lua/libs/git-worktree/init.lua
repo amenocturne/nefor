@@ -9,6 +9,7 @@
 --   } -> { tool definitions }
 
 local tool = require("libs.tool")
+local approval = require("libs.tool.approval")
 local tool_display = require("libs.chat.tool_display")
 
 local M = {}
@@ -54,7 +55,11 @@ function M.tools(opts)
       },
       display = display("create worktree", "worktree created"),
       context = {},
-      handler = forward("git_worktree_create"),
+      approval = {
+        decide = approval.writes("it creates a Git worktree and a branch"),
+        describe = approval.rejected_when_read_only("it creates a Git worktree and a branch"),
+      },
+      execute = forward("git_worktree_create"),
     },
     tool.define {
       name = "git_worktree_open",
@@ -67,7 +72,8 @@ function M.tools(opts)
       },
       display = display("open worktree", "worktree opened"),
       context = {},
-      handler = forward("git_worktree_open"),
+      approval = { decide = approval.reads() },
+      execute = forward("git_worktree_open"),
     },
   }
 end

@@ -5,6 +5,9 @@
     {
       "name": "git_worktree_create",
       "description": "Create a fresh Git worktree; existing paths or branches are errors.",
+      "policy_descriptions": {
+        "ReadOnly": "Your approval policy is ReadOnly, so every call to this tool is rejected: it creates a Git worktree and a branch."
+      },
       "parameters": {
         "type": "object",
         "properties": {

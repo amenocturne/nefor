@@ -6,11 +6,12 @@
 -- skill from the config. Neither is enabled by default.
 --
 -- Config-specific tools use `extra_tools = { tool.define { ... } }`, built with
--- `libs.tool`; their handlers receive validated arguments and settle with
+-- `libs.tool`; their `execute` receives validated arguments and settles with
 -- call.ok(text) or call.err(message). Included tools and extras share
 -- advertisement and dispatch on every live gate hello.
 
 local tool = require("libs.tool")
+local approval = require("libs.tool.approval")
 local envelope = require("core.envelope")
 local instruction_files = require("libs.instruction-files")
 local tool_display = require("libs.chat.tool_display")
@@ -117,7 +118,8 @@ local function base_tools()
           },
         },
       },
-      handler = discover_instruction_files,
+      approval = { decide = approval.reads() },
+      execute = discover_instruction_files,
     },
     tool.define {
       name = "skill",
@@ -140,7 +142,8 @@ local function base_tools()
         },
         required = { "name" },
       },
-      handler = skill,
+      approval = { decide = approval.reads() },
+      execute = skill,
     },
   }
 end

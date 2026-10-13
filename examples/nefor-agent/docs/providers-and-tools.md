@@ -60,7 +60,8 @@ return require("libs.read-only-tools").build {
         expanded = { label = "My read tool", fields = {} },
         result = { kind = "content", fields = {} },
       },
-      handler = function(args, call)
+      approval = { decide = require("libs.tool.approval").reads() },
+      execute = function(args, call)
         call.ok("result for " .. args.query)
         -- On expected failure, call call.err("message") instead.
       end,
@@ -69,9 +70,9 @@ return require("libs.read-only-tools").build {
 }
 ```
 
-Base tools are opt-in: `build {}` advertises none. The available base tools are repository instruction discovery and ordinary workflow skill loading; shell/process capabilities handle directory listings, searches, and Python analysis. `tool.define` checks the schema and Nefor's `display` metadata when the tool is defined, and rejects schema keywords its validator does not support. Every schema is closed: arguments not declared in `properties` are rejected, and invalid arguments never reach the handler; the caller receives an error such as ``my_read_tool: unknown argument `q`; accepted arguments: query``. Handlers settle exactly once through `call.ok` or `call.err`. All tools built here share source identity `read-only-tools`.
+Base tools are opt-in: `build {}` advertises none. The available base tools are repository instruction discovery and ordinary workflow skill loading; shell/process capabilities handle directory listings, searches, and Python analysis. `tool.define` checks the schema and Nefor's `display` metadata when the tool is defined, and rejects schema keywords its validator does not support. Every schema is closed: arguments not declared in `properties` are rejected, and invalid arguments never reach the tool; the caller receives an error such as ``my_read_tool: unknown argument `q`; accepted arguments: query``. `execute` settles exactly once through `call.ok` or `call.err`. `approval.decide` says what a call means under the calling agent's approval policy: `approval.reads()` declares a tool that only reads, so a `ReadOnly` agent may call it; a tool that declares nothing is rejected for a `ReadOnly` agent and follows the gate's configured setting otherwise. All tools built here share source identity `read-only-tools`.
 
-Spawn the actor before `tool-gate`; it advertises on the gate's hello. A tool intended for delegated agents may also need entries in the MAG toolset/allowlist, the validator's read-only inventory, gate policy, and startup readiness.
+Spawn the actor before `tool-gate`; it advertises on the gate's hello. A tool intended for delegated agents may also need entries in the MAG toolset/allowlist, gate policy, and startup readiness.
 
 ## Permission policy
 

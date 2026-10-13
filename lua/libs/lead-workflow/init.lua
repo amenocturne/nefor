@@ -79,6 +79,7 @@ local replay_window  = require("core.replay_window")
 local results_lib    = require("libs.agentic-loop.results")
 local tool_display   = require("libs.chat.tool_display")
 local tool           = require("libs.tool")
+local approval       = require("libs.tool.approval")
 local model_snapshot = require("libs.model-snapshot")
 
 local function display_field(label, source, path, kind, extra)
@@ -292,7 +293,7 @@ local expire_termination_waiter
 local tool_source
 
 local function emit_tool_result(body)
-  if current_invocation and current_invocation.id == body.id then
+  if body.kind == "tool.result" and current_invocation and current_invocation.id == body.id then
     if current_invocation.settled then return end
     current_invocation.settled = true
   end
@@ -1601,6 +1602,7 @@ local function lead_workflow_tool_specs()
   return {
     {
       name        = "mag-status",
+      approval    = { decide = approval.reads() },
       display = display_contract("graph status", run_label_field(false), {}, "content", nil, { display_field("state", "result", "$", "structured") }),
       description =
         "Returns the current state of MAG workflow runs: all active runs and recently completed ones, " ..
@@ -1619,6 +1621,7 @@ local function lead_workflow_tool_specs()
     },
     {
       name        = "mag-await",
+      approval    = { decide = approval.reads() },
       display = display_contract("await run", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
         "Waits until a run you started finishes and returns its result. A run finishes only when all " ..
@@ -1638,6 +1641,8 @@ local function lead_workflow_tool_specs()
     },
     {
       name        = "mag-terminate",
+      -- Stopping a run the caller itself started undoes nothing outside it.
+      approval    = { decide = approval.reads() },
       display = display_contract("terminate graph", run_label_field(true), {}, "content", nil, { display_field("outcome", "result", "$", "structured") }),
       description =
         "Stops one active run, identified by run_id, and returns once the run confirms it has stopped. " ..
@@ -1657,6 +1662,10 @@ local function lead_workflow_tool_specs()
     },
     {
       name        = "write-review",
+      approval    = {
+        decide = approval.writes("it asks the user to approve a plan to write"),
+        describe = approval.rejected_when_read_only("it asks the user to approve a plan to write"),
+      },
       display = display_contract("write review", nil, {}, "receipt", "AWAITING USER REVIEW", { display_field("status", "result", "$", "status", { sensitive = "omit" }) }),
       description =
         "Submits a plan for the user's review and returns their decision: approved, rejected with " ..
@@ -1674,6 +1683,8 @@ local function lead_workflow_tool_specs()
     },
     {
       name = "mag-write-file",
+      -- Writes only the caller's own MAG workspace: nothing runs.
+      approval = { decide = approval.reads() },
       display = display_contract("mag write file", display_field("file", "args", "file", "path"),
         {}, "receipt", "MAG source written", {}),
       description =
@@ -1691,6 +1702,7 @@ local function lead_workflow_tool_specs()
     },
     {
       name = "mag-preview",
+      approval = { decide = approval.reads() },
       display = display_contract("mag preview", display_field("file", "args", "file", "path"),
         {}, "content", nil, { display_field("workflow", "result", "workflow_tree", "text",
           { max_lines = 120, max_bytes = 12000 }) }, "delayed"),
@@ -2207,7 +2219,7 @@ local function tool_definitions()
   local definitions = {}
   for _, spec in ipairs(lead_workflow_tool_specs()) do
     local handler = assert(TOOL_HANDLERS[spec.name], spec.name)
-    spec.handler = function(args, call)
+    spec.execute = function(args, call)
       invoke_owned_handler(handler, call.id, args, {
         caller_id = call.request.caller_id,
         from = call.request.from,
@@ -2219,7 +2231,7 @@ local function tool_definitions()
   return definitions
 end
 
-tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions(), emit = emit_tool_result, propagate_handler_errors = true }
+tool_source = tool.source { name = SOURCE_NAME, tools = tool_definitions(), emit = emit_tool_result, propagate_errors = true }
 
 local function handle_tool_invoke(body)
   tool_source.invoke(body)
