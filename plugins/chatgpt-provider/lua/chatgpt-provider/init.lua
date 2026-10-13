@@ -376,6 +376,13 @@ local function translator(name, options)
     local body = type(env) == "table" and env.body or nil
     if type(body) == "table" then
       if body.kind == t.kinds.completion_request or body.kind == "ProviderRequest" then return nil end
+      -- The gate asks what a web read means before deciding to run it; the
+      -- answer is published by the tool source, nothing reaches the provider.
+      if body.kind == prefix .. "tool.prepare" then
+        if not nonempty(trusted_tool_gate) or env.from ~= trusted_tool_gate then return nil end
+        t.tool_source.prepare(body)
+        return nil
+      end
       if body.kind == prefix .. "tool.invoke" then
         if not nonempty(trusted_tool_gate) or env.from ~= trusted_tool_gate then return nil end
         lowered = nil

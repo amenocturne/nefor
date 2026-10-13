@@ -1,61 +1,66 @@
--- libs/tool-validator — single-decision tool permission validator (base).
+-- libs/tool-validator — command classification and the "ask the user" seam.
 --
--- Sits between tool-gate and the chat surface so popups only appear for
--- tool calls a human actually needs to see. Subscribes to
--- `chat.tool.permission_request` (tool-gate's --prompt output) and is the
--- ONLY consumer of that envelope; chat/update.lua now listens to
--- `chat.tool.popup_request` instead.
+-- Two things live here.
 --
--- For every gated invocation, the validator emits exactly one of:
---   * `tool.permission_response { id, decision = "approve" }` — auto-pass
---   * `tool.permission_response { id, decision = "deny" }`    — auto-block
---   * `chat.tool.popup_request   { id, tool, args }`          — defer to user
+-- ## Command classification
 --
--- ## Per-tool policies
+-- `classify_command(policy, command)` says what running a shell command means
+-- for a caller with approval policy `policy`: `safe`, `unsure` or `denied`
+-- (`libs.tool.approval`), with a reason for the last two. It is the one owner
+-- of that question. The tools that run commands (`shell.script`,
+-- `process.exec`) and the workflow tool that inspects a workflow's command
+-- nodes (`mag-apply`) all call it from their decision functions; the tool
+-- gate turns the result into run / ask / deny.
 --
--- `shell.script`: passes the command through `da` (https://github.com/amenocturne/da),
--- a shell-script classifier with explicit policy flags. da reads the
--- command on stdin and exits 0 / 1 / 2 for approve / defer / deny. We
--- bind a fixed policy stack matching upstream's CC hook example:
+-- The command goes through a classifier executable, normally `da`
+-- (https://github.com/amenocturne/da). The contract this module is written
+-- against: the classifier reads the command on stdin, takes policy flags as
+-- arguments, and exits 0 to approve, 1 to defer, 2 to deny. Each approval
+-- policy has its own flags:
 --
---   --read-only --macos-only --help-bypass
---   --git read,add,commit,restore-staged,tag,fetch,pull,push
---   --cargo local
+--   ReadOnly  --read-only --macos-only --help-bypass --git read
+--   Default   --read-only --macos-only --help-bypass
+--             --git read,add,commit,restore-staged,tag,fetch,pull,push
+--             --cargo local  [+ model_flag]
 --
--- `write_file`: whole-file writes and exact replacements share one policy.
--- The tool is approved only while lead-workflow has an approved plan and is
--- denied to read-only agents. Without approval it is denied instead of popped
--- up, so neither form can bypass the plan gate.
+-- `classify_argv(policy, argv)` answers the same question for a program run
+-- from an argument vector without a shell. The vector is written as the
+-- equivalent POSIX command, every element single-quoted (`core.shell`), and
+-- classified as that text, so a program and a script are judged by one rule
+-- set. A vector that cannot be written that way (empty, or not strings) is
+-- denied.
 --
--- Other tools: defer to the user (popup) unless the agent is read-only.
+-- ## Asking the user
 --
--- Agent capability is defined solely by the invocation allowlist. A request is
--- read-only exactly when every allowed tool belongs to the composition's
--- canonical read-only inventory; no separate wire flag participates.
+-- The gate asks with `chat.tool.permission_request` when its decision table
+-- says so. The actor built here is the only consumer of that envelope and
+-- forwards it to the chat surface as `chat.tool.popup_request { id, tool,
+-- args, reason?, approval_policy? }`. It decides nothing: which calls are
+-- asked about is the gate's table, and what a call means is its tool's
+-- decision function. A composition that wants another way of asking replaces
+-- this actor.
 --
--- ## Registration seam
+-- ## Build options
 --
--- `build{ shell_classifier, read_only_tools, auto_approve_tools, shell_fastpaths,
--- process_fastpaths }` returns the actor spec. `read_only_tools` is the
--- canonical inventory supplied by the composition; the remaining seams are
--- config-owned policy:
---   * `auto_approve_tools` — tool names auto-approved unconditionally
---     (e.g. a typed read-only wrapper that is schema-limited to safe
---     actions). Checked after yolo, before the edit/write/shell/process rules.
---   * `shell_fastpaths` — list of `function(script, read_only) -> bool`.
---     If any returns true the shell script is approved before `da` is
---     consulted. The predicate encodes its own read_only gating.
---   * `process_fastpaths` — list of `function(argv, args, read_only) -> bool`.
---     Predicates inspect the original argument vector; process arguments are
---     never joined into shell text. Unknown process shapes fail closed.
--- A downstream config passes its policy (e.g. a `mirror-projects` read
--- fast-path) instead of forking this file.
+-- `build{ classifier, classifier_args, model_flag, command_fastpaths }`
+-- returns the actor spec with `classify_command` and `classify_argv` on it:
+--   * `classifier` — the classifier executable, normally resolved by
+--     `nefor-pm.bin`. Required.
+--   * `classifier_args` — `{ [policy] = { flags } }`, replacing that policy's
+--     default flags above outright.
+--   * `model_flag` — the name of the classifier's opt-in model flag. When set
+--     it is appended to the default `Default` flags and to no other policy's.
+--     Leave it unset for a classifier release that has no such flag.
+--   * `command_fastpaths` — list of `function(command, policy) -> bool`. If
+--     any returns true the command is safe before the classifier is asked.
+--     A downstream config passes its narrow approvals here instead of forking
+--     this file.
 --
 -- ## Failure modes
 --
--- The composition supplies `shell_classifier`, normally resolved by
--- `nefor-pm.bin`. Missing or unusable classifiers deny the affected request
--- with an actionable reason so tool-gate never retains an unresolved prompt.
+-- A missing or unusable classifier, or one that exits with a status outside
+-- the contract, makes the command `denied` with an actionable reason, so a
+-- command nobody could classify never passes as merely unsure.
 
 local envelope     = require("core.envelope")
 local event        = require("core.event")
@@ -138,42 +143,17 @@ local function classifier_args(opts)
   return by_policy
 end
 
-local function has_approved_plan()
-  local ok, lw = pcall(require, "libs.lead-workflow")
-  if not ok or type(lw) ~= "table" then return false end
-  local internals = lw._internals
-  local st = type(internals) == "table" and internals.state or nil
-  local plan = type(st) == "table" and st.active_plan or nil
-  return type(plan) == "table" and plan.status == "approved"
-end
-
-local function auto_denial_reason(tool)
-  return "permission_denied[auto]: tool `" .. tostring(tool) .. "` requires human approval. " ..
-         "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
-end
-
--- build{ shell_classifier, read_only_tools, auto_approve_tools, shell_fastpaths, process_fastpaths } -> actor spec.
--- State
--- (da_cmd cache, gate_mode) is per-build so instances don't share.
+-- build{ classifier, classifier_args, model_flag, command_fastpaths } -> actor spec.
+-- State (the probed classifier path) is per-build so instances don't share.
 local function build(opts)
   opts = opts or {}
 
-  local read_only_tools = {}
-  for _, name in ipairs(opts.read_only_tools or {}) do
-    read_only_tools[name] = true
-  end
-  local auto_approve = {}
-  for _, name in ipairs(opts.auto_approve_tools or {}) do
-    auto_approve[name] = true
-  end
   local command_fastpaths = opts.command_fastpaths or {}
-  local process_fastpaths = opts.process_fastpaths or {}
 
   if type(opts.classifier) ~= "string" or opts.classifier == "" then
     error("tool-validator: build requires a non-empty `classifier` executable path", 0)
   end
 
-  local gate_mode = "safe"
   -- Resolved on first use. Holds the composition-provided package binary path
   -- (e.g. /Users/x/.local/share/nefor/plugins/da/bin/da) when da is reachable.
   -- nil => not probed yet.
@@ -186,36 +166,11 @@ local function build(opts)
     local r = nefor.process.run { cmd = opts.classifier, args = { "--version" } }
     if type(r) ~= "table" or r.code ~= 0 then
       local detail = type(r) == "table" and (r.stderr or r.stdout) or nil
-      error("configured shell classifier is unusable at " .. opts.classifier ..
+      error("configured command classifier is unusable at " .. opts.classifier ..
         (detail and detail ~= "" and ": " .. detail or ""), 0)
     end
     da_cmd = opts.classifier
     return da_cmd
-  end
-
-  local function emit_response(id, decision, reason, args)
-    local body = {
-      kind     = "tool.permission_response",
-      id       = id,
-      decision = decision,
-    }
-    if type(reason) == "string" and #reason > 0 then
-      body.reason = reason
-    end
-    if type(args) == "table" then
-      body.args = args
-    end
-    emit(nil, body)
-  end
-
-  local function emit_popup(body)
-    -- Forward verbatim to the chat surface under the new envelope kind.
-    emit(nil, {
-      kind = "chat.tool.popup_request",
-      id   = body.id,
-      tool = body.tool or body.name,
-      args = body.args,
-    })
   end
 
   local args_by_policy = classifier_args(opts)
@@ -278,166 +233,20 @@ local function build(opts)
     return classify_command(policy, command)
   end
 
-  -- Transitional mapping for the permission-request path below.
-  local function classify_shell_script(command, read_only)
-    local result, reason = classify_command(read_only and approval.ReadOnly or approval.Default, command)
-    if reason and reason:find("tool_classifier_unavailable", 1, true) then error(reason, 0) end
-    if result == approval.safe then return "approve" end
-    if result == approval.denied then return "deny" end
-    if read_only then return "deny" end
-    return "defer"
-  end
-
-  local function valid_argv(argv)
-    if type(argv) ~= "table" then return false end
-    local count = 0
-    for key, value in pairs(argv) do
-      if type(key) ~= "number" or key < 1 or key % 1 ~= 0
-          or type(value) ~= "string" then
-        return false
-      end
-      count = count + 1
-    end
-    if count == 0 then return false end
-    for index = 1, count do
-      if argv[index] == nil then return false end
-    end
-    return true
-  end
-
-  local function classify_process(args, read_only)
-    if type(args) ~= "table" or not valid_argv(args.argv) then return "deny" end
-    if type(args.cwd) ~= "string" or #args.cwd == 0 then return "deny" end
-    local timeout = args.timeout
-    if type(timeout) ~= "table" or type(timeout.present) ~= "boolean"
-        or type(timeout.milliseconds) ~= "number"
-        or timeout.milliseconds % 1 ~= 0 then
-      return "deny"
-    end
-    if timeout.present then
-      if timeout.milliseconds < 1 then return "deny" end
-    elseif timeout.milliseconds ~= 0 then
-      return "deny"
-    end
-    for _, pred in ipairs(process_fastpaths) do
-      if pred(args.argv, args, read_only) then return "approve" end
-    end
-    return "deny"
-  end
-
-  local function defer_or_deny(body)
-    if gate_mode == "yolo" then
-      emit_response(body.id, "approve")
-    elseif gate_mode == "auto" then
-      emit_response(body.id, "deny", auto_denial_reason(body.tool or body.name))
-    else
-      emit_popup(body)
-    end
-  end
-
-  local function validate_allowlist(allowlist, tool)
-    if allowlist == nil then return true, false end
-    if type(allowlist) ~= "table" then return false, false end
-
-    local count = 0
-    local contains_tool = false
-    for key, name in pairs(allowlist) do
-      if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or type(name) ~= "string" then
-        return false, false
-      end
-      count = count + 1
-      if name == tool then contains_tool = true end
-    end
-    for index = 1, count do
-      if allowlist[index] == nil then return false, false end
-    end
-    return contains_tool, true
-  end
-
-  local function allowlist_is_read_only(allowlist)
-    if type(allowlist) ~= "table" then return false end
-    for _, tool in ipairs(allowlist) do
-      if read_only_tools[tool] ~= true then
-        return false
-      end
-    end
-    return true
-  end
-
+  -- The gate asks; the chat surface shows the question.
   local function handle_permission_request(body)
     local id = body.id
     if type(id) ~= "string" or #id == 0 then return end
     local tool = body.tool or body.name
     if type(tool) ~= "string" or #tool == 0 then return end
-
-    local capability_allows = validate_allowlist(body.allowlist, tool)
-    if not capability_allows then
-      emit_response(id, "deny", "tool invocation has malformed capability data or excludes the requested tool")
-      return
-    end
-
-    if gate_mode == "yolo" then
-      emit_response(id, "approve")
-      return
-    end
-
-    if auto_approve[tool] then
-      emit_response(id, "approve")
-      return
-    end
-
-    local args = body.args
-    local is_ro = allowlist_is_read_only(body.allowlist)
-
-    if tool == "write_file" then
-      if is_ro then
-        emit_response(id, "deny", "write_file is not available to read-only agents")
-        return
-      end
-      if has_approved_plan() then
-        emit_response(id, "approve")
-      else
-        emit_response(id, "deny", "write_file requires an approved plan")
-      end
-      return
-    end
-
-    if tool == "shell.script" then
-      local script = (type(args) == "table" and args.script) or nil
-      local classified, verdict = pcall(classify_shell_script, script, is_ro)
-      if not classified then
-        emit_response(id, "deny", tostring(verdict))
-        return
-      end
-      if verdict == "approve" then
-        emit_response(id, "approve")
-        return
-      end
-      -- A classifier denial describes risk, not the user's decision. Safe
-      -- mode still presents it; auto mode denies because no human is present.
-      defer_or_deny(body)
-      return
-    end
-
-    if tool == "process.exec" then
-      local verdict = classify_process(args, is_ro)
-      if verdict == "approve" then
-        emit_response(id, "approve")
-      else
-        defer_or_deny(body)
-      end
-      return
-    elseif is_ro then
-      emit_response(id, "approve")
-      return
-    end
-
-    defer_or_deny(body)
-  end
-
-  local function set_mode(mode)
-    if mode == "normal" then mode = "safe" end
-    if mode == "safe" or mode == "auto" or mode == "yolo" then gate_mode = mode end
+    emit(nil, {
+      kind = "chat.tool.popup_request",
+      id   = id,
+      tool = tool,
+      args = body.args,
+      reason = body.reason,
+      approval_policy = body.approval_policy,
+    })
   end
 
   local function receive_msg(entry)
@@ -451,14 +260,6 @@ local function build(opts)
     local evt = event.decode(entry)
     if evt == nil then return end
     local body = evt.body
-    if evt.kind == "sessions.session_end" then
-      gate_mode = "safe"
-      return
-    end
-    if evt.kind == "tool-gate.mode_changed" then
-      set_mode(body.mode)
-      return
-    end
     if evt.kind ~= "chat.tool.permission_request" then return end
     handle_permission_request(body)
   end
@@ -472,13 +273,8 @@ local function build(opts)
     classify_argv    = classify_argv,
 
     _internals = {
-      classify_shell_script     = classify_shell_script,
-      classify_process          = classify_process,
       handle_permission_request = handle_permission_request,
-      set_mode                  = set_mode,
-      get_mode                  = function() return gate_mode end,
-      has_approved_plan         = has_approved_plan,
-      reset = function() da_cmd = nil; gate_mode = "safe" end,
+      reset = function() da_cmd = nil end,
     },
   }
 end

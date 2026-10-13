@@ -1,42 +1,17 @@
--- examples/nefor-agent/tool-validator — config composition for permission classification.
+-- examples/nefor-agent/tool-validator — config composition for command classification.
 --
--- The neutral JSON manifest under mag/lib is config-owned data shared by MAG
--- bindings and this Lua composition. Each runtime parses it with its native
--- JSON binding; neither runtime parses the other's programming language.
-
-local root = NEFOR_CONFIG_DIR or "."
-local path = root .. "/mag/lib/nefor/toolsets.json"
-local file, open_error = io.open(path, "r")
-if not file then
-  error("examples/nefor-agent/tool-validator: cannot read canonical toolsets at " .. path .. ": " .. tostring(open_error))
-end
-local source = file:read("*a")
-file:close()
-
-local ok, manifest = pcall(nefor.json.decode, source)
-if not ok then
-  error("examples/nefor-agent/tool-validator: invalid canonical toolsets JSON at " .. path .. ": " .. tostring(manifest))
-end
-
-local function string_array(field)
-  local value = type(manifest) == "table" and manifest[field] or nil
-  if type(value) ~= "table" then
-    error("examples/nefor-agent/tool-validator: canonical toolsets field `" .. field .. "` must be an array of strings")
-  end
-  for index, name in ipairs(value) do
-    if type(name) ~= "string" then
-      error("examples/nefor-agent/tool-validator: canonical toolsets field `" .. field .. "` member " .. index .. " must be a string")
-    end
-  end
-  return value
-end
+-- The starter uses the mechanism's default classifier flags for each approval
+-- policy. A configuration that needs different flags, a model flag, or
+-- command fast paths passes them here.
 
 return {
   build = function(opts)
     opts = opts or {}
     return require("libs.tool-validator").build {
       classifier = opts.classifier,
-      read_only_tools = string_array("read_only"),
+      classifier_args = opts.classifier_args,
+      model_flag = opts.model_flag,
+      command_fastpaths = opts.command_fastpaths,
     }
   end,
 }

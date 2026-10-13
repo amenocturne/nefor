@@ -1335,6 +1335,11 @@ local function handle_tool_popup_request(msg, state)
   else
     body = ""
   end
+  -- The gate says why it is asking (for example which nodes of a workflow
+  -- could not be shown to be safe).
+  if type(msg.reason) == "string" and msg.reason ~= "" then
+    body = msg.reason .. (body ~= "" and "\n\n" .. body or "")
+  end
   local new_popup = {
     variant = "tool_permission",
     tool    = msg.tool or msg.name or "?",

@@ -528,10 +528,13 @@ fn headless_starter_request_resume_tools_and_failures() {
         ],
     );
     let answer: serde_json::Value = serde_json::from_str(&success(&dispatch)).unwrap();
-    assert!(answer["answer"]
-        .as_str()
-        .unwrap()
-        .contains("steadfast lighthouse"));
+    assert!(
+        answer["answer"]
+            .as_str()
+            .unwrap()
+            .contains("steadfast lighthouse"),
+        "{answer}"
+    );
     let dispatched_session = answer["session_id"].as_str().unwrap();
     assert!(dir
         .join("data/nefor/sessions")

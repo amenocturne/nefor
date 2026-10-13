@@ -363,20 +363,37 @@ actor.spawn(lead_workflow)
 -- tool-gate spawn so the gate's first hello triggers our advertise.
 actor.spawn(require("read-only-tools"))
 
--- Tool-validator owns the chat.tool.permission_request → chat.tool.
--- popup_request translation: classifies shell scripts through `da` and process argv structurally
--- (approve/deny/defer), routes only the deferred ones to a user popup.
--- Must be spawned BEFORE tool-gate so its subscription is live when
--- the first gated invocation lands. The chat surface listens to
--- popup_request, not permission_request — without the validator
--- running, gated invocations never reach the popup.
-actor.spawn(require("tool-validator").build {
+-- Tool-validator owns command classification: what running a command means
+-- under each approval policy, answered by `da` with that policy's flags. The
+-- command tools and `mag-apply` decide from it. Its actor forwards the gate's
+-- chat.tool.permission_request to the chat surface as
+-- chat.tool.popup_request, so it must be spawned BEFORE tool-gate.
+--
+-- `model_flag` names the classifier's opt-in model flag; it is added to the
+-- Default policy's flags only. The pinned da release has no such flag (it
+-- always consults its model), so it stays unset here.
+local tool_validator = require("tool-validator").build {
   classifier = SHELL_CLASSIFIER,
-})
+  model_flag = nil,
+}
+actor.spawn(tool_validator)
+lead_workflow.configure_approval {
+  classify_command = tool_validator.classify_command,
+  classify_argv = tool_validator.classify_argv,
+}
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.git_worktree_actor_spec())
-actor.spawn(tools.basic_actor_spec { max_read_bytes = model_context_policy.item_limit })
+actor.spawn(tools.basic_actor_spec {
+  max_read_bytes = model_context_policy.item_limit,
+  classify_command = tool_validator.classify_command,
+  classify_argv = tool_validator.classify_argv,
+  -- write_file needs a current approved write-review plan.
+  decide_write = function()
+    if lead_workflow.has_approved_plan() then return "safe" end
+    return "denied", "write_file requires an approved plan"
+  end,
+})
 if startup.frontend == "tui" then
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),

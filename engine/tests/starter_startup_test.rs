@@ -73,13 +73,13 @@ fn starter_startup_parser_and_mode_application() {
         .find("actor.spawn(require(\"read-only-tools\"))")
         .expect("read-only tools registration");
     let tool_validator = init
-        .find("actor.spawn(require(\"tool-validator\").build {")
+        .find("actor.spawn(tool_validator)")
         .expect("tool validator registration");
     let gate = init
         .find(r#"actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))"#)
         .expect("tool gate registration");
     let basic_tools = init
-        .find("actor.spawn(tools.basic_actor_spec { max_read_bytes = model_context_policy.item_limit })")
+        .find("actor.spawn(tools.basic_actor_spec {")
         .expect("basic tools registration");
     let mode = init
         .find("startup_args.apply_mode(startup, agentic_loop)")

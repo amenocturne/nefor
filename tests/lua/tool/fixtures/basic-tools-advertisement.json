@@ -173,6 +173,9 @@
     {
       "name": "write_file",
       "description": "Write a complete text file, or edit an existing text file by replacing one exact unique string. Without old_string, new_string becomes the complete file contents and existing content is overwritten. With old_string, exactly one match is replaced. Empty new_string is allowed.",
+      "policy_descriptions": {
+        "ReadOnly": "Your approval policy is ReadOnly, so every call to this tool is rejected: it writes a file."
+      },
       "parameters": {
         "type": "object",
         "properties": {
@@ -229,6 +232,9 @@
     {
       "name": "process.exec",
       "description": "Execute a program from a structured argv without shell interpretation.",
+      "policy_descriptions": {
+        "ReadOnly": "Your approval policy is ReadOnly: a program that is not shown to be read-only is rejected."
+      },
       "parameters": {
         "type": "object",
         "properties": {
@@ -305,6 +311,9 @@
     {
       "name": "shell.script",
       "description": "Execute a script through /bin/sh -c.",
+      "policy_descriptions": {
+        "ReadOnly": "Your approval policy is ReadOnly: a script that is not shown to be read-only is rejected."
+      },
       "parameters": {
         "type": "object",
         "properties": {

@@ -245,7 +245,23 @@ actor.spawn(lead_workflow)
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
-actor.spawn(tools.basic_actor_spec { max_read_bytes = model_context_policy.item_limit })
+-- Deterministic fixture policy: this configuration has no command classifier
+-- and nobody to ask. A Default caller's commands run, as every tool does here;
+-- a ReadOnly caller's commands cannot be shown to be read-only.
+local approval = require("libs.tool.approval")
+local function fixture_classification(policy)
+  if policy == approval.Default then return approval.safe end
+  return approval.unsure, "this configuration has no command classifier"
+end
+lead_workflow.configure_approval {
+  classify_command = fixture_classification,
+  classify_argv = fixture_classification,
+}
+actor.spawn(tools.basic_actor_spec {
+  max_read_bytes = model_context_policy.item_limit,
+  classify_command = fixture_classification,
+  classify_argv = fixture_classification,
+})
 
 -- ------------------------------------------------------------------
 -- Virtual agentic-cli plugin — calls nefor.plugins.spawn directly to

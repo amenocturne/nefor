@@ -9,12 +9,15 @@
 --   tools.capability_tools_spec { name, command, gate, tools }
 --     Wraps a capability-provider binary as a tool source: Lua tool
 --     definitions (`libs.tool`) are advertised to the gate under the actor
---     name, invocations are validated in Lua, and handlers reach the binary
+--     name, calls are prepared, decided and validated in Lua, and `execute` reaches the binary
 --     through `<name>.capability.invoke` / `<name>.capability.cancel`.
 --
---   tools.basic_actor_spec { max_read_bytes = N, gate = "tool-gate" }
+--   tools.basic_actor_spec { max_read_bytes = N, gate = "tool-gate",
+--                            classify_command = f, classify_argv = f, decide_write = f? }
 --     The basic-tools capability binary with the `libs.basic-tools` tools.
---     The composition must supply the read_file maximum explicitly.
+--     The composition must supply the read_file maximum explicitly, and the
+--     command classification its command tools decide from
+--     (`libs.tool-validator`'s `classify_command` / `classify_argv`).
 --
 --   tools.git_worktree_actor_spec { gate = "tool-gate" }
 --     The git-worktree capability binary with the `libs.git-worktree` tools,
@@ -283,6 +286,9 @@ function M.basic_actor_spec(options)
         max_read_bytes = max_read_bytes,
         invoke = capability.invoke,
         cancel = capability.cancel,
+        classify_command = options.classify_command,
+        classify_argv = options.classify_argv,
+        decide_write = options.decide_write,
       }
     end,
   }

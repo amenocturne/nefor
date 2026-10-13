@@ -149,6 +149,11 @@ local project_build = nil
 local agent_system = nil
 local ambient_context = nil
 local resolve_model_snapshot = nil
+-- The configured command classification (libs.tool-validator): what a
+-- command, or a program run from an argument vector, means under an approval
+-- policy. mag-apply decides a workflow's command nodes from it.
+local classify_command = nil
+local classify_argv = nil
 
 local SYNC_COMPLETION_GRACE_MS = 3000
 local TERMINATION_CONFIRM_TIMEOUT_MS = 30000
@@ -2268,6 +2273,13 @@ local function receive_msg(entry)
     return
   end
 
+  -- The gate asks what a call means before it decides whether to run it.
+  if kind == "lead-workflow.tool.prepare" then
+    if replay_window.active() then return end
+    tool_source.prepare(body)
+    return
+  end
+
   if kind == "chat.workflows.terminate_requested" then
     if replay_window.active() or decoded.from ~= "nefor-tui" then return end
     mark_user_terminated_runs(body)
@@ -2652,10 +2664,24 @@ local M = {
       agent_system = nil
       ambient_context = nil
       resolve_model_snapshot = nil
+      classify_command = nil
+      classify_argv = nil
       advertised = false
     end,
   },
 }
+
+-- configure_approval{ classify_command, classify_argv }: the command
+-- classification mag-apply decides from. Separate from `configure` because a
+-- composition builds its classifier after this actor is configured.
+function M.configure_approval(opts)
+  if type(opts) ~= "table" or type(opts.classify_command) ~= "function"
+      or type(opts.classify_argv) ~= "function" then
+    error("lead-workflow: configure_approval needs classify_command and classify_argv functions", 2)
+  end
+  classify_command = opts.classify_command
+  classify_argv = opts.classify_argv
+end
 
 function M.configure(opts)
   if opts == nil then opts = {} end

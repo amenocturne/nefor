@@ -71,7 +71,28 @@ local function invoke(spec, id, name, args)
 end
 
 -- Advertisements equal the previous Rust-owned advertisements.
-local basic = tools.basic_actor_spec { max_read_bytes = 12345 }
+local classified = {}
+local plan_approved = false
+local basic = tools.basic_actor_spec {
+  max_read_bytes = 12345,
+  classify_command = function(policy, command)
+    classified[#classified + 1] = policy .. " command " .. command
+    if command:find("rm ", 1, true) then return "denied", "forbidden by the command classifier" end
+    if command:find("ls", 1, true) then return "safe" end
+    return "unsure", "not shown to be safe"
+  end,
+  classify_argv = function(policy, argv)
+    classified[#classified + 1] = policy .. " argv " .. table.concat(argv, "|")
+    if argv[1] == "ls" then return "safe" end
+    return "unsure", "not shown to be safe"
+  end,
+  decide_write = function()
+    if plan_approved then return "safe" end
+    return "denied", "write_file requires an approved plan"
+  end,
+}
+eq(pcall(tools.basic_actor_spec, { max_read_bytes = 1 }), false,
+  "the command tools need the configured command classification")
 eq(basic.name, "basic-tools", "actor keeps the basic-tools source name")
 eq(table.concat(basic.command, " "), "/bin/basic-tools --read-file-max-bytes 12345",
   "binary receives the read cap and no gate flag")
@@ -156,6 +177,81 @@ worktree.from_plugin({ { type = "event", from = "git-worktree", body = {
   kind = "capability.result", id = "gate-4", output = { ok = false, error = { kind = "git-failed" } },
 } } })
 eq(last_sent("tool.result", "gate-4").output.error.kind, "git-failed", "structured output preserved")
+
+-- What each tool says a call means under each approval policy. The gate asks
+-- with a prepare request; nothing reaches the capability while it decides.
+do
+  local function prepare(spec, id, name, args, policy)
+    spec.to_plugin({ { type = "event", from = "tool-gate", replay = false, body = {
+      kind = spec.name .. ".tool.prepare", id = id, name = name, args = args, approval_policy = policy,
+    } } })
+    local prepared = last_sent("tool.prepared", id)
+    assert(prepared, name .. " answers the prepare request under " .. policy)
+    return prepared.decision, prepared.reason
+  end
+  local timeout = { present = false, milliseconds = 0 }
+  local delivered_before = #delivered
+  local sequence = 0
+  local function check(spec, name, args, policy, decision, reason)
+    sequence = sequence + 1
+    local got, why = prepare(spec, "decide-" .. sequence, name, args, policy)
+    eq(got, decision, name .. " under " .. policy)
+    eq(why, reason, name .. " under " .. policy .. " gives its reason")
+  end
+  -- Reading tools: safe for a ReadOnly caller; Default is the gate's setting.
+  for _, name in ipairs({ "read_file", "read_image" }) do
+    check(basic, name, { path = "x" }, "ReadOnly", "safe", nil)
+    check(basic, name, { path = "x" }, "Default", nil, nil)
+  end
+  check(worktree, "git_worktree_open", { repository = "/r", path = "/p", branch = "b" }, "ReadOnly", "safe", nil)
+  check(worktree, "git_worktree_open", { repository = "/r", path = "/p", branch = "b" }, "Default", nil, nil)
+  -- Writing tools: denied for a ReadOnly caller, with the reason.
+  check(basic, "write_file", { path = "x", new_string = "" }, "ReadOnly", "denied", "it writes a file")
+  check(worktree, "git_worktree_create", { repository = "/r", path = "/p", branch = "b", base = "main" },
+    "ReadOnly", "denied", "it creates a Git worktree and a branch")
+  check(worktree, "git_worktree_create", { repository = "/r", path = "/p", branch = "b", base = "main" },
+    "Default", nil, nil)
+  -- write_file under Default follows the composition's write decision.
+  check(basic, "write_file", { path = "x", new_string = "" }, "Default", "denied",
+    "write_file requires an approved plan")
+  plan_approved = true
+  check(basic, "write_file", { path = "x", new_string = "" }, "Default", "safe", nil)
+  check(basic, "write_file", { path = "x", new_string = "" }, "ReadOnly", "denied", "it writes a file")
+  -- Command tools: the configured classification, under every policy.
+  classified = {}
+  check(basic, "shell.script", { script = "ls -la", cwd = ".", timeout = timeout }, "ReadOnly", "safe", nil)
+  check(basic, "shell.script", { script = "make", cwd = ".", timeout = timeout }, "Default", "unsure",
+    "not shown to be safe")
+  check(basic, "shell.script", { script = "rm -rf x", cwd = ".", timeout = timeout }, "Default", "denied",
+    "forbidden by the command classifier")
+  check(basic, "process.exec", { argv = { "ls", "-la" }, cwd = ".", timeout = timeout }, "ReadOnly", "safe", nil)
+  check(basic, "process.exec", { argv = { "make", "all" }, cwd = ".", timeout = timeout }, "ReadOnly", "unsure",
+    "not shown to be safe")
+  eq(table.concat(classified, "; "),
+    "ReadOnly command ls -la; Default command make; Default command rm -rf x; "
+      .. "ReadOnly argv ls|-la; ReadOnly argv make|all",
+    "each command tool asks the classifier with the caller's policy")
+  eq(#delivered, delivered_before, "deciding sends nothing to a capability")
+
+  -- A prepared call that is then invoked runs on the same id.
+  prepare(basic, "prepared-run", "read_file", { path = "README.md" }, "ReadOnly")
+  eq(#delivered, delivered_before, "still nothing before the invoke")
+  basic.to_plugin({ { type = "event", from = "tool-gate", replay = false, body = {
+    kind = "basic-tools.tool.invoke", id = "prepared-run", name = "read_file",
+    args = { path = "README.md" }, approval_policy = "ReadOnly",
+  } } })
+  eq(delivered[#delivered].envelope.body.id, "prepared-run", "the invoke reaches the capability")
+  basic.from_plugin({ { type = "event", from = "basic-tools", body = {
+    kind = "capability.result", id = "prepared-run", output = "text",
+  } } })
+  -- Cancelling a prepared call that never ran sends no capability cancel.
+  prepare(basic, "prepared-dropped", "shell.script", { script = "ls", cwd = ".", timeout = timeout }, "Default")
+  local before_cancel = #delivered
+  basic.to_plugin({ { type = "event", from = "tool-gate", replay = false, body = {
+    kind = "basic-tools.tool.cancel", id = "prepared-dropped",
+  } } })
+  eq(#delivered, before_cancel, "a call that never executed has nothing to cancel in the binary")
+end
 
 -- Other binary events are republished verbatim.
 basic.from_plugin({ { type = "event", from = "basic-tools", body = { kind = "basic-tools.hello", version = "v" } } })

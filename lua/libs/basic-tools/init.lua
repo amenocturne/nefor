@@ -10,10 +10,18 @@
 --     max_read_bytes = N,                    -- read_file cap, same as the process flag
 --     invoke = function(call, capability, args) end,
 --     cancel = function(call) end,           -- process capabilities only
+--     classify_command = function(policy, command) end,  -- -> result, reason
+--     classify_argv = function(policy, argv) end,        -- -> result, reason
+--     decide_write = function(policy, args, call) end,   -- optional
 --   } -> { tool definitions }
 --
 -- `libs.compositors.tools.basic_actor_spec` supplies invoke/cancel for the
--- wrapped process.
+-- wrapped process. The two classifiers are the configured command
+-- classification (`libs.tool-validator`): `shell.script` and `process.exec`
+-- answer their decision from it, under every approval policy. `write_file` is
+-- denied for a `ReadOnly` caller; under a wider policy `decide_write` decides
+-- when the composition supplies one (the starter requires an approved
+-- write-review plan), and otherwise the gate's configured setting does.
 
 local tool = require("libs.tool")
 local approval = require("libs.tool.approval")
@@ -64,9 +72,20 @@ function M.tools(opts)
     error("basic-tools.tools: invoke and cancel must be functions", 2)
   end
 
+  local classify_command, classify_argv = opts.classify_command, opts.classify_argv
+  if type(classify_command) ~= "function" or type(classify_argv) ~= "function" then
+    error("basic-tools.tools: classify_command and classify_argv must be functions", 2)
+  end
+  local decide_write = opts.decide_write
+  if decide_write ~= nil and type(decide_write) ~= "function" then
+    error("basic-tools.tools: decide_write must be a function", 2)
+  end
+
   local function forward(capability)
     return function(args, call) invoke(call, capability, args) end
   end
+
+  local WRITES_A_FILE = "it writes a file"
 
   return {
     tool.define {
@@ -139,6 +158,13 @@ function M.tools(opts)
       display = display("write file", field("path", "args", "path", "path"), {},
         { kind = "receipt", text = "file written", fields = tool_display.fields({}) }),
       context = file_path_context(nil),
+      approval = {
+        decide = function(policy, args, call)
+          if policy == approval.ReadOnly then return approval.denied, WRITES_A_FILE end
+          if decide_write then return decide_write(policy, args, call) end
+        end,
+        describe = approval.rejected_when_read_only(WRITES_A_FILE),
+      },
       execute = forward("write_file"),
     },
     tool.define {
@@ -162,6 +188,10 @@ function M.tools(opts)
       display = display("execute process", field("argv", "args", "argv", "scalar"), {},
         { kind = "content", fields = tool_display.fields({}) }),
       context = CWD_CONTEXT,
+      approval = {
+        decide = function(policy, args) return classify_argv(policy, args.argv) end,
+        describe = { [approval.ReadOnly] = "Your approval policy is ReadOnly: a program that is not shown to be read-only is rejected." },
+      },
       execute = forward("process.exec"),
       cancel = cancel,
     },
@@ -181,6 +211,10 @@ function M.tools(opts)
       display = display("execute shell script", field("script", "args", "script", "scalar"), {},
         { kind = "content", fields = tool_display.fields({}) }),
       context = CWD_CONTEXT,
+      approval = {
+        decide = function(policy, args) return classify_command(policy, args.script) end,
+        describe = { [approval.ReadOnly] = "Your approval policy is ReadOnly: a script that is not shown to be read-only is rejected." },
+      },
       execute = forward("shell.script"),
       cancel = cancel,
     },

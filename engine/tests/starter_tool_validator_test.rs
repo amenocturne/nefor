@@ -1,4 +1,4 @@
-//! Unit tests for `examples/nefor-agent/tool-validator/init.lua` permission modes.
+//! Unit tests for `examples/nefor-agent/tool-validator/init.lua` question forwarding and command classification.
 
 use std::path::PathBuf;
 
@@ -13,12 +13,12 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn starter_tool_validator_modes() {
+fn the_validator_forwards_questions_and_probes_its_classifier_once() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = repo_root().join("tests/lua/tool-validator/mode_test.lua");
+    let test_path = repo_root().join("tests/lua/tool-validator/ask_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 
@@ -27,7 +27,7 @@ fn starter_tool_validator_modes() {
         .set_name(test_path.display().to_string())
         .exec()
     {
-        panic!("tool_validator_mode_test.lua failed:\n{e}");
+        panic!("tool_validator_ask_test.lua failed:\n{e}");
     }
 }
 
