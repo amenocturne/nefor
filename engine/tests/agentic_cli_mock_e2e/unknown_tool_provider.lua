@@ -21,7 +21,7 @@ type ProbeInput {prompt: String}
 type ProbeReport {content: String}
 
 let exact_model: fn(nefor.actors.ResolvedModel) -> nefor.actors.AuthoredModel = |model| => nefor.actors.AuthoredModel.ResolvedModel(model)
-let resolved_model_value = nefor.actors.ResolvedModel {provider: "mock-plugin", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
+let resolved_model_value = nefor.actors.ResolvedModel {compaction_policy: nefor.actors.disabled_compaction, provider: "mock-plugin", model: "mock-model", reasoning_effort: nefor.actors.reasoning_effort("medium")}
 
 let start = nefor.graph.source("task", ProbeInput {prompt: "<initial task text>"})
 let worker = nefor.actors.agent<nefor.actors.ResolvedModel, ProbeInput, ProbeReport>("worker", exact_model, nefor.actors.AgentConfig<nefor.actors.ResolvedModel> {model: resolved_model_value, system: "UNKNOWN_TOOL_WORKER", toolset: nefor.contracts.Toolset {policy: nefor.contracts.ToolApprovalPolicy.Default, tools: ["read_image", "bash", "read_file"]}})
