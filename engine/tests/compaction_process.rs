@@ -62,7 +62,7 @@ fn run_case(case: &str) -> (PathBuf, Value, Vec<Value>) {
             )
         );
     } else if case == "dynamic" {
-        source = format!("import nefor.dynamic.{{DynamicList}}\nimport nefor.{{result_map, traverse}}\n{}", source.replace("agent<Unit, String, TextAnswer>", "agent<Unit, String, DynamicList<String>>").replace("compile_graph(source(\"task\", \"begin\") >>> worker)", "let child = agent<Unit, String, TextAnswer>(\"expanded-child\", resolve, AgentConfig<Unit>{model:nil,system:\"expanded worker\",toolset: Toolset {{policy: ToolApprovalPolicy.Default, tools: []}}})\ncompile_graph(result_map(source(\"task\", \"begin\") >>> worker, traverse(\"workers\", child)))"));
+        source = format!("import nefor.dynamic.{{DynamicList}}\nimport nefor.{{result_map, traverse}}\n{}", source.replace("agent<Unit, String, TextAnswer>", "agent<Unit, String, DynamicList<String>>").replace("compile_graph(source(\"task\", \"begin\") >>> worker)", "let child = agent<Unit, String, TextAnswer>(\"expanded-child\", resolve, AgentConfig<Unit>{model:nil,system:\"expanded worker\",toolset: Toolset {policy: ToolApprovalPolicy.Default, tools: []}})\ncompile_graph(result_map(source(\"task\", \"begin\") >>> worker, traverse(\"workers\", child)))"));
     }
     fs::write(dir.join("program.mag"), source).unwrap();
     let child = Command::new(bin.join("nefor"))
