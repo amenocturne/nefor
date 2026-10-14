@@ -2,8 +2,13 @@ local policy = require("libs.compaction-policy")
 local snapshot = require("libs.model-snapshot")
 local raw = {soft_percent=60,step_percent=10,hard_percent=90}
 local p = assert(policy.validate(raw))
-assert(policy.validate(nil).kind == "Disabled")
-assert(policy.validate(nefor.json.decode("null")).kind == "Disabled")
+assert(policy.validate(nil) == nil)
+local disabled = {kind="Disabled"}
+assert(policy.validate(disabled).kind == "Disabled")
+assert(policy.raw(policy.validate(disabled)).kind == "Disabled")
+assert(policy.preflight(policy.validate(disabled), {}, {kind="completed_response",total_tokens=1200},1000).kind == "Allow")
+assert(policy.validate(nefor.json.decode("null")) == nil)
+assert(policy.validate({kind="Disabled",extra=true}) == nil)
 assert(policy.validate({soft_percent=60.5,step_percent=0.25,hard_percent=90.5}))
 for _, invalid in ipairs({false, {}, {60,10,90}, {soft_percent=0,step_percent=10,hard_percent=90},
   {soft_percent=90,step_percent=10,hard_percent=90}, {soft_percent=60,step_percent=0,hard_percent=90},
@@ -59,25 +64,31 @@ local failed=policy.reduce(state,{kind="context_compaction_failed",request_id="c
 assert(failed.epoch_id == "created" and failed.delivered_notice_id == "notice")
 local reset=policy.reduce(state,{kind="context_compaction_completed",request_id="c"})
 assert(reset.epoch_id == "c" and reset.notified_through == nil and reset.delivered_notice_id == nil)
-assert(policy.self_eligibility(policy.validate(nil),state,{kind="unsupported"}) == nil)
+assert(policy.self_eligibility(policy.validate(disabled),state,{kind="unsupported"}) == nil)
 local copied=assert(snapshot.copy({provider="p",model="m",compaction_policy=raw,
   profiles={current={provider="p",model="m",compaction_policy=raw}}}))
 raw.soft_percent=61
 assert(copied.compaction_policy.soft_percent == 60 and copied.profiles.current.compaction_policy.soft_percent == 60)
 assert(snapshot.copy({provider="p",model="m",compaction_policy={}}) == nil)
 assert(snapshot.copy({provider="p",model="m",profiles={current={provider="p",model="m",compaction_policy={}}}}) == nil)
-assert(snapshot.copy({provider="p",model="m",compaction_policy=nefor.json.decode("null")}).compaction_policy == nil)
+assert(snapshot.copy({provider="p",model="m",compaction_policy=nefor.json.decode("null")}) == nil)
+assert(snapshot.copy({provider="p",model="m"}) == nil)
+assert(snapshot.copy({provider="p",model="m",compaction_policy=disabled,profiles={worker={provider="p",model="m"}}}) == nil)
+assert(snapshot.copy({provider="p",model="m",compaction_policy=disabled,profiles={worker={provider="p",model="m",compaction_policy=nefor.json.decode("null")}}}) == nil)
 print("compaction pure policy assertions passed")
 
+assert(policy.lower(nil) == nil)
+assert(policy.lower(nefor.json.decode("null")) == nil)
+assert(policy.self_eligibility(policy.validate(disabled),state,{kind="supported",provider="p",model="m",history_id={1}}) == nil)
 assert(policy.lower({constructor="Thresholds"}) == nil)
 assert(policy.lower({constructor="Thresholds",value=nefor.json.decode("null")}) == nil)
 assert(policy.lower({constructor="Disabled",value={}}) == nil)
 assert(policy.lower({constructor="Disabled",value=nefor.json.decode("null")}).kind == "Disabled")
 assert(policy.lower({constructor="Thresholds",value={soft_percent=60,step_percent=10,hard_percent=90}}).kind == "Thresholds")
 local options = {nested={value="preserved"}}
-local source = {provider="p",model="m",provider_options=options,profiles={worker={provider="p",model="m",provider_options=options,compaction_policy={soft_percent=60,step_percent=10,hard_percent=90}}}}
+local source = {provider="p",model="m",compaction_policy=disabled,provider_options=options,profiles={worker={provider="p",model="m",provider_options=options,compaction_policy={soft_percent=60,step_percent=10,hard_percent=90}}}}
 local copy = assert(snapshot.copy(source))
-assert(copy.compaction_policy == nil)
+assert(copy.compaction_policy.kind == "Disabled")
 options.nested.value = "changed"
 source.profiles.worker.compaction_policy.soft_percent = 61
 assert(copy.provider_options.nested.value == "preserved")

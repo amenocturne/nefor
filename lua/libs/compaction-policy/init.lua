@@ -9,9 +9,15 @@ local function null(value)
     and type(nefor.json.is_null) == "function" and nefor.json.is_null(value))
 end
 function M.validate(raw)
-  if null(raw) then return { kind = "Disabled" } end
+  if null(raw) then return nil, "compaction_policy must be explicit; use { kind = \"Disabled\" }" end
   if type(raw) ~= "table" or json_data.is_array(raw) then
-    return nil, "compaction_policy must be a closed threshold object or null"
+    return nil, "compaction_policy must be a closed threshold object or { kind = \"Disabled\" }"
+  end
+  if raw.kind == "Disabled" then
+    for key in pairs(raw) do
+      if key ~= "kind" then return nil, "Disabled compaction_policy has unknown field " .. tostring(key) end
+    end
+    return { kind = "Disabled" }
   end
   for key in pairs(raw) do
     if key ~= "soft_percent" and key ~= "step_percent" and key ~= "hard_percent" then
@@ -28,7 +34,7 @@ function M.validate(raw)
 end
 -- JSON-facing settings remain raw; this copies only validated fields.
 function M.raw(policy)
-  if policy.kind == "Disabled" then return nil end
+  if policy.kind == "Disabled" then return { kind = "Disabled" } end
   return { soft_percent = policy.soft_percent, step_percent = policy.step_percent,
     hard_percent = policy.hard_percent }
 end
@@ -37,7 +43,7 @@ function M.lower(value)
   for key in pairs(value) do
     if key ~= "constructor" and key ~= "value" then return nil, "invalid CompactionPolicy field " .. tostring(key) end
   end
-  if value.constructor == "Disabled" and null(value.value) then return M.validate(nil) end
+  if value.constructor == "Disabled" and null(value.value) then return M.validate({ kind = "Disabled" }) end
   if value.constructor == "Thresholds" and not null(value.value) then return M.validate(value.value) end
   return nil, "invalid CompactionPolicy variant"
 end

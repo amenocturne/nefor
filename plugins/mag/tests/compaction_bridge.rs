@@ -17,16 +17,16 @@ mod kernel {
         let config = std::env::var_os("NEFOR_SOURCE_CONFIG").map(std::path::PathBuf::from);
         let snapshot_source = match &config {
             Some(config) => format!("local resolver = dofile({}); return resolver.resolve({{provider='chatgpt',model='gpt-6-astra',reasoning_effort='high'}})", serde_json::to_string(&config.join("config/model-profiles.lua")).unwrap()),
-            None => "local profiles={}; for _,name in ipairs({'current','fast','efficient','standard','deep'}) do profiles[name]={provider='chatgpt',model='gpt-test',compaction_policy={soft_percent=60,step_percent=10,hard_percent=90}} end; return {provider='chatgpt',model='gpt-test',profiles=profiles}".to_owned(),
+            None => "local profiles={}; for _,name in ipairs({'current','fast','efficient','standard','deep'}) do profiles[name]={provider='chatgpt',model='gpt-test',compaction_policy={soft_percent=60,step_percent=10,hard_percent=90}} end; return {provider='chatgpt',model='gpt-test',compaction_policy={kind='Disabled'},profiles=profiles}".to_owned(),
         };
         let snapshot: mlua::Table = host.lua.load(&snapshot_source).eval().unwrap();
         host.lua.globals().set("source_snapshot", snapshot).unwrap();
-        let encoded: String = host.lua.load("local copy,err=require('libs.model-snapshot').copy(source_snapshot); assert(copy,err); assert(copy.compaction_policy==nil); for _,name in ipairs({'current','fast','efficient','standard','deep'}) do local p=copy.profiles[name].compaction_policy; assert(p.soft_percent==60 and p.step_percent==10 and p.hard_percent==90); assert(p~=source_snapshot.profiles[name].compaction_policy) end; return nefor.json.encode(copy)").eval().unwrap();
+        let encoded: String = host.lua.load("local copy,err=require('libs.model-snapshot').copy(source_snapshot); assert(copy,err); assert(copy.compaction_policy.kind=='Disabled'); for _,name in ipairs({'current','fast','efficient','standard','deep'}) do local p=copy.profiles[name].compaction_policy; assert(p.soft_percent==60 and p.step_percent==10 and p.hard_percent==90); assert(p~=source_snapshot.profiles[name].compaction_policy) end; return nefor.json.encode(copy)").eval().unwrap();
         let snapshot = serde_json::from_str::<ExecutionModelSnapshot>(&encoded)
             .unwrap()
             .validate()
             .unwrap();
-        assert!(snapshot.compaction_policy.is_none());
+        assert!(snapshot.compaction_policy == serde_json::json!({"kind":"Disabled"}));
         if let Some(config) = &config {
             host.lua
                 .globals()
@@ -46,19 +46,22 @@ mod kernel {
                 assert(ok, resolver)
                 local snapshot, err = require("libs.model-snapshot").copy(resolver.resolve({provider="chatgpt",model="gpt-6-astra"}))
                 assert(snapshot, err)
-                assert(snapshot.compaction_policy == nil)
-                for _, profile in pairs(snapshot.profiles) do assert(profile.compaction_policy == nil) end
+                assert(snapshot.compaction_policy.kind == "Disabled")
+                for _, profile in pairs(snapshot.profiles) do assert(profile.compaction_policy.kind == "Disabled") end
                 return nefor.json.encode(snapshot)
             "#).eval().unwrap();
             let disabled = serde_json::from_str::<ExecutionModelSnapshot>(&disabled)
                 .unwrap()
                 .validate()
                 .unwrap();
-            assert!(disabled.compaction_policy.is_none());
-            assert!(disabled
-                .profiles
-                .values()
-                .all(|profile| profile.compaction_policy.is_none()));
+            assert!(disabled.compaction_policy == serde_json::json!({"kind":"Disabled"}));
+            assert!(
+                disabled
+                    .profiles
+                    .values()
+                    .all(|profile| profile.compaction_policy
+                        == serde_json::json!({"kind":"Disabled"}))
+            );
         }
         let module_root = config
             .as_ref()
@@ -127,7 +130,7 @@ compile_graph(source("task", "begin") >>> sequence(workers))"#
             .globals()
             .set("root_graph", host.lua.to_value(&root_graph).unwrap())
             .unwrap();
-        host.lua.load("captured={}; local k=require('init'); assert(k.end_run('paired')); local snapshot=assert(require('libs.model-snapshot').copy(source_snapshot)); assert(k.begin_run({run_id='root-check',run_name='root-check',conversation_id='root',model_snapshot=snapshot}).ok); assert(k.start('root-check',root_graph).ok); local n=0; for _,c in pairs(captured) do n=n+1; assert(c.root and c.params.compaction_policy==nil) end; assert(n==5)").exec().unwrap();
+        host.lua.load("captured={}; local k=require('init'); assert(k.end_run('paired')); local snapshot=assert(require('libs.model-snapshot').copy(source_snapshot)); assert(k.begin_run({run_id='root-check',run_name='root-check',conversation_id='root',model_snapshot=snapshot}).ok); assert(k.start('root-check',root_graph).ok); local n=0; for _,c in pairs(captured) do n=n+1; assert(c.root and c.params.compaction_policy.kind=='Disabled') end; assert(n==5)").exec().unwrap();
     }
 
     pub fn fixture(path: &std::path::Path) {

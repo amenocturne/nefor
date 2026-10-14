@@ -118,6 +118,7 @@ if env_truthy("NEFOR_ENABLE_OLLAMA") then
 end
 
 M.active = {
+  compaction_policy = { kind = "Disabled" },
   default_provider = DEFAULT_PROVIDER,
   default_model    = DEFAULT_MODEL,
   default_reasoning_effort = DEFAULT_REASONING_EFFORT,

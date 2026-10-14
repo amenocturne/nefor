@@ -63,11 +63,11 @@ end
 local thresholds = {soft_percent=60,step_percent=10,hard_percent=90}
 local snapshot = { provider="p", model="m", profiles={
   current={provider="p",model="m",compaction_policy=thresholds},
-  disabled={provider="p",model="m"},
+  disabled={provider="p",model="m",compaction_policy={kind="Disabled"}},
 } }
 local function check(id, params, top_policy, expected, root)
   captured = nil
-  snapshot.compaction_policy = top_policy
+  snapshot.compaction_policy = top_policy or {kind="Disabled"}
   assert(kernel.begin_run({run_id=id,run_name=id,conversation_id="root",model_snapshot=snapshot}).ok)
   local graph = program()
   for k,v in pairs(params) do graph.actors[1].params[k] = v end
@@ -93,7 +93,7 @@ local function check(id, params, top_policy, expected, root)
   kernel.pump_commands(); assert(settled)
   assert(captured.deps.conversation.is_root == root)
   local actual = captured.params.compaction_policy
-  if expected == nil then assert(actual == nil) else
+  if expected == nil then assert(actual.kind == "Disabled") else
     assert(actual.soft_percent == expected.soft_percent and actual.hard_percent == expected.hard_percent)
   end
   assert(graph.actors[1].params.compaction_policy == params.compaction_policy, "authored spec unchanged")

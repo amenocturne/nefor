@@ -552,7 +552,9 @@ local function new_run_context(meta)
         .. "/actors/" .. tostring(record.id)
     ctx.actor_conversations[record.id] = actor_conversation_id
     local is_root_conversation = actor_conversation_id == ctx.conversation_id
-    if has_model_context(record.factory) then
+    -- Tool dispatch shares model identity, but only provider actors consume policy.
+    if has_model_context(record.factory) and record.factory ~= "nefor.factory.run-tool"
+        and record.factory ~= "run-tool" then
       local raw_policy = actor_params.compaction_policy
       if is_root_conversation and ctx.model_snapshot ~= nil then
         raw_policy = ctx.model_snapshot.compaction_policy

@@ -394,12 +394,13 @@ local function fresh_loop()
   manager_conversation_id = nil
   agentic_loop._internals.reset()
   selected_run_model_snapshot = {
+    compaction_policy = { kind = "Disabled" },
     provider = "mock",
     model = "test-model",
     reasoning_effort = "high",
     provider_options = { service_tier = "fast", nested = { owned = true } },
     profiles = {
-      current = { provider = "mock", model = "test-model", reasoning_effort = "high",
+      current = { compaction_policy = {kind="Disabled"}, provider = "mock", model = "test-model", reasoning_effort = "high",
         provider_options = { service_tier = "fast" } },
     },
   }

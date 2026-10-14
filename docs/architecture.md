@@ -384,11 +384,17 @@ Compaction policy is orchestration metadata, not a provider request option.
 facade and actor module expose aliases of those same nominal types. Fixed
 `ResolvedModel` and `ModelSettings` values require an explicit policy, including
 `disabled_compaction`. Profile selectors carry a Disabled placeholder until lazy
-construction resolves the run-owned profile. A Lua snapshot uses an absent/null
-`compaction_policy` for Disabled, or a closed object containing `soft_percent`,
-`step_percent`, and `hard_percent`. The parser validates and separately copies
-root and profile policies. A root conversation uses the snapshot's root policy,
-not its selected worker profile's policy.
+construction resolves the run-owned profile. Every Lua and Rust execution
+snapshot requires an explicit `compaction_policy`: `{ kind = "Disabled" }`, or a
+closed object containing `soft_percent`, `step_percent`, and `hard_percent`.
+The parser validates and separately copies root and profile policies; missing
+or null policies are errors in both. The starter selects Disabled in
+`config.active.compaction_policy` and supplies it through its snapshot resolver
+for lead turns and dispatched workflows. MAG-authored Disabled remains
+`CompactionPolicy.Disabled`; lazy construction lowers it to the explicit snapshot
+object without changing compaction capability or notice eligibility. Tool dispatch
+shares model identity but does not consume a compaction policy. A root conversation
+uses the snapshot's root policy, not its selected worker profile's policy.
 
 ### Canonical compaction and asynchronous provider requests
 

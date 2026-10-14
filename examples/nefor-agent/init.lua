@@ -224,7 +224,14 @@ local mag_context = require("libs.mag-context").new {
 }
 
 local agentic_loop = require("libs.agentic-loop")
+local function resolve_model_snapshot()
+  local snapshot = agentic_loop.model_snapshot()
+  snapshot.compaction_policy = cfg.compaction_policy
+  return snapshot
+end
+
 agentic_loop.configure {
+  resolve_model_snapshot = resolve_model_snapshot,
   provider         = cfg.default_provider,
   model            = cfg.default_model,
   reasoning_effort = cfg.lead_reasoning_effort,
@@ -349,7 +356,7 @@ lead_workflow.configure {
   dependency_module_roots = MAG_MODULE_ROOTS,
   ambient_context = mag_context,
   agent_system = lead_role.WORKER_SYSTEM_PROMPT,
-  resolve_model_snapshot = agentic_loop.model_snapshot,
+  resolve_model_snapshot = resolve_model_snapshot,
 }
 actor.spawn(lead_workflow)
 

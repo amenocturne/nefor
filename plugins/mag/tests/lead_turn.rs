@@ -1146,7 +1146,7 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         obj(json!({"kind":"mag.execute","id":"dynamic-exec",
       "run_id":"dynamic-run","run_name":"dynamic-tasks","session_id":SESSION_ID,
       "principal":"lead","conversation_id":CONVERSATION_ID,"artifact":loaded["artifact"].clone(),
-      "model_snapshot":{"provider":"mock-provider","model":"snapshot-dynamic","reasoning_effort":"high"}})),
+      "model_snapshot":{"provider":"mock-provider","model":"snapshot-dynamic","reasoning_effort":"high","compaction_policy":{"kind":"Disabled"}}})),
     )
     .await;
 

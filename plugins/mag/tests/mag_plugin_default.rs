@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn execution_model_snapshot_is_closed_optional_and_required_for_subagents() {
         let valid = serde_json::json!({
-            "model_snapshot": {"provider": "p", "model": "m", "reasoning_effort": "high",
+            "model_snapshot": {"compaction_policy":{"kind":"Disabled"},"provider": "p", "model": "m", "reasoning_effort": "high",
                 "provider_options": {"service_tier": "fast"}}
         });
         let parsed = parse_model_snapshot(valid.as_object().unwrap(), RunPrincipal::Subagent)
@@ -591,12 +591,12 @@ mod tests {
         assert!(parsed.profiles.is_empty());
 
         let with_profiles = serde_json::json!({
-            "model_snapshot": {
+            "model_snapshot": {"compaction_policy":{"kind":"Disabled"},
                 "provider": "current-provider",
                 "model": "current-model",
                 "profiles": {
-                    "fast": {"provider": "fast-provider", "model": "fast-model"},
-                    "standard": {
+                    "fast": {"compaction_policy":{"kind":"Disabled"},"provider": "fast-provider", "model": "fast-model"},
+                    "standard": {"compaction_policy":{"kind":"Disabled"},
                         "provider": "standard-provider",
                         "model": "standard-model",
                         "reasoning_effort": "medium"
@@ -615,7 +615,7 @@ mod tests {
         );
 
         let absent_effort = serde_json::json!({
-            "model_snapshot": {"provider": "p", "model": "m"}
+            "model_snapshot": {"compaction_policy":{"kind":"Disabled"},"provider": "p", "model": "m"}
         });
         assert_eq!(
             parse_model_snapshot(absent_effort.as_object().unwrap(), RunPrincipal::Lead)
@@ -630,6 +630,19 @@ mod tests {
             "lead execution preserves the no-snapshot compatibility path"
         );
         assert!(parse_model_snapshot(&Map::new(), RunPrincipal::Subagent).is_err());
+
+        for snapshot in [
+            serde_json::json!({"provider":"p","model":"m"}),
+            serde_json::json!({"provider":"p","model":"m","compaction_policy":null}),
+            serde_json::json!({"provider":"p","model":"m","compaction_policy":{"kind":"Disabled"},"profiles":{"worker":{"provider":"p","model":"m"}}}),
+            serde_json::json!({"provider":"p","model":"m","compaction_policy":{"kind":"Disabled"},"profiles":{"worker":{"provider":"p","model":"m","compaction_policy":null}}}),
+        ] {
+            let body = serde_json::json!({"model_snapshot":snapshot});
+            assert!(parse_model_snapshot(body.as_object().unwrap(), RunPrincipal::Lead).is_err());
+            assert!(
+                parse_model_snapshot(body.as_object().unwrap(), RunPrincipal::Subagent).is_err()
+            );
+        }
 
         for malformed in [
             serde_json::json!(null),
@@ -650,6 +663,24 @@ mod tests {
             serde_json::json!({"provider": "p", "model": "m", "profiles": {"fast": {"provider": "p", "model": "m", "extra": true}}}),
             serde_json::json!({"provider": "p", "model": "m", "extra": true}),
         ] {
+            let mut malformed = malformed;
+            if let Some(snapshot) = malformed.as_object_mut() {
+                snapshot.insert(
+                    "compaction_policy".into(),
+                    serde_json::json!({"kind":"Disabled"}),
+                );
+                if let Some(profiles) = snapshot.get_mut("profiles").and_then(Value::as_object_mut)
+                {
+                    for profile in profiles.values_mut() {
+                        if let Some(profile) = profile.as_object_mut() {
+                            profile.insert(
+                                "compaction_policy".into(),
+                                serde_json::json!({"kind":"Disabled"}),
+                            );
+                        }
+                    }
+                }
+            }
             let body = serde_json::json!({"model_snapshot": malformed});
             assert!(
                 parse_model_snapshot(body.as_object().unwrap(), RunPrincipal::Lead).is_err(),

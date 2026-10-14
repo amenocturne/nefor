@@ -138,7 +138,7 @@ local model_snapshot_resolutions
 
 local function fresh()
   lw._internals.reset()
-  selected_model_snapshot = { provider = "snapshot-provider", model = "snapshot-model" }
+  selected_model_snapshot = { compaction_policy = { kind = "Disabled" }, provider = "snapshot-provider", model = "snapshot-model" }
   model_snapshot_resolutions = 0
   lw.configure({
     resolve_model_snapshot = function()
@@ -1033,6 +1033,14 @@ do
   }
   for _, case in ipairs(invalid_snapshots) do
     fresh()
+    if type(case.value) == "table" then
+      case.value.compaction_policy = { kind = "Disabled" }
+      if type(case.value.profiles) == "table" then
+        for _, profile in pairs(case.value.profiles) do
+          profile.compaction_policy = { kind = "Disabled" }
+        end
+      end
+    end
     lw.configure({ resolve_model_snapshot = function() return case.value end })
     write_mag_file("invalid-snapshot-write-" .. case.label, "invalid-snapshot.mag", READ_ONLY_MAG)
     _test.calls_clear()
@@ -1104,10 +1112,10 @@ do
   end)
   assert_eq(pre_reply, nil, "no executing reply until the load handshake resolves")
 
-  selected_model_snapshot = {
+  selected_model_snapshot = { compaction_policy = { kind = "Disabled" },
     provider = "snapshot-provider-b", model = "snapshot-model-b", reasoning_effort = "high",
     profiles = {
-      fast = { provider = "fast-provider", model = "fast-model" },
+      fast = { compaction_policy = {kind="Disabled"}, provider = "fast-provider", model = "fast-model" },
     },
   }
   _test.calls_clear()
@@ -1204,7 +1212,7 @@ do
   assert_eq(first_exec.body.model_snapshot.reasoning_effort, nil,
     "absent effort is omitted from the execution snapshot")
 
-  selected_model_snapshot = { provider = "snapshot-provider-c", model = "snapshot-model-c" }
+  selected_model_snapshot = { compaction_policy = { kind = "Disabled" }, provider = "snapshot-provider-c", model = "snapshot-model-c" }
   _test.calls_clear()
   execute_mag("snapshot-run-c", "snapshot-runs.mag")
   feed_loaded(read_only_modification())
@@ -4210,16 +4218,16 @@ do
     assert_true(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end) == nil, "nothing runs")
   end
 
-  -- The per-policy description is one generic sentence.
+  -- The tool describes what ReadOnly permits and rejects.
   do
     local advertised
     for _, spec in ipairs(lw._internals.tool_source.advertisement("tool-gate").tools) do
       if spec.name == "mag-apply" then advertised = spec end
     end
     assert_eq(advertised.policy_descriptions.ReadOnly,
-      "Your approval policy is ReadOnly: a workflow that declares nodes that are not read-only, "
-      .. "or agents with a wider approval policy than yours, is rejected.",
-      "mag-apply tells a ReadOnly agent what is rejected, without naming mechanisms")
+      "Your approval policy is ReadOnly: shell/script and process nodes whose commands are classified as read-only are permitted; command execution is not prohibited. "
+      .. "Commands not established as read-only, or agents with a wider approval policy than yours, are rejected.",
+      "mag-apply tells a ReadOnly agent that classified commands are permitted")
     assert_eq(advertised.policy_descriptions.Default, nil, "and adds nothing for a Default agent")
     assert_true(approval.is_policy("ReadOnly"), "vocabulary loaded")
   end

@@ -63,7 +63,7 @@ pub mod kernel {
         #[test]
         fn execution_snapshot_compaction_policy_is_strict() {
             for policy in [
-                serde_json::json!(null),
+                serde_json::json!({"kind":"Disabled"}),
                 serde_json::json!({"soft_percent":60.5,"step_percent":0.5,"hard_percent":90}),
             ] {
                 let value = serde_json::json!({"provider":"p","model":"m","compaction_policy":policy,
@@ -73,7 +73,15 @@ pub mod kernel {
                     .validate()
                     .expect("valid policy");
             }
+            for value in [
+                serde_json::json!({"provider":"p","model":"m"}),
+                serde_json::json!({"provider":"p","model":"m","compaction_policy":{"kind":"Disabled"},"profiles":{"worker":{"provider":"p","model":"m"}}}),
+            ] {
+                assert!(serde_json::from_value::<ExecutionModelSnapshot>(value).is_err());
+            }
             for policy in [
+                serde_json::json!(null),
+                serde_json::json!({"kind":"Disabled","extra":true}),
                 serde_json::json!({}),
                 serde_json::json!([]),
                 serde_json::json!(false),
@@ -84,7 +92,7 @@ pub mod kernel {
             ] {
                 for value in [
                     serde_json::json!({"provider":"p","model":"m","compaction_policy":policy}),
-                    serde_json::json!({"provider":"p","model":"m","profiles":{"worker":{"provider":"p","model":"m","compaction_policy":policy}}}),
+                    serde_json::json!({"provider":"p","model":"m","compaction_policy":{"kind":"Disabled"},"profiles":{"worker":{"provider":"p","model":"m","compaction_policy":policy}}}),
                 ] {
                     assert!(serde_json::from_value::<ExecutionModelSnapshot>(value)
                         .expect("snapshot shape")
@@ -676,7 +684,7 @@ nefor.artifact.compile_graph(contextual)
             ] {
                 let modification = compile_mag_source(&host, run_id, &source);
                 let mut snapshot = ExecutionModelSnapshot {
-                    compaction_policy: None,
+                    compaction_policy: serde_json::json!({"kind":"Disabled"}),
                     provider: "snapshot-provider".to_owned(),
                     model: "snapshot-model".to_owned(),
                     reasoning_effort: None,
@@ -729,7 +737,7 @@ nefor.artifact.compile_graph(contextual)
 
                 if run_id == "snapshot-direct" {
                     let later_snapshot = ExecutionModelSnapshot {
-                        compaction_policy: None,
+                        compaction_policy: serde_json::json!({"kind":"Disabled"}),
                         provider: "later-provider".to_owned(),
                         model: "later-model".to_owned(),
                         reasoning_effort: Some("low".to_owned()),
@@ -798,7 +806,7 @@ nefor.artifact.compile_graph(contextual)
 
             let modification = compile_mag_source(&host, "snapshot-effort", direct);
             let snapshot = ExecutionModelSnapshot {
-                compaction_policy: None,
+                compaction_policy: serde_json::json!({"kind":"Disabled"}),
                 provider: "snapshot-provider".to_owned(),
                 model: "snapshot-model".to_owned(),
                 reasoning_effort: Some("high".to_owned()),
@@ -930,7 +938,7 @@ nefor.artifact.compile_graph(contextual)
                 profiles.insert(
                     "fast".to_owned(),
                     ExecutionResolvedModel {
-                        compaction_policy: None,
+                        compaction_policy: serde_json::json!({"kind":"Disabled"}),
                         provider: "fast-provider".to_owned(),
                         model: "fast-model".to_owned(),
                         reasoning_effort: Some("low".to_owned()),
@@ -941,7 +949,7 @@ nefor.artifact.compile_graph(contextual)
                     },
                 );
                 let snapshot = ExecutionModelSnapshot {
-                    compaction_policy: None,
+                    compaction_policy: serde_json::json!({"kind":"Disabled"}),
                     provider: "current-provider".to_owned(),
                     model: "current-model".to_owned(),
                     reasoning_effort: Some("high".to_owned()),
@@ -1008,7 +1016,7 @@ nefor.artifact.compile_graph(contextual)
             profiles.insert(
                 "standard".to_owned(),
                 ExecutionResolvedModel {
-                    compaction_policy: None,
+                    compaction_policy: serde_json::json!({"kind":"Disabled"}),
                     provider: "standard-provider".to_owned(),
                     model: "standard-model".to_owned(),
                     reasoning_effort: Some("medium".to_owned()),
@@ -1016,7 +1024,7 @@ nefor.artifact.compile_graph(contextual)
                 },
             );
             let snapshot = ExecutionModelSnapshot {
-                compaction_policy: None,
+                compaction_policy: serde_json::json!({"kind":"Disabled"}),
                 provider: "current-provider".to_owned(),
                 model: "current-model".to_owned(),
                 reasoning_effort: Some("high".to_owned()),
@@ -1055,7 +1063,7 @@ nefor.artifact.compile_graph(contextual)
 
             let modification = compile_mag_source(&host, "missing-profile", direct);
             let snapshot = ExecutionModelSnapshot {
-                compaction_policy: None,
+                compaction_policy: serde_json::json!({"kind":"Disabled"}),
                 provider: "current-provider".to_owned(),
                 model: "current-model".to_owned(),
                 reasoning_effort: None,

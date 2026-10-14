@@ -24,7 +24,7 @@ M.declaration = {
   params = {
     model = "string", system = "string?", tools = "table?",
     reasoning_effort = "string?",
-    provider_options = "table?", compaction_policy = "table?",
+    provider_options = "table?", compaction_policy = "table",
     tool_approval_policy = "table", -- the agent's policy; selects per-policy tool descriptions
     provider = "string", history = "table?",
     output_type = "string", error_type = "string", provider_error_type = "string",

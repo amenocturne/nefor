@@ -33,8 +33,8 @@ actor.spawn{name="test-driver",receive_msg=function(entry)
   if b.kind=="mag.hello" then
     emit{kind="mag.load",id="load",source_dir=DIR,entry="program.mag",module_roots={ROOT.."/mag/lib",ROOT.."/examples/nefor-agent/mag/lib"}}
   elseif b.kind=="mag.loaded" then
-    local policy=not (CASE=="disabled" or CASE=="unsupported") and {soft_percent=60,step_percent=10,hard_percent=90} or nil
-    emit{kind="mag.execute",id="execute",run_id="acceptance",run_name="acceptance",session_id="test-session",principal="lead",artifact=b.artifact,model_snapshot={provider="gpt",model="gpt-test",profiles={worker={provider="gpt",model="gpt-test",compaction_policy=policy}}}}
+    local policy=not (CASE=="disabled" or CASE=="unsupported") and {soft_percent=60,step_percent=10,hard_percent=90} or {kind="Disabled"}
+    emit{kind="mag.execute",id="execute",run_id="acceptance",run_name="acceptance",session_id="test-session",principal="lead",artifact=b.artifact,model_snapshot={provider="gpt",model="gpt-test",compaction_policy={kind="Disabled"},profiles={worker={provider="gpt",model="gpt-test",compaction_policy=policy}}}}
   elseif CASE=="cancel" and b.kind=="conversation.context.compact.accepted" and not kill_sent then
     kill_sent=true; emit{kind="mag.kill_run",id="kill",run_id="acceptance"}
   elseif b.kind=="mag.run_result" or b.kind=="mag.error" then

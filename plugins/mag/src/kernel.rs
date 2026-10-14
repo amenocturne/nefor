@@ -46,6 +46,13 @@ pub struct BeginRunOutcome {
     pub reaped: Vec<String>,
 }
 
+// Serde's JsonValue otherwise accepts a missing field as null.
+fn required_compaction_policy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<JsonValue, D::Error> {
+    JsonValue::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionResolvedModel {
@@ -55,8 +62,8 @@ pub struct ExecutionResolvedModel {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<Map<String, JsonValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compaction_policy: Option<JsonValue>,
+    #[serde(deserialize_with = "required_compaction_policy")]
+    pub compaction_policy: JsonValue,
 }
 
 impl ExecutionResolvedModel {
@@ -72,16 +79,16 @@ impl ExecutionResolvedModel {
                 "{field}.reasoning_effort must be a non-empty string when present"
             ));
         }
-        if let Some(policy) = self
-            .compaction_policy
-            .as_ref()
-            .filter(|value| !value.is_null())
+        let policy = &self.compaction_policy;
+        let Some(fields) = policy.as_object() else {
+            return Err(format!(
+                "{field}.compaction_policy must be an explicit policy object"
+            ));
+        };
+        if fields.len() == 1 && fields.get("kind") == Some(&JsonValue::String("Disabled".into())) {
+            return Ok(self);
+        }
         {
-            let Some(fields) = policy.as_object() else {
-                return Err(format!(
-                    "{field}.compaction_policy must be a threshold object"
-                ));
-            };
             let soft = fields.get("soft_percent").and_then(JsonValue::as_f64);
             let step = fields.get("step_percent").and_then(JsonValue::as_f64);
             let hard = fields.get("hard_percent").and_then(JsonValue::as_f64);
@@ -117,8 +124,8 @@ pub struct ExecutionModelSnapshot {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<Map<String, JsonValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compaction_policy: Option<JsonValue>,
+    #[serde(deserialize_with = "required_compaction_policy")]
+    pub compaction_policy: JsonValue,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ExecutionResolvedModel>,
 }
