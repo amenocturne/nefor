@@ -97,3 +97,45 @@ HOME does not hide the installed compiler; no Cargo cache is inherited.
 The deterministic `just test-source-prerequisites` covers simulated discovery
 and failure paths; simulated Darwin is not actual macOS installation evidence.
 CI runs native discovery on macOS and fresh source-install acceptance on Linux.
+
+## Pinned native runtime packaging
+
+`just package-runtime FULL_COMMIT /absolute/absent/runtime-directory` produces
+an uncompressed release-layout runtime for native macOS arm64. Commit producer
+changes first. The source commit must exist locally; the producer checks out
+that exact revision in a private detached clone under `tmp/runtime-build/`.
+Its own revision is recorded separately from the compiled runtime revision.
+This is a producer, not an installer or a new package-manager interface.
+
+The build requires the source prerequisites above, uv with Python 3, and macOS
+`file`, `lipo`, `otool`, `install_name_tool`, and `codesign`. Explicit
+`LUA_DEPENDENCIES_LUA_DIR` and `LUA_DEPENDENCIES_OPENSSL_DIR` prefixes permit a
+private native toolchain without Homebrew installation or global configuration.
+LuaRocks, its downloads/configuration, temporary files, the detached source and
+Cargo cache remain private to the build. Public locked Lua archives and Cargo
+crates are downloaded during production, never during bundle startup.
+
+The existing release assembler exports the engine, compiler, Cargo-enumerated
+plugins, Lua libraries, MAG source/book, starter and locked native Lua tree.
+The producer verifies the exact installed rocks against the lock, signs every
+Mach-O after Lua dylib relocation, rejects non-system absolute dependencies and
+unresolved loader paths, checks arm64 throughout, and computes the deployment
+floor from every binary/module/dylib (at least macOS 14.0). `RUNTIME.json` records
+source/producer revisions, architecture, floor, Lua ABI, lock digest, engine
+version and plugin inventory. `SHA256SUMS` covers every regular file except
+itself, including metadata; consumers must compare the complete file inventory
+as well as hashes. No symlinks are exported. Existing output is never replaced.
+Ad-hoc signatures establish local integrity, not notarization or publisher trust.
+
+A downstream distribution must set `SSL_CERT_FILE=/etc/ssl/cert.pem` for the
+bundled OpenSSL-backed Lua HTTP transport on macOS (or select its own explicit
+trusted CA file). Do not inherit a producer Homebrew/Nix trust-store location.
+This uses the macOS system PEM roots, not dynamic user Keychain trust; corporate
+roots need explicit separate setup. Rust providers retain their own TLS policy.
+Runtime packaging includes no WORK configuration, classifier package, provider
+credentials, user overlays, or destination activation logic. Those belong to
+the consuming distribution. Execution on the build host does not prove
+execution on the oldest OS described by load commands.
+
+`just test-package-runtime` checks inventory closure, lock agreement, admission
+and rejected native dependencies without a native build or public network.
