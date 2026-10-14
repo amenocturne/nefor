@@ -1,12 +1,12 @@
 # LuaRocks artifact closure resolved for nefor-pm-dev-1 (Lua 5.4).
-# package version artifact-architecture sha256
-basexx 0.4.1-1 src 3f6a7134a518676d73a9ba80437487de9a7d482e54859a96c0c5d8b381b0a8c6
-binaryheap 0.4-1 src ecce14dedfa7a1938aa2383c83036b98461876934f169384a2cec6bb46462d87
-bit32 5.3.5.1-1 src 0e273427f2b877270f9cec5642ebe2670242926ba9638d4e6df7e4e1263ca12c
-compat53 0.15.1-1 src c9e34ea62ac89a6b7ab62333a990b47b1dd37e02f00b0309e6a31511fd5b8806
-cqueues 20200726.54-0 src 32f24c9b7da39cac819703dbe880ac3b8c5c9892b002942f8cedaa9366fa5358
-fifo 0.2-0 all 38727eb4a7bc036fd0a7c807919c1d4357c07d2d8fc4f7641aff50238cd67014
-http 0.4-0 all 970c2cb6031d06a2465d927cf8a1d88ea84936b841d0a511b8a6e903890f5cc7
-lpeg 1.1.0-2 src 836d315b920a5cdd62e21786c6c9fad547c4faa131d5583ebca64f0b6595ee76
-lpeg_patterns 0.5-0 src 0e6d33543689e83911e2cb47965752e00412cbdfca888812ccbde9ec95259c56
-luaossl 20260910-0 src 22ad2d0e3d12a9376c3d06a000a1af70c45ed181ae581556759e55f637ff371d
+# package version artifact-architecture sha256 https-url
+basexx 0.4.1-1 src 3f6a7134a518676d73a9ba80437487de9a7d482e54859a96c0c5d8b381b0a8c6 https://luarocks.org/manifests/aiq/basexx-0.4.1-1.src.rock
+binaryheap 0.4-1 src ecce14dedfa7a1938aa2383c83036b98461876934f169384a2cec6bb46462d87 https://luarocks.org/manifests/tieske/binaryheap-0.4-1.src.rock
+bit32 5.3.5.1-1 src 0e273427f2b877270f9cec5642ebe2670242926ba9638d4e6df7e4e1263ca12c https://luarocks.org/manifests/siffiejoe/bit32-5.3.5.1-1.src.rock
+compat53 0.15.1-1 src c9e34ea62ac89a6b7ab62333a990b47b1dd37e02f00b0309e6a31511fd5b8806 https://luarocks.org/manifests/lunarmodules/compat53-0.15.1-1.src.rock
+cqueues 20200726.54-0 src 32f24c9b7da39cac819703dbe880ac3b8c5c9892b002942f8cedaa9366fa5358 https://luarocks.org/manifests/daurnimator/cqueues-20200726.54-0.src.rock
+fifo 0.2-0 all 38727eb4a7bc036fd0a7c807919c1d4357c07d2d8fc4f7641aff50238cd67014 https://luarocks.org/manifests/daurnimator/fifo-0.2-0.all.rock
+http 0.4-0 all 970c2cb6031d06a2465d927cf8a1d88ea84936b841d0a511b8a6e903890f5cc7 https://luarocks.org/manifests/daurnimator/http-0.4-0.all.rock
+lpeg 1.1.0-2 src 836d315b920a5cdd62e21786c6c9fad547c4faa131d5583ebca64f0b6595ee76 https://luarocks.org/manifests/gvvaughan/lpeg-1.1.0-2.src.rock
+lpeg_patterns 0.5-0 src 0e6d33543689e83911e2cb47965752e00412cbdfca888812ccbde9ec95259c56 https://luarocks.org/manifests/daurnimator/lpeg_patterns-0.5-0.src.rock
+luaossl 20260910-0 src 22ad2d0e3d12a9376c3d06a000a1af70c45ed181ae581556759e55f637ff371d https://luarocks.org/manifests/daurnimator/luaossl-20260910-0.src.rock

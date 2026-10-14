@@ -30,6 +30,7 @@
     { "recipe": "test-session-inspector", "lane": "default", "entrypoint": "tools/session-inspector/server.test.ts" },
     { "recipe": "test-release-bundle", "lane": "full", "entrypoint": "tools/test-release-bundle.sh" },
     { "recipe": "test-build-version", "lane": "full", "entrypoint": "tools/test-build-version.sh" },
-    { "recipe": "test-tui-scenarios", "lane": "full" }
+    { "recipe": "test-tui-scenarios", "lane": "full" },
+    { "recipe": "test-source-prerequisites", "lane": "default", "entrypoint": "tools/source-prerequisites.test.ts" }
   ]
 }

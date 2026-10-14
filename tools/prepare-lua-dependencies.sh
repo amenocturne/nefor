@@ -8,22 +8,12 @@ fi
 rockspec=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 lock=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 tools_root=$(cd "$(dirname "$0")" && pwd)
-lua_options=(--lua-version=5.4)
-if [ -n "${LUA_DEPENDENCIES_LUA_DIR:-}" ]; then lua_options+=(--lua-dir="$LUA_DEPENDENCIES_LUA_DIR"); fi
-build_options=()
-# LuaRocks does not search Homebrew prefixes, so macOS defaults to Homebrew's OpenSSL 3.
-if [ -z "${LUA_DEPENDENCIES_OPENSSL_DIR:-}" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null; then
-  LUA_DEPENDENCIES_OPENSSL_DIR=$(brew --prefix openssl@3)
-  [ -d "$LUA_DEPENDENCIES_OPENSSL_DIR/include/openssl" ] || {
-    echo "OpenSSL 3 is required: brew install openssl@3, or set LUA_DEPENDENCIES_OPENSSL_DIR" >&2; exit 1; }
-fi
-if [ -n "${LUA_DEPENDENCIES_OPENSSL_DIR:-}" ]; then
-  echo "Lua dependencies use OpenSSL from $LUA_DEPENDENCIES_OPENSSL_DIR" >&2
-  build_options+=("OPENSSL_DIR=$LUA_DEPENDENCIES_OPENSSL_DIR" "CRYPTO_DIR=$LUA_DEPENDENCIES_OPENSSL_DIR")
-fi
+source "$tools_root/source-prerequisites.sh"
+source_prerequisites
+lua_options=(--lua-version=5.4 --lua-dir="$LUA_SOURCE_PREFIX")
+build_options=("LUA=$LUA_SOURCE_BIN" "LUA_BINDIR=$(dirname "$LUA_SOURCE_BIN")" "LUA_INCDIR=$LUA_SOURCE_INCLUDE" "LUA_LIBDIR=$LUA_SOURCE_LIB" "OPENSSL_DIR=$OPENSSL_SOURCE_PREFIX" "OPENSSL_INCDIR=$OPENSSL_SOURCE_INCLUDE" "OPENSSL_LIBDIR=$OPENSSL_SOURCE_LIB" "CRYPTO_DIR=$OPENSSL_SOURCE_PREFIX" "CRYPTO_INCDIR=$OPENSSL_SOURCE_INCLUDE" "CRYPTO_LIBDIR=$OPENSSL_SOURCE_LIB")
 mkdir -p "$(dirname "$3")"
 tree=$(cd "$(dirname "$3")" && pwd)/$(basename "$3")
-command -v luarocks >/dev/null || { echo "LuaRocks with Lua 5.4 is required for distribution preparation" >&2; exit 1; }
 
 hash_file() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d ' ' -f 1
@@ -32,22 +22,38 @@ hash_file() {
 
 stage=$(mktemp -d "${tree}.prepare.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/downloads" "$stage/tree"
-while read -r name version architecture digest extra; do
+mkdir -p "$stage/downloads" "$stage/tree" "$stage/home" "$stage/config" "$stage/cache" "$stage/sysconfig"
+export HOME="$stage/home" XDG_CONFIG_HOME="$stage/config" XDG_CACHE_HOME="$stage/cache"
+export LUAROCKS_SYSCONFDIR="$stage/sysconfig" LUAROCKS_CONFIG="$stage/config.lua" LUAROCKS_CONFIG_5_4="$stage/config.lua"
+printf "rocks_servers = {}\n" > "$stage/config.lua"
+unset LUA_PATH LUA_CPATH LUA_INIT LUA_INIT_5_4 LUAROCKS_CONFIG_5_5 LUAROCKS_ROCKS_TREE LUAROCKS_CONFIG_5_1 LUAROCKS_CONFIG_5_2 LUAROCKS_CONFIG_5_3
+cd "$stage"
+luarocks --version >&2
+
+while read -r name version architecture digest url extra; do
   case "$name" in ''|'#'*) continue;; esac
-  if [ -n "${extra:-}" ] || [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || [[ ! "$version" =~ ^[a-zA-Z0-9_.-]+$ ]] || [[ ! "$architecture" =~ ^(src|all)$ ]] || [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+  if [ -n "${extra:-}" ] || [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || [[ ! "$version" =~ ^[a-zA-Z0-9_.-]+$ ]] || [[ ! "$architecture" =~ ^(src|all)$ ]] || [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]] || [[ ! "$url" =~ ^https://[a-zA-Z0-9.-]+/[^[:space:]]+\.rock$ ]]; then
     echo "invalid dependency lock row for $name" >&2
     exit 1
   fi
-  (
-    cd "$stage/downloads"
-    luarocks "${lua_options[@]}" download --arch "$architecture" "$name" "$version"
-  )
+  if grep -qxF "$name" "$stage/identities" 2>/dev/null; then echo "duplicate dependency: $name" >&2; exit 1; fi
+  echo "$name" >> "$stage/identities"
+done < "$lock"
+[ -s "$stage/identities" ] || { echo "empty dependency lock" >&2; exit 1; }
+# Validate the entire lock before any network request or native build.
+while read -r name version architecture digest url extra; do
+  case "$name" in ""|'#'*) continue;; esac
+  echo "Downloading $name $version: $url" >&2
+  curl --fail --location --show-error --proto =https --proto-redir =https --connect-timeout 20 --max-time 180 "$url" -o "$stage/downloads/$name-$version.$architecture.rock"
   archive="$stage/downloads/$name-$version.$architecture.rock"
   if [ "$(hash_file "$archive")" != "$digest" ]; then
     echo "dependency checksum mismatch: $name $version" >&2
     exit 1
   fi
+done < "$lock"
+while read -r name version architecture digest url extra; do
+  case "$name" in ""|'#'*) continue;; esac
+  archive="$stage/downloads/$name-$version.$architecture.rock"
   luarocks "${lua_options[@]}" --tree="$stage/tree" install --deps-mode=none "$archive" ${build_options[@]+"${build_options[@]}"}
 done < "$lock"
 # The declared rock and every locked rock must be satisfied by the locked closure.
@@ -55,7 +61,7 @@ done < "$lock"
 mkdir -p "$stage/no-server"
 satisfied() {
   luarocks "${lua_options[@]}" --tree="$stage/tree" --only-server="$stage/no-server" \
-    make --only-deps --deps-mode=one "$1" >/dev/null \
+    make --only-deps --deps-mode=one "$1" "${build_options[@]}" >/dev/null \
     || { echo "locked dependency closure does not satisfy $1" >&2; exit 1; }
 }
 satisfied "$rockspec"

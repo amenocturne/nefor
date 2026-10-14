@@ -34,7 +34,7 @@ test-lua-dylibs:
     tools/test-lua-dylibs.sh
 
 # Build once and execute every default deterministic target from prepared artifacts; bare Cargo exposes the same lane.
-test-default timeout="7200": check-test-lanes test-test-lanes-checker test-lua-dylibs test-docs test-session-inspector
+test-default timeout="7200": test-source-prerequisites check-test-lanes test-test-lanes-checker test-lua-dylibs test-docs test-session-inspector
     @echo "=== TEST LANE: default deterministic ==="
     cargo run --quiet -p nefor-cargo-test-harness -- --lane default "{{timeout}}"
 
@@ -207,7 +207,7 @@ test-tui-chat:
     cargo test -p nefor-tui --features full-tests --test chat_test -- --test-threads=1
 
 # Build once, execute every deterministic target from prepared artifacts, then reuse the binaries for operational checks.
-test-full timeout="7200": check-test-lanes test-test-lanes-checker test-lua-dylibs
+test-full timeout="7200": test-source-prerequisites check-test-lanes test-test-lanes-checker test-lua-dylibs
     #!/usr/bin/env bash
     set -euo pipefail
     repo="{{ justfile_directory() }}"
@@ -253,6 +253,10 @@ fmt: fmt-rust
 build:
     cargo build --workspace --release
 
+# Validate locally installed prerequisites without downloading or installing anything.
+preflight-source-install:
+    tools/preflight-source-install.sh
+
 # Prepare the starter's declared Lua dependencies into a private platform-specific tree.
 prepare-distribution-lua-dependencies tree="target/lua-dependencies":
     tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock "{{tree}}"
@@ -275,8 +279,9 @@ install-source expected_commit command engine_dir mag_dir plugin_root build_targ
         exit 1
       fi
     fi
+    just preflight-source-install
     just prepare-distribution-lua-dependencies "{{build_target}}/lua-dependencies"
-    cargo build --workspace --release --target-dir "{{build_target}}"
+    cargo build --workspace --release --locked --target-dir "{{build_target}}"
     release_dir="{{build_target}}/release"
     mkdir -p "{{engine_dir}}" "{{mag_dir}}" "{{plugin_root}}"
     install -m 0755 "$release_dir/nefor" "{{engine_dir}}/{{command}}"
@@ -375,6 +380,7 @@ install-nefor channel="source":
       done
     }
 
+    if [ "{{channel}}" = source ]; then just preflight-source-install; fi
     remove_old_layout_bins
 
     install_tarball() {
@@ -417,7 +423,7 @@ install-nefor channel="source":
     case "{{channel}}" in
       source)
         just prepare-distribution-lua-dependencies "target/lua-dependencies"
-        cargo build --workspace --release
+        cargo build --workspace --release --locked
         mkdir -p "$PREFIX/bin" "$LIBEXEC_BIN"
         cd "{{justfile_directory()}}"
         install -m 0755 "target/release/nefor" "$PREFIX/bin/nefor"
@@ -534,3 +540,11 @@ test-compaction: build-headless
 # Pair a source configuration directory with the candidate snapshot parser and lazy MAG factories.
 test-source-config config:
     NEFOR_SOURCE_CONFIG="{{config}}" just test-mag-plugin compaction_bridge source_config
+
+# Bounded prerequisite/discovery/download failure coverage (no public network).
+test-source-prerequisites:
+    bun test --timeout 20000 tools/source-prerequisites.test.ts
+
+# Opt-in actual source install with empty user settings/cache and private destinations.
+accept-source-install revision scratch:
+    tools/accept-source-install.sh "{{revision}}" "{{scratch}}"

@@ -37,8 +37,6 @@ jobs:
       - name: Prepare distribution Lua dependencies
         run: |
           brew install lua@5.4 luarocks openssl@3
-          export LUA_DEPENDENCIES_LUA_DIR="$(brew --prefix lua@5.4)"
-          export LUA_DEPENDENCIES_OPENSSL_DIR="$(brew --prefix openssl@3)"
           tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock target/lua-dependencies
           echo "NEFOR_LUA_DEPENDENCIES_ROOT=$PWD/target/lua-dependencies" >> "$GITHUB_ENV"
 
@@ -68,3 +66,14 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  source-install-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - name: Install declared native prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential m4 pkg-config lua5.4 liblua5.4-dev luarocks libssl-dev curl ca-certificates unzip
+      - name: Fresh exact-revision source-install acceptance
+        run: RUSTUP_HOME="$HOME/.rustup" just accept-source-install "$GITHUB_SHA" "$PWD/tmp/source-install-acceptance"
