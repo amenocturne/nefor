@@ -551,7 +551,7 @@ accept-source-install revision scratch:
 
 # Produce an exact-source native macOS arm64 runtime in an absent absolute directory.
 package-runtime pin output:
-    uv run --no-project python tools/package-runtime.py "{{pin}}" "{{output}}"
+    uv run --no-project python -B tools/package-runtime.py "{{pin}}" "{{output}}"
 
 # Offline inventory, exact-lock and producer admission checks.
 test-package-runtime:
