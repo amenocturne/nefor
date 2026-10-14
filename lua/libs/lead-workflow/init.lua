@@ -1946,8 +1946,9 @@ local function lead_workflow_tool_specs()
       approval = {
         ReadOnly = {
           decide = MAG_APPLY_DECIDE,
-          describe = "Your approval policy is ReadOnly: a workflow that declares nodes that are not "
-            .. "read-only, or agents with a wider approval policy than yours, is rejected.",
+          describe = "Your approval policy is ReadOnly: shell/script and process nodes whose commands "
+            .. "are classified as read-only are permitted; command execution is not prohibited. Commands "
+            .. "not established as read-only, or agents with a wider approval policy than yours, are rejected.",
         },
         Default = { decide = MAG_APPLY_DECIDE, describe = tool.nothing },
       },
