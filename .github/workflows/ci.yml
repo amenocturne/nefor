@@ -70,6 +70,7 @@ jobs:
   source-install-linux:
     runs-on: ubuntu-24.04
     steps:
+      - uses: astral-sh/setup-uv@v6
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@just

@@ -83,7 +83,10 @@ is disabled and no undocumented mirror fallback is attempted.
 `just accept-source-install REV /absolute/new/scratch` is opt-in and downloads
 public artifacts/crates. It requires exact committed HEAD and clean tracked
 source, declared installed prerequisites, and a previously nonexistent scratch
-root. Run it on a fresh Linux host/container without copied host Cargo/native
+root. The installed-engine HTTP acceptance additionally requires uv and an installed Python 3 (its
+Python test harness is managed through uv, not a source-build prerequisite;
+acceptance disables managed-Python downloads).
+Run it on a fresh Linux host/container without copied host Cargo/native
 archives, caches or targets. It uses empty user/XDG directories, a fresh Cargo
 cache and build target, no native prefix overrides, explicit installation
 destinations, then the installed-engine `test-pm-http` acceptance (no provider).

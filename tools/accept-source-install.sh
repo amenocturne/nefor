@@ -16,5 +16,5 @@ unset LUA_DEPENDENCIES_LUA_DIR LUA_DEPENDENCIES_OPENSSL_DIR LUA_PATH LUA_CPATH L
 export SOURCE_PREREQUISITES_TMP="$root/probes"
 just install-source "$rev" nefor "$root/engine" "$root/mag" "$root/plugins" "$root/target"
 cmp lua/nefor-pm/dependencies.lock "$root/target/lua-dependencies/dependencies.lock"
-just test-pm-http "$root/engine/nefor" "$root/target/lua-dependencies" "$root/http-smoke"
+UV_PYTHON_DOWNLOADS=never just test-pm-http "$root/engine/nefor" "$root/target/lua-dependencies" "$root/http-smoke"
 echo "source-install acceptance passed: $rev at $root"

@@ -19,7 +19,7 @@ function fixture(os="Linux") {
   exe(`${bin}/pkg-config`, `case "$*" in '--exists '*) exit 0;; '--variable=prefix lua5.4') echo '${lua}';; '--variable=libdir lua5.4') echo '${lua}/lib';; '--variable=prefix openssl') echo '${ssl}';; '--variable=includedir openssl') echo '${ssl}/include';; '--variable=libdir openssl') echo '${ssl}/lib';; esac`);
   exe(`${bin}/make`,"echo 'GNU Make'");exe(`${bin}/m4`,"echo 'GNU M4'");
   exe(`${bin}/curl`, `echo "$*" >> '${root}/curl.log'; while [ "$1" != -o ]; do shift; done; printf payload > "$2"`);
-  exe(`${bin}/luarocks`, `echo "HOME=$HOME CONFIG=$LUAROCKS_CONFIG SYS=$LUAROCKS_SYSCONFDIR CWD=$PWD" >> '${root}/env.log'; echo "$*" >> '${root}/rocks.log'; if [[ "$*" = *make* ]] && [ "\${FAIL_CLOSURE:-}" = 1 ]; then exit 1; fi`);
+  exe(`${bin}/luarocks`, `if [ "$1" = --version ]; then echo 'luarocks 3.8.0'; fi; echo "HOME=$HOME CONFIG=$LUAROCKS_CONFIG SYS=$LUAROCKS_SYSCONFDIR CWD=$PWD" >> '${root}/env.log'; echo "$*" >> '${root}/rocks.log'; if [[ "$*" = *make* ]] && [ "\${FAIL_CLOSURE:-}" = 1 ]; then exit 1; fi`);
   for(const path of [`${lua}/lib/liblua5.4.so`,`${ssl}/lib/libssl.so`,`${ssl}/lib/libcrypto.so`]) writeFileSync(path,'');
   for(const path of [`${lua}/include/lua5.4/lauxlib.h`,`${ssl}/include/openssl/ssl.h`,`${ssl}/include/openssl/crypto.h`]) writeFileSync(path,'');
   const env={...process.env, PATH:`${bin}:${process.env.PATH}`, SOURCE_PREREQUISITES_TMP:`${root}/scratch`, LUA_DEPENDENCIES_LUA_DIR:lua, LUA_DEPENDENCIES_OPENSSL_DIR:ssl};
@@ -69,4 +69,20 @@ test('missing required programs are actionable, not shell failures',()=>{
 test('missing selected-prefix libraries cannot be satisfied by another system install',()=>{
  const f=fixture();rmSync(`${f.ssl}/lib/libcrypto.so`);expect(f.preflight().stderr.toString()).toContain('crypto development library missing');
  const g=fixture();rmSync(`${g.lua}/lib/liblua5.4.so`);g.exe(`${g.bin}/cc`,'echo fixture-linux-gnu');expect(g.preflight().stderr.toString()).toContain('Lua 5.4 development library missing');
+});
+
+test('source recipes preflight before preparation, Cargo or installed-binary mutation',()=>{
+ const f=fixture(); const just=Bun.which('just')!;
+ f.exe(`${f.bin}/just`,`echo "$*" >> '${f.root}/just.log'; echo 'missing native prerequisite' >&2; exit 17`);
+ mkdirSync(`${f.root}/prefix/bin`,{recursive:true});writeFileSync(`${f.root}/prefix/bin/mag-plugin`,'keep');
+ const env={...process.env,PATH:f.bin+':'+process.env.PATH,PREFIX:f.root+'/prefix',HOME:f.root+'/home'};
+ const r=Bun.spawnSync([just,'install-nefor','source'],{env});expect(r.exitCode).not.toBe(0);expect(r.stderr.toString()).toContain('missing native prerequisite');expect(readFileSync(`${f.root}/prefix/bin/mag-plugin`,'utf8')).toBe('keep');
+ const revision=Bun.spawnSync(['git','rev-parse','HEAD']).stdout.toString().trim();
+ expect(Bun.spawnSync([just,'install-source',revision,'nefor',f.root+'/engine',f.root+'/mag',f.root+'/plugins',f.root+'/target'],{env}).exitCode).not.toBe(0);
+ expect(readFileSync(`${f.root}/just.log`,'utf8')).toBe('preflight-source-install\npreflight-source-install\n');
+});
+
+test('tool diagnostics reject unusable Rust and unsupported LuaRocks without auto-install',()=>{
+ const f=fixture();f.exe(`${f.bin}/rustc`,'[ "$RUSTUP_AUTO_INSTALL" = 0 ] && [ -n "$RUSTUP_TOOLCHAIN" ] || exit 99; exit 1');expect(f.preflight().stderr.toString()).toContain('usable installed Rust toolchain required');
+ const g=fixture();g.exe(`${g.bin}/luarocks`,'echo "luarocks 2.4.0"');expect(g.preflight().stderr.toString()).toContain('LuaRocks 3.x');
 });

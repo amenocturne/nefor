@@ -10,6 +10,20 @@ source_library() {
   done
   return 1
 }
+source_luarocks_version() (
+  set -e
+  mkdir -p "${SOURCE_PREREQUISITES_TMP:-tmp}"
+  local probe
+  probe=$(mktemp -d "${SOURCE_PREREQUISITES_TMP:-tmp}/luarocks-version.XXXXXX")
+  trap 'rm -rf "$probe"' EXIT
+  export HOME="$probe" XDG_CONFIG_HOME="$probe/config" XDG_CACHE_HOME="$probe/cache"
+  export LUAROCKS_SYSCONFDIR="$probe/system" LUAROCKS_CONFIG=/dev/null
+  export LUAROCKS_CONFIG_5_1=/dev/null LUAROCKS_CONFIG_5_2=/dev/null LUAROCKS_CONFIG_5_3=/dev/null LUAROCKS_CONFIG_5_4=/dev/null LUAROCKS_CONFIG_5_5=/dev/null
+  unset LUA_PATH LUA_CPATH LUA_INIT LUA_INIT_5_1 LUA_INIT_5_2 LUA_INIT_5_3 LUA_INIT_5_4 LUA_INIT_5_5
+  luarocks --version > "$probe/version"
+  cat "$probe/version" >&2
+  grep -Eq "[[:space:]]3\.[0-9]+" "$probe/version" || { echo "source install requires LuaRocks 3.x" >&2; exit 1; }
+)
 source_prerequisites() {
   local os tool prefix candidate probe
   os=$(uname -s)
@@ -20,6 +34,9 @@ source_prerequisites() {
   make --version | grep -q 'GNU Make' || { echo 'source install requires GNU make' >&2; return 1; }
   m4 --version | grep -q "GNU M4" || { echo "source install requires GNU m4" >&2; return 1; }
   command -v sha256sum >/dev/null || command -v shasum >/dev/null || { echo 'source install requires sha256sum or shasum' >&2; return 1; }
+  RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" RUSTUP_AUTO_INSTALL=0 rustc --version >&2 || { echo "usable installed Rust toolchain required" >&2; return 1; }
+  RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" RUSTUP_AUTO_INSTALL=0 cargo --version >&2 || { echo "usable installed Cargo required" >&2; return 1; }
+  source_luarocks_version || { echo "usable LuaRocks 3.x required (no global configuration is loaded)" >&2; return 1; }
   if [ "$os" = Darwin ]; then
     for tool in otool install_name_tool codesign realpath; do
       command -v "$tool" >/dev/null || { echo "source install requires $tool" >&2; return 1; }
