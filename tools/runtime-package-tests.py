@@ -2,10 +2,12 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import tarfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("producer", Path(__file__).with_name("package-runtime.py"))
+spec = importlib.util.spec_from_file_location("producer", Path(__file__).with_name("package-release.py"))
 producer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(producer)
 
@@ -39,8 +41,46 @@ class ProducerTests(unittest.TestCase):
         with patch.object(producer.subprocess, "run") as command:
             for pin, output in [("main", Path("/unused")), ("a" * 40, Path("relative"))]:
                 with self.assertRaises(ValueError):
-                    producer.package(pin, output)
+                    producer.package(pin, output, Path("/unused"), "a" * 64)
             command.assert_not_called()
+
+    def test_prepared_admission_fails_before_execution(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / "tmp") as directory:
+            root = Path(directory)
+            (root / "RUNTIME.json").write_text('{"runtime_commit": "' + 'a' * 40 + '", "target": "x86_64-unknown-linux-gnu"}')
+            (root / "SHA256SUMS").write_text(producer.inventory(root))
+            digest = producer.sha(root / "SHA256SUMS")
+            with patch.object(producer, "run") as command:
+                with self.assertRaisesRegex(ValueError, "digest differs"):
+                    producer.admit(root, "a" * 40, "b" * 64)
+                (root / "extra").write_text("extra")
+                with self.assertRaisesRegex(ValueError, "inventory is not complete"):
+                    producer.admit(root, "a" * 40, digest)
+                (root / "extra").unlink()
+                with self.assertRaisesRegex(ValueError, "source pin or target"):
+                    producer.admit(root, "a" * 40, digest)
+                command.assert_not_called()
+
+    def test_canonical_archive_target_root_and_checksum(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / "tmp") as directory:
+            root = Path(directory)
+            script = Path(__file__).with_name("archive-release.sh").resolve()
+            wrong = root / "nefor-WORK"
+            wrong.mkdir()
+            self.assertNotEqual(subprocess.run([str(script), str(wrong)], capture_output=True).returncode, 0)
+            stage = root / "nefor-aarch64-apple-darwin"
+            (stage / "bin").mkdir(parents=True)
+            for name in ("nefor", "mag"):
+                path = stage / "bin" / name
+                path.write_text("fixture")
+                path.chmod(0o755)
+            subprocess.run([str(script), str(stage)], check=True)
+            archive = stage.with_suffix(".tar.gz")
+            self.assertEqual(Path(str(archive) + ".sha256").read_text(),
+                             f"{producer.sha(archive)}  {archive.name}\n")
+            with tarfile.open(archive) as handle:
+                self.assertTrue(all(p.name.split("/")[0] == stage.name for p in handle))
+            self.assertNotEqual(subprocess.run([str(script), str(stage)], capture_output=True).returncode, 0)
 
     def test_native_absolute_and_missing_dependencies_are_rejected(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / "tmp") as directory:

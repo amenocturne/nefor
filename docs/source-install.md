@@ -100,32 +100,26 @@ CI runs native discovery on macOS and fresh source-install acceptance on Linux.
 
 ## Pinned native runtime packaging
 
-`just package-runtime FULL_COMMIT /absolute/absent/runtime-directory` produces
-an uncompressed release-layout runtime for native macOS arm64. Commit producer
-changes first. The source commit must exist locally; the producer checks out
-that exact revision in a private detached clone under `tmp/runtime-build/`.
-Its own revision is recorded separately from the compiled runtime revision.
-This is a producer, not an installer or a new package-manager interface.
+The local release producer reuses an explicitly admitted prepared native runtime,
+without downloading or rebuilding. See `just package-release` for its required
+source pin, absent absolute output directory, prepared directory and trusted
+SHA256SUMS digest. It requires a clean exact-pin detached source checkout under
+`tmp/runtime-build/<pin>/source` and a committed producer checkout.
 
-The build requires the source prerequisites above, uv with Python 3, and macOS
-`file`, `lipo`, `otool`, `install_name_tool`, and `codesign`. Explicit
-`LUA_DEPENDENCIES_LUA_DIR` and `LUA_DEPENDENCIES_OPENSSL_DIR` prefixes permit a
-private native toolchain without Homebrew installation or global configuration.
-LuaRocks, its downloads/configuration, temporary files, the detached source and
-Cargo cache remain private to the build. Public locked Lua archives and Cargo
-crates are downloaded during production, never during bundle startup.
+Both CI and local production use `tools/bundle-release.sh` and
+`tools/archive-release.sh`: one `nefor-aarch64-apple-darwin/` root and the normal
+archive/checksum sidecar. Local assembly compares every payload file to the
+admitted inputs. `RUNTIME.json` records source and producer revisions separately,
+target, Lua ABI/lock, native minimum OS and original inventory digest;
+`SHA256SUMS` covers the complete file set including metadata. Inventory, locked
+rocks, full engine stamp, all Mach-O architectures, signatures and internal or
+system-only dylib dependencies are checked before reuse and after assembly.
+No source bytes are taken from the producer branch. No symlinks are admitted.
+Ad-hoc signing is integrity evidence, not publisher authentication.
 
-The existing release assembler exports the engine, compiler, Cargo-enumerated
-plugins, Lua libraries, MAG source/book, starter and locked native Lua tree.
-The producer verifies the exact installed rocks against the lock, signs every
-Mach-O after Lua dylib relocation, rejects non-system absolute dependencies and
-unresolved loader paths, checks arm64 throughout, and computes the deployment
-floor from every binary/module/dylib (at least macOS 14.0). `RUNTIME.json` records
-source/producer revisions, architecture, floor, Lua ABI, lock digest, engine
-version and plugin inventory. `SHA256SUMS` covers every regular file except
-itself, including metadata; consumers must compare the complete file inventory
-as well as hashes. No symlinks are exported. Existing output is never replaced.
-Ad-hoc signatures establish local integrity, not notarization or publisher trust.
+This is runtime-only packaging. It does not extend the canonical payload with
+composition-selected packages such as da; fresh offline work startup still
+requires that separate distribution decision. No hidden cache seed is supplied.
 
 A downstream distribution must set `SSL_CERT_FILE=/etc/ssl/cert.pem` for the
 bundled OpenSSL-backed Lua HTTP transport on macOS (or select its own explicit
@@ -137,7 +131,7 @@ credentials, user overlays, or destination activation logic. Those belong to
 the consuming distribution. Execution on the build host does not prove
 execution on the oldest OS described by load commands.
 
-`just test-package-runtime` checks inventory closure, lock agreement, admission
+`just test-package-release` checks inventory closure, lock agreement, admission
 and rejected native dependencies without a native build or public network.
 `just test-runtime-transport ENGINE RUNTIME_ROOT /absolute/absent/scratch` runs
 the real embedded Lua HTTPS stack against local trusted/untrusted TLS peers,

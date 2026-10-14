@@ -115,9 +115,8 @@ jobs:
 
           tools/bundle-release.sh "$TARGET_BIN" "$DIST"
 
-          tar -czf "$DIST.tar.gz" "$DIST"
-          SHA256=$(shasum -a 256 "$DIST.tar.gz" | awk '{print $1}')
-          printf '%s  %s\n' "$SHA256" "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
+          tools/archive-release.sh "$DIST"
+          SHA256=$(awk '{print $1}' "$DIST.tar.gz.sha256")
 
           # Capture the binary's self-reported version (from build.rs git
           # describe). Used by the publish job for release notes.

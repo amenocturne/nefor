@@ -92,89 +92,73 @@ def verify_native(root):
     return ".".join(str(v) for v in floor[:2]) + (f".{floor[2]}" if floor[2] else "")
 
 
-def package(pin, output):
+def admit(prepared, pin, expected_inventory):
+    if sha(prepared / "SHA256SUMS") != expected_inventory:
+        raise ValueError("prepared inventory digest differs")
+    if inventory(prepared) != (prepared / "SHA256SUMS").read_text():
+        raise ValueError("prepared inventory is not complete or hashes differ")
+    metadata = json.loads((prepared / "RUNTIME.json").read_text())
+    if metadata["runtime_commit"] != pin or metadata["target"] != TARGET:
+        raise ValueError("prepared source pin or target differs")
+    if metadata["lua_abi"] != "5.4" or metadata["os"] != "Darwin" or metadata["arch"] != "arm64":
+        raise ValueError("prepared platform or ABI differs")
+    tree = prepared / "share/nefor/runtime/lua-dependencies"
+    verify_packages(tree)
+    if sha(tree / "dependencies.lock") != metadata["dependencies_lock_sha256"]:
+        raise ValueError("prepared dependency lock differs")
+    if run(str(prepared / "bin/nefor"), "--version") != metadata["engine_version"] or not metadata["engine_version"].endswith(pin):
+        raise ValueError("engine stamp differs from source pin")
+    if verify_native(prepared) != metadata["minimum_macos"]:
+        raise ValueError("native deployment floor differs")
+    return metadata
+
+
+def package(pin, output, prepared, expected_inventory):
     if not re.fullmatch("[a-f0-9]{40}", pin):
         raise ValueError("runtime pin must be a full lowercase commit ID")
     if not output.is_absolute() or output.exists():
         raise ValueError("output must be an absent absolute directory")
+    if not re.fullmatch("[a-f0-9]{64}", expected_inventory):
+        raise ValueError("prepared inventory digest must be explicit SHA256")
     if platform.system() != "Darwin" or platform.machine() != "arm64":
-        raise ValueError("package-runtime currently supports native macOS arm64 only")
+        raise ValueError("release reuse supports native macOS arm64 only")
     repo = Path(__file__).resolve().parent.parent
     producer = run("git", "rev-parse", "HEAD", cwd=repo)
     if run("git", "status", "--porcelain", "--untracked-files=normal", cwd=repo):
         raise ValueError("commit producer changes before packaging")
-    if run("git", "rev-parse", f"{pin}^{{commit}}", cwd=repo) != pin:
-        raise ValueError("runtime pin not available in producer repository")
-    build = repo / "tmp" / "runtime-build" / pin
-    source = build / "source"
-    build.mkdir(parents=True, exist_ok=True)
-    if not source.exists():
-        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout", str(repo), str(source)], check=True)
-        subprocess.run(["git", "checkout", "--detach", pin], cwd=source, check=True)
+    metadata = admit(prepared, pin, expected_inventory)
+    source = repo / "tmp/runtime-build" / pin / "source"
     if run("git", "rev-parse", "HEAD", cwd=source) != pin or run("git", "status", "--porcelain", cwd=source):
-        raise ValueError("private source checkout is not clean at the requested pin")
-    description = run("git", "describe", "--tags", "--long", "--always", "--abbrev=40",
-                      "--match", "v[0-9]*.[0-9]*.[0-9]*", cwd=source)
-    source_version = description.removeprefix("v")
-    if not source_version.endswith(pin):
-        raise ValueError("source version does not identify the full runtime pin")
-    # Use the source lane's explicit stamp hook, never an inherited override or
-    # a cached build-script executable's embedded old checkout directory.
-    os.environ["NEFOR_VERSION_OVERRIDE"] = source_version
-    os.environ["MACOSX_DEPLOYMENT_TARGET"] = "14.0"
-    # Build caches belong exclusively to this producer and exact source revision.
-    os.environ.pop("CARGO_TARGET_DIR", None)
-    os.environ["CARGO_HOME"] = str(build / "cargo-home")
-    os.environ["RUSTUP_AUTO_INSTALL"] = "0"
-    os.environ["TMPDIR"] = str(build / "temporary")
-    Path(os.environ["TMPDIR"]).mkdir(exist_ok=True)
-    subprocess.run(["just", "preflight-source-install"], cwd=source, check=True)
-    subprocess.run(["just", "prepare-distribution-lua-dependencies"], cwd=source, check=True)
-    subprocess.run(["cargo", "build", "--workspace", "--release", "--locked", "--target", TARGET], cwd=source, check=True)
-    stage = build / "distribution"
-    if stage.exists():
-        shutil.rmtree(stage)
-    env = dict(os.environ, NEFOR_LUA_DEPENDENCIES_ROOT=str(source / "target/lua-dependencies"))
-    subprocess.run([str(source / "tools/bundle-release.sh"), str(source / f"target/{TARGET}/release"), str(stage)], env=env, check=True)
-    # LuaRocks creates symlinks into its own immutable tree. Dereference only
-    # internal files; absolute build/store links are never exported.
-    for path in sorted(stage.rglob("*")):
-        if path.is_symlink():
-            resolved = path.resolve()
-            if not resolved.is_relative_to(stage.resolve()) or not resolved.is_file():
-                raise ValueError(f"unexplained bundle symlink: {path}")
-            data, mode = resolved.read_bytes(), resolved.stat().st_mode
-            path.unlink()
-            path.write_bytes(data)
-            path.chmod(mode)
-    tree = stage / "share/nefor/runtime/lua-dependencies"
-    verify_packages(tree)
-    for path in native_files(stage):
-        subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
-    minimum = verify_native(stage)
-    engine_version = run(str(stage / "bin/nefor"), "--version")
-    if engine_version != f"nefor {source_version}":
-        raise ValueError(f"engine stamp differs from pinned source: {engine_version}")
-    metadata = dict(schema_version=1, kind="nefor-runtime", runtime_commit=pin,
-                    producer_commit=producer, target=TARGET, os="Darwin", arch="arm64",
-                    minimum_macos=minimum, lua_abi="5.4",
-                    dependencies_lock_sha256=sha(tree / "dependencies.lock"),
-                    engine_version=engine_version,
-                    plugins=(stage / "share/nefor/plugins.manifest").read_text().splitlines())
+        raise ValueError("private source checkout is not clean at requested pin")
+    output.mkdir(parents=True)
+    binaries = output / "inputs"
+    binaries.mkdir()
+    for path in list((prepared / "bin").iterdir()) + list((prepared / "share/nefor/plugins").iterdir()):
+        shutil.copy2(path, binaries / path.name)
+    stage = output / f"nefor-{TARGET}"
+    env = dict(os.environ, NEFOR_RELEASE_SOURCE_ROOT=str(source),
+               NEFOR_LUA_DEPENDENCIES_ROOT=str(prepared / "share/nefor/runtime/lua-dependencies"))
+    subprocess.run([str(repo / "tools/bundle-release.sh"), str(binaries), str(stage)], env=env, check=True)
+    # Reassembly must preserve ALL prepared payload bytes, not just engine/hash.
+    def payload(root):
+        return {p.relative_to(root).as_posix(): sha(p) for p in root.rglob("*")
+                if p.is_file() and p.relative_to(root).as_posix() not in ("RUNTIME.json", "SHA256SUMS")}
+    if payload(stage) != payload(prepared):
+        raise ValueError("canonical pinned-source layout differs from prepared payload")
+    metadata.update(producer_commit=producer, prepared_inventory_sha256=expected_inventory)
     (stage / "RUNTIME.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     (stage / "SHA256SUMS").write_text(inventory(stage))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(stage, output)
-    if inventory(output) != (output / "SHA256SUMS").read_text():
-        raise ValueError("output inventory differs after transfer")
+    verify_native(stage)
+    subprocess.run([str(repo / "tools/archive-release.sh"), str(stage)], check=True)
+    shutil.rmtree(binaries)
     print(json.dumps(metadata, indent=2))
-    print(f"SHA256SUMS sha256: {sha(output / 'SHA256SUMS')}")
+    print(f"archive sha256: {sha(stage.with_suffix('.tar.gz'))}")
 
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 3:
-            raise ValueError("usage: package-runtime.py <full-runtime-pin> <absolute-output-directory>")
-        package(sys.argv[1], Path(sys.argv[2]))
+        if len(sys.argv) != 5:
+            raise ValueError("usage: package-release.py <source-pin> <absent-output-dir> <prepared-runtime> <inventory-sha256>")
+        package(sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]).resolve(), sys.argv[4])
     except (ValueError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))

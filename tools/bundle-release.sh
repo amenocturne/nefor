@@ -8,6 +8,7 @@ if [ "$#" -ne 2 ]; then
 fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source_root=${NEFOR_RELEASE_SOURCE_ROOT:-"$repo_root"}
 target_bin=$1
 dist_dir=$2
 
@@ -45,7 +46,7 @@ while IFS= read -r name; do
   fi
   cp "$target_bin/$name" "$plugin_dir/$name"
   printf '%s\n' "$name" >> "$manifest"
-done < <("$repo_root/tools/plugin-binaries.sh")
+done < <("$source_root/tools/plugin-binaries.sh")
 
 if [ ! -s "$manifest" ]; then
   echo "plugin manifest is empty" >&2
@@ -53,20 +54,20 @@ if [ ! -s "$manifest" ]; then
 fi
 
 
-cp -R "$repo_root/lua/." "$runtime_root/lua/"
+cp -R "$source_root/lua/." "$runtime_root/lua/"
 cp -R "$lua_dependencies" "$runtime_root/lua-dependencies"
-cp -R "$repo_root/mag/." "$runtime_root/mag/"
-for plugin_lua in "$repo_root"/plugins/*/lua; do
+cp -R "$source_root/mag/." "$runtime_root/mag/"
+for plugin_lua in "$source_root"/plugins/*/lua; do
   [ -d "$plugin_lua" ] || continue
   plugin_name=$(basename "$(dirname "$plugin_lua")")
   mkdir -p "$runtime_root/plugins/$plugin_name"
   cp -R "$plugin_lua" "$runtime_root/plugins/$plugin_name/lua"
 done
 mkdir -p "$runtime_root/examples/nefor-agent"
-cp -R "$repo_root/examples/nefor-agent/." "$runtime_root/examples/nefor-agent/"
+cp -R "$source_root/examples/nefor-agent/." "$runtime_root/examples/nefor-agent/"
 
-cp -R "$repo_root/examples/nefor-agent/." "$dist_dir/share/nefor/examples/nefor-agent/"
-cp "$repo_root/LICENSE" "$repo_root/README.md" "$dist_dir/share/nefor/"
-if [ -f "$repo_root/CHANGELOG.md" ]; then
-  cp "$repo_root/CHANGELOG.md" "$dist_dir/share/nefor/"
+cp -R "$source_root/examples/nefor-agent/." "$dist_dir/share/nefor/examples/nefor-agent/"
+cp "$source_root/LICENSE" "$source_root/README.md" "$dist_dir/share/nefor/"
+if [ -f "$source_root/CHANGELOG.md" ]; then
+  cp "$source_root/CHANGELOG.md" "$dist_dir/share/nefor/"
 fi

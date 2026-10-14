@@ -25,7 +25,7 @@
   "non_cargo": [
     { "recipe": "check-test-lanes", "lane": "default", "entrypoint": "tools/check-test-lanes.sh" },
     { "recipe": "test-test-lanes-checker", "lane": "default", "entrypoint": "tools/test-test-lanes-checker.sh" },
-    { "recipe": "test-package-runtime", "lane": "default", "entrypoint": "tools/test-package-runtime.sh" },
+    { "recipe": "test-package-release", "lane": "default", "entrypoint": "tools/test-package-release.sh" },
     { "recipe": "test-lua-dylibs", "lane": "default", "entrypoint": "tools/test-lua-dylibs.sh" },
     { "recipe": "test-docs", "lane": "default", "entrypoint": "tools/check-markdown-links.ts" },
     { "recipe": "test-session-inspector", "lane": "default", "entrypoint": "tools/session-inspector/server.test.ts" },

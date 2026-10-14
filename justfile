@@ -34,7 +34,7 @@ test-lua-dylibs:
     tools/test-lua-dylibs.sh
 
 # Build once and execute every default deterministic target from prepared artifacts; bare Cargo exposes the same lane.
-test-default timeout="7200": test-source-prerequisites check-test-lanes test-test-lanes-checker test-lua-dylibs test-package-runtime test-docs test-session-inspector
+test-default timeout="7200": test-source-prerequisites check-test-lanes test-test-lanes-checker test-lua-dylibs test-package-release test-docs test-session-inspector
     @echo "=== TEST LANE: default deterministic ==="
     cargo run --quiet -p nefor-cargo-test-harness -- --lane default "{{timeout}}"
 
@@ -207,7 +207,7 @@ test-tui-chat:
     cargo test -p nefor-tui --features full-tests --test chat_test -- --test-threads=1
 
 # Build once, execute every deterministic target from prepared artifacts, then reuse the binaries for operational checks.
-test-full timeout="7200": test-source-prerequisites check-test-lanes test-test-lanes-checker test-lua-dylibs test-package-runtime
+test-full timeout="7200": test-source-prerequisites check-test-lanes test-test-lanes-checker test-lua-dylibs test-package-release
     #!/usr/bin/env bash
     set -euo pipefail
     repo="{{ justfile_directory() }}"
@@ -229,14 +229,15 @@ test-all timeout="7200":
     just test-full "{{timeout}}"
 
 # Validate that a built workspace becomes a complete installable distribution.
-test-release-bundle prepared="false":
+test-release-bundle prepared="false" binaries="":
     #!/usr/bin/env bash
     set -euo pipefail
     repo="{{ justfile_directory() }}"
     target="${CARGO_TARGET_DIR:-$repo/target}"
     if [[ "$target" != /* ]]; then target="$repo/$target"; fi
     if [ "{{prepared}}" != "true" ]; then cargo build --workspace --locked; fi
-    tools/test-release-bundle.sh "$target/debug"
+    binaries="{{binaries}}"
+    tools/test-release-bundle.sh "${binaries:-$target/debug}"
 
 # Deterministic process-level checks kept separate from the fast default suite.
 test-integration: test-release-bundle test-tui-scenarios
@@ -550,13 +551,13 @@ accept-source-install revision scratch:
     tools/accept-source-install.sh "{{revision}}" "{{scratch}}"
 
 # Produce an exact-source native macOS arm64 runtime in an absent absolute directory.
-package-runtime pin output:
-    uv run --no-project python -B tools/package-runtime.py "{{pin}}" "{{output}}"
+package-release pin output prepared inventory:
+    uv run --no-project python -B tools/package-release.py "{{pin}}" "{{output}}" "{{prepared}}" "{{inventory}}"
 
 # Exercise relocated native HTTPS with trusted/untrusted local peers; optional public system trust.
 test-runtime-transport engine runtime scratch *args:
     uv run --no-project python -B tools/runtime-native-transport.py "{{engine}}" "{{runtime}}" "{{scratch}}" {{args}}
 
 # Offline inventory, exact-lock and producer admission checks.
-test-package-runtime:
-    tools/test-package-runtime.sh
+test-package-release:
+    tools/test-package-release.sh
