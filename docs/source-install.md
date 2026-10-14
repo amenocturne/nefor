@@ -139,3 +139,8 @@ execution on the oldest OS described by load commands.
 
 `just test-package-runtime` checks inventory closure, lock agreement, admission
 and rejected native dependencies without a native build or public network.
+`just test-runtime-transport ENGINE RUNTIME_ROOT /absolute/absent/scratch` runs
+the real embedded Lua HTTPS stack against local trusted/untrusted TLS peers,
+with an empty environment and sandbox-denied Nix/Homebrew reads. The optional
+`--public-system-trust` argument also requests `https://example.com/` using
+`/etc/ssl/cert.pem`; it transfers no provider configuration or credentials.

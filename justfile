@@ -553,6 +553,10 @@ accept-source-install revision scratch:
 package-runtime pin output:
     uv run --no-project python -B tools/package-runtime.py "{{pin}}" "{{output}}"
 
+# Exercise relocated native HTTPS with trusted/untrusted local peers; optional public system trust.
+test-runtime-transport engine runtime scratch *args:
+    uv run --no-project python -B tools/runtime-native-transport.py "{{engine}}" "{{runtime}}" "{{scratch}}" {{args}}
+
 # Offline inventory, exact-lock and producer admission checks.
 test-package-runtime:
     tools/test-package-runtime.sh
