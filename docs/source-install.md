@@ -100,25 +100,35 @@ CI runs native discovery on macOS and fresh source-install acceptance on Linux.
 
 ## Pinned native runtime packaging
 
-The local release producer reuses an explicitly admitted prepared native runtime,
-without downloading or rebuilding. See `just package-release` for its required
-source pin, absent absolute output directory, prepared directory and trusted
-SHA256SUMS digest. It requires a clean exact-pin detached source checkout under
-`tmp/runtime-build/<pin>/source` and a committed producer checkout.
+`just package TARGET OUTPUT [REVISION]` builds the complete runtime and creates
+`OUTPUT/nefor-TARGET/`, `nefor-TARGET.tar.gz` and its `.sha256` sidecar. The
+output directory must be absent; relative paths resolve against the producer
+checkout. Revision defaults to committed HEAD and may be a tag, branch or commit.
+No prepared inventory, binary directory or manually managed worktree is needed.
 
-Both CI and local production use `tools/bundle-release.sh` and
-`tools/archive-release.sh`: one target-named root and the normal
-archive/checksum sidecar. The archive step finalizes `RUNTIME.json` and
-`SHA256SUMS` for every CI target as well as local reuse, before creating the tarball.
-The source revision comes from the assembly source root; the producer revision
-comes from the packaging checkout. Local assembly compares every payload file to the
-admitted inputs. `RUNTIME.json` records source and producer revisions separately,
-target, Lua ABI/lock, native minimum OS on macOS and, for local reuse, original inventory digest;
-`SHA256SUMS` covers the complete file set including metadata. Inventory, locked
-rocks, full engine stamp, all Mach-O architectures, signatures and internal or
-system-only dylib dependencies are checked before reuse and after assembly.
-No source bytes are taken from the producer branch. No symlinks are admitted.
-Ad-hoc signing is integrity evidence, not publisher authentication.
+The producer must be clean and committed. It resolves the source to an immutable
+commit, creates and removes its own detached checkout, freshly prepares locked
+Lua dependencies, always runs the locked release workspace Cargo build, signs
+Darwin executables, and invokes the canonical bundle/archive primitives. Source
+payload bytes and the source lock come only from the selected revision.
+`RUNTIME.json` records separate source and producer commits, target, Lua ABI/lock,
+plugin list, exact engine stamp and native minimum OS on macOS. `SHA256SUMS`
+closes the complete file set including metadata; no symlinks are admitted.
+Ad-hoc signatures prove integrity, not publisher authentication.
+
+Supported targets are native-only: `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Host mismatch fails
+before preparation: native Lua probes and the finalizer execute host binaries.
+Install the prerequisites listed above, plus `uv` (the command runner) and `file`
+(and `lipo` on Darwin). Packaging never installs host tools or changes global Lua
+configuration. Lua/OpenSSL prefix overrides and normal Rust build environment
+remain supported. Caller-provided `NEFOR_VERSION_OVERRIDE` is rejected; the
+producer derives a full-commit Git description for the build stamp itself,
+including when building historical source or an exact tag. The command ignores an
+inherited `NEFOR_LUA_DEPENDENCIES_ROOT`: dependencies are always freshly prepared.
+`CARGO_TARGET_DIR` selects an optional build cache (relative to the producer);
+otherwise `target/package` is used. Cached binaries never bypass Cargo.
+A failed command can leave a partial output directory, which cannot be reused.
 
 This is runtime-only packaging. It does not extend the canonical payload with
 composition-selected packages such as da; fresh offline work startup still
@@ -134,7 +144,7 @@ credentials, user overlays, or destination activation logic. Those belong to
 the consuming distribution. Execution on the build host does not prove
 execution on the oldest OS described by load commands.
 
-`just test-package-release` checks inventory closure, lock agreement, admission
+`just test-package-release` checks inventory closure, lock agreement, command orchestration
 and rejected native dependencies without a native build or public network.
 `just test-runtime-transport ENGINE RUNTIME_ROOT /absolute/absent/scratch` runs
 the real embedded Lua HTTPS stack against local trusted/untrusted TLS peers,

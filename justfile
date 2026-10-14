@@ -550,14 +550,14 @@ test-source-prerequisites:
 accept-source-install revision scratch:
     tools/accept-source-install.sh "{{revision}}" "{{scratch}}"
 
-# Produce an exact-source native macOS arm64 runtime in an absent absolute directory.
-package-release pin output prepared inventory:
-    uv run --no-project python -B tools/package-release.py "{{pin}}" "{{output}}" "{{prepared}}" "{{inventory}}"
+# Build and archive a native runtime from a committed revision into an absent directory.
+package target output revision="HEAD":
+    uv run --no-project python -B tools/package-release.py "{{target}}" "{{output}}" "{{revision}}"
 
 # Exercise relocated native HTTPS with trusted/untrusted local peers; optional public system trust.
 test-runtime-transport engine runtime scratch *args:
     uv run --no-project python -B tools/runtime-native-transport.py "{{engine}}" "{{runtime}}" "{{scratch}}" {{args}}
 
-# Offline inventory, exact-lock and producer admission checks.
+# Offline package command, inventory and native closure checks.
 test-package-release *args:
     tools/test-package-release.sh {{args}}

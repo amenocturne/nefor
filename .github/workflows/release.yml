@@ -95,32 +95,22 @@ jobs:
             echo "LUA_DEPENDENCIES_OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
           else
             sudo apt-get update
-            sudo apt-get install -y lua5.4 liblua5.4-dev luarocks libssl-dev pkg-config make gcc unzip
+            sudo apt-get install -y lua5.4 liblua5.4-dev luarocks libssl-dev pkg-config make gcc unzip m4 jq
           fi
 
-      - name: Prepare private Lua dependencies
-        shell: bash
-        run: tools/prepare-lua-dependencies.sh lua/nefor-pm/nefor-pm-dev-1.rockspec lua/nefor-pm/dependencies.lock target/${{ matrix.target }}/lua-dependencies
+      - uses: extractions/setup-just@v2
 
-      - name: cargo build release
-        run: cargo build --release --workspace --locked --target ${{ matrix.target }}
+      - uses: astral-sh/setup-uv@v6
 
-      - name: bundle tarball
+      - name: Build and package native release
         id: bundle
         shell: bash
         run: |
           set -euo pipefail
-          DIST=nefor-${{ matrix.target }}
-          TARGET_BIN=target/${{ matrix.target }}/release
-
-          tools/bundle-release.sh "$TARGET_BIN" "$DIST"
-
-          tools/archive-release.sh "$DIST"
+          just package "${{ matrix.target }}" "$PWD/release-output" "$GITHUB_SHA"
+          DIST=release-output/nefor-${{ matrix.target }}
           SHA256=$(awk '{print $1}' "$DIST.tar.gz.sha256")
-
-          # Capture the binary's self-reported version (from build.rs git
-          # describe). Used by the publish job for release notes.
-          VERSION="$("$TARGET_BIN/nefor" --version | awk '{print $2}')"
+          VERSION="$("$DIST/bin/nefor" --version | awk '{print $2}')"
           echo "tarball=$DIST.tar.gz" >> "$GITHUB_OUTPUT"
           echo "sha256_file=$DIST.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
