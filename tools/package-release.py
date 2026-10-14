@@ -113,6 +113,52 @@ def admit(prepared, pin, expected_inventory):
     return metadata
 
 
+def finalize(stage):
+    """Close canonical release provenance and inventory immediately before tar."""
+    target = stage.name.removeprefix("nefor-")
+    platforms = {
+        "aarch64-apple-darwin": ("Darwin", "arm64"),
+        "x86_64-unknown-linux-gnu": ("Linux", "x86_64"),
+        "aarch64-unknown-linux-gnu": ("Linux", "aarch64"),
+    }
+    if target not in platforms:
+        raise ValueError(f"unsupported release target: {target}")
+    repo = Path(__file__).resolve().parent.parent
+    source = Path(os.environ.get("NEFOR_RELEASE_SOURCE_ROOT", repo))
+    runtime_commit = run("git", "rev-parse", "HEAD", cwd=source)
+    producer_commit = run("git", "rev-parse", "HEAD", cwd=repo)
+    if any(not re.fullmatch("[a-f0-9]{40}", pin) for pin in (runtime_commit, producer_commit)):
+        raise ValueError("release revisions must be full commit IDs")
+    tree = stage / "share/nefor/runtime/lua-dependencies"
+    verify_packages(tree)
+    plugins = (stage / "share/nefor/plugins.manifest").read_text().splitlines()
+    if not plugins or len(set(plugins)) != len(plugins):
+        raise ValueError("release plugin manifest is empty or duplicated")
+    metadata = {
+        "schema_version": 1,
+        "kind": "nefor-runtime",
+        "runtime_commit": runtime_commit,
+        "producer_commit": producer_commit,
+        "target": target,
+        "os": platforms[target][0],
+        "arch": platforms[target][1],
+        "lua_abi": "5.4",
+        "dependencies_lock_sha256": sha(tree / "dependencies.lock"),
+        "plugins": plugins,
+        "engine_version": run(str(stage.resolve() / "bin/nefor"), "--version"),
+    }
+    if target == TARGET:
+        metadata["minimum_macos"] = verify_native(stage)
+    prepared_inventory = os.environ.get("NEFOR_RELEASE_PREPARED_INVENTORY_SHA256")
+    if prepared_inventory is not None:
+        if not re.fullmatch("[a-f0-9]{64}", prepared_inventory):
+            raise ValueError("prepared inventory digest must be explicit SHA256")
+        metadata["prepared_inventory_sha256"] = prepared_inventory
+    (stage / "RUNTIME.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    (stage / "SHA256SUMS").write_text(inventory(stage))
+    return metadata
+
+
 def package(pin, output, prepared, expected_inventory):
     if not re.fullmatch("[a-f0-9]{40}", pin):
         raise ValueError("runtime pin must be a full lowercase commit ID")
@@ -123,10 +169,9 @@ def package(pin, output, prepared, expected_inventory):
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise ValueError("release reuse supports native macOS arm64 only")
     repo = Path(__file__).resolve().parent.parent
-    producer = run("git", "rev-parse", "HEAD", cwd=repo)
     if run("git", "status", "--porcelain", "--untracked-files=normal", cwd=repo):
         raise ValueError("commit producer changes before packaging")
-    metadata = admit(prepared, pin, expected_inventory)
+    admit(prepared, pin, expected_inventory)
     source = repo / "tmp/runtime-build" / pin / "source"
     if run("git", "rev-parse", "HEAD", cwd=source) != pin or run("git", "status", "--porcelain", cwd=source):
         raise ValueError("private source checkout is not clean at requested pin")
@@ -145,11 +190,9 @@ def package(pin, output, prepared, expected_inventory):
                 if p.is_file() and p.relative_to(root).as_posix() not in ("RUNTIME.json", "SHA256SUMS")}
     if payload(stage) != payload(prepared):
         raise ValueError("canonical pinned-source layout differs from prepared payload")
-    metadata.update(producer_commit=producer, prepared_inventory_sha256=expected_inventory)
-    (stage / "RUNTIME.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-    (stage / "SHA256SUMS").write_text(inventory(stage))
-    verify_native(stage)
-    subprocess.run([str(repo / "tools/archive-release.sh"), str(stage)], check=True)
+    env["NEFOR_RELEASE_PREPARED_INVENTORY_SHA256"] = expected_inventory
+    subprocess.run([str(repo / "tools/archive-release.sh"), str(stage)], env=env, check=True)
+    metadata = json.loads((stage / "RUNTIME.json").read_text())
     shutil.rmtree(binaries)
     print(json.dumps(metadata, indent=2))
     print(f"archive sha256: {sha(stage.with_suffix('.tar.gz'))}")
@@ -157,8 +200,11 @@ def package(pin, output, prepared, expected_inventory):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 5:
-            raise ValueError("usage: package-release.py <source-pin> <absent-output-dir> <prepared-runtime> <inventory-sha256>")
-        package(sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]).resolve(), sys.argv[4])
+        if len(sys.argv) == 3 and sys.argv[1] == "--finalize":
+            finalize(Path(sys.argv[2]))
+        elif len(sys.argv) == 5:
+            package(sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]).resolve(), sys.argv[4])
+        else:
+            raise ValueError("usage: package-release.py <source-pin> <absent-output-dir> <prepared-runtime> <inventory-sha256> | --finalize <release-root>")
     except (ValueError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))

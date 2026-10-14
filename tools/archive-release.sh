@@ -14,6 +14,9 @@ esac
 test -x "$directory/bin/nefor"
 test -x "$directory/bin/mag"
 test ! -e "$parent/$name.tar.gz"
+# Both CI builds and prepared-input reuse close the same metadata here.
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+python3 -B "$repo_root/tools/package-release.py" --finalize "$directory"
 (cd "$parent" && COPYFILE_DISABLE=1 tar -czf "$name.tar.gz" "$name")
 sha=$(shasum -a 256 "$parent/$name.tar.gz" | awk '{print $1}')
 printf '%s  %s\n' "$sha" "$name.tar.gz" > "$parent/$name.tar.gz.sha256"

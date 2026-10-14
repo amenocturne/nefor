@@ -1,5 +1,8 @@
 """Offline boundary tests for the exact-pin producer."""
 import importlib.util
+import json
+import os
+import sys
 from pathlib import Path
 import tempfile
 import tarfile
@@ -10,6 +13,14 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("producer", Path(__file__).with_name("package-release.py"))
 producer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(producer)
+
+
+consumer = None
+if len(sys.argv) == 3 and sys.argv[1] == "--consumer":
+    consumer_spec = importlib.util.spec_from_file_location("consumer", sys.argv[2])
+    consumer = importlib.util.module_from_spec(consumer_spec)
+    consumer_spec.loader.exec_module(consumer)
+    del sys.argv[1:]
 
 
 class ProducerTests(unittest.TestCase):
@@ -61,26 +72,84 @@ class ProducerTests(unittest.TestCase):
                     producer.admit(root, "a" * 40, digest)
                 command.assert_not_called()
 
-    def test_canonical_archive_target_root_and_checksum(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / "tmp") as directory:
+    def test_canonical_bundle_archive_provenance_and_consumer(self):
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory(dir=repo / "tmp") as directory:
             root = Path(directory)
-            script = Path(__file__).with_name("archive-release.sh").resolve()
+            source = root / "source"
+            source.mkdir()
+            # A distinct source revision tests the prepared-input override used locally.
+            for name in ("tools", "lua/nefor-pm", "mag", "plugins/example/lua", "examples/nefor-agent"):
+                (source / name).mkdir(parents=True)
+            plugins = subprocess.check_output([str(repo / "tools/plugin-binaries.sh")], text=True).splitlines()
+            script = source / "tools/plugin-binaries.sh"
+            script.write_text("#!/bin/sh\nprintf '%s\\n' " + " ".join(plugins) + "\n")
+            script.chmod(0o755)
+            for name in ("LICENSE", "README.md", "lua/nefor-pm/init.lua", "examples/nefor-agent/init.lua"):
+                (source / name).write_text("fixture\n")
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture"], check=True)
+            pin = producer.run("git", "rev-parse", "HEAD", cwd=source)
+            dependencies = root / "dependencies"
+            dependencies.mkdir()
+            (dependencies / "dependencies.lock").write_text("a 1-1 all hash https://fixture/a.rock\n")
+            (dependencies / "installed-packages.tsv").write_text("a\t1-1\tinstalled\n")
+            binaries = root / "binaries"
+            binaries.mkdir()
+            for name in ["nefor", "mag", *plugins]:
+                binary = binaries / name
+                binary.write_text(f"#!/bin/sh\necho 'nefor fixture-{pin}'\n")
+                binary.chmod(0o755)
+            stage = root / "nefor-x86_64-unknown-linux-gnu"
+            env = dict(os.environ, NEFOR_RELEASE_SOURCE_ROOT=str(source),
+                       NEFOR_LUA_DEPENDENCIES_ROOT=str(dependencies))
+            subprocess.run([str(repo / "tools/bundle-release.sh"), str(binaries), str(stage)], env=env, check=True)
+            archive_script = repo / "tools/archive-release.sh"
             wrong = root / "nefor-WORK"
             wrong.mkdir()
-            self.assertNotEqual(subprocess.run([str(script), str(wrong)], capture_output=True).returncode, 0)
-            stage = root / "nefor-aarch64-apple-darwin"
-            (stage / "bin").mkdir(parents=True)
-            for name in ("nefor", "mag"):
-                path = stage / "bin" / name
-                path.write_text("fixture")
-                path.chmod(0o755)
-            subprocess.run([str(script), str(stage)], check=True)
+            self.assertNotEqual(subprocess.run([str(archive_script), str(wrong)], capture_output=True).returncode, 0)
+            subprocess.run([str(archive_script), str(stage)], env=env, check=True)
+            metadata = json.loads((stage / "RUNTIME.json").read_text())
+            self.assertEqual(metadata["runtime_commit"], pin)
+            self.assertEqual(metadata["producer_commit"], producer.run("git", "rev-parse", "HEAD", cwd=repo))
+            self.assertNotEqual(metadata["producer_commit"], pin)
+            self.assertNotIn("prepared_inventory_sha256", metadata)
+            self.assertEqual((stage / "SHA256SUMS").read_text(), producer.inventory(stage))
             archive = stage.with_suffix(".tar.gz")
-            self.assertEqual(Path(str(archive) + ".sha256").read_text(),
-                             f"{producer.sha(archive)}  {archive.name}\n")
+            digest = producer.sha(archive)
+            self.assertEqual(Path(str(archive) + ".sha256").read_text(), f"{digest}  {archive.name}\n")
             with tarfile.open(archive) as handle:
                 self.assertTrue(all(p.name.split("/")[0] == stage.name for p in handle))
-            self.assertNotEqual(subprocess.run([str(script), str(stage)], capture_output=True).returncode, 0)
+            if consumer is not None:
+                extracted = consumer.validate(archive, digest, pin, metadata["target"], root / "validated")
+                self.assertEqual((extracted / "RUNTIME.json").read_bytes(), (stage / "RUNTIME.json").read_bytes())
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    consumer.validate(archive, digest, "0" * 40, metadata["target"], root / "wrong-pin")
+                (stage / "bin/mag").write_text("changed")
+                damaged = root / "damaged.tar.gz"
+                with tarfile.open(damaged, "w:gz") as handle:
+                    handle.add(stage, arcname=stage.name)
+                with self.assertRaisesRegex(ValueError, "inventory mismatch"):
+                    consumer.validate(damaged, producer.sha(damaged), pin, metadata["target"], root / "damaged")
+            self.assertNotEqual(subprocess.run([str(archive_script), str(stage)], capture_output=True).returncode, 0)
+
+    def test_finalize_native_and_prepared_evidence(self):
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory(dir=repo / "tmp") as directory:
+            stage = Path(directory) / "nefor-aarch64-apple-darwin"
+            tree = stage / "share/nefor/runtime/lua-dependencies"
+            tree.mkdir(parents=True)
+            (tree / "dependencies.lock").write_text("a 1-1 all hash url\n")
+            (tree / "installed-packages.tsv").write_text("a\t1-1\tinstalled\n")
+            (stage / "share/nefor/plugins.manifest").write_text("plugin\n")
+            with patch.object(producer, "run", side_effect=["a" * 40, "b" * 40, "nefor fixture"]), patch.object(producer, "verify_native", return_value="14.0"), patch.dict(os.environ, {"NEFOR_RELEASE_PREPARED_INVENTORY_SHA256": "c" * 64}):
+                metadata = producer.finalize(stage)
+            self.assertEqual(metadata["minimum_macos"], "14.0")
+            self.assertEqual(metadata["prepared_inventory_sha256"], "c" * 64)
+            self.assertEqual(metadata["runtime_commit"], "a" * 40)
+            self.assertEqual(metadata["producer_commit"], "b" * 40)
+            self.assertEqual((stage / "SHA256SUMS").read_text(), producer.inventory(stage))
 
     def test_native_absolute_and_missing_dependencies_are_rejected(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / "tmp") as directory:

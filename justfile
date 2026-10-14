@@ -559,5 +559,5 @@ test-runtime-transport engine runtime scratch *args:
     uv run --no-project python -B tools/runtime-native-transport.py "{{engine}}" "{{runtime}}" "{{scratch}}" {{args}}
 
 # Offline inventory, exact-lock and producer admission checks.
-test-package-release:
-    tools/test-package-release.sh
+test-package-release *args:
+    tools/test-package-release.sh {{args}}

@@ -107,10 +107,13 @@ SHA256SUMS digest. It requires a clean exact-pin detached source checkout under
 `tmp/runtime-build/<pin>/source` and a committed producer checkout.
 
 Both CI and local production use `tools/bundle-release.sh` and
-`tools/archive-release.sh`: one `nefor-aarch64-apple-darwin/` root and the normal
-archive/checksum sidecar. Local assembly compares every payload file to the
+`tools/archive-release.sh`: one target-named root and the normal
+archive/checksum sidecar. The archive step finalizes `RUNTIME.json` and
+`SHA256SUMS` for every CI target as well as local reuse, before creating the tarball.
+The source revision comes from the assembly source root; the producer revision
+comes from the packaging checkout. Local assembly compares every payload file to the
 admitted inputs. `RUNTIME.json` records source and producer revisions separately,
-target, Lua ABI/lock, native minimum OS and original inventory digest;
+target, Lua ABI/lock, native minimum OS on macOS and, for local reuse, original inventory digest;
 `SHA256SUMS` covers the complete file set including metadata. Inventory, locked
 rocks, full engine stamp, all Mach-O architectures, signatures and internal or
 system-only dylib dependencies are checked before reuse and after assembly.
