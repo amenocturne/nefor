@@ -113,6 +113,14 @@ def package(pin, output):
         subprocess.run(["git", "checkout", "--detach", pin], cwd=source, check=True)
     if run("git", "rev-parse", "HEAD", cwd=source) != pin or run("git", "status", "--porcelain", cwd=source):
         raise ValueError("private source checkout is not clean at the requested pin")
+    description = run("git", "describe", "--tags", "--long", "--always", "--abbrev=40",
+                      "--match", "v[0-9]*.[0-9]*.[0-9]*", cwd=source)
+    source_version = description.removeprefix("v")
+    if not source_version.endswith(pin):
+        raise ValueError("source version does not identify the full runtime pin")
+    # Use the source lane's explicit stamp hook, never an inherited override or
+    # a cached build-script executable's embedded old checkout directory.
+    os.environ["NEFOR_VERSION_OVERRIDE"] = source_version
     os.environ["MACOSX_DEPLOYMENT_TARGET"] = "14.0"
     # Build caches belong exclusively to this producer and exact source revision.
     os.environ.pop("CARGO_TARGET_DIR", None)
@@ -144,11 +152,14 @@ def package(pin, output):
     for path in native_files(stage):
         subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
     minimum = verify_native(stage)
+    engine_version = run(str(stage / "bin/nefor"), "--version")
+    if engine_version != f"nefor {source_version}":
+        raise ValueError(f"engine stamp differs from pinned source: {engine_version}")
     metadata = dict(schema_version=1, kind="nefor-runtime", runtime_commit=pin,
                     producer_commit=producer, target=TARGET, os="Darwin", arch="arm64",
                     minimum_macos=minimum, lua_abi="5.4",
                     dependencies_lock_sha256=sha(tree / "dependencies.lock"),
-                    engine_version=run(str(stage / "bin/nefor"), "--version"),
+                    engine_version=engine_version,
                     plugins=(stage / "share/nefor/plugins.manifest").read_text().splitlines())
     (stage / "RUNTIME.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     (stage / "SHA256SUMS").write_text(inventory(stage))
