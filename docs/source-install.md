@@ -12,7 +12,8 @@ pruning existing installed binaries. Network failures can still occur afterwards
 
 Supported native hosts are Linux and macOS. Install these before source installation:
 
-- Git, just, current Rust stable with Cargo; a C compiler (`cc`) and GNU make.
+- Git, just, jq (the source installer enumerates plugin binaries from Cargo metadata),
+  current Rust stable with Cargo; a C compiler (`cc`) and GNU make.
 - LuaRocks 3.x, Lua **5.4** interpreter, development headers and library;
   pkg-config; OpenSSL **3** headers and ssl/crypto libraries.
 - GNU m4 (cqueues generates `errno.c` from its included template), curl with a
@@ -22,7 +23,7 @@ Supported native hosts are Linux and macOS. Install these before source installa
   modules and vendored non-system dylibs are signed by distribution preparation.
 
 For Debian trixie the native packages are `build-essential m4 pkg-config lua5.4
-liblua5.4-dev luarocks libssl-dev curl ca-certificates unzip git just`; install
+liblua5.4-dev luarocks libssl-dev curl ca-certificates unzip git just jq`; install
 current Rust stable separately (Debian's Rust may lag locked crate requirements).
 On macOS install Homebrew `lua@5.4 luarocks openssl@3`, GNU m4 if absent,
 and the compiler/relocation tools from Apple's command-line developer tools.

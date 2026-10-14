@@ -28,7 +28,7 @@ source_prerequisites() {
   local os tool prefix candidate probe
   os=$(uname -s)
   case "$os" in Linux|Darwin) ;; *) echo "unsupported source-install OS: $os" >&2; return 1;; esac
-  for tool in bash cc make m4 pkg-config luarocks curl unzip tar gzip git just cargo rustc; do
+  for tool in bash cc make m4 pkg-config luarocks curl unzip tar gzip git just jq cargo rustc; do
     command -v "$tool" >/dev/null || { echo "source install requires $tool (see docs/source-install.md)" >&2; return 1; }
   done
   make --version | grep -q 'GNU Make' || { echo 'source install requires GNU make' >&2; return 1; }

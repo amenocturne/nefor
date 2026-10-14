@@ -75,6 +75,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@just
       - name: Install declared native prerequisites
-        run: sudo apt-get update && sudo apt-get install -y build-essential m4 pkg-config lua5.4 liblua5.4-dev luarocks libssl-dev curl ca-certificates unzip
+        run: sudo apt-get update && sudo apt-get install -y build-essential m4 pkg-config lua5.4 liblua5.4-dev luarocks libssl-dev curl ca-certificates unzip jq
       - name: Fresh exact-revision source-install acceptance
         run: RUSTUP_HOME="$HOME/.rustup" just accept-source-install "$GITHUB_SHA" "$PWD/tmp/source-install-acceptance"
