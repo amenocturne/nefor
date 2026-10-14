@@ -39,6 +39,7 @@ return {
   build = function(opts)
     return require("libs.tool-validator").build {
       classifier = opts.classifier,
+      classifier_check = opts.classifier_check,
       classifier_args = CLASSIFIER_ARGS,
       -- This configuration approves no command ahead of the classifier.
       command_fastpaths = {},

@@ -147,7 +147,7 @@ Commands are classified by `libs.tool-validator`, which the command tools and
 ```lua
 local pm = require("nefor-pm")
 local da = require("libs.tool-validator.da")
-pm.install { da.package { commit = "<trusted-da-commit>" } }
+pm.install { da.package { commit = "<trusted full 40-hex da commit>" } }
 
 local validator = require("libs.tool-validator").build {
   classifier = pm.bin("da", "da"),
@@ -176,6 +176,13 @@ says classification failed and why, never with a policy answer.
 `classify_argv` writes the vector as the equivalent POSIX command, every
 element single-quoted, and classifies that text, so a program and a script are
 judged by the same rules. Fast paths are trusted policy predicates.
+
+The starter declares an exact release version and checksum in Lua. Its package
+verifier runs `da --version` before startup succeeds, including on cached installs.
+Its optional `classifier_check(path)` also uses `da.verify_version` at the
+validator's first-use probe, so a version mismatch fails before classification.
+This callback checks the configured binary only; it never installs or downloads.
+Generic compositions that omit it retain the ordinary executable usability probe.
 
 ## Tool plugins
 

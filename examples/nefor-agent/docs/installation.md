@@ -21,8 +21,9 @@ Rust toolchain and Cargo; repository recipes require `just`.
 The starter pins a prebuilt `da` command classifier as a `nefor-pm` package.
 First launch downloads and verifies the platform archive, then installs it
 under `<data-root>/plugins/da`; preparation phases appear before the TUI starts.
-Later launches reuse that exact package. This needs `curl`, `tar`, and a SHA-256
-utility (`shasum` or `sha256sum`), but no Rust or Git LFS for the classifier.
+Later launches reuse a matching package after checking its executable version;
+changing the declared pin reconciles it before startup. This needs the prepared
+Lua HTTP dependency tree, `tar`, and a SHA-256 utility (`shasum` or `sha256sum`), but no Rust or Git LFS for the classifier.
 Its Linux binaries require glibc 2.39 or newer; x86-64 additionally requires an
 x86-64-v3 CPU. Intel macOS has no prebuilt classifier for the selected ONNX
 Runtime. An explicit source configuration using `da.package` still requires

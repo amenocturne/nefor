@@ -122,7 +122,7 @@ fn run_inner(
             use std::os::unix::fs::PermissionsExt;
             std::fs::write(
                 &classifier,
-                "#!/bin/sh\ncase \"$(cat)\" in *touch*) exit 1 ;; esac\nprintf 'allow\\n'\n",
+                "#!/bin/sh\nif [ \"${1-}\" = \"--version\" ]; then echo \"da ${NEFOR_TEST_CLASSIFIER_VERSION:-0.3.0}\"; exit 0; fi\ncase \"$(cat)\" in *touch*) exit 1 ;; esac\nprintf 'allow\\n'\n",
             )
             .unwrap();
             std::fs::set_permissions(&classifier, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -404,6 +404,37 @@ fn success(out: &Output) -> String {
     );
     assert!(!out.stdout.contains(&0x1b), "no terminal escapes");
     String::from_utf8(out.stdout.clone()).unwrap()
+}
+
+#[test]
+fn starter_rejects_wrong_classifier_version_before_starting_actors() {
+    if std::env::var_os("NEFOR_TEST_REAL_DA").is_some() {
+        return; // The injected wrong-version fixture is intentionally synthetic.
+    }
+    std::fs::create_dir_all(root().join("tmp")).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("wrong-version-")
+        .tempdir_in(root().join("tmp"))
+        .unwrap();
+    for name in ["home", "config", "data", "cache", "bin"] {
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+    }
+    let output = run_with_env(
+        dir.path(),
+        &["--frontend", "cli", "--prompt", "must not run"],
+        &[("NEFOR_TEST_CLASSIFIER_VERSION", "0.2.0")],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("expected da 0.3.0") && error.contains("da 0.2.0"),
+        "{error}"
+    );
+    assert!(
+        !dir.path().join("data/nefor/sessions").exists(),
+        "verification precedes sessions and actor startup"
+    );
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

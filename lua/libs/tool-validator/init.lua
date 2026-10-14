@@ -51,6 +51,8 @@
 --   * `classifier_args` — `{ [policy] = { flags } }`, the classifier flags
 --     for every approval policy. A flag such as the classifier's opt-in
 --     model flag is simply listed for the policies that should use it.
+--   * Optional `classifier_check(path)` replaces the generic usability probe;
+--     it must raise if the composition's executable contract is not met.
 --   * `command_fastpaths` — list of `function(command, policy) -> bool`. If
 --     any returns true the command is safe before the classifier is asked.
 --     A downstream config passes its narrow approvals here instead of forking
@@ -116,6 +118,10 @@ local function build(opts)
     error("tool-validator: build requires a non-empty `classifier` executable path", 0)
   end
 
+  if opts.classifier_check ~= nil and type(opts.classifier_check) ~= "function" then
+    error("tool-validator: `classifier_check` must be a function", 0)
+  end
+
   -- Resolved on first use. Holds the composition-provided package binary path
   -- (e.g. /Users/x/.local/share/nefor/plugins/da/bin/da) when da is reachable.
   -- nil => not probed yet.
@@ -125,6 +131,11 @@ local function build(opts)
   -- builds happen during bootstrap, never while a permission is pending.
   local function probe_da()
     if da_cmd ~= nil then return da_cmd end
+    if opts.classifier_check then
+      opts.classifier_check(opts.classifier)
+      da_cmd = opts.classifier
+      return da_cmd
+    end
     local r = nefor.process.run { cmd = opts.classifier, args = { "--version" } }
     if type(r) ~= "table" or r.code ~= 0 then
       local detail = type(r) == "table" and (r.stderr or r.stdout) or nil

@@ -123,13 +123,13 @@ fn parse_spec_accepts_shorthand_and_name() {
             local s = pm._internals.parse_spec({
               "amenocturne/nefor",
               name = "nefor-libs",
-              tag = "v0.1.5",
+              commit = "1111111111111111111111111111111111111111",
               path = "lua-libs/",
             }, 1)
             return s.name == "nefor-libs"
               and s.url == "https://github.com/amenocturne/nefor.git"
-              and s.ref == "v0.1.5"
-              and s.ref_kind == "tag"
+              and s.ref == "1111111111111111111111111111111111111111"
+              and s.ref_kind == "commit"
               and s.path == "lua-libs/"
             "#,
         )
@@ -139,65 +139,26 @@ fn parse_spec_accepts_shorthand_and_name() {
 }
 
 #[test]
-fn parse_spec_defaults_to_main_branch() {
+fn parse_spec_requires_exact_config_identity_regardless_of_engine_version() {
     let lua = lua_with_pm();
-    let ok: bool = lua
-        .load(
-            r#"
-            local pm = require("nefor-pm")
-            local s = pm._internals.parse_spec({
-              "owner/repo", name = "x",
-            }, 1)
-            return s.ref == "main" and s.ref_kind == "branch"
-            "#,
-        )
-        .eval()
-        .expect("eval");
-    assert!(ok);
-}
-
-#[test]
-fn parse_spec_defaults_to_version_tag_when_set() {
-    let lua = lua_with_pm();
-    lua.load(r#"nefor.version = "0.1.9""#)
-        .exec()
-        .expect("set version");
-    let (ref_val, kind): (String, String) = lua
-        .load(
-            r#"
-            local pm = require("nefor-pm")
-            local s = pm._internals.parse_spec({
-              "owner/repo", name = "x",
-            }, 1)
-            return s.ref, s.ref_kind
-            "#,
-        )
-        .eval()
-        .expect("eval");
-    assert_eq!(ref_val, "v0.1.9", "exact semver → tag ref");
-    assert_eq!(kind, "tag", "exact semver → tag kind");
-}
-
-#[test]
-fn parse_spec_defaults_to_main_for_nightly_version() {
-    let lua = lua_with_pm();
-    lua.load(r#"nefor.version = "0.1.9-12-gabcdef""#)
-        .exec()
-        .expect("set version");
-    let (ref_val, kind): (String, String) = lua
-        .load(
-            r#"
-            local pm = require("nefor-pm")
-            local s = pm._internals.parse_spec({
-              "owner/repo", name = "x",
-            }, 1)
-            return s.ref, s.ref_kind
-            "#,
-        )
-        .eval()
-        .expect("eval");
-    assert_eq!(ref_val, "main", "nightly version → main branch");
-    assert_eq!(kind, "branch", "nightly version → branch kind");
+    lua.load(
+        r#"
+      local pm = require("nefor-pm")
+      for _, version in ipairs({"0.1.9", "0.1.9-nightly"}) do
+        nefor.version = version
+        for _, fields in ipairs({{}, {tag="v0.1.9"}, {branch="main"}, {commit="abc"}}) do
+          fields[1], fields.name = "owner/repo", "x"
+          local ok, err = pcall(pm._internals.parse_spec, fields, 1)
+          assert(not ok and tostring(err):find("exact full"))
+        end
+      end
+      local raw = {name="local", dir="relative"}
+      pm._internals.parse_spec(raw, 1)
+      assert(raw.dir == "relative", "parsing must not mutate caller spec")
+    "#,
+    )
+    .exec()
+    .expect("missing immutable identity rejected");
 }
 
 #[test]
@@ -284,7 +245,7 @@ fn parse_spec_rejects_conflicting_tag_and_commit() {
         )
         .exec()
         .expect_err("tag+commit must fail");
-    assert!(err.to_string().contains("at most one"));
+    assert!(err.to_string().contains("exact full"));
 }
 
 #[test]
@@ -299,7 +260,7 @@ fn parse_spec_rejects_no_source() {
         )
         .exec()
         .expect_err("missing source must fail");
-    assert!(err.to_string().contains("clonable source"));
+    assert!(err.to_string().contains("exact full"));
 }
 
 #[test]
@@ -351,9 +312,9 @@ fn lockfile_roundtrip_sorted_keys() {
         r#"
         pm = require("nefor-pm")
         pm._internals.write_lockfile({
-          zeta  = { ref = "v1", commit = "aaa", build_hash = nil },
-          alpha = { ref = "v2", commit = "bbb", build_hash = "h2" },
-          mid   = { ref = "v3", commit = "ccc" },
+          zeta  = { ref = "v1", commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", build_hash = nil },
+          alpha = { ref = "v2", commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", build_hash = "h2" },
+          mid   = { ref = "v3", commit = "cccccccccccccccccccccccccccccccccccccccc" },
         })
         "#,
     )
@@ -375,8 +336,8 @@ fn lockfile_roundtrip_sorted_keys() {
         .load(
             r#"
             local lock = pm._internals.read_lockfile()
-            return lock.alpha.commit == "bbb"
-              and lock.mid.commit == "ccc"
+            return lock.alpha.commit == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              and lock.mid.commit == "cccccccccccccccccccccccccccccccccccccccc"
               and lock.zeta.ref == "v1"
             "#,
         )
@@ -864,6 +825,19 @@ fn make_origin_repo(path: &std::path::Path) -> String {
     format!("file://{}", path.display())
 }
 
+fn git_head(path: &std::path::Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("head");
+    assert!(out.status.success());
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
 fn run_git(path: &std::path::Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -900,6 +874,7 @@ fn install_clones_and_creates_lockfile() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
 
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
@@ -909,7 +884,7 @@ fn install_clones_and_creates_lockfile() {
         r#"
         local pm = require("nefor-pm")
         pm.install({{
-          {{ name = "test-plugin", url = "{}", branch = "main" }},
+          {{ name = "test-plugin", url = "{}", commit = "{pin}" }},
         }})
         return true
         "#,
@@ -933,112 +908,67 @@ fn install_clones_and_creates_lockfile() {
         body.contains("\"test-plugin\""),
         "lock missing entry: {body}"
     );
-    assert!(
-        body.contains("\"ref\":\"main\""),
-        "ref not recorded: {body}"
-    );
+    assert!(body.contains(&pin), "ref not recorded: {body}");
 }
 
 #[test]
-fn install_reproduces_existing_lock_without_moving_until_update() {
+fn install_reconciles_config_upgrade_downgrade_and_update_refreshes_same_pin() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
-    let pinned = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&origin)
-        .output()
-        .expect("read pinned commit");
-    assert!(pinned.status.success());
-    let pinned = String::from_utf8(pinned.stdout)
-        .expect("utf8 commit")
-        .trim()
-        .to_owned();
-
-    std::fs::write(origin.join("README.md"), "new head\n").expect("update README");
-    run_git(&origin, &["add", "README.md"]);
+    let first = git_head(&origin);
+    std::fs::write(origin.join("README.md"), "new head\n").expect("write");
+    run_git(&origin, &["add", "."]);
     run_git(&origin, &["commit", "-m", "new head", "--quiet"]);
-    let moved = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&origin)
-        .output()
-        .expect("read moved commit");
-    assert!(moved.status.success());
-    let moved = String::from_utf8(moved.stdout)
-        .expect("utf8 commit")
-        .trim()
-        .to_owned();
-
-    let data = tempfile::tempdir().expect("datadir");
+    let second = git_head(&origin);
+    let data = tempfile::tempdir().expect("data");
     let _g = DataDirGuard::new(data.path());
-    let plugins = data.path().join("plugins");
-    std::fs::create_dir_all(&plugins).expect("plugins dir");
-    std::fs::write(
-        plugins.join("nefor-pm.lock.json"),
-        format!("{{\"pinned\":{{\"ref\":\"main\",\"commit\":\"{pinned}\"}}}}\n"),
-    )
-    .expect("seed lock");
-
     let lua = lua_with_pm();
-    let install = format!(
-        r#"local pm = require("nefor-pm"); pm.install({{{{ name = "pinned", url = "{}", branch = "main" }}}})"#,
-        url
-    );
-    lua.load(&install).exec().expect("fresh install from lock");
-
-    let checkout = plugins.join("pinned");
-    let checkout_head = || {
-        let head = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&checkout)
-            .output()
-            .expect("read checkout head");
-        assert!(head.status.success());
-        String::from_utf8_lossy(&head.stdout).trim().to_owned()
-    };
-    assert_eq!(checkout_head(), pinned, "fresh install must honor lock");
-    lua.load(&install).exec().expect("ordinary sync");
-    assert_eq!(checkout_head(), pinned, "ordinary sync must not move lock");
-
-    let update = format!(
-        r#"
-        local pm = require("nefor-pm")
-        local real_run = nefor.process.run
-        local events = {{}}
-        nefor.process.run = function(opts)
-          if opts.cmd == "git" and opts.args[3] == "fetch" then
-            assert(events[#events] == "pinned: Fetching revision main")
-          elseif opts.cmd == "git" and opts.args[3] == "checkout" then
-            assert(events[#events] == "pinned: Checking out main")
-          end
-          return real_run(opts)
-        end
-        pm.update({{{{ name = "pinned", url = "{}", branch = "main" }}}}, {{
-          on_progress = function(name, phase)
-            events[#events + 1] = name .. ": " .. phase
-          end,
-        }})
-        return table.concat(events, "|")
-        "#,
-        url
-    );
-    let update_events: String = lua.load(&update).eval().expect("explicit update");
-    assert_eq!(
-        update_events,
-        "pinned: Fetching revision main|pinned: Checking out main|pinned: Ready"
-    );
-    let head = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&checkout)
-        .output()
-        .expect("read checkout head");
-    assert!(head.status.success());
-    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), moved);
-    let lock = std::fs::read_to_string(plugins.join("nefor-pm.lock.json")).expect("lock");
-    assert!(
-        lock.contains(&moved),
-        "explicit update must move lock: {lock}"
-    );
+    lua.globals().set("url", url).expect("url");
+    lua.globals().set("first", first).expect("first");
+    lua.globals().set("second", second).expect("second");
+    lua.load(r#"
+      local pm = require("nefor-pm")
+      local fs = nefor.fs
+      fs.mkdir_p(fs.data_root() .. "/plugins")
+      fs.write_file(pm._internals.lockfile_path(), nefor.json.encode({tool={ref="main",commit=first}}))
+      local spec = {name="tool",url=url,commit=second}
+      local builds = 0
+      spec.build = function(p) builds = builds + 1; fs.write_file(p.dir .. "/bin/tool", p.ref) end
+      spec.verify = function(p)
+        assert(fs.read_file(p.dir .. "/bin/tool").content == p.identity.commit)
+        return {commit=p.identity.commit}
+      end
+      local r = pm.install({spec}).tool
+      assert(r.identity.commit == second and r.verification.commit == second and builds == 1)
+      spec.commit = first
+      pm.install({spec})
+      assert(pm._internals.read_lockfile().tool.commit == first and builds == 2)
+      pm.install({spec})
+      assert(builds == 2)
+      pm.update({spec})
+      assert(builds == 3 and pm._internals.read_lockfile().tool.commit == first)
+      local lock = fs.read_file(pm._internals.lockfile_path()).content
+      spec.commit = second
+      spec.build = function() error("failed build") end
+      assert(not pcall(pm.install, {spec}))
+      assert(fs.read_file(pm.bin("tool")).content == first)
+      assert(fs.read_file(pm._internals.lockfile_path()).content == lock)
+      spec.build = function(p) fs.write_file(p.dir .. "/bin/tool", p.ref) end
+      spec.verify = function() error("wrong binary") end
+      assert(not pcall(pm.install, {spec}))
+      assert(fs.read_file(pm.bin("tool")).content == first)
+      spec.verify = nil
+      local write = fs.write_file
+      fs.write_file = function(path, value)
+        if path == pm._internals.lockfile_path() .. ".tmp" then return {ok=false,error="lock denied"} end
+        return write(path,value)
+      end
+      assert(not pcall(pm.install, {spec}))
+      assert(fs.read_file(pm.bin("tool")).content == first)
+      assert(fs.read_file(pm._internals.lockfile_path()).content == lock)
+      fs.write_file = write
+    "#).exec().expect("config reconciliation and transactional failures");
 }
 
 #[test]
@@ -1046,11 +976,12 @@ fn install_uses_valid_pin_offline_and_rejects_invalid_pin() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
     let lua = lua_with_pm();
     let install = format!(
-        r#"local pm = require("nefor-pm"); pm.install({{{{ name = "offline", url = "{}", branch = "main" }}}})"#,
+        r#"local pm = require("nefor-pm"); pm.install({{{{ name = "offline", url = "{}", commit = "{pin}" }}}})"#,
         url
     );
     lua.load(&install).exec().expect("initial install");
@@ -1078,16 +1009,18 @@ fn install_uses_valid_pin_offline_and_rejects_invalid_pin() {
 }
 
 #[test]
-fn sync_checkout_updates_existing_checkout_to_requested_tag() {
+fn sync_checkout_adopts_exact_declared_commit() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
     run_git(&origin, &["tag", "v1.0.0"]);
+    let first = git_head(&origin);
 
     std::fs::write(origin.join("README.md"), "tag-two\n").expect("update README");
     run_git(&origin, &["add", "README.md"]);
     run_git(&origin, &["commit", "-m", "tag two", "--quiet"]);
     run_git(&origin, &["tag", "v1.0.1"]);
+    let second = git_head(&origin);
 
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
@@ -1109,16 +1042,16 @@ fn sync_checkout_updates_existing_checkout_to_requested_tag() {
               name = "managed-upstream",
               dir = dir,
               url = "{}",
-              ref = "v1.0.0",
-              ref_kind = "tag",
+              ref = "{first}",
+              ref_kind = "commit",
             }})
             local first_body = read_readme(dir)
             local second = pm.sync_checkout({{
               name = "managed-upstream",
               dir = dir,
               url = "{}",
-              ref = "v1.0.1",
-              ref_kind = "tag",
+              ref = "{second}",
+              ref_kind = "commit",
             }})
             local second_body = read_readme(dir)
             return first.ref, second.ref, first_body, second_body
@@ -1130,14 +1063,14 @@ fn sync_checkout_updates_existing_checkout_to_requested_tag() {
         .eval()
         .expect("sync checkout");
 
-    assert_eq!(first_ref, "v1.0.0");
-    assert_eq!(second_ref, "v1.0.1");
+    assert_eq!(first_ref, first);
+    assert_eq!(second_ref, second);
     assert_eq!(first_body, "root\n");
     assert_eq!(second_body, "tag-two\n");
 }
 
 #[test]
-fn sync_checkout_resolves_unpushed_local_commit_and_keeps_authoritative_pin_offline() {
+fn sync_checkout_reconciles_local_commits_and_reuses_matching_identity_offline() {
     let work = tempfile::tempdir().expect("workdir");
     let source = work.path().join("source");
     let _url = make_origin_repo(&source);
@@ -1200,21 +1133,18 @@ fn sync_checkout_resolves_unpushed_local_commit_and_keeps_authoritative_pin_offl
     );
 
     let (_, commit, _) = sync(&second, false).expect("ordinary sync keeps pin");
-    assert_eq!(
-        commit, first,
-        "ordinary sync must not move authoritative pin"
-    );
+    assert_eq!(commit, second, "ordinary sync must adopt desired commit");
 
     std::fs::remove_dir_all(&checkout).expect("remove managed checkout");
     let (_, commit, head) =
         sync(&second, false).expect("fresh checkout reproduces authoritative pin");
-    assert_eq!(commit, first);
-    assert_eq!(head, first);
+    assert_eq!(commit, second);
+    assert_eq!(head, second);
 
     std::fs::rename(&source, work.path().join("source-offline")).expect("hide source");
     let (_, commit, head) = sync(&second, false).expect("reuse exact checkout offline");
-    assert_eq!(commit, first);
-    assert_eq!(head, first);
+    assert_eq!(commit, second);
+    assert_eq!(head, second);
 
     std::fs::rename(work.path().join("source-offline"), &source).expect("restore source");
     let (_, commit, head) = sync(&second, true).expect("explicit update moves pin");
@@ -1227,10 +1157,61 @@ fn sync_checkout_resolves_unpushed_local_commit_and_keeps_authoritative_pin_offl
 }
 
 #[test]
+fn git_identity_includes_repository_and_subtree_and_checkout_lock_failures_roll_back() {
+    let work = tempfile::tempdir().expect("work");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let first = git_head(&origin);
+    let data = tempfile::tempdir().expect("data");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+    lua.globals().set("url", url).expect("url");
+    lua.globals().set("first", first).expect("first");
+    lua.load(r#"
+      local pm = require("nefor-pm")
+      local fs = nefor.fs
+      local spec = {name="parts",url=url,commit=first,path="lua-libs"}
+      pm.install({spec})
+      local root = pm.root("parts")
+      assert(fs.exists(root .. "/test-lib.lua") and not fs.exists(root .. "/rust-bin"))
+      spec.path = "rust-bin"
+      pm.install({spec})
+      assert(fs.read_file(root .. "/README").content == "decoy\n" and not fs.exists(root .. "/test-lib.lua"))
+      local lock = fs.read_file(pm._internals.lockfile_path()).content
+      spec.path = "absent"
+      assert(not pcall(pm.install, {spec}))
+      assert(fs.read_file(root .. "/README").content == "decoy\n")
+      spec.path, spec.url = "rust-bin", url .. "-offline"
+      local ok, err = pcall(pm.install, {spec})
+      assert(not ok and tostring(err):find(spec.url, 1, true))
+      assert(fs.read_file(pm._internals.lockfile_path()).content == lock)
+      local checkout = {name="source",dir=fs.data_root() .. "/checkout",url=url,ref=first,ref_kind="commit",lockfile=fs.data_root() .. "/checkout.commit"}
+      pm.sync_checkout(checkout)
+      local old = fs.read_file(checkout.lockfile).content
+      local write = fs.write_file
+      fs.write_file = function(path, value)
+        if path == checkout.lockfile .. ".tmp" then return {ok=false,error="lock denied"} end
+        return write(path,value)
+      end
+      local ok, err = pcall(pm.update_checkout, checkout)
+      assert(not ok and tostring(err):find("lock denied", 1, true))
+      assert(fs.read_file(checkout.lockfile).content == old)
+      assert(fs.read_file(checkout.dir .. "/README.md").content == "root\n")
+      fs.write_file = write
+      checkout.ref = "main"
+      assert(not pcall(pm.sync_checkout, checkout), "symbolic revisions have no fallback")
+      checkout.ref = first
+      fs.write_file(checkout.lockfile, "bad lock")
+      assert(not pcall(pm.sync_checkout, checkout))
+    "#).exec().expect("repository/subtree authority and checkout rollback");
+}
+
+#[test]
 fn install_sparse_checkout_pulls_only_subtree() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
 
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
@@ -1240,7 +1221,7 @@ fn install_sparse_checkout_pulls_only_subtree() {
         r#"
         local pm = require("nefor-pm")
         pm.install({{
-          {{ name = "subtree-only", url = "{}", branch = "main", path = "lua-libs/" }},
+          {{ name = "subtree-only", url = "{}", commit = "{pin}", path = "lua-libs/" }},
         }})
         return true
         "#,
@@ -1316,6 +1297,7 @@ fn install_flattens_deeply_nested_sparse_subtree() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_deep_origin_repo(&origin);
+    let pin = git_head(&origin);
 
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
@@ -1325,7 +1307,7 @@ fn install_flattens_deeply_nested_sparse_subtree() {
         r#"
         local pm = require("nefor-pm")
         pm.install({{
-          {{ name = "deep-lib", url = "{}", branch = "main",
+          {{ name = "deep-lib", url = "{}", commit = "{pin}",
              path = "subdir/deep/lib/" }},
         }})
         local mod = pm.load("deep-lib")
@@ -1366,7 +1348,7 @@ fn install_flattens_deeply_nested_sparse_subtree() {
             r#"
             local pm = require("nefor-pm")
             pm.install({{
-              {{ name = "deep-lib", url = "{}", branch = "main",
+              {{ name = "deep-lib", url = "{}", commit = "{pin}",
                  path = "subdir/deep/lib/" }},
             }})
             return pm.load("deep-lib").name == "deep-lib"
@@ -1383,6 +1365,7 @@ fn install_runs_build_callback_and_records_hash() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
 
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
@@ -1405,14 +1388,14 @@ fn install_runs_build_callback_and_records_hash() {
           _G._last_plugin_tag = plugin.tag
         end
         pm.install({{
-          {{ name = "with-build", url = "{}", branch = "main", build = build }},
+          {{ name = "with-build", url = "{}", commit = "{pin}", build = build }},
         }})
         _G._first_invocation_count = invocations
         local first_bin = pm.bin("with-build")
         -- Run install again — build_hash unchanged, fresh clone present →
         -- build must NOT re-run.
         pm.install({{
-          {{ name = "with-build", url = "{}", branch = "main", build = build }},
+          {{ name = "with-build", url = "{}", commit = "{pin}", build = build }},
         }})
         _G._second_invocation_count = invocations
         return first_bin
@@ -1439,12 +1422,9 @@ fn install_runs_build_callback_and_records_hash() {
         "build must be skipped on second idempotent install"
     );
     let last_dir: String = lua.globals().get("_last_plugin_dir").expect("plugin.dir");
-    assert!(
-        last_dir.ends_with("plugins/with-build"),
-        "plugin.dir = {last_dir}"
-    );
+    assert!(last_dir.ends_with("/content"), "plugin.dir = {last_dir}");
     let last_tag: String = lua.globals().get("_last_plugin_tag").expect("plugin.tag");
-    assert_eq!(last_tag, "main");
+    assert_eq!(last_tag, pin);
 }
 
 #[test]
@@ -1458,16 +1438,18 @@ fn install_reports_download_before_clone_and_never_reports_ready_after_clone_fai
             r#"
             local pm = require("nefor-pm")
             local events = {}
+            local real_run = nefor.process.run
             nefor.process.run = function(opts)
               if opts.cmd == "git" and opts.args[1] == "clone" then
                 assert(events[1] == "blocked: Downloading package")
                 return { code = 19, stdout = "", stderr = "fixture clone blocked" }
               end
+              if opts.cmd == "mktemp" then return real_run(opts) end
               error("unexpected process: " .. tostring(opts.cmd))
             end
             local ok, err = pcall(function()
               pm.install({
-                { name = "blocked", url = "https://invalid.example/plugin.git", branch = "main" },
+                { name = "blocked", url = "https://invalid.example/plugin.git", commit = "1111111111111111111111111111111111111111" },
               }, {
                 on_progress = function(name, phase)
                   events[#events + 1] = name .. ": " .. phase
@@ -1490,6 +1472,7 @@ fn install_reports_cold_phases_and_ready_only_after_lock_is_saved() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
     let lua = lua_with_pm();
@@ -1509,7 +1492,7 @@ fn install_reports_cold_phases_and_ready_only_after_lock_is_saved() {
               end,
             }}
             local specs = {{
-              {{ name = "phased", url = "{}", branch = "main", build = build }},
+              {{ name = "phased", url = "{}", commit = "{pin}", build = build }},
             }}
             pm.install(specs, opts)
             local cold = table.concat(events, "|")
@@ -1524,7 +1507,7 @@ fn install_reports_cold_phases_and_ready_only_after_lock_is_saved() {
 
     assert_eq!(
         cold,
-        "phased: Downloading package|phased: Building package|phased: Ready"
+        format!("phased: Downloading package|phased: Fetching revision {pin}|phased: Checking out {pin}|phased: Building package|phased: Ready")
     );
     assert_eq!(cached, "", "a fully cached install must not report work");
 }
@@ -1534,6 +1517,7 @@ fn install_does_not_report_ready_when_build_fails() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
     let lua = lua_with_pm();
@@ -1548,7 +1532,7 @@ fn install_does_not_report_ready_when_build_fails() {
                 {{
                   name = "broken-build",
                   url = "{}",
-                  branch = "main",
+                  commit = "{pin}",
                   build = function() error("fixture compiler failure") end,
                 }},
               }}, {{
@@ -1568,7 +1552,7 @@ fn install_does_not_report_ready_when_build_fails() {
     assert!(message.contains("fixture compiler failure"), "{message}");
     assert_eq!(
         events,
-        "broken-build: Downloading package|broken-build: Building package"
+        format!("broken-build: Downloading package|broken-build: Fetching revision {pin}|broken-build: Checking out {pin}|broken-build: Building package")
     );
 }
 
@@ -1998,6 +1982,7 @@ fn install_skips_clone_when_lockfile_matches_head() {
     let work = tempfile::tempdir().expect("workdir");
     let origin = work.path().join("origin");
     let url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
 
     let data = tempfile::tempdir().expect("datadir");
     let _g = DataDirGuard::new(data.path());
@@ -2007,7 +1992,7 @@ fn install_skips_clone_when_lockfile_matches_head() {
         r#"
         local pm = require("nefor-pm")
         pm.install({{
-          {{ name = "twice", url = "{}", branch = "main" }},
+          {{ name = "twice", url = "{}", commit = "{pin}" }},
         }})
         return true
         "#,
@@ -2042,13 +2027,15 @@ fn install_invalid_lockfile_fails_loudly() {
     let _g = DataDirGuard::new(data.path());
     let plugins = data.path().join("plugins");
     std::fs::create_dir_all(&plugins).expect("plugins dir");
-    std::fs::write(plugins.join("nefor-pm.lock.json"), "not json\n").expect("lock");
     let lua = lua_with_pm();
-    let err = lua
-        .load(r#"local pm = require("nefor-pm"); pm.install({})"#)
-        .exec()
-        .expect_err("invalid lock must fail");
-    assert!(err.to_string().contains("lockfile is invalid"), "{err}");
+    for body in ["not json\n", "", r#"{"bad":{"ref":"main","commit":"abc"}}"#] {
+        std::fs::write(plugins.join("nefor-pm.lock.json"), body).expect("lock");
+        let err = lua
+            .load(r#"local pm = require("nefor-pm"); pm.install({})"#)
+            .exec()
+            .expect_err("invalid lock must fail");
+        assert!(err.to_string().contains("lockfile"), "{err}");
+    }
 }
 
 #[test]
@@ -2066,7 +2053,7 @@ fn install_failed_clone_surfaces_structured_error() {
             r#"
             local pm = require("nefor-pm")
             pm.install({{
-              {{ name = "broken", url = "{}", branch = "main" }},
+              {{ name = "broken", url = "{}", commit = "1111111111111111111111111111111111111111" }},
             }})
             "#,
             url
@@ -2144,9 +2131,19 @@ fn lua_with_archive_pm() -> Lua {
 
 // Local release fixtures exercise the download/extract/replace boundary without a network.
 fn archive_fixture(root: &std::path::Path, name: &str) -> (String, String) {
+    archive_fixture_content(root, name, name)
+}
+
+fn archive_fixture_content(root: &std::path::Path, name: &str, body: &str) -> (String, String) {
     let package = root.join(name);
     std::fs::create_dir_all(package.join("bin")).expect("fixture bin");
-    std::fs::write(package.join("bin/tool"), name).expect("fixture executable");
+    std::fs::write(package.join("bin/tool"), body).expect("fixture executable");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        package.join("bin/tool"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("executable");
     let archive = root.join(format!("{name}.tar.gz"));
     assert!(Command::new("tar")
         .args(["-czf"])
@@ -2208,7 +2205,7 @@ fn archives_install_cache_and_upgrade_exact_pins_without_build_tools() {
     lua.load(format!(
         r#"
         pm.install({{{}}}, opts)
-        assert(nefor.fs.read_file(pm.bin("tool")).content == "first", "install reproduces the lock")
+        assert(nefor.fs.read_file(pm.bin("tool")).content == "second", "install adopts declaration")
         pm.update({{{}}}, opts)
         assert(nefor.fs.read_file(pm.bin("tool")).content == "second")
         assert(pm._internals.read_lockfile().tool.sha256 == "{}")
@@ -2219,6 +2216,59 @@ fn archives_install_cache_and_upgrade_exact_pins_without_build_tools() {
     ))
     .exec()
     .expect("upgrade explicit archive pin");
+}
+
+#[test]
+fn archive_verification_reports_actual_binary_and_rejects_cached_mismatch_offline() {
+    let work = tempfile::tempdir().expect("work");
+    let data = tempfile::tempdir().expect("data");
+    let _g = DataDirGuard::new(data.path());
+    let lua = lua_with_archive_pm();
+    let (old_url, old_sha) =
+        archive_fixture_content(work.path(), "older", "#!/bin/sh\necho da 0.2.0\n");
+    let (new_url, new_sha) =
+        archive_fixture_content(work.path(), "newer", "#!/bin/sh\necho da 0.3.0\n");
+    lua.load(format!(r##"
+      local pm = require("nefor-pm")
+      local da = require("libs.tool-validator.da")
+      local fs = nefor.fs
+      local older, newer = {}, {}
+      older.verify = function(p) return da.verify_version(p.dir .. "/bin/tool", "0.2.0") end
+      newer.verify = function(p) return da.verify_version(p.dir .. "/bin/tool", "0.3.0") end
+      local result = pm.install({{older}}).tool
+      assert(result.verification.version == "0.2.0" and result.verification.executable == pm.bin("tool"))
+      result = pm.install({{newer}}).tool
+      assert(result.verification.version == "0.3.0" and result.identity.sha256 == newer.archive.sha256)
+      result = pm.install({{older}}).tool
+      assert(result.verification.version == "0.2.0", "explicit downgrade adopts desired version")
+      local http = require("http.request")
+      local fetch = http.new_from_uri
+      http.new_from_uri = function() error("offline download denied") end
+      assert(pm.install({{older}}).tool.verification.version == "0.2.0")
+      local lock = fs.read_file(pm._internals.lockfile_path()).content
+      local binary = fs.read_file(pm.bin("tool")).content
+      local ok, err = pcall(pm.install, {{newer}})
+      assert(not ok and tostring(err):find("desired", 1, true) and tostring(err):find(newer.archive.sha256, 1, true))
+      assert(fs.read_file(pm._internals.lockfile_path()).content == lock)
+      assert(fs.read_file(pm.bin("tool")).content == binary)
+      fs.write_file(pm.bin("tool"), "#!/bin/sh\necho da 0.9.0\n")
+      assert(not pcall(pm.install, {{older}}), "marker cannot hide wrong cached binary")
+      fs.write_file(pm.bin("tool"), "#!/bin/sh\nexit 0\n")
+      assert(not pcall(pm.install, {{older}}), "empty version output is not success")
+      http.new_from_uri = fetch
+      local bad = {}
+      bad.verify = older.verify
+      assert(not pcall(pm.install, {{bad}}), "staged wrong version fails")
+      assert(fs.read_file(pm._internals.lockfile_path()).content == lock)
+      assert(fs.read_file(pm.bin("tool")).content == "#!/bin/sh\nexit 0\n")
+      fs.write_file(pm.bin("tool"), binary)
+      local refreshed = pm.update({{older}}).tool
+      assert(refreshed.verification.version == "0.2.0")
+      pm.register({{{{name="readonly", dir=refreshed.dir}}}})
+      older.name = "readonly"
+      assert(not pcall(pm.install, {{older}}), "registered roots cannot be rebound")
+    "##, archive_spec(&old_url, &old_sha), archive_spec(&new_url, &new_sha), archive_spec(&new_url, &new_sha)))
+        .exec().expect("real executable verification across archive lifecycle");
 }
 
 #[test]
@@ -2297,7 +2347,7 @@ fn archive_failures_preserve_previous_installation_and_lock() {
             local pm = require("nefor-pm")
             {inject}
             local events = {{}}
-            local ok, err = pcall(pm.update, {{{spec}}}, {{
+            local ok, err = pcall(pm.install, {{{spec}}}, {{
               on_progress = function(_, phase) events[#events + 1] = phase end,
             }})
             assert(not ok and tostring(err):find("{expected}", 1, true), tostring(err))
@@ -2353,12 +2403,13 @@ fn archives_replace_managed_git_but_refuse_unowned_directories_and_dev_links() {
     let _g = DataDirGuard::new(data.path());
     let origin = work.path().join("origin");
     let git_url = make_origin_repo(&origin);
+    let pin = git_head(&origin);
     let (url, digest) = archive_fixture(work.path(), "release");
     let lua = lua_with_archive_pm();
     lua.load(format!(
         r#"
         local pm = require("nefor-pm")
-        pm.install({{{{ name = "tool", url = "{git_url}", branch = "main" }}}})
+        pm.install({{{{ name = "tool", url = "{git_url}", commit = "{pin}" }}}})
         pm.install({{{}}})
         assert(nefor.fs.read_file(pm.bin("tool")).content == "release")
         assert(not nefor.fs.exists(pm.root("tool") .. "/.git"))

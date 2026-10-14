@@ -44,9 +44,10 @@ pm.register({
 -- External executable dependencies use nefor-pm's writable package lifecycle;
 -- the selected immutable Nefor runtime tree above remains read-only.
 local da_package = require("libs.tool-validator.da")
+local DA_VERSION = "0.3.0"
 pm.install({
   da_package.release_package {
-    version = "0.3.0",
+    version = DA_VERSION,
     checksums = {
       ["aarch64-apple-darwin"] = "04fd66aba05497c954e729b8e48c5eaf87d6319292bbf75cc3b4f7967078e053",
       ["aarch64-unknown-linux-gnu"] = "0cdac8e2a4bc7488a7c4bb37ac1e475a7adabbb6b1b49156f76b2d11751b4503",
@@ -373,6 +374,7 @@ actor.spawn(require("read-only-tools"))
 -- chat.tool.popup_request, so it must be spawned BEFORE tool-gate.
 local tool_validator = require("tool-validator").build {
   classifier = SHELL_CLASSIFIER,
+  classifier_check = function(path) return da_package.verify_version(path, DA_VERSION) end,
 }
 actor.spawn(tool_validator)
 

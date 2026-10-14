@@ -24,7 +24,7 @@ local function same(left, right)
     and left.strip_components == right.strip_components
 end
 
-function M.install(spec, root, locked, progress, run)
+function M.install(spec, root, locked, progress, run, refresh)
   local fs = nefor.fs
   local target = root .. "/" .. spec.name
   local desired = spec.archive
@@ -50,9 +50,17 @@ function M.install(spec, root, locked, progress, run)
   local exists = fs.exists(target)
   if exists and not locked then fail("archive install cannot replace an unowned directory: " .. target) end
   local marker = fs.read_file(target .. "/" .. MARKER)
-  if exists and same(locked, desired) and marker.ok then
+  local evidence
+  local function verify(dir)
+    if spec.verify then
+      local value = spec.verify({name = spec.name, dir = dir, identity = desired})
+      if value ~= nil then nefor.json.encode(value) end
+      return value
+    end
+  end
+  if not refresh and exists and same(locked, desired) and marker.ok then
     local ok, installed = pcall(nefor.json.decode, marker.content)
-    if ok and same(installed, desired) then return desired end
+    if ok and same(installed, desired) then return desired, nil, verify(target) end
   end
 
   local staging = command({ "mktemp", "-d", root .. "/." .. spec.name .. ".XXXXXX" }):gsub("%s+$", "")
@@ -87,10 +95,12 @@ function M.install(spec, root, locked, progress, run)
     if not entries or #entries == 0 then fail("archive produced no files: " .. tostring(list_error or content)) end
     local written = fs.write_file(content .. "/" .. MARKER, nefor.json.encode(desired))
     if not written.ok then fail("cannot record archive identity: " .. tostring(written.error)) end
+    evidence = verify(content)
     if exists then rename(target, previous) end
     phase = "backed-up"
     rename(content, target)
     phase = "installed"
+    evidence = verify(target)
   end)
   if not ok then
     local restored, restore_error = pcall(rollback)
@@ -107,7 +117,7 @@ function M.install(spec, root, locked, progress, run)
         io.stderr:flush()
       end
     end,
-  }
+  }, evidence
 end
 
 return M

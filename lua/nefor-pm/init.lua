@@ -1,44 +1,11 @@
 -- nefor-pm — pure-Lua plugin manager.
 --
--- Public API:
---   pm.install(specs, opts)  reproduce the exact source/archive pins in the lockfile;
---                            resolve and pin refs only when no lock exists.
---   pm.update(specs, opts)   explicitly resolve refs again and move their pins.
---                            Both operations are synchronous, so init.lua can
---                            rely on plugins being present when they return.
---                            opts.on_progress(name, message) is optional.
---   pm.stderr_progress(name, message) flush one phase notification to stderr.
---   pm.register(specs)       register immutable, already-materialized dirs
---                            without writing links, locks, or checkout state.
---   pm.load(name)            plain `require(name)`. Resolution is Lua's job —
---                            install/register has already added a search path.
---   pm.root(name)            resolve any registered or managed package root.
---   pm.bin(name[, binname])  resolve <plugin_dir>/bin/<binname> (default: name).
---   pm.require(name)         alias of pm.load — never triggers install.
---   pm.sync_checkout(opts)   ensure a managed git checkout is present at a ref;
---                            optional `lockfile` makes its commit authoritative.
---   pm.update_checkout(opts) explicitly move that managed-checkout pin.
---   pm.engine_ref()          returns (ref, ref_kind) derived from nefor.version:
---                            exact semver → ("vX.Y.Z", "tag"); otherwise ("main", "branch").
---
--- Git/development spec shape (archive specs are documented in README.md):
---   {
---     "owner/repo",                     -- [1] shorthand → https://github.com/owner/repo
---     name   = "string",                -- required, non-empty.
---     tag    = "v0.1.5",                -- optional. default: engine version tag (or "main" for dev).
---     branch = "main",                  -- optional. mutually exclusive with tag/commit.
---     commit = "<sha>",                 -- optional. mutually exclusive with tag/branch.
---     url    = "...",                   -- optional. mutually exclusive with [1].
---     path   = "subtree/",              -- optional. sparse-checkout this dir only.
---     dir    = "/local/path",           -- optional. dev override — skip clone.
---                                          Install creates a symlink
---                                          <plugins_root>/<name> -> dir so
---                                          require("<name>") resolves through
---                                          the canonical <plugins_root>/?/init.lua
---                                          graft. basename(dir) does not need
---                                          to match name.
---     build  = function(plugin) ... end -- optional. runs after clone.
---   }
+-- install reconciles the caller's exact immutable identity; update refreshes
+-- that same identity. Locks record installed state, never choose a revision.
+-- Both return per-name {dir, identity, verification}. Optional spec.verify
+-- receives {dir, name, identity} on staged and cached packages.
+-- Managed Git requires url (or shorthand) and a full commit; archive requires
+-- URL/SHA-256/layout. Local dir overrides and read-only register are explicit.
 
 local M = {}
 local archive = require("nefor-pm.archive")
@@ -182,8 +149,7 @@ end
 
 -- Returns a normalized spec table:
 --   { name, url?, tag?, branch?, commit?, path?, dir?, build?, ref, ref_kind }
--- ref/ref_kind = the resolved ref to check out.
--- Defaults to the engine's version tag for exact releases, "main" branch otherwise.
+-- Managed operations require a full commit selected by the caller.
 local function parse_spec(spec, index)
   if not is_table(spec) then
     error(string.format("nefor-pm: spec #%d must be a table, got %s",
@@ -194,7 +160,14 @@ local function parse_spec(spec, index)
       "nefor-pm: spec #%d missing required `name` field (must be a non-empty string)",
       index), 0)
   end
+  local copy = {}
+  for k, v in pairs(spec) do copy[k] = v end
+  spec = copy
   local label = spec.name
+  if label == "." or label == ".." or label:find("/", 1, true) then
+    fail(label, "package name must be a single directory name")
+  end
+  if spec.verify ~= nil and not is_function(spec.verify) then fail(label, "`verify` must be a function") end
   if spec.archive ~= nil then
     for _, key in ipairs({ 1, "url", "tag", "branch", "commit", "path", "dir", "build" }) do
       if spec[key] ~= nil then fail(label, "`archive` cannot be combined with `" .. tostring(key) .. "`") end
@@ -204,7 +177,7 @@ local function parse_spec(spec, index)
     end
     local ok, normalized = pcall(archive.normalize, spec.archive)
     if not ok then fail(label, normalized) end
-    return { name = label, archive = normalized }
+    return { name = label, archive = normalized, verify = spec.verify }
   end
 
   local shorthand = spec[1]
@@ -219,15 +192,15 @@ local function parse_spec(spec, index)
     url = "https://github.com/" .. shorthand .. ".git"
   end
 
-  local ref, ref_kind
-  local ref_count = 0
-  if is_string(spec.tag)    then ref = spec.tag;    ref_kind = "tag";    ref_count = ref_count + 1 end
-  if is_string(spec.branch) then ref = spec.branch; ref_kind = "branch"; ref_count = ref_count + 1 end
-  if is_string(spec.commit) then ref = spec.commit; ref_kind = "commit"; ref_count = ref_count + 1 end
-  if ref_count > 1 then
-    fail(label, "at most one of `tag`, `branch`, `commit` may be set")
+  if not spec.dir then
+    if spec.tag ~= nil or spec.branch ~= nil then
+      fail(label, "managed Git requires an exact full `commit`, not tag or branch")
+    end
+    if not is_string(spec.commit) or #spec.commit ~= 40 or spec.commit:find("[^%x]") then
+      fail(label, "managed Git requires an exact full 40-hex `commit`")
+    end
   end
-  if ref_count == 0 then ref, ref_kind = engine_ref() end
+  local ref, ref_kind = spec.commit and spec.commit:lower(), "commit"
 
   if spec.build ~= nil and not is_function(spec.build) then
     fail(label, "`build` must be a function, got " .. type(spec.build))
@@ -266,6 +239,7 @@ local function parse_spec(spec, index)
     path     = spec.path,
     dir      = spec.dir,
     build    = spec.build,
+    verify   = spec.verify,
     ref      = ref,
     ref_kind = ref_kind,
   }
@@ -274,9 +248,12 @@ end
 local function read_lockfile()
   local fs = require_fs()
   local res = fs.read_file(lockfile_path())
-  if not res.ok then return {} end
+  if not res.ok then
+    if fs.exists(lockfile_path()) then error("nefor-pm: cannot read lockfile: " .. tostring(res.error), 0) end
+    return {}
+  end
   local body = res.content or ""
-  if body == "" then return {} end
+  if body == "" then error("nefor-pm: lockfile is invalid: " .. lockfile_path(), 0) end
   local ok, decoded = pcall(nefor.json.decode, body)
   if not ok or type(decoded) ~= "table" then
     error("nefor-pm: lockfile is invalid: " .. lockfile_path(), 0)
@@ -287,6 +264,12 @@ local function read_lockfile()
       valid = pcall(archive.normalize, entry)
     else
       valid = valid and entry.kind == nil and is_string(entry.ref) and is_string(entry.commit)
+        and #entry.commit == 40 and not entry.commit:find("[^%x]")
+      if valid and entry.identity ~= nil then
+        local identity = entry.identity
+        valid = type(identity) == "table" and identity.kind == "git" and is_string(identity.url)
+          and identity.commit == entry.commit and (identity.path == nil or is_string(identity.path))
+      end
     end
     if not valid then
       error("nefor-pm: lockfile has an invalid entry: " .. tostring(name), 0)
@@ -326,12 +309,8 @@ local function write_lockfile(lock)
   end
 end
 
--- We hash a stable JSON serialization of the spec's *configuration* fields
--- (everything except `dir`, `url`, and the `build` function itself). Changing
--- tag / branch / commit / path / name triggers a rebuild; moving the clone
--- url or pointing at a local dir does not. Lua functions have no portable
--- hash; documented limitation — bumping `tag` forces a rebuild.
-
+-- Lua callback bodies have no portable identity. Explicit update refreshes
+-- builds when only callback code changes; metadata is a cache predicate.
 local function stable_encode(t)
   if type(t) ~= "table" then return nefor.json.encode(t) end
   local keys = {}
@@ -368,13 +347,6 @@ end
 
 local function git(label, args, opts)
   return run_or_die(label, { "git", table.unpack(args) }, opts)
-end
-
-local function git_fetch_ref(spec)
-  if spec.ref_kind == "tag" then
-    return { "tag", spec.ref }
-  end
-  return { spec.ref }
 end
 
 local function current_commit(dir)
@@ -442,25 +414,6 @@ local function clone(label, spec, target_dir, progress)
   end
 end
 
-local function update_to_ref(label, spec, target_dir, progress)
-  progress = progress or function() end
-  local fetch_args = { "-C", target_dir, "fetch", "--depth", "1", "origin" }
-  for _, arg in ipairs(git_fetch_ref(spec)) do
-    fetch_args[#fetch_args + 1] = arg
-  end
-  progress("Fetching revision " .. spec.ref)
-  git(label, fetch_args)
-  progress("Checking out " .. spec.ref)
-  if spec.ref_kind == "commit" then
-    git(label, { "-C", target_dir, "checkout", spec.ref })
-  else
-    git(label, { "-C", target_dir, "checkout", "--force", "FETCH_HEAD" })
-  end
-  if spec.path then
-    git(label, { "-C", target_dir, "sparse-checkout", "set", spec.path })
-  end
-end
-
 local function normalize_sparse_paths(paths)
   if paths == nil then return nil end
   if is_string(paths) then return { paths } end
@@ -477,101 +430,6 @@ local function normalize_sparse_paths(paths)
     out[#out + 1] = path
   end
   return out
-end
-
-local function sync_checkout(opts, update)
-  if not is_table(opts) then
-    error("nefor-pm.sync_checkout: opts must be a table", 0)
-  end
-  local label = opts.name or opts.dir or "checkout"
-  if not is_string(opts.dir) then
-    fail(label, "`dir` must be a non-empty string")
-  end
-  if not is_string(opts.url) then
-    fail(label, "`url` must be a non-empty string")
-  end
-  local ref = opts.ref
-  local ref_kind = opts.ref_kind
-  if not is_string(ref) then
-    ref, ref_kind = engine_ref()
-  elseif ref_kind == nil then
-    ref_kind = ref:match("^v%d+%.%d+%.%d+$") and "tag" or "branch"
-  end
-  if ref_kind ~= "branch" and ref_kind ~= "tag" and ref_kind ~= "commit" then
-    fail(label, "`ref_kind` must be branch, tag, or commit")
-  end
-
-  local spec = {
-    url      = opts.url,
-    ref      = ref,
-    ref_kind = ref_kind,
-  }
-  local pin_path = opts.lockfile
-  local pin
-  if is_string(pin_path) then
-    local lock_read = require_fs().read_file(pin_path)
-    if lock_read.ok and is_string(lock_read.content) then
-      pin = lock_read.content:match("^%s*(%x+)%s*$")
-      if not pin then fail(label, "checkout lock is invalid: " .. pin_path) end
-    end
-  end
-  if pin and not update then
-    spec.ref = pin
-    spec.ref_kind = "commit"
-  end
-  local sparse_paths = normalize_sparse_paths(opts.sparse)
-  local fs = require_fs()
-  local parent_mk = fs.mkdir_p(parent_dir(opts.dir))
-  if not parent_mk.ok then
-    fail(label, "cannot create checkout parent: " .. tostring(parent_mk.error))
-  end
-
-  local head_now = is_cloned(opts.dir) and current_commit(opts.dir) or nil
-  local local_target = is_cloned(opts.dir) and resolved_commit(opts.dir, spec.ref) or nil
-  if head_now and local_target and head_now == local_target then
-    -- A locally available exact revision is complete without contacting origin.
-  elseif not is_cloned(opts.dir) then
-    local args = { "clone", "--depth", "1" }
-    if sparse_paths then
-      args[#args + 1] = "--filter=blob:none"
-      args[#args + 1] = "--sparse"
-    end
-    if spec.ref_kind == "branch" or spec.ref_kind == "tag" then
-      args[#args + 1] = "--branch"
-      args[#args + 1] = spec.ref
-    end
-    args[#args + 1] = spec.url
-    args[#args + 1] = opts.dir
-    git(label, args)
-    if spec.ref_kind == "commit" then
-      update_to_ref(label, spec, opts.dir)
-    end
-  else
-    update_to_ref(label, spec, opts.dir)
-  end
-
-  local commit = verify_checkout(label, opts.dir, spec.ref)
-
-  if is_string(pin_path) and (not pin or update) then
-    local write = require_fs().write_file(pin_path, commit .. "\n")
-    if not write.ok then fail(label, "cannot write checkout lock: " .. tostring(write.error)) end
-  end
-
-  if sparse_paths then
-    local sparse_args = { "-C", opts.dir, "sparse-checkout", "set" }
-    for _, path in ipairs(sparse_paths) do
-      sparse_args[#sparse_args + 1] = path
-    end
-    git(label, sparse_args)
-  end
-
-  return {
-    dir      = opts.dir,
-    ref      = ref,
-    ref_kind = ref_kind,
-    commit   = commit,
-    head     = commit,
-  }
 end
 
 -- Trim leading and trailing slashes. "/a/b/" -> "a/b", "a" -> "a", "" -> "".
@@ -595,7 +453,7 @@ local function flatten_subtree(label, target_dir, spec_path)
   local subtree_dir = pjoin(target_dir, rel)
 
   local fs = require_fs()
-  if not fs.exists(subtree_dir) then return end
+  if not fs.exists(subtree_dir) then fail(label, "requested subtree is absent: " .. spec_path) end
 
   -- Stage the subtree to a sibling of target_dir so the move is a single
   -- rename within the same filesystem. Pre-clean any stale staging dir
@@ -624,134 +482,177 @@ local function flatten_subtree(label, target_dir, spec_path)
   run_or_die(label, { "rmdir", staging })
 end
 
-local function pinned_spec(spec, entry)
-  if not (entry and is_string(entry.commit)) then return spec end
-  local pinned = {}
-  for k, v in pairs(spec) do pinned[k] = v end
-  pinned.ref = entry.commit
-  pinned.ref_kind = "commit"
-  return pinned
+local function verify_package(spec, dir, identity)
+  if not spec.verify then return nil end
+  local evidence = spec.verify({name = spec.name, dir = dir, identity = identity})
+  if evidence ~= nil then nefor.json.encode(evidence) end
+  return evidence
 end
 
-local function install_spec(spec, lock, update, progress)
-  local label = spec.name
+local function stage_git(label, spec, target, exists, prepare)
   local fs = require_fs()
+  local staging = run_or_die(label, {"mktemp", "-d", parent_dir(target) .. "/." .. label .. ".XXXXXX"}).stdout:gsub("%s+$", "")
+  local content, previous = staging .. "/content", staging .. "/previous"
+  local phase = "staging"
+  local function rename(from, to)
+    local ok, err = os.rename(from, to)
+    if not ok then fail(label, "cannot move " .. from .. " to " .. to .. ": " .. tostring(err)) end
+  end
+  local function remove(dir)
+    local result = fs.remove_dir_all(dir)
+    if not result.ok then fail(label, "cannot remove " .. dir .. ": " .. tostring(result.error)) end
+  end
+  local function rollback()
+    if phase == "installed" then remove(target) end
+    if exists and (phase == "installed" or phase == "backed-up") then rename(previous, target) end
+    remove(staging)
+  end
+  local ok, result = pcall(function()
+    clone(label, spec, content, spec.progress or function() end)
+    verify_checkout(label, content, spec.ref)
+    local evidence = prepare(content)
+    if exists then rename(target, previous) end
+    phase = "backed-up"
+    rename(content, target)
+    phase = "installed"
+    return evidence
+  end)
+  if not ok then
+    local restored, err = pcall(rollback)
+    if not restored then result = tostring(result) .. "\nRollback failed: " .. tostring(err) end
+    error(result, 0)
+  end
+  return result, {rollback = rollback, commit = function()
+    local removed = fs.remove_dir_all(staging)
+    if not removed.ok then io.stderr:write("nefor-pm[" .. label .. "]: cannot remove staging: " .. tostring(removed.error) .. "\n") end
+  end}
+end
 
+local function sync_checkout(opts, refresh)
+  if not is_table(opts) then error("nefor-pm.sync_checkout: opts must be a table", 0) end
+  local label = opts.name or "checkout"
+  if not is_string(opts.dir) or not is_string(opts.url) then fail(label, "requires dir and url") end
+  if opts.ref_kind ~= "commit" or not is_string(opts.ref) or #opts.ref ~= 40 or opts.ref:find("[^%x]") then
+    fail(label, "requires ref_kind = commit and an exact full 40-hex ref")
+  end
+  local fs = require_fs()
+  local sparse = normalize_sparse_paths(opts.sparse)
+  local identity = {kind = "git", url = opts.url, commit = opts.ref:lower(), sparse = sparse}
+  local marker = opts.dir .. "/.nefor-pm-checkout.json"
+  local recorded = fs.read_file(marker)
+  local same = false
+  if recorded.ok then
+    local ok, value = pcall(nefor.json.decode, recorded.content)
+    same = ok and stable_encode(value) == stable_encode(identity)
+  end
+  local pin
+  if opts.lockfile and fs.exists(opts.lockfile) then
+    local read = fs.read_file(opts.lockfile)
+    if not read.ok then fail(label, "cannot read checkout lock: " .. tostring(read.error)) end
+    pin = read.content:match("^%s*(%x+)%s*$")
+    if not pin or #pin ~= 40 then fail(label, "checkout lock is invalid: " .. opts.lockfile) end
+  end
+  if fs.is_symlink(opts.dir) then fail(label, "cannot replace development symlink") end
+  local exists = fs.exists(opts.dir)
+  if exists and (not is_cloned(opts.dir) or (not recorded.ok and not pin)) then fail(label, "cannot replace unowned checkout") end
+  local made = fs.mkdir_p(parent_dir(opts.dir))
+  if not made.ok then fail(label, made.error) end
+  local transaction
+  if refresh or not same or current_commit(opts.dir) ~= identity.commit then
+    local spec = {url = opts.url, ref = identity.commit, ref_kind = "commit"}
+    local _, tx = stage_git(label, spec, opts.dir, exists, function(content)
+      if sparse then
+        git(label, {"-C", content, "sparse-checkout", "init", "--cone"})
+        git(label, {"-C", content, "sparse-checkout", "set", table.unpack(sparse)})
+      end
+      local written = fs.write_file(content .. "/.nefor-pm-checkout.json", nefor.json.encode(identity))
+      if not written.ok then fail(label, written.error) end
+    end)
+    transaction = tx
+  end
+  local ok, err = pcall(function()
+    if opts.lockfile then
+      local temp = opts.lockfile .. ".tmp"
+      local written = fs.write_file(temp, identity.commit .. "\n")
+      if not written.ok then fail(label, "cannot write checkout lock: " .. tostring(written.error)) end
+      local renamed, why = os.rename(temp, opts.lockfile)
+      if not renamed then fs.remove(temp); fail(label, "cannot replace checkout lock: " .. tostring(why)) end
+    end
+  end)
+  if not ok then
+    if transaction then transaction.rollback() end
+    error(err, 0)
+  end
+  if transaction then transaction.commit() end
+  return {dir = opts.dir, ref = identity.commit, ref_kind = "commit", commit = identity.commit, head = identity.commit, identity = identity}
+end
+
+local function install_spec(spec, lock, refresh, progress)
+  local label, fs = spec.name, require_fs()
+  if plugins[label] and plugins[label].source == "registered" then fail(label, "cannot rebind a registered package") end
   if spec.dir then
-    -- Dev override: place a symlink at <plugins_root>/<name> -> spec.dir so
-    -- the canonical <plugins_root>/?/init.lua graft used by the clone path
-    -- also resolves dir-overrides. Decouples basename(dir) from name.
-    local root_mk = fs.mkdir_p(plugins_root())
-    if not root_mk.ok then
-      fail(label, "cannot create plugins root: " .. tostring(root_mk.error))
-    end
+    local made = fs.mkdir_p(plugins_root())
+    if not made.ok then fail(label, made.error) end
     ensure_on_path(plugins_root())
-    local link_path = pjoin(plugins_root(), spec.name)
-    local existing_target
-    if fs.is_symlink(link_path) then
-      existing_target = fs.read_link(link_path)
-    end
-    if existing_target ~= spec.dir then
-      if existing_target ~= nil then
-        local rm = fs.remove(link_path)
-        if not rm.ok then
-          fail(label, "cannot remove stale symlink at " .. link_path .. ": " .. tostring(rm.error))
-        end
-      elseif fs.exists(link_path) then
-        -- Non-symlink entry occupying the slot (e.g. leftover real clone from
-        -- a previous non-dir install). Refuse rather than silently nuking
-        -- whatever lives there.
-        fail(label, string.format(
-          "cannot create dev-override symlink at %s: a non-symlink entry already exists; remove it manually",
-          link_path))
-      end
-      local sl = fs.symlink(spec.dir, link_path)
-      if not sl.ok then
-        fail(label, "symlink failed: " .. tostring(sl.error))
+    local link = pjoin(plugins_root(), label)
+    local old = fs.is_symlink(link) and fs.read_link(link) or nil
+    if fs.exists(link) and not old then fail(label, "cannot create dev-override symlink: a non-symlink entry already exists") end
+    local identity = {kind = "dir", dir = spec.dir}
+    local evidence = verify_package(spec, spec.dir, identity)
+    local changed = old ~= spec.dir
+    if changed then
+      if old then fs.remove(link) end
+      local result = fs.symlink(spec.dir, link)
+      if not result.ok then
+        if old then fs.symlink(old, link) end
+        fail(label, "symlink failed: " .. tostring(result.error))
       end
     end
-    plugins[spec.name] = { dir = spec.dir, source = "dir" }
-    return lock[spec.name]
+    plugins[label] = {dir = spec.dir, source = "dir"}
+    return lock[label], changed and {rollback = function()
+      fs.remove(link)
+      if old then fs.symlink(old, link) end
+    end, commit = function() end} or nil, {dir = spec.dir, identity = identity, verification = evidence}
   end
-
-  local target_dir = pjoin(plugins_root(), spec.name)
-  local root_mk = fs.mkdir_p(plugins_root())
-  if not root_mk.ok then
-    fail(label, "cannot create plugins root: " .. tostring(root_mk.error))
-  end
-  -- Cloned plugins live as siblings under plugins_root(); add the parent
-  -- once so subsequent require() calls resolve through Lua's own search.
+  local target = pjoin(plugins_root(), label)
+  local made = fs.mkdir_p(plugins_root())
+  if not made.ok then fail(label, made.error) end
   ensure_on_path(plugins_root())
-
-  local entry = lock[spec.name]
+  local entry = lock[label]
   if spec.archive then
-    local desired = spec
-    if not update and entry and entry.kind == "archive" then
-      desired = { name = spec.name, archive = archive.normalize(entry) }
-    end
-    local installed, transaction = archive.install(desired, plugins_root(), entry, progress, run_cmd)
-    plugins[spec.name] = { dir = target_dir, source = "data" }
-    return installed, transaction
+    local installed, transaction, evidence = archive.install(spec, plugins_root(), entry, progress, run_cmd, refresh)
+    plugins[label] = {dir = target, source = "data"}
+    return installed, transaction, {dir = target, identity = spec.archive, verification = evidence}
   end
-  if entry and entry.kind == "archive" and fs.exists(target_dir) then
-    fail(label, "remove the managed archive before switching this package back to Git source")
+  if fs.is_symlink(target) then fail(label, "Git install cannot replace a development symlink") end
+  local exists = fs.exists(target)
+  if exists and not entry then fail(label, "Git install cannot replace an unowned directory: " .. target) end
+  local identity = {kind = "git", url = spec.url, commit = spec.ref, path = spec.path}
+  local installed = {ref = spec.ref, commit = spec.ref, identity = identity, build_hash = compute_build_hash(spec)}
+  local evidence, transaction
+  if not refresh and entry and stable_encode(entry.identity) == stable_encode(identity)
+      and entry.build_hash == installed.build_hash and current_commit(target) == spec.ref then
+    evidence = verify_package(spec, target, identity)
+  else
+    spec.progress = progress
+    evidence, transaction = stage_git(label, spec, target, exists, function(content)
+      if spec.path then flatten_subtree(label, content, spec.path) end
+      if spec.build then
+        progress("Building package")
+        local bin = fs.mkdir_p(pjoin(content, "bin"))
+        if not bin.ok then fail(label, bin.error) end
+        spec.build({dir = content, name = label, tag = spec.ref, ref = spec.ref, url = spec.url, repo = spec.url, identity = identity, progress = progress})
+      end
+      return verify_package(spec, content, identity)
+    end)
   end
-  local desired = update and spec or pinned_spec(spec, entry)
-  local build_hash = compute_build_hash(spec)
-
-  -- The lock commit is authoritative for ordinary installs. Validate HEAD
-  -- before touching the network; an exact local pin is a complete success.
-  local fresh_clone = false
-  local head_now = is_cloned(target_dir) and current_commit(target_dir) or nil
-  if head_now ~= desired.ref then
-    if not is_cloned(target_dir) then
-      clone(label, desired, target_dir, progress)
-      fresh_clone = true
-    else
-      update_to_ref(label, desired, target_dir, progress)
-    end
-    if spec.path then
-      flatten_subtree(label, target_dir, spec.path)
-    end
+  if transaction then
+    local ok, value = pcall(verify_package, spec, target, identity)
+    if not ok then transaction.rollback(); error(value, 0) end
+    evidence = value
   end
-
-  local installed_commit = current_commit(target_dir)
-  local need_build = spec.build ~= nil and (
-    fresh_clone
-    or not entry
-    or entry.commit ~= installed_commit
-    or entry.build_hash ~= build_hash
-  )
-
-  if need_build then
-    progress("Building package")
-    -- Build is responsible for placing artefacts at target_dir/bin/<name>.
-    local bin_mk = fs.mkdir_p(pjoin(target_dir, "bin"))
-    if not bin_mk.ok then
-      fail(label, "cannot create bin dir: " .. tostring(bin_mk.error))
-    end
-    local plugin_record = {
-      dir  = target_dir,
-      name = spec.name,
-      tag  = spec.ref,
-      ref  = spec.ref,
-      url  = spec.url,
-      repo = spec.url,
-      progress = progress,
-    }
-    local ok, err = pcall(spec.build, plugin_record)
-    if not ok then
-      fail(label, "build function raised: " .. tostring(err))
-    end
-  end
-
-  plugins[spec.name] = { dir = target_dir, source = "data" }
-
-  return {
-    ref        = spec.ref,
-    commit     = installed_commit,
-    build_hash = build_hash,
-  }
+  plugins[label] = {dir = target, source = "data"}
+  return installed, transaction, {dir = target, identity = identity, verification = evidence}
 end
 
 local function apply_specs(specs, update, opts)
@@ -760,7 +661,7 @@ local function apply_specs(specs, update, opts)
     error("nefor-pm: options.on_progress must be a function", 0)
   end
   local on_progress = opts.on_progress
-  local completed = {}
+  local completed, results = {}, {}
   if not is_table(specs) then
     error("nefor-pm: specs must be a list of tables", 0)
   end
@@ -783,7 +684,12 @@ local function apply_specs(specs, update, opts)
           reported = true
         end
       end
-      local entry, transaction = install_spec(spec, new_lock, update, progress)
+      local success, entry, transaction, result = pcall(install_spec, spec, new_lock, update, progress)
+      if not success then
+        local desired = spec.archive or {kind = spec.dir and "dir" or "git", url = spec.url, commit = spec.ref, path = spec.path, dir = spec.dir}
+        fail(spec.name, "cannot reconcile desired " .. stable_encode(desired) .. "; recorded " .. stable_encode(new_lock[spec.name]) .. "\n" .. tostring(entry))
+      end
+      results[spec.name] = result
       if transaction then transactions[#transactions + 1] = transaction end
       if reported then completed[#completed + 1] = spec.name end
       if entry ~= nil then new_lock[spec.name] = entry end
@@ -795,11 +701,13 @@ local function apply_specs(specs, update, opts)
       local restored, restore_error = pcall(transactions[i].rollback)
       if not restored then err = tostring(err) .. "\nRollback failed: " .. tostring(restore_error) end
     end
-    plugins = previous_plugins
+    for name in pairs(plugins) do plugins[name] = nil end
+    for name, entry in pairs(previous_plugins) do plugins[name] = entry end
     error(err, 0)
   end
   for _, transaction in ipairs(transactions) do transaction.commit() end
   for _, name in ipairs(completed) do on_progress(name, "Ready") end
+  return results
 end
 
 function M.stderr_progress(name, message)
@@ -808,11 +716,11 @@ function M.stderr_progress(name, message)
 end
 
 function M.install(specs, opts)
-  apply_specs(specs, false, opts)
+  return apply_specs(specs, false, opts)
 end
 
 function M.update(specs, opts)
-  apply_specs(specs, true, opts)
+  return apply_specs(specs, true, opts)
 end
 
 function M.register(specs)
@@ -925,7 +833,6 @@ M._internals = {
   write_lockfile  = write_lockfile,
   compute_build_hash = compute_build_hash,
   sync_checkout   = sync_checkout,
-  git_fetch_ref   = git_fetch_ref,
   djb2            = djb2,
   stable_encode   = stable_encode,
   plugins         = plugins,

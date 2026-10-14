@@ -27,9 +27,7 @@ pm.install {
   {
     "owner/repository",
     name = "my-plugin",
-    tag = "v0.4.0",              -- choose only one of tag/branch/commit
-    -- branch = "main",
-    -- commit = "full-or-resolvable-sha",
+    commit = "<author-chosen full 40-hex commit>",
     -- url = "/alternate/git/source",
     path = "plugins/my-plugin/lua/my-plugin/",
     build = function(plugin)
@@ -43,9 +41,9 @@ local lib = pm.load("my-plugin")
 local executable = pm.bin("my-plugin", "my-plugin")
 ```
 
-`path` uses sparse checkout and flattens the selected subtree into the managed package directory. Build callbacks must populate the package's `bin` directory. They rerun when checkout/pin/spec build metadata requires it; changing only the Lua function body is not detected by the current hash, so explicitly update/rebuild after such a change.
+`path` uses sparse checkout and flattens the selected subtree into the managed package directory. Build callbacks must populate the package's `bin` directory. They run in a staging checkout before replacement. Changing only a Lua callback body is not detectable from the declaration; use `update` to explicitly rebuild the same identity.
 
-The plugin lock lives at `<data-root>/plugins/nefor-pm.lock.json`. `install` reproduces an existing exact pin and does not move it. `update` resolves again and moves the selected pins. Partial operations preserve unrelated lock entries.
+The plugin lock lives at `<data-root>/plugins/nefor-pm.lock.json`. The declaration, not the lock, chooses the desired immutable identity. `install` reconciles changed declarations, including explicit downgrades. `update` rematerializes and rebuilds the SAME declared identity; it never discovers or selects another version. Partial operations preserve unrelated lock entries.
 
 ### Prebuilt archives
 
@@ -71,18 +69,15 @@ Installation uses the external `lua-http` library through ordinary Lua `require`
 plus `tar` and either `shasum` or `sha256sum`; no compiler, `curl`, or source
 checkout is used during archive installation. The composition supplies the URL and SHA-256.
 
-`install` reproduces the recorded archive identity; `update` adopts a changed
-URL/checksum/layout. A cached package with the matching lock and installation
-marker does not download or extract again. Download, checksum, extraction, or
+`install` adopts the declared URL/checksum/layout even when a different identity is recorded in the lock; `update` explicitly refreshes that declared identity. A cached package with the matching lock and installation
+marker does not download or extract again. Download, checksum, extraction, verification, build, or
 lock-write failures preserve the previous package and lock. After successful
 lock persistence, a cleanup failure reports the leftover staging path without
 undoing or misreporting the installed package. These guarantees cover reported
 operation failures, not process termination or simultaneous writers.
 
 Archives can replace an existing managed Git package with a lock entry.
-Unowned directories and development symlinks are never replaced. To deliberately
-switch an archive back to a Git checkout, remove its managed package directory
-first. Packages remain under `<data-root>/plugins/<name>`.
+Unowned directories and development symlinks are never replaced. Git and archive installs both stage the new package before replacing an owned directory, including when switching between these source kinds. Packages remain under `<data-root>/plugins/<name>`.
 
 The shell classifier helper `libs.tool-validator.da.release_package` produces
 this spec from a composition-owned `version` and a `checksums` table keyed by
@@ -90,6 +85,37 @@ release target. It supports Apple Silicon macOS and GNU Linux on x86_64/ARM64,
 and fails explicitly on unsupported platforms or missing checksums. The
 separate `da.package { commit = ... }` helper remains an explicit source-build
 choice requiring Rust and Git LFS.
+
+### Verification and results
+
+`install` and `update` return a table keyed by package name. Each value is
+`{ dir, identity, verification }`: the final directory, declared normalized
+identity, and optional current verifier evidence. Git identity is
+`{ kind = "git", url, commit, path? }`; archive identity is the normalized
+archive record; development identity is `{ kind = "dir", dir }`.
+
+An optional `verify = function(package) ... end` receives
+`{ name, dir, identity }`. It must raise on mismatch and may return JSON-serializable
+evidence. It runs on staged packages before replacement, again at the final
+path, and on matching cached packages before success. Verifiers must be read-only;
+they do not select versions or install dependencies. Locks and markers establish
+cache identity, not executable correctness; a configured verifier still runs
+offline and rejects a replaced, absent, or wrong-version binary.
+
+`da.release_package` attaches a verifier for its caller-owned version.
+`da.verify_version(path, expected)` requires successful `--version` output exactly
+`da X.Y.Z` (apart from surrounding whitespace) and returns
+`{ version, executable }`. `da.package` can opt into that contract with an
+explicit `version`; a source commit alone does not imply a release version.
+The validator's optional `classifier_check(path)` can reuse this helper at its
+first-use cached probe, before classification, without downloading anything.
+
+Immutable `register` roots remain read-only and cannot be rebound by an install.
+Managed operations refuse unowned directories or development symlinks. Existing
+Git lock records without repository/subtree identity trigger one staged
+reconciliation rather than silently inferring identity from the path. A matching
+prepared identity needs no fetch; a changed identity unavailable offline fails
+with desired and recorded identities, preserving the old package and lock.
 
 ### Startup progress
 
@@ -115,7 +141,7 @@ Already prepared packages emit no messages during `install`. Without an
 
 ### Source modes
 
-- **Managed Git:** repository/ref fields create a manager-owned checkout and lock entry.
+- **Managed Git:** repository/full-commit fields create a manager-owned checkout and lock entry.
 - **Managed archive:** an `archive` record selects a checksum-verified tar.gz package with an exact lock.
 - **Development override:** `dir = "/absolute/local/path"` creates a symlink to mutable source, performs no clone, and writes no lock entry. It refuses to replace a non-symlink.
 - **Immutable registration:** `pm.register { { name = "x", dir = "/absolute/materialized/x" } }` changes only the current Lua resolver. It creates no checkout, symlink, or lock and refuses to rebind a name to another directory.
@@ -130,7 +156,7 @@ replaying its install spec.
 
 ## Version-derived refs
 
-`pm.engine_ref()` maps an exact engine semantic version to `v<version>`. Development, nightly, dirty, and described builds map to `main`. An external distribution can override this policy by supplying an explicit ref/pin and owning compatibility.
+`pm.engine_ref()` maps an exact engine semantic version to `v<version>`. Development, nightly, dirty, and described builds map to `main`. This is an informational helper only. Managed installs and checkouts never use it as a default: missing full commits fail before fetching. Tags and branches must be resolved by the author to an immutable commit before declaring a managed package.
 
 ## Managed source checkouts
 
@@ -141,8 +167,8 @@ local checkout = pm.sync_checkout {
   name = "nefor-runtime",
   dir = data_root .. "/runtime/nefor",
   url = "https://github.com/amenocturne/nefor.git",
-  ref = pm.engine_ref().ref,
-  ref_kind = pm.engine_ref().ref_kind,
+  ref = "<author-chosen full 40-hex commit>",
+  ref_kind = "commit",
   lockfile = data_root .. "/runtime/nefor.commit",
   sparse = { "lua", "examples/nefor-agent" },
 }
@@ -155,12 +181,12 @@ Options:
 - `name`: diagnostic label;
 - `dir`: checkout destination;
 - `url`: Git URL or local repository path;
-- `ref`: branch, tag, or commit (defaults from `engine_ref`);
-- `ref_kind`: `branch`, `tag`, or `commit`;
+- `ref`: required full 40-hex commit;
+- `ref_kind`: required `"commit"`;
 - `lockfile`: one-commit text lock;
 - `sparse`: one path or an array of paths.
 
-With a lockfile, `sync_checkout` treats the pinned commit as authoritative and verifies the checkout. `update_checkout` is the operation that resolves the ref again and moves the lock. The returned record includes the requested ref/ref kind and verified `commit`/`head`. Local Git sources and unpublished local commits are supported.
+`sync_checkout` adopts the declared repository/commit/sparse identity, regardless of the recorded lock. `update_checkout` refreshes that same declaration. The checkout is staged and verified before replacement, and a reported lock-write failure restores the previous checkout. The returned record includes the requested ref/ref kind and verified `commit`/`head`. Local Git sources and unpublished local commits are supported.
 
 ## Runtime bootstrap
 
@@ -168,7 +194,7 @@ The installable agent example demonstrates a complete bootstrap in [`examples/ne
 
 ## Failure and trust model
 
-Package refs and locks select code that runs inside the engine's Lua process and may build executables. Pin trusted sources. A build callback is arbitrary config code, not a sandbox. Network/Git/build failures are synchronous startup failures rather than silently falling back to another revision.
+Package declarations select code that runs inside the engine's Lua process and may build executables. Pin trusted sources. A build callback is arbitrary config code, not a sandbox. Network/Git/build failures are synchronous startup failures rather than silently falling back to another revision.
 
 Implementation and exhaustive edge-case tests live in [`lua/nefor-pm/init.lua`](init.lua) and `engine/tests/nefor_pm_test.rs`.
 

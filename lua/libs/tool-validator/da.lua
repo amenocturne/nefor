@@ -37,6 +37,41 @@ local function run_or_error(label, opts)
   end
 end
 
+local function exact_version(version)
+  return type(version) == "string" and version:match("^%d+%.%d+%.%d+$") ~= nil
+end
+
+function M.verify_version(path, expected_version)
+  if type(path) ~= "string" or path == "" then
+    error("da version: executable path must be a non-empty string", 0)
+  end
+  if not exact_version(expected_version) then
+    error("da version: expected version must be an exact release version", 0)
+  end
+  local result = nefor.process.run { cmd = path, args = { "--version" } }
+  local output = type(result) == "table" and result.stdout or nil
+  local trimmed = type(output) == "string" and output:match("^%s*(.-)%s*$") or ""
+  local actual = trimmed:match("^da (%d+%.%d+%.%d+)$")
+  if type(result) ~= "table" or result.code ~= 0 or actual ~= expected_version then
+    error(append_output(
+      "da version verification failed at " .. path .. ": expected da " .. expected_version ..
+        ", actual " .. string.format("%q", trimmed) ..
+        " (exit " .. tostring(type(result) == "table" and result.code or nil) .. ")",
+      command_output("--version", result)
+    ), 0)
+  end
+  return { version = actual, executable = path }
+end
+
+local function version_verifier(version)
+  if not exact_version(version) then
+    error("da package: `version` must be an exact release version", 0)
+  end
+  return function(package)
+    return M.verify_version(package.dir .. "/bin/da", version)
+  end
+end
+
 local function model_state(root)
   local path = root .. "/" .. MODEL_PATH
   local file, open_error = io.open(path, "rb")
@@ -120,6 +155,7 @@ function M.package(opts)
     url = url,
     commit = opts.commit,
     build = build,
+    verify = opts.version ~= nil and version_verifier(opts.version) or nil,
   }
 end
 
@@ -135,7 +171,7 @@ end
 
 function M.release_package(opts)
   opts = opts or {}
-  if type(opts.version) ~= "string" or not opts.version:match("^%d+%.%d+%.%d+$") then
+  if not exact_version(opts.version) then
     error("da release: `version` must be an exact release version", 0)
   end
   local function uname(flag)
@@ -150,6 +186,7 @@ function M.release_package(opts)
   end
   return {
     name = opts.name or "da",
+    verify = version_verifier(opts.version),
     archive = {
       url = "https://github.com/amenocturne/da/releases/download/v" .. opts.version .. "/da-" .. target .. ".tar.gz",
       sha256 = checksum,

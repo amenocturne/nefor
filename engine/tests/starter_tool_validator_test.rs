@@ -31,6 +31,20 @@ fn the_validator_forwards_questions_and_probes_its_classifier_once() {
     }
 }
 
+#[test]
+fn declared_da_version_is_verified_before_classification() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    let test_path = repo_root().join("tests/lua/tool-validator/version_test.lua");
+    let src = std::fs::read_to_string(&test_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
+    lua.load(&src)
+        .set_name(test_path.display().to_string())
+        .exec()
+        .expect("da version verification contract");
+}
+
 /// `classify_command` and argument-vector quoting against the fake classifier
 /// executable beside the Lua test; `nefor.process.run` runs real processes.
 #[test]
