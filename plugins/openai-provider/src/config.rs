@@ -25,16 +25,17 @@
 //!   --name ollama \
 //!   --base-url http://localhost:11434 \
 //!   --model phi4-mini:latest \
-//!   --retry-policy '{"max_attempts":8,"max_rounds":6,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":60000,"jitter_bps":1000,"response_headers_timeout_ms":120000}'
+//!   --retry-policy '{"max_attempts":8,"max_rounds":6,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":60000,"jitter_bps":1000,"response_headers_timeout_ms":120000}'
 //! ```
 
 use clap::Parser;
 
 /// Explicit per-instance transport budget, checked once at the CLI boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
     pub(crate) max_attempts: usize,
     pub(crate) max_rounds: usize,
+    pub(crate) backoff_multiplier: f64,
     pub(crate) initial_delay_ms: u64,
     pub(crate) max_delay_ms: u64,
     pub(crate) round_cooldown_ms: u64,
@@ -47,6 +48,7 @@ pub struct RetryPolicy {
 struct RawRetryPolicy {
     max_attempts: usize,
     max_rounds: usize,
+    backoff_multiplier: f64,
     initial_delay_ms: u64,
     max_delay_ms: u64,
     round_cooldown_ms: u64,
@@ -60,20 +62,23 @@ impl RetryPolicy {
         let policy = Self {
             max_attempts: raw.max_attempts,
             max_rounds: raw.max_rounds,
+            backoff_multiplier: raw.backoff_multiplier,
             initial_delay_ms: raw.initial_delay_ms,
             max_delay_ms: raw.max_delay_ms,
             round_cooldown_ms: raw.round_cooldown_ms,
             jitter_bps: raw.jitter_bps,
             response_headers_timeout_ms: raw.response_headers_timeout_ms,
         };
-        if policy.max_attempts == 0
+        if !policy.backoff_multiplier.is_finite()
+            || policy.backoff_multiplier < 1.0
+            || policy.max_attempts == 0
             || policy.max_rounds == 0
             || policy.response_headers_timeout_ms == 0
             || policy.initial_delay_ms > policy.max_delay_ms
             || policy.jitter_bps > 10000
         {
             return Err(
-                "invalid retry policy counts, delay bounds, jitter or header timeout".into(),
+                "invalid retry policy multiplier (finite and >= 1), counts, delay bounds, jitter or header timeout".into(),
             );
         }
         policy
@@ -108,7 +113,7 @@ impl std::str::FromStr for RetryPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+#[derive(Debug, Clone, PartialEq, Parser)]
 #[command(
     name = "openai-provider",
     about = "NCP v0.1 plugin: streams OpenAI-compatible chat completions back as chat-contract events.",
@@ -207,7 +212,7 @@ fn trim_trailing_slash(s: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    const POLICY: &str = r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+    const POLICY: &str = r#"{"max_attempts":8,"max_rounds":1,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
 
     fn cfg(name: &str) -> Config {
         Config {
@@ -254,7 +259,7 @@ mod tests {
             end
             commands[#commands+1] = command.openai("openai-provider", {
                 name="custom", base_url="http://local", transport_retry={max_attempts=2,max_rounds=3,
-                    initial_delay_ms=0,max_delay_ms=0,round_cooldown_ms=9,jitter_bps=0,response_headers_timeout_ms=30}})
+                    backoff_multiplier = 1.5, initial_delay_ms =0,max_delay_ms=0,round_cooldown_ms=9,jitter_bps=0,response_headers_timeout_ms=30}})
             return commands
         "#).eval().and_then(|value| lua.from_value(value)).unwrap();
         assert_eq!(commands.len(), 3);
@@ -267,6 +272,10 @@ mod tests {
             assert_eq!(
                 parsed.retry_policy.max_rounds,
                 if index == 2 { 3 } else { 6 }
+            );
+            assert_eq!(
+                parsed.retry_policy.backoff_multiplier,
+                if index == 2 { 1.5 } else { 2.0 }
             );
             assert_eq!(
                 command
@@ -297,6 +306,9 @@ mod tests {
                 serde_json::json!(1.5),
                 serde_json::from_str("18446744073709551616").unwrap(),
             ] {
+                if field == "backoff_multiplier" && invalid.as_f64().is_some_and(|v| v >= 1.0) {
+                    continue;
+                }
                 let mut malformed = valid.clone();
                 malformed[field] = invalid;
                 assert!(
@@ -304,6 +316,13 @@ mod tests {
                     "field {field}: {malformed}"
                 );
             }
+        }
+        for invalid in ["0", "0.5", "-1", "1e400", "NaN", "Infinity", "-Infinity"] {
+            let malformed = POLICY.replace(
+                "\"backoff_multiplier\":2",
+                &format!("\"backoff_multiplier\":{invalid}"),
+            );
+            assert!(RetryPolicy::from_json(&malformed).is_err(), "{invalid}");
         }
         let mut extra = valid.clone();
         extra["unknown"] = serde_json::json!(1);
@@ -332,7 +351,7 @@ mod tests {
 
     #[test]
     fn retry_policy_admits_explicit_zero_delay_and_custom_budgets() {
-        let policy = RetryPolicy::from_json(r#"{"max_attempts":2,"max_rounds":3,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":10000,"response_headers_timeout_ms":1}"#).unwrap();
+        let policy = RetryPolicy::from_json(r#"{"max_attempts":2,"max_rounds":3,"backoff_multiplier":2,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":10000,"response_headers_timeout_ms":1}"#).unwrap();
         assert_eq!(
             (
                 policy.max_attempts,

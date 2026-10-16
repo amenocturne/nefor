@@ -736,16 +736,41 @@ fn random_sample() -> u64 {
 }
 
 impl RetryPolicy {
+    fn exponential_delay_ms(&self, attempt: usize) -> u64 {
+        if self.initial_delay_ms == 0 {
+            return 0;
+        }
+        let cap = self.max_delay_ms as f64;
+        // Capped exponentiation by squaring bounds work even for usize::MAX attempts.
+        // Check before multiplication so neither large factors nor exponents overflow.
+        let multiply = |left: f64, right: f64| {
+            if left >= cap / right {
+                cap
+            } else {
+                left * right
+            }
+        };
+        let mut delay = self.initial_delay_ms as f64;
+        let mut factor = self.backoff_multiplier.min(cap);
+        let mut exponent = attempt.saturating_sub(1);
+        while exponent > 0 {
+            if exponent % 2 == 1 {
+                delay = multiply(delay, factor);
+            }
+            exponent /= 2;
+            if exponent > 0 {
+                factor = multiply(factor, factor);
+            }
+        }
+        // Millisecond timers truncate fractional results; retain the exact integer cap.
+        (delay as u64).min(self.max_delay_ms)
+    }
+
     fn local_delay(&self, attempt: usize, outer: bool, sample: u64) -> Duration {
         let base = if outer {
             self.round_cooldown_ms
         } else {
-            self.initial_delay_ms
-                .saturating_mul(
-                    1u64.checked_shl(attempt.saturating_sub(1).try_into().unwrap_or(u32::MAX))
-                        .unwrap_or(u64::MAX),
-                )
-                .min(self.max_delay_ms)
+            self.exponential_delay_ms(attempt)
         };
         // Divide before multiplying the sample so even the largest admitted timer cannot overflow.
         let scaled = u128::from(base) * u128::from(self.jitter_bps);
@@ -1309,7 +1334,35 @@ mod tests {
     use super::*;
 
     fn selected_policy() -> RetryPolicy {
-        RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":6,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":60000,"jitter_bps":1000,"response_headers_timeout_ms":120000}"#).unwrap()
+        RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":6,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":60000,"jitter_bps":1000,"response_headers_timeout_ms":120000}"#).unwrap()
+    }
+
+    #[test]
+    fn configured_exponential_multiplier_and_saturation() {
+        let mut policy = selected_policy();
+        policy.jitter_bps = 0;
+        for (factor, expected) in [
+            (1.0, [500, 500, 500, 500]),
+            (1.5, [500, 750, 1125, 1687]),
+            (3.0, [500, 1500, 4500, 13500]),
+        ] {
+            policy.backoff_multiplier = factor;
+            for (index, delay) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    policy.local_delay(index + 1, false, 0),
+                    Duration::from_millis(delay)
+                );
+            }
+        }
+        for factor in [1.5, 3.0, f64::MAX] {
+            policy.backoff_multiplier = factor;
+            assert_eq!(policy.exponential_delay_ms(usize::MAX), 30000);
+        }
+        policy.initial_delay_ms = 0;
+        assert_eq!(policy.exponential_delay_ms(usize::MAX), 0);
+        policy.backoff_multiplier = 1.0;
+        policy.initial_delay_ms = 500;
+        assert_eq!(policy.exponential_delay_ms(usize::MAX), 500);
     }
 
     #[test]

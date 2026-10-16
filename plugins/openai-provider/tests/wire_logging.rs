@@ -131,7 +131,7 @@ async fn disabled_trace_leaves_successful_stream_outcome_unchanged() {
 }
 
 fn retry_policy() -> openai_provider::config::RetryPolicy {
-    openai_provider::config::RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).expect("explicit fixture retry policy")
+    openai_provider::config::RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":1,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).expect("explicit fixture retry policy")
 }
 
 #[tokio::test(start_paused = true)]
@@ -167,7 +167,7 @@ async fn retry_after_deadline_counts_body_time_and_overrides_inner_cap_or_outer_
         let (records_tx, mut records) = tokio::sync::mpsc::unbounded_channel();
         let (progress_tx, mut progress) = tokio::sync::mpsc::unbounded_channel();
         let policy = openai_provider::config::RetryPolicy::from_json(&serde_json::json!({
-            "max_attempts":attempts,"max_rounds":rounds,"initial_delay_ms":500,"max_delay_ms":30000,
+            "max_attempts":attempts,"max_rounds":rounds,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,
             "round_cooldown_ms":60000,"jitter_bps":0,"response_headers_timeout_ms":120000
         }).to_string()).unwrap();
         let started = tokio::time::Instant::now();

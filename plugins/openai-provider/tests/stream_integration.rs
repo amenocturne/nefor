@@ -2087,14 +2087,14 @@ async fn incomplete_tool_refusal_malformed_and_in_band_error_are_typed_failures(
 }
 
 fn retry_policy() -> openai_provider::config::RetryPolicy {
-    openai_provider::config::RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).expect("explicit fixture retry policy")
+    openai_provider::config::RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":1,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).expect("explicit fixture retry policy")
 }
 
 fn rounds_policy(attempts: usize, rounds: usize) -> openai_provider::config::RetryPolicy {
     openai_provider::config::RetryPolicy::from_json(
         &serde_json::json!({
             "max_attempts": attempts, "max_rounds": rounds,
-            "initial_delay_ms": 500, "max_delay_ms": 30000,
+            "backoff_multiplier":2,"initial_delay_ms": 500, "max_delay_ms": 30000,
             "round_cooldown_ms": 60000, "jitter_bps": 0,
             "response_headers_timeout_ms": 120000
         })

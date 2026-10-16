@@ -58,7 +58,7 @@ Each native instance requires `--retry-policy <JSON>`; the other flags select it
 
 | Flag               | Default                  | Notes                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--retry-policy <JSON>` | required | Explicit seven-field transport budget described below; no native defaults. |
+| `--retry-policy <JSON>` | required | Explicit eight-field transport budget described below; no native defaults. |
 | `--auth-header <NAME>` | `Authorization` | Custom authentication header; nonstandard headers send the key without a Bearer prefix. |
 | `--name <NAME>`    | `openai`                 | Per-instance identity. Used as the event-kind prefix (`<name>.hello`, `<name>.stream.delta`, ...).                                                                                                                                                                                                                                                                                                            |
 | `--base-url <URL>` | `http://localhost:11434` | OpenAI-compatible base. Trailing slash trimmed automatically; the plugin appends `/v1/chat/completions`.                                                                                                                                                                                                                                                                                                      |
@@ -76,7 +76,7 @@ settings, not defaults compiled into the plugin:
 ```lua
 local transport_retry = {
   max_attempts = 8, max_rounds = 6,
-  initial_delay_ms = 500, max_delay_ms = 30000,
+  backoff_multiplier = 2, initial_delay_ms = 500, max_delay_ms = 30000,
   round_cooldown_ms = 60000, jitter_bps = 1000,
   response_headers_timeout_ms = 120000,
 }
@@ -100,7 +100,11 @@ exhausted round that saw a transient 429 may open another round; that evidence i
 retained across mixed retryable failures but reset at each new round. No agent
 turn, completed tool or conversation context is restarted.
 
-Inner delays double from `initial_delay_ms` and cap locally at `max_delay_ms`.
+Inner delays are `initial_delay_ms * backoff_multiplier^(failed_attempt - 1)`,
+capped locally at `max_delay_ms` before additive jitter. `backoff_multiplier` is
+a required finite number >= 1 (including fractional values); 1 keeps delays
+constant. Fractional millisecond results truncate to whole milliseconds. The
+starter selects 2; the plugin has no multiplier default.
 `jitter_bps` adds uniformly sampled jitter (1000 means up to 10%); the local inner
 cap still applies. Exhausted eligible rounds use one `round_cooldown_ms` plus
 additive jitter instead of an additional inner wait. Valid Retry-After seconds

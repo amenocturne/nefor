@@ -1249,7 +1249,7 @@ fn starter_openai_command_encodes_selected_or_custom_policy_once() {
               count = count + 1
               local policy = nefor.json.decode(argv[i+1])
               assert(policy.max_attempts == 8 and policy.max_rounds == 6)
-              assert(policy.initial_delay_ms == 500 and policy.max_delay_ms == 30000)
+              assert(policy.backoff_multiplier == 2 and policy.initial_delay_ms == 500 and policy.max_delay_ms == 30000)
               assert(policy.round_cooldown_ms == 60000 and policy.jitter_bps == 1000)
               assert(policy.response_headers_timeout_ms == 120000)
             end
@@ -1266,7 +1266,7 @@ fn starter_openai_command_encodes_selected_or_custom_policy_once() {
       end
       assert(seen == 2)
       local p = {name="custom",base_url="http://local",model="m",extra_args={"--future","v"},
-        transport_retry={max_attempts=1,max_rounds=2,initial_delay_ms=0,max_delay_ms=0,
+        transport_retry={max_attempts=1,max_rounds=2,backoff_multiplier = 2, initial_delay_ms =0,max_delay_ms=0,
           round_cooldown_ms=9,jitter_bps=0,response_headers_timeout_ms=30}}
       local argv = command.openai("/bin/provider", p)
       assert(#argv == 11 and argv[6] == "--model" and argv[8] == "--future")

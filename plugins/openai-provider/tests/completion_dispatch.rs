@@ -36,7 +36,7 @@ fn event_body(outgoing: &PluginOutgoing) -> Option<&Map<String, Value>> {
 }
 
 async fn spawn_provider(base_url: &str) -> (Child, ChildStdin, BufReader<ChildStdout>) {
-    spawn_provider_with_policy(base_url, r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).await
+    spawn_provider_with_policy(base_url, r#"{"max_attempts":8,"max_rounds":1,"backoff_multiplier":2,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).await
 }
 
 async fn spawn_provider_with_policy(
@@ -955,7 +955,7 @@ async fn both_native_dispatch_apis_report_safe_retry_counters_and_exhaustion() {
             );
             requests
         });
-        let policy = r#"{"max_attempts":2,"max_rounds":2,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+        let policy = r#"{"max_attempts":2,"max_rounds":2,"backoff_multiplier":2,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
         let (mut child, mut stdin, mut stdout) =
             spawn_provider_with_policy(&format!("http://{addr}"), policy).await;
         if legacy {
@@ -1067,7 +1067,7 @@ async fn persistent_429_native_process_exhausts_at_48_sends_with_one_error_event
     });
     // Timing and selected jitter bounds are independently covered under virtual
     // time; this process witness checks the same8x6 send budget without sleeping.
-    let policy = r#"{"max_attempts":8,"max_rounds":6,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+    let policy = r#"{"max_attempts":8,"max_rounds":6,"backoff_multiplier":2,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
     let (mut child, mut stdin, mut stdout) =
         spawn_provider_with_policy(&format!("http://{addr}"), policy).await;
     send_completion_messages(
@@ -1103,4 +1103,97 @@ async fn persistent_429_native_process_exhausts_at_48_sends_with_one_error_event
         "one terminal and no late notices"
     );
     child.kill().await.unwrap();
+}
+
+// The same native executable consumes each policy encoded by the shipped Lua helper.
+#[tokio::test]
+async fn lua_multiplier_changes_native_retry_progress() {
+    use mlua::LuaSerdeExt;
+    for (multiplier, expected) in [
+        (1.0, vec![20, 20, 20]),
+        (1.5, vec![20, 30, 45]),
+        (3.0, vec![20, 60, 180]),
+    ] {
+        let lua = mlua::Lua::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        lua.globals()
+            .get::<mlua::Table>("package")
+            .unwrap()
+            .set(
+                "path",
+                format!(
+                    "{0}/lua/?/init.lua;{0}/../../lua/?.lua;{0}/../../lua/?/init.lua",
+                    root.display()
+                ),
+            )
+            .unwrap();
+        let json = lua.create_table().unwrap();
+        json.set(
+            "encode",
+            lua.create_function(|lua, value: mlua::Value| {
+                let value: Value = lua.from_value(value)?;
+                serde_json::to_string(&value).map_err(mlua::Error::external)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let nefor = lua.create_table().unwrap();
+        nefor.set("json", json).unwrap();
+        lua.globals().set("nefor", nefor).unwrap();
+        lua.globals().set("multiplier", multiplier).unwrap();
+        let args: Vec<String> = lua
+            .from_value(
+                lua.load(
+                    r#"
+            return require("openai-provider").retry_args({max_attempts=4,max_rounds=1,
+                backoff_multiplier=multiplier,initial_delay_ms=20,max_delay_ms=1000,
+                round_cooldown_ms=0,jitter_bps=0,response_headers_timeout_ms=1000})
+        "#,
+                )
+                .eval()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(args[0], "--retry-policy");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request_json(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 429 Fixture\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let (mut child, mut stdin, mut stdout) =
+            spawn_provider_with_policy(&format!("http://{addr}"), &args[1]).await;
+        send_completion_messages(
+            &mut stdin,
+            "multiplier",
+            json!([{ "role":"user", "content":"same request" }]),
+        )
+        .await;
+        let mut delays = Vec::new();
+        loop {
+            let outgoing = read_outgoing(&mut stdout).await;
+            let Some(body) = event_body(&outgoing) else {
+                continue;
+            };
+            if body["kind"] == "fixture.completion.event" {
+                if body["event"] == "retry" {
+                    delays.push(body["delay_ms"].as_u64().unwrap());
+                }
+                if body["event"] == "error" {
+                    break;
+                }
+            }
+        }
+        assert_eq!(delays, expected, "Lua multiplier {multiplier}");
+        server.await.unwrap();
+        child.kill().await.unwrap();
+    }
 }

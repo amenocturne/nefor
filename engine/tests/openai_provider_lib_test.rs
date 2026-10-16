@@ -838,7 +838,7 @@ fn retry_args_requires_explicit_policy_and_encodes_without_mutation() {
       end
       assert(not pcall(provider.retry_args))
       local policy = {
-        max_attempts = 2, max_rounds = 3, initial_delay_ms = 0, max_delay_ms = 10,
+        max_attempts = 2, max_rounds = 3, backoff_multiplier = 2, initial_delay_ms = 0, max_delay_ms = 10,
         round_cooldown_ms = 7, jitter_bps = 0, response_headers_timeout_ms = 500,
       }
       local before = nefor.json.encode(policy)
@@ -850,7 +850,7 @@ fn retry_args_requires_explicit_policy_and_encodes_without_mutation() {
         count = count + 1
         assert(decoded[key] == value)
       end
-      assert(count == 7 and nefor.json.encode(policy) == before)
+      assert(count == 8 and nefor.json.encode(policy) == before)
       -- Full closed-record validation belongs to the native parser.
       assert(#provider.retry_args({}) == 2)
       local t = provider.translator("provider")
