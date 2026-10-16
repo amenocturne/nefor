@@ -7,6 +7,11 @@ local json_data = require("core.json_data")
 local M = {}
 local clone_table = json_data.copy
 
+function M.retry_args(policy)
+  assert(type(policy) == "table", "openai-provider.retry_args: policy table required")
+  return { "--retry-policy", json.encode(policy) }
+end
+
 -- Test-only: drop module-level state.
 function M._reset()
 end

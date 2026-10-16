@@ -120,6 +120,10 @@ test-provider:
 test-openai-provider target="openai_provider_default" *args:
     cargo test -p openai-provider --features full-tests --test {{target}} {{args}}
 
+# Focused OpenAI-provider policy/parser and replay-safety unit tests.
+test-openai-provider-unit *args:
+    cargo test -p openai-provider --lib {{args}}
+
 # Focused ChatGPT-provider dispatcher/parser unit tests.
 test-chatgpt-provider-unit *args:
     cargo test -p chatgpt-provider --lib {{args}}

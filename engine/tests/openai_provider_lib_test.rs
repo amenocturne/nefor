@@ -828,3 +828,38 @@ fn chatgpt_compaction_plan_falls_back_to_full_context_for_foreign_checkpoint() {
         "conversation compaction request identity is missing"
     );
 }
+
+#[test]
+fn retry_args_requires_explicit_policy_and_encodes_without_mutation() {
+    let lua = lua_with_lib();
+    lua.load(r#"
+      for _, invalid in ipairs({ false, 1, "policy" }) do
+        assert(not pcall(provider.retry_args, invalid))
+      end
+      assert(not pcall(provider.retry_args))
+      local policy = {
+        max_attempts = 2, max_rounds = 3, initial_delay_ms = 0, max_delay_ms = 10,
+        round_cooldown_ms = 7, jitter_bps = 0, response_headers_timeout_ms = 500,
+      }
+      local before = nefor.json.encode(policy)
+      local args = provider.retry_args(policy)
+      assert(#args == 2 and args[1] == "--retry-policy")
+      local decoded = nefor.json.decode(args[2])
+      local count = 0
+      for key, value in pairs(policy) do
+        count = count + 1
+        assert(decoded[key] == value)
+      end
+      assert(count == 7 and nefor.json.encode(policy) == before)
+      -- Full closed-record validation belongs to the native parser.
+      assert(#provider.retry_args({}) == 2)
+      local t = provider.translator("provider")
+      local toast = t.outbound({ type = "event", body = { kind = "provider.stream.retry", id = "legacy",
+        phase = "round", round = 1, max_rounds = 3, attempt = 2, max_attempts = 2,
+        next_round = 2, next_attempt = 1, total_attempts = 2, category = "rate_limit",
+        delay_ms = 7000, message = "round 1/3 attempt 2/2; next round in 7s",
+      } })
+      assert(toast.kind == "chat.toast" and toast.id == "legacy")
+      assert(toast.ttl_ms == 8500 and toast.text == "round 1/3 attempt 2/2; next round in 7s")
+    "#).exec().expect("explicit retry policy and legacy progress translation");
+}

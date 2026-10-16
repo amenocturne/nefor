@@ -84,11 +84,15 @@ These APIs build actor or wrapper specs for the current starter contracts. They 
 ```lua
 local provider = require("libs.compositors.provider")
 
-local spec = provider.spawn_spec("local", {
-  require("config").bin("openai-provider"),
-  "--name", "local",
-  "--base-url", "http://localhost:11434",
-}, {
+local transport_retry = {
+  max_attempts=8, max_rounds=6, initial_delay_ms=500, max_delay_ms=30000,
+  round_cooldown_ms=60000, jitter_bps=1000, response_headers_timeout_ms=120000,
+}
+local command = require("config.provider_command").openai(
+  require("config").bin("openai-provider"), {
+    name="local", base_url="http://localhost:11434", transport_retry=transport_retry,
+  })
+local spec = provider.spawn_spec("local", command, {
   translator_lib = "openai-provider",
   static_token = "ollama-local",
   agentic_loop = agentic_loop,

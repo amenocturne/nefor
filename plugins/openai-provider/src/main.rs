@@ -880,6 +880,7 @@ async fn dispatch_event(
                 }
                 Err(e) => {
                     let msg = match &e {
+                        StreamError::Exhausted { retry, .. } => retry.to_string(),
                         StreamError::Unauthorized { body } => {
                             format!("HTTP 401: {}", snippet(body))
                         }
@@ -1354,18 +1355,18 @@ async fn dispatch_completion_request(
                         .await;
                 }
                 Err(error) => {
-                    let _ = out_tx
-                        .send(PluginOutgoing::event(completion_event_body(
-                            &event_prefix,
-                            &request_id,
-                            "error",
-                            [
-                                ("message", Value::String(error.to_string())),
-                                ("model", Value::String(model)),
-                                ("duration_ms", Value::Number(elapsed_ms.into())),
-                            ],
-                        )))
-                        .await;
+                    let mut body = completion_event_body(
+                        &event_prefix,
+                        &request_id,
+                        "error",
+                        [
+                            ("message", Value::String(error.to_string())),
+                            ("model", Value::String(model)),
+                            ("duration_ms", Value::Number(elapsed_ms.into())),
+                        ],
+                    );
+                    add_retry_exhaustion(&mut body, &error);
+                    let _ = out_tx.send(PluginOutgoing::event(body)).await;
                 }
             }
         };
@@ -1439,6 +1440,7 @@ async fn run_completion_attempt(
 
     run_chat_stream_with_retry_progress_and_format_and_additions(
         client,
+        &config.retry_policy,
         &config.chat_endpoint(),
         token,
         &config.auth_header,
@@ -1487,24 +1489,11 @@ async fn run_completion_attempt(
             }
         },
         move |progress| {
-            let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body(
+            let _ = tx_for_retry.try_send(PluginOutgoing::event(completion_event_body_from_iter(
                 &retry_event_prefix,
                 &id_for_retry,
                 "retry",
-                [
-                    ("attempt", Value::Number(progress.retry_index().into())),
-                    (
-                        "delay_ms",
-                        Value::Number((progress.next_delay.as_millis() as u64).into()),
-                    ),
-                    (
-                        "error",
-                        progress
-                            .status
-                            .map(|status| Value::String(format!("HTTP {status}")))
-                            .unwrap_or(Value::String("transient provider error".into())),
-                    ),
-                ],
+                progress.fields(),
             )));
         },
     )
@@ -1520,11 +1509,11 @@ fn completion_event_body<const N: usize>(
     completion_event_body_from_iter(prefix, request_id, event, fields)
 }
 
-fn completion_event_body_from_iter<'a>(
+fn completion_event_body_from_iter<K: AsRef<str>>(
     prefix: &str,
     request_id: &str,
     event: &str,
-    fields: impl IntoIterator<Item = (&'a str, Value)>,
+    fields: impl IntoIterator<Item = (K, Value)>,
 ) -> Map<String, Value> {
     let mut body = Map::new();
     body.insert(
@@ -1534,7 +1523,7 @@ fn completion_event_body_from_iter<'a>(
     body.insert("request_id".into(), Value::String(request_id.to_owned()));
     body.insert("event".into(), Value::String(event.to_owned()));
     for (name, value) in fields {
-        body.insert(name.to_owned(), value);
+        body.insert(name.as_ref().to_owned(), value);
     }
     body
 }
@@ -1779,6 +1768,7 @@ fn spawn_turn(
                 let mut reasoning_started_at: Option<std::time::Instant> = None;
                 let result = run_chat_stream_with_retry_progress_and_format(
                     &client,
+                    &config.retry_policy,
                     &endpoint,
                     token.as_deref(),
                     &config.auth_header,
@@ -2051,6 +2041,7 @@ fn spawn_turn(
                     }
                     Err(e) => {
                         let msg = match &e {
+                            StreamError::Exhausted { retry, .. } => retry.to_string(),
                             StreamError::Unauthorized { body } => {
                                 format!("HTTP 401: {}", extract_error_message(body))
                             }
@@ -2089,9 +2080,9 @@ fn spawn_turn(
                         errored = true;
                         final_finish_reason = Some("error".to_string());
                         final_error = Some(msg.clone());
-                        let _ = out_tx
-                            .send(PluginOutgoing::event(turn_error_body(&config, &msg)))
-                            .await;
+                        let mut body = turn_error_body(&config, &msg);
+                        add_retry_exhaustion(&mut body, &e);
+                        let _ = out_tx.send(PluginOutgoing::event(body)).await;
                         break;
                     }
                 }
@@ -2731,44 +2722,14 @@ fn retry_progress_body(
     chat_id: &ChatId,
     progress: RetryProgress,
 ) -> Map<String, Value> {
-    let retry_index = progress.retry_index();
-    let max_retries = progress.max_retries();
-    let delay_ms = progress.next_delay.as_millis() as u64;
-    let code = progress
-        .status
-        .map(|status| format!("HTTP {status}"))
-        .unwrap_or_else(|| "request error".to_owned());
-    let mut m = Map::new();
-    m.insert(
+    let mut fields = progress.fields();
+    fields.insert(
         "kind".into(),
         Value::String(format!("{prefix}stream.retry")),
     );
-    m.insert("id".into(), Value::String(id.to_owned()));
-    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
-    if let Some(status) = progress.status {
-        m.insert("status".into(), Value::Number(status.into()));
-    }
-    m.insert("attempt".into(), Value::Number(retry_index.into()));
-    m.insert("max_retries".into(), Value::Number(max_retries.into()));
-    m.insert("delay_ms".into(), Value::Number(delay_ms.into()));
-    m.insert(
-        "message".into(),
-        Value::String(format!(
-            "{code}; retrying {retry_index}/{max_retries} in {}",
-            format_retry_delay(progress.next_delay)
-        )),
-    );
-    m
-}
-
-fn format_retry_delay(delay: Duration) -> String {
-    if delay.as_secs() == 0 {
-        format!("{}ms", delay.as_millis())
-    } else if delay.subsec_millis() == 0 {
-        format!("{}s", delay.as_secs())
-    } else {
-        format!("{:.1}s", delay.as_secs_f64())
-    }
+    fields.insert("id".into(), Value::String(id.to_owned()));
+    fields.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    fields
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2923,6 +2884,14 @@ fn reasoning_set_ack_body(
         m.insert("chat_id".into(), Value::String(cid.to_string()));
     }
     m
+}
+
+fn add_retry_exhaustion(body: &mut Map<String, Value>, error: &StreamError) {
+    if let StreamError::Exhausted { retry, .. } = error {
+        if let Ok(value) = serde_json::to_value(retry) {
+            body.insert("retry".into(), value);
+        }
+    }
 }
 
 fn turn_error_body(config: &Config, message: &str) -> Map<String, Value> {

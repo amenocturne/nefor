@@ -966,7 +966,23 @@ function M.spawn_spec(name, command, opts)
               end
             end
           end
-          if pending_requests[request_id] then report(translated) end
+          if pending_requests[request_id] then
+            report(translated)
+            -- Only the explicit transport-round notice contract guarantees a
+            -- safe message. Other providers keep their own progress vocabulary.
+            if translated.event == "retry"
+                and (translated.phase == "attempt" or translated.phase == "round") then
+              emit_synthetic(name, {
+                kind = "chat.toast",
+                id = request_id,
+                request_id = request_id,
+                provider = name,
+                text = translated.message,
+                level = "warn",
+                ttl_ms = translated.delay_ms + 1500,
+              })
+            end
+          end
           if translated.event == "completed" or translated.event == "result"
               or translated.event == "failed" or translated.event == "error"
               or translated.event == "interrupted" then

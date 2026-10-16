@@ -1218,3 +1218,138 @@ fn adapter_preparation_waits_for_observed_regular_capacity_without_polling() {
       assert(#_test.delivered()==0)
     "#).exec().expect("metadata preparation without guessed capacity or polling");
 }
+
+#[test]
+fn starter_openai_command_encodes_selected_or_custom_policy_once() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).unwrap();
+    set_package_path(&lua).unwrap();
+    lua.load(
+        r#"
+      local getenv = os.getenv
+      os.getenv = function(key)
+        if key == "NEFOR_ENABLE_OPENROUTER" or key == "NEFOR_ENABLE_OLLAMA"
+          or key == "NEFOR_ENABLE_CHATGPT" then return "1" end
+        return getenv(key)
+      end
+      local providers = require("config").active.providers
+      local command = require("config.provider_command")
+      local selected
+      local seen = 0
+      for _, p in ipairs(providers) do
+        if p.kind == "openai" then
+          seen = seen + 1
+          assert(p.transport_retry)
+          if selected then assert(p.transport_retry == selected) end
+          selected = p.transport_retry
+          local argv = command.openai("/bin/openai-provider", p)
+          local count = 0
+          for i, value in ipairs(argv) do
+            if value == "--retry-policy" then
+              count = count + 1
+              local policy = nefor.json.decode(argv[i+1])
+              assert(policy.max_attempts == 8 and policy.max_rounds == 6)
+              assert(policy.initial_delay_ms == 500 and policy.max_delay_ms == 30000)
+              assert(policy.round_cooldown_ms == 60000 and policy.jitter_bps == 1000)
+              assert(policy.response_headers_timeout_ms == 120000)
+            end
+          end
+          assert(count == 1)
+        else
+          assert(p.transport_retry == nil)
+          if p.kind == "chatgpt" then
+            for _, arg in ipairs(command.chatgpt("/bin/chatgpt-provider", p)) do
+              assert(arg ~= "--retry-policy")
+            end
+          end
+        end
+      end
+      assert(seen == 2)
+      local p = {name="custom",base_url="http://local",model="m",extra_args={"--future","v"},
+        transport_retry={max_attempts=1,max_rounds=2,initial_delay_ms=0,max_delay_ms=0,
+          round_cooldown_ms=9,jitter_bps=0,response_headers_timeout_ms=30}}
+      local argv = command.openai("/bin/provider", p)
+      assert(#argv == 11 and argv[6] == "--model" and argv[8] == "--future")
+      assert(argv[10] == "--retry-policy")
+      assert(nefor.json.decode(argv[11]).round_cooldown_ms == 9)
+      p.transport_retry = nil
+      assert(not pcall(command.openai, "/bin/provider", p))
+    "#,
+    )
+    .exec()
+    .expect("starter explicit retry command wiring");
+}
+
+#[test]
+fn canonical_retry_preserves_progress_and_toasts_only_pending_current_requests() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).unwrap();
+    set_package_path(&lua).unwrap();
+    lua.load(
+        r#"
+      local spec = require("libs.compositors.provider").spawn_spec("native", {"/bin/true"}, {
+        agentic_loop = {}, conversations = {context = function()
+          return {messages={{role="user",content="hello"}},watermark=1}
+        end},
+      })
+      local function invoke(id)
+        spec.to_plugin({{type="event",from="conversation-manager",body={
+          kind="conversation.provider.invoke",provider="native",approval_policy="Default",
+          request_id=id,conversation_id="lead",watermark=1}}})
+        _test.delivered()
+      end
+      local function progress(id, phase)
+        spec.from_plugin({{type="event",from="native",body={kind="completion.event",
+          request_id=id,event="retry",phase=phase,round=1,max_rounds=6,
+          attempt=phase == "round" and 8 or 7,max_attempts=8,
+          next_round=phase == "round" and 2 or 1,next_attempt=phase == "round" and 1 or 8,
+          total_attempts=phase == "round" and 8 or 7,
+          delay_ms=60000,category="rate_limit",status=429,
+          message="HTTP429; round 1/6; next send in 60s"}}})
+      end
+      progress("unknown", "round")
+      assert(#_test.sent() == 0)
+      invoke("live")
+      for _, phase in ipairs({"attempt", "round"}) do
+        progress("live", phase)
+        local sent = _test.sent()
+        assert(#sent == 2)
+        local event, toast = sent[1].body, sent[2].body
+        assert(event.kind == "conversation.provider.event.reported" and event.event == "retry")
+        assert(event.phase == phase and event.max_rounds == 6 and event.max_attempts == 8)
+        assert(event.attempt == (phase == "round" and 8 or 7))
+        assert(event.total_attempts == event.attempt)
+        assert(event.next_round == (phase == "round" and 2 or 1))
+        assert(event.next_attempt == (phase == "round" and 1 or 8))
+        assert(event.category == "rate_limit" and event.status == 429)
+        assert(toast.kind == "chat.toast" and toast.id == "live" and toast.request_id == "live")
+        assert(toast.provider == "native" and toast.text == event.message and toast.ttl_ms == 61500)
+        assert(spec._internals.pending_requests().live)
+      end
+      -- ChatGPT's separate retry vocabulary has no transport-round phase;
+      -- preserve its canonical reporting without inventing a native safe toast.
+      spec.from_plugin({{type="event",from="native",body={kind="completion.event",
+        request_id="live",event="retry",attempt=1,delay_ms=100,message="provider-specific"}}})
+      local other_retry = _test.sent()
+      assert(#other_retry == 1 and other_retry[1].body.kind == "conversation.provider.event.reported")
+      spec.to_plugin({{type="event",from="conversation-manager",body={
+        kind="conversation.provider.cancel",request_id="live"}}})
+      assert(spec._internals.pending_requests().live == nil)
+      progress("live", "round")
+      assert(#_test.sent() == 0)
+      invoke("old-session")
+      spec.to_plugin({{type="event",from="sessions",body={kind="sessions.session_start"}}})
+      _test.sent()
+      progress("old-session", "round")
+      assert(#_test.sent() == 0)
+      invoke("finished")
+      spec.from_plugin({{type="event",from="native",body={kind="completion.event",
+        request_id="finished",event="completed",result={text="done"}}}})
+      _test.sent()
+      progress("finished", "round")
+      assert(#_test.sent() == 0)
+    "#,
+    )
+    .exec()
+    .expect("canonical progress visibility and cancellation guards");
+}

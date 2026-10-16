@@ -47,6 +47,7 @@ async fn successful_non_sse_json_response_fails_clearly() {
 
     let error = run_chat_stream(
         &reqwest::Client::new(),
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -141,6 +142,7 @@ async fn structured_request_has_object_root_and_decodes_successful_response() {
     let client = reqwest::Client::new();
     let outcome = run_chat_stream_with_retry_progress_and_format(
         &client,
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -204,6 +206,7 @@ async fn chat_stream_retries_transient_500_then_succeeds() {
     let mut deltas: Vec<String> = Vec::new();
     let outcome = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -266,6 +269,7 @@ async fn chat_stream_retries_sse_transport_loss_before_output() {
     let mut progress = Vec::new();
     let outcome = run_chat_stream_with_retry_progress(
         &reqwest::Client::new(),
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -288,7 +292,7 @@ async fn chat_stream_retries_sse_transport_loss_before_output() {
     assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].status, None);
-    assert_eq!(progress[0].retry_index(), 1);
+    assert_eq!(progress[0].failed_attempt, 1);
 }
 
 #[tokio::test]
@@ -332,6 +336,7 @@ async fn chat_stream_retries_429_then_succeeds_and_reports_progress() {
     let mut progress = Vec::new();
     let outcome = run_chat_stream_with_retry_progress(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -353,8 +358,8 @@ async fn chat_stream_retries_429_then_succeeds_and_reports_progress() {
     assert_eq!(outcome.full_text, "Recovered");
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].status, Some(429));
-    assert_eq!(progress[0].retry_index(), 1);
-    assert_eq!(progress[0].max_retries(), 7);
+    assert_eq!(progress[0].failed_attempt, 1);
+    assert_eq!(progress[0].max_attempts, 8);
     assert_eq!(
         progress[0].next_delay,
         std::time::Duration::from_millis(500)
@@ -387,6 +392,7 @@ async fn chat_stream_does_not_retry_quota_denial() {
     let mut progress = Vec::new();
     let error = run_chat_stream_with_retry_progress(
         &reqwest::Client::new(),
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -447,8 +453,10 @@ async fn chat_stream_429_retry_respects_retry_after_seconds() {
     let messages = vec![Message::user("hello")];
 
     let mut progress: Vec<RetryProgress> = Vec::new();
+    let started = std::time::Instant::now();
     let outcome = run_chat_stream_with_retry_progress(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -470,11 +478,13 @@ async fn chat_stream_429_retry_respects_retry_after_seconds() {
     assert_eq!(outcome.full_text, "OK");
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].status, Some(429));
-    assert_eq!(progress[0].next_delay, std::time::Duration::from_secs(2));
+    assert!(progress[0].next_delay <= std::time::Duration::from_secs(2));
+    assert!(progress[0].next_delay >= std::time::Duration::from_millis(500));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
 }
 
 #[tokio::test]
-async fn chat_stream_429_retry_respects_past_retry_after_http_date_as_zero_delay() {
+async fn chat_stream_429_past_retry_after_does_not_shorten_local_backoff() {
     let (listener, addr) = bind_local().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_server = attempts.clone();
@@ -514,6 +524,7 @@ async fn chat_stream_429_retry_respects_past_retry_after_http_date_as_zero_delay
     let mut progress: Vec<RetryProgress> = Vec::new();
     let outcome = run_chat_stream_with_retry_progress(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -535,7 +546,10 @@ async fn chat_stream_429_retry_respects_past_retry_after_http_date_as_zero_delay
     assert_eq!(outcome.full_text, "OK");
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].status, Some(429));
-    assert_eq!(progress[0].next_delay, std::time::Duration::ZERO);
+    assert_eq!(
+        progress[0].next_delay,
+        std::time::Duration::from_millis(500)
+    );
 }
 
 #[tokio::test]
@@ -568,6 +582,7 @@ async fn chat_stream_cancellation_during_backoff_interrupts_without_second_reque
         std::time::Duration::from_secs(5),
         run_chat_stream_with_retry_progress(
             &client,
+            &retry_policy(),
             &endpoint,
             None,
             "Authorization",
@@ -621,6 +636,7 @@ async fn streaming_emits_deltas_then_end() {
     let mut deltas: Vec<String> = Vec::new();
     let outcome = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -670,6 +686,7 @@ async fn completed_chunked_stream_tolerates_missing_http_terminator() {
     let mut deltas: Vec<String> = Vec::new();
     let outcome = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -712,6 +729,7 @@ async fn incomplete_chunked_stream_still_errors_without_finish_reason() {
 
     let err = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -760,6 +778,7 @@ async fn request_failure_emits_turn_error() {
 
     let err = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -842,6 +861,7 @@ async fn chat_completion_uses_passed_in_model_not_a_default() {
     let messages = vec![Message::user("hi")];
     let _ = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -945,6 +965,7 @@ async fn unauthorized_response_yields_unauthorized_variant() {
 
     let err = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         Some("badkey"),
         "Authorization",
@@ -1000,6 +1021,7 @@ async fn streaming_assembles_tool_call_from_fragmented_deltas() {
 
     let outcome = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1094,6 +1116,7 @@ async fn request_body_carries_tools_array_when_present() {
 
     let _ = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1184,6 +1207,7 @@ async fn request_body_omits_tools_when_none_attached() {
 
     let _ = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1243,6 +1267,7 @@ async fn http_400_with_tools_unsupported_signature_yields_dedicated_variant() {
 
     let err = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1297,6 +1322,7 @@ async fn http_400_without_tools_in_request_falls_through_to_http_error() {
 
     let err = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1460,6 +1486,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
 
     let first = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1506,6 +1533,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
 
     let outcome = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1622,6 +1650,7 @@ async fn http_400_with_unrelated_message_falls_through_to_http_error() {
 
     let err = run_chat_stream(
         &client,
+        &retry_policy(),
         &endpoint,
         None,
         "Authorization",
@@ -1671,6 +1700,7 @@ async fn run_scripted_stream(
     let mut reasoning = Vec::new();
     let result = run_chat_stream(
         &reqwest::Client::new(),
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -1754,6 +1784,7 @@ async fn cancellation_before_usage_does_not_fabricate_accounting() {
     let cancel_after_delta = cancel.clone();
     let outcome = run_chat_stream(
         &reqwest::Client::new(),
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -1802,6 +1833,7 @@ async fn terminal_usage_and_completion_id_survive_cancellation_before_done() {
     });
     let outcome = run_chat_stream(
         &reqwest::Client::new(),
+        &retry_policy(),
         &format!("http://{addr}/v1/chat/completions"),
         None,
         "Authorization",
@@ -2051,5 +2083,555 @@ async fn incomplete_tool_refusal_malformed_and_in_band_error_are_typed_failures(
             | ("provider", StreamError::Provider { .. }) => {}
             (_, other) => panic!("unexpected {expected} error: {other:?}"),
         }
+    }
+}
+
+fn retry_policy() -> openai_provider::config::RetryPolicy {
+    openai_provider::config::RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).expect("explicit fixture retry policy")
+}
+
+fn rounds_policy(attempts: usize, rounds: usize) -> openai_provider::config::RetryPolicy {
+    openai_provider::config::RetryPolicy::from_json(
+        &serde_json::json!({
+            "max_attempts": attempts, "max_rounds": rounds,
+            "initial_delay_ms": 500, "max_delay_ms": 30000,
+            "round_cooldown_ms": 60000, "jitter_bps": 0,
+            "response_headers_timeout_ms": 120000
+        })
+        .to_string(),
+    )
+    .expect("explicit rounds fixture policy")
+}
+
+// Additional reply scripts for the shared HTTP ledger. Zero already denotes
+// a connection loss before headers; real HTTP statuses remain unchanged.
+const EMPTY_STREAM_LOSS: u16 = 1;
+const IN_BAND_ERROR: u16 = 2;
+const MALFORMED_STREAM: u16 = 3;
+const QUOTA_DENIAL: u16 = 4;
+const POST_TEXT_STREAM_LOSS: u16 = 5;
+
+/// Keep a runnable task while real localhost I/O is pending: Tokio's automatic
+/// paused-clock advancement must not mistake socket latency for a header timeout.
+/// Only an observed retry notice authorizes advancing the clock here.
+async fn scripted_retry_ledger(
+    statuses: Vec<u16>,
+    attempts_per_round: usize,
+    rounds: usize,
+) -> (
+    Result<openai_provider::stream::StreamOutcome, StreamError>,
+    Vec<RetryProgress>,
+    Vec<String>,
+    std::time::Duration,
+) {
+    let (listener, addr) = bind_local().await;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let server = tokio::spawn(async move {
+        let mut index = 0;
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("accept scripted request");
+            let mut request = read_request(&mut socket).await;
+            let (headers, body) = request.split_once("\r\n\r\n").expect("HTTP headers");
+            let expected_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .expect("request content length");
+            let mut body_length = body.len();
+            while body_length < expected_length {
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.expect("request body");
+                assert!(count > 0, "complete request body");
+                body_length += count;
+                request.push_str(std::str::from_utf8(&bytes[..count]).expect("UTF-8 fixture body"));
+            }
+            recorded.lock().unwrap().push(request);
+            let status = statuses.get(index).copied().unwrap_or(429);
+            index += 1;
+            if status == 0 {
+                // Dropping without headers is a replay-safe request transport error.
+                continue;
+            }
+            let (http_status, content_type, body, truncate) = match status {
+                EMPTY_STREAM_LOSS => (200, "text/event-stream", "", true),
+                IN_BAND_ERROR => (200, "text/event-stream", "data: {\"error\":{\"message\":\"rate limited\"}}\n\n", false),
+                MALFORMED_STREAM => (200, "text/event-stream", "data: {bad\n\n", false),
+                QUOTA_DENIAL => (429, "application/json", "{\"error\":{\"type\":\"insufficient_quota\"}}", false),
+                POST_TEXT_STREAM_LOSS => (200, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", true),
+                200 => (200, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false),
+                status => (status, "application/json", "{\"error\":\"fixture response\"}", false),
+            };
+            let length = body.len() + usize::from(truncate);
+            let response = format!("HTTP/1.1 {http_status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("scripted response");
+        }
+    });
+    let keep_clock_still = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let start = tokio::time::Instant::now();
+    let mut completion = tokio::spawn(async move {
+        run_chat_stream_with_retry_progress(
+            &reqwest::Client::new(),
+            &rounds_policy(attempts_per_round, rounds),
+            &format!("http://{addr}/v1/chat/completions"),
+            None,
+            "Authorization",
+            "fixture-model",
+            &[Message::user("same logical request")],
+            None,
+            None,
+            CancellationToken::new(),
+            |_| {},
+            |_| {},
+            move |notice| {
+                progress_tx.send(notice).expect("progress receiver");
+            },
+        )
+        .await
+    });
+    let mut ledger = Vec::new();
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            Some(notice) = progress_rx.recv() => {
+                ledger.push(notice);
+                tokio::time::advance(notice.next_delay).await;
+            }
+            result = &mut completion => break result.expect("completion task"),
+        }
+    };
+    let elapsed = start.elapsed();
+    server.abort();
+    keep_clock_still.abort();
+    let requests = requests.lock().unwrap().clone();
+    (outcome, ledger, requests, elapsed)
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_429_consumes_exactly_eight_attempts_in_each_of_six_rounds() {
+    let (result, progress, requests, elapsed) = scripted_retry_ledger(vec![429; 48], 8, 6).await;
+    let StreamError::Exhausted { retry, source } = result.expect_err("finite rate-limit budget")
+    else {
+        panic!("expected exhaustion")
+    };
+    assert_eq!(requests.len(), 48, "no 49th send");
+    assert_eq!(
+        (
+            retry.reason.as_str(),
+            retry.round,
+            retry.attempt,
+            retry.total_attempts
+        ),
+        ("rounds_exhausted", 6, 8, 48)
+    );
+    assert_eq!(
+        (retry.category.as_str(), retry.status),
+        ("rate_limit", Some(429))
+    );
+    assert!(matches!(*source, StreamError::Http { status: 429, .. }));
+    assert_eq!(progress.len(), 47, "no wait after final send");
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|p| p.phase.as_str() == "attempt")
+            .count(),
+        42
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|p| p.phase.as_str() == "round")
+            .count(),
+        5
+    );
+    let inner_ms = [500, 1000, 2000, 4000, 8000, 16000, 30000];
+    for (index, notice) in progress.iter().enumerate() {
+        let round = index / 8 + 1;
+        let attempt = index % 8 + 1;
+        assert_eq!(
+            (
+                notice.round,
+                notice.max_rounds,
+                notice.failed_attempt,
+                notice.max_attempts
+            ),
+            (round, 6, attempt, 8)
+        );
+        assert_eq!(notice.total_attempts, index + 1);
+        assert_eq!(
+            (notice.category.as_str(), notice.status),
+            ("rate_limit", Some(429))
+        );
+        if attempt == 8 {
+            assert_eq!(
+                (
+                    notice.phase.as_str(),
+                    notice.next_round,
+                    notice.next_attempt
+                ),
+                ("round", round + 1, 1)
+            );
+            assert_eq!(notice.next_delay, std::time::Duration::from_secs(60));
+        } else {
+            assert_eq!(
+                (
+                    notice.phase.as_str(),
+                    notice.next_round,
+                    notice.next_attempt
+                ),
+                ("attempt", round, attempt + 1)
+            );
+            assert_eq!(
+                notice.next_delay,
+                std::time::Duration::from_millis(inner_ms[attempt - 1])
+            );
+        }
+    }
+    assert_eq!(
+        elapsed,
+        std::time::Duration::from_millis(6 * inner_ms.iter().sum::<u64>() + 5 * 60000)
+    );
+    let bodies: Vec<_> = requests
+        .iter()
+        .map(|request| request.split_once("\r\n\r\n").expect("HTTP body").1)
+        .collect();
+    assert!(
+        bodies.iter().all(|body| *body == bodies[0]),
+        "rounds reuse the prepared conversation and request body"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn last_attempt_can_succeed_in_first_or_last_round() {
+    for total in [8, 48] {
+        let mut statuses = vec![429; total - 1];
+        statuses.push(200);
+        let (result, progress, requests, _) = scripted_retry_ledger(statuses, 8, 6).await;
+        assert_eq!(
+            result.expect("last attempt succeeds").full_text,
+            "recovered"
+        );
+        assert_eq!(requests.len(), total);
+        assert_eq!(progress.len(), total - 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_small_budgets_change_sends_and_reset_attempts() {
+    let (result, progress, requests, elapsed) = scripted_retry_ledger(vec![429], 1, 1).await;
+    assert!(matches!(result, Err(StreamError::Exhausted { .. })));
+    assert_eq!(requests.len(), 1);
+    assert!(progress.is_empty());
+    assert_eq!(elapsed, std::time::Duration::ZERO);
+    let (result, progress, requests, _) =
+        scripted_retry_ledger(vec![429, 429, 429, 200], 2, 2).await;
+    assert!(result.is_ok());
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        progress
+            .iter()
+            .map(|p| (p.round, p.failed_attempt, p.next_round, p.next_attempt))
+            .collect::<Vec<_>>(),
+        [(1, 1, 1, 2), (1, 2, 2, 1), (2, 1, 2, 2)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn outer_eligibility_retains_current_round_429_but_not_previous_round_429() {
+    for final_status in [503, 0] {
+        let (result, progress, requests, _) =
+            scripted_retry_ledger(vec![429, final_status, 503, 503], 2, 6).await;
+        let StreamError::Exhausted { retry, .. } =
+            result.expect_err("second round lacks backpressure")
+        else {
+            panic!("expected exhaustion")
+        };
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            (
+                retry.reason.as_str(),
+                retry.round,
+                retry.attempt,
+                retry.total_attempts
+            ),
+            ("attempts_exhausted", 2, 2, 4)
+        );
+        assert_eq!(progress[1].phase.as_str(), "round");
+        assert_eq!(
+            progress[1].status,
+            if final_status == 0 {
+                None
+            } else {
+                Some(final_status)
+            }
+        );
+        assert_eq!(
+            progress[1].category.as_str(),
+            if final_status == 0 {
+                "transport"
+            } else {
+                "server"
+            }
+        );
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|p| p.phase.as_str() == "round")
+                .count(),
+            1
+        );
+    }
+    for status in [503, 0] {
+        let (result, progress, requests, _) = scripted_retry_ledger(vec![status; 8], 8, 6).await;
+        let StreamError::Exhausted { retry, .. } = result.expect_err("no 429 means one round")
+        else {
+            panic!("expected exhaustion")
+        };
+        assert_eq!(requests.len(), 8);
+        assert_eq!(retry.reason.as_str(), "attempts_exhausted");
+        assert!(progress.iter().all(|p| p.phase.as_str() == "attempt"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_status_after_429_wins_without_exhaustion_or_outer_retry() {
+    for status in [400, 401] {
+        let (result, progress, requests, _) = scripted_retry_ledger(vec![429, status], 2, 6).await;
+        let error = result.expect_err("terminal status");
+        if status == 401 {
+            assert!(matches!(error, StreamError::Unauthorized { .. }));
+        } else {
+            assert!(matches!(error, StreamError::Http { status: 400, .. }));
+        }
+        assert_eq!(requests.len(), 2);
+        assert_eq!(progress.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_stalled_headers_error_body_and_wrong_content_type_body() {
+    for headers in [
+        "",
+        "HTTP/1.1 429 Fixture\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{",
+        "HTTP/1.1 200 Fixture\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{",
+    ] {
+        let (listener, addr) = bind_local().await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request");
+            let _ = read_request(&mut socket).await;
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("partial response");
+            ready_tx.send(()).expect("ready receiver");
+            // Hold the connection open after cancellation to distinguish it from
+            // a body EOF; still observe whether an unauthorized resend arrives.
+            match tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+            {
+                Err(_) => {}
+                Ok(_) => panic!("cancellation must not send another request"),
+            }
+        });
+        let completion = tokio::spawn(async move {
+            run_chat_stream_with_retry_progress(
+                &reqwest::Client::new(),
+                &rounds_policy(2, 2),
+                &format!("http://{addr}/v1/chat/completions"),
+                None,
+                "Authorization",
+                "fixture-model",
+                &[Message::user("cancel stalled request")],
+                None,
+                None,
+                token,
+                |_| panic!("no semantic output"),
+                |_| {},
+                |_| panic!("no retry after cancellation"),
+            )
+            .await
+        });
+        ready_rx.await.expect("server holds response open");
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+            .await
+            .expect("cancel must interrupt header/body acquisition")
+            .expect("completion task")
+            .expect("cancel is not exhaustion");
+        assert!(outcome.interrupted);
+        server.await.expect("no replay");
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_outer_cooldown_has_no_next_send() {
+    let (listener, addr) = bind_local().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("first request");
+        let _ = read_request(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 429 Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("429");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "no send during cancelled cooldown"
+        );
+    });
+    let cancel = CancellationToken::new();
+    let cancel_from_progress = cancel.clone();
+    let mut progress = Vec::new();
+    let outcome = run_chat_stream_with_retry_progress(
+        &reqwest::Client::new(),
+        &rounds_policy(1, 6),
+        &format!("http://{addr}/v1/chat/completions"),
+        None,
+        "Authorization",
+        "fixture-model",
+        &[Message::user("cancel cooldown")],
+        None,
+        None,
+        cancel,
+        |_| {},
+        |_| {},
+        |notice| {
+            progress.push(notice);
+            cancel_from_progress.cancel();
+        },
+    )
+    .await
+    .expect("cancel is not exhausted");
+    assert!(outcome.interrupted);
+    assert_eq!(progress.len(), 1);
+    assert_eq!(
+        (
+            progress[0].phase.as_str(),
+            progress[0].failed_attempt,
+            progress[0].next_round,
+            progress[0].next_attempt
+        ),
+        ("round", 1, 2, 1)
+    );
+    server.await.expect("no next request");
+}
+
+#[tokio::test]
+async fn semantic_state_blocks_transport_replay_even_when_structured_text_is_hidden() {
+    for (delta, structured) in [
+        (serde_json::json!({"content":"partial answer"}), false),
+        (serde_json::json!({"reasoning":"partial thought"}), false),
+        (
+            serde_json::json!({"reasoning_details":[{"type":"reasoning.encrypted","data":"sealed"}]}),
+            false,
+        ),
+        (
+            serde_json::json!({"tool_calls":[{"index":0,"id":"partial-tool"}]}),
+            false,
+        ),
+        (serde_json::json!({"content":"{\"partial\":"}), true),
+    ] {
+        let (listener, addr) = bind_local().await;
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices":[{"delta":delta}]})
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request");
+            let _ = read_request(&mut socket).await;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len() + 100);
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("semantic fragment");
+            socket.shutdown().await.expect("truncated body");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "semantic state forbids a resend"
+            );
+        });
+        let format = serde_json::json!({"type":"json_object"});
+        let mut deltas = Vec::new();
+        let result = run_chat_stream_with_retry_progress_and_format(
+            &reqwest::Client::new(),
+            &rounds_policy(2, 6),
+            &format!("http://{addr}/v1/chat/completions"),
+            None,
+            "Authorization",
+            "fixture-model",
+            &[Message::user("do not replay partial output")],
+            None,
+            None,
+            structured.then_some(&format),
+            CancellationToken::new(),
+            |text| {
+                if !structured {
+                    deltas.push(text.to_owned());
+                }
+            },
+            |_| {},
+            |_| panic!("semantic failure cannot retry"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(StreamError::Body(_))),
+            "must preserve non-budget body failure: {result:?}"
+        );
+        if structured {
+            assert!(
+                deltas.is_empty(),
+                "structured text stays hidden but still forbids replay"
+            );
+        }
+        server.await.expect("no replay");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shared_counter_includes_presemantic_sse_loss_and_terminal_failures_override_prior_429() {
+    let (result, progress, requests, _) =
+        scripted_retry_ledger(vec![429, 0, EMPTY_STREAM_LOSS, 503, 503, 503], 3, 6).await;
+    let StreamError::Exhausted { retry, .. } = result.unwrap_err() else {
+        panic!("exhausted")
+    };
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        (retry.round, retry.attempt, retry.total_attempts),
+        (2, 3, 6)
+    );
+    assert_eq!(retry.reason.as_str(), "attempts_exhausted");
+    assert_eq!(progress[2].category.as_str(), "stream_transport");
+    assert_eq!(progress[2].phase.as_str(), "round");
+    assert_eq!(progress[2].total_attempts, 3);
+    for final_reply in [
+        IN_BAND_ERROR,
+        MALFORMED_STREAM,
+        QUOTA_DENIAL,
+        POST_TEXT_STREAM_LOSS,
+    ] {
+        let (result, progress, requests, _) =
+            scripted_retry_ledger(vec![429, final_reply], 2, 6).await;
+        let error = result.expect_err("terminal result beats earlier rate-limit eligibility");
+        assert!(!matches!(error, StreamError::Exhausted { .. }));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(progress.len(), 1);
     }
 }

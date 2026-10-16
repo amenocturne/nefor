@@ -36,8 +36,17 @@ fn event_body(outgoing: &PluginOutgoing) -> Option<&Map<String, Value>> {
 }
 
 async fn spawn_provider(base_url: &str) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    spawn_provider_with_policy(base_url, r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).await
+}
+
+async fn spawn_provider_with_policy(
+    base_url: &str,
+    policy: &str,
+) -> (Child, ChildStdin, BufReader<ChildStdout>) {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_openai-provider"))
         .args([
+            "--retry-policy",
+            policy,
             "--name",
             "fixture",
             "--base-url",
@@ -922,4 +931,176 @@ async fn stdout_loss_without_new_bus_traffic_cancels_sibling_http_work() {
             .expect("read"),
         0
     );
+}
+
+#[tokio::test]
+async fn both_native_dispatch_apis_report_safe_retry_counters_and_exhaustion() {
+    for legacy in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.expect("retry request");
+                requests.push(read_request_json(&mut socket).await);
+                let body = r#"{"error":"private-body-must-not-appear-in-notice"}"#;
+                let response = format!("HTTP/1.1 429 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.expect("429");
+            }
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "finite budget must not send a fifth request"
+            );
+            requests
+        });
+        let policy = r#"{"max_attempts":2,"max_rounds":2,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+        let (mut child, mut stdin, mut stdout) =
+            spawn_provider_with_policy(&format!("http://{addr}"), policy).await;
+        if legacy {
+            write_envelope(&mut stdin, Envelope::event(
+                PluginName::new("test-caller").expect("caller"), Timestamp::now(),
+                json!({"kind":"fixture.prompt","text":"same request","approval_policy":"Default"}).as_object().unwrap().clone(),
+            )).await;
+        } else {
+            send_completion_messages(&mut stdin, "retry-request", json!([
+                {"role":"assistant","tool_calls":[{"id":"completed-tool","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"completed-tool","content":"already completed"}
+            ])).await;
+        }
+        let mut progress = Vec::new();
+        let terminal = loop {
+            let outgoing = read_outgoing(&mut stdout).await;
+            let Some(body) = event_body(&outgoing) else {
+                continue;
+            };
+            if legacy {
+                if body["kind"] == "fixture.stream.retry" {
+                    progress.push(body.clone());
+                }
+                if body["kind"] == "fixture.turn.error" {
+                    break body.clone();
+                }
+            } else if body["kind"] == "fixture.completion.event"
+                && body["request_id"] == "retry-request"
+            {
+                if body["event"] == "retry" {
+                    progress.push(body.clone());
+                }
+                if body["event"] == "error" {
+                    break body.clone();
+                }
+            }
+        };
+        assert_eq!(progress.len(), 3);
+        for (notice, (round, attempt, next_round, next_attempt, phase, consumed)) in
+            progress.iter().zip([
+                (1, 1, 1, 2, "attempt", 1),
+                (1, 2, 2, 1, "round", 2),
+                (2, 1, 2, 2, "attempt", 3),
+            ])
+        {
+            assert_eq!(notice["phase"], phase);
+            assert_eq!(notice["round"], round);
+            assert_eq!(notice["attempt"], attempt);
+            assert_eq!(notice["max_rounds"], 2);
+            assert_eq!(notice["max_attempts"], 2);
+            assert_eq!(notice["next_round"], next_round);
+            assert_eq!(notice["next_attempt"], next_attempt);
+            assert_eq!(notice["total_attempts"], consumed);
+            assert_eq!(notice["category"], "rate_limit");
+            assert_eq!(notice["status"], 429);
+            assert_eq!(notice["delay_ms"], 0);
+            assert!(notice.get("max_retries").is_none());
+            assert!(!notice["message"].as_str().unwrap().contains("private-body"));
+            assert!(notice["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("round {round}/2")));
+            assert!(notice["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("attempt {attempt}/2")));
+        }
+        assert_eq!(
+            terminal["retry"],
+            json!({"reason":"rounds_exhausted","round":2,"max_rounds":2,"attempt":2,"max_attempts":2,"total_attempts":4,"category":"rate_limit","status":429})
+        );
+        assert!(!terminal["message"]
+            .as_str()
+            .unwrap()
+            .contains("private-body"));
+        let requests = server.await.expect("server");
+        assert!(
+            requests.iter().all(|request| request == &requests[0]),
+            "transport retry never rebuilds history or reexecutes completed tools"
+        );
+        if !legacy {
+            assert_eq!(requests[0]["messages"][1]["content"], "already completed");
+        }
+        child.kill().await.expect("stop provider");
+    }
+}
+
+#[tokio::test]
+async fn persistent_429_native_process_exhausts_at_48_sends_with_one_error_event() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..48 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_json(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "no49thsend"
+        );
+    });
+    // Timing and selected jitter bounds are independently covered under virtual
+    // time; this process witness checks the same8x6 send budget without sleeping.
+    let policy = r#"{"max_attempts":8,"max_rounds":6,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+    let (mut child, mut stdin, mut stdout) =
+        spawn_provider_with_policy(&format!("http://{addr}"), policy).await;
+    send_completion_messages(
+        &mut stdin,
+        "exhaust48",
+        json!([{"role":"user","content":"fixture"}]),
+    )
+    .await;
+    let mut notices = Vec::new();
+    let terminal = loop {
+        let outgoing = read_outgoing(&mut stdout).await;
+        if let Some(body) = event_body(&outgoing) {
+            if body["kind"] == "fixture.completion.event" && body["request_id"] == "exhaust48" {
+                match body["event"].as_str().unwrap() {
+                    "retry" => notices.push(body.clone()),
+                    "error" => break body.clone(),
+                    unexpected => panic!("unexpected semantic or terminal event: {unexpected}"),
+                }
+            }
+        }
+    };
+    assert_eq!(notices.len(), 47);
+    assert_eq!(notices.iter().filter(|p| p["phase"] == "round").count(), 5);
+    assert_eq!(terminal["retry"]["total_attempts"], 48);
+    assert_eq!(terminal["retry"]["round"], 6);
+    assert_eq!(terminal["retry"]["attempt"], 8);
+    assert_eq!(terminal["retry"]["reason"], "rounds_exhausted");
+    server.await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), read_outgoing(&mut stdout))
+            .await
+            .is_err(),
+        "one terminal and no late notices"
+    );
+    child.kill().await.unwrap();
 }

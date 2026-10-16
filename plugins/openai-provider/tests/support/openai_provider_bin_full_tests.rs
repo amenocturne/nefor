@@ -1553,7 +1553,7 @@
         let tasks = Arc::new(publisher::Tasks::default());
         publisher::TASKS.scope(tasks.clone(), async {
             for expected in ["fixture.chat.error", "fixture.chat.complete.result"] {
-                start_completion_turn(&chats, &auth, &catalog, &broker, &config, &client, &wire, chat_id.clone(), false, Vec::new(), Some(serde_json::json!({"type":"json_object"}))).await.expect("start");
+                start_completion_turn(&chats, &auth, &catalog, &broker, &config, &client, &wire, chat_id.clone(), None, Vec::new(), Some(serde_json::json!({"type":"json_object"}))).await.expect("start");
                 let terminal = tokio::time::timeout(Duration::from_secs(20), async {
                     loop {
                         let body = match output.recv().await.expect("output").body { Body::Event(body) => body, _ => panic!("event") };
@@ -1590,7 +1590,7 @@
         let (wire, mut output) = mpsc::channel(32);
         let tasks = Arc::new(publisher::Tasks::default());
         publisher::TASKS.scope(tasks.clone(), async {
-            start_completion_turn(&chats, &auth, &catalog, &broker, &config, &client, &wire, chat_id.clone(), false, Vec::new(), None).await.expect("start");
+            start_completion_turn(&chats, &auth, &catalog, &broker, &config, &client, &wire, chat_id.clone(), None, Vec::new(), None).await.expect("start");
             dispatch_completion_request(&completions, &auth, &catalog, &config, &client, &wire, &make_event_body("fixture.completion.request", &[("request_id", Value::String("shutdown-request".into())), ("messages", serde_json::json!([{"role":"user", "content":"answer"}]))])).await.expect("completion");
         }).await;
         let (mut first, _) = listener.accept().await.expect("first HTTP request");

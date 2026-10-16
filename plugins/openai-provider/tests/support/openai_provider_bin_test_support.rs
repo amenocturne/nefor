@@ -2,6 +2,7 @@
 
     fn cfg(name: &str) -> Config {
         Config {
+            retry_policy: openai_provider::config::RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#).expect("fixture policy"),
             provider_name: name.into(),
             base_url: "http://localhost:11434".into(),
             model: Some("qwen2.5-coder:7b".into()),

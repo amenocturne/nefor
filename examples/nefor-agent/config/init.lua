@@ -13,6 +13,16 @@
 
 local M = {}
 
+local transport_retry = {
+  max_attempts = 8,
+  max_rounds = 6,
+  initial_delay_ms = 500,
+  max_delay_ms = 30000,
+  round_cooldown_ms = 60000,
+  jitter_bps = 1000,
+  response_headers_timeout_ms = 120000,
+}
+
 local DEFAULT_REASONING_EFFORT = "xhigh"
 
 local function env_truthy(name)
@@ -80,6 +90,7 @@ end
 if env_truthy("NEFOR_ENABLE_OPENROUTER") then
   providers[#providers + 1] = {
     kind = "openai",
+    transport_retry = transport_retry,
     name = "openrouter",
     base_url = "https://openrouter.ai/api",
     extra_args = {},
@@ -110,6 +121,7 @@ end
 if env_truthy("NEFOR_ENABLE_OLLAMA") then
   providers[#providers + 1] = {
     kind         = "openai",
+    transport_retry = transport_retry,
     name         = "ollama",
     static_token = "ollama-local",
     base_url     = "http://localhost:11434",

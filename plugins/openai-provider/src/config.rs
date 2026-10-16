@@ -16,8 +16,7 @@
 //! still falls back to `OPENAI_PROVIDER_API_KEY` so users can keep
 //! secrets out of init.lua.
 //!
-//! See `examples/nefor-agent/openai-providers-example.lua` for the multi-instance
-//! recipe.
+//! The starter assembles explicit per-instance arguments in `config.provider_command`.
 //!
 //! # Example
 //!
@@ -25,10 +24,89 @@
 //! openai-provider \
 //!   --name ollama \
 //!   --base-url http://localhost:11434 \
-//!   --model phi4-mini:latest
+//!   --model phi4-mini:latest \
+//!   --retry-policy '{"max_attempts":8,"max_rounds":6,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":60000,"jitter_bps":1000,"response_headers_timeout_ms":120000}'
 //! ```
 
 use clap::Parser;
+
+/// Explicit per-instance transport budget, checked once at the CLI boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub(crate) max_attempts: usize,
+    pub(crate) max_rounds: usize,
+    pub(crate) initial_delay_ms: u64,
+    pub(crate) max_delay_ms: u64,
+    pub(crate) round_cooldown_ms: u64,
+    pub(crate) jitter_bps: u64,
+    pub(crate) response_headers_timeout_ms: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetryPolicy {
+    max_attempts: usize,
+    max_rounds: usize,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    round_cooldown_ms: u64,
+    jitter_bps: u64,
+    response_headers_timeout_ms: u64,
+}
+
+impl RetryPolicy {
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let raw: RawRetryPolicy = serde_json::from_str(json).map_err(|error| error.to_string())?;
+        let policy = Self {
+            max_attempts: raw.max_attempts,
+            max_rounds: raw.max_rounds,
+            initial_delay_ms: raw.initial_delay_ms,
+            max_delay_ms: raw.max_delay_ms,
+            round_cooldown_ms: raw.round_cooldown_ms,
+            jitter_bps: raw.jitter_bps,
+            response_headers_timeout_ms: raw.response_headers_timeout_ms,
+        };
+        if policy.max_attempts == 0
+            || policy.max_rounds == 0
+            || policy.response_headers_timeout_ms == 0
+            || policy.initial_delay_ms > policy.max_delay_ms
+            || policy.jitter_bps > 10000
+        {
+            return Err(
+                "invalid retry policy counts, delay bounds, jitter or header timeout".into(),
+            );
+        }
+        policy
+            .max_attempts
+            .checked_mul(policy.max_rounds)
+            .ok_or("retry attempt product overflows")?;
+        let cooldown = policy
+            .round_cooldown_ms
+            .checked_add(
+                ((u128::from(policy.round_cooldown_ms) * u128::from(policy.jitter_bps)) / 10000)
+                    .try_into()
+                    .map_err(|_| "retry cooldown jitter overflows")?,
+            )
+            .ok_or("retry cooldown overflows")?;
+        for ms in [
+            policy.max_delay_ms,
+            cooldown,
+            policy.response_headers_timeout_ms,
+        ] {
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(ms))
+                .ok_or("retry timer is not representable")?;
+        }
+        Ok(policy)
+    }
+}
+
+impl std::str::FromStr for RetryPolicy {
+    type Err = String;
+    fn from_str(json: &str) -> Result<Self, Self::Err> {
+        Self::from_json(json)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(
@@ -46,6 +124,10 @@ don't collide on the bus.\
 "
 )]
 pub struct Config {
+    /// Required closed JSON transport retry policy; Lua configuration owns all values.
+    #[arg(long)]
+    pub retry_policy: RetryPolicy,
+
     /// Per-instance identity used as the event-kind prefix. With
     /// `--name ollama` the plugin emits `ollama.hello`,
     /// `ollama.stream.delta`, … and consumes `ollama.prompt`.
@@ -125,14 +207,145 @@ fn trim_trailing_slash(s: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    const POLICY: &str = r#"{"max_attempts":8,"max_rounds":1,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+
     fn cfg(name: &str) -> Config {
         Config {
+            retry_policy: RetryPolicy::from_json(POLICY).unwrap(),
             provider_name: name.into(),
             base_url: "http://localhost:11434".into(),
             model: Some("qwen2.5-coder:7b".into()),
             api_key: None,
             auth_header: "Authorization".into(),
         }
+    }
+
+    #[test]
+    fn starter_lua_argv_crosses_the_native_checked_parser() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let package: mlua::Table = lua.globals().get("package").unwrap();
+        package.set("path", format!("{0}/examples/nefor-agent/?.lua;{0}/examples/nefor-agent/?/init.lua;{0}/lua/?.lua;{0}/lua/?/init.lua;{0}/plugins/openai-provider/lua/?/init.lua", root.display())).unwrap();
+        let json = lua.create_table().unwrap();
+        json.set(
+            "encode",
+            lua.create_function(|lua, value: mlua::Value| {
+                let value: serde_json::Value = lua.from_value(value)?;
+                serde_json::to_string(&value).map_err(mlua::Error::external)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let nefor = lua.create_table().unwrap();
+        nefor.set("json", json).unwrap();
+        lua.globals().set("nefor", nefor).unwrap();
+        let commands: Vec<Vec<String>> = lua.load(r#"
+            package.loaded["config.distribution"] = {binary=function(name) return name end}
+            local getenv = os.getenv
+            os.getenv = function(key)
+                if key == "NEFOR_ENABLE_OPENROUTER" or key == "NEFOR_ENABLE_OLLAMA" then return "1" end
+                return getenv(key)
+            end
+            local commands = {}
+            local command = require("config.provider_command")
+            for _, p in ipairs(require("config").active.providers) do
+                if p.kind == "openai" then commands[#commands+1] = command.openai("openai-provider", p) end
+            end
+            commands[#commands+1] = command.openai("openai-provider", {
+                name="custom", base_url="http://local", transport_retry={max_attempts=2,max_rounds=3,
+                    initial_delay_ms=0,max_delay_ms=0,round_cooldown_ms=9,jitter_bps=0,response_headers_timeout_ms=30}})
+            return commands
+        "#).eval().and_then(|value| lua.from_value(value)).unwrap();
+        assert_eq!(commands.len(), 3);
+        for (index, command) in commands.iter().enumerate() {
+            let parsed = Config::try_parse_from(command).unwrap();
+            assert_eq!(
+                parsed.retry_policy.max_attempts,
+                if index == 2 { 2 } else { 8 }
+            );
+            assert_eq!(
+                parsed.retry_policy.max_rounds,
+                if index == 2 { 3 } else { 6 }
+            );
+            assert_eq!(
+                command
+                    .iter()
+                    .filter(|value| *value == "--retry-policy")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn retry_policy_is_required_and_closed() {
+        assert!(Config::try_parse_from(["openai-provider"]).is_err());
+        let valid: serde_json::Value = serde_json::from_str(POLICY).unwrap();
+        for field in valid.as_object().unwrap().keys() {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                RetryPolicy::from_json(&missing.to_string()).is_err(),
+                "missing {field}"
+            );
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(true),
+                serde_json::json!("1"),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::from_str("18446744073709551616").unwrap(),
+            ] {
+                let mut malformed = valid.clone();
+                malformed[field] = invalid;
+                assert!(
+                    RetryPolicy::from_json(&malformed.to_string()).is_err(),
+                    "field {field}: {malformed}"
+                );
+            }
+        }
+        let mut extra = valid.clone();
+        extra["unknown"] = serde_json::json!(1);
+        assert!(RetryPolicy::from_json(&extra.to_string()).is_err());
+        for (field, invalid) in [
+            ("max_attempts", 0),
+            ("max_rounds", 0),
+            ("response_headers_timeout_ms", 0),
+            ("jitter_bps", 10001),
+            ("initial_delay_ms", 30001),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[field] = serde_json::json!(invalid);
+            assert!(RetryPolicy::from_json(&malformed.to_string()).is_err());
+        }
+        let mut overflow = valid.clone();
+        overflow["max_attempts"] = serde_json::json!(usize::MAX);
+        overflow["max_rounds"] = serde_json::json!(2);
+        assert!(RetryPolicy::from_json(&overflow.to_string()).is_err());
+        overflow = valid.clone();
+        overflow["round_cooldown_ms"] = serde_json::json!(u64::MAX);
+        overflow["jitter_bps"] = serde_json::json!(10000);
+        assert!(RetryPolicy::from_json(&overflow.to_string()).is_err());
+        assert_eq!(RetryPolicy::from_json(POLICY).unwrap().max_attempts, 8);
+    }
+
+    #[test]
+    fn retry_policy_admits_explicit_zero_delay_and_custom_budgets() {
+        let policy = RetryPolicy::from_json(r#"{"max_attempts":2,"max_rounds":3,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":10000,"response_headers_timeout_ms":1}"#).unwrap();
+        assert_eq!(
+            (
+                policy.max_attempts,
+                policy.max_rounds,
+                policy.initial_delay_ms
+            ),
+            (2, 3, 0)
+        );
+        let args = ["openai-provider", "--retry-policy", POLICY];
+        assert_eq!(
+            Config::try_parse_from(args).unwrap().retry_policy,
+            RetryPolicy::from_json(POLICY).unwrap()
+        );
     }
 
     #[test]
@@ -212,7 +425,8 @@ mod tests {
     /// the env-fallback tests.
     fn parse_clean(args: &[&str]) -> (ScopedEnvVar, Config) {
         let env = ScopedEnvVar::remove("OPENAI_PROVIDER_API_KEY");
-        let mut c = Config::try_parse_from(args).expect("parse args");
+        let mut c = Config::try_parse_from(args.iter().copied().chain(["--retry-policy", POLICY]))
+            .expect("parse args");
         c.normalize();
         (env, c)
     }
@@ -286,7 +500,8 @@ mod tests {
     #[test]
     fn api_key_falls_back_to_env_var() {
         let _env = ScopedEnvVar::set("OPENAI_PROVIDER_API_KEY", "env-secret");
-        let mut c = Config::try_parse_from(["openai-provider"]).expect("parse args");
+        let mut c = Config::try_parse_from(["openai-provider", "--retry-policy", POLICY])
+            .expect("parse args");
         c.normalize();
         assert_eq!(c.api_key.as_deref(), Some("env-secret"));
     }
@@ -294,8 +509,14 @@ mod tests {
     #[test]
     fn explicit_flag_beats_env_var() {
         let _env = ScopedEnvVar::set("OPENAI_PROVIDER_API_KEY", "env-secret");
-        let mut c = Config::try_parse_from(["openai-provider", "--api-key", "flag-secret"])
-            .expect("parse args");
+        let mut c = Config::try_parse_from([
+            "openai-provider",
+            "--api-key",
+            "flag-secret",
+            "--retry-policy",
+            POLICY,
+        ])
+        .expect("parse args");
         c.normalize();
         assert_eq!(c.api_key.as_deref(), Some("flag-secret"));
     }

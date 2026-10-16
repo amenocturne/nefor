@@ -26,15 +26,7 @@ use crate::openai::{
 };
 use crate::wire::WireTrace;
 
-// Retry budget sized for overloaded internal gateways: 8 attempts = 7 retries
-// at 0.5s, 1s, 2s, 4s, 8s, 16s, 30s (doubling, capped) ≈ 60s of patience
-// before the turn fails. It covers connection failures, 429/all 5xx responses,
-// and SSE transport loss before any text, reasoning, or tool-call state exists.
-// A `Retry-After` header overrides the computed delay, and every retry surfaces
-// through RetryProgress so the chat shows what's happening.
-const CHAT_STREAM_MAX_ATTEMPTS: usize = 8;
-const CHAT_STREAM_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
-const CHAT_STREAM_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+use crate::config::RetryPolicy;
 
 /// Outcome of `run_chat_stream`. Carries everything the caller needs to
 /// either finalize the turn (`tool_calls` empty, `finish_reason ==
@@ -64,6 +56,11 @@ pub struct StreamOutcome {
 /// preserved here for tracing/diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
+    #[error("{retry}")]
+    Exhausted {
+        retry: RetryExhaustion,
+        source: Box<StreamError>,
+    },
     #[error("request failed: {0}")]
     Request(String),
     /// 401 specifically — the server rejected our credentials. Surfaced
@@ -149,21 +146,122 @@ pub enum ReasoningEvent<'a> {
     End { text: &'a str },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPhase {
+    Attempt,
+    Round,
+}
+
+impl RetryPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempt",
+            Self::Round => "round",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryCategory {
+    RateLimit,
+    Server,
+    Transport,
+    StreamTransport,
+}
+
+impl RetryCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Server => "server",
+            Self::Transport => "transport",
+            Self::StreamTransport => "stream_transport",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryExhaustionReason {
+    AttemptsExhausted,
+    RoundsExhausted,
+}
+
+impl RetryExhaustionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AttemptsExhausted => "attempts_exhausted",
+            Self::RoundsExhausted => "rounds_exhausted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryProgress {
+    pub phase: RetryPhase,
+    pub round: usize,
+    pub max_rounds: usize,
+    pub next_round: usize,
+    pub next_attempt: usize,
+    pub total_attempts: usize,
+    pub category: RetryCategory,
     pub status: Option<u16>,
     pub failed_attempt: usize,
     pub max_attempts: usize,
     pub next_delay: Duration,
 }
 
-impl RetryProgress {
-    pub fn retry_index(&self) -> usize {
-        self.failed_attempt
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RetryExhaustion {
+    pub reason: RetryExhaustionReason,
+    pub round: usize,
+    pub max_rounds: usize,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub total_attempts: usize,
+    pub category: RetryCategory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+}
 
-    pub fn max_retries(&self) -> usize {
-        self.max_attempts.saturating_sub(1)
+impl std::fmt::Display for RetryExhaustion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: round {}/{} attempt {}/{}; {}{}; {} sends",
+            self.reason.as_str(),
+            self.round,
+            self.max_rounds,
+            self.attempt,
+            self.max_attempts,
+            self.category.as_str(),
+            self.status
+                .map(|status| format!(" HTTP {status}"))
+                .unwrap_or_default(),
+            self.total_attempts
+        )
+    }
+}
+
+impl RetryProgress {
+    pub fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::json!({
+            "phase": self.phase, "round": self.round, "max_rounds": self.max_rounds,
+            "attempt": self.failed_attempt, "max_attempts": self.max_attempts,
+            "next_round": self.next_round, "next_attempt": self.next_attempt,
+            "total_attempts": self.total_attempts, "delay_ms": self.next_delay.as_millis() as u64,
+            "category": self.category,
+            "message": format!("{}{}; round {}/{} attempt {}/{}; next round {} attempt {} in {}ms",
+                self.category.as_str(), self.status.map(|status| format!(" HTTP {status}")).unwrap_or_default(),
+                self.round, self.max_rounds, self.failed_attempt, self.max_attempts,
+                self.next_round, self.next_attempt, self.next_delay.as_millis())
+        }).as_object().cloned().unwrap_or_default();
+        if let Some(status) = self.status {
+            fields.insert("status".into(), status.into());
+        }
+        fields
     }
 }
 
@@ -180,6 +278,7 @@ impl RetryProgress {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_stream<F, R>(
     client: &reqwest::Client,
+    retry_policy: &RetryPolicy,
     endpoint: &str,
     api_key: Option<&str>,
     auth_header: &str,
@@ -197,6 +296,7 @@ where
 {
     run_chat_stream_with_retry_progress(
         client,
+        retry_policy,
         endpoint,
         api_key,
         auth_header,
@@ -215,6 +315,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_stream_with_retry_progress<F, R, P>(
     client: &reqwest::Client,
+    retry_policy: &RetryPolicy,
     endpoint: &str,
     api_key: Option<&str>,
     auth_header: &str,
@@ -234,6 +335,7 @@ where
 {
     run_chat_stream_with_retry_progress_and_format(
         client,
+        retry_policy,
         endpoint,
         api_key,
         auth_header,
@@ -253,6 +355,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_stream_with_retry_progress_and_format<F, R, P>(
     client: &reqwest::Client,
+    retry_policy: &RetryPolicy,
     endpoint: &str,
     api_key: Option<&str>,
     auth_header: &str,
@@ -273,6 +376,7 @@ where
 {
     run_chat_stream_with_retry_progress_and_format_and_additions(
         client,
+        retry_policy,
         endpoint,
         api_key,
         auth_header,
@@ -293,6 +397,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_stream_with_retry_progress_and_format_and_additions<F, R, P>(
     client: &reqwest::Client,
+    retry_policy: &RetryPolicy,
     endpoint: &str,
     api_key: Option<&str>,
     auth_header: &str,
@@ -314,6 +419,7 @@ where
 {
     run_chat_stream_with_retry_progress_and_format_and_additions_and_wire(
         client,
+        retry_policy,
         endpoint,
         api_key,
         auth_header,
@@ -335,6 +441,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_stream_with_retry_progress_and_format_and_wire<F, R, P>(
     client: &reqwest::Client,
+    retry_policy: &RetryPolicy,
     endpoint: &str,
     api_key: Option<&str>,
     auth_header: &str,
@@ -356,6 +463,7 @@ where
 {
     run_chat_stream_with_retry_progress_and_format_and_additions_and_wire(
         client,
+        retry_policy,
         endpoint,
         api_key,
         auth_header,
@@ -377,6 +485,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat_stream_with_retry_progress_and_format_and_additions_and_wire<F, R, P>(
     client: &reqwest::Client,
+    retry_policy: &RetryPolicy,
     endpoint: &str,
     api_key: Option<&str>,
     auth_header: &str,
@@ -427,206 +536,230 @@ where
     }
     wire.begin("POST", endpoint);
 
-    let mut attempt = 1usize;
-    'attempts: loop {
-        let (response, successful_attempt) = {
-            loop {
-                wire.request(attempt, "POST", endpoint, &body_json);
-                let mut builder = client
-                    .post(endpoint)
-                    .header(ACCEPT, "text/event-stream")
-                    .header(ACCEPT_ENCODING, "identity")
-                    .json(&request_value);
-                if let Some(k) = api_key {
-                    builder = apply_auth(builder, auth_header, k);
+    let mut total_attempts = 0;
+    for round in 1..=retry_policy.max_rounds {
+        let mut saw_transient_429 = false;
+        let mut server_not_before: Option<tokio::time::Instant> = None;
+        for attempt in 1..=retry_policy.max_attempts {
+            if cancel.is_cancelled() {
+                return Ok(interrupted(&mut wire, total_attempts));
+            }
+            total_attempts += 1;
+            wire.request(total_attempts, "POST", endpoint, &body_json);
+            let mut builder = client
+                .post(endpoint)
+                .header(ACCEPT, "text/event-stream")
+                .header(ACCEPT_ENCODING, "identity")
+                .json(&request_value);
+            if let Some(key) = api_key {
+                builder = apply_auth(builder, auth_header, key);
+            }
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(interrupted(&mut wire, total_attempts)),
+                sent = tokio::time::timeout(Duration::from_millis(retry_policy.response_headers_timeout_ms), builder.send()) => match sent {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(error)) => Err(StreamError::Request(reqwest_error_detail(&error))),
+                    Err(_) => Err(StreamError::Request(format!("timed out waiting for response headers after {}ms", retry_policy.response_headers_timeout_ms))),
                 }
-
-                let sent = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        wire.cancel(Some(attempt));
-                        return Ok(StreamOutcome {
-                            interrupted: true,
-                            ..Default::default()
-                        });
-                    }
-                    r = tokio::time::timeout(Duration::from_secs(120), builder.send()) => match r {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => Err(StreamError::Request(reqwest_error_detail(&e))),
-                        Err(_) => Err(StreamError::Request(
-                            "timed out waiting for response headers after 120s".to_owned(),
-                        )),
-                    },
-                };
-
-                let response = match sent {
-                    Ok(response) => response,
-                    Err(e) => {
-                        wire.error(Some(attempt), e.to_string());
-                        if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&e) {
-                            let delay = retry_delay(attempt, None);
-                            wire.retry(
-                                attempt,
-                                format!("delay_ms={} error={e}", delay.as_millis()),
-                            );
-                            tracing::warn!(
-                                attempt,
-                                max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
-                                delay_ms = delay.as_millis(),
-                                error = %e,
-                                "chat completion request failed; retrying"
-                            );
-                            on_retry_progress(RetryProgress {
-                                status: None,
-                                failed_attempt: attempt,
-                                max_attempts: CHAT_STREAM_MAX_ATTEMPTS,
-                                next_delay: delay,
-                            });
-                            if !sleep_before_retry(&cancel, delay).await {
-                                wire.cancel(Some(attempt));
-                                return Ok(StreamOutcome {
-                                    interrupted: true,
-                                    ..Default::default()
-                                });
-                            }
-                            attempt += 1;
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                };
-
-                let status = response.status().as_u16();
-                wire.response(attempt, status, response.headers());
-                if response.status().is_success() {
+            };
+            let mut received_retry_after = None;
+            let (error, category, status) = match sent {
+                Err(error) => (error, RetryCategory::Transport, None),
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let received_at = tokio::time::Instant::now();
+                    received_retry_after =
+                        retry_after_delay(response.headers(), std::time::SystemTime::now())
+                            .map(|delay| (received_at, delay));
+                    wire.response(total_attempts, status, response.headers());
                     let content_type = response
                         .headers()
                         .get(CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("<missing>")
                         .to_owned();
-                    if !content_type.split(';').next().is_some_and(|media_type| {
-                        media_type.trim().eq_ignore_ascii_case("text/event-stream")
-                    }) {
-                        let body_bytes = response
-                            .bytes()
-                            .await
-                            .map(|bytes| bytes.to_vec())
-                            .unwrap_or_else(|_| b"<unreadable response body>".to_vec());
-                        wire.response_body(attempt, &body_bytes);
-                        let body = String::from_utf8_lossy(&body_bytes);
-                        let error = StreamError::Malformed(format!(
-                            "expected streaming SSE response with Content-Type text/event-stream, got {content_type:?}: {}",
-                            response_snippet(&body)
-                        ));
-                        wire.error(Some(attempt), error.to_string());
-                        return Err(error);
+                    if response.status().is_success()
+                        && content_type.split(';').next().is_some_and(|media| {
+                            media.trim().eq_ignore_ascii_case("text/event-stream")
+                        })
+                    {
+                        match consume_response_stream(
+                            response,
+                            total_attempts,
+                            &cancel,
+                            &mut on_delta,
+                            &mut on_reasoning,
+                            &mut wire,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => return Ok(outcome),
+                            Err(failure) if failure.replay_safe => {
+                                (failure.error, RetryCategory::StreamTransport, None)
+                            }
+                            Err(failure) => {
+                                wire.error(Some(total_attempts), failure.error.to_string());
+                                return Err(failure.error);
+                            }
+                        }
+                    } else {
+                        let success = response.status().is_success();
+                        let body_bytes = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Ok(interrupted(&mut wire, total_attempts)),
+                            bytes = response.bytes() => bytes.map(|bytes| bytes.to_vec()).unwrap_or_else(|_| b"<unreadable response body>".to_vec()),
+                        };
+                        wire.response_body(total_attempts, &body_bytes);
+                        let body = String::from_utf8_lossy(&body_bytes).into_owned();
+                        if success {
+                            let error = StreamError::Malformed(format!(
+                                "expected streaming SSE response with Content-Type text/event-stream, got {content_type:?}: {}",
+                                response_snippet(&body)
+                            ));
+                            wire.error(Some(total_attempts), error.to_string());
+                            return Err(error);
+                        }
+                        if status == 401 {
+                            wire.error(Some(total_attempts), "HTTP 401".into());
+                            return Err(StreamError::Unauthorized { body });
+                        }
+                        if status == 400 && tools.is_some() && body_signals_tools_unsupported(&body)
+                        {
+                            wire.error(Some(total_attempts), "HTTP 400 tools unsupported".into());
+                            return Err(StreamError::ToolsUnsupported { body });
+                        }
+                        if response_signals_terminal_quota_denial(status, &body)
+                            || !(status == 429 || (500..600).contains(&status))
+                        {
+                            wire.error(Some(total_attempts), format!("HTTP {status}"));
+                            return Err(StreamError::Http { status, body });
+                        }
+                        saw_transient_429 |= status == 429;
+                        (
+                            StreamError::Http { status, body },
+                            if status == 429 {
+                                RetryCategory::RateLimit
+                            } else {
+                                RetryCategory::Server
+                            },
+                            Some(status),
+                        )
                     }
-                    break (response, attempt);
                 }
-
-                let retry_after = retry_after_delay(response.headers());
-                let body_bytes = match response.bytes().await {
-                    Ok(bytes) => bytes.to_vec(),
-                    Err(_) => b"<unreadable response body>".to_vec(),
-                };
-                wire.response_body(attempt, &body_bytes);
-                let body = String::from_utf8_lossy(&body_bytes).into_owned();
-                if status == 401 {
-                    wire.error(Some(attempt), format!("HTTP {status}"));
-                    return Err(StreamError::Unauthorized { body });
-                }
-                // Reactive fallback: only meaningful when the request actually
-                // carried tools. If we sent no tools and still got the signature,
-                // the server is telling us something else — fall through to Http.
-                if status == 400 && tools.is_some() && body_signals_tools_unsupported(&body) {
-                    wire.error(Some(attempt), "HTTP 400 tools unsupported".to_owned());
-                    return Err(StreamError::ToolsUnsupported { body });
-                }
-                let terminal_quota_denial = response_signals_terminal_quota_denial(status, &body);
-                let err = StreamError::Http { status, body };
-                if attempt < CHAT_STREAM_MAX_ATTEMPTS
-                    && stream_error_is_retriable(&err)
-                    && !terminal_quota_denial
-                {
-                    let delay = retry_delay(attempt, retry_after);
-                    wire.retry(
-                        attempt,
-                        format!("delay_ms={} HTTP {status}", delay.as_millis()),
-                    );
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
-                        delay_ms = delay.as_millis(),
-                        error = %err,
-                        "chat completion returned retriable HTTP status; retrying"
-                    );
-                    on_retry_progress(RetryProgress {
-                        status: Some(status),
-                        failed_attempt: attempt,
-                        max_attempts: CHAT_STREAM_MAX_ATTEMPTS,
-                        next_delay: delay,
-                    });
-                    if !sleep_before_retry(&cancel, delay).await {
-                        wire.cancel(Some(attempt));
-                        return Ok(StreamOutcome {
-                            interrupted: true,
-                            ..Default::default()
-                        });
-                    }
-                    attempt += 1;
-                    continue;
-                }
-                wire.error(Some(attempt), err.to_string());
-                return Err(err);
+            };
+            if cancel.is_cancelled() {
+                return Ok(interrupted(&mut wire, total_attempts));
             }
-        };
-
-        match consume_response_stream(
-            response,
-            successful_attempt,
-            &cancel,
-            &mut on_delta,
-            &mut on_reasoning,
-            &mut wire,
-        )
-        .await
-        {
-            Ok(outcome) => return Ok(outcome),
-            Err(failure) => {
-                wire.error(Some(successful_attempt), failure.error.to_string());
-                if failure.replay_safe && attempt < CHAT_STREAM_MAX_ATTEMPTS {
-                    let delay = retry_delay(attempt, None);
-                    wire.retry(
-                        attempt,
-                        format!("delay_ms={} error={}", delay.as_millis(), failure.error),
-                    );
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
-                        delay_ms = delay.as_millis(),
-                        error = %failure.error,
-                        "chat completion stream failed before output; retrying"
-                    );
-                    on_retry_progress(RetryProgress {
-                        status: None,
-                        failed_attempt: attempt,
-                        max_attempts: CHAT_STREAM_MAX_ATTEMPTS,
-                        next_delay: delay,
-                    });
-                    if !sleep_before_retry(&cancel, delay).await {
-                        wire.cancel(Some(attempt));
-                        return Ok(StreamOutcome {
-                            interrupted: true,
-                            ..Default::default()
-                        });
-                    }
-                    attempt += 1;
-                    continue 'attempts;
-                }
-                return Err(failure.error);
+            wire.error(Some(total_attempts), error.to_string());
+            let exhausted = attempt == retry_policy.max_attempts;
+            let phase = if exhausted {
+                RetryPhase::Round
+            } else {
+                RetryPhase::Attempt
+            };
+            let metadata = RetryExhaustion {
+                reason: if exhausted && saw_transient_429 {
+                    RetryExhaustionReason::RoundsExhausted
+                } else {
+                    RetryExhaustionReason::AttemptsExhausted
+                },
+                round,
+                max_rounds: retry_policy.max_rounds,
+                attempt,
+                max_attempts: retry_policy.max_attempts,
+                total_attempts,
+                category,
+                status,
+            };
+            if exhausted && (!saw_transient_429 || round == retry_policy.max_rounds) {
+                return Err(StreamError::Exhausted {
+                    retry: metadata,
+                    source: Box::new(error),
+                });
+            }
+            if let Some((received_at, delay)) = received_retry_after {
+                // A valid but unrepresentable deadline must fail closed,
+                // not silently permit a send before the server's deadline.
+                let deadline = received_at
+                    .checked_add(delay)
+                    .filter(|_| delay.as_millis() <= u128::from(u64::MAX))
+                    .ok_or_else(|| {
+                        StreamError::Malformed("Retry-After deadline is not representable".into())
+                    })?;
+                server_not_before =
+                    Some(server_not_before.map_or(deadline, |old| old.max(deadline)));
+            }
+            let local_delay = retry_policy.local_delay(attempt, exhausted, random_sample());
+            let remaining = server_not_before
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .unwrap_or_default();
+            let delay = local_delay.max(remaining);
+            on_retry_progress(RetryProgress {
+                phase,
+                round,
+                max_rounds: retry_policy.max_rounds,
+                failed_attempt: attempt,
+                max_attempts: retry_policy.max_attempts,
+                next_round: if exhausted { round + 1 } else { round },
+                next_attempt: if exhausted { 1 } else { attempt + 1 },
+                total_attempts,
+                category,
+                status,
+                next_delay: delay,
+            });
+            wire.retry(
+                total_attempts,
+                format!("phase={} delay_ms={}", phase.as_str(), delay.as_millis()),
+            );
+            if !sleep_before_retry(&cancel, delay).await {
+                return Ok(interrupted(&mut wire, total_attempts));
             }
         }
+    }
+    unreachable!("validated nonzero retry rounds always return a result")
+}
+
+fn interrupted(wire: &mut WireTrace, attempt: usize) -> StreamOutcome {
+    wire.cancel((attempt > 0).then_some(attempt));
+    StreamOutcome {
+        interrupted: true,
+        ..Default::default()
+    }
+}
+
+fn random_sample() -> u64 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[10], bytes[11],
+    ])
+}
+
+impl RetryPolicy {
+    fn local_delay(&self, attempt: usize, outer: bool, sample: u64) -> Duration {
+        let base = if outer {
+            self.round_cooldown_ms
+        } else {
+            self.initial_delay_ms
+                .saturating_mul(
+                    1u64.checked_shl(attempt.saturating_sub(1).try_into().unwrap_or(u32::MAX))
+                        .unwrap_or(u64::MAX),
+                )
+                .min(self.max_delay_ms)
+        };
+        // Divide before multiplying the sample so even the largest admitted timer cannot overflow.
+        let scaled = u128::from(base) * u128::from(self.jitter_bps);
+        let sample = u128::from(sample);
+        let denominator = u128::from(u64::MAX);
+        let product = (scaled / 10000) * sample;
+        let jitter = product / denominator
+            + ((product % denominator) * 10000 + (scaled % 10000) * sample) / (denominator * 10000);
+        let delay = u128::from(base) + jitter;
+        Duration::from_millis(if outer {
+            delay as u64
+        } else {
+            delay.min(u128::from(self.max_delay_ms)) as u64
+        })
     }
 }
 
@@ -666,6 +799,7 @@ where
 
     loop {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 wire.cancel(Some(successful_attempt));
                 outcome.interrupted = true;
@@ -749,39 +883,14 @@ fn response_snippet(body: &str) -> String {
     snippet
 }
 
-fn stream_error_is_retriable(err: &StreamError) -> bool {
-    match err {
-        StreamError::Request(_) => true,
-        StreamError::Http { status, .. } => *status == 429 || (500..600).contains(status),
-        StreamError::Unauthorized { .. }
-        | StreamError::ToolsUnsupported { .. }
-        | StreamError::Body(_)
-        | StreamError::Malformed(_)
-        | StreamError::Provider { .. }
-        | StreamError::Refusal(_)
-        | StreamError::IncompleteToolCall { .. } => false,
-    }
-}
-
-fn retry_delay(failed_attempt: usize, retry_after: Option<Duration>) -> Duration {
-    retry_after.unwrap_or_else(|| exponential_retry_delay(failed_attempt))
-}
-
-fn exponential_retry_delay(failed_attempt: usize) -> Duration {
-    let factor = 1u32
-        .checked_shl(failed_attempt.saturating_sub(1) as u32)
-        .unwrap_or(u32::MAX);
-    CHAT_STREAM_INITIAL_RETRY_DELAY
-        .saturating_mul(factor)
-        .min(CHAT_STREAM_MAX_RETRY_DELAY)
-}
-
-fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+fn retry_after_delay(
+    headers: &reqwest::header::HeaderMap,
+    now: std::time::SystemTime,
+) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    let now = std::time::SystemTime::now();
     let when = httpdate::parse_http_date(value).ok()?;
     Some(when.duration_since(now).unwrap_or(Duration::ZERO))
 }
@@ -1198,6 +1307,78 @@ impl ToolCallAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selected_policy() -> RetryPolicy {
+        RetryPolicy::from_json(r#"{"max_attempts":8,"max_rounds":6,"initial_delay_ms":500,"max_delay_ms":30000,"round_cooldown_ms":60000,"jitter_bps":1000,"response_headers_timeout_ms":120000}"#).unwrap()
+    }
+
+    #[test]
+    fn local_delay_has_additive_jitter_caps_and_independent_outer_cooldown() {
+        let policy = selected_policy();
+        assert_eq!(policy.local_delay(1, false, 0), Duration::from_millis(500));
+        assert_eq!(
+            policy.local_delay(1, false, u64::MAX),
+            Duration::from_millis(550)
+        );
+        assert_eq!(
+            policy.local_delay(2, false, u64::MAX),
+            Duration::from_millis(1100)
+        );
+        assert_eq!(
+            policy.local_delay(8, false, u64::MAX),
+            Duration::from_millis(30000)
+        );
+        assert_eq!(
+            policy.local_delay(usize::MAX, false, u64::MAX),
+            Duration::from_millis(30000)
+        );
+        assert_eq!(policy.local_delay(8, true, 0), Duration::from_millis(60000));
+        assert_eq!(
+            policy.local_delay(8, true, u64::MAX),
+            Duration::from_millis(66000)
+        );
+        let mut no_jitter = policy.clone();
+        no_jitter.jitter_bps = 0;
+        assert_eq!(
+            no_jitter.local_delay(1, false, u64::MAX),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            no_jitter.local_delay(8, true, u64::MAX),
+            Duration::from_millis(60000)
+        );
+        // Fractional basis-point products are rounded only after sampling.
+        let mut fractional = policy;
+        fractional.initial_delay_ms = 19;
+        fractional.jitter_bps = 1000;
+        assert_eq!(
+            fractional.local_delay(1, false, u64::MAX / 4 * 3),
+            Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_dates_but_does_not_define_local_delay() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1700000000);
+        for (text, expected) in [
+            ("0", Some(Duration::ZERO)),
+            ("120", Some(Duration::from_secs(120))),
+            ("bad", None),
+            ("-1", None),
+            ("Wed, 21 Oct 2015 07:28:00 GMT", Some(Duration::ZERO)),
+        ] {
+            headers.insert(RETRY_AFTER, text.parse().unwrap());
+            assert_eq!(retry_after_delay(&headers, now), expected);
+        }
+        let future = now + Duration::from_secs(120);
+        headers.insert(
+            RETRY_AFTER,
+            httpdate::fmt_http_date(future).parse().unwrap(),
+        );
+        let delay = retry_after_delay(&headers, now).unwrap();
+        assert_eq!(delay, Duration::from_secs(120));
+    }
 
     fn bytes(s: &str) -> SseBuffer {
         let mut buffer = SseBuffer::new();

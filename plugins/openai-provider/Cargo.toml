@@ -62,8 +62,9 @@ uuid = { version = "1", features = ["v4"] }
 clap = { workspace = true, features = ["env"] }
 
 [dev-dependencies]
+mlua = { workspace = true }
 nefor-mag = { path = "../../crates/nefor-mag" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

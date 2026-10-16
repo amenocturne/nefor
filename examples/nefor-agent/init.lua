@@ -269,18 +269,8 @@ for _, p in ipairs(cfg.providers or {}) do
       { agentic_loop = agentic_loop, conversations = conversation_reader }
     ))
   elseif p.kind == "openai" then
-    local provider_command = {
-      require("config").bin("openai-provider"),
-      "--name",     p.name,
-      "--base-url", p.base_url,
-    }
-    if p.model then
-      table.insert(provider_command, "--model")
-      table.insert(provider_command, p.model)
-    end
-    for _, a in ipairs(p.extra_args or {}) do
-      table.insert(provider_command, a)
-    end
+    local provider_command = require("config.provider_command").openai(
+      require("config").bin("openai-provider"), p)
     actor.spawn(provider.spawn_spec(
       p.name,
       provider_command,

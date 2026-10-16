@@ -54,16 +54,76 @@ Legacy `<prefix>.prompt`, `<prefix>.interrupt`, and `<prefix>.reset` remain as d
 
 ## Configuration
 
-Four CLI flags, all optional:
+Each native instance requires `--retry-policy <JSON>`; the other flags select its endpoint, model and identity.
 
 | Flag               | Default                  | Notes                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--retry-policy <JSON>` | required | Explicit seven-field transport budget described below; no native defaults. |
+| `--auth-header <NAME>` | `Authorization` | Custom authentication header; nonstandard headers send the key without a Bearer prefix. |
 | `--name <NAME>`    | `openai`                 | Per-instance identity. Used as the event-kind prefix (`<name>.hello`, `<name>.stream.delta`, ...).                                                                                                                                                                                                                                                                                                            |
 | `--base-url <URL>` | `http://localhost:11434` | OpenAI-compatible base. Trailing slash trimmed automatically; the plugin appends `/v1/chat/completions`.                                                                                                                                                                                                                                                                                                      |
 | `--model <MODEL>`  | --                       | Model id passed verbatim in the request body. Optional -- omitting it means `chat.create` without a model fails with `NoModelConfigured` until one is set via `/model`.                                                                                                                                                                                                                                       |
 | `--api-key <KEY>`  | --                       | Initial bearer token. Falls back to the `OPENAI_PROVIDER_API_KEY` env var (so secrets can stay out of `init.lua`). When set, plugin starts in `auth_state = connected`; when unset, `login_required` (chat will prompt the user to `/login`). For local providers like Ollama that don't actually need credentials, leave it unset and ignore the `login_required` status -- request still goes through fine. |
 
 Why CLI flags and not env vars: the engine's `nefor.plugins.spawn` API does not propagate per-instance env to children. CLI args ride the command line straight through. `--api-key` keeps an env-var fallback because real users want to set secrets through the shell, not by editing `init.lua`.
+
+## Transport retry policy
+
+Lua configuration owns every value. The starter chooses the following policy
+once and attaches it to its OpenAI-compatible provider entries; these are example
+settings, not defaults compiled into the plugin:
+
+```lua
+local transport_retry = {
+  max_attempts = 8, max_rounds = 6,
+  initial_delay_ms = 500, max_delay_ms = 30000,
+  round_cooldown_ms = 60000, jitter_bps = 1000,
+  response_headers_timeout_ms = 120000,
+}
+local args = require("openai-provider").retry_args(transport_retry)
+-- Append both args to this instance's native command exactly once.
+```
+
+`retry_args` returns `{ "--retry-policy", nefor.json.encode(policy) }` without
+mutating or filling the table. Native parsing rejects missing/unknown fields,
+noninteger or negative values, zero counts/header timeout, reversed delay bounds,
+jitter outside 0–10000 basis points, and unrepresentable budgets/timers. Zero
+local delays and zero jitter are explicit supported settings. All public Rust
+`run_chat_stream*` functions require a checked `&RetryPolicy` immediately after
+the client; `RetryPolicy::from_json` is the public construction boundary.
+
+Each send consumes one attempt from one shared per-round counter: connection or
+header failure, transient HTTP 429/all 5xx, and SSE transport loss **before** any
+text, reasoning continuation or tool-call state. Permanent quota/billing denials,
+other HTTP errors and semantic/malformed in-band failures do not replay. Only an
+exhausted round that saw a transient 429 may open another round; that evidence is
+retained across mixed retryable failures but reset at each new round. No agent
+turn, completed tool or conversation context is restarted.
+
+Inner delays double from `initial_delay_ms` and cap locally at `max_delay_ms`.
+`jitter_bps` adds uniformly sampled jitter (1000 means up to 10%); the local inner
+cap still applies. Exhausted eligible rounds use one `round_cooldown_ms` plus
+additive jitter instead of an additional inner wait. Valid Retry-After seconds
+or HTTP dates are a minimum server not-before deadline, never shortened by the
+local cap or a zero/past header; body-read time counts toward that deadline.
+The selected 8×6 policy therefore permits exactly 48 sends, 42 inner waits and 5
+round waits under persistent transient 429, with no final wait. Pure 5xx or
+connection failure gets one round only. This is a per-transport-invocation bound,
+not an elapsed deadline or an overall bound across independent auth or
+unsupported-tools fallback invocations. ChatGPT transport and tool timeouts are
+separate.
+
+Cancellation interrupts both waits, header acquisition, error/non-SSE body
+reads and SSE consumption. Header timeout applies anew to every send.
+`completion.event` with `event="retry"` and legacy `<prefix>.stream.retry` carry
+`phase`, `round`, `max_rounds`, `attempt`, `max_attempts`, `next_round`,
+`next_attempt`, `total_attempts`, `delay_ms`, `category`, optional `status`, and a
+safe `message`. Categories are `rate_limit`, `server`, `transport`, and
+`stream_transport`; notices never contain raw server bodies. Both routes produce
+visible toasts, with canonical notices correlated only to pending current-session
+requests. Budget errors add `retry` metadata with the same counters/category and
+`reason="attempts_exhausted"|"rounds_exhausted"`; cancellation has no exhaustion
+metadata. Nonbudget errors keep their existing classification.
 
 ## Opt-in raw wire logging
 
@@ -91,7 +151,7 @@ the request builder and credential headers are never debug-formatted.
 
 ## Example configurations
 
-The defaults match a local Ollama install. Override the four flags per spawn for everything else.
+Select the endpoint/model and an explicit transport policy per native instance.
 
 | Provider       | `--base-url`                  | Example `--model`                   | Auth                                    |
 | -------------- | ----------------------------- | ----------------------------------- | --------------------------------------- |
@@ -104,14 +164,16 @@ The defaults match a local Ollama install. Override the four flags per spawn for
 Example spawn (Lua):
 
 ```lua
+local command = {
+  bin("openai-provider"), "--name", "ollama",
+  "--base-url", "http://localhost:11434", "--model", "phi4-mini:latest",
+}
+for _, arg in ipairs(require("openai-provider").retry_args(transport_retry)) do
+  command[#command + 1] = arg
+end
 ncp.spawn {
   name    = "ollama",
-  command = {
-    bin("openai-provider"),
-    "--name",     "ollama",
-    "--base-url", "http://localhost:11434",
-    "--model",    "phi4-mini:latest",
-  },
+  command = command,
   from_plugin = ollama.from_plugin,
   to_plugin   = ollama.to_plugin,
 }
