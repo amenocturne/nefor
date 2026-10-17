@@ -60,6 +60,20 @@ Source installation also prepares the starter’s Lua dependencies. See the cano
 [source-install prerequisites](docs/source-install.md) for installed programs,
 version-aware Lua/OpenSSL discovery, preflight and declared network inputs.
 
+### Build a release archive
+
+To build a native runtime archive from this checkout, run `just package`
+with a supported host target and a new output directory:
+
+```sh
+just package aarch64-apple-darwin tmp/package
+```
+
+This creates `tmp/package/nefor-aarch64-apple-darwin.tar.gz` and its SHA-256
+sidecar. The command builds the complete runtime and dependencies; official
+releases use the same command, pinned to the release commit. See the
+[packaging prerequisites and details](docs/source-install.md#pinned-native-runtime-packaging).
+
 `just install` builds the engine and plugin binaries, then copies the starter
 composition to `~/.config/nefor`. Use lower-level targets when needed:
 
