@@ -13,9 +13,9 @@
 --
 -- What outlives turns lives in conversation-manager. This actor caches only
 -- its universal context projection and never folds provider or MAG facts.
--- What remains HERE is queueing/orchestration — queued-message promotion while busy, the
---     deferred relay queue for dispatched-run completions
---     (lead-workflow → relay_run_completion), model/profile switching, the
+-- What remains HERE is queueing/orchestration — one arrival-order selector over
+--     human and dispatched-run completion payloads, correlated provider-boundary
+--     delivery, model/profile switching, and the
 --     statusline runtime states.
 --
 -- Kernel wire ids remain run-scoped (`r<K>/…`). Their prefix is private
@@ -112,9 +112,12 @@ local state = {
   current_run_id = nil,         ---@type string|nil
   -- The in-flight turn: { run_id, user_text, scope }.
   current_turn   = nil,         ---@type table|nil
+  arrival_sequence = 0,
+  delivered_runs = {},
+  delivery_paused = false,
   deferred_queue       = {},    ---@type table  queued relay texts { text }
   pending_user_inputs  = {},    ---@type table  queued submits while busy
-  pending_steer        = nil,   ---@type table|nil queued inputs awaiting MAG steer ack
+  pending_steer        = nil,   ---@type table|nil delivery groups awaiting canonical receipts
 
   -- Observer registries. Public on_* setters append; producers fire via
   -- pcall so a bad observer doesn't break the chain.
@@ -460,6 +463,8 @@ local function ensure_lead_program_loaded()
 end
 
 local flush_pending_user_inputs
+local steer_pending_inputs
+local settle_pending_steer
 local handle_execute_rejection
 
 local function release_lead_program()
@@ -555,38 +560,16 @@ end
 -- canonical conversation identity onto the lead llm actor, and submits
 -- `mag.execute`. The provider actor reads history from conversation-manager;
 -- duplicating it in this persisted command would make session growth quadratic.
-local function submit_orchestrator_run(user_text, submission_ids, input_cause, release_obligations)
-  if state.current_run_id ~= nil then return nil end
-  local ready, readiness_status = provider_ready()
-  if not ready then
-    if readiness_status == "pending" then
-      state.pending_user_inputs[#state.pending_user_inputs + 1] = {
-        text = user_text, submission_ids = submission_ids or {},
-      }
-      ensure_conversation_id()
-      ensure_lead_program_loaded()
-    end
-    return nil
-  end
+local function submit_orchestrator_run(user_text, submission_ids, input_cause, release_obligations, delivery_id, intake, initial_messages)
+  assert(state.current_run_id == nil, "lead intake dispatched while busy")
   local conversation_id = ensure_conversation_id()
-  if not conversation_ready() then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = user_text, submission_ids = submission_ids or {} }
-    ensure_lead_program_loaded()
-    return nil
-  end
   local p = state.lead_program
-  if p.artifact == nil then
-    -- Program not compiled yet: queue the text and (re)kick the load; the
-    -- mag.loaded reply flushes the queue.
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = user_text, submission_ids = submission_ids or {} }
-    ensure_lead_program_loaded()
-    return nil
-  end
-
   local overlay_params = {
     conversation_id = conversation_id,
     submission_ids = submission_ids,
     input_cause = input_cause,
+    delivery_id = delivery_id,
+    initial_messages = initial_messages,
     authored_prompt = input_cause == nil and user_text or nil,
   }
   if type(state.config.provider) == "string" and #state.config.provider > 0 then
@@ -623,6 +606,7 @@ local function submit_orchestrator_run(user_text, submission_ids, input_cause, r
     manager_terminal = false,
     result_body = nil,
     request_ids = RequestLifecycle.copy_ids(submission_ids),
+    intake = intake,
   }
   local sessions = require("libs.sessions")
   local turn_obligation = "turn:" .. run_id
@@ -669,77 +653,103 @@ local function submit_orchestrator_run(user_text, submission_ids, input_cause, r
   return run_id
 end
 
--- Drain the WHOLE deferred queue into one text: every run completion that
--- arrived while the lead was busy rides a single relay turn (separated so
--- each block stays readable) instead of costing one provider turn each — a
--- burst of detached eval completions would otherwise replay the full history
--- once per result.
-local function drain_deferred_text()
-  if #state.deferred_queue == 0 then return nil end
-  local parts, request_ids, obligations = {}, {}, {}
-  for _, entry in ipairs(state.deferred_queue) do
-    if type(entry.text) == "string" and #entry.text > 0 then
-      parts[#parts + 1] = entry.text
-    end
-    for _, request_id in ipairs(entry.request_ids or {}) do
-      request_ids[#request_ids + 1] = request_id
-    end
-    if entry.obligation_id ~= nil then
-      obligations[#obligations + 1] = {
-        id = entry.obligation_id,
-        request_ids = entry.request_ids or {},
-      }
-    end
-  end
-  state.deferred_queue = {}
-  if #parts == 0 then return nil end
-  return table.concat(parts, "\n\n---\n\n"),
-    RequestLifecycle.copy_ids(request_ids), obligations
+-- Arrival is first acceptance in this serialized destination owner. The two
+-- payload stores share ONE selector; retries never receive a new ordinal.
+local function enqueue(queue, item)
+  state.arrival_sequence = state.arrival_sequence + 1
+  item.arrival = state.arrival_sequence
+  item.delivery_id = "lead-delivery-" .. envelope.uuid_lite()
+  queue[#queue + 1] = item
 end
 
--- Deferred relay queue. Carries any text that needs to land as the next
--- turn's user-role task: dispatched kernel-run completion bodies relayed
--- by lead-workflow (relay_run_completion).
-local function flush_deferred()
-  if state.current_run_id ~= nil then return end
-  if conversation_commit_pending() or not conversation_ready() then return end
+local function next_queue()
+  local human, completion = state.pending_user_inputs[1], state.deferred_queue[1]
+  if human == nil then return state.deferred_queue, "completion" end
+  if completion == nil or human.arrival < completion.arrival then
+    return state.pending_user_inputs, "human"
+  end
+  return state.deferred_queue, "completion"
+end
+
+local function take_prefix()
+  local queue, kind = next_queue()
+  if #queue == 0 then return nil end
+  local other = kind == "human" and state.deferred_queue or state.pending_user_inputs
+  local items, texts, request_ids, obligations = {}, {}, {}, {}
+  while queue[1] and (not other[1] or queue[1].arrival < other[1].arrival) do
+    local item = table.remove(queue, 1)
+    items[#items + 1] = item
+    texts[#texts + 1] = item.text
+    for _, id in ipairs(item.submission_ids or item.request_ids or {}) do
+      request_ids[#request_ids + 1] = id
+      if kind == "human" then obligations[#obligations + 1] = { id = "input:" .. id, request_ids = { id } } end
+    end
+    if item.obligation_id then
+      obligations[#obligations + 1] = { id = item.obligation_id, request_ids = item.request_ids }
+    end
+  end
+  return { kind = kind, items = items, text = table.concat(texts, kind == "human" and "\n" or "\n\n---\n\n"),
+    request_ids = RequestLifecycle.copy_ids(request_ids), obligations = obligations,
+    delivery_id = items[1].delivery_id }
+end
+
+local function restore_prefix(pending)
+  if pending.dropped then return end
+  local queue = pending.kind == "human" and state.pending_user_inputs or state.deferred_queue
+  for _, item in ipairs(pending.items) do
+    local ids_for_item, retained = item.submission_ids or item.request_ids or {}, {}
+    for _, id in ipairs(ids_for_item) do
+      if request_lifecycle:is_forced(id) then
+        request_lifecycle:release(id, item.obligation_id or ("input:" .. id))
+      else retained[#retained + 1] = id end
+    end
+    if #ids_for_item == 0 or #retained > 0 then
+      if item.submission_ids then item.submission_ids = retained else item.request_ids = retained end
+      queue[#queue + 1] = item
+    end
+  end
+  table.sort(queue, function(a, b) return a.arrival < b.arrival end)
+end
+
+local function flush_intake()
+  if state.delivery_paused then return end
+  if state.current_run_id ~= nil then
+    local turn = state.current_turn
+    if turn and turn.started and not turn.stopping and
+        (turn.auto_steer or #state.deferred_queue > 0) then steer_pending_inputs() end
+    return
+  end
+  if state.pending_steer or conversation_commit_pending() or not conversation_ready() then return end
   if state.lead_program.artifact == nil or not provider_ready() then return end
-  local merged, request_ids, obligations = drain_deferred_text()
-  if type(merged) ~= "string" then return end
-  nefor.log.info("agentic-loop: flushing deferred run completions", {
-    text_preview = string.sub(merged, 1, 80),
-  })
-  submit_orchestrator_run(merged, request_ids, "internal_async_completion", obligations)
+  local groups, messages, request_ids, obligations = {}, {}, {}, {}
+  local task, human_task
+  while true do
+    local group = take_prefix()
+    if not group then break end
+    groups[#groups + 1] = group
+    task = task or group.text
+    if group.kind == "human" then human_task = group.text end
+    for _, id in ipairs(group.request_ids) do request_ids[#request_ids + 1] = id end
+    for _, obligation in ipairs(group.obligations) do obligations[#obligations + 1] = obligation end
+    messages[#messages + 1] = { role = "user", content = group.text,
+      submission_ids = group.request_ids, delivery_id = group.delivery_id,
+      input_cause = group.kind == "completion" and "internal_async_completion" or nil,
+      authored_prompt = group.kind == "human" and group.text or nil }
+  end
+  if #groups == 0 then return end
+  -- The task retains the authored human intent, when present. Context remains
+  -- separate messages in arrival order; no completion masquerades as that task.
+  local run = submit_orchestrator_run(human_task or task, RequestLifecycle.copy_ids(request_ids),
+    not human_task and "internal_async_completion" or nil, obligations, nil, { groups = groups }, messages)
+  if run and state.current_turn then
+    for _, group in ipairs(groups) do
+      if group.kind == "completion" then state.current_turn.auto_steer = true end
+    end
+  end
 end
 
-flush_pending_user_inputs = function()
-  if state.current_run_id ~= nil then return end
-  if conversation_commit_pending() or not conversation_ready() then return end
-  if state.lead_program.artifact == nil then return end
-  if #state.pending_user_inputs == 0 then return end
-  if not provider_ready() then return end
-  local inputs = state.pending_user_inputs
-  local texts, submission_ids = {}, {}
-  for _, input in ipairs(inputs) do
-    texts[#texts + 1] = input.text
-    for _, id in ipairs(input.submission_ids or {}) do submission_ids[#submission_ids + 1] = id end
-  end
-  local combined = table.concat(texts, "\n")
-  nefor.log.info("agentic-loop: flushing queued user inputs", {
-    count = #inputs,
-    text_preview = string.sub(combined, 1, 80),
-  })
-  state.pending_user_inputs = {}
-  emit("nefor-tui", { kind = "chat.queue.steered" })
-  local obligations = {}
-  for _, request_id in ipairs(RequestLifecycle.copy_ids(submission_ids)) do
-    obligations[#obligations + 1] = {
-      id = "input:" .. request_id,
-      request_ids = { request_id },
-    }
-  end
-  submit_orchestrator_run(combined, submission_ids, nil, obligations)
-end
+local function flush_deferred() flush_intake() end
+flush_pending_user_inputs = flush_intake
 
 -- ── interrupt = kill ──────────────────────────────────────────────────
 
@@ -791,9 +801,11 @@ end
 local function discard_pending_inputs()
   local inputs = state.pending_user_inputs
   state.pending_user_inputs = {}
-  if state.pending_steer then
-    for _, input in ipairs(state.pending_steer.inputs) do inputs[#inputs + 1] = input end
-    state.pending_steer = nil
+  for _, group in ipairs(state.pending_steer and state.pending_steer.groups or {}) do
+    if group.kind == "human" then
+      group.dropped = true
+      for _, input in ipairs(group.items) do inputs[#inputs + 1] = input end
+    end
   end
   for _, input in ipairs(inputs) do
     for _, request_id in ipairs(input.submission_ids or {}) do
@@ -805,69 +817,104 @@ local function discard_pending_inputs()
   end
 end
 
--- Abort the current lead turn. When requested by the TUI's hard-stop paths,
--- queued input has already been restored to the prompt and must not respawn.
 local function cancel(drop_queued)
-  if drop_queued or state.current_run_id == nil then
-    discard_pending_inputs()
-  end
+  state.delivery_paused = true
+  if state.current_turn then state.current_turn.stopping = true end
+  if drop_queued or state.current_run_id == nil then discard_pending_inputs() end
   kill_active_lead_run()
 end
 
-local function steer_pending_inputs()
-  if state.current_run_id == nil or state.pending_steer ~= nil then return false end
-  if #state.pending_user_inputs == 0 then return false end
-  local inputs = state.pending_user_inputs
-  state.pending_user_inputs = {}
-  local texts, submission_ids = {}, {}
-  for _, input in ipairs(inputs) do
-    texts[#texts + 1] = input.text
-    for _, id in ipairs(input.submission_ids or {}) do submission_ids[#submission_ids + 1] = id end
+steer_pending_inputs = function()
+  local turn = state.current_turn
+  if turn == nil or turn.stopping or turn.steer_rejected
+      or (state.pending_steer and state.pending_steer.awaiting_ack) then return false end
+  local groups, messages = {}, {}
+  while true do
+    local group = take_prefix()
+    if not group then break end
+    groups[#groups + 1] = group
+    if group.kind == "completion" then turn.auto_steer = true end
+    messages[#messages + 1] = { role = "user", content = group.text,
+      submission_ids = group.request_ids, delivery_id = group.delivery_id,
+      input_cause = group.kind == "completion" and "internal_async_completion" or nil,
+      authored_prompt = group.kind == "human" and group.text or nil }
   end
-  local text = table.concat(texts, "\n")
-  local id = "lead-steer-" .. envelope.uuid_lite()
-  state.pending_steer = {
-    id = id,
-    run_id = state.current_run_id,
-    texts = texts,
-    inputs = inputs,
-  }
+  if #groups == 0 then return false end
+  local pending = state.pending_steer or { run_id = turn.run_id, groups = {} }
+  pending.id = "lead-steer-" .. envelope.uuid_lite()
+  pending.awaiting_ack = true
+  for _, group in ipairs(groups) do
+    group.batch_id = pending.id
+    pending.groups[#pending.groups + 1] = group
+  end
+  state.pending_steer = pending
   emit("mag", {
-    kind = "mag.steer_run",
-    id = id,
-    run_id = state.current_run_id,
+    kind = "mag.steer_run", id = pending.id, run_id = pending.run_id,
     actor_id = state.lead_program.llm_actor,
-    message = { role = "user", content = text, submission_ids = submission_ids },
+    message = #messages == 1 and messages[1] or { messages = messages },
   })
   return true
 end
 
+-- MAG's steer ack means volatile acceptance, NOT canonical insertion. Retain
+-- every obligation until the manager projects that exact completed message.
 local function handle_run_steered(body)
   local pending = state.pending_steer
   if pending == nil or body.in_reply_to ~= pending.id then return end
-  state.pending_steer = nil
+  pending.awaiting_ack = false
   if body.accepted == true and body.run_id == pending.run_id then
-    -- Acceptance is the ownership boundary: the queued text is now part of
-    -- model-visible history. Conversation-manager owns its durable projection.
-    local turn = state.current_turn
-    if turn ~= nil and turn.run_id == pending.run_id then
-      for _, input in ipairs(pending.inputs) do
-        for _, request_id in ipairs(input.submission_ids or {}) do
-          turn.request_ids[#turn.request_ids + 1] = request_id
-          request_lifecycle:acquire(request_id, "turn:" .. turn.run_id)
-          request_lifecycle:release(request_id, "input:" .. request_id)
-        end
-      end
-      turn.request_ids = RequestLifecycle.copy_ids(turn.request_ids)
-    end
-    emit("nefor-tui", { kind = "chat.queue.steered" })
+    if #pending.groups == 0 then state.pending_steer = nil end
+    flush_intake()
     return
   end
-  local restored = {}
-  for _, input in ipairs(pending.inputs) do restored[#restored + 1] = input end
-  for _, input in ipairs(state.pending_user_inputs) do restored[#restored + 1] = input end
-  state.pending_user_inputs = restored
-  flush_pending_user_inputs()
+  local retained = {}
+  for _, group in ipairs(pending.groups) do
+    if group.batch_id == pending.id then restore_prefix(group) else retained[#retained + 1] = group end
+  end
+  pending.groups = retained
+  if #retained == 0 then state.pending_steer = nil end
+  if state.current_turn then state.current_turn.steer_rejected = true end
+  -- Do not retry against the same ended/not-yet-live actor. run_started or
+  -- terminal commitment will retry the preserved prefix.
+end
+
+settle_pending_steer = function(turn)
+  local pending = state.pending_steer
+  if not pending or pending.run_id ~= turn.run_id then return end
+  state.pending_steer = nil
+  for _, group in ipairs(pending.groups) do restore_prefix(group) end
+end
+
+local function commit_initial_message(turn, message)
+  local groups = turn.intake and turn.intake.groups
+  if not groups or not groups[1] or groups[1].delivery_id ~= message.delivery_id then return end
+  local group = table.remove(groups, 1)
+  if group.kind == "human" then
+    emit("nefor-tui", { kind = "chat.queue.steered", submission_ids = group.request_ids, text = group.text })
+  end
+  if #groups == 0 then turn.intake = nil end
+end
+
+local function commit_steered_message(change)
+  local pending, turn = state.pending_steer, state.current_turn
+  local message = change.message
+  if not pending or not turn or type(message) ~= "table" or message.turn_id ~= turn.turn_id then return end
+  local group = pending.groups[1]
+  if not group or message.delivery_id ~= group.delivery_id then return end
+  table.remove(pending.groups, 1)
+  if not group.dropped then
+    request_lifecycle:acquire_all(group.request_ids, "turn:" .. turn.run_id)
+    for _, id in ipairs(group.request_ids) do turn.request_ids[#turn.request_ids + 1] = id end
+    turn.request_ids = RequestLifecycle.copy_ids(turn.request_ids)
+    for _, obligation in ipairs(group.obligations) do
+      request_lifecycle:release_all(obligation.request_ids, obligation.id)
+    end
+    if group.kind == "human" then
+      emit("nefor-tui", { kind = "chat.queue.steered", submission_ids = group.request_ids, text = group.text })
+    end
+  end
+  if #pending.groups == 0 and not pending.awaiting_ack then state.pending_steer = nil end
+  flush_intake()
 end
 
 -- Session interrupt-all: gracefully interrupt the current turn and drop
@@ -878,6 +925,8 @@ end
 -- behaviour): a dispatched run's completion still reaches the model on the next
 -- submit. A transcript notice makes the interrupt visible.
 local function cancel_all()
+  state.delivery_paused = true
+  if state.current_turn then state.current_turn.stopping = true end
   local interrupted = interrupt_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
   discard_pending_inputs()
@@ -897,11 +946,24 @@ end
 -- starts a fresh conversation. The retained turn-program artifact survives — the
 -- program is per-session config, not per-conversation state.
 local function new_chat()
+  -- Reset cancels the old request owner before discarding its local delivery
+  -- state. Registry-owned child obligations still settle through their owner.
+  local turn, pending = state.current_turn, state.pending_steer
+  local groups = {}
+  for _, group in ipairs(turn and turn.intake and turn.intake.groups or {}) do groups[#groups + 1] = group end
+  for _, group in ipairs(pending and pending.groups or {}) do groups[#groups + 1] = group end
+  fail_open_requests({ code = "conversation_reset", message = "Conversation was reset" })
+  for _, group in ipairs(groups) do
+    for _, obligation in ipairs(group.obligations) do request_lifecycle:release_all(obligation.request_ids, obligation.id) end
+  end
+  if turn then request_lifecycle:release_all(turn.request_ids, "turn:" .. turn.run_id) end
   discard_pending_inputs()
   state.current_run_id = nil
   state.current_turn = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
+  state.delivered_runs = {}
+  state.delivery_paused = false
   state.pending_steer = nil
   state.conversation:reset()
   state.conversation_id = nil
@@ -1060,42 +1122,12 @@ local function handle_chat_input_submit(body)
     user_queued = #state.pending_user_inputs,
   })
 
+  state.delivery_paused = false
   ensure_conversation_id()
-  if state.config.resolve_provider_readiness ~= nil then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
-    ensure_lead_program_loaded()
-    if not provider_ready() then return end
-    flush_deferred()
-    flush_pending_user_inputs()
-    return
-  end
-  if state.current_run_id ~= nil or conversation_commit_pending()
-      or not conversation_ready() then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
-    ensure_lead_program_loaded()
-    return
-  end
-
-  if state.lead_program.artifact == nil then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
-    ensure_lead_program_loaded()
-    return
-  end
-
-  local deferred, deferred_request_ids, deferred_obligations = drain_deferred_text()
-  if type(deferred) == "string" then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = {
-      text = text,
-      submission_ids = submission_ids,
-    }
-    submit_orchestrator_run(deferred, deferred_request_ids,
-      "internal_async_completion", deferred_obligations)
-    return
-  end
-
-  submit_orchestrator_run(text, submission_ids, nil, {
-    { id = "input:" .. request_id, request_ids = submission_ids },
-  })
+  enqueue(state.pending_user_inputs, { text = text, submission_ids = submission_ids })
+  ensure_lead_program_loaded()
+  if not provider_ready() then return end
+  flush_intake()
 end
 
 local function handle_chat_reset()
@@ -1163,6 +1195,7 @@ local function handle_mag_run_started(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
   turn.started = true
+  turn.steer_rejected = nil
   if type(body.scope) ~= "string" or #body.scope == 0 then
     nefor.log.warn("agentic-loop: mag.run_started carried no scope; transcript binding skipped", {
       run_id = body.run_id,
@@ -1170,6 +1203,7 @@ local function handle_mag_run_started(body)
     return
   end
   turn.scope = body.scope
+  flush_intake()
 end
 
 local function typed_semantic_name(result)
@@ -1362,6 +1396,18 @@ local function finish_mag_run_result(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
   local run_id = turn.run_id
+  settle_pending_steer(turn)
+  for _, group in ipairs(turn.intake and turn.intake.groups or {}) do
+    if group.kind == "completion" then
+      -- The manager fence proves no canonical insertion. Preserve original
+      -- obligations, and require a fresh submit rather than retrying a failure.
+      if #state.pending_user_inputs == 0 then state.delivery_paused = true end
+      for _, obligation in ipairs(group.obligations) do
+        request_lifecycle:acquire_all(obligation.request_ids, obligation.id)
+      end
+      restore_prefix(group)
+    end
+  end
   local request_ids = turn.request_ids or {}
   local turn_obligation = "turn:" .. run_id
   state.current_run_id = nil
@@ -1463,9 +1509,16 @@ handle_execute_rejection = function(body)
   local turn = state.current_turn
   if turn == nil or turn.started or turn.result_body ~= nil or body.in_reply_to ~= turn.run_id then return false end
   local run_id, request_ids = turn.run_id, turn.request_ids or {}
+  for _, group in ipairs(turn.intake and turn.intake.groups or {}) do
+    if group.kind == "completion" then
+      if #state.pending_user_inputs == 0 then state.delivery_paused = true end
+      for _, obligation in ipairs(group.obligations) do request_lifecycle:acquire_all(obligation.request_ids, obligation.id) end
+      restore_prefix(group)
+    end
+  end
   state.current_run_id = nil
   state.current_turn = nil
-  state.pending_steer = nil
+  settle_pending_steer(turn)
   local message = tostring(body.message or "Lead execution was rejected before starting")
   emit("nefor-tui", { kind = "chat.error.append", title = "Lead execution rejected",
     message = message, retryable = true })
@@ -1484,14 +1537,35 @@ local function handle_mag_run_result(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
   turn.result_body = deep_clone(body)
-  -- A lead entry can fail before any provider or conversation-manager activity,
-  -- so no terminal projection will arrive to release this exact run. Terminal
-  -- failures are already canonical kernel outcomes; settle them immediately.
-  if body.status ~= "completed" and body.status ~= "killed" then
-    finish_mag_run_result(turn.result_body)
-  elseif turn.manager_terminal then
-    finish_mag_run_result(turn.result_body)
+  turn.stopping = true
+  if turn.manager_terminal then finish_mag_run_result(turn.result_body); return end
+  -- All MAG writes (including teardown) precede its terminal envelope. A query
+  -- on the same manager mailbox therefore fences both the no-activation case
+  -- and delayed projections without guessing from kernel status.
+  if turn.terminal_query == nil then
+    turn.terminal_query = "lead-terminal-" .. envelope.uuid_lite()
+    emit("conversation-manager", { kind = "conversation.context.request",
+      request_id = turn.terminal_query, conversation_id = state.conversation_id })
   end
+end
+
+local function handle_terminal_snapshot(body)
+  local turn = state.current_turn
+  if not turn or body.request_id ~= turn.terminal_query or body.conversation_id ~= state.conversation_id then return end
+  turn.terminal_query = nil
+  if body.found ~= true or type(body.context) ~= "table" then
+    M.mag_authority_lost({ code = "terminal_context_unavailable", message = "Canonical terminal context unavailable" })
+    return
+  end
+  -- Projections normally precede the snapshot. Reconcile by immutable identity
+  -- as well, so a duplicate/delayed projection cannot restore committed work.
+  for _, message in ipairs(body.context.messages or {}) do
+    if message.turn_id == turn.turn_id and message.status == "completed" then
+      commit_initial_message(turn, message)
+      commit_steered_message({ message = message })
+    end
+  end
+  finish_mag_run_result(turn.result_body)
 end
 
 local terminal_turn_changes = {
@@ -1558,6 +1632,14 @@ local function handle_conversation_projection_delta(body)
     request_lifecycle:recheck_all()
     emit_ready_if_ready()
     return
+  end
+
+  if change.kind == "message_completed" then
+    local turn = state.current_turn
+    if turn and turn.intake and type(change.message) == "table" then
+      commit_initial_message(turn, change.message)
+    end
+    commit_steered_message(change)
   end
 
   if terminal_turn_changes[change.kind] then
@@ -1663,6 +1745,11 @@ local function handle_conversation_rejection(body)
 end
 
 local function handle_conversation_query_rejection(body)
+  local turn = state.current_turn
+  if turn and body.request_id == turn.terminal_query then
+    M.mag_authority_lost({ code = "terminal_context_unavailable", message = tostring(body.code) })
+    return
+  end
   local pending = state.pending_context_request
   if type(pending) ~= "table" or body.request_id ~= pending.id then return end
   state.pending_context_request = nil
@@ -1722,6 +1809,8 @@ local function teardown_for_session_end()
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
   state.pending_steer       = nil
+  state.delivered_runs = {}
+  state.delivery_paused = false
   state.conversation:reset()
   state.conversation_id = nil
   state.pending_conversation_create = nil
@@ -1746,7 +1835,10 @@ end
 local M = {}
 
 -- Public API (consumed by cli/init.lua + chat surfaces).
-function M.submit(text, _opts) return submit_orchestrator_run(text) end
+function M.submit(text, opts)
+  handle_chat_input_submit({ text = text, submission_id = opts and opts.submission_id })
+  return state.current_run_id
+end
 function M.cancel()      cancel() end
 function M.cancel_all()  return cancel_all() end
 function M.new_chat()    new_chat() end
@@ -1851,35 +1943,35 @@ function M.configure(opts)
   end
 end
 
--- Relay a completed dispatched run to the model as a fresh turn. The
--- completion is formatted into a user-role task (format_deferred) and
--- submitted as a new turn-program once the lead is idle (deferred_queue +
--- flush_deferred). lead-workflow drives this for kernel runs the lead
--- dispatched via its `mag-apply` tool.
+-- Relay an accepted root-owned result through the same FIFO as human input.
+-- Idle admission and busy steering retain the same identity, cause and
+-- obligation. Nested results never enter this destination-owner seam.
 -- `completion` shape: { run_id, status = "success"|"failed", output|error }.
 function M.relay_run_completion(completion)
   if type(completion) ~= "table" then return false end
   local request_ids = RequestLifecycle.copy_ids(completion.request_ids)
   local obligation_id = "delivery:" .. tostring(completion.run_id or envelope.uuid_lite())
-  if #request_ids == 0 then
-    state.deferred_queue[#state.deferred_queue + 1] = { text = format_deferred(completion) }
-    flush_deferred()
-    return true
+  local run_id = completion.run_id
+  if type(run_id) == "string" then
+    if state.delivered_runs[run_id] then return true end
+    state.delivered_runs[run_id] = true
   end
   request_lifecycle:acquire_all(request_ids, obligation_id)
   local deliverable = {}
   for _, request_id in ipairs(request_ids) do
     if not request_lifecycle:is_forced(request_id) then deliverable[#deliverable + 1] = request_id end
   end
-  if #deliverable == 0 then
+  if #request_ids > 0 and #deliverable == 0 then
     request_lifecycle:release_all(request_ids, obligation_id)
     return true
   end
-  state.deferred_queue[#state.deferred_queue + 1] = {
+  enqueue(state.deferred_queue, {
     text = format_deferred(completion),
     request_ids = deliverable,
     obligation_id = obligation_id,
-  }
+  })
+  ensure_conversation_id()
+  ensure_lead_program_loaded()
   flush_deferred()
   return true
 end
@@ -1970,7 +2062,6 @@ function M.fail_request(request_id, err)
     end
   end
   state.pending_user_inputs = retained
-  request_lifecycle:release(request_id, "input:" .. request_id)
 
   local deferred = {}
   for _, entry in ipairs(state.deferred_queue) do
@@ -1988,6 +2079,24 @@ function M.fail_request(request_id, err)
   end
   state.deferred_queue = deferred
 
+  local pending = state.pending_steer
+  if pending then
+    for _, group in ipairs(pending.groups) do
+      for _, id in ipairs(group.request_ids) do
+        if id == request_id then
+          -- Already accepted by an actor: kill that actor, retain its input
+          -- obligation until terminal reconciliation determines insertion.
+          if state.current_turn then
+            state.current_turn.stopping = true
+            request_lifecycle:acquire(request_id, "turn:" .. state.current_turn.run_id)
+            state.current_turn.request_ids[#state.current_turn.request_ids + 1] = request_id
+          end
+          kill_active_lead_run()
+          break
+        end
+      end
+    end
+  end
   local turn = state.current_turn
   if turn ~= nil then
     for _, id in ipairs(turn.request_ids or {}) do
@@ -2052,6 +2161,8 @@ local function receive_msg(entry)
     return
   end
   if kind == "conversation.context.snapshot" then
+    local turn = state.current_turn
+    if turn and body.request_id == turn.terminal_query then handle_terminal_snapshot(body); return end
     handle_conversation_context_snapshot(body)
     return
   end
@@ -2227,6 +2338,8 @@ M._internals  = {
     state.current_turn = nil
     state.deferred_queue = {}
     state.pending_user_inputs = {}
+    state.delivered_runs = {}
+    state.delivery_paused = false
     state.pending_steer = nil
     state.stream_observers = {}
     state.reasoning_observers = {}

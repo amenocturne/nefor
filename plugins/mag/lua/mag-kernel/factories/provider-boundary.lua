@@ -203,6 +203,7 @@ function M.construct(id, params, emit, options)
   local turn_active = false
   local awaiting_continuation = false
   local steered_messages = {}
+  local steering_deliveries = {}
   local streamed_message_id = nil
   local streamed_text = ""
   local terminal_metadata = {}
@@ -217,6 +218,10 @@ function M.construct(id, params, emit, options)
   local seed_recorded = false
   local submission_ids = params.submission_ids
   params.submission_ids = nil
+  local initial_messages = params.initial_messages
+  params.initial_messages = nil
+  local delivery_id = params.delivery_id
+  params.delivery_id = nil
   local input_cause = params.input_cause
   params.input_cause = nil
   local authored_prompt = params.authored_prompt
@@ -481,6 +486,7 @@ function M.construct(id, params, emit, options)
       if not submission_identity_recorded and message.role == "user" then
         message.submission_ids = submission_ids
         message.input_cause = input_cause
+        message.delivery_id = delivery_id
         message.authored_prompt = authored_prompt
         submission_identity_recorded = true
       end
@@ -938,7 +944,11 @@ function M.construct(id, params, emit, options)
       end)
       return { status = "pending" }
     end
-    record_input(input)
+    if initial_messages ~= nil then
+      for _, message in ipairs(initial_messages) do state:append(message) end
+      initial_messages = nil
+      submission_identity_recorded = true
+    else record_input(input) end
     append_steered_messages()
     if not continuation and options.on_turn_start then options.on_turn_start(state) end
     invoke_provider()
@@ -1006,8 +1016,17 @@ function M.construct(id, params, emit, options)
 
   function instance.handle_steer(message)
     if draining or not options.steerable or type(message) ~= "table" then return false end
-    if type(message.role) ~= "string" or message.role == "" then return false end
-    steered_messages[#steered_messages + 1] = message
+    local messages = message.messages or { message }
+    if type(messages) ~= "table" or #messages == 0 then return false end
+    for _, item in ipairs(messages) do
+      if type(item) ~= "table" or type(item.role) ~= "string" or item.role == "" then return false end
+    end
+    for _, item in ipairs(messages) do
+      if item.delivery_id == nil or not steering_deliveries[item.delivery_id] then
+        if item.delivery_id then steering_deliveries[item.delivery_id] = true end
+        steered_messages[#steered_messages + 1] = item
+      end
+    end
     return true
   end
 

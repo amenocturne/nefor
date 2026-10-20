@@ -421,10 +421,11 @@ async fn settle_run(
     if let Some(id) = active_run.in_reply_to {
         reply.insert("in_reply_to".into(), Value::String(id));
     }
-    let sent = send_terminal(out_tx, reply).await;
+    // Terminal consumers may immediately query canonical context. Publish the
+    // teardown facts before that boundary, just as the explicit kill path does.
     host.end_run(run_id, reason)?;
-    sent?;
-    flush_emits(out_tx, host, bridge).await
+    flush_emits(out_tx, host, bridge).await?;
+    send_terminal(out_tx, reply).await
 }
 
 /// Fail the still-pending execute replies of runs the kernel reaped at a
@@ -1078,11 +1079,10 @@ async fn handle_execute(
     let outcome = host.start_program(&run_id, &execution.initial, &execution.operations)?;
     if !outcome.ok {
         let msg = outcome.error.unwrap_or_else(|| "start failed".into());
-        let sent = send_terminal(out_tx, run_result_failed(in_reply_to, &run_id, &msg, elapsed_ms(started_at))).await;
         host.end_run(&run_id, TeardownReason::RunFailed)?;
         active.remove(&run_id);
-        sent?;
-        return flush_emits(out_tx, host, bridge).await;
+        flush_emits(out_tx, host, bridge).await?;
+        return send_terminal(out_tx, run_result_failed(in_reply_to, &run_id, &msg, elapsed_ms(started_at))).await;
     }
     settle_run(out_tx, host, active, bridge, &run_id).await
 }

@@ -1566,6 +1566,7 @@ compile_graph(left &&& right)"#,
                     cancelled = true;
                 }
                 if body["kind"] == RUN_RESULT_KIND {
+                    assert!(cancelled, "teardown must be visible before terminal consumers query canonical context");
                     assert_eq!(body["status"], "failed");
                     assert_eq!(body["failure"], "output_delivery");
                     terminals += 1;

@@ -4234,3 +4234,41 @@ do
   fresh()
   gate.prepared, gate.answers = {}, {}
 end
+
+-- Owner-local async results remain isolated while root FIFO intake changes.
+-- Reverse sibling completion order, duplicate terminals/receipts, and a dead
+-- owner must never reroute a nested result to the root continuation.
+do
+  fresh()
+  local registry = lw._internals.run_registry
+  local parent = registry:mint_run_id()
+  lw._internals.register_active_run(parent, {}, "terminal", "fifo-parent", "parent", sessions.current_id())
+  local children = {}
+  for i = 1, 2 do
+    local child = registry:mint_run_id()
+    children[i] = child
+    lw._internals.register_active_run(child, {}, "terminal", "fifo-child-" .. i,
+      "child-" .. i, sessions.current_id(), "opaque-dispatcher-" .. i,
+      { run_id = parent, actor_id = "opaque-owner-" .. i, conversation_id = "owner-conversation-" .. i })
+  end
+  local root_deliveries = 0
+  local original_relay = agentic_loop.relay_run_completion
+  agentic_loop.relay_run_completion = function() root_deliveries = root_deliveries + 1; return true end
+  _test.calls_clear()
+  for _, i in ipairs({ 2, 1 }) do
+    local terminal = { kind = "mag.run_result", run_id = children[i], status = "completed", result = { text = "child-" .. i } }
+    feed("mag", terminal); feed("mag", terminal)
+  end
+  local resumes = find_calls(decode_calls(), function(c) return c.body.kind == "mag.resume_actor" end)
+  assert_eq(#resumes, 2, "each nested terminal is delivered once")
+  for index, i in ipairs({ 2, 1 }) do
+    local body = resumes[index].body
+    assert_eq(body.run_id, parent)
+    assert_eq(body.actor_id, "opaque-owner-" .. i)
+    assert_eq(body.conversation_id, "owner-conversation-" .. i)
+    feed("mag", { kind = "mag.actor_resumed", run_id = parent, actor_id = body.actor_id, accepted = true })
+    feed("mag", { kind = "mag.actor_resumed", run_id = parent, actor_id = body.actor_id, accepted = true })
+  end
+  assert_eq(root_deliveries, 0, "neither sibling may spill into root context")
+  agentic_loop.relay_run_completion = original_relay
+end

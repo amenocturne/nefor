@@ -57,6 +57,7 @@ local function projected_message(conversation, message, include_provider_context
     turn_id = message.turn_id,
     submission_ids = domain.copy(message.submission_ids or {}),
     input_cause = message.input_cause,
+    delivery_id = message.delivery_id,
     role = message.role,
     status = message.status,
     visibility = message.visibility or "transcript",

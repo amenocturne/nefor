@@ -80,6 +80,15 @@ end
 
 local function send_to_loop(origin, body)
   if origin == "mag" and body.kind == "mag.run_result" then
+    local turn = agentic_loop._internals.state.current_turn
+    if turn and turn.intake then
+      local groups = require("core.json_data").copy(turn.intake.groups)
+      for _, group in ipairs(groups) do
+        manager_delta({ kind = "message_completed", message = {
+          delivery_id = group.delivery_id, turn_id = turn.turn_id,
+        } })
+      end
+    end
     manager_delta({
       kind = "message_completed",
       context_messages = result_context_messages(body),
@@ -771,8 +780,12 @@ do
     status = "failed", error = "lead.entry typed-output validation failed",
   })
   local calls = decode_calls()
+  local fence = assert(find_kind(calls, "conversation.context.request")).body
+  raw_send_to_loop("conversation-manager", { kind = "conversation.context.snapshot", request_id = fence.request_id,
+    conversation_id = fence.conversation_id, found = true, context = { messages = {}, turns = {} } })
+  calls = decode_calls()
   local promoted = find_kind(calls, "mag.execute")
-  assert(promoted ~= nil, "early lead.entry failure promotes queued input")
+  assert(promoted ~= nil, "early lead.entry failure promotes queued input after canonical fence")
   assert_eq(task_prompt(promoted.body), "queued after failure",
     "the promoted run carries the queued user input")
   assert_eq(agentic_loop._internals.state.current_run_id, promoted.body.run_id,
@@ -835,8 +848,8 @@ do
   assert(exec ~= nil, "loaded program starts the queued turn")
   assert_eq(task_prompt(exec.body), "cold one\ncold two",
     "cold submits coalesce into one model delivery")
-  assert(find_kind(calls, "chat.queue.steered") ~= nil,
-    "promotion reconciles the optimistic queue")
+  assert_eq(find_kind(calls, "chat.queue.steered"), nil,
+    "admission alone cannot acknowledge canonical input")
   assert_eq(find_call(calls, "chat.message.append"), nil,
     "promotion emits no legacy transcript projection")
 end
@@ -1498,8 +1511,14 @@ do
     run_id = exec.body.run_id, accepted = true,
   })
   calls = decode_calls()
+  assert_eq(find_kind(calls, "chat.queue.steered"), nil,
+    "volatile acceptance cannot mark uncommitted text as delivered")
+  manager_delta({ kind = "message_completed", message = {
+    delivery_id = steer.body.message.delivery_id, turn_id = exec.body.run_id,
+  } })
+  calls = decode_calls()
   assert(find_kind(calls, "chat.queue.steered") ~= nil,
-    "accepted steer tells the TUI its queued entry is now live transcript")
+    "canonical receipt tells the TUI its queued entry is now live transcript")
   assert_eq(find_call(calls, "chat.message.append"), nil,
     "accepted steer relies on canonical manager projection")
   assert_eq(agentic_loop._internals.state.pending_steer, nil,
@@ -2036,4 +2055,359 @@ for _, outcome in ipairs({ "ready", "failed", "cancel", "reset" }) do
     "snapshot only at admission")
   assert_eq(find_kind(decode_calls(), "agentic_loop.request_completed"), nil,
     "late program cannot duplicate terminal")
+end
+
+-- FIFO contract: test the real loop, provider boundary and canonical manager
+-- fold together. Only the bus/provider and kernel scheduling are deterministic
+-- transports; assertions inspect canonical context at each provider invocation.
+do
+  local kernel = _starter_dir .. "/../../plugins/mag/lua/mag-kernel"
+  package.path = kernel .. "/?.lua;" .. kernel .. "/?/init.lua;" .. package.path
+  local factory = require("factories.llm")
+  local manager = require("libs.conversation-manager")
+  local projection = require("libs.conversation-manager.projection")
+  local Async = dofile(_starter_dir .. "/../../tests/lua/mag-kernel/async_compaction_fixture.lua")
+
+  local function coupled(exec)
+    local store = manager.new()
+    local cid, run = agentic_loop._internals.state.conversation_id, exec.body.run_id
+    assert(store:append({ event_id = "fixture-create", conversation_id = cid, kind = "created", provenance = {} }))
+    local deltas, invocations, outputs = {}, {}, {}
+    local params = require("core.json_data").copy(exec.body.params_overlay["actor:8:lead.llm"])
+    params.output_type, params.error_type, params.provider_error_type = "answer", "error", "provider-error"
+    params.tool_approval_policy = { constructor = "Default" }
+    params.compaction_policy = { constructor = "Disabled" }
+    local transport = Async.disabled()
+    local actor = assert(factory.construct("lead.llm", params, function(message)
+      outputs[#outputs + 1] = message
+      if message.kind == "capability.invoke" then
+        invocations[#invocations + 1] = { message = message, context = projection.context(store:peek(cid)) }
+      end
+    end, { compaction = transport.facet, conversation = {
+      id = cid, turn_id = run, is_root = true, provenance = { run_id = run, actor_id = "lead.llm" },
+      emit = function(fact)
+        local c, err, _, event = store:append(fact)
+        assert(c, err and err.code)
+        deltas[#deltas + 1] = projection.change(c, event)
+      end,
+    } }))
+    transport.wrap(actor)
+    local cursor = 0
+    local function pump()
+      for _ = 1, 50 do
+        local progressed = false
+        local calls = decode_calls()
+        while cursor < #calls do
+          cursor = cursor + 1
+          local b = calls[cursor].body
+          if b.kind == "mag.steer_run" then
+            local accepted = actor.handle_steer(b.message)
+            -- Repeated transport delivery is idempotent by delivery identity.
+            assert_eq(actor.handle_steer(b.message), accepted)
+            raw_send_to_loop("mag", { kind = "mag.run_steered", in_reply_to = b.id,
+              run_id = run, accepted = accepted })
+            progressed = true
+          end
+        end
+        while #deltas > 0 do manager_delta(table.remove(deltas, 1)); progressed = true end
+        if not progressed then return end
+      end
+      error("fixture did not settle")
+    end
+    actor.deliver({ messages = {{ message = { text = task_prompt(exec.body) } }} })
+    pump()
+    return { actor = actor, pump = pump, invocations = invocations, store = store, cid = cid,
+      reply = function(result)
+        actor.deliver({ kind = "reply", ref = invocations[#invocations].message.ref, result = result })
+        pump()
+      end }
+  end
+
+  for _, order in ipairs({ {"H1", "C1", "H2", "C2"}, {"C1", "H1", "C2"}, {"H1", "C1"}, {"C1", "H1"} }) do
+    for _, boundary in ipairs({ "final", "tool" }) do
+      fresh_loop()
+      local exec = begin_bound_turn("original", "fifo-active")
+      _test.calls_clear()
+      local t = coupled(exec)
+      for _, name in ipairs(order) do
+        if name:sub(1, 1) == "H" then
+          raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = name, submission_id = name })
+          raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = name, submission_id = name })
+        else
+          agentic_loop.relay_run_completion({ run_id = name, status = "success", output = name })
+          agentic_loop.relay_run_completion({ run_id = name, status = "success", output = name })
+        end
+        t.pump()
+      end
+      if boundary == "tool" then
+        t.reply({ text = "", finish_reason = "tool_calls", tool_calls = {{ id = "read-1", name = "read", args = {} }} })
+        t.actor.deliver({ messages = {{ message = { messages = {{ role = "tool", tool_call_id = "read-1", name = "read", content = "read result" }} } }} })
+        t.pump()
+      else t.reply({ text = "old answer", finish_reason = "stop" }) end
+      assert_eq(#t.invocations, 2, "all accepted arrivals reach the next provider boundary")
+      local context = t.invocations[2].context.messages
+      local received = {}
+      for _, message in ipairs(context) do
+        if message.role == "user" and message.delivery_id ~= exec.body.params_overlay["actor:8:lead.llm"].initial_messages[1].delivery_id then
+          received[#received + 1] = message
+        end
+      end
+      assert_eq(#received, #order, "duplicates neither lose nor duplicate input")
+      for i, name in ipairs(order) do
+        local message = received[i]
+        assert(message.content:find(name, 1, true), "canonical FIFO content at index " .. i)
+        assert(type(message.delivery_id) == "string", "canonical delivery receipt identity")
+        if name:sub(1, 1) == "H" then
+          assert_eq(message.submission_ids[1], name)
+          assert_eq(message.authored_prompt, name)
+          assert_eq(message.input_cause, nil)
+        else
+          assert_eq(message.input_cause, "internal_async_completion")
+          assert_eq(message.authored_prompt, nil, "result cannot become authored human task")
+        end
+      end
+      assert_eq(agentic_loop._internals.state.pending_steer, nil, "canonical receipts settle delivery ledger")
+    end
+  end
+end
+
+-- Buffered idle/readiness arrivals use the same selector, never whole-kind
+-- draining across an intervening unlike arrival.
+for _, order in ipairs({ {"H1", "C1", "H2", "C2"}, {"C1", "H1", "C2"} }) do
+  fresh_loop()
+  local exec = begin_bound_turn("seed", "fifo-seed")
+  send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "completed", result = { text = "seed" } })
+  local ready = false
+  agentic_loop.configure { resolve_provider_readiness = function() return { status = ready and "ready" or "pending" } end }
+  _test.calls_clear()
+  for _, name in ipairs(order) do
+    if name:sub(1,1) == "H" then
+      raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = name, submission_id = name })
+    else agentic_loop.relay_run_completion({ run_id = name, status = "success", output = name }) end
+  end
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "readiness holds the complete FIFO")
+  ready = true
+  _test.calls_clear()
+  agentic_loop.provider_readiness_changed("mock")
+  local selected = assert(find_kind(decode_calls(), "mag.execute")).body
+  local overlay = selected.params_overlay["actor:8:lead.llm"]
+  assert_eq(#overlay.initial_messages, #order, "idle admission includes whole mixed batch")
+  for i, name in ipairs(order) do
+    local message = overlay.initial_messages[i]
+    assert(message.content:find(name, 1, true), "idle canonical FIFO position " .. i)
+    if name:sub(1,1) == "H" then
+      assert_eq(message.submission_ids[1], name)
+      assert_eq(message.authored_prompt, name)
+    else assert_eq(message.input_cause, "internal_async_completion") end
+  end
+  local last_human
+  for _, name in ipairs(order) do if name:sub(1,1) == "H" then last_human = name end end
+  assert_eq(task_prompt(selected), last_human, "authored task is not replaced by old result backlog")
+  assert_eq(overlay.input_cause, nil, "mixed batch is not an autonomous old-completion task")
+end
+
+-- Kill/rejection/terminal races retain only uncommitted groups with the same
+-- identity. A late ack is never proof of delivery or permission to restart.
+for _, terminal_first in ipairs({ true, false }) do
+  for _, committed in ipairs({ true, false }) do
+    for _, ack in ipairs({ "before", "after", "rejected" }) do
+      fresh_loop()
+      local exec = begin_bound_turn("root", "fifo-kill")
+      _test.calls_clear()
+      agentic_loop.relay_run_completion({ run_id = "result-kill", status = "success", output = "old result" })
+      local steer = assert(find_kind(decode_calls(), "mag.steer_run")).body
+      if ack == "before" then raw_send_to_loop("mag", { kind = "mag.run_steered", in_reply_to = steer.id, run_id = exec.body.run_id, accepted = true }) end
+      if committed then manager_delta({ kind = "message_completed", message = { delivery_id = steer.message.delivery_id, turn_id = exec.body.run_id } }) end
+      raw_send_to_loop("nefor-tui", { kind = "chat.interrupt", drop_queued = true })
+      _test.calls_clear()
+      local function kernel() raw_send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "killed" }) end
+      local function manager() manager_delta({ kind = "turn_interrupted", turn_id = exec.body.run_id, run_id = exec.body.run_id }) end
+      if terminal_first then kernel(); manager() else manager(); kernel() end
+      raw_send_to_loop("mag", { kind = "mag.run_steered", in_reply_to = steer.id, run_id = exec.body.run_id, accepted = ack ~= "rejected" })
+      assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "kill never autonomously restarts retained completion")
+      assert_eq(#agentic_loop._internals.state.deferred_queue, committed and 0 or 1, "only uncommitted completion retained")
+      _test.calls_clear()
+      raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "new instruction", submission_id = "new-human" })
+      local next_run = assert(find_kind(decode_calls(), "mag.execute")).body
+      local overlay = next_run.params_overlay["actor:8:lead.llm"]
+      assert_eq(overlay.input_cause, nil, "fresh authored task survives retained completion context")
+      assert_eq(overlay.authored_prompt, "new instruction")
+      assert_eq(task_prompt(next_run), "new instruction", "backlog does not select the wrong task")
+      assert_eq(#overlay.initial_messages, committed and 1 or 2)
+      if not committed then
+        assert(overlay.initial_messages[1].content:find("result-kill", 1, true), "older result is still FIRST, not human priority")
+        assert_eq(overlay.initial_messages[1].input_cause, "internal_async_completion")
+      end
+      local human = overlay.initial_messages[#overlay.initial_messages]
+      assert_eq(human.submission_ids[1], "new-human")
+      assert_eq(human.authored_prompt, "new instruction")
+    end
+  end
+end
+
+-- Terminal fence handles a killed run that never activated a provider actor.
+for _, status in ipairs({ "killed", "failed" }) do
+  fresh_loop()
+  local exec = begin_turn("not yet activated", "no-activation")
+  _test.calls_clear()
+  raw_send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = status, error = "entry failed" })
+  local fence = assert(find_kind(decode_calls(), "conversation.context.request")).body
+  assert_eq(agentic_loop._internals.state.current_run_id, exec.body.run_id, "kernel result alone cannot settle unknown writes")
+  raw_send_to_loop("conversation-manager", { kind = "conversation.context.snapshot", request_id = fence.request_id,
+    conversation_id = fence.conversation_id, found = true, context = { messages = {}, turns = {} } })
+  assert_eq(agentic_loop._internals.state.current_run_id, nil, "no-activation fence settles without nonexistent terminal projection")
+  raw_send_to_loop("conversation-manager", { kind = "conversation.context.snapshot", request_id = fence.request_id,
+    conversation_id = fence.conversation_id, found = true, context = { messages = {}, turns = {} } })
+  local n = 0
+  for _, call in ipairs(decode_calls()) do if call.body.kind == "agentic_loop.request_completed" then n = n + 1 end end
+  assert_eq(n, 1, "duplicate terminal fence cannot settle twice")
+end
+
+-- In-flight request failure must await actor cancellation, never complete early
+-- or restore a forced input after a late volatile acknowledgement.
+for _, kind in ipairs({ "human", "completion" }) do
+  fresh_loop()
+  local exec = begin_bound_turn("base", "fifo-force")
+  local request = "forced-" .. kind
+  _test.calls_clear()
+  if kind == "human" then
+    raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "cancel me", submission_id = request })
+    raw_send_to_loop("nefor-tui", { kind = "chat.steer" })
+  else
+    agentic_loop.acquire_request_obligation({ request }, "run:force")
+    agentic_loop.relay_run_completion({ run_id = "force-child", status = "success", output = "cancel result", request_ids = { request } })
+    agentic_loop.settle_request_obligation({ request }, "run:force")
+  end
+  local steer = assert(find_kind(decode_calls(), "mag.steer_run")).body
+  agentic_loop.fail_request(request, { code = "test_cancel", message = "cancel requested" })
+  assert_eq(find_kind(decode_calls(), "agentic_loop.request_completed"), nil, "forced pending input still has an actor owner")
+  raw_send_to_loop("mag", { kind = "mag.run_steered", in_reply_to = steer.id, run_id = exec.body.run_id, accepted = true })
+  send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "killed" })
+  local count = 0
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "agentic_loop.request_completed" and c.body.request_id == request then count = count + 1 end
+  end
+  assert_eq(count, 1, "forced request settles exactly once after cancellation")
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0)
+  assert_eq(#agentic_loop._internals.state.deferred_queue, 0, "forced result cannot be redelivered")
+end
+
+-- A completed task that never reached canonical insertion survives execute
+-- rejection and pre-activation killed/failed terminals with ALL original IDs.
+for _, outcome in ipairs({ "rejected", "killed", "failed" }) do
+  fresh_loop()
+  local seed = begin_turn("seed")
+  send_to_loop("mag", { kind = "mag.run_result", run_id = seed.body.run_id, status = "completed", result = { text = "seed" } })
+  local ready = false
+  agentic_loop.configure { resolve_provider_readiness = function() return { status = ready and "ready" or "pending" } end }
+  for i = 1, 2 do
+    local request = "initial-result-" .. i
+    agentic_loop.acquire_request_obligation({ request }, "run:initial-" .. i)
+    agentic_loop.relay_run_completion({ run_id = "initial-child-" .. i, status = "success", output = "output " .. i, request_ids = { request } })
+    agentic_loop.settle_request_obligation({ request }, "run:initial-" .. i)
+  end
+  ready = true
+  _test.calls_clear()
+  agentic_loop.provider_readiness_changed("mock")
+  local exec = assert(find_kind(decode_calls(), "mag.execute")).body
+  if outcome == "rejected" then raw_send_to_loop("mag", { kind = "mag.error", in_reply_to = exec.run_id, message = "rejected" })
+  else
+    raw_send_to_loop("mag", { kind = "mag.run_result", run_id = exec.run_id, status = outcome, error = "entry failure" })
+    local fence = assert(find_kind(decode_calls(), "conversation.context.request")).body
+    raw_send_to_loop("conversation-manager", { kind = "conversation.context.snapshot", request_id = fence.request_id,
+      conversation_id = fence.conversation_id, found = true, context = { messages = {}, turns = {} } })
+  end
+  assert_eq(#agentic_loop._internals.state.deferred_queue, 2, "initial result batch retained after " .. outcome)
+  _test.calls_clear()
+  raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "resume", submission_id = "resume-input" })
+  exec = assert(find_kind(decode_calls(), "mag.execute")).body
+  send_to_loop("mag", { kind = "mag.run_result", run_id = exec.run_id, status = "completed", result = { text = "whole answer" } })
+  local completed = {}
+  for _, c in ipairs(decode_calls()) do if c.body.kind == "agentic_loop.request_completed" then completed[c.body.request_id] = (completed[c.body.request_id] or 0) + 1 end end
+  assert_eq(completed["initial-result-1"], 1)
+  assert_eq(completed["initial-result-2"], 1, "second original obligation cannot leak after recovery")
+  assert_eq(completed["resume-input"], 1)
+end
+
+-- Kernel-first failure with committed steering may not redeliver that message.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("base", "fifo-fail-race")
+  _test.calls_clear()
+  agentic_loop.relay_run_completion({ run_id = "already-committed", status = "success", output = "result" })
+  local steer = assert(find_kind(decode_calls(), "mag.steer_run")).body
+  raw_send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "failed", error = "later failure" })
+  local fence = assert(find_kind(decode_calls(), "conversation.context.request")).body
+  raw_send_to_loop("conversation-manager", { kind = "conversation.context.snapshot", request_id = fence.request_id,
+    conversation_id = fence.conversation_id, found = true, context = { messages = {{
+      role = "user", status = "completed", turn_id = exec.body.run_id, delivery_id = steer.message.delivery_id,
+    }}, turns = {{ id = exec.body.run_id, status = "failed" }} } })
+  assert_eq(#agentic_loop._internals.state.deferred_queue, 0, "manager fence reconciles committed steering before restoration")
+end
+
+-- Fresh input arriving between hard kill and terminal is not swallowed by the
+-- stop latch. Both terminal orders select its task, retaining earlier context.
+for _, kernel_first in ipairs({ true, false }) do
+  fresh_loop()
+  local exec = begin_bound_turn("base", "fifo-fresh-during-kill")
+  _test.calls_clear()
+  agentic_loop.relay_run_completion({ run_id = "earlier", status = "success", output = "old context" })
+  raw_send_to_loop("nefor-tui", { kind = "chat.interrupt", drop_queued = true })
+  raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "fresh during kill", submission_id = "fresh-during" })
+  _test.calls_clear()
+  local function terminal() raw_send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "killed" }) end
+  local function commit() manager_delta({ kind = "turn_interrupted", turn_id = exec.body.run_id, run_id = exec.body.run_id }) end
+  if kernel_first then terminal(); commit() else commit(); terminal() end
+  local selected = assert(find_kind(decode_calls(), "mag.execute")).body
+  assert_eq(task_prompt(selected), "fresh during kill")
+  local messages = selected.params_overlay["actor:8:lead.llm"].initial_messages
+  assert_eq(messages[1].input_cause, "internal_async_completion")
+  assert_eq(messages[2].submission_ids[1], "fresh-during")
+end
+
+-- Reset invalidates volatile receipts and settles the old local owner, never
+-- adding its context to the new conversation.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("base", "fifo-reset")
+  raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "old queued", submission_id = "reset-old" })
+  _test.calls_clear()
+  raw_send_to_loop("nefor-tui", { kind = "chat.steer" })
+  local steer = assert(find_kind(decode_calls(), "mag.steer_run")).body
+  raw_send_to_loop("nefor-tui", { kind = "chat.reset" })
+  raw_send_to_loop("mag", { kind = "mag.run_steered", in_reply_to = steer.id, run_id = exec.body.run_id, accepted = true })
+  raw_send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "killed" })
+  assert_eq(agentic_loop._internals.state.pending_steer, nil)
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0)
+  local settled = false
+  for _, c in ipairs(decode_calls()) do if c.body.kind == "agentic_loop.request_completed" and c.body.request_id == "reset-old" then settled = true end end
+  assert(settled, "reset cannot leave an input obligation without an owner")
+end
+
+-- Retained trace shape: three older root results plus chat-local-entry-3
+-- after Esc. FIFO remains results FIRST, but the admitted task/cause must not
+-- be the autonomous completion-only task formerly attributed to entry-1.
+do
+  fresh_loop()
+  local exec = begin_turn("original task", "chat-local-entry-1")
+  local result_ids = { "mag-run-rg-1792478552-16-323088643", "mag-run-rg-1792478566-19-1136230526", "mag-run-rg-1792478650-28-639138116" }
+  for _, run in ipairs(result_ids) do
+    agentic_loop.relay_run_completion({ run_id = run, status = "success", output = "fixture result", request_ids = { "chat-local-entry-1" } })
+  end
+  raw_send_to_loop("nefor-tui", { kind = "chat.interrupt", drop_queued = true })
+  send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "killed" })
+  _test.calls_clear()
+  raw_send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "correct the task and delegate", submission_id = "chat-local-entry-3" })
+  local selected = assert(find_kind(decode_calls(), "mag.execute")).body
+  local overlay = selected.params_overlay["actor:8:lead.llm"]
+  assert_eq(task_prompt(selected), "correct the task and delegate")
+  assert_eq(overlay.input_cause, nil)
+  assert_eq(overlay.authored_prompt, "correct the task and delegate")
+  assert_list_eq(overlay.submission_ids, { "chat-local-entry-1", "chat-local-entry-3" }, "batch retains both request owners")
+  assert_eq(#overlay.initial_messages, 2)
+  local results, human = overlay.initial_messages[1], overlay.initial_messages[2]
+  for _, run in ipairs(result_ids) do assert(results.content:find(run, 1, true)) end
+  assert_eq(results.input_cause, "internal_async_completion")
+  assert_list_eq(human.submission_ids, { "chat-local-entry-3" })
+  assert_eq(human.authored_prompt, "correct the task and delegate")
 end

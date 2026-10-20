@@ -13844,3 +13844,50 @@ fn startup_input_thinks_until_pre_dispatch_catalog_error() {
         "{failed}"
     );
 }
+
+#[test]
+fn mixed_fifo_canonical_echo_claims_only_its_queued_prefix() {
+    let mut engine = Engine::new(80, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "initial-task");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "fifo-first");
+    let first_emits = engine.take_emit_queue();
+    let first = submission_id(&first_emits).to_owned();
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "fifo-second");
+    let second_emits = engine.take_emit_queue();
+    let second = submission_id(&second_emits).to_owned();
+
+    // No optimistic promotion before the canonical echo: mixed idle admission
+    // must not overwrite a single pending echo slot with a later human group.
+    fixture_message_with_submissions(&mut engine, "user", "fifo-first", &[&first]);
+    dispatch_event(
+        &mut engine,
+        json!({"kind":"chat.queue.steered",
+        "submission_ids":[first], "text":"fifo-first"}),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({"kind":"conversation.context.snapshot",
+        "request_id":"lead-terminal-fence", "found":true, "context":{"messages":[]}}),
+    );
+    let partial = render_snapshot(&mut engine);
+    assert_eq!(partial.matches("fifo-first").count(), 1, "{partial:?}");
+    assert_eq!(partial.matches("fifo-second").count(), 1, "{partial:?}");
+
+    fixture_message(&mut engine, "assistant", "between-prefixes");
+    fixture_message_with_submissions(&mut engine, "user", "fifo-second", &[&second]);
+    dispatch_event(
+        &mut engine,
+        json!({"kind":"chat.queue.steered",
+        "submission_ids":[second], "text":"fifo-second"}),
+    );
+    let delivered = render_snapshot(&mut engine);
+    assert_eq!(delivered.matches("fifo-first").count(), 1, "{delivered:?}");
+    assert_eq!(delivered.matches("fifo-second").count(), 1, "{delivered:?}");
+    assert!(delivered.find("fifo-first") < delivered.find("between-prefixes"));
+    assert!(delivered.find("between-prefixes") < delivered.find("fifo-second"));
+}

@@ -31,7 +31,7 @@ M.declaration = {
     output_type = "string", error_type = "string",
     provider_error_type = "string",
     conversation_id = "string?",
-    turn_id = "string?", submission_ids = "table?", input_cause = "string?",
+    initial_messages = "table?", delivery_id = "string?", turn_id = "string?", submission_ids = "table?", input_cause = "string?",
     authored_prompt = "string?",
     dynamic = "bool?", dynamic_item_type = "string?", dynamic_item_descriptor = "table?",
   },

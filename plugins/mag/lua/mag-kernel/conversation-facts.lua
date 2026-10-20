@@ -219,6 +219,7 @@ function M.new(options)
       name = message.name,
       submission_ids = message.submission_ids,
       input_cause = message.input_cause,
+      delivery_id = message.delivery_id,
       authored_prompt = message.authored_prompt,
       visibility = visibility_of(message),
     })

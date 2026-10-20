@@ -901,7 +901,7 @@ local function handle_message(msg, state)
   local role = msg.role or "system"
   if role == "user" then
     local reconciled, matched = queued_input.reconcile_echo(
-      state, msg.submission_ids, msg.message_id, msg.turn_id)
+      state, msg.submission_ids, msg.message_id, msg.turn_id, text)
     if matched then return reconciled, {} end
   end
   local turn_state = role == "system"
@@ -1451,8 +1451,8 @@ local function handle_mag_run_started(msg, state)
   return run_panel.mag_run_started(state, run_id, msg.run_name, msg.principal, tui.now_ms()), {}
 end
 
-local function handle_queue_steered(_msg, state)
-  local next_state, changed = queued_input.accept_steered(state)
+local function handle_queue_steered(msg, state)
+  local next_state, changed = queued_input.accept_steered(state, msg.submission_ids, msg.text)
   if not changed then return state, {} end
   height_cache.invalidate_all()
   return next_state, {}

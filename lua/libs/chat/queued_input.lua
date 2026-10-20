@@ -74,24 +74,43 @@ end
 -- The backend has promoted the queue into the next canonical turn. Reposition
 -- its optimistic row at the causal boundary and transfer ownership to the
 -- durable projection acknowledgement. The row remains visible throughout.
-function M.accept_steered(state)
+function M.accept_steered(state, submission_ids, text)
   local idx = owned_index(state, state.queued_entry_id)
   if idx == nil then return state, false end
 
   local owned = state.entries[idx]
+  local remainder
+  if submission_ids ~= nil then
+    local owned_ids = owned.submission_ids or {}
+    if #submission_ids == 0 or #submission_ids > #owned_ids then return state, false end
+    for i, id in ipairs(submission_ids) do
+      if id ~= owned_ids[i] then return state, false end
+    end
+    if #submission_ids < #owned_ids then
+      if type(text) ~= "string" or owned.text:sub(1, #text + 1) ~= text .. "\n" then return state, false end
+      remainder = Entry.set_text(owned, owned.text:sub(#text + 2))
+      remainder.submission_ids = {}
+      for i = #submission_ids + 1, #owned_ids do
+        remainder.submission_ids[#remainder.submission_ids + 1] = owned_ids[i]
+      end
+      owned = Entry.user(text, submission_ids[1])
+      owned.submission_ids = copy_entries(submission_ids)
+    end
+  end
   local entries = {}
   for entry_idx, entry in ipairs(state.entries or {}) do
-    if entry_idx ~= idx then entries[#entries + 1] = entry end
+    if entry_idx ~= idx then entries[#entries + 1] = entry
+    elseif remainder then entries[#entries + 1] = remainder end
   end
   entries[#entries + 1] = owned
 
   local next_state = copy_table(state)
   next_state.entries = entries
-  next_state.queued_entry_id = nil
+  next_state.queued_entry_id = remainder and remainder.local_id or nil
   next_state.pending_submission_ids = owned.submission_ids
   next_state.pending_user_echo_id = owned.local_id
   if type(state.in_flight) == "number" then
-    if state.in_flight > idx then
+    if state.in_flight > idx and not remainder then
       next_state.in_flight = state.in_flight - 1
     elseif state.in_flight == idx then
       next_state.in_flight = nil
@@ -112,8 +131,14 @@ function M.observe_external_submit(state, text, submission_id)
   return next_state, true
 end
 
-function M.reconcile_echo(state, submission_ids, message_id, turn_id)
+function M.reconcile_echo(state, submission_ids, message_id, turn_id, text)
   if type(submission_ids) ~= "table" then return state, false end
+  -- Canonical projection can precede the loop's queue receipt on the bus.
+  -- Claim only its identified prefix, never later queued submissions.
+  local queue_idx = owned_index(state, state.queued_entry_id)
+  if queue_idx and submission_ids[1] == (state.entries[queue_idx].submission_ids or {})[1] then
+    state = select(1, M.accept_steered(state, submission_ids, text))
+  end
   local acknowledged = {}
   for _, id in ipairs(submission_ids) do acknowledged[id] = true end
   local matched = false

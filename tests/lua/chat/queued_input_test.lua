@@ -101,3 +101,15 @@ eq(restored_empty.input_value, "queued ",
   "restoring into an empty prompt leaves a space ready for continued typing")
 
 print("queued_input_test: all assertions passed")
+
+-- Prefix receipt and hard-stop restoration cannot claim a later submission.
+do
+  local state = queued_input.submit({ entries = {} }, "one", true, "fifo-one")
+  state = queued_input.submit(state, "two", true, "fifo-two")
+  state = select(1, queued_input.reconcile_echo(state, { "fifo-one" }, "m-one", "turn", "one"))
+  eq(state.entries[#state.entries].message_id, "m-one")
+  local restored = select(1, queued_input.restore(state))
+  eq(restored.input_value, "two ", "hard stop restores only the uncommitted suffix")
+  eq(#restored.entries, 1, "canonical prefix remains exactly once")
+  eq(restored.entries[1].text, "one")
+end

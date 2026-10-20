@@ -140,6 +140,9 @@ handlers.message_started = function(c, event)
   event.history_id = allocated
   local parent_key = history_path.key(parent)
   c.history_child_max[parent_key] = allocated[#allocated]
+  if event.delivery_id ~= nil and (type(event.delivery_id) ~= "string" or event.delivery_id == "" or event.role ~= "user") then
+    return err("invalid_delivery_id", { message_id = event.message_id })
+  end
   if event.authored_prompt ~= nil and type(event.authored_prompt) ~= "string" then
     return err("invalid_authored_prompt", { message_id = event.message_id })
   end
@@ -152,6 +155,7 @@ handlers.message_started = function(c, event)
     turn_id = event.turn_id, tool_call_id = event.tool_call_id,
     submission_ids = copy(event.submission_ids or {}),
     input_cause = event.input_cause,
+    delivery_id = event.delivery_id,
     authored_prompt = event.authored_prompt,
     tool_name = event.tool_name or (tool_exchange and tool_exchange.tool_name),
     chunks = {}, attempts = {}, exchange_ids = {},
