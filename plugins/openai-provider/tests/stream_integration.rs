@@ -1945,7 +1945,7 @@ async fn clean_eof_does_not_complete_partial_native_reasoning() {
             "displayed text remains partial output"
         );
         assert!(matches!(result, Err(StreamError::Body(message))
-            if message == "native reasoning stream ended before finish_reason"));
+            if message == "stream ended before a complete semantic response"));
     }
 }
 
@@ -2015,7 +2015,12 @@ async fn pairwise_mixed_frames_reach_downstream_accumulators() {
         ),
     ];
     for (json, name) in frames {
-        let body = format!("data: {json}\n\n");
+        let terminal = match name {
+            "content_tool" => "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "usage_only" => "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            _ => "",
+        };
+        let body = format!("data: {json}\n\n{terminal}");
         let (result, deltas, reasoning) = run_scripted_stream(body).await;
         let outcome = result.expect(name);
         match name {
@@ -2110,6 +2115,7 @@ const IN_BAND_ERROR: u16 = 2;
 const MALFORMED_STREAM: u16 = 3;
 const QUOTA_DENIAL: u16 = 4;
 const POST_TEXT_STREAM_LOSS: u16 = 5;
+const CLEAN_EMPTY_EOF: u16 = 6;
 
 /// Keep a runnable task while real localhost I/O is pending: Tokio's automatic
 /// paused-clock advancement must not mistake socket latency for a header timeout.
@@ -2159,6 +2165,7 @@ async fn scripted_retry_ledger(
             }
             let (http_status, content_type, body, truncate) = match status {
                 EMPTY_STREAM_LOSS => (200, "text/event-stream", "", true),
+                CLEAN_EMPTY_EOF => (200, "text/event-stream", ": keepalive\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n", false),
                 IN_BAND_ERROR => (200, "text/event-stream", "data: {\"error\":{\"message\":\"rate limited\"}}\n\n", false),
                 MALFORMED_STREAM => (200, "text/event-stream", "data: {bad\n\n", false),
                 QUOTA_DENIAL => (429, "application/json", "{\"error\":{\"type\":\"insufficient_quota\"}}", false),
@@ -2633,5 +2640,91 @@ async fn shared_counter_includes_presemantic_sse_loss_and_terminal_failures_over
         assert!(!matches!(error, StreamError::Exhausted { .. }));
         assert_eq!(requests.len(), 2);
         assert_eq!(progress.len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn clean_presemantic_eof_uses_the_shared_bounded_ledger() {
+    let (result, progress, requests, _) =
+        scripted_retry_ledger(vec![CLEAN_EMPTY_EOF, CLEAN_EMPTY_EOF, 200], 3, 1).await;
+    assert_eq!(
+        result.expect("recovered before output").full_text,
+        "recovered"
+    );
+    assert_eq!(requests.len(), 3);
+    assert_eq!(progress.len(), 2);
+    assert!(progress
+        .iter()
+        .all(|notice| notice.category.as_str() == "stream_transport"));
+
+    let (result, _, requests, _) = scripted_retry_ledger(vec![CLEAN_EMPTY_EOF; 3], 3, 6).await;
+    assert!(matches!(result, Err(StreamError::Exhausted { .. })));
+    assert_eq!(
+        requests.len(),
+        3,
+        "body failure alone cannot open outer rounds"
+    );
+}
+
+#[tokio::test]
+async fn semantic_fragments_never_replay_on_clean_or_chunked_eof() {
+    for delta in [
+        serde_json::json!({"content":"partial"}),
+        serde_json::json!({"reasoning":"partial"}),
+        serde_json::json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"effect","arguments":"{}"}}]}),
+    ] {
+        for framing in ["clean", "chunk-size", "chunk-body"] {
+            let (listener, addr) = bind_local().await;
+            let body = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":delta}]})
+            );
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("request");
+                let _ = read_request(&mut socket).await;
+                let response = if framing == "clean" {
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else {
+                    let tail = if framing == "chunk-size" {
+                        "a"
+                    } else {
+                        "a\r\nxx"
+                    };
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n{tail}", body.len())
+                };
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response");
+                socket.shutdown().await.expect("EOF");
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "no resend after semantic state"
+                );
+            });
+            let result = run_chat_stream_with_retry_progress(
+                &reqwest::Client::new(),
+                &rounds_policy(2, 6),
+                &format!("http://{addr}/v1/chat/completions"),
+                None,
+                "Authorization",
+                "fixture-model",
+                &[Message::user("no replay")],
+                None,
+                None,
+                CancellationToken::new(),
+                |_| {},
+                |_| {},
+                |_| panic!("no retry"),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(StreamError::Body(_))),
+                "{framing}: {result:?}"
+            );
+            server.await.expect("no replay");
+        }
     }
 }

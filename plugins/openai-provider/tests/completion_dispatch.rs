@@ -1197,3 +1197,68 @@ async fn lua_multiplier_changes_native_retry_progress() {
         child.kill().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn native_eof_is_bounded_before_output_and_never_publishes_unfinished_tools() {
+    for semantic in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for _ in 0..if semantic { 1 } else { 3 } {
+                let (mut stream, _) = listener.accept().await.expect("request");
+                read_request_json(&mut stream).await;
+                let body = if semantic {
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"effect\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{}\"}}]}}]}\n\n"
+                } else {
+                    ": keepalive\n\n"
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response");
+            }
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "no extra send"
+            );
+        });
+        let policy = r#"{"max_attempts":3,"max_rounds":6,"backoff_multiplier":2,"initial_delay_ms":0,"max_delay_ms":0,"round_cooldown_ms":0,"jitter_bps":0,"response_headers_timeout_ms":120000}"#;
+        let (mut child, mut stdin, mut stdout) =
+            spawn_provider_with_policy(&format!("http://{addr}"), policy).await;
+        send_completion_messages(
+            &mut stdin,
+            "eof",
+            json!([{"role":"user","content":"fixture"}]),
+        )
+        .await;
+        let mut retries = 0;
+        let terminal = loop {
+            let event = next_completion_event(&mut stdout, "eof").await;
+            match event["event"].as_str().expect("event") {
+                "retry" => retries += 1,
+                "error" => break event,
+                other => panic!("unfinished completion cannot publish {other}"),
+            }
+        };
+        assert_eq!(retries, if semantic { 0 } else { 2 });
+        if semantic {
+            assert!(
+                terminal.get("retry").is_none(),
+                "semantic loss is not exhaustion"
+            );
+        } else {
+            assert_eq!(terminal["retry"]["total_attempts"], 3);
+        }
+        server.await.expect("bounded transport");
+        assert!(
+            timeout(Duration::from_millis(100), read_outgoing(&mut stdout))
+                .await
+                .is_err(),
+            "one terminal event"
+        );
+        child.kill().await.expect("stop fixture");
+    }
+}

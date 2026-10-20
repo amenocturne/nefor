@@ -874,9 +874,9 @@ where
     ) {
         return Err(StreamAttemptFailure::new(error, &outcome, &tool_calls));
     }
-    if outcome.reasoning_continuation.is_some() && !stream_semantically_complete(&outcome) {
+    if !stream_semantically_complete(&outcome) || !buffer.is_empty() {
         return Err(StreamAttemptFailure::new(
-            StreamError::Body("native reasoning stream ended before finish_reason".to_owned()),
+            StreamError::Body("stream ended before a complete semantic response".to_owned()),
             &outcome,
             &tool_calls,
         ));
