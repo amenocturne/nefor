@@ -127,6 +127,12 @@ local function apply(label, msg)
     } or nil
     next_legacy.replay_mode = current_msg.from_resume and true or nil
   end
+  -- Accepted startup input now displays activity before a provider turn exists.
+  -- The rendered pending/error contract is covered by the startup catalog test.
+  if msg.kind == "chat.input.submit" and msg._event_source == "startup"
+      and #(msg.text or "") > 0 then
+    next_legacy.pending = true
+  end
   local legacy_state_view = stable(next_legacy)
   local current_state_view = stable(next_current)
   assert(legacy_state_view == current_state_view,

@@ -890,6 +890,7 @@ local function handle_chat_submit(msg, state)
   state = shallow_merge(state, {
     rewind_notice = NIL_SENTINEL,
     pending_rewind = NIL_SENTINEL,
+    pending = true,
   })
   return queued_input.observe_external_submit(state, text, msg.submission_id), {}
 end

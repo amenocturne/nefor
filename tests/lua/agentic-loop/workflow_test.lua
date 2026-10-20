@@ -1952,3 +1952,88 @@ do
   lifecycle:release("r", "delivery")
   assert_eq(#emitted, 1)
 end
+
+-- Catalog/auth readiness is not snapshot failure. Intake owns the original
+-- identity through program-first admission and late notifications cannot revive it.
+for _, outcome in ipairs({ "ready", "failed", "cancel", "reset" }) do
+  fresh_loop()
+  local readiness = { status = "pending" }
+  agentic_loop.configure { resolve_provider_readiness = function(provider)
+    assert_eq(provider, "mock", "readiness belongs to selected provider")
+    return readiness
+  end }
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "held catalog input", submission_id = "held-" .. outcome })
+  project_pending_conversation(decode_calls())
+  local load = find_kind(decode_calls(), "mag.load")
+  assert(load, "accepted input requests lead program")
+  send_to_loop("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:test", artifact = program_artifact() })
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "pending catalog does not execute")
+  assert_eq(run_model_snapshot_resolutions, 0, "snapshot is deferred until actual admission")
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 1, "accepted input remains owned")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "duplicate", submission_id = "held-" .. outcome })
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 1, "duplicate intake ignored")
+  if outcome == "cancel" then
+    send_to_loop("nefor-tui", { kind = "chat.interrupt", drop_queued = true })
+  elseif outcome == "reset" then
+    send_to_loop("nefor-tui", { kind = "chat.reset" })
+    project_pending_conversation(decode_calls())
+  end
+  _test.calls_clear()
+  readiness = outcome == "failed" and { status = "failed", message = "Synthetic catalog failure" }
+    or { status = "ready" }
+  agentic_loop.provider_readiness_changed("other-provider")
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "other provider cannot release queue")
+  agentic_loop.provider_readiness_changed("mock")
+  local execute = find_kind(decode_calls(), "mag.execute")
+  if outcome == "ready" then
+    assert(execute, "ready releases accepted input")
+    assert_eq(task_prompt(execute.body), "held catalog input", "original text survives readiness")
+    assert_eq(execute.body.params_overlay["actor:8:lead.llm"].submission_ids[1], "held-ready", "original ID survives readiness")
+    assert_eq(run_model_snapshot_resolutions, 1, "one strict snapshot at admission")
+  else
+    assert_eq(execute, nil, "terminal failure/cancel/reset cannot execute")
+    assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0, "terminal input removed")
+  end
+  _test.calls_clear()
+  agentic_loop.provider_readiness_changed("mock")
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "duplicate ready cannot execute twice")
+end
+
+for _, outcome in ipairs({ "ready", "failed", "cancel", "reset" }) do
+  fresh_loop()
+  local readiness = { status = "pending" }
+  agentic_loop.configure { resolve_provider_readiness = function() return readiness end }
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "catalog first",
+    submission_id = "early-" .. outcome })
+  project_pending_conversation(decode_calls())
+  local load = find_kind(decode_calls(), "mag.load")
+  assert(load, "lead program remains in flight")
+  if outcome == "cancel" then
+    send_to_loop("nefor-tui", { kind = "chat.interrupt" })
+  elseif outcome == "reset" then
+    send_to_loop("nefor-tui", { kind = "chat.reset" })
+    project_pending_conversation(decode_calls())
+  end
+  _test.calls_clear()
+  readiness = outcome == "failed" and { status = "failed", message = "catalog failure" }
+    or { status = "ready" }
+  agentic_loop.provider_readiness_changed("mock")
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil, "no program means no dispatch")
+  if outcome == "failed" then
+    assert(find_kind(decode_calls(), "chat.error.append"), "pre-dispatch failure clears thinking")
+    local terminal = find_kind(decode_calls(), "agentic_loop.request_completed")
+    assert(terminal, "catalog failure settles accepted request without waiting for program")
+    assert_eq(terminal.body.request_id, "early-failed", "terminal correlates original identity")
+    assert_eq(terminal.body.status, "error", "catalog terminal is an error")
+  end
+  _test.calls_clear()
+  send_to_loop("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:test", artifact = program_artifact() })
+  local execute = find_kind(decode_calls(), "mag.execute")
+  assert_eq(execute ~= nil, outcome == "ready", "late load cannot revive cancelled/failed/reset input")
+  assert_eq(run_model_snapshot_resolutions, outcome == "ready" and 1 or 0,
+    "snapshot only at admission")
+  assert_eq(find_kind(decode_calls(), "agentic_loop.request_completed"), nil,
+    "late program cannot duplicate terminal")
+end

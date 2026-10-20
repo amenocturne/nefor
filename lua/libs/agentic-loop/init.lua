@@ -76,6 +76,7 @@ local state = {
     system           = nil,
     ambient_context  = nil,
     resolve_model_snapshot = nil,
+    resolve_provider_readiness = nil,
   },
   pending_model_selection = nil, ---@type table|nil { provider, model }
 
@@ -527,6 +528,28 @@ handle_lead_program_error = function(body)
   emit_idle_state("lead-program-load-failed")
 end
 
+-- Composition owns dynamic readiness; the snapshot resolver remains strict.
+local function provider_ready()
+  local resolve = state.config.resolve_provider_readiness
+  if resolve == nil then return true end
+  local readiness = resolve(state.config.provider)
+  assert(type(readiness) == "table", "provider readiness must be a tagged state")
+  if readiness.status == "ready" then return true end
+  if readiness.status == "failed" then
+    local had_waiting_input = #state.pending_user_inputs > 0 or #state.deferred_queue > 0
+    fail_open_requests({ code = "provider_unavailable", message = readiness.message })
+    state.deferred_queue = {}
+    if had_waiting_input then
+      emit("nefor-tui", { kind = "chat.error.append", title = "Selected provider unavailable",
+        message = readiness.message, retryable = false })
+    end
+    emit_idle_state("provider-unavailable")
+    return false, "failed"
+  end
+  assert(readiness.status == "pending", "invalid provider readiness status")
+  return false, "pending"
+end
+
 -- Spawn one turn-program for `user_text`. Clones the retained inline artifact and
 -- overlays the initial mag.Task plus live config +
 -- canonical conversation identity onto the lead llm actor, and submits
@@ -534,6 +557,17 @@ end
 -- duplicating it in this persisted command would make session growth quadratic.
 local function submit_orchestrator_run(user_text, submission_ids, input_cause, release_obligations)
   if state.current_run_id ~= nil then return nil end
+  local ready, readiness_status = provider_ready()
+  if not ready then
+    if readiness_status == "pending" then
+      state.pending_user_inputs[#state.pending_user_inputs + 1] = {
+        text = user_text, submission_ids = submission_ids or {},
+      }
+      ensure_conversation_id()
+      ensure_lead_program_loaded()
+    end
+    return nil
+  end
   local conversation_id = ensure_conversation_id()
   if not conversation_ready() then
     state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = user_text, submission_ids = submission_ids or {} }
@@ -669,6 +703,7 @@ end
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
   if conversation_commit_pending() or not conversation_ready() then return end
+  if state.lead_program.artifact == nil or not provider_ready() then return end
   local merged, request_ids, obligations = drain_deferred_text()
   if type(merged) ~= "string" then return end
   nefor.log.info("agentic-loop: flushing deferred run completions", {
@@ -682,6 +717,7 @@ flush_pending_user_inputs = function()
   if conversation_commit_pending() or not conversation_ready() then return end
   if state.lead_program.artifact == nil then return end
   if #state.pending_user_inputs == 0 then return end
+  if not provider_ready() then return end
   local inputs = state.pending_user_inputs
   local texts, submission_ids = {}, {}
   for _, input in ipairs(inputs) do
@@ -752,12 +788,28 @@ local function interrupt_active_lead_run()
   return true
 end
 
+local function discard_pending_inputs()
+  local inputs = state.pending_user_inputs
+  state.pending_user_inputs = {}
+  if state.pending_steer then
+    for _, input in ipairs(state.pending_steer.inputs) do inputs[#inputs + 1] = input end
+    state.pending_steer = nil
+  end
+  for _, input in ipairs(inputs) do
+    for _, request_id in ipairs(input.submission_ids or {}) do
+      request_lifecycle:force(request_id, "interrupted", {
+        code = "interrupted", message = "Queued request was cancelled",
+      })
+      request_lifecycle:release(request_id, "input:" .. request_id)
+    end
+  end
+end
+
 -- Abort the current lead turn. When requested by the TUI's hard-stop paths,
 -- queued input has already been restored to the prompt and must not respawn.
 local function cancel(drop_queued)
-  if drop_queued then
-    state.pending_user_inputs = {}
-    state.pending_steer = nil
+  if drop_queued or state.current_run_id == nil then
+    discard_pending_inputs()
   end
   kill_active_lead_run()
 end
@@ -828,8 +880,7 @@ end
 local function cancel_all()
   local interrupted = interrupt_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
-  state.pending_user_inputs = {}
-  state.pending_steer = nil
+  discard_pending_inputs()
   nefor.log.info("agentic-loop: cancel_all (graceful interrupt)", {
     interrupted_lead_run = interrupted,
     deferred_queued = #state.deferred_queue,
@@ -846,6 +897,7 @@ end
 -- starts a fresh conversation. The retained turn-program artifact survives — the
 -- program is per-session config, not per-conversation state.
 local function new_chat()
+  discard_pending_inputs()
   state.current_run_id = nil
   state.current_turn = nil
   state.deferred_queue = {}
@@ -996,6 +1048,7 @@ local function handle_chat_input_submit(body)
     or "submission-" .. envelope.uuid_lite()
   local submission_ids = { request_id }
   local sessions = require("libs.sessions")
+  if request_lifecycle:get(request_id) ~= nil then return end
   request_lifecycle:accept(request_id, sessions.current_id())
   request_lifecycle:acquire(request_id, "input:" .. request_id, sessions.current_id())
 
@@ -1008,6 +1061,14 @@ local function handle_chat_input_submit(body)
   })
 
   ensure_conversation_id()
+  if state.config.resolve_provider_readiness ~= nil then
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
+    ensure_lead_program_loaded()
+    if not provider_ready() then return end
+    flush_deferred()
+    flush_pending_user_inputs()
+    return
+  end
   if state.current_run_id ~= nil or conversation_commit_pending()
       or not conversation_ready() then
     state.pending_user_inputs[#state.pending_user_inputs + 1] = { text = text, submission_ids = submission_ids }
@@ -1744,6 +1805,11 @@ function M.configure(opts)
     end
     state.config.resolve_model_snapshot = opts.resolve_model_snapshot
   end
+  if opts.resolve_provider_readiness ~= nil then
+    assert(type(opts.resolve_provider_readiness) == "function",
+      "configure: resolve_provider_readiness must be a function")
+    state.config.resolve_provider_readiness = opts.resolve_provider_readiness
+  end
   -- lead_program: where the shipped turn-program lives. `source_dir`
   -- defaults to the config dir (NEFOR_CONFIG_DIR); compositions whose
   -- config dir is not the starter (cli-config) pass it explicitly.
@@ -1875,6 +1941,12 @@ function M.prepare()
   state.prepare_requested = true
   emit_ready_if_ready()
   return true
+end
+
+function M.provider_readiness_changed(provider)
+  if provider ~= state.config.provider or not provider_ready() then return end
+  flush_deferred()
+  flush_pending_user_inputs()
 end
 
 function M.is_ready()
@@ -2128,6 +2200,7 @@ M._internals  = {
       system = nil,
       ambient_context = nil,
       resolve_model_snapshot = nil,
+      resolve_provider_readiness = nil,
     }
     state.pending_model_selection = nil
     state.lead_program = {

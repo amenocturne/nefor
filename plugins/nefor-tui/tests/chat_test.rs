@@ -13816,3 +13816,31 @@ fn canonical_extension_events_links_and_popup_hooks_preserve_permission_preceden
         .is_none());
     assert!(render_str(&mut engine).contains("EXTENSION POPUP"));
 }
+
+#[test]
+fn startup_input_thinks_until_pre_dispatch_catalog_error() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    load_chat_scenario(&mut engine);
+    let _ = render_str(&mut engine);
+    chat_harness::dispatch_event_from(
+        &mut engine,
+        "startup",
+        json!({"kind":"chat.input.submit",
+        "text":"accepted before catalog", "submission_id":"startup-pending"}),
+    );
+    let waiting = render_str(&mut engine);
+    assert!(
+        waiting.contains("accepted before catalog") && waiting.contains("[thinking..."),
+        "{waiting}"
+    );
+    dispatch_event(
+        &mut engine,
+        json!({"kind":"chat.error.append", "title":"Selected provider unavailable",
+        "message":"Synthetic catalog failure", "retryable":false}),
+    );
+    let failed = render_str(&mut engine);
+    assert!(
+        failed.contains("Synthetic catalog failure") && !failed.contains("[thinking..."),
+        "{failed}"
+    );
+}
