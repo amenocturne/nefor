@@ -72,8 +72,18 @@ local function colored(segment)
 end
 
 local example = bar.segment(108000, 272000, 872000)
-eq(text(example), "108k   272k   │     740k      │872k 12%", "stationary centered three-region fixture")
-eq(#cells(example), 39, "compact example width, including dividers")
+eq(text(example), "108k · 12%   272k   │     740k      │872k", "stationary centered three-region fixture")
+eq(#cells(example), 41, "compact example width, including dividers")
+for _, cell in ipairs(cells(example)) do
+  if cell.char == "·" or cell.char == "%" then
+    eq(cell.bg, nil, "count/percentage prefix is not part of the colored bar")
+    eq(cell.fg, example.used.fg, "dot and percentage use the ordinary text style")
+  end
+end
+for _, segment in ipairs({ bar.segment(0, 872000), bar.segment(0, 800000, 872000),
+  bar.segment(0, 500000, 872000), bar.segment(nil, nil, nil) }) do
+  eq(#cells({ spans = segment.bar }), 30, "one/two/three-region and neutral bars keep the same footprint")
+end
 local baseline = colored(example)
 eq(#baseline, 28, "28 proportional colored cells")
 local previous = -1
@@ -94,11 +104,11 @@ end
 local _, full = colored(bar.segment(872000, 272000, 872000))
 eq(full, 28, "maximum fills the whole bar")
 local over = bar.segment(1000000, 272000, 872000)
-assert(text(over):match("^1.0M ") and text(over):match(" 115%%$"), "over-capacity usage and percent are not capped")
+assert(text(over):match("^1.0M ") and text(over):match(" · 115%% "), "over-capacity usage and percent are not capped")
 local _, over_fill = colored(over)
 eq(over_fill, 28, "only visual fill caps at maximum")
 local unknown = bar.segment(nil, 272000, 872000)
-assert(text(unknown):match("^%? ") and text(unknown):match(" %?%%$"), "unknown is not a measured zero")
+assert(text(unknown):match("^%? · %?%% "), "unknown is not a measured zero")
 for _, segment in ipairs({ unknown, bar.segment(nil, nil, nil), bar.segment(47000, nil, nil) }) do
   for _, span in ipairs(segment.bar) do
     if span.text ~= "│" then
@@ -108,26 +118,26 @@ for _, segment in ipairs({ unknown, bar.segment(nil, nil, nil), bar.segment(4700
   end
   eq(segment.percent, "?", "percentage needs both measurement and denominator")
 end
-assert(text(bar.segment(0, nil, nil)):match("^0 .*%?%%$"), "known zero without capacity")
-assert(text(bar.segment(nil, nil, nil)):match("^%? .*%?%%$"), "unknown without capacity")
-assert(text(bar.segment(108000, nil, nil)):match("^108k .*%?%%$"), "no invented capacity or percent")
-eq(text(bar.segment(108000, 272000)), "108k              272k              40%", "one default-window fixture")
+assert(text(bar.segment(0, nil, nil)):match("^0 · %?%% "), "known zero without capacity")
+assert(text(bar.segment(nil, nil, nil)):match("^%? · %?%% "), "unknown without capacity")
+assert(text(bar.segment(108000, nil, nil)):match("^108k · %?%% "), "no invented capacity or percent")
+eq(text(bar.segment(108000, 272000)), "108k · 40%              272k             ", "one default-window fixture")
 eq(text(bar.segment(108000, 272000, 272000)), text(bar.segment(108000, 272000)), "equal maximum collapses")
 eq(text(bar.segment(108000, 272000, 100000)), text(bar.segment(108000, 272000)), "inconsistent maximum retains default")
-eq(text(bar.segment(1, 1, 2, 1)), "1 1│2 50%", "tiny windows omit overlapping warning boundary")
-eq(text(bar.segment(950, 900, 1000, 1)), "950 900│1k 95%", "default beyond warning collapses yellow")
-eq(text(bar.segment(1001, 1001, 1002, 1)), "1k 1001│1002 100%", "rounded labels do not duplicate thresholds")
+eq(text(bar.segment(1, 1, 2, 1)), "1 · 50% 1│2", "tiny windows omit overlapping warning boundary")
+eq(text(bar.segment(950, 900, 1000, 1)), "950 · 95% 900│1k", "default beyond warning collapses yellow")
+eq(text(bar.segment(1001, 1001, 1002, 1)), "1k · 100% 1001│1002", "rounded labels do not duplicate thresholds")
 local narrow = bar.segment(108000, 272000, 872000, 1)
-eq(text(narrow), "108k 272k│740k│872k 12%", "minimum width keeps labels in their regions")
+eq(text(narrow), "108k · 12% 272k│740k│872k", "minimum width keeps labels in their regions")
 local invalid = bar.segment(-1, 0, 0)
-assert(text(invalid):match("^%? .*%?%%$"), "invalid inputs do not become zero")
+assert(text(invalid):match("^%? · %?%% "), "invalid inputs do not become zero")
 eq(text(bar.segment(0 / 0, 272000)), text(bar.segment(nil, 272000)), "nonfinite measurement stays unknown")
 
 local row = footer.view({ model = "gpt-5.4", reasoning_effort = "high", gate_mode = "safe",
   current_context_tokens = 108000, max_tokens = 272000, max_context_tokens = 872000,
   usage = { ["fixture/quota"] = { kind = "free" } },
 })
-eq(text(row), "SAFE │ gpt-5.4 · high │ 108k   272k   │     740k      │872k  12% │ free", "footer preserves model/reasoning/quota")
+eq(text(row), "SAFE │ gpt-5.4 · high │ free │ 108k · 12%    272k   │     740k      │872k", "footer preserves model/reasoning/quota")
 for _, child in ipairs(row.children) do
   if child.wrap then eq(child.wrap, "none", "footer remains a single row") end
 end

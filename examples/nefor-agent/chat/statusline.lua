@@ -46,10 +46,6 @@ local function build_segments(state)
     segs[#segs + 1] = { spans = { { text = "Start chatting to see stats", fg = C.status_dim } } }
   end
 
-  local context_index = #segs + 1
-  segs[context_index] = context_bar.segment(
-    state.current_context_tokens, state.max_tokens, state.max_context_tokens)
-
   local function add_usage(usage_id)
     local value = type(state.usage) == "table" and state.usage[usage_id] or nil
     local usage_text, available = usage_view.footer(value)
@@ -63,42 +59,34 @@ local function build_segments(state)
     for _, usage_id in ipairs(usage_config.statusline_ids or {}) do add_usage(usage_id) end
   end
 
-  return segs, context_index
+  return segs, context_bar.segment(
+    state.current_context_tokens, state.max_tokens, state.max_context_tokens)
 end
 
 function M.view(state, pane_width)
-  local segs, context_index = build_segments(state)
-  local identity, measurements = {}, {}
+  local segs, context = build_segments(state)
+  local identity = {}
   for i, seg in ipairs(segs) do
-    if i ~= context_index then
-      local out = i < context_index and identity or measurements
-      if i > 1 then out[#out + 1] = { text = " │ ", fg = C.status_dim } end
-      for _, sp in ipairs(seg.spans) do out[#out + 1] = sp end
-    end
+    if i > 1 then identity[#identity + 1] = { text = " │ ", fg = C.status_dim } end
+    for _, sp in ipairs(seg.spans) do identity[#identity + 1] = sp end
   end
-  local context = segs[context_index]
   local used = context.used.text
-  -- Counts and percentages retain their slots across unknown/partial/zero
-  -- measurements. Keep a short identity prefix readable at narrow widths;
-  -- only the bar clips, not its count or percentage. The 43-cell meter is a
-  -- 3-cell divider, 5-cell count, 30-cell bar, and 5-cell percentage. Its
-  -- 13-cell minimum leaves no bar, while 20 cells reserve a short identity.
-  -- No capacity means neutral unknown, never empty usage.
-  local meter_width = pane_width and math.min(43, math.max(13, pane_width - 20)) or 43
-  local meter = tui.constrained { max_width = meter_width, child = tui.row { gap = 0, children = {
+  -- Reserve the count/dot/percentage before yielding bar cells. Constraining
+  -- (not expanding) the preceding widgets keeps a short footer inline, while
+  -- long identities yield before the measurement prefix, and the bar uses
+  -- only the remaining cells (at most its normal 30).
+  local meter = tui.constrained { max_width = 45, child = tui.row { gap = 0, children = {
     tui.spans { spans = {
       { text = " │ ", fg = C.status_dim },
-      { text = string.rep(" ", math.max(0, 4 - #used)) .. used .. " ", fg = C.system },
+      { text = string.rep(" ", math.max(0, 4 - #used)) .. used
+        .. " · " .. string.format("%-4s", context.percent .. "%") .. " ", fg = C.system },
     }, wrap = "none" },
     tui.expanded { child = tui.spans { spans = context.bar, wrap = "none" } },
-    tui.spans { spans = {
-      { text = " " .. string.format("%3s", context.percent) .. "%", fg = C.system },
-    }, wrap = "none" },
   } } }
   return tui.row { gap = 0, children = {
-    tui.expanded { child = tui.spans { spans = identity, wrap = "none" } },
+    tui.constrained { max_width = pane_width and math.max(0, pane_width - 15) or nil,
+      child = tui.spans { spans = identity, wrap = "none" } },
     meter,
-    tui.spans { spans = measurements, wrap = "none" },
   } }
 end
 

@@ -724,15 +724,20 @@ fn context_bar_first_display_preserves_slots_through_data_order_and_resize() {
                     "5%"
                 };
                 let footer = snapshot.lines().find(|line| line.contains(percent)).unwrap_or_else(|| panic!("phase {phase}, capacity_first {capacity_first}, width {width}: {snapshot}"));
-                let right = footer.trim_end().chars().count();
-                assert_eq!(
-                    right, width as usize,
-                    "meter ends at the pane edge: {footer}"
+                let count =
+                    if phase == 0 || phase == 4 || phase >= 6 || (phase == 1 && capacity_first) {
+                        "?"
+                    } else if phase == 3 {
+                        "0"
+                    } else {
+                        "47k"
+                    };
+                assert!(
+                    footer.contains(&format!("{count:>4} · {percent}")),
+                    "measurement prefix survives at width {width}: {footer}"
                 );
+                assert!(footer.chars().count() <= width as usize, "{footer}");
                 if width >= 56 {
-                    let meter_width = 43.min((width as usize).saturating_sub(20).max(13));
-                    let separator = width as usize - meter_width + 1;
-                    assert_eq!(footer.chars().nth(separator), Some('│'), "{footer}");
                     if phase == 1 && !capacity_first {
                         assert!(
                             footer.contains("47k"),
@@ -743,12 +748,117 @@ fn context_bar_first_display_preserves_slots_through_data_order_and_resize() {
                             "unknown denominator is not zero percent"
                         );
                     }
-                    if width >= 80 && (phase == 2 || phase == 3) {
+                    if width >= 160 && (phase == 2 || phase == 3) {
                         for label in ["500k", "740k", "872k"] {
                             assert!(footer.contains(label), "{footer}");
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn context_meter_is_inline_after_all_widgets_with_free_space_to_its_right() {
+    let mut engine = Engine::new(160, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    engine
+        .state_table()
+        .unwrap()
+        .set("show_sidebar", false)
+        .unwrap();
+    engine
+        .state_table()
+        .unwrap()
+        .set("reasoning_effort", "medium")
+        .unwrap();
+    engine
+        .lua()
+        .load(
+            r#"
+      require("libs.chat.extensions").configure({ status_segments = function()
+        return { { spans = { { text = "quota 85%" } } } }
+      end })
+    "#,
+        )
+        .exec()
+        .unwrap();
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "conversation.usage.update", "subscription_id": "status",
+            "values": [{ "usage_id": "openrouter/session-total", "usage": {
+                "kind": "monetary", "amount": "0.125", "currency": "USD"
+            }}]
+        }),
+    );
+    for (used, capacity, count, percent) in [
+        (None, false, "?", "?%"),
+        (Some(52000), false, "52k", "?%"),
+        (None, true, "?", "?%"),
+        (Some(0), true, "0", "0%"),
+        (Some(52000), true, "52k", "6%"),
+    ] {
+        engine
+            .state_table()
+            .unwrap()
+            .set("current_context_tokens", used)
+            .unwrap();
+        engine
+            .state_table()
+            .unwrap()
+            .set("max_tokens", capacity.then_some(500000))
+            .unwrap();
+        engine
+            .state_table()
+            .unwrap()
+            .set("max_context_tokens", capacity.then_some(872000))
+            .unwrap();
+        for width in [160, 120, 100, 160] {
+            engine.handle_resize(width, 24).unwrap();
+            render_str(&mut engine);
+            let snapshot = engine.snapshot();
+            let footer = snapshot
+                .lines()
+                .find(|line| line.contains("quota 85%"))
+                .unwrap();
+            let identity = "quota 85% │ SAFE │ mock-model · medium │ $0.125";
+            assert!(footer.starts_with(identity), "{footer}");
+            let prefix = format!(" │ {count:>4} · {percent:<4} ");
+            assert!(
+                footer[identity.len()..].starts_with(&prefix),
+                "meter immediately follows all widgets: {footer}"
+            );
+            let bar_x = identity.chars().count() + prefix.chars().count();
+            assert!(
+                bar_x + 30 < width as usize,
+                "free cells remain after the bounded bar"
+            );
+            assert!(
+                footer.chars().skip(bar_x + 30).all(|c| c == ' '),
+                "nothing follows meter: {footer}"
+            );
+            if capacity {
+                assert_eq!(
+                    footer.chars().nth(bar_x + 16),
+                    Some('│'),
+                    "first capacity divider: {footer}"
+                );
+                assert_eq!(
+                    footer.chars().nth(bar_x + 25),
+                    Some('│'),
+                    "second capacity divider: {footer}"
+                );
+                for label in ["500k", "740k", "872k"] {
+                    assert!(footer.contains(label), "{footer}");
+                }
+            } else {
+                assert_eq!(
+                    footer.chars().nth(bar_x + 14),
+                    Some('?'),
+                    "neutral bar keeps its slot: {footer}"
+                );
             }
         }
     }
@@ -828,10 +938,10 @@ fn context_bar_keeps_percentage_visible_with_long_model_and_sidebar() {
             .lines()
             .find(|line| line.contains("12%"))
             .expect("percentage remains visible");
-        let labels = if width >= 120 {
+        let labels = if width >= 160 {
             vec!["108k", "272k", "740k", "872k"]
         } else {
-            vec!["108k", "272k"]
+            vec!["108k"]
         };
         for label in labels {
             assert!(footer.contains(label), "{width}: {snapshot}");

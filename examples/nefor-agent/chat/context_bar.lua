@@ -74,6 +74,15 @@ local function widths(regions, capacity, requested)
   end
 end
 
+local function measurement(used, bar, percent)
+  local spans = {
+    used,
+    { text = " · " .. percent .. "% ", fg = common.C.system },
+  }
+  for _, span in ipairs(bar) do spans[#spans + 1] = span end
+  return { spans = spans, used = used, bar = bar, percent = percent }
+end
+
 function M.segment(used, regular, maximum, requested_width)
   if not integer(used, 0) then used = nil end
   local spans = { { text = used and count(used) or "?", fg = common.C.system } }
@@ -81,9 +90,7 @@ function M.segment(used, regular, maximum, requested_width)
   if not capacity then
     local neutral = { text = string.rep(" ", 14) .. "?" .. string.rep(" ", 15),
       fg = common.C.md_code_fg, bg = "#30303C" }
-    return { spans = { spans[1], { text = " " }, neutral,
-      { text = " ?%", fg = common.C.system } },
-      used = spans[1], bar = { neutral }, percent = "?" }
+    return measurement(spans[1], { neutral }, "?")
   end
   widths(zones, capacity, requested_width)
   spans[#spans + 1] = { text = " ", fg = common.C.system }
@@ -110,10 +117,10 @@ function M.segment(used, regular, maximum, requested_width)
     end
   end
   local percent = used and tostring(math.floor(100 * used / capacity + 0.5)) or "?"
-  spans[#spans + 1] = { text = " " .. percent .. "%", fg = common.C.system }
+
   local bar = {}
-  for i = 3, #spans - 1 do bar[#bar + 1] = spans[i] end
-  return { spans = spans, used = spans[1], bar = bar, percent = percent }
+  for i = 3, #spans do bar[#bar + 1] = spans[i] end
+  return measurement(spans[1], bar, percent)
 end
 
 return M
