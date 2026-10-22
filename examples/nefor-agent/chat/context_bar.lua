@@ -50,9 +50,9 @@ local function widths(regions, capacity, requested)
     minimum = minimum + #region.label
   end
   -- 28 colored cells fits the 272k/740k/872k example (9/15/4).
-  -- One window uses 12. Narrow requests stop at label-fit minimum; we never
-  -- truncate a threshold or let it cross a divider. Dividers add n-1 cells.
-  local target = math.max(minimum, math.floor(requested or (#regions == 1 and 12 or 28)))
+  -- One window uses 30 (the same width including dividers). Narrow requests
+  -- stop at label-fit minimum; labels never cross a divider. Dividers add n-1 cells.
+  local target = math.max(minimum, math.floor(requested or (30 - (#regions - 1))))
   local allocated = 0
   for _, region in ipairs(regions) do
     region.width = math.max(#region.label,
@@ -78,7 +78,13 @@ function M.segment(used, regular, maximum, requested_width)
   if not integer(used, 0) then used = nil end
   local spans = { { text = used and count(used) or "?", fg = common.C.system } }
   local zones, capacity = regions(regular, maximum)
-  if not capacity then return { spans = spans } end
+  if not capacity then
+    local neutral = { text = string.rep(" ", 14) .. "?" .. string.rep(" ", 15),
+      fg = common.C.md_code_fg, bg = "#30303C" }
+    return { spans = { spans[1], { text = " " }, neutral,
+      { text = " ?%", fg = common.C.system } },
+      used = spans[1], bar = { neutral }, percent = "?" }
+  end
   widths(zones, capacity, requested_width)
   spans[#spans + 1] = { text = " ", fg = common.C.system }
   local bar_width = 0
@@ -95,8 +101,8 @@ function M.segment(used, regular, maximum, requested_width)
     for j = 1, zone.width do
       cell = cell + 1
       local active = cell <= filled
-      local fg = active and "#101010" or zone.color.label
-      local bg = active and zone.color.filled or zone.color.empty
+      local fg = not used and common.C.md_code_fg or (active and "#101010" or zone.color.label)
+      local bg = not used and "#30303C" or (active and zone.color.filled or zone.color.empty)
       local char = text:sub(j, j)
       local previous = spans[#spans]
       if previous.fg == fg and previous.bg == bg then previous.text = previous.text .. char
@@ -105,7 +111,9 @@ function M.segment(used, regular, maximum, requested_width)
   end
   local percent = used and tostring(math.floor(100 * used / capacity + 0.5)) or "?"
   spans[#spans + 1] = { text = " " .. percent .. "%", fg = common.C.system }
-  return { spans = spans }
+  local bar = {}
+  for i = 3, #spans - 1 do bar[#bar + 1] = spans[i] end
+  return { spans = spans, used = spans[1], bar = bar, percent = percent }
 end
 
 return M

@@ -11,7 +11,7 @@ local CURSOR_ROW_STYLE = common.CURSOR_ROW_STYLE
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL = common.NIL_SENTINEL
 
-local M = {}
+local M = { MAX_WIDTH = 36 }
 
 M.LINGER_MS = 2000
 
@@ -384,7 +384,7 @@ function M.panel(state)
   end
   return tui.constrained {
     min_width = 28,
-    max_width = 36,
+    max_width = M.MAX_WIDTH,
     child = tui.scrollable {
       key = "sidebar",
       stick_to = "start",

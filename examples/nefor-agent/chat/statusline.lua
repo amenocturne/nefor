@@ -66,20 +66,38 @@ local function build_segments(state)
   return segs, context_index
 end
 
-function M.view(state)
+function M.view(state, pane_width)
   local segs, context_index = build_segments(state)
   local identity, measurements = {}, {}
   for i, seg in ipairs(segs) do
-    local out = i < context_index and identity or measurements
-    if i > 1 then
-      out[#out + 1] = { text = " │ ", fg = C.status_dim }
+    if i ~= context_index then
+      local out = i < context_index and identity or measurements
+      if i > 1 then out[#out + 1] = { text = " │ ", fg = C.status_dim } end
+      for _, sp in ipairs(seg.spans) do out[#out + 1] = sp end
     end
-    for _, sp in ipairs(seg.spans) do out[#out + 1] = sp end
   end
-  -- Reserve the measured footer's natural width before allocating model text.
-  -- Long model names clip, rather than pushing the bar/percentage offscreen.
+  local context = segs[context_index]
+  local used = context.used.text
+  -- Counts and percentages retain their slots across unknown/partial/zero
+  -- measurements. Keep a short identity prefix readable at narrow widths;
+  -- only the bar clips, not its count or percentage. The 43-cell meter is a
+  -- 3-cell divider, 5-cell count, 30-cell bar, and 5-cell percentage. Its
+  -- 13-cell minimum leaves no bar, while 20 cells reserve a short identity.
+  -- No capacity means neutral unknown, never empty usage.
+  local meter_width = pane_width and math.min(43, math.max(13, pane_width - 20)) or 43
+  local meter = tui.constrained { max_width = meter_width, child = tui.row { gap = 0, children = {
+    tui.spans { spans = {
+      { text = " │ ", fg = C.status_dim },
+      { text = string.rep(" ", math.max(0, 4 - #used)) .. used .. " ", fg = C.system },
+    }, wrap = "none" },
+    tui.expanded { child = tui.spans { spans = context.bar, wrap = "none" } },
+    tui.spans { spans = {
+      { text = " " .. string.format("%3s", context.percent) .. "%", fg = C.system },
+    }, wrap = "none" },
+  } } }
   return tui.row { gap = 0, children = {
     tui.expanded { child = tui.spans { spans = identity, wrap = "none" } },
+    meter,
     tui.spans { spans = measurements, wrap = "none" },
   } }
 end

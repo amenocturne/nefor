@@ -245,7 +245,8 @@ local function render(state, statusline, slash)
         style = STYLE.popup_user,
         wrap = "word",
       } or nil,
-      statusline.view(state),
+      statusline.view(state, math.max(0, tui.dimensions().width
+        - (state.show_sidebar and (run_panel.MAX_WIDTH + 1) or 0))),
       blank_row(),
       render_keepalive(state),
     },

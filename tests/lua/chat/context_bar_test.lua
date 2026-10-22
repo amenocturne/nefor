@@ -10,6 +10,7 @@ package.loaded.config = { active = { usage = {
 tui = {
   spans = function(value) return value end,
   expanded = function(value) return value.child end,
+  constrained = function(value) return value.child end,
   row = function(value)
     value.spans = {}
     for _, child in ipairs(value.children) do
@@ -98,12 +99,19 @@ local _, over_fill = colored(over)
 eq(over_fill, 28, "only visual fill caps at maximum")
 local unknown = bar.segment(nil, 272000, 872000)
 assert(text(unknown):match("^%? ") and text(unknown):match(" %?%%$"), "unknown is not a measured zero")
-local _, unknown_fill = colored(unknown)
-eq(unknown_fill, 0, "unknown does not invent a fill")
-eq(text(bar.segment(0, nil, nil)), "0", "known zero without capacity")
-eq(text(bar.segment(nil, nil, nil)), "?", "unknown without capacity")
-eq(text(bar.segment(108000, nil, nil)), "108k", "no invented capacity or percent")
-eq(text(bar.segment(108000, 272000)), "108k     272k     40%", "one default-window fixture")
+for _, segment in ipairs({ unknown, bar.segment(nil, nil, nil), bar.segment(47000, nil, nil) }) do
+  for _, span in ipairs(segment.bar) do
+    if span.text ~= "│" then
+      eq(span.bg, "#30303C", "unknown measurements or capacities use neutral backgrounds")
+    end
+    assert(not filled_colors[span.bg], "unknown is not a measured fill")
+  end
+  eq(segment.percent, "?", "percentage needs both measurement and denominator")
+end
+assert(text(bar.segment(0, nil, nil)):match("^0 .*%?%%$"), "known zero without capacity")
+assert(text(bar.segment(nil, nil, nil)):match("^%? .*%?%%$"), "unknown without capacity")
+assert(text(bar.segment(108000, nil, nil)):match("^108k .*%?%%$"), "no invented capacity or percent")
+eq(text(bar.segment(108000, 272000)), "108k              272k              40%", "one default-window fixture")
 eq(text(bar.segment(108000, 272000, 272000)), text(bar.segment(108000, 272000)), "equal maximum collapses")
 eq(text(bar.segment(108000, 272000, 100000)), text(bar.segment(108000, 272000)), "inconsistent maximum retains default")
 eq(text(bar.segment(1, 1, 2, 1)), "1 1│2 50%", "tiny windows omit overlapping warning boundary")
@@ -112,16 +120,16 @@ eq(text(bar.segment(1001, 1001, 1002, 1)), "1k 1001│1002 100%", "rounded label
 local narrow = bar.segment(108000, 272000, 872000, 1)
 eq(text(narrow), "108k 272k│740k│872k 12%", "minimum width keeps labels in their regions")
 local invalid = bar.segment(-1, 0, 0)
-eq(text(invalid), "?", "invalid inputs do not become zero")
+assert(text(invalid):match("^%? .*%?%%$"), "invalid inputs do not become zero")
 eq(text(bar.segment(0 / 0, 272000)), text(bar.segment(nil, 272000)), "nonfinite measurement stays unknown")
 
 local row = footer.view({ model = "gpt-5.4", reasoning_effort = "high", gate_mode = "safe",
   current_context_tokens = 108000, max_tokens = 272000, max_context_tokens = 872000,
   usage = { ["fixture/quota"] = { kind = "free" } },
 })
-eq(text(row), "SAFE │ gpt-5.4 · high │ " .. text(example) .. " │ free", "footer preserves model/reasoning/quota")
+eq(text(row), "SAFE │ gpt-5.4 · high │ 108k   272k   │     740k      │872k  12% │ free", "footer preserves model/reasoning/quota")
 for _, child in ipairs(row.children) do
-  eq(child.wrap, "none", "footer remains a single row")
+  if child.wrap then eq(child.wrap, "none", "footer remains a single row") end
 end
 assert(#cells(row) <= 80, "representative sidebar chat width fits within 80 columns")
 assert(text(footer.view({ model = "gpt-5.4", max_tokens = 272000 })):find("?", 1, true), "footer shows unknown with known capacity")

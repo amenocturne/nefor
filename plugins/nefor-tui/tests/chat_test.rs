@@ -632,6 +632,168 @@ fn completed_response_total_renders_extended_background_bar_with_sidebar() {
 }
 
 #[test]
+fn context_bar_first_display_preserves_slots_through_data_order_and_resize() {
+    for capacity_first in [false, true] {
+        let mut engine = Engine::new(120, 24).expect("engine");
+        load_chat_scenario(&mut engine);
+        engine
+            .state_table()
+            .unwrap()
+            .set("show_sidebar", false)
+            .unwrap();
+        engine
+            .state_table()
+            .unwrap()
+            .set(
+                "reasoning_effort",
+                "a-long-identity-that-must-yield-to-the-meter",
+            )
+            .unwrap();
+        let capacities = json!({
+            "kind": "chat.models.listed", "provider": "mock-plugin",
+            "models": ["mock-model"], "context_windows": { "mock-model": 500000 },
+            "max_context_windows": { "mock-model": 872000 }
+        });
+        for phase in 0..8 {
+            match phase {
+                1 if capacity_first => dispatch_event(&mut engine, capacities.clone()),
+                1 => fixture_assistant_completed(
+                    &mut engine,
+                    Some("answer".into()),
+                    json!({
+                        "provider": "mock-plugin",
+                        "latest_response_usage": { "kind": "completed_response", "total_tokens": 47000 }
+                    }),
+                ),
+                2 if capacity_first => fixture_assistant_completed(
+                    &mut engine,
+                    Some("answer".into()),
+                    json!({
+                        "provider": "mock-plugin",
+                        "latest_response_usage": { "kind": "completed_response", "total_tokens": 47000 }
+                    }),
+                ),
+                2 => dispatch_event(&mut engine, capacities.clone()),
+                3 => fixture_assistant_completed(
+                    &mut engine,
+                    Some("zero".into()),
+                    json!({
+                        "provider": "mock-plugin",
+                        "latest_response_usage": { "kind": "completed_response", "total_tokens": 0 }
+                    }),
+                ),
+                4 => {
+                    dispatch_event(
+                        &mut engine,
+                        json!({ "kind": "input.submit", "value": "/new" }),
+                    );
+                    dispatch_event(
+                        &mut engine,
+                        json!({ "kind": "sessions.session_start", "session_id": "meter-new",
+                        "request_id": "chat-transition-1" }),
+                    );
+                }
+                5 | 6 => {
+                    activate_conversation(&mut engine, "meter-resume");
+                    let mut projection = json!({ "messages": [] });
+                    if phase == 5 {
+                        projection["response_usage"] = json!({ "provider": "mock-plugin", "model": "mock-model",
+                            "latest_response_usage": { "kind": "completed_response", "total_tokens": 47000 } });
+                    }
+                    dispatch_event(
+                        &mut engine,
+                        json!({ "kind": "conversation.snapshot", "conversation_id": "meter-resume",
+                        "found": true, "projection": projection }),
+                    );
+                }
+                7 => dispatch_event(
+                    &mut engine,
+                    json!({ "kind": "chat.models.listed", "provider": "mock-plugin", "models": ["mock-model"] }),
+                ),
+                _ => {}
+            }
+            for width in [120, 80, 56, 32, 160, 120] {
+                engine.handle_resize(width, 24).expect("resize");
+                render_str(&mut engine);
+                let snapshot = engine.snapshot();
+                let percent = if phase == 0 || phase == 4 || phase >= 6 || phase == 1 {
+                    "?%"
+                } else if phase == 3 {
+                    "0%"
+                } else {
+                    "5%"
+                };
+                let footer = snapshot.lines().find(|line| line.contains(percent)).unwrap_or_else(|| panic!("phase {phase}, capacity_first {capacity_first}, width {width}: {snapshot}"));
+                let right = footer.trim_end().chars().count();
+                assert_eq!(
+                    right, width as usize,
+                    "meter ends at the pane edge: {footer}"
+                );
+                if width >= 56 {
+                    let meter_width = 43.min((width as usize).saturating_sub(20).max(13));
+                    let separator = width as usize - meter_width + 1;
+                    assert_eq!(footer.chars().nth(separator), Some('│'), "{footer}");
+                    if phase == 1 && !capacity_first {
+                        assert!(
+                            footer.contains("47k"),
+                            "known measurement survives missing capacities: {footer}"
+                        );
+                        assert!(
+                            !footer.contains("0%"),
+                            "unknown denominator is not zero percent"
+                        );
+                    }
+                    if width >= 80 && (phase == 2 || phase == 3) {
+                        for label in ["500k", "740k", "872k"] {
+                            assert!(footer.contains(label), "{footer}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn context_bar_partial_measurement_survives_long_quota_and_sidebar() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    load_chat_scenario(&mut engine);
+    engine
+        .lua()
+        .load(
+            r#"
+      require("libs.chat.extensions").configure({ status_segments = function()
+        return { { spans = { { text = string.rep("quota until tomorrow ", 20) } } } }
+      end })
+    "#,
+        )
+        .exec()
+        .expect("configure long quota fixture");
+    fixture_assistant_completed(
+        &mut engine,
+        Some("answer".into()),
+        json!({
+            "provider": "mock-plugin",
+            "latest_response_usage": { "kind": "completed_response", "total_tokens": 47000 }
+        }),
+    );
+    for width in [80, 120, 160, 80] {
+        engine.handle_resize(width, 24).expect("resize");
+        render_str(&mut engine);
+        let snapshot = engine.snapshot();
+        let footer = snapshot
+            .lines()
+            .find(|line| line.contains("?%"))
+            .expect("unknown denominator");
+        assert!(
+            footer.contains("47k"),
+            "quota cannot take the measurement's space: {snapshot}"
+        );
+        assert!(snapshot.contains("Workflows"), "{snapshot}");
+    }
+}
+
+#[test]
 fn context_bar_keeps_percentage_visible_with_long_model_and_sidebar() {
     for width in [80, 120, 160] {
         let mut engine = Engine::new(width, 24).expect("engine");
@@ -666,7 +828,12 @@ fn context_bar_keeps_percentage_visible_with_long_model_and_sidebar() {
             .lines()
             .find(|line| line.contains("12%"))
             .expect("percentage remains visible");
-        for label in ["108k", "272k", "740k", "872k"] {
+        let labels = if width >= 120 {
+            vec!["108k", "272k", "740k", "872k"]
+        } else {
+            vec!["108k", "272k"]
+        };
+        for label in labels {
             assert!(footer.contains(label), "{width}: {snapshot}");
         }
         assert!(snapshot.contains("Workflows"), "{snapshot}");
