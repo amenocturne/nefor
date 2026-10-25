@@ -1318,26 +1318,78 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
         first_occurrence.is_disjoint(&second_occurrence),
         "equal values materialize disjoint actor constellations"
     );
-    let applied = lifecycle_trace
+    // Collection completion is a routed value, not a graph modification.
+    // The fold applies the initial program, each occurrence, and the final reap.
+    let applied = observed_events
         .iter()
-        .filter(|kind| kind.as_str() == "mag.modification_applied")
-        .count();
+        .filter(|event| event["kind"] == "mag.modification_applied")
+        .collect::<Vec<_>>();
     assert_eq!(
-        applied, 3,
-        "two occurrences plus collection completion apply"
+        applied.len(),
+        4,
+        "initial program, two occurrences, teardown"
     );
+    fn spawned_by(event: &Value) -> std::collections::HashSet<&str> {
+        event["spawned"]
+            .as_array()
+            .expect("applied modification lists spawned actors")
+            .iter()
+            .map(|id| id.as_str().expect("spawned actor id"))
+            .collect::<std::collections::HashSet<_>>()
+    }
+    let initial_ids = initial["actors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|actor| actor["id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(spawned_by(applied[0]), initial_ids);
+    assert_eq!(spawned_by(applied[1]), first_occurrence);
+    assert_eq!(spawned_by(applied[2]), second_occurrence);
+    // Empty Lua tables may be encoded as either an empty object or array.
+    let empty_collection = |value: &Value| value == &json!({}) || value == &json!([]);
+    for modification in &applied[..3] {
+        assert!(empty_collection(&modification["killed"]));
+    }
+    assert!(empty_collection(&applied[3]["spawned"]));
     assert_eq!(
         lifecycle_trace.last().map(String::as_str),
         Some("mag.run_result"),
         "the terminal result closes the observed lifecycle"
     );
+    let completed_at = observed_events
+        .iter()
+        .position(|event| event["kind"] == "mag.run_complete")
+        .expect("run completion precedes teardown");
+    let mut killed_ids = std::collections::HashSet::new();
+    for (position, event) in observed_events.iter().enumerate() {
+        if event["kind"] == "mag.actor_killed" {
+            assert!(position > completed_at, "no actor is killed during work");
+            assert_eq!(
+                event["reason"], fixture["scenarios"]["actor_teardown_reason"],
+                "completed-run cleanup is not an interruption"
+            );
+            assert!(killed_ids.insert(event["id"].as_str().unwrap()));
+        }
+    }
+    let all_ids = initial_ids
+        .union(&first_occurrence)
+        .copied()
+        .chain(second_occurrence.iter().copied())
+        .collect::<std::collections::HashSet<_>>();
     assert_eq!(
-        lifecycle_trace
+        killed_ids, all_ids,
+        "teardown reaps every actor exactly once"
+    );
+    assert_eq!(
+        applied[3]["killed"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|kind| kind == "mag.actor_killed"),
-        fixture["scenarios"]["actor_killed_before_terminal_result"]
-            .as_bool()
-            .expect("actor-killed fixture"),
+            .map(|id| id.as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>(),
+        killed_ids,
+        "the final modification owns all teardown kills"
     );
     shutdown(stdin, child).await;
 }

@@ -97,6 +97,6 @@
       "terminal_status": "completed",
       "terminal_variant": "nefor.contracts.AgentError"
     },
-    "actor_killed_before_terminal_result": false
+    "actor_teardown_reason": "run_complete"
   }
 }
