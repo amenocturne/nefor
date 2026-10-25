@@ -1638,8 +1638,18 @@ compile_graph(left &&& right)"#,
     async fn idle_writer_and_terminal_stdin_faults_wake_and_teardown() {
         for writer_closed in [false, true] {
             let host = host();
-            host.begin_run("idle", "idle", Some("admission-test"))
-                .unwrap();
+            assert!(
+                host.begin_run_with_principal(
+                    "idle",
+                    "idle",
+                    Some("admission-test"),
+                    None,
+                    None,
+                    None
+                )
+                .unwrap()
+                .ok
+            );
             let (tx, rx) = mpsc::channel(128);
             let (input, mut incoming) = mpsc::channel(4);
             if writer_closed {
