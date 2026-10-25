@@ -1485,8 +1485,11 @@ mock.serve {{ respond = function(request)
   if last.role == "tool" and last.name == "mag-write-file" then
     return mock.tool_call("mag-apply", {{file="giant-join.mag"}})
   end
-  if last.role == "tool" or nefor.json.encode(last.content):find("mag_run", 1, true) or nefor.json.encode(last.content):find("Summarise octopuses in one sentence.", 1, true) then
+  if nefor.json.encode(last.content):find("mag_run", 1, true) or nefor.json.encode(last.content):find("Summarise octopuses in one sentence.", 1, true) then
     return mock.text("observed bounded MAG terminal")
+  end
+  if last.role == "tool" then
+    return mock.text("waiting for MAG completion")
   end
   return mock.tool_call("mag-write-file", {{file="giant-join.mag",new_string=program}})
 end }}
@@ -1552,12 +1555,43 @@ end }}
         .iter()
         .position(|body| body["kind"] == "mag.run_result" && body["run_id"] == *run_id)
         .unwrap();
-    assert!(
-        bodies[failed_index + 1..]
-            .iter()
-            .any(|body| body["kind"] == "mag.run_started"),
-        "same MAG process accepts the subsequent deferred lead turn"
+    // A completion can enter a still-running lead via FIFO steering or start
+    // a new lead run. The canonical message receipt, not a fresh run ID,
+    // proves that the terminal notification was actually consumed.
+    let deliveries = bodies[failed_index + 1..]
+        .iter()
+        .filter(|body| {
+            body["kind"] == "conversation.fact.recorded"
+                && body["duplicate"] == false
+                && body["event"]["kind"] == "message_started"
+                && body["event"]["input_cause"] == "internal_async_completion"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deliveries.len(), 1, "one canonical completion delivery");
+    let delivery = &deliveries[0]["event"];
+    assert_eq!(delivery["role"], "user");
+    assert_eq!(
+        delivery["submission_ids"],
+        serde_json::json!([result["request_id"]])
     );
+    let delivery_message = &delivery["message_id"];
+    let delivered_text = bodies
+        .iter()
+        .filter(|body| {
+            body["kind"] == "conversation.fact.recorded"
+                && body["event"]["kind"] == "content_chunk_appended"
+                && body["event"]["message_id"] == *delivery_message
+        })
+        .filter_map(|body| body["event"]["chunk"]["data"].as_str())
+        .collect::<String>();
+    assert!(delivered_text.contains(run_id.as_str().unwrap()));
+    assert!(delivered_text.contains("output admission failed"));
+    assert!(bodies.iter().any(|body| {
+        body["kind"] == "conversation.fact.recorded"
+            && body["event"]["kind"] == "message_completed"
+            && body["event"]["message_id"] == *delivery_message
+    }));
+    assert_eq!(result["answer"], "observed bounded MAG terminal");
     assert!(
         bodies
             .iter()

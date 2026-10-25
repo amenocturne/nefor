@@ -34,3 +34,8 @@ semver = "1"
 # Line tables preserve source-level backtraces while avoiding the cost and disk
 # footprint of full local-variable debug information in routine development.
 debug = 1
+
+# MAG evaluates workflow libraries at runtime, including on every fresh lead
+# session. Keep that interpreter responsive in otherwise unoptimized builds.
+[profile.dev.package.nefor-mag]
+opt-level = 3
