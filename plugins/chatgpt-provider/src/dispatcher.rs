@@ -1245,9 +1245,8 @@ pub async fn run_dispatch_loop(
                                 result = dispatch_event(&ctx, &env.from, map) => result,
                             };
                             if let Err(e) = result {
-                                if matches!(e, ChatgptError::Transport(TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming)) {
-                                    if publish_dispatch_failure(&ctx, map).await? { continue; }
-                                }
+                                if matches!(e, ChatgptError::Transport(TransportError::FrameTooLarge { .. } | TransportError::InvalidFraming))
+                                    && publish_dispatch_failure(&ctx, map).await? { continue; }
                                 if matches!(e, ChatgptError::Transport(_)) { return Err(e); }
                                 tracing::error!(error = %e, "dispatch_event errored; continuing");
                             }
@@ -4088,12 +4087,12 @@ async fn run_turn(
         let mut auth_401_recovery_stage: u8 = 0;
         let conversation_id = logical_routing_id(
             ctx.chats
-                .conversation_id(&chat_id)
+                .conversation_id(chat_id)
                 .await
                 .ok()
                 .flatten()
                 .as_deref(),
-            &chat_id,
+            chat_id,
         );
         let provider_routing = provider_routing_identity(&conversation_id);
         let cache_key = provider_routing.thread_id.clone();
@@ -4119,7 +4118,7 @@ async fn run_turn(
                 break;
             }
 
-            let snapshot = match ctx.chats.snapshot(&chat_id).await {
+            let snapshot = match ctx.chats.snapshot(chat_id).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished mid-turn");
@@ -4128,7 +4127,7 @@ async fn run_turn(
                     final_error = Some(e.to_string());
                     checked_send(
                         &ctx.out_tx,
-                        PluginOutgoing::event(chat_error_body(&ctx.args, &chat_id, e.to_string())),
+                        PluginOutgoing::event(chat_error_body(&ctx.args, chat_id, e.to_string())),
                     )
                     .await?;
                     break;
@@ -4316,7 +4315,7 @@ async fn run_turn(
             } else {
                 None
             };
-            if !ctx.recovery_gate.admit(&cancel).await {
+            if !ctx.recovery_gate.admit(cancel).await {
                 break;
             }
             let mut stream = match open_response_stream(
@@ -4556,7 +4555,7 @@ async fn run_turn(
                                             stream_delta_body(
                                                 &ctx.args.event_prefix(),
                                                 &turn_id,
-                                                &chat_id,
+                                                chat_id,
                                                 &delta,
                                             )
                                         };
@@ -4584,7 +4583,7 @@ async fn run_turn(
                                             stream_reasoning_delta_body(
                                                 &ctx.args.event_prefix(),
                                                 &turn_id,
-                                                &chat_id,
+                                                chat_id,
                                                 &formatted,
                                             )
                                         };
@@ -4618,7 +4617,7 @@ async fn run_turn(
                                             stream_reasoning_delta_body(
                                                 &ctx.args.event_prefix(),
                                                 &turn_id,
-                                                &chat_id,
+                                                chat_id,
                                                 &formatted,
                                             )
                                         };
@@ -4636,7 +4635,7 @@ async fn run_turn(
                                         stream_reasoning_delta_body(
                                             &ctx.args.event_prefix(),
                                             &turn_id,
-                                            &chat_id,
+                                            chat_id,
                                             &delta,
                                         )
                                     };
@@ -4647,7 +4646,7 @@ async fn run_turn(
                                     tool_buf.on_args_delta(item_id.as_deref(), &delta);
                                     let body = stream_tool_call_delta_body(
                                         &ctx.args.event_prefix(),
-                                        &chat_id,
+                                        chat_id,
                                         item_id.as_deref(),
                                         &delta,
                                     );
@@ -4841,7 +4840,7 @@ async fn run_turn(
                     ));
                     iterations = iterations.saturating_sub(1);
                     if direct_request.is_none() {
-                        let body = stream_retry_body(&ctx.args, &chat_id, attempt, delay, &failure);
+                        let body = stream_retry_body(&ctx.args, chat_id, attempt, delay, &failure);
                         checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
                     }
                     continue;
@@ -4865,7 +4864,7 @@ async fn run_turn(
                     stream_reasoning_delta_body(
                         &ctx.args.event_prefix(),
                         &turn_id,
-                        &chat_id,
+                        chat_id,
                         &formatted,
                     )
                 };
@@ -4892,7 +4891,7 @@ async fn run_turn(
                     stream_reasoning_end_body(
                         &ctx.args.event_prefix(),
                         &turn_id,
-                        &chat_id,
+                        chat_id,
                         &reasoning_text,
                         duration_ms,
                     )
@@ -4932,7 +4931,7 @@ async fn run_turn(
                 if !output_text.is_empty() {
                     let _ = ctx
                         .chats
-                        .push_assistant(&chat_id, output_text.clone())
+                        .push_assistant(chat_id, output_text.clone())
                         .await;
                 }
                 final_text = output_text;
@@ -4963,12 +4962,12 @@ async fn run_turn(
                 if iter_native_output.is_empty() {
                     let _ = ctx
                         .chats
-                        .push_assistant_tool_calls(&chat_id, output_text.clone(), tool_calls.clone())
+                        .push_assistant_tool_calls(chat_id, output_text.clone(), tool_calls.clone())
                         .await;
                 } else {
                     let _ = ctx
                         .chats
-                        .append_native_history(&chat_id, iter_native_output.clone())
+                        .append_native_history(chat_id, iter_native_output.clone())
                         .await;
                 }
 
@@ -4983,12 +4982,12 @@ async fn run_turn(
             if !iter_native_output.is_empty() {
                 let _ = ctx
                     .chats
-                    .append_native_history(&chat_id, iter_native_output.clone())
+                    .append_native_history(chat_id, iter_native_output.clone())
                     .await;
             } else if !output_text.is_empty() {
                 let _ = ctx
                     .chats
-                    .push_assistant(&chat_id, output_text.clone())
+                    .push_assistant(chat_id, output_text.clone())
                     .await;
             }
             final_text = output_text;
@@ -5112,7 +5111,7 @@ async fn run_turn(
         let _ = ctx
             .chats
             .record_turn(
-                &chat_id,
+                chat_id,
                 Some(&active_model),
                 usage_to_record(
                     interrupted,
@@ -5130,7 +5129,7 @@ async fn run_turn(
         let mut body = stream_end_body(
             &ctx.args,
             &turn_id,
-            &chat_id,
+            chat_id,
             visible_final_text,
             &active_model,
             elapsed_ms,
@@ -5140,10 +5139,10 @@ async fn run_turn(
             body.insert("latest_response_usage".into(), measurement.clone());
         }
         checked_send(&ctx.out_tx, PluginOutgoing::event(body)).await?;
-        if let Ok(stats) = ctx.chats.stats_snapshot(&chat_id).await {
+        if let Ok(stats) = ctx.chats.stats_snapshot(chat_id).await {
             checked_send(
                 &ctx.out_tx,
-                PluginOutgoing::event(session_stats_body(&ctx.args, &chat_id, &stats)),
+                PluginOutgoing::event(session_stats_body(&ctx.args, chat_id, &stats)),
             )
             .await?;
         }
@@ -5157,7 +5156,7 @@ async fn run_turn(
 
         let mut body = chat_complete_result_body(
             &ctx.args,
-            &chat_id,
+            chat_id,
             &final_text,
             &final_tool_calls,
             final_finish_reason.as_deref(),

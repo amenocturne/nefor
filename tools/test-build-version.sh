@@ -15,6 +15,10 @@ cat > "$repo/engine/Cargo.toml" <<'EOF'
 name = "build-version-fixture"
 version = "9.9.9"
 edition = "2021"
+
+[[bin]]
+name = "nefor"
+path = "src/main.rs"
 EOF
 cat > "$repo/engine/src/main.rs" <<'EOF'
 fn main() { println!("{}", env!("NEFOR_VERSION")); }
@@ -35,7 +39,7 @@ build() {
   cargo build --color never --manifest-path "$1/engine/Cargo.toml" --target-dir "$target" -v 2>&1
 }
 version() {
-  "$target/debug/build-version-fixture"
+  "$target/debug/nefor"
 }
 assert_version() {
   local expected=$1 actual

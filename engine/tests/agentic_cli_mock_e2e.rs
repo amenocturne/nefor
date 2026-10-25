@@ -1748,8 +1748,9 @@ fn a_read_only_agents_workflows_are_decided_by_its_policy_in_every_mode() {
         assert!(
             worker_description.starts_with("Runs MAG code.")
                 && worker_description.ends_with(
-                    "Your approval policy is ReadOnly: a workflow that declares nodes that are \
-                     not read-only, or agents with a wider approval policy than yours, is rejected."
+                    "Your approval policy is ReadOnly: shell/script and process nodes whose commands \
+                     are classified as read-only are permitted; command execution is not prohibited. Commands \
+                     not established as read-only, or agents with a wider approval policy than yours, are rejected."
                 ),
             "{mode}: {worker_description}"
         );

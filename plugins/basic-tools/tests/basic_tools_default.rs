@@ -745,6 +745,7 @@ mod tools {
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime.rs"));
+include!("support/tool_invocation.rs");
 
 #[cfg(test)]
 mod tests {

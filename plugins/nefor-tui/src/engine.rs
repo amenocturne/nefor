@@ -2135,7 +2135,7 @@ mod tests {
                     y: 0,
                     button: Some("left"),
                     mods: if cancel == "modified_down" {
-                        vec!["ctrl".into()]
+                        vec!["ctrl"]
                     } else {
                         vec![]
                     },
@@ -2167,7 +2167,7 @@ mod tests {
                         "left"
                     }),
                     mods: if cancel == "modified_up" {
-                        vec!["ctrl".into()]
+                        vec!["ctrl"]
                     } else {
                         vec![]
                     },

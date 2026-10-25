@@ -165,7 +165,7 @@ return function(make, thresholds, calls, eq, count, last)
 
   -- Genuine supported capability under Disabled is not fabricated unsupported.
   do
-    local t = make(nil, nil, "supported"); t.start(); t.reply(calls("self_compact"))
+    local t = make({ kind = "Disabled" }, nil, "supported"); t.start(); t.reply(calls("self_compact"))
     t.actor.deliver({ messages = {{ message = { messages = {} } }} })
     assert(not t.op())
     local found = false

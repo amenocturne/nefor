@@ -1011,6 +1011,15 @@ impl TextInputState {
     }
 }
 
+// Hard-newline navigation retains its byte-column policy, but a shorter or
+// differently encoded line may put that column inside a scalar.
+fn floor_char_boundary(value: &str, mut offset: usize) -> usize {
+    while !value.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,13 +1590,4 @@ mod tests {
             assert_eq!(back, cursor, "round-trip failed @ cursor={cursor}");
         }
     }
-}
-
-// Hard-newline navigation retains its byte-column policy, but a shorter or
-// differently encoded line may put that column inside a scalar.
-fn floor_char_boundary(value: &str, mut offset: usize) -> usize {
-    while !value.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }

@@ -302,7 +302,13 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
     // process acceptance program. They are shipped test inputs, so they must
     // keep compiling against the library like any entrypoint.
     let test_program_root = root.join("engine/tests");
-    let test_programs = mag_files(&test_program_root);
+    let mut test_programs = mag_files(&test_program_root);
+    for entry in fs::read_dir(root.join("plugins")).expect("plugin directories") {
+        let tests = entry.expect("plugin directory").path().join("tests");
+        if tests.is_dir() {
+            test_programs.extend(mag_files(&tests));
+        }
+    }
     let entrypoints = all_mag
         .iter()
         .filter(|path| {

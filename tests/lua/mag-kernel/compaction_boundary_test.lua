@@ -242,14 +242,14 @@ do
 end
 -- Unsupported takes precedence even under Disabled.
 do
-  local t = make(nil, nil, "unsupported"); t.start(); t.reply(calls("self_compact")); continue_batch(t)
+  local t = make({ kind = "Disabled" }, nil, "unsupported"); t.start(); t.reply(calls("self_compact")); continue_batch(t)
   assert(not t.op()); local error
   for _, f in ipairs(t.facts) do if f.kind == "tool_error_recorded" then error = f.error end end
   eq(error, "compaction_unsupported")
 end
 -- Self + submit rejects all before ordinary effects, even without eligibility.
 do
-  local t = make(nil); t.start(); t.reply(calls("self_compact", "submit_output", "shell.script"))
+  local t = make({ kind = "Disabled" }); t.start(); t.reply(calls("self_compact", "submit_output", "shell.script"))
   eq(count(t.out, "generic-tool.ToolCalls"), 0); assert(not t.op())
   local n = 0
   for _, f in ipairs(t.facts) do if f.kind == "tool_error_recorded" then eq(f.error, "compaction_terminal_conflict"); n = n + 1 end end
