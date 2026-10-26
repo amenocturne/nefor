@@ -3,9 +3,8 @@
 -- Actors receive raw session-log entries. This module is the boundary
 -- where that untrusted shape becomes a trusted event body.
 
+local json_decode = require("core.json_decode")
 local M = {}
-
-local json = nefor.json
 
 function M.decode(entry)
   if type(entry) ~= "table" then
@@ -17,7 +16,7 @@ function M.decode(entry)
     return nil, "entry.payload is not a non-empty string"
   end
 
-  local ok, decoded = pcall(json.decode, payload)
+  local ok, decoded = pcall(json_decode.owned, payload)
   if not ok then
     return nil, "entry.payload is not valid JSON: " .. tostring(decoded)
   end

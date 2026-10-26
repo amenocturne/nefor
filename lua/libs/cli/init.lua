@@ -1,5 +1,6 @@
 -- A noninteractive frontend over the shared session and request lifecycle.
 -- It never interprets tool names, graph activity, or turn terminals as completion.
+local json_decode = require("core.json_decode")
 local M = {}
 local configured = nil
 local function stderr(text) io.stderr:write(text); io.stderr:flush() end
@@ -96,7 +97,7 @@ function M.start(opts)
 
   nefor.bus.on_event("*", function(entry)
     if phase == "finished" or (entry.origin == "step" and entry.target ~= nil) then return end
-    local ok, env = pcall(nefor.json.decode, entry.payload or "")
+    local ok, env = pcall(json_decode.owned, entry.payload or "")
     local body = ok and type(env) == "table" and env.body
     if type(body) ~= "table" or replay.active() then return end
     local kind = body.kind

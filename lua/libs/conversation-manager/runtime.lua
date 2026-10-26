@@ -1,3 +1,4 @@
+local json_decode = require("core.json_decode")
 local manager = require("libs.conversation-manager")
 local domain = manager.domain
 local projection = require("libs.conversation-manager.projection")
@@ -784,7 +785,7 @@ function M.build(options)
 
   local function receive_msg(entry)
     if type(entry.payload) ~= "string" or entry.payload == "" then return end
-    local ok, decoded = pcall(json.decode, entry.payload)
+    local ok, decoded = pcall(json_decode.owned, entry.payload)
     if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
     local body = decoded.body
 

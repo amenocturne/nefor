@@ -64,6 +64,18 @@ jobs:
           path: tmp/tui-driver-artifacts/
           if-no-files-found: ignore
 
+      - name: Upload giant resume diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: giant-resume-diagnostics
+          path: |
+            tmp/mag-output-admission-*/resume.stdout.json
+            tmp/mag-output-admission-*/resume.stderr.log
+            tmp/mag-output-admission-*/boundary-trace.jsonl
+            tmp/mag-output-admission-*/data/nefor/logs/
+          if-no-files-found: ignore
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

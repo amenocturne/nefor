@@ -40,6 +40,7 @@
 -- The composition supplies the selected root through `configure` before
 -- initialization. Path: `<sessions-root>/<id>.jsonl`.
 
+local json_decode = require("core.json_decode")
 local json = nefor.json
 local replay_window = require("core.replay_window")
 
@@ -248,7 +249,7 @@ local function persist_envelope(entry)
 
   -- Drop sessions.* control events. They're starter-internal lifecycle
   -- signals, not session content.
-  local ok, decoded = pcall(json.decode, entry.payload)
+  local ok, decoded = pcall(json_decode.owned, entry.payload)
   if ok and type(decoded) == "table" and type(decoded.body) == "table" then
     local kind = decoded.body.kind
     if kind == "tool.register" or (type(kind) == "string" and kind:match("%.tool%.register$")) then return end
@@ -601,7 +602,7 @@ local function receive_msg(entry)
   local payload = entry.payload
   if type(payload) ~= "string" or payload == "" then return end
 
-  local ok, decoded = pcall(json.decode, payload)
+  local ok, decoded = pcall(json_decode.owned, payload)
   if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
   local kind = decoded.body.kind
 

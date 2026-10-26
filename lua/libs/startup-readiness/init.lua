@@ -4,6 +4,7 @@
 -- explicit liveness from every actor the first turn needs and the complete
 -- public tool catalog assembled by tool-gate.
 
+local json_decode = require("core.json_decode")
 local M = {}
 
 local function set(values)
@@ -143,7 +144,7 @@ function M.wait(opts)
   nefor.bus.on_event("*", function(entry)
     local payload = type(entry) == "table" and entry.payload or nil
     if type(payload) ~= "string" then return end
-    local ok, env = pcall(nefor.json.decode, payload)
+    local ok, env = pcall(json_decode.owned, payload)
     if not ok or type(env) ~= "table" then return end
     barrier.observe(env.body, env.from, replay_window.active())
   end)

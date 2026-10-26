@@ -67,6 +67,7 @@
 -- canceled. Also clears `state.active_plan` so a resumed/new session starts
 -- with no carry-over approval.
 
+local json_decode = require("core.json_decode")
 local json = nefor.json
 
 local mag            = require("libs.mag-workspace")
@@ -2611,7 +2612,7 @@ end
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local ok, decoded = pcall(json.decode, entry.payload)
+  local ok, decoded = pcall(json_decode.owned, entry.payload)
   if not ok then return end
   local body = decoded.body
   local kind = body.kind
@@ -2909,7 +2910,7 @@ if nefor.bus and nefor.bus.on_event then
     state.gate_mode = "safe"
     local session_id
     if type(entry) == "table" and type(entry.payload) == "string" then
-      local ok, decoded = pcall(json.decode, entry.payload)
+      local ok, decoded = pcall(json_decode.owned, entry.payload)
       if ok and type(decoded) == "table" and type(decoded.body) == "table" then
         session_id = decoded.body.session_id
       end

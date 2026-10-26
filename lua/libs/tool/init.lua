@@ -113,6 +113,7 @@
 -- is answered exactly like a tool that does not exist. The tool gate words the
 -- same message over the whole registry.
 
+local json_decode = require("core.json_decode")
 local json_data = require("core.json_data")
 local envelope = require("core.envelope")
 local replay_window = require("core.replay_window")
@@ -647,7 +648,7 @@ function M.actor(opts)
     if entry.origin == "step" and entry.target ~= nil then return end
     local payload = entry.payload
     if type(payload) ~= "string" or payload == "" then return end
-    local ok, decoded = pcall(json.decode, payload)
+    local ok, decoded = pcall(json_decode.owned, payload)
     if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
     if replay_window.active() then return end
     local body = decoded.body

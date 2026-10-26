@@ -21,6 +21,17 @@ carry the single closed `InstantiateDeltaTemplate` operation with its five
 expression forms; raw modifications, a general runtime expression language,
 and post-compilation function application are not part of version 4.
 
+## Lua bus payload decoding
+
+Bus consumers use `core.json_decode.owned(payload)` when they need an owned JSON
+value. The helper retains only the most recently decoded payload and copies its
+JSON-shaped tables for each caller, preserving array identity and nulls. Large
+immutable strings are shared instead of repeatedly parsed and allocated by
+adjacent consumers. A different payload replaces the cache; this is not a
+session-history cache. Consumers may mutate their returned tables without
+changing another consumer's view. Raw bus entries, replay ordering, targeting,
+and persistence remain unchanged.
+
 ## MAG authoring and runtime protocol ownership
 
 The `nefor` facade is an explicit authoring allowlist over the public modules.

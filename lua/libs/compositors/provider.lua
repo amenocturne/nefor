@@ -42,6 +42,7 @@
 -- options; this actor reads the manager-owned conversation view and delivers the
 -- expanded native request directly to its process.
 
+local json_decode = require("core.json_decode")
 local M = {}
 local json_data = require("core.json_data")
 local error_value = require("core.error")
@@ -1294,7 +1295,7 @@ function M.spawn_spec(name, command, opts)
     -- NCP diagnostics are deliberately barred from physical egress. Observe
     -- them locally through the actor bus instead of the suppressed wrapper.
     receive_msg = function(entry)
-      local ok, env = pcall(nefor.json.decode, entry.payload or "")
+      local ok, env = pcall(json_decode.owned, entry.payload or "")
       if ok and type(env) == "table" and type(env.body) == "table"
           and env.body.kind == "ncp.delivery_failed" and env.body.peer == name and not env.replay
           and not require("core.replay_window").active() then

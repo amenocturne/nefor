@@ -47,6 +47,7 @@
 --   * `conversation.context.snapshot`    — restore/query universal model context
 --   * `sessions.session_end`             — teardown
 
+local json_decode = require("core.json_decode")
 local json = nefor.json
 
 local envelope        = require("core.envelope")
@@ -2148,7 +2149,7 @@ local function receive_msg(entry)
   -- as the fan-out copies for each ready peer.
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local ok, decoded = pcall(json.decode, entry.payload)
+  local ok, decoded = pcall(json_decode.owned, entry.payload)
   if not ok then return end
   local body = decoded.body
   local kind = body.kind

@@ -1070,6 +1070,8 @@ nefor.bus.on_event("*", function(entry)
   local body = ok and type(env) == "table" and env.body
   if type(body) ~= "table" then return end
   if body.kind == "sessions.transition_failed" or body.kind == "sessions.resume_done"
+      or body.kind == "sessions.replay.start" or body.kind == "sessions.replay.progress"
+      or body.kind == "sessions.replay.end"
       or body.kind == "sessions.flush_request" or body.kind == "sessions.flush_done"
       or body.kind == "tool.result" or body.kind == "basic-tools.tool.invoke"
       or body.kind == "tool-gate.tool.invoke" then
@@ -1689,11 +1691,13 @@ end }}
             "Summarise octopuses in one sentence.",
         ],
     );
+    std::fs::write(dir.join("resume.stdout.json"), &resumed.stdout).unwrap();
+    std::fs::write(dir.join("resume.stderr.log"), &resumed.stderr).unwrap();
+    println!("retained accepted MAG output artifacts: {}", dir.display());
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&success(&resumed)).unwrap()["status"],
         "success"
     );
-    println!("retained accepted MAG output artifacts: {}", dir.display());
 }
 
 /// An agent's approval policy is enforced end to end. The lead (Default)

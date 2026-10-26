@@ -1681,6 +1681,32 @@ fn replay_reader_faults_settle_and_release_continuations() {
 }
 
 #[test]
+fn owned_decode_preserves_complete_replay_and_canonical_reconstruction() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _data_dir = ScopedEnvVar::set(&ENV_LOCK, "NEFOR_DATA_DIR", tempdir.path());
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("stub");
+    set_package_path(&lua).expect("paths");
+    lua.load(include_str!(
+        "../../tests/lua/sessions/replay_equivalence_test.lua"
+    ))
+    .exec()
+    .expect("lossless replay equivalence");
+}
+
+#[test]
+fn adjacent_replay_consumers_keep_decode_equivalence_and_mutation_isolation() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("stub");
+    set_package_path(&lua).expect("paths");
+    lua.load(include_str!(
+        "../../tests/lua/sessions/decode_ownership_test.lua"
+    ))
+    .exec()
+    .expect("owned decode equivalence");
+}
+
+#[test]
 fn chat_replay_failure_clears_loading_with_correlated_diagnostic() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("stub");
