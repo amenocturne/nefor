@@ -4,7 +4,6 @@
 -- explicit liveness from every actor the first turn needs and the complete
 -- public tool catalog assembled by tool-gate.
 
-local json_decode = require("core.json_decode")
 local M = {}
 
 local function set(values)
@@ -137,6 +136,7 @@ local function new_barrier(opts)
 end
 
 function M.wait(opts)
+  local json_decode = require("core.json_decode")
   opts = opts or {}
   local barrier = new_barrier(opts)
   local replay_window = require("core.replay_window")
