@@ -1161,9 +1161,10 @@ mod tests {
             plan.package_test_args(TestLane::Full, "serial"),
             [OsString::from("--test-threads=1")]
         );
-        assert!(plan
-            .package_test_args(TestLane::Default, "serial")
-            .is_empty());
+        assert_eq!(
+            plan.package_test_args(TestLane::Default, "serial"),
+            Vec::<OsString>::new()
+        );
     }
 
     #[test]
