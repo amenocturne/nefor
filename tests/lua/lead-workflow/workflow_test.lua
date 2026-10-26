@@ -3246,6 +3246,35 @@ do
   assert_eq(completed.body.error.code, "completion_undeliverable")
 end
 
+-- A gate write can fail before the OS exit is observed. This must fail the
+-- whole request as unknown, while retaining the surviving MAG authority's
+-- obligation until its real terminal arrives.
+for _, kind in ipairs({ "ncp.delivery_failed", "engine.plugin_transport_failed", "engine.plugin_delivery_lost" }) do
+  fresh()
+  local registry = lw._internals.run_registry
+  local run_id = registry:mint_run_id()
+  local request_id = "gate-delivery-request"
+  lw._internals.register_active_run(run_id, {}, "terminal", "gate-delivery-dispatch",
+    "gate-delivery-run", sessions.current_id(), nil, nil, { request_id })
+  feed("mag", { kind = "mag.run_started", run_id = run_id })
+  _test.calls_clear()
+  feed("engine", { kind = kind, peer = "tool-gate", plugin = "tool-gate", extent = "unknown" })
+  local calls = decode_calls()
+  assert_true(find_call(calls, function(c)
+    return c.body.kind == "mag.interrupt_run" and c.body.run_id == run_id
+  end) ~= nil, "gate loss cancels accepted work through the surviving kernel")
+  assert_eq(find_call(calls, function(c) return c.body.kind == "agentic_loop.request_completed" end), nil,
+    "gate loss cannot fabricate a MAG terminal")
+  feed("mag", { kind = "mag.run_result", run_id = run_id, status = "killed" })
+  local completed = assert(find_call(decode_calls(), function(c)
+    return c.body.kind == "agentic_loop.request_completed" and c.body.request_id == request_id
+  end))
+  assert_eq(completed.body.status, "error")
+  assert_eq(completed.body.error.code, "capability_lost")
+  assert_eq(completed.body.error.authority, "tool-gate")
+  assert_eq(completed.body.error.outcome, "unknown")
+end
+
 -- The live capability observation, not process exit timing, reconciles unknown
 -- delivery extent. Known-none delivery errors reject only their correlation.
 for _, kind in ipairs({ "ncp.delivery_failed", "engine.plugin_transport_failed", "engine.plugin_delivery_lost" }) do

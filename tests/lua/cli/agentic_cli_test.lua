@@ -147,6 +147,29 @@ do
   emit { kind = "sessions.flush_done", request_id = id }
   assert(exits[1].code == 1)
 end
+-- The canonical request diagnostic is authoritative whether the CLI sees the
+-- gate's OS exit before completion, or only while waiting for persistence.
+for _, exit_first in ipairs({ false, true }) do
+  reset()
+  local id = start("json")
+  activate()
+  local function gate_exit()
+    emit { kind = "engine.plugin_process_terminated", plugin = "tool-gate" }
+  end
+  if exit_first then gate_exit() end
+  local diagnostic = { code = "capability_lost", authority = "tool-gate", outcome = "unknown",
+    message = "Capability delivery failed; accepted outcomes are unknown" }
+  emit { kind = "agentic_loop.request_completed", request_id = id, session_id = "s1",
+    status = "error", error = diagnostic }
+  if not exit_first then gate_exit() end
+  assert(#out == 0 and #exits == 0, "gate death must not bypass the flush barrier")
+  emit { kind = "sessions.flush_done", request_id = id }
+  local result = nefor.json.decode(table.concat(out))
+  assert(result.status == "error" and result.error.code == "capability_lost")
+  assert(result.error.authority == "tool-gate" and result.error.outcome == "unknown")
+  assert(result.error.message == diagnostic.message, "OS accounting cannot rewrite canonical completion")
+  assert(#exits == 1 and exits[1].code == 1)
+end
 reset()
 do
   local id = start("json")

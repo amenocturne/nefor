@@ -345,6 +345,80 @@ fn assert_canonical_settlement(dir: &Path, output: &Output, minimum_runs: usize)
     );
 }
 
+// A killed peer can first be observed through a failed write/delivery, or
+// through its OS exit. Protect failure attribution and canonical settlement,
+// not which asynchronous observation wins on a particular platform.
+fn assert_plugin_loss(dir: &Path, output: &Output, plugin: &str) {
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = result["session_id"].as_str().unwrap();
+    let persisted = std::fs::read_to_string(
+        dir.join("data/nefor/sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .unwrap();
+    let mut process_terminated = false;
+    let mut capability_unavailable = false;
+    for line in persisted.lines().skip(1) {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let Some(payload) = row["payload"].as_str() else {
+            continue;
+        };
+        let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let body = &envelope["body"];
+        if body["kind"] == "agentic_loop.request_completed"
+            && body["request_id"] == result["request_id"]
+        {
+            break;
+        }
+        match body["kind"].as_str() {
+            Some("engine.plugin_process_terminated") if body["plugin"] == plugin => {
+                assert_eq!(body["outcome"]["kind"], "signal");
+                assert_eq!(body["outcome"]["signal"], 15);
+                process_terminated = true;
+            }
+            Some("engine.plugin_transport_failed" | "engine.plugin_delivery_lost")
+                if body["plugin"] == plugin =>
+            {
+                capability_unavailable = true;
+            }
+            Some("ncp.delivery_failed") if body["peer"] == plugin => {
+                capability_unavailable = true;
+            }
+            _ => {}
+        }
+    }
+    match result["error"]["code"].as_str() {
+        Some("plugin_terminated") => {
+            assert!(
+                process_terminated,
+                "exit diagnostic requires the killed peer's OS fact"
+            );
+            assert_eq!(
+                result["error"]["message"],
+                format!("Required runtime process terminated: {plugin}")
+            );
+        }
+        Some("capability_lost") => {
+            // The lead-workflow capability observer owns gate delivery loss;
+            // provider death is still owned by the CLI's required-peer handler.
+            assert_eq!(plugin, "tool-gate");
+            assert!(
+                capability_unavailable,
+                "capability diagnostic requires a delivery fault before completion"
+            );
+            assert_eq!(result["error"]["authority"], plugin);
+            assert_eq!(result["error"]["outcome"], "unknown");
+            assert!(result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown"));
+        }
+        other => panic!("unexpected plugin-loss diagnostic: {other:?}: {result}"),
+    }
+    assert_eq!(result["status"], "error");
+    assert_canonical_settlement(dir, output, 1);
+}
+
 fn assert_authority_loss(dir: &Path, output: &Output) {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"], "error");
@@ -749,15 +823,7 @@ fn headless_starter_request_resume_tools_and_failures() {
             &[],
         );
         assert_eq!(plugin_death.status.code(), Some(1));
-        let plugin_result: serde_json::Value =
-            serde_json::from_slice(&plugin_death.stdout).unwrap();
-        assert_eq!(plugin_result["status"], "error");
-        assert_eq!(plugin_result["error"]["code"], "plugin_terminated");
-        assert!(plugin_result["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains(executable));
-        assert_canonical_settlement(&dir, &plugin_death, 1);
+        assert_plugin_loss(&dir, &plugin_death, executable);
     }
 
     let mag_death = run_inner(
