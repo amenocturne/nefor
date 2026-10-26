@@ -61,6 +61,15 @@ The CLI mock process tests copy the starter configuration into retained project
 test fixture. Providers, gate, tools, MAG, sessions and CLI still use their real
 routed owners. Fixture observation does not perform settlement.
 
+Before starting the TUI scenario clocks, the recipe installs the starter's
+external packages once into a private suite data directory through `nefor-pm`.
+`examples/nefor-agent/config/packages.lua` owns the same release pins and
+verification for both preparation and normal startup. Each scenario gets a copy
+of the prepared package tree and lockfile, while its sessions and other mutable
+data remain isolated. Startup still resolves and verifies those packages; UI
+readiness assertions do not include public-network transfer time. Preparation
+requires network access unless an explicit local executable is selected.
+
 The TUI scenario recipe accepts the optional `NEFOR_TEST_DA_BINARY` environment
 variable for offline execution with an existing real classifier executable.
 `tools/stage-tui-local-package.ts` stages an isolated config/package and adjusts

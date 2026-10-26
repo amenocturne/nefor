@@ -44,17 +44,9 @@ pm.register({
 -- External executable dependencies use nefor-pm's writable package lifecycle;
 -- the selected immutable Nefor runtime tree above remains read-only.
 local da_package = require("libs.tool-validator.da")
-local DA_VERSION = "0.3.0"
-pm.install({
-  da_package.release_package {
-    version = DA_VERSION,
-    checksums = {
-      ["aarch64-apple-darwin"] = "04fd66aba05497c954e729b8e48c5eaf87d6319292bbf75cc3b4f7967078e053",
-      ["aarch64-unknown-linux-gnu"] = "0cdac8e2a4bc7488a7c4bb37ac1e475a7adabbb6b1b49156f76b2d11751b4503",
-      ["x86_64-unknown-linux-gnu"] = "06c71d7e18e9e7a9cc6027a641b400ff97e99f5900f4972eef214b77a07b2a1b",
-    },
-  },
-}, { on_progress = pm.stderr_progress })
+local packages = require("config.packages")
+local DA_VERSION = packages.classifier_version
+pm.install(packages.external(), { on_progress = pm.stderr_progress })
 local SHELL_CLASSIFIER = pm.bin("da", "da")
 
 local MAG_PACKAGE_ROOT = pm.root("nefor-mag")

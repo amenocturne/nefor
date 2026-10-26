@@ -169,16 +169,25 @@ test-tui-scenarios prepared="false":
       tests/tui/starter-sidebar-overflow.json
       tests/tui/starter-interrupt-recovery.json
     )
+    export NEFOR_LUA_DEPENDENCIES_ROOT="${NEFOR_LUA_DEPENDENCIES_ROOT:-$repo/target/lua-dependencies}"
     config_dir="$repo/examples/nefor-agent"
     if [ -n "${NEFOR_TEST_DA_BINARY:-}" ]; then
       bun tools/stage-tui-local-package.ts "$repo" "$suite_dir" "$NEFOR_TEST_DA_BINARY"
       config_dir="$suite_dir/config"
+    else
+      # External packages are prepared once, outside the UI readiness deadline.
+      NEFOR_TEST_STARTER_CONFIG="$config_dir" NEFOR_DEV_DIR="$repo" \
+        NEFOR_DATA_DIR="$suite_dir/prepared" "$target/debug/nefor" \
+        --config "$repo/tests/tui/prepare-dependencies"
     fi
     for scenario in "${scenarios[@]}"; do
       scenario_name="$(basename "$scenario" .json)"
       if [ -n "${NEFOR_TEST_DA_BINARY:-}" ]; then scenario="$suite_dir/$scenario_name.json"; fi
       data_dir="$suite_dir/$scenario_name"
       mkdir -p "$data_dir"
+      if [ -z "${NEFOR_TEST_DA_BINARY:-}" ]; then
+        cp -R "$suite_dir/prepared/plugins" "$data_dir/plugins"
+      fi
       fast_mock=1
       if [ "$scenario_name" = "starter-interrupt-recovery" ]; then fast_mock=0; fi
       tui-driver run-script "$scenario" \
