@@ -74,7 +74,19 @@ marker does not download or extract again. Download, checksum, extraction, verif
 lock-write failures preserve the previous package and lock. After successful
 lock persistence, a cleanup failure reports the leftover staging path without
 undoing or misreporting the installed package. These guarantees cover reported
-operation failures, not process termination or simultaneous writers.
+operation failures, not rollback after process termination.
+
+`install` and `update` serialize reconciliation across processes sharing a plugin
+root. The exclusive OS lock is acquired before reading the package lockfile and
+held through package changes, lockfile persistence, and transaction cleanup or
+rollback. Concurrent startups wait rather than overwriting each other's temporary
+files or discarding unrelated lock entries. The persistent `.nefor-pm.mutex`
+sidecar is never removed or renamed; the OS releases its lock on close or process
+exit. Do not delete the sidecar while Nefor processes are running.
+
+Re-entering the same plugin-root reconciliation from a build, verifier, or
+progress callback is rejected. The locking implementation uses the distribution's
+pinned `luaposix` dependency; package-manager policy remains in Lua.
 
 Archives can replace an existing managed Git package with a lock entry.
 Unowned directories and development symlinks are never replaced. Git and archive installs both stage the new package before replacing an owned directory, including when switching between these source kinds. Packages remain under `<data-root>/plugins/<name>`.

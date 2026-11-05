@@ -10,3 +10,4 @@ http 0.4-0 all 970c2cb6031d06a2465d927cf8a1d88ea84936b841d0a511b8a6e903890f5cc7 
 lpeg 1.1.0-2 src 836d315b920a5cdd62e21786c6c9fad547c4faa131d5583ebca64f0b6595ee76 https://luarocks.org/manifests/gvvaughan/lpeg-1.1.0-2.src.rock
 lpeg_patterns 0.5-0 src 0e6d33543689e83911e2cb47965752e00412cbdfca888812ccbde9ec95259c56 https://luarocks.org/manifests/daurnimator/lpeg_patterns-0.5-0.src.rock
 luaossl 20260910-0 src 22ad2d0e3d12a9376c3d06a000a1af70c45ed181ae581556759e55f637ff371d https://luarocks.org/manifests/daurnimator/luaossl-20260910-0.src.rock
+luaposix 36.3-1 src e9201eed27907f2e516489d87535e77b23c40e40da20c7a629df116decb336e3 https://luarocks.org/manifests/gvvaughan/luaposix-36.3-1.src.rock

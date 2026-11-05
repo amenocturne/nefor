@@ -6,12 +6,13 @@ description = {
   summary = "Replaceable Lua package/source manager for Nefor compositions",
   license = "MIT",
 }
-dependencies = { "lua >= 5.4, < 5.5", "http == 0.4" }
+dependencies = { "lua >= 5.4, < 5.5", "http == 0.4", "luaposix == 36.3" }
 build = {
   type = "builtin",
   modules = {
     ["nefor-pm"] = "lua/nefor-pm/init.lua",
     ["nefor-pm.archive"] = "lua/nefor-pm/archive.lua",
     ["nefor-pm.download"] = "lua/nefor-pm/download.lua",
+    ["nefor-pm.lock"] = "lua/nefor-pm/lock.lua",
   },
 }

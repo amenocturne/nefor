@@ -1,13 +1,13 @@
 //! Tests for `lua/nefor-pm/init.lua`.
 //!
-//! Post-sync refactor every test runs on a plain `Lua::new()` /
-//! `eval()` harness — pm.install drives `nefor.process.run` and
-//! `nefor.fs.*` synchronously, so the tokio multi-thread runtime
-//! the previous version needed is gone.
+//! Trusted Lua VMs load the prepared native dependency closure. Package
+//! operations drive `nefor.process.run` and `nefor.fs.*` synchronously;
+//! concurrency regressions use separate OS processes as advisory-lock owners.
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use mlua::{Lua, Value};
 
@@ -57,14 +57,37 @@ fn set_pm_on_path(lua: &Lua) -> mlua::Result<()> {
         r#"package.path = "{0}/?.lua;{0}/?/init.lua;" .. package.path"#,
         dir.display()
     );
-    lua.load(&script).exec()
+    lua.load(&script).exec()?;
+    let dependencies = std::env::var_os("NEFOR_LUA_DEPENDENCIES_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dir.parent()
+                .expect("repo root")
+                .join("target/lua-dependencies")
+        });
+    lua.globals().set(
+        "pm_test_dependencies",
+        dependencies.to_string_lossy().as_ref(),
+    )?;
+    lua.load(
+        r#"
+      package.path = pm_test_dependencies .. "/share/lua/5.4/?.lua;"
+        .. pm_test_dependencies .. "/share/lua/5.4/?/init.lua;" .. package.path
+      package.cpath = pm_test_dependencies .. "/lib/lua/5.4/?.so;" .. package.cpath
+    "#,
+    )
+    .exec()
 }
 
 /// Lua + nefor table + pm on package.path. Caller still has to `require("nefor-pm")`.
 fn lua_with_pm() -> Lua {
-    let lua = Lua::new();
+    // These trusted fixtures exercise the pinned native POSIX dependency.
+    let lua = unsafe { Lua::unsafe_new() };
     install_nefor(&lua).expect("install nefor surface");
     set_pm_on_path(&lua).expect("pm on path");
+    lua.load("require('posix.fcntl'); require('posix.stdio')")
+        .exec()
+        .expect("prepare pinned Lua dependencies with just prepare-distribution-lua-dependencies");
     lua
 }
 
@@ -2358,13 +2381,16 @@ fn archive_failures_preserve_previous_installation_and_lock() {
             .exec()
             .expect("failure preserves prior package");
         assert_eq!(std::fs::read(&lock_path).expect("retained lock"), lock);
-        assert_eq!(
-            std::fs::read_dir(data.path().join("plugins"))
-                .expect("plugins")
-                .count(),
-            2,
-            "failed attempts leave no staging directories"
-        );
+        for entry in std::fs::read_dir(data.path().join("plugins")).expect("plugins") {
+            let entry = entry.expect("plugin directory entry");
+            if entry.file_type().expect("entry type").is_dir() {
+                assert_eq!(
+                    entry.file_name(),
+                    "tool",
+                    "failed attempts leave no staging directories"
+                );
+            }
+        }
     }
 }
 
@@ -2511,4 +2537,375 @@ fn archive_http_transport_closes_resources_on_failures() {
         local file = assert(io.open(path, "wb")); assert(file:write("replacement")); assert(file:close())
       end
     "#, path = destination.path().to_string_lossy().as_ref())).exec().expect("HTTP resource cleanup");
+}
+
+// Each worker has its own POSIX lock owner; separate Lua VMs in one process
+// would not exercise inter-process advisory locks.
+struct PmWorker {
+    child: Child,
+    log: PathBuf,
+}
+
+impl PmWorker {
+    fn start(root: &Path, data: &Path, script: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let log = root.join(format!(
+            "worker-{}.log",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let output = std::fs::File::create(&log).expect("worker output");
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "pm_reconciliation_process_worker", "--nocapture"])
+            .env("NEFOR_PM_TEST_SCRIPT", script)
+            .env("NEFOR_DATA_DIR", data)
+            .stdout(output.try_clone().expect("clone worker output"))
+            .stderr(output)
+            .spawn()
+            .expect("spawn PM worker");
+        Self { child, log }
+    }
+
+    fn diagnostics(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn wait_for(&mut self, marker: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(
+                self.child.try_wait().expect("poll worker").is_none(),
+                "worker exited before {}: {}",
+                marker.display(),
+                self.diagnostics()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "worker did not reach {}: {}",
+                marker.display(),
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn finish(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll worker") {
+                assert!(status.success(), "worker failed: {}", self.diagnostics());
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not exit: {}",
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn terminate(&mut self) {
+        self.child.kill().expect("terminate blocked worker");
+        self.child.wait().expect("reap blocked worker");
+    }
+}
+
+impl Drop for PmWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn pm_reconciliation_process_worker() {
+    let Ok(script) = std::env::var("NEFOR_PM_TEST_SCRIPT") else {
+        return;
+    };
+    let lua = lua_with_pm();
+    lua.globals()
+        .set(
+            "test_barrier",
+            lua.create_function(|_, (marker, release): (String, Option<String>)| {
+                std::fs::write(&marker, b"reached").map_err(mlua::Error::external)?;
+                if let Some(release) = release {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while !Path::new(&release).exists() {
+                        if Instant::now() >= deadline {
+                            return Err(mlua::Error::external(format!(
+                                "barrier release missing: {release}"
+                            )));
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Ok(())
+            })
+            .expect("barrier callback"),
+        )
+        .expect("install barrier");
+    lua.load(&script).exec().expect("PM worker operation");
+}
+
+fn concurrent_pm_fixture() -> tempfile::TempDir {
+    let root = lua_dir().parent().expect("repo root").join("tmp");
+    std::fs::create_dir_all(&root).expect("project scratch directory");
+    tempfile::Builder::new()
+        .prefix("pm-concurrency-")
+        .tempdir_in(root)
+        .expect("concurrency fixture")
+}
+
+fn lua_string(value: impl AsRef<str>) -> String {
+    serde_json::to_string(value.as_ref()).expect("Lua string")
+}
+
+fn install_statement(url: &str, commit: &str, name: &str) -> String {
+    format!(
+        "pm.install({{{{name={},url={},commit={}}}}})",
+        lua_string(name),
+        lua_string(url),
+        lua_string(commit)
+    )
+}
+
+fn announce_lock_attempt(marker: &Path) -> String {
+    format!(
+        r#"
+      local fcntl = require("posix.fcntl")
+      local original, announced = fcntl.fcntl, false
+      fcntl.fcntl = function(fd, operation, value)
+        if operation == fcntl.F_SETLKW and not announced then
+          announced = true
+          test_barrier({}, nil)
+        end
+        return original(fd, operation, value)
+      end
+    "#,
+        lua_string(marker.to_string_lossy())
+    )
+}
+
+fn pause_lock_write(marker: &Path, release: &Path, fail: bool) -> String {
+    format!(
+        r#"
+      local fs = nefor.fs
+      local original, paused = fs.write_file, false
+      fs.write_file = function(path, value)
+        local result = original(path, value)
+        if path:sub(-4) == ".tmp" and not paused then
+          paused = true
+          test_barrier({}, {})
+          if {} then return {{ok=false,error="fixture lock write rejected"}} end
+        end
+        return result
+      end
+    "#,
+        lua_string(marker.to_string_lossy()),
+        lua_string(release.to_string_lossy()),
+        fail
+    )
+}
+
+fn package_lock(data: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &std::fs::read(data.join("plugins/nefor-pm.lock.json")).expect("package lock"),
+    )
+    .expect("valid package lock")
+}
+
+#[test]
+fn concurrent_cached_installs_share_one_consistent_package_and_lock() {
+    let root = concurrent_pm_fixture();
+    let data = root.path().join("data");
+    let origin = root.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let commit = git_head(&origin);
+    let operation = install_statement(&url, &commit, "shared");
+    let base = "local pm = require('nefor-pm')\n";
+    PmWorker::start(root.path(), &data, &format!("{base}{operation}")).finish();
+    let blocked = root.path().join("writer-paused");
+    let attempted = root.path().join("waiter-attempted");
+    let release = root.path().join("release-writer");
+    let mut first = PmWorker::start(
+        root.path(),
+        &data,
+        &format!(
+            "{base}{}{operation}",
+            pause_lock_write(&blocked, &release, false)
+        ),
+    );
+    first.wait_for(&blocked);
+    let mut second = PmWorker::start(
+        root.path(),
+        &data,
+        &format!("{base}{}{operation}", announce_lock_attempt(&attempted)),
+    );
+    second.wait_for(&attempted);
+    std::fs::write(&release, b"continue").expect("release writer");
+    first.finish();
+    second.finish();
+    assert_eq!(package_lock(&data)["shared"]["commit"], commit);
+    assert_eq!(git_head(&data.join("plugins/shared")), commit);
+}
+
+#[test]
+fn concurrent_partial_installs_preserve_both_package_records() {
+    let root = concurrent_pm_fixture();
+    let data = root.path().join("data");
+    let origin = root.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let commit = git_head(&origin);
+    let blocked = root.path().join("first-verify");
+    let attempted = root.path().join("second-attempted");
+    let release = root.path().join("release-first");
+    let first_script = format!(
+        r#"
+      local pm, paused = require("nefor-pm"), false
+      pm.install({{{{name="first",url={},commit={},verify=function()
+        if not paused then paused=true; test_barrier({}, {}) end
+      end}}}})
+    "#,
+        lua_string(&url),
+        lua_string(&commit),
+        lua_string(blocked.to_string_lossy()),
+        lua_string(release.to_string_lossy())
+    );
+    let mut first = PmWorker::start(root.path(), &data, &first_script);
+    first.wait_for(&blocked);
+    let mut second = PmWorker::start(
+        root.path(),
+        &data,
+        &format!(
+            "local pm = require('nefor-pm')\n{}{}",
+            announce_lock_attempt(&attempted),
+            install_statement(&url, &commit, "second")
+        ),
+    );
+    second.wait_for(&attempted);
+    std::fs::write(&release, b"continue").expect("release first install");
+    first.finish();
+    second.finish();
+    let lock = package_lock(&data);
+    assert_eq!(lock["first"]["commit"], commit);
+    assert_eq!(lock["second"]["commit"], commit);
+    assert_eq!(git_head(&data.join("plugins/first")), commit);
+    assert_eq!(git_head(&data.join("plugins/second")), commit);
+}
+
+#[test]
+fn waiting_install_observes_package_restored_after_failed_reconciliation() {
+    let root = concurrent_pm_fixture();
+    let data = root.path().join("data");
+    let origin = root.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let first_commit = git_head(&origin);
+    let base = "local pm = require('nefor-pm')\n";
+    let initial = install_statement(&url, &first_commit, "shared");
+    PmWorker::start(root.path(), &data, &format!("{base}{initial}")).finish();
+    std::fs::write(origin.join("README.md"), "replacement\n").expect("replacement source");
+    run_git(&origin, &["add", "README.md"]);
+    run_git(&origin, &["commit", "-m", "replacement", "--quiet"]);
+    let second_commit = git_head(&origin);
+    let blocked = root.path().join("failed-writer-paused");
+    let attempted = root.path().join("waiter-attempted");
+    let release = root.path().join("release-failure");
+    let failure_script = format!(
+        r#"{base}{}
+      local ok, err = pcall(function() {} end)
+      assert(not ok and tostring(err):find("fixture lock write rejected", 1, true))
+    "#,
+        pause_lock_write(&blocked, &release, true),
+        install_statement(&url, &second_commit, "shared")
+    );
+    let mut first = PmWorker::start(root.path(), &data, &failure_script);
+    first.wait_for(&blocked);
+    let mut second = PmWorker::start(
+        root.path(),
+        &data,
+        &format!("{base}{}{initial}", announce_lock_attempt(&attempted)),
+    );
+    second.wait_for(&attempted);
+    std::fs::write(&release, b"continue").expect("release failing operation");
+    first.finish();
+    second.finish();
+    assert_eq!(package_lock(&data)["shared"]["commit"], first_commit);
+    assert_eq!(git_head(&data.join("plugins/shared")), first_commit);
+    assert_eq!(
+        std::fs::read_to_string(data.join("plugins/shared/README.md")).expect("restored package"),
+        "root\n"
+    );
+}
+
+#[test]
+fn waiting_install_recovers_when_cached_writer_process_terminates() {
+    let root = concurrent_pm_fixture();
+    let data = root.path().join("data");
+    let origin = root.path().join("origin");
+    let url = make_origin_repo(&origin);
+    let commit = git_head(&origin);
+    let base = "local pm = require('nefor-pm')\n";
+    let operation = install_statement(&url, &commit, "shared");
+    PmWorker::start(root.path(), &data, &format!("{base}{operation}")).finish();
+    let blocked = root.path().join("crashing-writer-paused");
+    let attempted = root.path().join("waiter-attempted");
+    let release = root.path().join("never-release");
+    let mut first = PmWorker::start(
+        root.path(),
+        &data,
+        &format!(
+            "{base}{}{operation}",
+            pause_lock_write(&blocked, &release, false)
+        ),
+    );
+    first.wait_for(&blocked);
+    let mut second = PmWorker::start(
+        root.path(),
+        &data,
+        &format!("{base}{}{operation}", announce_lock_attempt(&attempted)),
+    );
+    second.wait_for(&attempted);
+    first.terminate();
+    second.finish();
+    assert_eq!(package_lock(&data)["shared"]["commit"], commit);
+    assert_eq!(git_head(&data.join("plugins/shared")), commit);
+}
+
+#[test]
+fn reconciliation_retries_interrupted_acquisition_and_releases_failed_locks() {
+    let data = concurrent_pm_fixture();
+    let _guard = DataDirGuard::new(data.path());
+    let lua = lua_with_pm();
+    lua.load(r#"
+      local pm = require("nefor-pm")
+      local fcntl, errno = require("posix.fcntl"), require("posix.errno")
+      local original, attempts = fcntl.fcntl, 0
+      fcntl.fcntl = function(fd, operation, value)
+        if operation == fcntl.F_SETLKW then
+          attempts = attempts + 1
+          if attempts == 1 then return nil, "fixture interrupted", errno.EINTR end
+        end
+        return original(fd, operation, value)
+      end
+      pm.install({})
+      assert(attempts == 2, "interrupted acquisition must retry")
+      fcntl.fcntl = function(fd, operation, value)
+        if operation == fcntl.F_SETLKW then return nil, "fixture acquisition rejected", errno.EINVAL end
+        return original(fd, operation, value)
+      end
+      local ok, err = pcall(pm.install, {})
+      assert(not ok and tostring(err):find("fixture acquisition rejected", 1, true))
+      fcntl.fcntl = original
+      pm.install({})
+      local spec = {name="recursive",dir=nefor.fs.data_root() .. "/source"}
+      assert(nefor.fs.mkdir_p(spec.dir).ok)
+      -- A verifier runs under the outer reconciliation lock. Recursing must
+      -- fail before another handle can close and release that outer lock.
+      spec.verify = function() pm.install({}) end
+      local ok, err = pcall(pm.install, {spec})
+      assert(not ok and tostring(err):find("recursive reconciliation", 1, true))
+      spec.verify = nil
+      pm.install({spec})
+    "#).exec().expect("interruption, acquisition failure, and reentry keep lock lifecycle sound");
 }

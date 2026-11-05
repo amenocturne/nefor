@@ -9,6 +9,7 @@
 
 local M = {}
 local archive = require("nefor-pm.archive")
+local operation_lock = require("nefor-pm.lock")
 
 -- Materialized package registry. Populated by register and install_spec;
 -- pm.root/pm.bin resolve through it while pm.load delegates to Lua.
@@ -655,7 +656,7 @@ local function install_spec(spec, lock, refresh, progress)
   return installed, transaction, {dir = target, identity = identity, verification = evidence}
 end
 
-local function apply_specs(specs, update, opts)
+local function reconcile_specs(specs, update, opts)
   opts = opts or {}
   if not is_table(opts) or (opts.on_progress ~= nil and not is_function(opts.on_progress)) then
     error("nefor-pm: options.on_progress must be a function", 0)
@@ -708,6 +709,14 @@ local function apply_specs(specs, update, opts)
   for _, transaction in ipairs(transactions) do transaction.commit() end
   for _, name in ipairs(completed) do on_progress(name, "Ready") end
   return results
+end
+
+local function apply_specs(specs, update, opts)
+  local made = require_fs().mkdir_p(plugins_root())
+  if not made.ok then error("nefor-pm: cannot create plugins root: " .. tostring(made.error), 0) end
+  return operation_lock.with(pjoin(plugins_root(), ".nefor-pm.mutex"), function()
+    return reconcile_specs(specs, update, opts)
+  end)
 end
 
 function M.stderr_progress(name, message)
