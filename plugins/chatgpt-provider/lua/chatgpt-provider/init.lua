@@ -247,20 +247,23 @@ local function translator(name, options)
     local body = copy(request)
     body.provider = nil
     body.watermark = nil
-    body.messages = {}
-    for index, message in ipairs(context.messages) do body.messages[index] = t.context_message(message) end
-    local lowered_context = copy(context)
+    body.messages = nil
+    body.conversation_context = nil
     local checkpoint = context.compaction and context.compaction.checkpoint
-    if not t.checkpoint_compatible(checkpoint, name, request.model, request.provider_options) then
-      lowered_context.compaction = nil
+    local messages = context.messages
+    local lowered = {}
+    if t.checkpoint_compatible(checkpoint, name, request.model, request.provider_options) then
+      -- Rust restores the opaque checkpoint and consumes only its tail. Never
+      -- serialize the full fallback history alongside that selected context.
+      body.conversation_context = {
+        compaction = { checkpoint = copy(checkpoint) },
+        tail_messages = lowered,
+      }
+      messages = context.tail_messages or {}
+    else
+      body.messages = lowered
     end
-    lowered_context.messages = {}
-    for index, message in ipairs(context.messages) do lowered_context.messages[index] = t.context_message(message) end
-    lowered_context.tail_messages = {}
-    for index, message in ipairs(context.tail_messages or {}) do
-      lowered_context.tail_messages[index] = t.context_message(message)
-    end
-    body.conversation_context = lowered_context
+    for index, message in ipairs(messages) do lowered[index] = t.context_message(message) end
     body.kind = t.kinds.completion_request
     return body
   end

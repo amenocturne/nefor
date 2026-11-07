@@ -99,6 +99,9 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
             Some(Value::String(s)) => s.to_str()?.to_owned(),
             _ => return Ok(()),
         };
+        let wire_bytes = payload.len() + 1;
+        let payload =
+            nefor::ncp::connection::admit_frame(payload).map_err(mlua::Error::external)?;
         let json: Table = lua.globals().get::<Table>("nefor")?.get::<Table>("json")?;
         let decode: Function = json.get("decode")?;
         let decoded: Value = decode.call(lua.create_string(&payload)?)?;
@@ -109,6 +112,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         let log: Table = lua.globals().get("_delivered_log")?;
         let row = lua.create_table()?;
         row.set("peer", lua.create_string(&peer)?)?;
+        row.set("wire_bytes", wire_bytes)?;
         row.set("body", body)?;
         let n = log.len()?;
         log.set(n + 1, row)?;
@@ -691,10 +695,10 @@ fn universal_tool_calls_are_lowered_only_at_provider_boundary() {
 #[test]
 fn chatgpt_direct_completion_lowers_manager_history_without_dropping_run_input() {
     let lua = lua_with_lib();
-    let (kind, input, tail_input, name, arguments, encrypted): (
+    let (kind, input, no_duplicate, name, arguments, encrypted): (
         String,
         String,
-        String,
+        bool,
         String,
         String,
         String,
@@ -729,11 +733,11 @@ fn chatgpt_direct_completion_lowers_manager_history_without_dropping_run_input()
                     { role = "user", content = "current input" },
                 },
             })
-            local call = request.conversation_context.messages[2].tool_calls[1]
-            return request.kind, request.conversation_context.messages[3].content,
-                   request.conversation_context.tail_messages[1].content,
+            local call = request.messages[2].tool_calls[1]
+            return request.kind, request.messages[3].content,
+                   request.conversation_context == nil,
                    call["function"].name, call["function"].arguments,
-                   request.conversation_context.messages[2]
+                   request.messages[2]
                      .provider_context.artifact.items[1].encrypted_content
             "#,
         )
@@ -741,7 +745,7 @@ fn chatgpt_direct_completion_lowers_manager_history_without_dropping_run_input()
         .expect("lower direct ChatGPT completion request");
     assert_eq!(kind, "chatgpt.completion.request");
     assert_eq!(input, "current input");
-    assert_eq!(tail_input, "current input");
+    assert!(no_duplicate);
     assert_eq!(name, "read_file");
     assert_eq!(arguments, r#"{"path":"x"}"#);
     assert_eq!(encrypted, "sealed");
@@ -862,4 +866,15 @@ fn retry_args_requires_explicit_policy_and_encodes_without_mutation() {
       assert(toast.kind == "chat.toast" and toast.id == "legacy")
       assert(toast.ttl_ms == 8500 and toast.text == "round 1/3 attempt 2/2; next round in 7s")
     "#).exec().expect("explicit retry policy and legacy progress translation");
+}
+
+#[test]
+fn large_structured_tool_results_fit_the_selected_provider_wire_after_rewind() {
+    let lua = lua_with_lib();
+    let path = repo_root().join("tests/lua/provider_wire_test.lua");
+    let source = std::fs::read_to_string(&path).expect("read provider wire regression");
+    lua.load(&source)
+        .set_name(path.display().to_string())
+        .exec()
+        .expect("canonical media fits provider delivery without changing model input");
 }

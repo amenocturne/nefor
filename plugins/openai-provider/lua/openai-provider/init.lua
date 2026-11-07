@@ -292,8 +292,15 @@ function M.translator(name)
   end
 
   local function context_message(message)
-    local out = clone_table(message)
-    if type(out) ~= "table" or out.role ~= "assistant"
+    -- Canonical projections also carry transcript chunks, structured values,
+    -- and presentation metadata. Only content is model input; forwarding the
+    -- other views repeats embedded media on the bounded process wire.
+    local out = {}
+    for _, field in ipairs({ "role", "content", "tool_call_id", "tool_name", "name",
+        "tool_calls", "provider_context" }) do
+      out[field] = clone_table(message[field])
+    end
+    if out.role ~= "assistant"
         or type(out.tool_calls) ~= "table" then
       return out
     end

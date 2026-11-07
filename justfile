@@ -105,6 +105,10 @@ test-engine target *args:
 test-producer-admission: build-headless
     just test-engine producer_admission_process_test
 
+# Provider Lua lowering and private-wire contract, without sockets or provider calls.
+test-provider-lua *args:
+    cargo test -p nefor --test openai_provider_lib_test {{args}}
+
 # Provider/API translation tests; may need local socket binding permissions.
 test-provider:
     cargo test -p openai-provider --lib
