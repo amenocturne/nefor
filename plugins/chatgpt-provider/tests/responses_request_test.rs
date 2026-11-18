@@ -691,6 +691,48 @@ async fn post_header_sse_idle_timeout_has_its_own_error_class() {
 }
 
 #[tokio::test]
+async fn list_models_sends_advertised_codex_client_version() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(count, 0, "request ended before HTTP headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let body = r#"{"models":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
+        String::from_utf8(bytes).expect("request headers")
+    });
+
+    let client = test_responses_client(format!("http://{addr}"), "test-installation", "nefor_test");
+    let models = client
+        .list_models(&test_auth_snapshot())
+        .await
+        .expect("model list");
+    assert!(models.is_empty());
+    let headers = server.await.expect("server");
+    assert_eq!(
+        headers.lines().next(),
+        Some("GET /models?client_version=0.170.0 HTTP/1.1"),
+    );
+}
+
+#[tokio::test]
 async fn any_sse_bytes_reset_the_activity_idle_timeout() {
     use chatgpt_provider::responses::ResponseEvent;
     use futures::StreamExt;
